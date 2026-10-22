@@ -64,6 +64,7 @@ use axum::{extract::State, http::StatusCode, response::Json};
 use serde_json::Value;
 use tracing::info;
 
+use crate::mcp::app_dispatch::ArmPayloads;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::request::{
@@ -207,6 +208,37 @@ fn wait_ceiling(budget_ms: u64) -> u64 {
     budget_ms.saturating_sub(DECODE_HEADROOM_MS).max(1)
 }
 
+/// The transport budget a page-side wait is fitted to, and what a caller can
+/// do about a wait that does not fit it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitBudget {
+    /// The direct route: the runner's own IPC envelope, sized by the
+    /// `QONTINUI_TIMEOUT_UI_BRIDGE_IPC` setting.
+    UiBridgeIpc(u64),
+    /// The `/sdk/` wrapper: a fixed [`SDK_DISPATCH_BUDGET_MS`] that no setting
+    /// changes, so its refusal must not point at one.
+    SdkDispatch,
+}
+
+impl WaitBudget {
+    fn ms(self) -> u64 {
+        match self {
+            Self::UiBridgeIpc(ms) => ms,
+            Self::SdkDispatch => SDK_DISPATCH_BUDGET_MS,
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::UiBridgeIpc(_) => {
+                "lower it, or raise the runner's UI Bridge IPC timeout \
+                 (QONTINUI_TIMEOUT_UI_BRIDGE_IPC)"
+            }
+            Self::SdkDispatch => "lower it; the /sdk/ transport's budget is fixed",
+        }
+    }
+}
+
 /// What a transport arm does with an ABSENT page-side wait. See the module doc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitFill {
@@ -225,17 +257,18 @@ pub(crate) enum WaitFill {
 fn fit_wait(
     body: &mut Value,
     field: &str,
-    budget_ms: u64,
+    budget: WaitBudget,
     fill_ms: Option<u64>,
     result: &str,
 ) -> Result<(), String> {
+    let budget_ms = budget.ms();
     let ceiling = wait_ceiling(budget_ms);
     let obj = body.as_object_mut().ok_or("body must be a JSON object")?;
     match obj.get(field).map(whole_u64) {
         Some(Some(n)) if n > ceiling => Err(format!(
             "{field} {n} would outlive the transport's {budget_ms} ms budget (at most \
-             {ceiling} ms leaves room for {result} to reach you); lower it, or raise the \
-             runner's UI Bridge IPC timeout"
+             {ceiling} ms leaves room for {result} to reach you); {}",
+            budget.remedy()
         )),
         Some(_) => Ok(()),
         None => {
@@ -247,26 +280,26 @@ fn fit_wait(
     }
 }
 
-/// Fit the decode wait inside a transport budget of `budget_ms`: refuse a
+/// Fit the decode wait inside a transport `budget`: refuse a
 /// `decodeTimeoutMs` that would outlive the transport, and fill an absent one
 /// when the arm is [`WaitFill::EngineDirect`].
 pub(crate) fn fit_decode_budget(
     body: &mut Value,
-    budget_ms: u64,
+    budget: WaitBudget,
     fill: WaitFill,
 ) -> Result<(), String> {
     let fill_ms = (fill == WaitFill::EngineDirect)
-        .then(|| wait_ceiling(budget_ms).min(DEFAULT_DECODE_TIMEOUT_MS));
+        .then(|| wait_ceiling(budget.ms()).min(DEFAULT_DECODE_TIMEOUT_MS));
     fit_wait(
         body,
         "decodeTimeoutMs",
-        budget_ms,
+        budget,
         fill_ms,
         "the typed DECODE_TIMEOUT and its rollback",
     )
 }
 
-/// Fit a restore's verify wait inside a transport budget of `budget_ms`: refuse
+/// Fit a restore's verify wait inside a transport `budget`: refuse
 /// a `verifyTimeoutMs` that would outlive the transport, and fill an absent one
 /// with the full ceiling when the arm is [`WaitFill::EngineDirect`].
 ///
@@ -282,15 +315,15 @@ pub(crate) fn fit_decode_budget(
 /// every restore into an `INVALID_REQUEST`.
 pub(crate) fn fit_verify_budget(
     body: &mut Value,
-    budget_ms: u64,
+    budget: WaitBudget,
     fill: WaitFill,
 ) -> Result<(), String> {
     let fill_ms = (fill == WaitFill::EngineDirect)
-        .then(|| wait_ceiling(budget_ms).min(MAX_DECODE_TIMEOUT_MS));
+        .then(|| wait_ceiling(budget.ms()).min(MAX_DECODE_TIMEOUT_MS));
     fit_wait(
         body,
         "verifyTimeoutMs",
-        budget_ms,
+        budget,
         fill_ms,
         "the restore's verdict",
     )
@@ -299,54 +332,58 @@ pub(crate) fn fit_verify_budget(
 /// Validate + budget-fit an override body. Shared with the `/sdk/` wrapper.
 pub(crate) fn prepare_override_body(
     mut body: Value,
-    budget_ms: u64,
+    budget: WaitBudget,
     fill: WaitFill,
 ) -> Result<Value, String> {
     validate_override_body(&body)?;
-    fit_decode_budget(&mut body, budget_ms, fill)?;
+    fit_decode_budget(&mut body, budget, fill)?;
     Ok(body)
 }
 
 /// Validate + budget-fit a restore body. Shared with the `/sdk/` wrapper.
 pub(crate) fn prepare_restore_body(
     mut body: Value,
-    budget_ms: u64,
+    budget: WaitBudget,
     fill: WaitFill,
 ) -> Result<Value, String> {
     validate_restore_body(&body)?;
-    fit_verify_budget(&mut body, budget_ms, fill)?;
+    fit_verify_budget(&mut body, budget, fill)?;
     Ok(body)
 }
 
-/// The two bodies the `/sdk/` wrapper hands `dispatch_app_request`, which
-/// sends exactly one of them depending on the active app's transport.
-#[derive(Debug)]
-pub(crate) struct SdkArmBodies {
-    /// WebSocket arm — engine-direct, so an absent wait is filled.
-    pub ws: Value,
-    /// HTTP arm — the app's ui-bridge server fits an absent wait itself.
-    pub http: Value,
-}
+type FitWait = fn(&mut Value, WaitBudget, WaitFill) -> Result<(), String>;
 
-fn sdk_arm_bodies(
+/// The `/sdk/` wrapper's per-arm bodies, as one [`ArmPayloads`] the dispatcher
+/// selects from on the same registry read that picks the arm. Validated once;
+/// the ceiling is checked on the body both arms share, and only the WebSocket
+/// copy gains the fill (its second fit cannot refuse: a present value has
+/// already passed the same ceiling).
+fn sdk_arm_payloads(
     body: Value,
-    prepare: fn(Value, u64, WaitFill) -> Result<Value, String>,
-) -> Result<SdkArmBodies, String> {
-    Ok(SdkArmBodies {
-        ws: prepare(body.clone(), SDK_DISPATCH_BUDGET_MS, WaitFill::EngineDirect)?,
-        http: prepare(body, SDK_DISPATCH_BUDGET_MS, WaitFill::AppServerFits)?,
-    })
+    validate: fn(&Value) -> Result<(), String>,
+    fit: FitWait,
+) -> Result<ArmPayloads, String> {
+    validate(&body)?;
+    let mut http = body;
+    fit(&mut http, WaitBudget::SdkDispatch, WaitFill::AppServerFits)?;
+    let mut websocket = http.clone();
+    fit(
+        &mut websocket,
+        WaitBudget::SdkDispatch,
+        WaitFill::EngineDirect,
+    )?;
+    Ok(ArmPayloads::per_arm(websocket, http))
 }
 
 /// `/sdk/` POST bodies: validated, a caller's `decodeTimeoutMs` held to the
 /// runner's 30 s budget on both arms, an absent one filled on the WS arm only.
-pub(crate) fn sdk_override_bodies(body: Value) -> Result<SdkArmBodies, String> {
-    sdk_arm_bodies(body, prepare_override_body)
+pub(crate) fn sdk_override_bodies(body: Value) -> Result<ArmPayloads, String> {
+    sdk_arm_payloads(body, validate_override_body, fit_decode_budget)
 }
 
 /// `/sdk/` DELETE bodies: as [`sdk_override_bodies`], for `verifyTimeoutMs`.
-pub(crate) fn sdk_restore_bodies(body: Value) -> Result<SdkArmBodies, String> {
-    sdk_arm_bodies(body, prepare_restore_body)
+pub(crate) fn sdk_restore_bodies(body: Value) -> Result<ArmPayloads, String> {
+    sdk_arm_payloads(body, validate_restore_body, fit_verify_budget)
 }
 
 fn target_label(body: &Value) -> String {
@@ -384,8 +421,12 @@ pub async fn ui_bridge_media_override_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<Value>,
 ) -> HandlerResult {
-    let body = prepare_override_body(body, get_ui_bridge_timeout_ms(), WaitFill::EngineDirect)
-        .map_err(bad_request)?;
+    let body = prepare_override_body(
+        body,
+        WaitBudget::UiBridgeIpc(get_ui_bridge_timeout_ms()),
+        WaitFill::EngineDirect,
+    )
+    .map_err(bad_request)?;
     info!("UI Bridge API: media override on {}", target_label(&body));
     wrap_ipc_result_keeping_failure_data(
         ui_bridge_request_sync(&state, "media_override_apply", body).await,
@@ -400,8 +441,12 @@ pub async fn ui_bridge_media_override_restore_handler(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    let body = prepare_restore_body(body, get_ui_bridge_timeout_ms(), WaitFill::EngineDirect)
-        .map_err(bad_request)?;
+    let body = prepare_restore_body(
+        body,
+        WaitBudget::UiBridgeIpc(get_ui_bridge_timeout_ms()),
+        WaitFill::EngineDirect,
+    )
+    .map_err(bad_request)?;
     info!("UI Bridge API: media override restore");
     wrap_ipc_result_keeping_failure_data(
         ui_bridge_request_sync(&state, "media_override_restore", body).await,
@@ -438,6 +483,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::app_registry::AppTransport;
     use serde_json::json;
 
     #[test]
@@ -522,7 +568,7 @@ mod tests {
     fn an_absent_decode_wait_is_fitted_inside_the_transport_budget() {
         let body = prepare_override_body(
             json!({"slotId": "a", "src": "x"}),
-            10_000,
+            WaitBudget::UiBridgeIpc(10_000),
             WaitFill::EngineDirect,
         )
         .unwrap();
@@ -530,7 +576,7 @@ mod tests {
         // A roomy budget keeps the SDK's own default.
         let body = prepare_override_body(
             json!({"slotId": "a", "src": "x"}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::EngineDirect,
         )
         .unwrap();
@@ -538,7 +584,7 @@ mod tests {
         // A tiny budget still leaves a positive wait rather than zero.
         let body = prepare_override_body(
             json!({"slotId": "a", "src": "x"}),
-            1_500,
+            WaitBudget::UiBridgeIpc(1_500),
             WaitFill::EngineDirect,
         )
         .unwrap();
@@ -549,14 +595,14 @@ mod tests {
     fn a_decode_wait_that_would_outlive_the_transport_is_refused_naming_the_budget() {
         let err = prepare_override_body(
             json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 9_000}),
-            10_000,
+            WaitBudget::UiBridgeIpc(10_000),
             WaitFill::EngineDirect,
         )
         .unwrap_err();
         assert!(err.contains("10000 ms budget"), "{err}");
         assert!(prepare_override_body(
             json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 8_000}),
-            10_000,
+            WaitBudget::UiBridgeIpc(10_000),
             WaitFill::EngineDirect
         )
         .is_ok());
@@ -581,9 +627,12 @@ mod tests {
             ),
         ];
         for (body, needle) in cases {
-            let err =
-                prepare_override_body(body.clone(), SDK_DISPATCH_BUDGET_MS, WaitFill::EngineDirect)
-                    .expect_err(&body.to_string());
+            let err = prepare_override_body(
+                body.clone(),
+                WaitBudget::SdkDispatch,
+                WaitFill::EngineDirect,
+            )
+            .expect_err(&body.to_string());
             assert!(err.contains(needle), "{body}: {err} lacks {needle}");
         }
     }
@@ -603,7 +652,7 @@ mod tests {
         // The /sdk/ DELETE: an override applied with a 60 s decode wait (the
         // injected runtime allows it) would otherwise be restored with a 60 s
         // verify wait over a 30 s transport.
-        let body = prepare_restore_body(json!({}), SDK_DISPATCH_BUDGET_MS, WaitFill::EngineDirect)
+        let body = prepare_restore_body(json!({}), WaitBudget::SdkDispatch, WaitFill::EngineDirect)
             .unwrap();
         assert_eq!(
             body["verifyTimeoutMs"],
@@ -612,18 +661,28 @@ mod tests {
         assert!(body["verifyTimeoutMs"].as_u64().unwrap() < SDK_DISPATCH_BUDGET_MS);
         let body = prepare_restore_body(
             json!({"overrideId": "mo-1"}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::EngineDirect,
         )
         .unwrap();
         assert_eq!(body["overrideId"], json!("mo-1"));
         assert_eq!(body["verifyTimeoutMs"], json!(28_000));
         // A tiny budget still leaves a positive wait rather than zero.
-        let body = prepare_restore_body(json!({}), 1_500, WaitFill::EngineDirect).unwrap();
+        let body = prepare_restore_body(
+            json!({}),
+            WaitBudget::UiBridgeIpc(1_500),
+            WaitFill::EngineDirect,
+        )
+        .unwrap();
         assert_eq!(body["verifyTimeoutMs"], json!(1));
         // A raised IPC timeout never fills past the SDK's own bound, which the
         // SDK refuses — and the filled body still passes the runner's mirror.
-        let body = prepare_restore_body(json!({}), 120_000, WaitFill::EngineDirect).unwrap();
+        let body = prepare_restore_body(
+            json!({}),
+            WaitBudget::UiBridgeIpc(120_000),
+            WaitFill::EngineDirect,
+        )
+        .unwrap();
         assert_eq!(body["verifyTimeoutMs"], json!(MAX_DECODE_TIMEOUT_MS));
         assert!(validate_restore_body(&body).is_ok());
     }
@@ -632,7 +691,7 @@ mod tests {
     fn a_verify_wait_that_would_outlive_the_transport_is_refused_naming_the_budget() {
         let err = prepare_restore_body(
             json!({"verifyTimeoutMs": 28_001}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::EngineDirect,
         )
         .unwrap_err();
@@ -641,7 +700,7 @@ mod tests {
         // A caller's wait that fits is kept, not replaced by the fill.
         let body = prepare_restore_body(
             json!({"verifyTimeoutMs": 5_000}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::EngineDirect,
         )
         .unwrap();
@@ -649,57 +708,83 @@ mod tests {
         // Validation runs before the fit: a malformed body is refused, not filled.
         assert!(prepare_restore_body(
             json!({"overrideId": ""}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::EngineDirect
         )
         .unwrap_err()
         .contains("overrideId"));
     }
 
+    /// The body each transport is sent, read the way the dispatcher reads it
+    /// ([`ArmPayloads::for_transport`]) — so a swap of the two arms' bodies
+    /// anywhere between here and the dispatcher reds the tests below.
+    fn sent_to(payloads: &ArmPayloads, transport: AppTransport) -> Value {
+        payloads.clone().for_transport(transport)
+    }
+
     #[test]
-    fn the_sdk_http_arm_leaves_an_absent_wait_for_the_apps_server_to_fit() {
+    fn an_http_registered_app_is_sent_no_wait_for_its_server_to_fit() {
         // The app's ui-bridge server fits these to ITS relay budget (a 6 s
         // ceiling by default) and refuses more — so a runner fill sized to
         // the runner's 30 s would refuse every request on an HTTP app.
         let apply = sdk_override_bodies(json!({"slotId": "a", "src": "x"})).unwrap();
-        assert_eq!(apply.http, json!({"slotId": "a", "src": "x"}));
-        assert!(apply.http.get("decodeTimeoutMs").is_none());
+        let http = sent_to(&apply, AppTransport::Http);
+        assert_eq!(http, json!({"slotId": "a", "src": "x"}));
+        assert!(http.get("decodeTimeoutMs").is_none());
         let restore = sdk_restore_bodies(json!({"overrideId": "mo-1"})).unwrap();
-        assert_eq!(restore.http, json!({"overrideId": "mo-1"}));
-        assert!(restore.http.get("verifyTimeoutMs").is_none());
+        let http = sent_to(&restore, AppTransport::Http);
+        assert_eq!(http, json!({"overrideId": "mo-1"}));
+        assert!(http.get("verifyTimeoutMs").is_none());
         let restore_all = sdk_restore_bodies(json!({})).unwrap();
-        assert_eq!(restore_all.http, json!({}));
+        assert_eq!(sent_to(&restore_all, AppTransport::Http), json!({}));
     }
 
     #[test]
-    fn the_sdk_ws_arm_fills_an_absent_wait_engine_direct() {
+    fn a_websocket_registered_app_is_sent_the_filled_wait_engine_direct() {
         let apply = sdk_override_bodies(json!({"slotId": "a", "src": "x"})).unwrap();
         assert_eq!(
-            apply.ws["decodeTimeoutMs"],
+            sent_to(&apply, AppTransport::Websocket)["decodeTimeoutMs"],
             json!(DEFAULT_DECODE_TIMEOUT_MS)
         );
         let restore = sdk_restore_bodies(json!({})).unwrap();
         assert_eq!(
-            restore.ws["verifyTimeoutMs"],
+            sent_to(&restore, AppTransport::Websocket)["verifyTimeoutMs"],
             json!(SDK_DISPATCH_BUDGET_MS - DECODE_HEADROOM_MS)
         );
     }
 
     #[test]
+    fn a_refusal_names_a_remedy_that_works_on_its_transport() {
+        // /sdk/: the budget is fixed, so the refusal must not send the caller
+        // to an IPC setting that has no effect there.
+        let err = sdk_restore_bodies(json!({"verifyTimeoutMs": 28_001})).unwrap_err();
+        assert!(err.contains("budget is fixed"), "{err}");
+        assert!(!err.contains("IPC"), "{err}");
+        // The direct route: the IPC timeout is the budget, so raising it helps.
+        let err = prepare_override_body(
+            json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 9_000}),
+            WaitBudget::UiBridgeIpc(10_000),
+            WaitFill::EngineDirect,
+        )
+        .unwrap_err();
+        assert!(err.contains("QONTINUI_TIMEOUT_UI_BRIDGE_IPC"), "{err}");
+    }
+
+    #[test]
     fn the_app_server_arm_refuses_an_over_budget_wait_on_its_own() {
-        // `sdk_arm_bodies` builds the WS body first, so the tests through it
-        // only ever see the WS arm's refusal. Pin the HTTP arm's directly:
-        // leaving a wait absent must not also stop refusing an oversized one.
+        // Pin the HTTP arm's refusal directly, not only through
+        // `sdk_arm_payloads`: leaving a wait absent must not also stop
+        // refusing an oversized one.
         let err = prepare_override_body(
             json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 28_001}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::AppServerFits,
         )
         .unwrap_err();
         assert!(err.contains("decodeTimeoutMs 28001"), "{err}");
         let err = prepare_restore_body(
             json!({"verifyTimeoutMs": 28_001.0}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::AppServerFits,
         )
         .unwrap_err();
@@ -707,7 +792,7 @@ mod tests {
         // And it validates: a malformed body is refused, not passed through.
         assert!(prepare_restore_body(
             json!({"overrideId": ""}),
-            SDK_DISPATCH_BUDGET_MS,
+            WaitBudget::SdkDispatch,
             WaitFill::AppServerFits
         )
         .is_err());
@@ -728,11 +813,13 @@ mod tests {
         // A caller's wait that fits is passed through unchanged on both arms.
         let b = sdk_override_bodies(json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 4_000}))
             .unwrap();
-        assert_eq!(b.ws["decodeTimeoutMs"], json!(4_000));
-        assert_eq!(b.http["decodeTimeoutMs"], json!(4_000));
+        for transport in [AppTransport::Websocket, AppTransport::Http] {
+            assert_eq!(sent_to(&b, transport)["decodeTimeoutMs"], json!(4_000));
+        }
         let b = sdk_restore_bodies(json!({"verifyTimeoutMs": 4_000})).unwrap();
-        assert_eq!(b.ws["verifyTimeoutMs"], json!(4_000));
-        assert_eq!(b.http["verifyTimeoutMs"], json!(4_000));
+        for transport in [AppTransport::Websocket, AppTransport::Http] {
+            assert_eq!(sent_to(&b, transport)["verifyTimeoutMs"], json!(4_000));
+        }
     }
 
     #[test]
