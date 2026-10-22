@@ -23,6 +23,7 @@ import { LAYOUT_PRESETS } from "./useZoneLayout";
 import {
   readSignature,
   preHasPrefix,
+  PTY_SPAWN_SETTLE_MS,
   TERMINAL_INPUT_GLOB,
   ZONE_HEADER_GLOB,
 } from "./terminalPageSignatures";
@@ -43,31 +44,44 @@ function textParam(params: ActionParams, key: string): string | undefined {
  * Pure core of `select-layout`'s prediction.
  *
  * Zone headers render only in a multi-zone layout (`showLabels =
- * isMultiZone`). Switching to a single-zone preset therefore removes every
- * rendered header — the one consequence the handler fixes regardless of the
- * live assignments. Between multi-zone presets `applyLayout` preserves
- * in-range assignments and compacts the rest, and which headers that leaves
- * is not stated by the handler, so it is not predicted (an unknown layout id
- * throws before any effect, so nothing is predicted for it either).
+ * isMultiZone`), but a single-zone choice is a starting point, not a latch:
+ * `useZoneLayout`'s auto-grow effect re-expands any layout the page's live
+ * tabs overflow (`computeAutoGrowLayoutId`, keyed on every tab, plan tabs
+ * included). So switching to a single-zone preset removes the rendered
+ * headers ONLY when the page has at most one tab; with more, the grid grows
+ * straight back and the headers stay. Between multi-zone presets `applyLayout`
+ * preserves in-range assignments and compacts the rest, and which headers that
+ * leaves is not stated by the handler, so it is not predicted (an unknown
+ * layout id throws before any effect, so nothing is predicted for it either).
  */
-export function predictSelectLayout(params: ActionParams, pre: SemanticSnapshot): PredictedDelta {
+export function predictSelectLayout(
+  params: ActionParams,
+  pre: SemanticSnapshot,
+  tabCount: number,
+): PredictedDelta {
   const layoutId = textParam(params, "layoutId");
   const preset = LAYOUT_PRESETS.find((l) => l.id === layoutId);
   if (!preset) return {};
-  if (preset.zones.length <= 1 && preHasPrefix(pre, ZONE_HEADER_PREFIX)) {
+  if (preset.zones.length <= 1 && tabCount <= 1 && preHasPrefix(pre, ZONE_HEADER_PREFIX)) {
     return { elementsDisappear: [{ id: ZONE_HEADER_GLOB }] };
   }
   return {};
 }
 
-/** `select-layout` — switches the grid preset; another `select-layout` undoes it. */
-export const SELECT_LAYOUT_SIGNATURE: EffectSignature = {
-  id: "zone-layout-picker.select-layout",
-  predicts: predictSelectLayout,
-  scope: { elementIds: [ZONE_HEADER_GLOB] },
-  reversibility: "reversible",
-  provenance: "declared",
-};
+/**
+ * `select-layout` — switches the grid preset; another `select-layout` undoes
+ * it. `tabCount` is the page's tab count the picker is rendered with — the
+ * same count auto-grow keys on.
+ */
+export function selectLayoutSignature(tabCount: number): EffectSignature {
+  return {
+    id: "zone-layout-picker.select-layout",
+    predicts: (params, pre) => predictSelectLayout(params, pre, tabCount),
+    scope: { elementIds: [ZONE_HEADER_GLOB] },
+    reversibility: "reversible",
+    provenance: "declared",
+  };
+}
 
 export const LIST_LAYOUTS_SIGNATURE = readSignature("zone-layout-picker.list-layouts");
 
@@ -100,7 +114,9 @@ export function predictLoadProfile(
 /**
  * `load-profile` — `destructive`, so `one-way`: the arrangement it overwrites
  * was never saved, and it can launch `claude --resume` into new tabs. The
- * profiles map and live tab count are the ones the handler closes over.
+ * profiles map and live tab count are the ones the handler closes over. The
+ * handler awaits the whole apply (each spawn included), and the PTY settle
+ * window covers the last spawned tab's element registering.
  */
 export function loadProfileSignature(
   profiles: Readonly<Record<string, ZoneProfile>>,
@@ -110,6 +126,7 @@ export function loadProfileSignature(
     id: "zone-profile-picker.load-profile",
     predicts: (params) => predictLoadProfile(params, profiles, liveTabCount),
     scope: { elementIds: [TERMINAL_INPUT_GLOB, ZONE_HEADER_GLOB] },
+    settleMs: PTY_SPAWN_SETTLE_MS,
     reversibility: "one-way",
     provenance: "declared",
   };

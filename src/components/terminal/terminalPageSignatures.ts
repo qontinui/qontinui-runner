@@ -35,8 +35,27 @@
  *
  * Declaring a signature opts the action into post-execution verification
  * (`ComponentAction.signature`, ui-bridge `core/types.ts`). A prediction that
- * holds but sees extra unpredicted changes reports `Surprise`, not
- * `Contradiction`; a wrong signature is fixed here, never in the handler.
+ * holds but sees extra unpredicted changes reports `Surprise`; a wrong
+ * signature is fixed here, never in the handler.
+ *
+ * ## What glob criteria do NOT protect against
+ *
+ * A glob matches ANY element of its family, not only the one this action
+ * touched. So an unrelated change inside the settle window is attributed to
+ * the action: a `terminal-input-*` appear-prediction met by an unrelated tab
+ * CLOSING in the same window (a `terminal-input-*` disappearance) can classify
+ * as `Contradiction` even though this action did exactly what it should, and
+ * an unrelated tab appearing can make a disappear-prediction read as held. A
+ * `Contradiction` on a glob signature is therefore evidence to read against
+ * the observed delta, not proof the handler is wrong.
+ *
+ * ## Settle windows
+ *
+ * A spawn resolves when the PTY exists, but its `terminal-input-<id>` element
+ * registers only after the `terminal-created` event reaches React state and the
+ * proxy mounts. Window moves land through a `session-assignment-changed`
+ * event. Both overrun the SDK's fallback settle band, so those signatures
+ * carry an explicit `settleMs`.
  */
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -47,6 +66,8 @@ import type {
   SemanticSnapshot,
 } from "@qontinui/ui-bridge";
 
+import { FLOW_GRID_ID } from "./useZoneLayout";
+
 /** Every terminal tab's UI Bridge element (`TerminalBridgeProxies`). */
 export const TERMINAL_INPUT_GLOB = "terminal-input-*";
 /** Every rendered zone header (`zoneHeaderElementSpec` in `zone-grid/ZoneLabel.tsx`). */
@@ -54,6 +75,16 @@ export const ZONE_HEADER_GLOB = "terminal-zone-header-*";
 
 /** The terminal surface: tab elements plus the zone headers they render under. */
 const TERMINAL_ZONE_SCOPE = { elementIds: [TERMINAL_INPUT_GLOB, ZONE_HEADER_GLOB] };
+
+/**
+ * Settle window for a PTY spawn: the PTY exists when the handler resolves, but
+ * its element registers only after `terminal-created` reaches React state and
+ * the proxy mounts.
+ */
+export const PTY_SPAWN_SETTLE_MS = 1500;
+
+/** Settle window for a window move landing through `session-assignment-changed`. */
+export const WINDOW_EVENT_SETTLE_MS = 750;
 
 /** Does the pre-snapshot contain an element whose id starts with `prefix`? */
 export function preHasPrefix(pre: SemanticSnapshot, prefix: string): boolean {
@@ -104,6 +135,7 @@ function spawnSignature(
     id,
     predicts: (): PredictedDelta => ({ elementsAppear: [{ id: TERMINAL_INPUT_GLOB }] }),
     scope,
+    settleMs: PTY_SPAWN_SETTLE_MS,
     reversibility,
     provenance: "declared",
   };
@@ -114,13 +146,15 @@ function spawnSignature(
 // ---------------------------------------------------------------------------
 
 /**
- * `create-terminal` — raw `createTerminal`: a PTY tab with no zone assignment.
- * Closing the tab undoes it.
+ * `create-terminal` — raw `createTerminal`. The handler itself assigns no
+ * zone, but `useZoneLayout` does as the tab arrives (`reconcileAssignments`,
+ * and auto-grow when it overflows the layout), so a header may follow — same
+ * claim and widened scope as `create-plain-terminal`. Closing the tab undoes it.
  */
 export const CREATE_TERMINAL_SIGNATURE = spawnSignature(
   "terminal-page.create-terminal",
   "reversible",
-  { elementIds: [TERMINAL_INPUT_GLOB] },
+  TERMINAL_ZONE_SCOPE,
 );
 
 /**
@@ -162,27 +196,53 @@ export const POP_OUT_ACTIVE_TERMINAL_SIGNATURE: EffectSignature = {
   id: "terminal-page.pop-out-active-terminal",
   predicts: (): PredictedDelta => ({ elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] }),
   scope: TERMINAL_ZONE_SCOPE,
+  settleMs: WINDOW_EVENT_SETTLE_MS,
   reversibility: "reversible",
   provenance: "declared",
 };
 
+/** Non-plan tabs: the ones that own a `terminal-input-*` element. */
+export function countTerminalTabs(tabs: ReadonlyArray<{ type?: string }>): number {
+  return tabs.filter((t) => t.type !== "plan").length;
+}
+
 /**
- * `pop-out-page` — binds a whole page to a new window; a page binding beats
- * the per-terminal owner map, so all of that page's tab elements leave this
- * registry. Which `terminal-input-*` ids belong to the page is not visible in
- * the snapshot, so the criterion is the glob (scope widened to every tab),
- * and it is only predicted when the pre-snapshot holds any tab at all.
+ * Pure core of `pop-out-page`'s prediction.
+ *
+ * Binding a page to a new window beats the per-terminal owner map, so all of
+ * that page's tab elements leave this registry. Which `terminal-input-*` ids
+ * belong to a page is not visible in the snapshot, so the criterion is the
+ * glob. For the ACTIVE page (the default target) the page's own terminal count
+ * is known, so an empty page predicts nothing. For another page only the
+ * snapshot is available: a disappearance is predicted when this window renders
+ * any tab at all — an over-prediction when that page happens to be empty.
  */
-export const POP_OUT_PAGE_SIGNATURE: EffectSignature = {
-  id: "terminal-page.pop-out-page",
-  predicts: (_params, pre): PredictedDelta =>
-    preHasPrefix(pre, TERMINAL_INPUT_PREFIX)
-      ? { elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] }
-      : {},
-  scope: TERMINAL_ZONE_SCOPE,
-  reversibility: "reversible",
-  provenance: "declared",
-};
+export function predictPopOutPage(
+  params: ActionParams,
+  pre: SemanticSnapshot,
+  activePageId: string,
+  activePageTerminals: number,
+): PredictedDelta {
+  const target = textParam(params, "pageId") ?? activePageId;
+  const hasTabs =
+    target === activePageId ? activePageTerminals > 0 : preHasPrefix(pre, TERMINAL_INPUT_PREFIX);
+  return hasTabs ? { elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] } : {};
+}
+
+/** `pop-out-page`, built from the active page and its terminal count. */
+export function popOutPageSignature(
+  activePageId: string,
+  activePageTerminals: number,
+): EffectSignature {
+  return {
+    id: "terminal-page.pop-out-page",
+    predicts: (params, pre) => predictPopOutPage(params, pre, activePageId, activePageTerminals),
+    scope: TERMINAL_ZONE_SCOPE,
+    settleMs: WINDOW_EVENT_SETTLE_MS,
+    reversibility: "reversible",
+    provenance: "declared",
+  };
+}
 
 /** This webview's window label; `"main"` outside Tauri (tests). */
 function currentWindowLabel(): string {
@@ -221,21 +281,68 @@ export const MOVE_TERMINAL_TO_WINDOW_SIGNATURE: EffectSignature = {
   id: "terminal-page.move-terminal-to-window",
   predicts: (params, pre) => predictMoveTerminal(params, pre, currentWindowLabel()),
   scope: { elementIds: [TERMINAL_INPUT_GLOB] },
+  settleMs: WINDOW_EVENT_SETTLE_MS,
   reversibility: "reversible",
   provenance: "declared",
 };
 
-/** The zone-view state the maximize/restore handlers read at invocation time. */
+/** The zone-view state the maximize/restore handlers act on. */
 export interface ZoneViewFacts {
   maximizedZone: number | null;
   zoneCount: number;
+  /**
+   * How many zone headers the TILED grid renders — occupied zones whose cell
+   * is not a compact card (`ZoneGrid`: `!showCompactCard && showLabels`).
+   * `null` when that cannot be known: flow-grid virtualization decides which
+   * cells mount from the viewport.
+   */
+  labelledZonesWhenTiled: number | null;
+}
+
+/** What {@link countLabelledZones} needs from the page. */
+export interface ZoneLabelInputs {
+  layoutId: string;
+  zoneCount: number;
+  assignments: Readonly<Record<number, string>>;
+  tabs: ReadonlyArray<{ id: string; type?: string }>;
+  focusedZone: number;
+  pinnedZones: ReadonlySet<number>;
+  /** `viewMode === "compact"` — `ZoneGrid`'s `forceCompact`. */
+  compactView: boolean;
+}
+
+/**
+ * Count the zone headers the tiled grid renders, mirroring `ZoneGrid`: no
+ * headers in a single-zone layout; a header per OCCUPIED zone, except one
+ * shown as a compact card — a non-plan tab that is neither focused nor pinned
+ * while the view is forced compact. Flow-grid virtualization is decided by
+ * the viewport, so it answers `null` (unknown) rather than a guess.
+ */
+export function countLabelledZones(input: ZoneLabelInputs): number | null {
+  if (input.layoutId === FLOW_GRID_ID) return null;
+  if (input.zoneCount <= 1) return 0;
+  const tabsById = new Map(input.tabs.map((t) => [t.id, t]));
+  let count = 0;
+  for (let zone = 0; zone < input.zoneCount; zone++) {
+    const tabId = input.assignments[zone];
+    const tab = tabId === undefined ? undefined : tabsById.get(tabId);
+    if (!tab) continue;
+    const compact =
+      tab.type !== "plan" &&
+      zone !== input.focusedZone &&
+      !input.pinnedZones.has(zone) &&
+      input.compactView;
+    if (!compact) count += 1;
+  }
+  return count;
 }
 
 /**
  * Zone headers render only in the tiled multi-zone view (`ZoneGrid`:
  * `showLabels = isMultiZone`, and the maximized branch renders its own
  * unregistered header instead of `ZoneLabel`). So entering the maximized view
- * removes every rendered header, and leaving it brings them back.
+ * removes every rendered header, and leaving it brings back the ones the
+ * tiled grid renders — if that is known and non-zero.
  */
 function enterMaximized(pre: SemanticSnapshot, facts: ZoneViewFacts): PredictedDelta {
   if (facts.maximizedZone !== null || !preHasPrefix(pre, ZONE_HEADER_PREFIX)) return {};
@@ -244,6 +351,7 @@ function enterMaximized(pre: SemanticSnapshot, facts: ZoneViewFacts): PredictedD
 
 function leaveMaximized(facts: ZoneViewFacts): PredictedDelta {
   if (facts.maximizedZone === null || facts.zoneCount <= 1) return {};
+  if (facts.labelledZonesWhenTiled === null || facts.labelledZonesWhenTiled === 0) return {};
   return { elementsAppear: [{ id: ZONE_HEADER_GLOB }] };
 }
 
@@ -269,17 +377,17 @@ export function predictZoneView(
  * `maximize-zone` / `restore-zone` / `toggle-maximize-zone` — display state
  * only (`effect: 'read'`: never persisted, undone by its inverse). They change
  * which elements are rendered but modify none, which is what a read effect may
- * predict. `readFacts` is called at PREDICT time, so the prediction is made
- * against the zone view as it is then, not as it was at registration.
+ * predict. Built per render from the zone view as rendered (see
+ * `useZoneViewFacts`), which is the state a predict between renders sees.
  */
 export function zoneViewSignature(
   kind: "maximize" | "restore" | "toggle",
-  readFacts: () => ZoneViewFacts,
+  facts: ZoneViewFacts,
 ): EffectSignature {
   const actionId = kind === "toggle" ? "toggle-maximize-zone" : `${kind}-zone`;
   return {
     id: `terminal-page.${actionId}`,
-    predicts: (params, pre) => predictZoneView(kind, params, pre, readFacts()),
+    predicts: (params, pre) => predictZoneView(kind, params, pre, facts),
     scope: { elementIds: [ZONE_HEADER_GLOB] },
     reversibility: "reversible",
     provenance: "declared",
