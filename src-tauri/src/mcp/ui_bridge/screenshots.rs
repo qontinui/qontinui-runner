@@ -38,6 +38,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::screen;
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::visibility_canvas::{CanvasCoverage, CoverageUnavailableReason};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Bound on the native monitor-crop capture.
@@ -1188,10 +1189,18 @@ fn validate_min_ratio(min_ratio: f64) -> Result<(), String> {
 
 /// One directed occlusion relation, mirroring the SDK's
 /// `VisibilityOcclusionEntry` field for field.
+///
+/// `paints_text` is the element state's `paintsText` (plan
+/// `2026-10-22-occlusion-sweep-is-blind-to-canvas-painted-text`, D3): a canvas
+/// surface paints its text as pixels, so its `textContent` is empty and the
+/// DOM rule would call the occlusion blank. Such an entry reads
+/// `hidesText: true, textSource: "painted"`; every other entry reads
+/// `textSource: "dom"` with `hidesText` from the DOM text as before.
 fn occlusion_entry(
     element_id: &str,
     label: Option<&str>,
     text: &str,
+    paints_text: bool,
     occluded_by: &str,
     ratio: f64,
     is_expected_overlay: bool,
@@ -1205,7 +1214,8 @@ fn occlusion_entry(
         // stack it is `false`, and the report-level `expectedOverlayDetection`
         // says `unavailable` so the `false` is not read as a classification.
         "isExpectedOverlay": is_expected_overlay,
-        "hidesText": !text.is_empty(),
+        "hidesText": hides_text(text, paints_text),
+        "textSource": if paints_text { "painted" } else { "dom" },
         // Always `hit-test`: the numbers come from the registry's
         // `elementFromPoint` sampling. The geometric arm lives in
         // ui-bridge-auto and is not consulted here.
@@ -1219,6 +1229,13 @@ fn occlusion_entry(
         obj.insert("text".to_string(), serde_json::json!(text));
     }
     entry
+}
+
+/// The one `hidesText` rule, shared by the entry and the report's sort key so
+/// the two can never disagree: painted text always counts, DOM text counts when
+/// non-empty.
+fn hides_text(text: &str, paints_text: bool) -> bool {
+    paints_text || !text.is_empty()
 }
 
 /// Extract the modal identity set from a `get_modal_context` IPC answer.
@@ -1289,12 +1306,26 @@ fn is_tracked_overlay(occluded_by: &str, modal_ids: &HashSet<String>) -> bool {
 /// then an occluder that is a tracked modal is dropped and counted in
 /// `expectedOverlaysFiltered` unless `include_expected`, in which case it is
 /// kept with `isExpectedOverlay: true`.
+///
+/// `canvas_coverage` is the webview's canvas census (see
+/// `visibility_canvas.rs`). `None` reads as `unavailable` with reason
+/// `page-sdk-lacks-coverage`, the SDK relay's rule for an absent field. The
+/// verdict order is the SDK's (plan
+/// `2026-10-22-occlusion-sweep-is-blind-to-canvas-painted-text`, D3):
+/// `unknown_empty_registry` → `occlusions_found` → `unknown_canvas` (no
+/// occlusions, but a canvas is unattributed or the census is unavailable) →
+/// `clear`.
 pub(crate) fn build_visibility_report(
     elements: &[serde_json::Value],
     min_ratio: f64,
     include_expected: bool,
     modal_ids: Option<&HashSet<String>>,
+    canvas_coverage: Option<&CanvasCoverage>,
 ) -> serde_json::Value {
+    let absent_coverage = CanvasCoverage::Unavailable {
+        reason: CoverageUnavailableReason::PageSdkLacksCoverage,
+    };
+    let canvas_coverage = canvas_coverage.unwrap_or(&absent_coverage);
     let mut occlusions: Vec<(bool, f64, serde_json::Value)> = Vec::new();
     let mut expected_overlays_filtered: u64 = 0;
     // Did ANY element carry occlusion data at all? See `occlusionDataObserved`
@@ -1342,10 +1373,19 @@ pub(crate) fn build_visibility_report(
             .unwrap_or("")
             .trim();
         let label = el.get("label").and_then(|v| v.as_str());
+        let paints_text = state.get("paintsText").and_then(|v| v.as_bool()) == Some(true);
         occlusions.push((
-            !text.is_empty(),
+            hides_text(text, paints_text),
             ratio,
-            occlusion_entry(id, label, text, occluded_by, ratio, is_expected_overlay),
+            occlusion_entry(
+                id,
+                label,
+                text,
+                paints_text,
+                occluded_by,
+                ratio,
+                is_expected_overlay,
+            ),
         ));
     }
 
@@ -1360,10 +1400,17 @@ pub(crate) fn build_visibility_report(
         // An empty list from a registry with no elements is UNKNOWN, not
         // "nothing is covered" - the SDK models this case too.
         "unknown_empty_registry"
-    } else if entries.is_empty() {
-        "clear"
-    } else {
+    } else if !entries.is_empty() {
+        // `canvasCoverage` still lists the unattributed canvases.
         "occlusions_found"
+    } else if canvas_coverage.withholds_clear() {
+        // Nothing observed as covered, but a visible canvas paints text no
+        // registration accounts for (its occlusions are invisible to the
+        // sweep), or the census itself could not be read. Either way `clear`
+        // would assert an absence nobody measured.
+        "unknown_canvas"
+    } else {
+        "clear"
     };
 
     serde_json::json!({
@@ -1378,10 +1425,12 @@ pub(crate) fn build_visibility_report(
         "expectedOverlayDetection": if modal_ids.is_some() { "modal-stack" } else { "unavailable" },
         "expectedOverlaysFiltered": expected_overlays_filtered,
         "verdict": verdict,
+        "canvasCoverage": canvas_coverage.to_json(),
         // -- Runner-only advisory field, deliberately OUTSIDE the verdict --
         //
-        // The verdict union stays exactly the SDK's three variants so no
-        // consumer breaks on an unknown value. But a `clear` minted here is
+        // The verdict union stays exactly the SDK's union (four variants since
+        // `unknown_canvas`) so no consumer meets a value the SDK does not
+        // declare. But a `clear` minted here is
         // only as good as the data the webview handed us, and the webview's
         // @qontinui/ui-bridge is version-pinned: occlusion sampling landed in
         // ui-bridge `4284cd2` (2026-08-26).
@@ -1433,7 +1482,10 @@ pub(crate) fn build_visibility_report(
 /// modal IPC that fails or answers `null` degrades only the classification
 /// (`expectedOverlayDetection: "unavailable"`, nothing filtered) — never the
 /// sweep, matching the SDK's "a misbehaving tracker degrades the field, never
-/// the caller". Going the other way -
+/// the caller". A third concurrent IPC, `get_canvas_coverage`, reads the
+/// webview's canvas census (`visibility_canvas.rs`); its failure becomes
+/// `canvasCoverage: unavailable`, which withholds `clear` (verdict
+/// `unknown_canvas`) but never fails the sweep. Going the other way -
 /// forwarding a `visibility` request type to the webview - would answer
 /// "unknown request type": the frontend dispatches UI Bridge requests through
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
@@ -1479,12 +1531,27 @@ pub async fn ui_bridge_visibility_handler(
     let discover_payload = serde_json::json!({
         "options": { "includeHidden": true, "interactiveOnly": false }
     });
-    // Concurrent, as `state-summary` does: the wall time is the slower of the
-    // two, not their sum.
-    let (discover_result, modal_result) = tokio::join!(
+    // Concurrent, as `state-summary` does: the wall time is the slowest of the
+    // three, not their sum.
+    let (discover_result, modal_result, coverage_result) = tokio::join!(
         ui_bridge_request_sync(&state, "discover", discover_payload),
         ui_bridge_request_sync(&state, "get_modal_context", serde_json::json!({})),
+        ui_bridge_request_sync(&state, "get_canvas_coverage", serde_json::json!({})),
     );
+    // A coverage failure is NOT a sweep failure either, but unlike the modal
+    // stack it WITHHOLDS `clear` (verdict `unknown_canvas`): a missing canvas
+    // census loses the ability to say "clear" truthfully. Never `?`-propagated.
+    let canvas_coverage = match &coverage_result {
+        Ok(answer) => CanvasCoverage::from_ipc(Ok(answer)),
+        Err(e) => {
+            warn!(
+                "UI Bridge API: visibility get_canvas_coverage failed ({}); \
+                 canvasCoverage=unavailable",
+                e
+            );
+            CanvasCoverage::from_ipc(Err(e.as_str()))
+        }
+    };
     // A modal-context failure is NOT a sweep failure: log it, classify nothing,
     // and let the report say `unavailable`. Never `?`-propagated.
     let modal_ids = match modal_result {
@@ -1529,6 +1596,7 @@ pub async fn ui_bridge_visibility_handler(
         min_ratio,
         include_expected,
         modal_ids.as_ref(),
+        Some(&canvas_coverage),
     ))))
 }
 
@@ -1678,7 +1746,7 @@ mod visibility_tests {
     //! which is the handler minus its single `discover` IPC. Both directions
     //! are covered: an occluded page must report the DIRECTED relation, and a
     //! clean page must not invent one.
-    use super::build_visibility_report;
+    use super::{build_visibility_report, CanvasCoverage};
     use serde_json::json;
 
     /// A `discover` element as the webview emits it.
@@ -1697,7 +1765,13 @@ mod visibility_tests {
                 "textContent": "  Zone 8: qontinui-web  ",
             }),
         )];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(report["verdict"], json!("occlusions_found"));
         assert_eq!(report["elementCount"], json!(1));
         assert_eq!(report["occlusionDataObserved"], json!(true));
@@ -1712,6 +1786,11 @@ mod visibility_tests {
         // not actionable, naming the string is.
         assert_eq!(entry["text"], json!("Zone 8: qontinui-web"));
         assert_eq!(entry["hidesText"], json!(true));
+        assert_eq!(
+            entry["textSource"],
+            json!("dom"),
+            "no `paintsText` on the state: the text came from the DOM"
+        );
         assert_eq!(entry["source"], json!("hit-test"));
         assert_eq!(entry["isExpectedOverlay"], json!(false));
     }
@@ -1729,7 +1808,13 @@ mod visibility_tests {
             ),
             el("btn-2", "Cancel", json!({ "textContent": "Cancel" })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(report["verdict"], json!("clear"));
         assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(report["elementCount"], json!(2));
@@ -1746,7 +1831,13 @@ mod visibility_tests {
             ),
             el("real", "b", json!({ "occludedBy": "y", "occludedPct": 60 })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         let ids: Vec<&str> = report["occlusions"]
             .as_array()
             .unwrap()
@@ -1756,7 +1847,13 @@ mod visibility_tests {
         assert_eq!(ids, vec!["real"]);
         // Raising the floor above the real one drops it too - proving the
         // parameter is read rather than ignored.
-        let strict = build_visibility_report(&elements, 0.9, false, None);
+        let strict = build_visibility_report(
+            &elements,
+            0.9,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(strict["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(strict["verdict"], json!("clear"));
         assert_eq!(strict["minRatio"], json!(0.9));
@@ -1782,7 +1879,13 @@ mod visibility_tests {
                 json!({ "occludedBy": "x", "occludedPct": 70, "textContent": "yo" }),
             ),
         ];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         let ids: Vec<&str> = report["occlusions"]
             .as_array()
             .unwrap()
@@ -1795,7 +1898,13 @@ mod visibility_tests {
     /// An empty registry is UNKNOWN, never "nothing is covered".
     #[test]
     fn an_empty_registry_is_unknown_not_clear() {
-        let report = build_visibility_report(&[], 0.02, false, None);
+        let report = build_visibility_report(
+            &[],
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(report["verdict"], json!("unknown_empty_registry"));
         assert_eq!(report["elementCount"], json!(0));
         assert_eq!(report["occlusionDataObserved"], json!(false));
@@ -1817,7 +1926,13 @@ mod visibility_tests {
             "Save",
             json!({ "visible": true, "textContent": "Save" }),
         )];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(report["verdict"], json!("clear"));
         assert_eq!(report["occlusionDataObserved"], json!(false));
     }
@@ -1825,7 +1940,13 @@ mod visibility_tests {
     /// Params are echoed back so a caller can audit what the sweep actually ran with.
     #[test]
     fn the_report_echoes_the_parameters_it_ran_with() {
-        let report = build_visibility_report(&[el("a", "a", json!({}))], 0.25, true, None);
+        let report = build_visibility_report(
+            &[el("a", "a", json!({}))],
+            0.25,
+            true,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(report["minRatio"], json!(0.25));
         assert_eq!(report["includeExpected"], json!(true));
     }
@@ -1839,7 +1960,13 @@ mod visibility_tests {
             el("empty-occluder", "x", json!({ "occludedBy": "" })),
             el("no-pct", "x", json!({ "occludedBy": "y" })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false, None);
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         // `no-pct` has an occluder but a 0 ratio, which is below the floor.
         assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(report["elementCount"], json!(4));
@@ -1925,6 +2052,157 @@ mod visibility_tests {
         ));
     }
 
+    /// A canvas surface (`paintsText: true`) has no DOM text, so the DOM rule
+    /// would call its occlusion blank and sort it last. It must read
+    /// `hidesText: true, textSource: "painted"`, and the sort must agree.
+    #[test]
+    fn a_painted_surface_hides_text_and_sorts_as_text_hiding() {
+        let elements = vec![
+            el(
+                "blank-90",
+                "",
+                json!({ "occludedBy": "x", "occludedPct": 90 }),
+            ),
+            el(
+                "terminal-surface-abc",
+                "Terminal: Zone 1 (abc)",
+                json!({ "occludedBy": "div.minimap", "occludedPct": 30, "paintsText": true }),
+            ),
+            el(
+                "explicit-false",
+                "",
+                json!({ "occludedBy": "x", "occludedPct": 50, "paintsText": false }),
+            ),
+        ];
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        let entries = report["occlusions"].as_array().unwrap();
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["terminal-surface-abc", "blank-90", "explicit-false"],
+            "the painted surface outranks the worse blank occlusions"
+        );
+        let painted = &entries[0];
+        assert_eq!(painted["hidesText"], json!(true));
+        assert_eq!(painted["textSource"], json!("painted"));
+        assert!(painted.get("text").is_none(), "no DOM text to echo");
+        for blank in &entries[1..] {
+            assert_eq!(blank["hidesText"], json!(false));
+            assert_eq!(blank["textSource"], json!("dom"));
+        }
+    }
+
+    /// Collapsed-`<details>` regression (plan D4): content inside a closed
+    /// disclosure reads `visibilityReason: "hidden"` with no `occludedBy`. That
+    /// is not occlusion, so it must never become an entry, whatever its
+    /// `occludedPct` or text says.
+    #[test]
+    fn a_hidden_element_without_an_occluder_is_never_an_occlusion() {
+        let elements = vec![
+            el(
+                "details-body",
+                "Advanced",
+                json!({ "visible": false, "visibilityReason": "hidden", "textContent": "Advanced options" }),
+            ),
+            el(
+                "details-body-with-pct",
+                "Advanced",
+                json!({ "visibilityReason": "hidden", "occludedPct": 100, "textContent": "x" }),
+            ),
+            el(
+                "details-body-null-occluder",
+                "Advanced",
+                json!({ "visibilityReason": "hidden", "occludedBy": null, "occludedPct": 100 }),
+            ),
+        ];
+        let report = build_visibility_report(
+            &elements,
+            0.0,
+            true,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(report["verdict"], json!("clear"));
+        assert_eq!(
+            report["occlusionDataObserved"],
+            json!(true),
+            "the hidden reason IS occlusion data; it just is not an occlusion"
+        );
+    }
+
+    /// Every arm of the D3 verdict order, in order.
+    #[test]
+    fn the_verdict_follows_the_canvas_aware_order() {
+        use super::super::visibility_canvas::CoverageUnavailableReason;
+        let rect = json!({ "x": 0, "y": 0, "width": 100, "height": 100 });
+        let unattributed = CanvasCoverage::from_ipc(Ok(&json!({
+            "canvases": 2,
+            "attributed": 1,
+            "unattributed": [{ "descriptor": "canvas.stray", "rect": rect }],
+        })));
+        let attributed = CanvasCoverage::from_ipc(Ok(&json!({
+            "canvases": 2, "attributed": 2, "unattributed": [],
+        })));
+        let unavailable = CanvasCoverage::Unavailable {
+            reason: CoverageUnavailableReason::AccessorThrew,
+        };
+        let quiet = vec![el("a", "a", json!({ "textContent": "a" }))];
+        let covered = vec![el(
+            "a",
+            "a",
+            json!({ "occludedBy": "x", "occludedPct": 50 }),
+        )];
+
+        // 1. Empty registry wins over everything, unattributed canvases included.
+        let r = build_visibility_report(&[], 0.02, false, None, Some(&unattributed));
+        assert_eq!(r["verdict"], json!("unknown_empty_registry"));
+
+        // 2. Any occlusion is `occlusions_found`; coverage still lists the stray.
+        let r = build_visibility_report(&covered, 0.02, false, None, Some(&unattributed));
+        assert_eq!(r["verdict"], json!("occlusions_found"));
+        assert_eq!(
+            r["canvasCoverage"]["unattributed"][0]["descriptor"],
+            json!("canvas.stray")
+        );
+
+        // 3. No occlusions + an unattributed canvas, or unavailable coverage.
+        let r = build_visibility_report(&quiet, 0.02, false, None, Some(&unattributed));
+        assert_eq!(r["verdict"], json!("unknown_canvas"));
+        let r = build_visibility_report(&quiet, 0.02, false, None, Some(&unavailable));
+        assert_eq!(r["verdict"], json!("unknown_canvas"));
+        assert_eq!(
+            r["canvasCoverage"],
+            json!({ "state": "unavailable", "reason": "accessor-threw" })
+        );
+        let r = build_visibility_report(&quiet, 0.02, false, None, None);
+        assert_eq!(
+            r["verdict"],
+            json!("unknown_canvas"),
+            "absent coverage withholds clear"
+        );
+        assert_eq!(
+            r["canvasCoverage"],
+            json!({ "state": "unavailable", "reason": "page-sdk-lacks-coverage" })
+        );
+
+        // 4. Otherwise `clear`: zero canvases, or every canvas attributed.
+        for cov in [&CanvasCoverage::measured_empty(), &attributed] {
+            let r = build_visibility_report(&quiet, 0.02, false, None, Some(cov));
+            assert_eq!(r["verdict"], json!("clear"));
+            assert_eq!(r["canvasCoverage"]["state"], json!("measured"));
+        }
+    }
+
     /// The route must be BOTH mounted and declared - `route_entries()` is what
     /// the SDK-drift test diffs against, and a handler mounted without an
     /// entry (or vice versa) is exactly the drift class item 2 closes.
@@ -1948,7 +2226,7 @@ mod visibility_min_ratio_contract_tests {
     //! never admit an occlusion, so `clear` asserted an absence the threshold
     //! itself guaranteed.
 
-    use super::{build_visibility_report, validate_min_ratio, VisibilityRequest};
+    use super::{build_visibility_report, validate_min_ratio, CanvasCoverage, VisibilityRequest};
 
     // ── Item 3: the range gate ────────────────────────────────────
 
@@ -1986,7 +2264,13 @@ mod visibility_min_ratio_contract_tests {
             "label": "covered",
             "state": { "occludedBy": "overlay", "occludedPct": 100 },
         })];
-        let report = build_visibility_report(&elements, 1.0, false, None);
+        let report = build_visibility_report(
+            &elements,
+            1.0,
+            false,
+            None,
+            Some(&CanvasCoverage::measured_empty()),
+        );
         assert_eq!(
             report["occlusions"].as_array().unwrap().len(),
             1,
