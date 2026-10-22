@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
+ * The browser's own Async Clipboard functions, captured by
+ * {@link installNativeClipboardShim} BEFORE it patches `navigator.clipboard`,
+ * so the fallbacks below never call back into the shim (which would recurse).
+ */
+let browserWriteText: ((text: string) => Promise<void>) | null = null;
+let browserReadText: (() => Promise<string>) | null = null;
+
+/**
  * Write text to the OS clipboard reliably from within the Tauri webview.
  *
  * Why not `navigator.clipboard.writeText`? The browser Async Clipboard API is
@@ -19,14 +27,6 @@ import { invoke } from "@tauri-apps/api/core";
  *   throws — callers can rely on the boolean to decide whether to show
  *   success/failure feedback.
  */
-/**
- * The browser's own Async Clipboard functions, captured by
- * {@link installNativeClipboardShim} BEFORE it patches `navigator.clipboard`,
- * so the fallbacks below never call back into the shim (which would recurse).
- */
-let browserWriteText: ((text: string) => Promise<void>) | null = null;
-let browserReadText: (() => Promise<string>) | null = null;
-
 export async function writeClipboard(text: string): Promise<boolean> {
   try {
     await invoke("clipboard_write_text", { text });
