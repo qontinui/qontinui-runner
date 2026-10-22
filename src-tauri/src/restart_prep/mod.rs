@@ -465,6 +465,12 @@ mod tests {
             wip_state: Some("captured".to_string()),
             wip_ref: Some(format!("refs/wip/{id}")),
             custody_session_mismatch: false,
+            name_source: None,
+            resume_config_dir: None,
+            resume_command: None,
+            provider: None,
+            last_seen_at: None,
+            finished: false,
         }
     }
 

@@ -907,7 +907,7 @@ async fn resume_one(
     // `failed` until the process read below proves it), never at boot — a
     // placeholder nobody has restored yet is not a failed boot restore.
     if cand.cohort.is_some() {
-        store.mark_restore_pending(&cand.id);
+        store.mark_restore_pending(&cand.id, true);
     }
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => {

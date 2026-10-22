@@ -1869,16 +1869,7 @@ fn live_restore_set_body(
     restore_set_body(
         rows,
         cohort.as_ref(),
-        |id| {
-            store.get(id).map(|rec| {
-                let transcript_exists = store
-                    .probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-                RestoreCandidate {
-                    record: rec,
-                    transcript_exists,
-                }
-            })
-        },
+        |id| store.get(id).map(|rec| restore_candidate(store, rec)),
         |terminal_id| restore_set_terminal_live(terminals.as_deref(), terminal_id),
         |terminal_id| {
             crate::terminal::holder_boot_sweep::holder_left_running(terminal_id)
@@ -2100,21 +2091,26 @@ fn restore_candidates(
     store
         .restorable_records(prior_marker_at, boot_was_clean)
         .into_iter()
-        .map(|rec| {
-            let transcript_exists =
-                store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-            let location =
-                TranscriptLocation::from_holders(store.probe_transcript_config_dirs(
-                    &rec.claude_session_id,
-                    rec.working_dir.as_deref(),
-                ));
-            RestoreCandidate {
-                record: rec,
-                transcript_exists,
-                location,
-            }
-        })
+        .map(|rec| restore_candidate(store, rec))
         .collect()
+}
+
+/// One registry record as a [`RestoreCandidate`]: the record plus its derived
+/// `transcriptExists` bit and transcript location, probed from disk now.
+fn restore_candidate(
+    store: &SessionLifecycleStore,
+    rec: TerminalSessionRecord,
+) -> RestoreCandidate {
+    let transcript_exists =
+        store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+    let location = TranscriptLocation::from_holders(
+        store.probe_transcript_config_dirs(&rec.claude_session_id, rec.working_dir.as_deref()),
+    );
+    RestoreCandidate {
+        record: rec,
+        transcript_exists,
+        location,
+    }
 }
 
 /// List EVERY previous Claude terminal session for display — the "previous
@@ -3316,6 +3312,7 @@ mod tests {
                 .map(|id| RestoreCandidate {
                     record: restore_candidate_record(id),
                     transcript_exists: Some(true),
+                    location: TranscriptLocation::default(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -3343,6 +3340,7 @@ mod tests {
             Some(RestoreCandidate {
                 record,
                 transcript_exists: Some(true),
+                location: TranscriptLocation::default(),
             })
         };
         let none_live = |_: &str| false;
@@ -3432,6 +3430,7 @@ mod tests {
             RestoreCandidate {
                 record,
                 transcript_exists: Some(true),
+                location: TranscriptLocation::default(),
             }
         };
         let rows = || vec![row(&waiting), row(&running)];
@@ -3488,6 +3487,7 @@ mod tests {
             RestoreCandidate {
                 record,
                 transcript_exists: Some(true),
+                location: TranscriptLocation::default(),
             }
         };
         // Live on the first look, exited on every look after it.

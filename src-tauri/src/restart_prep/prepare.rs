@@ -1200,6 +1200,12 @@ pub(crate) fn active_controller_for_test(
                     wip_state: None,
                     wip_ref: None,
                     custody_session_mismatch: false,
+                    name_source: None,
+                    resume_config_dir: None,
+                    resume_command: None,
+                    provider: None,
+                    last_seen_at: None,
+                    finished: false,
                 },
                 RowFacts::default(),
             )
@@ -1334,6 +1340,12 @@ mod tests {
             wip_state: None,
             wip_ref: None,
             custody_session_mismatch: false,
+            name_source: None,
+            resume_config_dir: None,
+            resume_command: None,
+            provider: None,
+            last_seen_at: None,
+            finished: false,
         }
     }
 

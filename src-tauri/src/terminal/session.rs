@@ -4838,14 +4838,6 @@ impl TerminalSession {
         self.is_alive.load(Ordering::Relaxed)
     }
 
-    /// Test seam: set the liveness [`Self::is_alive`] reports, on a PTY-less
-    /// test session. Clear it again before the session drops — `Drop` closes
-    /// a session it believes alive.
-    #[cfg(test)]
-    pub(crate) fn set_alive_for_test(&self, alive: bool) {
-        self.is_alive.store(alive, Ordering::SeqCst);
-    }
-
     /// The waiter's frozen exit facts and exit instant, `None` while the
     /// process runs. See the `exit_snapshot` field.
     pub fn exit_snapshot(&self) -> Option<(PaneExitFacts, std::time::Instant)> {

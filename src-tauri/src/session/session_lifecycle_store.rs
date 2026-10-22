@@ -11302,7 +11302,7 @@ mod tests {
         );
         // The control: the census DOES count a row once a restore of it is
         // attempted — which is when, and only when, the resume core stamps it.
-        store.mark_restore_pending("victim-a");
+        store.mark_restore_pending("victim-a", true);
         let observed = crate::session::restore_census::observe_restored(&store, boot);
         assert_eq!(observed.len(), 1, "{observed:?}");
         assert_eq!(

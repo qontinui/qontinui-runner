@@ -425,6 +425,12 @@ mod tests {
             wip_state: None,
             wip_ref: None,
             custody_session_mismatch: false,
+            name_source: None,
+            resume_config_dir: None,
+            resume_command: None,
+            provider: None,
+            last_seen_at: None,
+            finished: false,
         }
     }
 
@@ -434,6 +440,7 @@ mod tests {
             captured_at_ms: 1_000,
             captured_at: "2026-10-21T00:00:00Z".to_string(),
             reason: "restart-prep".to_string(),
+            boot_at_ms: None,
             shutdown_at: None,
             clean_shutdown: None,
             sessions: ids.iter().map(|id| entry(id)).collect(),
@@ -751,6 +758,7 @@ mod tests {
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(1),
             handle: None,
             account_label: Some("iris".to_string()),
