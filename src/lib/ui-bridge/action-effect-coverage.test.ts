@@ -53,26 +53,9 @@ import {
   CREATE_PLAIN_TERMINAL_ACTION_ID,
 } from "@/components/terminal/createPlainTerminalAction";
 import { buildTerminalLaunchMenuActions } from "@/components/terminal/terminalLaunchMenuActions";
-import {
-  CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE,
-  CREATE_TERMINAL_SIGNATURE,
-  GET_ZONE_VIEW_STATE_SIGNATURE,
-  LIST_RUNNER_WINDOWS_SIGNATURE,
-  LIST_TERMINALS_SIGNATURE,
-  MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
-  OPEN_TERMINAL_WINDOW_SIGNATURE,
-  POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
-  POP_OUT_PAGE_SIGNATURE,
-  zoneViewSignature,
-} from "@/components/terminal/terminalPageSignatures";
-import {
-  DELETE_PROFILE_SIGNATURE,
-  LIST_LAYOUTS_SIGNATURE,
-  LIST_PROFILES_SIGNATURE,
-  SAVE_PROFILE_SIGNATURE,
-  SELECT_LAYOUT_SIGNATURE,
-  loadProfileSignature,
-} from "@/components/terminal/zonePickerSignatures";
+import * as pageSignatures from "@/components/terminal/terminalPageSignatures";
+import type { ZoneViewFacts } from "@/components/terminal/terminalPageSignatures";
+import * as pickerSignatures from "@/components/terminal/zonePickerSignatures";
 
 const SRC_ROOT = resolve(__dirname, "../..");
 
@@ -103,8 +86,8 @@ interface FoundAction {
   action: string;
   /** `undefined` when the registration declares no `effect`. */
   effect: string | undefined;
-  /** Whether the action literal declares a `signature` property at all. */
-  hasSignature: boolean;
+  /** The `signature:` initializer as written, or `undefined` when none is declared. */
+  signature: ts.Expression | undefined;
   where: string;
 }
 
@@ -252,7 +235,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: `<unreadable actions factory: ${actionsNode.getText().slice(0, 60)}>`,
               effect: undefined,
-              hasSignature: false,
+              signature: undefined,
               where,
             });
           }
@@ -275,7 +258,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
                 component: componentId,
                 action: `<unreadable element: ${el.getText().slice(0, 60)}>`,
                 effect: undefined,
-                hasSignature: false,
+                signature: undefined,
                 where,
               });
               continue;
@@ -285,7 +268,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: literalText(objectProperty(literal, "id")) ?? "<unreadable id>",
               effect: literalText(objectProperty(literal, "effect")) ?? undefined,
-              hasSignature: objectProperty(literal, "signature") !== undefined,
+              signature: objectProperty(literal, "signature"),
               where,
             });
           }
@@ -361,6 +344,11 @@ describe("component-action effect coverage", () => {
 // every action on these four components must declare one. The set is read from
 // the walk, never pinned as a count: a sibling PR adding an action here must
 // add its signature or go red.
+//
+// The signature each action carries is resolved FROM THE WALK — the
+// `signature:` initializer written at that registration — not from a table
+// kept beside this test. A signature wired to the wrong action names itself
+// after a different action, which is what the id check below catches.
 
 /** The four component ids whose every action must declare a `signature`. */
 const SIGNATURE_COMPONENTS = [
@@ -374,42 +362,57 @@ const SIGNATURE_COMPONENTS = [
 const MIN_SIGNATURE_ACTIONS = 22;
 
 /**
- * The runtime signature each action registers, built the way its registration
- * builds it (factories called with stubs). Keyed `<componentId>.<actionId>`.
+ * The walk reports an action id written as an identifier by the identifier's
+ * NAME (it is for reporting). The one such id on these components resolves
+ * here, so ids compare against the runtime ones.
  */
-function runtimeSignatures(): Map<string, EffectSignature | undefined> {
-  const facts = () => ({ maximizedZone: null, zoneCount: 4 });
-  const launch = buildTerminalLaunchMenuActions({
-    callRegistry: async () => [] as never,
-    launchAiSession: async () => [],
-  });
-  const plain = buildCreatePlainTerminalAction(async () => "tab-1");
-  const entries: [string, EffectSignature | undefined][] = [
-    ["terminal-page.create-terminal", CREATE_TERMINAL_SIGNATURE],
-    [`terminal-page.${plain.id}`, plain.signature],
-    ["terminal-page.list-terminals", LIST_TERMINALS_SIGNATURE],
-    ["terminal-page.open-terminal-window", OPEN_TERMINAL_WINDOW_SIGNATURE],
-    ["terminal-page.pop-out-active-terminal", POP_OUT_ACTIVE_TERMINAL_SIGNATURE],
-    ["terminal-page.pop-out-page", POP_OUT_PAGE_SIGNATURE],
-    ["terminal-page.move-terminal-to-window", MOVE_TERMINAL_TO_WINDOW_SIGNATURE],
-    ["terminal-page.maximize-zone", zoneViewSignature("maximize", facts)],
-    ["terminal-page.restore-zone", zoneViewSignature("restore", facts)],
-    ["terminal-page.toggle-maximize-zone", zoneViewSignature("toggle", facts)],
-    ["terminal-page.get-zone-view-state", GET_ZONE_VIEW_STATE_SIGNATURE],
-    ["terminal-page.list-runner-windows", LIST_RUNNER_WINDOWS_SIGNATURE],
-    ["terminal-page.close-empty-terminal-windows", CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE],
-    ...launch.map((a): [string, EffectSignature | undefined] => [
-      `terminal-launch-menu.${a.id}`,
-      a.signature,
-    ]),
-    ["zone-layout-picker.select-layout", SELECT_LAYOUT_SIGNATURE],
-    ["zone-layout-picker.list-layouts", LIST_LAYOUTS_SIGNATURE],
-    ["zone-profile-picker.load-profile", loadProfileSignature({}, 0)],
-    ["zone-profile-picker.save-profile", SAVE_PROFILE_SIGNATURE],
-    ["zone-profile-picker.delete-profile", DELETE_PROFILE_SIGNATURE],
-    ["zone-profile-picker.list-profiles", LIST_PROFILES_SIGNATURE],
-  ];
-  return new Map(entries);
+const ID_CONSTANTS: Record<string, string> = { CREATE_PLAIN_TERMINAL_ACTION_ID };
+
+/** Every export a registration may name in its `signature:` initializer. */
+const SIGNATURE_EXPORTS: Record<string, unknown> = { ...pageSignatures, ...pickerSignatures };
+
+/** Zone-view facts with a maximized zone and labelled tiled zones. */
+const STUB_ZONE_FACTS: ZoneViewFacts = {
+  maximizedZone: 1,
+  zoneCount: 4,
+  labelledZonesWhenTiled: 2,
+};
+
+/**
+ * Stand-ins for a factory's NON-literal arguments (render-time values the
+ * walk cannot evaluate). A literal argument is always passed as written, so
+ * `zoneViewSignature("restore", …)` resolves as the restore signature.
+ */
+const STUB_ARGS: Record<string, unknown[]> = {
+  zoneViewSignature: [undefined, STUB_ZONE_FACTS],
+  popOutPageSignature: ["default", 1],
+  selectLayoutSignature: [1],
+  loadProfileSignature: [{}, 0],
+};
+
+/**
+ * Evaluate a `signature:` initializer the way the registration does: an
+ * identifier names an export; a call invokes the exported factory with its
+ * literal arguments and stubs for the rest. Anything else is unresolvable,
+ * which the test reports rather than skips.
+ */
+function resolveSignature(init: ts.Expression): EffectSignature | string {
+  if (ts.isIdentifier(init)) {
+    const value = SIGNATURE_EXPORTS[init.text];
+    return value ? (value as EffectSignature) : `unknown signature export ${init.text}`;
+  }
+  if (ts.isCallExpression(init) && ts.isIdentifier(init.expression)) {
+    const name = init.expression.text;
+    const factory = SIGNATURE_EXPORTS[name];
+    if (typeof factory !== "function") return `unknown signature factory ${name}`;
+    const stubs = STUB_ARGS[name];
+    if (!stubs) return `no STUB_ARGS for signature factory ${name}`;
+    const args = init.arguments.map((arg, i) =>
+      ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) ? arg.text : stubs[i],
+    );
+    return (factory as (...a: unknown[]) => EffectSignature)(...args);
+  }
+  return `unresolvable signature initializer ${init.getText()}`;
 }
 
 function snapshotOf(ids: string[]): SemanticSnapshot {
@@ -426,24 +429,31 @@ const PRE_SNAPSHOTS: SemanticSnapshot[] = [
 const PARAM_BAGS: Record<string, unknown>[] = [
   {},
   { zoneIndex: 0 },
+  { zoneIndex: 1 },
   { layoutId: "single" },
   { terminalId: "t1", windowLabel: "term-1" },
   { terminalId: "t9", windowLabel: "main" },
   { name: "p" },
+  { pageId: "other" },
 ];
-
-/**
- * The walk reports an action id written as an identifier by the identifier's
- * NAME (it is for reporting). The one such id on these components resolves
- * here, so keys compare against the runtime ids.
- */
-const ID_CONSTANTS: Record<string, string> = { CREATE_PLAIN_TERMINAL_ACTION_ID };
 
 describe("component-action signature coverage (terminal page)", () => {
   const { actions } = collect();
   const scoped = actions
     .filter((a) => (SIGNATURE_COMPONENTS as readonly string[]).includes(a.component))
     .map((a) => ({ ...a, action: ID_CONSTANTS[a.action] ?? a.action }));
+
+  /** `<componentId>.<actionId>` → the signature its registration resolves to. */
+  const resolved = new Map<string, EffectSignature | string>(
+    scoped.map((a) => [
+      `${a.component}.${a.action}`,
+      a.signature ? resolveSignature(a.signature) : "no `signature` declared",
+    ]),
+  );
+  const signatureOf = (a: { component: string; action: string }): EffectSignature | undefined => {
+    const r = resolved.get(`${a.component}.${a.action}`);
+    return typeof r === "string" ? undefined : r;
+  };
 
   it("found all four components and at least the 22 actions they registered (non-vacuity floor)", () => {
     expect([...new Set(scoped.map((a) => a.component))].sort()).toEqual(
@@ -454,7 +464,7 @@ describe("component-action signature coverage (terminal page)", () => {
 
   it("every action on the four components declares a `signature`", () => {
     const missing = scoped
-      .filter((a) => !a.hasSignature)
+      .filter((a) => a.signature === undefined)
       .map((a) => `${a.component}.${a.action} (${a.where})`);
     expect(
       missing,
@@ -464,27 +474,40 @@ describe("component-action signature coverage (terminal page)", () => {
     ).toEqual([]);
   });
 
-  it("every action's RUNTIME signature exists and names itself <componentId>.<actionId>", () => {
-    const runtime = runtimeSignatures();
-    // The table must cover exactly what the walk found — an action added to a
-    // registration without a table row reds here, as does a stale row.
-    expect([...runtime.keys()].sort()).toEqual(
-      scoped.map((a) => `${a.component}.${a.action}`).sort(),
-    );
+  it("each registration's signature resolves and names ITS OWN <componentId>.<actionId>", () => {
+    const wrong: string[] = [];
     for (const a of scoped) {
-      const sig = runtime.get(`${a.component}.${a.action}`);
-      expect(sig, `${a.component}.${a.action} has no runtime signature`).toBeDefined();
-      const normalized = normalizeDeclaredComponentSignature(sig, a.component, a.action);
-      expect(normalized?.id).toBe(componentSignatureId(a.component, a.action));
-      expect(normalized?.provenance).toBe("declared");
+      const key = `${a.component}.${a.action}`;
+      const r = resolved.get(key);
+      if (typeof r === "string" || r === undefined) {
+        wrong.push(`${key}: ${r ?? "unresolved"}`);
+        continue;
+      }
+      const normalized = normalizeDeclaredComponentSignature(r, a.component, a.action);
+      if (normalized?.id !== componentSignatureId(a.component, a.action)) {
+        wrong.push(`${key} carries signature "${normalized?.id}" (${a.where})`);
+      }
+      if (normalized?.provenance !== "declared") wrong.push(`${key}: provenance not declared`);
     }
+    expect(wrong).toEqual([]);
+  });
+
+  it("factory-built actions carry their signature at RUNTIME, not only in source", () => {
+    const launch = buildTerminalLaunchMenuActions({
+      callRegistry: async () => [] as never,
+      launchAiSession: async () => [],
+    });
+    for (const a of launch) {
+      expect(a.signature?.id).toBe(componentSignatureId("terminal-launch-menu", a.id));
+    }
+    const plain = buildCreatePlainTerminalAction(async () => "tab-1");
+    expect(plain.signature?.id).toBe(componentSignatureId("terminal-page", plain.id));
   });
 
   it("every signature agrees with its declared `effect` (the SDK's authoring lint)", () => {
-    const runtime = runtimeSignatures();
     const messages: string[] = [];
     for (const a of scoped) {
-      const sig = runtime.get(`${a.component}.${a.action}`);
+      const sig = signatureOf(a);
       if (!sig) continue;
       for (const pre of PRE_SNAPSHOTS) {
         for (const bag of PARAM_BAGS) {
@@ -506,11 +529,10 @@ describe("component-action signature coverage (terminal page)", () => {
   });
 
   it("query actions (list-* / get-*) predict an explicit empty delta, idempotent", () => {
-    const runtime = runtimeSignatures();
     const queries = scoped.filter((a) => /^(list|get)-/.test(a.action));
     expect(queries.length).toBeGreaterThanOrEqual(5);
     for (const a of queries) {
-      const sig = runtime.get(`${a.component}.${a.action}`);
+      const sig = signatureOf(a);
       expect(a.effect).toBe("read");
       expect(sig?.reversibility).toBe("idempotent");
       for (const pre of PRE_SNAPSHOTS) {
@@ -522,13 +544,17 @@ describe("component-action signature coverage (terminal page)", () => {
   });
 
   it("every destructive action is one-way, including the two the plan names", () => {
-    const runtime = runtimeSignatures();
-    for (const a of scoped.filter((x) => x.effect === "destructive")) {
-      expect(runtime.get(`${a.component}.${a.action}`)?.reversibility, a.action).toBe("one-way");
+    const destructive = scoped.filter((x) => x.effect === "destructive");
+    expect(destructive.length).toBeGreaterThanOrEqual(2);
+    for (const a of destructive) {
+      expect(signatureOf(a)?.reversibility, a.action).toBe("one-way");
     }
-    expect(runtime.get("terminal-page.close-empty-terminal-windows")?.reversibility).toBe(
-      "one-way",
-    );
-    expect(runtime.get("zone-profile-picker.delete-profile")?.reversibility).toBe("one-way");
+    for (const key of [
+      "terminal-page.close-empty-terminal-windows",
+      "zone-profile-picker.delete-profile",
+    ]) {
+      const r = resolved.get(key);
+      expect(typeof r === "string" ? r : r?.reversibility, key).toBe("one-way");
+    }
   });
 });
