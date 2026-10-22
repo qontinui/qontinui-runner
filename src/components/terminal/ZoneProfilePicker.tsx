@@ -17,6 +17,12 @@ import {
 } from "./zoneProfileStorage";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { textArg } from "./commands";
+import {
+  DELETE_PROFILE_SIGNATURE,
+  LIST_PROFILES_SIGNATURE,
+  SAVE_PROFILE_SIGNATURE,
+  loadProfileSignature,
+} from "./zonePickerSignatures";
 
 interface ZoneProfilePickerProps {
   currentLayoutId: string;
@@ -247,6 +253,7 @@ export function ZoneProfilePicker({
         // them. Dim 1: the arrangement it overwrites was never saved anywhere. Dim 3: it
         // widens or narrows auto-approval silently, which is the worst quadrant.
         effect: "destructive",
+        signature: loadProfileSignature(profiles, tabs?.length ?? 0),
         // `{name: {}}` used to reach the "Profile not found" sentence as
         // `Profile not found: "[object Object]"` — an operator-facing message
         // quoting a stringified object back as though it had been typed.
@@ -282,6 +289,7 @@ export function ZoneProfilePicker({
         // confirmation and no copy of what it replaced (dim 1 + dim 3), and it also makes
         // the profile active — see the description above, which used to omit that.
         effect: "destructive",
+        signature: SAVE_PROFILE_SIGNATURE,
         // THE SHARPEST ONE ON THIS PAGE. `{name: {}}` is truthy, so it passed
         // `if (!name)`, became the COMPUTED KEY `"[object Object]"` in the
         // saved map, and was then handed to React as a child: two `setting_set`
@@ -331,6 +339,7 @@ export function ZoneProfilePicker({
         // `destructive` — removes a saved profile from the page's persisted settings.
         // There is no undo and no recycle bin.
         effect: "destructive",
+        signature: DELETE_PROFILE_SIGNATURE,
         // Same stringify-into-the-message defect as `load-profile`.
         handler: guardedHandler("delete-profile", PROFILE_NAME_SCHEMA, (args) => {
           const name = textArg(args, "name");
@@ -344,6 +353,7 @@ export function ZoneProfilePicker({
         label: "List Profiles",
         // `read` — returns the profile names and the active one. A query.
         effect: "read",
+        signature: LIST_PROFILES_SIGNATURE,
         handler: () => ({
           profiles: profileNames,
           active: activeProfileName,
