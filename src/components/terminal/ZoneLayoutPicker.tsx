@@ -4,7 +4,7 @@ import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
-import { LIST_LAYOUTS_SIGNATURE, SELECT_LAYOUT_SIGNATURE } from "./zonePickerSignatures";
+import { LIST_LAYOUTS_SIGNATURE, selectLayoutSignature } from "./zonePickerSignatures";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -105,7 +105,7 @@ export function ZoneLayoutPicker({
         // terminal is ended: `applyLayout` preserves in-range assignments and only
         // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
         effect: "write",
-        signature: SELECT_LAYOUT_SIGNATURE,
+        signature: selectLayoutSignature(tabCount),
         // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
         // stringified into the operator-facing sentence as
         // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the
