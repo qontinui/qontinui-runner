@@ -47,9 +47,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport, RegisteredApp};
 
 /// 5-second TTL cache. The worst-case staleness is 5 s of an apparently-
@@ -166,6 +166,14 @@ async fn collect_live_ws_components(
             .await
         {
             Ok(value) => unwrap_components_payload(value),
+            // Expected, not a failure: the app turned HTTP mid fan-out.
+            Err(DispatchError::NotWebsocket(_)) => {
+                debug!(
+                    "[wrapper-manifest] getComponents skipped '{}': no longer WS-registered",
+                    app_id
+                );
+                continue;
+            }
             Err(e) => {
                 warn!(
                     "[wrapper-manifest] getComponents WS dispatch to '{}' failed: {}",
