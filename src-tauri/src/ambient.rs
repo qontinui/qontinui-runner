@@ -1137,6 +1137,17 @@ pub mod test_support {
             let dir = tempfile::tempdir().expect("isolated ambient fixture needs a temp dir");
             let root = dir.path().join("root");
             std::fs::create_dir_all(&root).expect("isolated ambient fixture needs <dir>/root");
+            // Windows resolves the known folders (`dirs::config_dir()` is
+            // FOLDERID_RoamingAppData) from `USERPROFILE`, which this fixture
+            // points at `dir`, and VERIFIES they exist. Without these the
+            // lookup fails, and (on the CI evidence) the answer can stick for the rest of
+            // the process, so every later test outside a fixture saw no
+            // platform config dir (backup::test_backup_paths, and every seam
+            // that reads the live model-gateway plan).
+            #[cfg(windows)]
+            for sub in ["AppData/Roaming", "AppData/Local"] {
+                let _ = std::fs::create_dir_all(dir.path().join(sub));
+            }
 
             let prev_thread_armed = THREAD_ARMED.with(|c| c.replace(true));
             LIVE_GUARDS.fetch_add(1, Ordering::SeqCst);

@@ -40,7 +40,13 @@ function settingsWith(patch: {
 }
 
 describe("displayedAccountSelection — the runner's rule over form state", () => {
-  const modes: AccountSelectionMode[] = ["manual", "least_usage", "highest_expected_usage"];
+  const modes: AccountSelectionMode[] = [
+    "manual",
+    "least_usage",
+    "highest_expected_usage",
+    "weighted_random",
+    "alternating_handoff",
+  ];
   const fleets: (AccountSelectionMode | null)[] = [null, ...modes];
 
   it("matches resolve_selection in every (local, pinned, fleet) cell", () => {
@@ -60,7 +66,7 @@ describe("displayedAccountSelection — the runner's rule over form state", () =
         }
       }
     }
-    expect(cells).toBe(24);
+    expect(cells).toBe(60);
   });
 
   it("un-ticking the pin while the fleet has a value shows the fleet's mode", () => {
@@ -132,5 +138,7 @@ describe("accountSelectionModeLabel", () => {
     expect(accountSelectionModeLabel("manual")).toBe("Manual");
     expect(accountSelectionModeLabel("least_usage")).toBe("Least Usage");
     expect(accountSelectionModeLabel("highest_expected_usage")).toBe("Highest Expected Usage");
+    expect(accountSelectionModeLabel("weighted_random")).toBe("Weighted Random");
+    expect(accountSelectionModeLabel("alternating_handoff")).toBe("Alternating Handoff");
   });
 });

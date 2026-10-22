@@ -171,7 +171,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
-    ("commands/ai_settings.rs", "not-coord", 3),
+    // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
+    // Phase 9): the Claude connection test and the usage probe now build their
+    // requests through `model_gateway::ModelCall`, which has no `.post(` here and
+    // never attaches a coord credential. The remaining site is the Gemini call.
+    ("commands/ai_settings.rs", "not-coord", 1),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
     ("credential_helper.rs", "device-jwt-required", 1),

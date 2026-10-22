@@ -92,20 +92,19 @@ fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
 /// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
 /// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
 /// defaulting it would silently re-point every runner on the machine. A sent
-/// value is parsed: `manual` and `least_usage` select those modes, anything
-/// else (including `highest_expected_usage`) is `HighestExpectedUsage`, the
-/// settings.rs default. Plan
+/// value is parsed with `AccountSelectionMode::from_wire`; an unknown spelling
+/// is `AccountSelectionMode::default()` (settings.rs). Plan
 /// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 1.
 fn resolve_saved_selection_mode(
     sent: Option<&str>,
     stored: AccountSelectionMode,
 ) -> AccountSelectionMode {
+    // A named mode is taken as given; an unknown spelling resolves to the
+    // default (`AccountSelectionMode::default()` in settings.rs).
     match sent {
         None => stored,
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        Some(_) => AccountSelectionMode::HighestExpectedUsage,
+        Some(raw) => AccountSelectionMode::from_wire(raw).unwrap_or_default(),
     }
 }
 
@@ -455,7 +454,10 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
 
     let ai_settings = settings::get_ai_settings();
 
+    let refusal = crate::model_gateway::provider_refusal(&ai_settings.provider);
     let result = match ai_settings.provider {
+        // Review M5: refused while a model gateway is declared.
+        _ if refusal.is_some() => Err(refusal.unwrap_or_default()),
         AiProvider::ClaudeCli => test_claude_cli_connection(&ai_settings.claude_cli).await,
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
@@ -561,28 +563,39 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
 
 /// Test Claude API connection
 async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<String, String> {
-    // Get API key from keychain
-    let api_key = get_ai_api_key("claude_api")
-        .map_err(|e| {
-            String::from(AppError::ConfigError(format!(
-                "Failed to retrieve API key: {}",
-                e
-            )))
-        })?
-        .ok_or_else(|| "No API key configured. Please enter your Claude API key.".to_string())?;
+    // Vendor host + keychain key, or the declared model gateway + its
+    // api-key-helper key (`crate::model_gateway`). Resolved on a blocking
+    // thread: the helper is a subprocess.
+    let call = spawn_blocking_tracked(|| {
+        crate::model_gateway::ModelCall::resolve(|| {
+            get_ai_api_key("claude_api")
+                .map_err(|e| {
+                    String::from(AppError::ConfigError(format!(
+                        "Failed to retrieve API key: {}",
+                        e
+                    )))
+                })?
+                .ok_or_else(|| {
+                    "No API key configured. Please enter your Claude API key.".to_string()
+                })
+        })
+    })
+    .await
+    .map_err(|e| format!("credential resolution task failed: {e}"))??;
 
     info!(
-        "Testing Claude API connection with model: {}",
-        settings.model
+        "Testing Claude API connection with model: {} (route: {})",
+        settings.model,
+        call.route_label()
     );
 
     // Make a minimal API request to test the connection
     let client = reqwest::Client::new();
-    // coord-auth-exempt(not-coord): Anthropic's API. A coord bearer here would be
-    // a credential leak to a third party.
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
+    // Not a coord write: Anthropic's API or the operator's declared model
+    // gateway, built by `ModelCall` (which never attaches a coord bearer — that
+    // would be a credential leak to a third party).
+    let response = call
+        .post_async(&client, crate::model_gateway::MESSAGES_PATH)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&serde_json::json!({
@@ -1216,6 +1229,22 @@ static USAGE_PROBE_CACHE: Lazy<
 ///
 /// See [`crate::commands::usage_probe_cache`] for the mechanism.
 pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+    // Subscription accounts are off while a model gateway is declared, and a
+    // subscription token must not be spent or sent on their behalf
+    // (`crate::model_gateway`). Answered before the cache so no stale sample
+    // outlives the switch.
+    if crate::model_gateway::gateway_declared() {
+        let label = std::path::Path::new(&config_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| config_dir.clone());
+        return AccountUsageInfo {
+            config_dir,
+            label,
+            error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
+            ..Default::default()
+        };
+    }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
         .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
@@ -1329,12 +1358,14 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
     let client = reqwest::Client::new();
-    let request = crate::ai_provider::anthropic_auth::apply_async(
-        // coord-auth-exempt(not-coord): Anthropic's API, authenticated by the
-        // operator's own OAuth/API credential via `anthropic_auth::apply_async`.
-        client.post("https://api.anthropic.com/v1/messages"),
-        &token,
-    )
+    // Not a coord write: Anthropic's API, authenticated by the operator's own
+    // OAuth/API credential via `anthropic_auth::apply_async`.
+    // Always the vendor route: this measures a subscription account's own quota,
+    // and `probe_account_usage` never reaches here while a gateway is declared.
+    let request = crate::model_gateway::ModelCall::Vendor {
+        token: token.to_string(),
+    }
+    .post_async(&client, crate::model_gateway::MESSAGES_PATH)
     .header("anthropic-version", "2023-06-01")
     .header("content-type", "application/json")
     .json(&serde_json::json!({
@@ -1641,7 +1672,8 @@ mod usage_twin_report {
         /// stored by coord in its own `coord.prepaid_balances` table.
         prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
-        /// (`"manual"` | `"least_usage"` — see
+        /// (`"manual"` | `"least_usage"` | `"highest_expected_usage"` |
+        /// `"weighted_random"` | `"alternating_handoff"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
         /// per-account: the roster file holds one mode for the whole box.
         ///
@@ -2487,6 +2519,8 @@ mod save_selection_mode_tests {
             AccountSelectionMode::Manual,
             AccountSelectionMode::LeastUsage,
             AccountSelectionMode::HighestExpectedUsage,
+            AccountSelectionMode::WeightedRandom,
+            AccountSelectionMode::AlternatingHandoff,
         ] {
             assert_eq!(resolve_saved_selection_mode(None, stored), stored);
         }
@@ -2507,10 +2541,18 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
             AccountSelectionMode::Manual
         );
-        // An unknown spelling keeps the historical fallback to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("weighted_random"), stored),
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("alternating_handoff"), stored),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        // An unknown spelling falls back to the default.
         assert_eq!(
             resolve_saved_selection_mode(Some("bogus"), stored),
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
     }
 }
