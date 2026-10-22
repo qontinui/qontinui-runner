@@ -1290,9 +1290,16 @@ impl From<HashSet<String>> for ModalIdentities {
 /// which must never collapse into "no modals are open". A `modals` array that is
 /// present but empty is `Some(empty)`: detection ran and found nothing.
 ///
+/// Only modals [`admits_as_expected_overlay`] admits contribute identities —
+/// the SDK's `if (modal?.blocking !== true) continue` (`visibility-report.ts`
+/// `modalIdentities`, ui-bridge `eb8ed32`). A non-blocking overlay (a docked
+/// drawer, a headless menu, a popover, a `<dialog>` opened with `show()`) never
+/// makes an occlusion expected, under either its `id` or its `bridgeId`. A stack
+/// whose every modal is non-blocking is still `Some(empty)`: detection ran.
+///
 /// Entries whose `id` is absent, non-string or empty are skipped, mirroring the
-/// SDK's `if (modal?.id) ids.add(modal.id)` (`visibility-report.ts`
-/// `modalIdentities`). `bridgeId` is read under the same rule.
+/// SDK's `if (modal.id) ids.add(modal.id)`. `bridgeId` is read under the same
+/// rule.
 ///
 /// **One deliberate divergence from the SDK — do not "fix" it toward parity.**
 /// The SDK's `modalIdentities` reads `modalContext.modals ?? []`, so ANY defined
@@ -1307,6 +1314,7 @@ pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<Moda
     let field = |key: &'static str| -> HashSet<String> {
         modals
             .iter()
+            .filter(|m| admits_as_expected_overlay(m))
             .filter_map(|m| m.get(key).and_then(|v| v.as_str()))
             .filter(|id| !id.is_empty())
             .map(str::to_string)
@@ -1316,6 +1324,16 @@ pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<Moda
         ids: field("id"),
         bridge_ids: field("bridgeId"),
     })
+}
+
+/// May this `ModalInfo` make an occlusion EXPECTED? The SDK's admission rule,
+/// kept in one predicate so a tightening of it is a one-line change here.
+///
+/// Today: `blocking === true` exactly. An absent, `false` or non-boolean
+/// `blocking` is NOT admitted — the same `!== true` test the SDK uses, so an
+/// older detector that omits the flag can never hide an occlusion.
+fn admits_as_expected_overlay(modal: &serde_json::Value) -> bool {
+    modal.get("blocking").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// Is `occluded_by` one of the tracked modals, BY IDENTITY?
@@ -2054,12 +2072,12 @@ mod visibility_tests {
 
         let ids = modal_ids_from_context(&json!({
             "modals": [
-                { "id": "modal-1", "type": "dialog" },
-                { "id": 7 },
-                { "id": "" },
-                { "type": "no-id" },
+                { "id": "modal-1", "type": "dialog", "blocking": true },
+                { "id": 7, "blocking": true },
+                { "id": "", "blocking": true },
+                { "type": "no-id", "blocking": true },
                 null,
-                { "id": "dropdown-2" },
+                { "id": "dropdown-2", "blocking": true },
             ]
         }))
         .expect("modals array present");
@@ -2111,10 +2129,10 @@ mod visibility_tests {
         use super::{is_tracked_overlay, modal_ids_from_context};
         let modals = modal_ids_from_context(&json!({
             "modals": [
-                { "id": "settings-dialog", "bridgeId": "bridge-settings" },
-                { "id": "no-bridge" },
-                { "id": "empty-bridge", "bridgeId": "" },
-                { "id": "numeric-bridge", "bridgeId": 9 },
+                { "id": "settings-dialog", "bridgeId": "bridge-settings", "blocking": true },
+                { "id": "no-bridge", "blocking": true },
+                { "id": "empty-bridge", "bridgeId": "", "blocking": true },
+                { "id": "numeric-bridge", "bridgeId": 9, "blocking": true },
             ]
         }))
         .expect("modals array present");
@@ -2150,6 +2168,78 @@ mod visibility_tests {
         );
         assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(report["expectedOverlaysFiltered"], json!(1));
+    }
+
+    /// SDK `modalIdentities` (ui-bridge `eb8ed32`): only a `blocking: true`
+    /// modal makes an occlusion expected. A non-blocking overlay whose `id` OR
+    /// `bridgeId` equals the occluder leaves the occlusion REPORTED and the
+    /// verdict `occlusions_found`; an absent or non-boolean `blocking` is not
+    /// blocking.
+    #[test]
+    fn a_non_blocking_modal_never_makes_an_occlusion_expected() {
+        use super::modal_ids_from_context;
+        let report_for = |modal: serde_json::Value| {
+            let modals = modal_ids_from_context(&json!({ "modals": [modal] }))
+                .expect("a modals array is a real answer, even when nothing is admitted");
+            let elements = vec![el(
+                "btn-save",
+                "Save",
+                json!({ "occludedBy": "settings-dialog", "occludedPct": 40, "textContent": "Save" }),
+            )];
+            build_visibility_report(
+                &elements,
+                0.02,
+                false,
+                Some(&modals),
+                Some(&CanvasCoverage::measured_empty()),
+            )
+        };
+
+        for (label, modal) in [
+            (
+                "blocking: false",
+                json!({ "id": "settings-dialog", "blocking": false }),
+            ),
+            ("blocking absent", json!({ "id": "settings-dialog" })),
+            (
+                "blocking non-boolean",
+                json!({ "id": "settings-dialog", "blocking": "true" }),
+            ),
+            (
+                "bridgeId match, blocking: false",
+                json!({ "id": "x", "bridgeId": "settings-dialog", "blocking": false }),
+            ),
+            (
+                "bridgeId match, blocking absent",
+                json!({ "id": "x", "bridgeId": "settings-dialog" }),
+            ),
+        ] {
+            let r = report_for(modal);
+            assert_eq!(r["verdict"], json!("occlusions_found"), "{label}");
+            assert_eq!(r["occlusions"].as_array().unwrap().len(), 1, "{label}");
+            assert_eq!(
+                r["occlusions"][0]["isExpectedOverlay"],
+                json!(false),
+                "{label}"
+            );
+            assert_eq!(r["expectedOverlaysFiltered"], json!(0), "{label}");
+            assert_eq!(
+                r["expectedOverlayDetection"],
+                json!("modal-stack"),
+                "{label}: detection RAN, it admitted nothing"
+            );
+        }
+
+        // Control: the same modal, blocking, IS the expected overlay — under
+        // its id and under its bridgeId.
+        for modal in [
+            json!({ "id": "settings-dialog", "blocking": true }),
+            json!({ "id": "x", "bridgeId": "settings-dialog", "blocking": true }),
+        ] {
+            let r = report_for(modal.clone());
+            assert_eq!(r["occlusions"].as_array().unwrap().len(), 0, "{modal}");
+            assert_eq!(r["expectedOverlaysFiltered"], json!(1), "{modal}");
+        }
     }
 
     /// A canvas surface (`paintsText: true`) has no DOM text, so the DOM rule
