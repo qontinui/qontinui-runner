@@ -29,8 +29,8 @@ terminal.approve-all	empty	[]	ok	ctx.approveAll	true	approved 0/1 session	error
 terminal.auto-approve	alternate	[["action","clear"],["pattern","p"]]	ok	effects.setAutoApprovePatterns	false	cleared 1 auto-approve pattern	ok
 terminal.auto-approve	canonical	[["action","list"],["pattern","p"]]	ok	-	false	listed 1 auto-approve pattern	ok
 terminal.auto-approve	empty	[]	error:invalid-args	-	false	-	error
-terminal.close	canonical	[["tabId","tab-a"],["zone",1]]	ok	session.closeTerminal	false	closed 1 session	ok
-terminal.close	empty	[]	ok	session.closeTerminal	false	closed 1 session	ok
+terminal.close	canonical	[["tabId","tab-a"],["zone",1]]	ok	session.closeTerminal	true	closed 1 session	ok
+terminal.close	empty	[]	ok	session.closeTerminal	true	closed 1 session	ok
 terminal.copy-names	canonical	[]	error:no-sessions	invoke	true	-	error
 terminal.copy-names	empty	[]	error:no-sessions	invoke	true	-	error
 terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]	ok

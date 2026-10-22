@@ -655,6 +655,38 @@ describe("handlers — every stubbed effect's other arm", () => {
   });
 
   /**
+   * `/close` reports what `closeTerminal` actually did: a deferred close has
+   * not killed anything yet (10 s Undo window), and a worker view is only
+   * hidden. Claiming "closed" for either would be a kill that did not happen.
+   */
+  it("/close reports a deferred close as pending and a worker view as hidden", async () => {
+    const action = h.byId("terminal.close");
+    h.resetArms();
+    try {
+      h.setArms({ closeRoute: "defer" });
+      const deferred = await action.handler({ tabId: "tab-a" } as never, { source: "test" });
+      expect(deferred.ok).toBe(true);
+      expect(renderCommandStatus(action.slash, deferred.ok ? deferred.value : null).text).toBe(
+        "/close ✓ closing 1 session — tab-a (undo 10 s)",
+      );
+
+      h.setArms({ closeRoute: "hide-worker" });
+      const hidden = await action.handler({ tabId: "tab-a" } as never, { source: "test" });
+      expect(renderCommandStatus(action.slash, hidden.ok ? hidden.value : null).text).toBe(
+        "/close ✓ hid 1 session — tab-a (worker keeps running)",
+      );
+
+      h.setArms({ closeRoute: "kill-now" });
+      const killed = await action.handler({ tabId: "tab-a" } as never, { source: "test" });
+      expect(renderCommandStatus(action.slash, killed.ok ? killed.value : null).text).toBe(
+        "/close ✓ closed 1 session — tab-a",
+      );
+    } finally {
+      h.resetArms();
+    }
+  });
+
+  /**
    * D2: `/history` is a BODY card. Its count cannot come from `sections` and
    * used to be structurally zero — indistinguishable from an empty history.
    */
