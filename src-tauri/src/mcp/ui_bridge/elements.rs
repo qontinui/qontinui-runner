@@ -30,7 +30,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::envelope::UiBridgeJson;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
@@ -2297,15 +2297,17 @@ pub(crate) async fn try_ws_dispatch_for_app(
         return None;
     }
     debug!(
-        "[ui-bridge/elements] {} via WS → app_id='{}' (path={})",
-        action, app_id, http_path
+        "[ui-bridge/elements] {} via WS → app_id='{}' (http equivalent: {} {})",
+        action, app_id, http_method, http_path
     );
-    Some(
-        dispatcher
-            .dispatch(app_id, action, http_method, http_path, payload)
-            .await
-            .map_err(|e| e.to_user_message()),
-    )
+    // WebSocket ONLY: a registration that turned HTTP since the read above is
+    // refused (`NotWebsocket`) rather than sent down the HTTP arm, and reads
+    // as "no WS entry" — the caller falls through, as it would had the read
+    // above seen HTTP.
+    match dispatcher.dispatch_websocket(app_id, action, payload).await {
+        Err(DispatchError::NotWebsocket(_)) => None,
+        result => Some(result.map_err(|e| e.to_user_message())),
+    }
 }
 
 /// Whose components a `GET /ui-bridge/control/components` read returns.
@@ -2398,14 +2400,10 @@ async fn ws_collect_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => {
