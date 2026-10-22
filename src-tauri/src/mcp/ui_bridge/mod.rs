@@ -51,6 +51,7 @@ pub mod tauri_audit;
 pub mod terminals;
 pub mod toasts;
 pub mod types;
+pub(crate) mod visibility_canvas;
 pub mod vision_ai;
 pub mod vision_frame_source;
 pub mod vision_routes;
