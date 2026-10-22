@@ -70,7 +70,11 @@ pub fn vision_cache_root_from(
          source checkout."
             .to_string()
     })?;
-    Ok(scope(&base.join(VISION_CACHE_DIR_NAME)))
+    // Scope FIRST, then join: `<base>/instance-<name>/vision_cache` sits inside
+    // the per-instance directory the supervisor's app-data cleanup removes
+    // when a temp runner is deleted, so a spawn-test runner's captures do not
+    // outlive it.
+    Ok(scope(&base).join(VISION_CACHE_DIR_NAME))
 }
 
 /// Relative HTTP path that serves a cache entry's bytes:
@@ -214,9 +218,9 @@ mod tests {
         let alpha = root_for("alpha");
         let beta = root_for("beta");
         assert_ne!(alpha, beta, "two instances must not share a vision cache");
-        let shared = machine.join(RUNNER_BUNDLE_ID).join("vision_cache");
-        assert_eq!(alpha, shared.join("instance-alpha"));
-        assert_eq!(beta, shared.join("instance-beta"));
+        let shared = machine.join(RUNNER_BUNDLE_ID);
+        assert_eq!(alpha, shared.join("instance-alpha").join("vision_cache"));
+        assert_eq!(beta, shared.join("instance-beta").join("vision_cache"));
 
         // Two ROOTED subjects likewise get two roots.
         let r1 = tmp.path().join("r1");
@@ -256,8 +260,8 @@ mod tests {
     #[test]
     fn inline_base64_round_trips_to_the_get_by_sha_bytes() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = qontinui_vision_core::VisionCache::new(tmp.path(), 8 * 1024 * 1024)
-            .expect("cache");
+        let cache =
+            qontinui_vision_core::VisionCache::new(tmp.path(), 8 * 1024 * 1024).expect("cache");
         let key = qontinui_vision_core::sha256_of(b"v=1|mut=0|req=test");
         let bytes: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
         let hit = cache.put(&key, &bytes, "jpeg").expect("put");
@@ -357,6 +361,9 @@ mod tests {
             ..resp
         };
         let v = serde_json::to_value(&plain).expect("serialize");
-        assert!(!v.as_object().expect("object").contains_key("base64"), "{v}");
+        assert!(
+            !v.as_object().expect("object").contains_key("base64"),
+            "{v}"
+        );
     }
 }
