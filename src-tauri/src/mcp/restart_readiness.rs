@@ -196,7 +196,7 @@ use crate::mcp::types::ApiState;
 use crate::session::claude_activity::{self, ActivityCounts, LivePid, RecordReading};
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{
-    self, HolderPane, HolderPaneState, LiveClaudeProcess, TrackingHealthReport,
+    self, HolderPane, HolderPaneState, LiveClaudeProcess, PaneHandoff, TrackingHealthReport,
 };
 use crate::session::wind_down_observer::{self, ObservedInputs, TerminalObservation};
 use qontinui_runner_lib::wind_down::{self, WindDownView};
@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); `safe_to_restart` (unchanged) does NOT treat a holder pane as surviving a restart — the ONE exception is a HANDOFF restart (a graceful close that DETACHES holder panes instead of killing them), reported separately as `safe_with_handoff`: each pane's `handoff` is `survivable` only for a live, answering holder whose `protection` was OBSERVED as `protected` (Linux: its own `qontinui-pty-holder-*.scope` or no systemd unit; Windows and macOS: by spawn-route construction), `killed` with `handoffReason` `unprotected_cgroup` for a holder inside a systemd unit cgroup and `holder_dead` for a dead holder's still-running child, `unknown` (`unresolved_holder` / `protection_unknown`) whenever nothing proves it, and an unknown is NEVER counted survivable; `safe_with_handoff` is `true` when `safe_to_restart` is, or when every holder pane is survivable (or has no process), `terminal_sessions.killed_by_handoff` (in-process panes' `claude`, which no handoff can keep) is 0, and the headless, AI and unclassified planes are empty — `null` whenever the verdict is UNKNOWN; it describes a handoff restart ONLY: an ordinary restart, a crash, or a supervisor kill still takes every pane down, and a handed-off pane is kept only if the next build adopts it";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -292,6 +292,13 @@ pub struct TerminalPlane {
     /// no names at all — on a headless box that is the whole of what an
     /// operator could learn about a session a restart would silently destroy.
     pub unclassified_processes: Vec<LiveClaudeProcess>,
+    /// Of `count`, the processes in no PTY holder pane's tree — IN-PROCESS
+    /// panes, whose PTY dies with the runner, so even a handoff restart kills
+    /// them (plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D6). Every such process counts, nested and `finished` ones included.
+    /// A holder-held pane a live terminal claims is NOT here: its fate is its
+    /// pane's `handoff` in `holder_sessions.panes`.
+    pub killed_by_handoff: usize,
 }
 
 /// The **headless-exempt** plane: `claude` children the agent runtime owns
@@ -341,10 +348,16 @@ pub struct HeadlessPlane {
 /// blocks as a PANE, because nothing this runner can drive proves what it is
 /// running. A LIVE holder pane whose tree holds no `claude` (a plain shell)
 /// does not block, exactly as an in-process shell pane does not: this endpoint
-/// counts agent sessions, and a shell carries none. A holder pane is not
-/// treated as surviving a restart: that is the
-/// feature's goal, but the plan's acceptance run (kill the runner, reattach,
-/// same `claude` pid) is unrun, so the verdict stays fail-closed.
+/// counts agent sessions, and a shell carries none. `safe_to_restart` does not
+/// treat a holder pane as surviving a restart: a plain restart, crash or kill
+/// takes it down, so that verdict stays fail-closed.
+///
+/// **The handoff exception** (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D6): a HANDOFF restart detaches holder panes instead of killing them. What
+/// it would keep is reported per pane (`HolderPane::handoff`) and summed in
+/// `survivable_by_handoff` / `killed_by_handoff` / `unknown`, feeding the
+/// separate top-level `safe_with_handoff`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HolderPlane {
     /// Live `claude` PROCESSES in holder panes and claimed by no live tracked
@@ -367,7 +380,20 @@ pub struct HolderPlane {
     pub dead_panes: usize,
     /// `unknown_panes + incompatible_panes`. **Each blocks a restart.**
     pub unresolved_panes: usize,
-    /// Per-pane detail: state, holder and child pid, build, versions, why.
+    /// Of `panes_total`, the panes whose `handoff` is `survivable`: a live,
+    /// answering holder with OBSERVED protection, which a handoff restart
+    /// detaches and leaves running (D6).
+    pub survivable_by_handoff: usize,
+    /// Of `panes_total`, the panes whose `handoff` is `killed` — an
+    /// `unprotected_cgroup` holder, or a dead holder's still-running child.
+    pub killed_by_handoff: usize,
+    /// Of `panes_total`, the panes whose `handoff` is `unknown` — an
+    /// unresolved holder, or a live one whose protection could not be
+    /// observed. **Never counted survivable.** Not to be confused with
+    /// `unknown_panes`, the census STATE count (which is a subset of this).
+    pub unknown: usize,
+    /// Per-pane detail: state, holder and child pid, build, versions, why,
+    /// and the pane's `protection` / `handoff` / `handoffReason`.
     pub panes: Vec<HolderPane>,
     /// pid, age, cwd and the children hint for `count`.
     pub processes: Vec<LiveClaudeProcess>,
@@ -547,6 +573,16 @@ pub struct RestartReadiness {
     /// `0`.
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
+    /// Whether a HANDOFF restart (holder panes detached, not killed) would
+    /// lose no work worth protecting (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D6). `true` when `safe_to_restart` is (a handoff kills a subset of what
+    /// a plain restart kills), or when every holder pane is `survivable` (or
+    /// has no process), no in-process terminal pane runs a `claude`, no holder
+    /// pane is unresolved, and the headless, AI and unclassified planes are
+    /// empty. `null` whenever any input is unknown — never a default.
+    /// `safe_to_restart` itself is unchanged. See [`safe_with_handoff`].
+    pub safe_with_handoff: Option<bool>,
     pub boundary: &'static str,
 }
 
@@ -624,7 +660,25 @@ pub fn terminal_plane_from(
         sessions,
         processes: report.terminal_hosted.clone(),
         unclassified_processes: report.live_untracked.clone(),
+        killed_by_handoff: in_process_count(report),
     }
+}
+
+/// Terminal-hosted `claude` processes found in NO holder pane's tree: their
+/// PTY is in-process and dies with the runner. A pane whose holder has no
+/// observable pid lists no `claude_pids`, so its processes land here — the
+/// fail-closed direction (`killed`), and that pane is unresolved anyway.
+fn in_process_count(report: &TrackingHealthReport) -> usize {
+    let held: std::collections::HashSet<u32> = report
+        .holder_panes
+        .iter()
+        .flat_map(|p| p.claude_pids.iter().copied())
+        .collect();
+    report
+        .terminal_hosted
+        .iter()
+        .filter(|p| !held.contains(&p.pid))
+        .count()
 }
 
 /// Shape the headless-exempt plane from the SAME pass — no second census.
@@ -644,6 +698,16 @@ pub fn headless_plane_from(report: &TrackingHealthReport) -> HeadlessPlane {
 pub fn holder_plane_from(report: &TrackingHealthReport) -> HolderPlane {
     let unknown = report.holder_pane_count(HolderPaneState::Unknown);
     let incompatible = report.holder_pane_count(HolderPaneState::Incompatible);
+    // Re-derived here so the per-pane verdict can never disagree with the
+    // facts it is served beside, whoever built the pane.
+    let mut panes: Vec<HolderPane> = report.holder_panes.clone();
+    for p in &mut panes {
+        p.refresh_handoff();
+    }
+    let handoff_count = |h: PaneHandoff| panes.iter().filter(|p| p.handoff == h).count();
+    let survivable_by_handoff = handoff_count(PaneHandoff::Survivable);
+    let killed_by_handoff = handoff_count(PaneHandoff::Killed);
+    let handoff_unknown = handoff_count(PaneHandoff::Unknown);
     HolderPlane {
         count: report.holder_hosted.len(),
         blocking_count: TrackingHealthReport::blocking_count(&report.holder_hosted),
@@ -656,7 +720,10 @@ pub fn holder_plane_from(report: &TrackingHealthReport) -> HolderPlane {
         incompatible_panes: incompatible,
         dead_panes: report.holder_pane_count(HolderPaneState::Dead),
         unresolved_panes: unknown + incompatible,
-        panes: report.holder_panes.clone(),
+        survivable_by_handoff,
+        killed_by_handoff,
+        unknown: handoff_unknown,
+        panes,
         processes: report.holder_hosted.clone(),
         census_error: report.holder_census_error.clone(),
     }
@@ -1015,6 +1082,8 @@ pub fn build_verdict(
             census,
             session_status_source: status_source,
             wind_down_candidates,
+            // Any unknown input: the handoff verdict is unknown too.
+            safe_with_handoff: None,
             boundary: BOUNDARY,
         };
     }
@@ -1179,6 +1248,8 @@ pub fn build_verdict(
         parts.join("; ")
     };
 
+    let safe_with_handoff = Some(safe_with_handoff(safe, &t, &h, &hp, &a, &totals));
+
     RestartReadiness {
         safe_to_restart: safe,
         reason,
@@ -1191,8 +1262,44 @@ pub fn build_verdict(
         census,
         session_status_source: status_source,
         wind_down_candidates,
+        safe_with_handoff,
         boundary: BOUNDARY,
     }
+}
+
+/// The handoff verdict over RESOLVED planes (D6). `build_verdict` reports
+/// `null` instead whenever any plane is unknown.
+///
+/// A handoff restart kills a SUBSET of what a plain restart kills, so a safe
+/// plain restart is a safe handoff restart. Otherwise every condition must
+/// hold: every holder pane `survivable` (a `no_process` pane has nothing to
+/// keep or lose; `killed` and `unknown` both fail), no unresolved holder pane,
+/// no in-process terminal `claude`, and the planes no handoff reaches —
+/// headless (every process blocks: no work axis reaches it), AI/task-run
+/// (`kill_orphaned_ai_processes` ends it on any restart) and unclassified —
+/// all empty.
+pub fn safe_with_handoff(
+    safe_to_restart: bool,
+    t: &TerminalPlane,
+    h: &HeadlessPlane,
+    hp: &HolderPlane,
+    a: &AiPlane,
+    totals: &LiveClaudeTotals,
+) -> bool {
+    if safe_to_restart {
+        return true;
+    }
+    let every_pane_kept = hp
+        .panes
+        .iter()
+        .all(|p| matches!(p.handoff, PaneHandoff::Survivable | PaneHandoff::NoProcess));
+    every_pane_kept
+        && hp.unresolved_panes == 0
+        && t.killed_by_handoff == 0
+        && t.live_untracked_count == 0
+        && h.count == 0
+        && a.count == 0
+        && totals.ai_plane == 0
 }
 
 /// Whether the AI/task-run plane may be reported this request, given
@@ -1455,7 +1562,8 @@ pub async fn restart_readiness_handler(
 mod tests {
     use super::*;
     use crate::session::tracking_health::{
-        evaluate, LiveClaudeProcess, SessionWorkStatus, TrackedDeadRecord, TrackingHealthReport,
+        evaluate, HandoffReason, HolderProtection, LiveClaudeProcess, SessionWorkStatus,
+        TrackedDeadRecord, TrackingHealthReport,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -3885,6 +3993,11 @@ mod tests {
             holder_versions: vec![],
             detail: None,
             claude_pids: vec![],
+            // A live holder's protection is OBSERVED by the census; these
+            // fixtures stand for a holder outside every systemd unit.
+            protection: HolderProtection::Protected,
+            handoff: PaneHandoff::Unknown,
+            handoff_reason: None,
         }
     }
 
@@ -4044,5 +4157,400 @@ mod tests {
         );
         assert!(!v.safe_to_restart);
         assert!(v.reason.contains("PTY-holder plane"), "{}", v.reason);
+    }
+
+    // -----------------------------------------------------------------------
+    // The handoff verdict (plan 2026-10-21 graceful-runner-restart-detaches-
+    // holder-panes-instead-of-killing-them, D6 / Phase 3)
+    // -----------------------------------------------------------------------
+
+    fn holder_pane_with(
+        id: &str,
+        holder_pid: u32,
+        child_pid: Option<u32>,
+        protection: HolderProtection,
+    ) -> HolderPane {
+        HolderPane {
+            child_pid,
+            protection,
+            ..holder_census_pane(id, HolderPaneState::Live, Some(holder_pid))
+        }
+    }
+
+    /// One census pass over `snap` with `panes` as the holder census, an
+    /// optional tracked terminal (`(terminal_id, pid)`) and optional headless
+    /// roots — then the verdict exactly as the handler composes it.
+    fn handoff_verdict_over(
+        snap: &crate::process_capture::process_tree::ProcessSnapshot,
+        panes: Vec<HolderPane>,
+        terminals: &[(&str, u32)],
+        headless_roots: &[u32],
+        unknowns: Vec<String>,
+        now_ms: i64,
+    ) -> RestartReadiness {
+        let records: Vec<TerminalSessionRecord> = terminals
+            .iter()
+            .enumerate()
+            .map(|(i, (tid, _))| record(&format!("sess-{i}"), tid, now_ms - 60_000))
+            .collect();
+        let terminal_pids: HashMap<String, u32> = terminals
+            .iter()
+            .map(|(tid, pid)| (tid.to_string(), *pid))
+            .collect();
+        let census = crate::session::tracking_health::HolderCensus {
+            panes,
+            error: None,
+            verified_terminal_pids: Default::default(),
+        };
+        let report = evaluate(
+            snap,
+            1,
+            &records,
+            &terminal_pids,
+            &headless_roots.iter().copied().collect(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+            &census,
+        );
+        assert!(report.partition_covers_total());
+        verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        )
+    }
+
+    /// The wire shape: every new field under the spelling a consumer (the
+    /// supervisor's handoff gate, `/restart-readiness` docs) reads. A live,
+    /// protected holder pane running `claude` keeps `safe_to_restart: false`
+    /// — unchanged — while `safe_with_handoff` reads `true`.
+    #[test]
+    fn handoff_fields_are_served_under_their_wire_names() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[]), (100, &[101])],
+            &[(100, now_s), (101, now_s)],
+            &[(100, "qontinui-pty-holder"), (101, "claude")],
+        );
+        let v = handoff_verdict_over(
+            &snap,
+            vec![holder_pane_with(
+                "kept",
+                100,
+                Some(101),
+                HolderProtection::Protected,
+            )],
+            &[],
+            &[],
+            vec![],
+            now_ms,
+        );
+        assert!(
+            !v.safe_to_restart,
+            "the plain verdict is unchanged: {}",
+            v.reason
+        );
+        assert_eq!(v.safe_with_handoff, Some(true));
+
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["safe_with_handoff"], true);
+        assert_eq!(json["safe_to_restart"], false);
+        let hp = &json["holder_sessions"];
+        assert_eq!(hp["survivable_by_handoff"], 1);
+        assert_eq!(hp["killed_by_handoff"], 0);
+        assert_eq!(hp["unknown"], 0);
+        let pane = &hp["panes"][0];
+        assert_eq!(pane["handoff"], "survivable");
+        assert!(pane["handoffReason"].is_null(), "{pane}");
+        assert_eq!(pane["protection"], "protected");
+        assert_eq!(json["terminal_sessions"]["killed_by_handoff"], 0);
+        assert!(BOUNDARY.contains("`safe_with_handoff`"));
+        assert!(BOUNDARY.contains("`handoffReason`"));
+        assert!(BOUNDARY.contains("`terminal_sessions.killed_by_handoff`"));
+        assert!(
+            !BOUNDARY.contains("a holder pane is NOT treated as surviving a restart\""),
+            "the BOUNDARY names the handoff exception"
+        );
+    }
+
+    /// An IN-PROCESS terminal pane's `claude` dies on any restart: it makes
+    /// `safe_with_handoff` false and is counted in
+    /// `terminal_sessions.killed_by_handoff`. A terminal that claims a
+    /// HOLDER pane's `claude` is not counted there.
+    #[test]
+    fn an_in_process_pane_makes_safe_with_handoff_false() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // Runner 1 → shell 5 → claude 10 (in-process, tracked t-5). Holder 100
+        // (outside the subtree) → shell 101 → claude 102, tracked t-7 via 101.
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[10]), (100, &[101]), (101, &[102])],
+            &[
+                (5, now_s),
+                (10, now_s),
+                (100, now_s),
+                (101, now_s),
+                (102, now_s),
+            ],
+            &[
+                (5, "bash"),
+                (10, "claude"),
+                (100, "qontinui-pty-holder"),
+                (101, "bash"),
+                (102, "claude"),
+            ],
+        );
+        let panes = vec![holder_pane_with(
+            "t-7",
+            100,
+            Some(101),
+            HolderProtection::Protected,
+        )];
+        let v = handoff_verdict_over(
+            &snap,
+            panes.clone(),
+            &[("t-5", 5), ("t-7", 101)],
+            &[],
+            vec![],
+            now_ms,
+        );
+        let t = v.terminal_sessions.as_ref().unwrap();
+        assert_eq!(t.count, 2, "both are terminal-hosted");
+        assert_eq!(t.killed_by_handoff, 1, "only the in-process one");
+        assert_eq!(v.holder_sessions.as_ref().unwrap().survivable_by_handoff, 1);
+        assert_eq!(v.safe_with_handoff, Some(false), "{}", v.reason);
+        assert!(!v.safe_to_restart);
+
+        // Without the in-process pane, the holder-hosted terminal survives.
+        let held_only = snap_with(
+            &[(1, &[]), (100, &[101]), (101, &[102])],
+            &[(100, now_s), (101, now_s), (102, now_s)],
+            &[(100, "qontinui-pty-holder"), (101, "bash"), (102, "claude")],
+        );
+        let v = handoff_verdict_over(&held_only, panes, &[("t-7", 101)], &[], vec![], now_ms);
+        assert_eq!(v.terminal_sessions.as_ref().unwrap().killed_by_handoff, 0);
+        assert_eq!(v.safe_with_handoff, Some(true), "{}", v.reason);
+    }
+
+    /// D4: a holder inside a systemd unit cgroup (`Unprotected::Cgroup`)
+    /// dies with that unit — `killed` / `unprotected_cgroup`, never
+    /// `survivable` — and the handoff verdict is false.
+    #[test]
+    fn an_unprotected_holder_pane_reads_killed_unprotected_cgroup() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[]), (100, &[101])],
+            &[(100, now_s), (101, now_s)],
+            &[(100, "qontinui-pty-holder"), (101, "claude")],
+        );
+        let v = handoff_verdict_over(
+            &snap,
+            vec![holder_pane_with(
+                "doomed",
+                100,
+                Some(101),
+                HolderProtection::UnprotectedCgroup,
+            )],
+            &[],
+            &[],
+            vec![],
+            now_ms,
+        );
+        let hp = v.holder_sessions.as_ref().unwrap();
+        assert_eq!(hp.panes[0].handoff, PaneHandoff::Killed);
+        assert_eq!(
+            hp.panes[0].handoff_reason,
+            Some(HandoffReason::UnprotectedCgroup)
+        );
+        assert_eq!(
+            (hp.survivable_by_handoff, hp.killed_by_handoff, hp.unknown),
+            (0, 1, 0)
+        );
+        assert_eq!(v.safe_with_handoff, Some(false));
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["holder_sessions"]["panes"][0]["handoff"], "killed");
+        assert_eq!(
+            json["holder_sessions"]["panes"][0]["handoffReason"],
+            "unprotected_cgroup"
+        );
+        assert_eq!(
+            json["holder_sessions"]["panes"][0]["protection"],
+            "unprotected_cgroup"
+        );
+    }
+
+    /// A blocking headless `claude` (a direct child of the runner, which no
+    /// handoff reaches) makes `safe_with_handoff` false even when every
+    /// holder pane is survivable.
+    #[test]
+    fn a_blocking_headless_session_makes_safe_with_handoff_false() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[7]), (100, &[101])],
+            &[(7, now_s), (100, now_s), (101, now_s)],
+            &[(7, "claude"), (100, "qontinui-pty-holder"), (101, "claude")],
+        );
+        let v = handoff_verdict_over(
+            &snap,
+            vec![holder_pane_with(
+                "kept",
+                100,
+                Some(101),
+                HolderProtection::Protected,
+            )],
+            &[],
+            &[7],
+            vec![],
+            now_ms,
+        );
+        assert_eq!(v.headless_sessions.as_ref().unwrap().count, 1);
+        assert_eq!(v.holder_sessions.as_ref().unwrap().survivable_by_handoff, 1);
+        assert_eq!(v.safe_with_handoff, Some(false), "{}", v.reason);
+    }
+
+    /// Unknown inputs: any unresolved plane makes `safe_with_handoff` NULL —
+    /// never a default `false` or `true` — and a pane whose protection or
+    /// holder could not be observed is `unknown`, never `survivable`.
+    #[test]
+    fn unknown_inputs_yield_a_null_or_never_survivable_handoff() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[]), (100, &[101])],
+            &[(100, now_s), (101, now_s)],
+            &[(100, "qontinui-pty-holder"), (101, "claude")],
+        );
+        let v = handoff_verdict_over(
+            &snap,
+            vec![holder_pane_with(
+                "kept",
+                100,
+                Some(101),
+                HolderProtection::Protected,
+            )],
+            &[],
+            &[],
+            vec!["the AI/task-run plane could not be determined".into()],
+            now_ms,
+        );
+        assert_eq!(v.safe_with_handoff, None);
+        assert!(serde_json::to_value(&v).unwrap()["safe_with_handoff"].is_null());
+
+        // An absent holder plane is unknown too.
+        let empty = empty_report(now_ms);
+        let v = build_verdict(
+            Some(terminal_plane_from(&empty, &[], now_ms)),
+            Some(headless_plane_from(&empty)),
+            None,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            Some(live_claude_totals_from(&empty)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            clean_status_source(),
+        );
+        assert_eq!(v.safe_with_handoff, None);
+
+        // Unobserved protection on a live holder: `unknown`, and false.
+        let v = handoff_verdict_over(
+            &snap,
+            vec![holder_pane_with(
+                "unseen",
+                100,
+                Some(101),
+                HolderProtection::Unknown,
+            )],
+            &[],
+            &[],
+            vec![],
+            now_ms,
+        );
+        let hp = v.holder_sessions.as_ref().unwrap();
+        assert_eq!(hp.panes[0].handoff, PaneHandoff::Unknown);
+        assert_eq!(
+            hp.panes[0].handoff_reason,
+            Some(HandoffReason::ProtectionUnknown)
+        );
+        assert_eq!((hp.survivable_by_handoff, hp.unknown), (0, 1));
+        assert_eq!(v.safe_with_handoff, Some(false));
+
+        // An unresolved holder (unknown / incompatible) can never be asked
+        // to detach: `unknown` / `unresolved_holder`, and false.
+        for state in [HolderPaneState::Unknown, HolderPaneState::Incompatible] {
+            let report = TrackingHealthReport {
+                holder_panes: vec![HolderPane {
+                    protection: HolderProtection::Protected,
+                    ..holder_census_pane("p", state, None)
+                }],
+                ..empty_report(now_ms)
+            };
+            let v = verdict_from(
+                &report,
+                &[],
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            );
+            let hp = v.holder_sessions.as_ref().unwrap();
+            assert_eq!(hp.panes[0].handoff, PaneHandoff::Unknown, "{state:?}");
+            assert_eq!(
+                hp.panes[0].handoff_reason,
+                Some(HandoffReason::UnresolvedHolder)
+            );
+            assert_eq!(v.safe_with_handoff, Some(false), "{state:?}");
+        }
+    }
+
+    /// A safe plain restart is a safe handoff restart (a handoff kills a
+    /// subset), and a dead holder's still-running child is `killed`.
+    #[test]
+    fn safe_to_restart_implies_safe_with_handoff_and_a_dead_holders_child_is_killed() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let v = verdict_from(
+            &empty_report(now_ms),
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(v.safe_to_restart);
+        assert_eq!(v.safe_with_handoff, Some(true));
+
+        let mut dead = holder_census_pane("gone", HolderPaneState::Dead, None);
+        dead.child_pid = Some(400);
+        let mut over = holder_census_pane("over", HolderPaneState::Dead, None);
+        over.child_pid = None;
+        let plane = holder_plane_from(&TrackingHealthReport {
+            holder_panes: vec![dead, over],
+            ..empty_report(now_ms)
+        });
+        assert_eq!(plane.panes[0].handoff, PaneHandoff::Killed);
+        assert_eq!(
+            plane.panes[0].handoff_reason,
+            Some(HandoffReason::HolderDead)
+        );
+        assert_eq!(plane.panes[1].handoff, PaneHandoff::NoProcess);
+        assert_eq!(
+            (
+                plane.survivable_by_handoff,
+                plane.killed_by_handoff,
+                plane.unknown
+            ),
+            (0, 1, 0)
+        );
     }
 }
