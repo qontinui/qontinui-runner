@@ -201,7 +201,14 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
         // types a save-and-pause notice into every live session, which Cancel
         // cannot take back. The plan's Phase 5 said `write`; the rubric decides.
         effect: "destructive",
-        handler: () => clickPrepare(store),
+        // Over the bridge a call that cannot prepare yet says so rather than
+        // answering a success-shaped `null` after only opening the panel.
+        handler: () =>
+          store.getSnapshot().loaded
+            ? clickPrepare(store)
+            : Promise.reject(
+                new Error("the restart-prep record has not been read yet — try again shortly"),
+              ),
       },
     ],
     // Read from the store at CALL time: `useUIComponent` keeps the getter it
@@ -566,7 +573,10 @@ export function RestartPrepPanel({
       data-ui-bridge-id={RESTART_PREP_PANEL_ID}
       data-headline-kind={headline?.kind ?? "none"}
       data-prep-state={rec?.state ?? "none"}
-      className="mx-2 mb-1 rounded border border-[#2a2d3d] bg-[#1a1b26] text-[10px]"
+      // Bounded and scrolling: the panel sits in the page's column above the
+      // zone grid, so an unbounded one would squeeze every pane on exactly the
+      // busy box this is for (one row per session, plus the blocker list).
+      className="mx-2 mb-1 max-h-[40vh] overflow-y-auto rounded border border-[#2a2d3d] bg-[#1a1b26] text-[10px]"
     >
       <div className="flex items-center gap-2 px-2 py-1">
         <Power className="w-3 h-3 text-[#565f89]" />

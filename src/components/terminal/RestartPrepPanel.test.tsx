@@ -233,6 +233,8 @@ describe("the panel rows and controls", () => {
     expect(html).toContain("account unknown");
     expect(html).toContain("zone 3 · page page-a");
     expect(html).toContain('data-ui-bridge-id="terminal.restart-prep-cancel"');
+    // Bounded, so a large cohort scrolls instead of squeezing the zone grid.
+    expect(html).toContain("max-h-[40vh] overflow-y-auto");
 
     const effects = Object.fromEntries(
       registered.flatMap((c) => c.actions.map((a) => [`${c.id}.${a.id}`, a.effect])),
