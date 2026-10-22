@@ -135,6 +135,13 @@ export interface PrepareRecord {
   hold_until_ms: number | null;
   hold_until: string | null;
   verdict: PrepVerdict | null;
+  /**
+   * The hold's release, once one was sent (`ReleaseReport`): `outcome` is
+   * coord's answer verbatim, `read_back` the device drain read after it
+   * (`clear`, `drained (<reason>)`, `unreadable: …`; null when no coord
+   * release was sent).
+   */
+  release?: { outcome: string; read_back: string | null } | null;
 }
 
 /** `restart_prep::prepare::PrepView`. */

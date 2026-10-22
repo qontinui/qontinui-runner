@@ -389,8 +389,23 @@ function endedLine(snap: RestartPrepSnapshot): string {
   // proof that no prepare ran — an unparseable record reads the same.
   if (!rec) return "No readable prepare record: none is running, or its record could not be read.";
   switch (rec.state) {
-    case "cancelled":
-      return `Prepare cancelled — spawns are no longer held (${snap.view?.hold ?? "release unread"}).`;
+    case "cancelled": {
+      // "No longer held" only when the drain read back clear: a release
+      // coord answered `not_owner` leaves an operator's drain holding the
+      // lane, and an unreadable one is UNKNOWN.
+      const release = rec.release;
+      const outcome = release?.outcome ?? "unread";
+      if (release?.read_back === "clear") {
+        return `Prepare cancelled — spawns are no longer held (release: ${outcome}; the device drain reads clear).`;
+      }
+      if (outcome === "local") {
+        return `Prepare cancelled — the runner-local hold was lifted (release: ${outcome}).`;
+      }
+      return (
+        `Prepare cancelled — this prepare's hold was released (release: ${outcome}); ` +
+        `the device drain reads ${release?.read_back ?? "unread"}.`
+      );
+    }
     case "restoring":
       return "The runner restarted — its sessions are waiting to be restored.";
     case "done":
@@ -408,8 +423,9 @@ export function panelStateOf(snap: RestartPrepSnapshot): Record<string, unknown>
     headlineKind: headline?.kind ?? null,
     state: snap.record?.state ?? null,
     hold: snap.view?.hold ?? null,
-    rows: snap.record?.cohort.rows.length ?? 0,
-    liveUpdates: snap.eventsError === null,
+    // `null` while unread — never a count of zero.
+    rows: snap.loaded && snap.readError === null ? (snap.record?.cohort.rows.length ?? 0) : null,
+    listenerError: snap.eventsError,
   };
 }
 

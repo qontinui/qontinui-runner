@@ -262,6 +262,27 @@ describe("the panel rows and controls", () => {
 
   it("offers Cancel only while the prepare is in its window, and says what ended it", () => {
     const cancelled = renderPanel(snapshot({ record: record({ state: "cancelled" }) }));
+    expect(cancelled).not.toContain("no longer held");
+    // "No longer held" only when the drain read back clear.
+    const clear = renderPanel(
+      snapshot({
+        record: record({
+          state: "cancelled",
+          release: { outcome: "released", read_back: "clear" },
+        }),
+      }),
+    );
+    expect(clear).toContain("spawns are no longer held");
+    const operatorStillHolds = renderPanel(
+      snapshot({
+        record: record({
+          state: "cancelled",
+          release: { outcome: "not_owner", read_back: "drained (maintenance)" },
+        }),
+      }),
+    );
+    expect(operatorStillHolds).not.toContain("no longer held");
+    expect(operatorStillHolds).toContain("the device drain reads drained (maintenance)");
     expect(cancelled).not.toContain('data-ui-bridge-id="terminal.restart-prep-cancel"');
     expect(cancelled).not.toContain('data-ui-bridge-id="terminal.restart-prep-extend"');
     expect(cancelled).toContain("Prepare cancelled");
