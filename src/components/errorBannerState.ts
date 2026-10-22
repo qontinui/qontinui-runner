@@ -1,26 +1,29 @@
 /**
  * The app-wide `error` event banner's state, as a pure reducer.
  *
- * `StatusIndicator` used to hold one `showError` boolean: a click on X hid the
- * card forever, and only a NEW `error` event could bring it back — so one click
- * left the working surface with no trace of a fault that was still live, and an
- * undismissed card stayed forever even after the fault cleared. Neither state
- * followed the fault (plan
+ * `StatusIndicator` used to hold one `showError` boolean over one `error`
+ * slot: a click on X hid the card forever, only a NEW `error` event could bring
+ * it back, and any new event overwrote the previous one — so one click (or one
+ * passing `info`) left the working surface with no trace of a fault that was
+ * still live, and an undismissed card stayed forever even after the fault
+ * cleared. Neither state followed the fault (plan
  * `2026-10-22-runner-terminal-overlays-cover-zone-content-and-controls` F2).
  *
  * The rule this reducer encodes:
- * - a new fault shows the full banner;
- * - dismissing a non-`info` fault collapses it to a compact RESIDUAL that names
- *   the code and re-opens the banner on click;
+ * - every non-`info` fault is tracked on its own, keyed by `error_code`, so one
+ *   fault can never erase another;
+ * - a new fault shows its full banner;
+ * - dismissing it collapses it to a compact RESIDUAL that names the code and
+ *   re-opens the banner on click;
  * - the SAME code re-emitted while dismissed keeps the residual (and refreshes
  *   its last-seen time) — a re-report is not a new fault;
- * - a DIFFERENT code shows the banner again;
- * - an observed clear (`error-cleared` for the current code) removes it;
+ * - an observed clear (`error-cleared` for that code) removes it;
  * - a fault whose emitter never reports clearing keeps the residual, which says
  *   when the fault was last observed rather than inventing a clear.
  *
- * `info` events stay transient: they auto-hide (the `expired` action) and a
- * dismissed `info` leaves no residual.
+ * `info` events are transient and live in their own slot: they auto-hide (the
+ * `expired` action), a dismissed `info` leaves no residual, and an `info` never
+ * touches a fault.
  */
 
 export type ErrorSeverity = "info" | "warning" | "error" | "critical";
@@ -35,19 +38,32 @@ export interface ErrorEventPayload {
   suggested_action?: string;
 }
 
-export interface ErrorBannerState {
-  /** The most recent fault, or null when none is live. */
-  current: ErrorEventPayload | null;
-  /** Epoch ms of the most recent observation of `current`. */
-  lastSeenAt: number | null;
-  /** True once the operator collapsed `current` to its residual. */
+/** One tracked non-`info` fault. */
+export interface TrackedFault {
+  error: ErrorEventPayload;
+  /** Epoch ms of the most recent observation of this fault. */
+  lastSeenAt: number;
+  /** True once the operator collapsed it to its residual. */
   dismissed: boolean;
+}
+
+/** The current transient `info` event, if one is up. */
+export interface TransientInfo {
+  error: ErrorEventPayload;
+  /** Epoch ms it was received — the occurrence its auto-hide is keyed on. */
+  at: number;
+}
+
+export interface ErrorBannerState {
+  /** Live non-`info` faults, oldest first, at most one per `error_code`. */
+  faults: TrackedFault[];
+  info: TransientInfo | null;
 }
 
 export type ErrorBannerAction =
   | { type: "received"; error: ErrorEventPayload; at: number }
-  | { type: "dismissed" }
-  | { type: "reopened" }
+  | { type: "dismissed"; errorCode: string }
+  | { type: "reopened"; errorCode: string }
   | { type: "cleared"; errorCode: string }
   /**
    * The transient `info` auto-hide timer fired for the occurrence received at
@@ -57,13 +73,13 @@ export type ErrorBannerAction =
    */
   | { type: "expired"; errorCode: string; at: number };
 
-export type ErrorBannerView = "banner" | "residual" | "none";
+/** What renders: full banners in flow, and residual chips in the status bar. */
+export interface ErrorBannerView {
+  banners: ErrorEventPayload[];
+  residuals: TrackedFault[];
+}
 
-export const INITIAL_ERROR_BANNER_STATE: ErrorBannerState = {
-  current: null,
-  lastSeenAt: null,
-  dismissed: false,
-};
+export const INITIAL_ERROR_BANNER_STATE: ErrorBannerState = { faults: [], info: null };
 
 export function errorBannerReducer(
   state: ErrorBannerState,
@@ -71,41 +87,67 @@ export function errorBannerReducer(
 ): ErrorBannerState {
   switch (action.type) {
     case "received": {
-      const sameFault =
-        state.current !== null && state.current.error_code === action.error.error_code;
-      if (sameFault && state.dismissed) {
-        // A re-report of a fault the operator already collapsed: keep the
-        // residual, refresh what it says.
-        return { current: action.error, lastSeenAt: action.at, dismissed: true };
+      if (action.error.severity === "info") {
+        return { ...state, info: { error: action.error, at: action.at } };
       }
-      return { current: action.error, lastSeenAt: action.at, dismissed: false };
+      const code = action.error.error_code;
+      const existing = state.faults.find((f) => f.error.error_code === code);
+      if (existing) {
+        // A re-report of a tracked fault: refresh what it says, keep its
+        // dismissal (a re-report is not a new fault).
+        return {
+          ...state,
+          faults: state.faults.map((f) =>
+            f === existing ? { ...f, error: action.error, lastSeenAt: action.at } : f,
+          ),
+        };
+      }
+      return {
+        ...state,
+        faults: [...state.faults, { error: action.error, lastSeenAt: action.at, dismissed: false }],
+      };
     }
     case "dismissed":
-      if (state.current === null) return state;
-      if (state.current.severity === "info") return INITIAL_ERROR_BANNER_STATE;
-      return { ...state, dismissed: true };
+      if (state.info && state.info.error.error_code === action.errorCode) {
+        return { ...state, info: null };
+      }
+      return setDismissed(state, action.errorCode, true);
     case "reopened":
-      if (state.current === null) return state;
-      return { ...state, dismissed: false };
-    case "cleared":
-      if (state.current === null || state.current.error_code !== action.errorCode) return state;
-      return INITIAL_ERROR_BANNER_STATE;
+      return setDismissed(state, action.errorCode, false);
+    case "cleared": {
+      const faults = state.faults.filter((f) => f.error.error_code !== action.errorCode);
+      return faults.length === state.faults.length ? state : { ...state, faults };
+    }
     case "expired":
       if (
-        state.current === null ||
-        state.current.severity !== "info" ||
-        state.current.error_code !== action.errorCode ||
-        state.lastSeenAt !== action.at
+        state.info === null ||
+        state.info.error.error_code !== action.errorCode ||
+        state.info.at !== action.at
       ) {
         return state;
       }
-      return INITIAL_ERROR_BANNER_STATE;
+      return { ...state, info: null };
   }
 }
 
+function setDismissed(
+  state: ErrorBannerState,
+  errorCode: string,
+  dismissed: boolean,
+): ErrorBannerState {
+  let changed = false;
+  const faults = state.faults.map((f) => {
+    if (f.error.error_code !== errorCode || f.dismissed === dismissed) return f;
+    changed = true;
+    return { ...f, dismissed };
+  });
+  return changed ? { ...state, faults } : state;
+}
+
 export function errorBannerView(state: ErrorBannerState): ErrorBannerView {
-  if (state.current === null) return "none";
-  return state.dismissed ? "residual" : "banner";
+  const banners = state.faults.filter((f) => !f.dismissed).map((f) => f.error);
+  if (state.info) banners.push(state.info.error);
+  return { banners, residuals: state.faults.filter((f) => f.dismissed) };
 }
 
 /** The dismiss control's accessible name — the button carries only an icon. */
