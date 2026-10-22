@@ -203,11 +203,12 @@ pub fn emit_user_facing_error_cleared(
     error_code: &str,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    app.emit("error-cleared", ErrorCleared { error_code }).map_err(|e| {
-        let msg = format!("Failed to emit error-cleared event: {e}");
-        tracing::warn!(error_code = %error_code, "{msg}");
-        msg
-    })
+    app.emit("error-cleared", ErrorCleared { error_code })
+        .map_err(|e| {
+            let msg = format!("Failed to emit error-cleared event: {e}");
+            tracing::warn!(error_code = %error_code, "{msg}");
+            msg
+        })
 }
 
 // ErrorSeverity is re-exported from crate::error_monitor::types above
