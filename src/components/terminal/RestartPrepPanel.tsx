@@ -461,7 +461,9 @@ export function RestartPrepPanel({
 
   useUIComponent({
     id: RESTART_PREP_CANCEL_ID,
-    name: releaseLabel === "Cancel" ? "Cancel the restart prepare" : "Release the restart hold",
+    // A fixed name: `useUIComponent` registers its name once, so one that
+    // switched between "Cancel" and "Release hold" would go stale.
+    name: "Cancel the restart prepare / release its hold",
     description:
       "Release the spawn hold and lift the account freeze; sessions that were told to pause are " +
       "told to resume. Notices already delivered stay delivered.",

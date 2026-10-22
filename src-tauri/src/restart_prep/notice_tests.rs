@@ -1527,3 +1527,98 @@ async fn restart_prep_an_idle_told_session_holding_an_mcp_shim_child_is_paused()
             .ready_to_restart
     );
 }
+
+// ---------------------------------------------------------------------------
+// The held toggle vs a running tick (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// A pane whose paste blocks until released, so a tick can be held at the
+/// point where it has read the cohort and not yet written it back.
+struct GatedTerminals {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+struct GatedPane {
+    cfg: PaneCfg,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl InputPane for GatedPane {
+    async fn looks_idle_quiescent(&self) -> bool {
+        self.cfg.quiescent
+    }
+    async fn claude_live(&self) -> Result<(), GateMiss> {
+        Ok(())
+    }
+    fn screen(&self) -> ScreenText {
+        self.cfg.screen.clone()
+    }
+}
+
+#[async_trait]
+impl NoticePane for GatedPane {
+    fn input(&self) -> &dyn InputPane {
+        self
+    }
+    async fn submit(&self, _text: &str) -> Result<(), String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+impl NoticeTerminals for GatedTerminals {
+    fn pane(&self, _terminal_id: &str) -> Option<Box<dyn NoticePane>> {
+        Some(Box::new(GatedPane {
+            cfg: idle_pane(),
+            entered: self.entered.clone(),
+            release: self.release.clone(),
+        }))
+    }
+}
+
+/// The tick replaces the whole cohort with the one it read at its start; a
+/// held toggle written while it ran would be lost. `set_held_on` takes the
+/// same `ops` lock, so the toggle lands after the tick, on its result.
+#[tokio::test]
+async fn restart_prep_a_held_toggle_during_a_tick_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctl, _) = controller(&dir, &record(vec![row("a")], HoldStatus::Confirmed));
+    let terms = GatedTerminals {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let ev = census(vec![("a", proc(Activity::Idle, Some(false)))]);
+    let toggle = async {
+        terms.entered.notified().await;
+        let set = crate::restart_prep::restore::set_held_on(&ctl, PREP, "a", true);
+        tokio::pin!(set);
+        // Let the toggle run as far as it can while the tick is mid-paste.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut set).await;
+        terms.release.notify_one();
+        match early {
+            Ok(r) => r,
+            Err(_) => set.await,
+        }
+    };
+    let (tick, held) = tokio::join!(
+        ctl.notice_tick(&terms, recapture(&["a"], T0 + 1_000), &ev, T0 + 1_000),
+        toggle
+    );
+    assert!(
+        matches!(tick, TickOutcome::Ran { delivered: 1, .. }),
+        "{tick:?}"
+    );
+    held.unwrap();
+    let rec = ctl.record().unwrap();
+    let a = row_of(&rec, "a");
+    assert!(a.held, "the toggle survived the tick's write");
+    assert_eq!(
+        a.notified_at,
+        Some(T0 + 1_000),
+        "and the tick's own stamp too"
+    );
+}

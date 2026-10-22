@@ -6,7 +6,7 @@
  * to save and pause, freezes account moves and records every session. This
  * module is what the Terminal page reads it through:
  *
- * - the WIRE types of the prepare record (`restart_prep_status` /
+ * - the WIRE types of the prepare record (`restart_prep_current` /
  *   `restart_prep_prepare` / `restart_prep_cancel` / `restart_prep_set_held`
  *   and the `restart-prep-changed` event payload), snake_case as Rust sends
  *   them — the cohort's `session` is the ledger entry, camelCase;
@@ -19,7 +19,7 @@
  *   another.
  *
  * The store LISTENS to `restart-prep-changed` (emitted by the backend on every
- * state change) instead of polling; it reads `restart_prep_status` once when the
+ * state change) instead of polling; it reads `restart_prep_current` once when the
  * first consumer mounts, because an event only says what changed after it.
  */
 
@@ -414,7 +414,7 @@ export interface RestartPrepStore {
    * Reference-counted: the last `release` stops listening.
    */
   retain(): () => void;
-  /** Re-read the record (`restart_prep_status`). */
+  /** Re-read the record (`restart_prep_current`). */
   refresh(): Promise<void>;
   /**
    * Prepare for a restart. A call while one is in flight JOINS it (the same
@@ -457,7 +457,10 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
   let stopListening: (() => void) | null = null;
   let listening = false;
   const inflight: Partial<Record<PrepAction, Promise<PrepChanged>>> = {};
-  /** Bumped by every event, so an action reply older than an event is not applied over it. */
+  /**
+   * Bumped by every event and every applied action reply, so neither an
+   * action reply nor a read that started before a newer change lands over it.
+   */
   let eventSeq = 0;
 
   const set = (patch: Partial<RestartPrepSnapshot>): void => {
@@ -469,9 +472,14 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     set({ record: changed.record, view: changed.view, readError: null, loaded: true });
   };
 
-  /** Apply an action's reply unless an event arrived while it was in flight. */
+  /**
+   * Apply an action's reply unless something newer landed while it was in
+   * flight. An applied reply counts as newer than any read still out.
+   */
   const applyReply = (changed: PrepChanged, seqAtStart: number): void => {
-    if (eventSeq === seqAtStart) applyChanged(changed);
+    if (eventSeq !== seqAtStart) return;
+    eventSeq += 1;
+    applyChanged(changed);
   };
 
   const onEvent = (payload: unknown): void => {
@@ -484,27 +492,22 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
   const refresh = async (): Promise<void> => {
     const seq = eventSeq;
     try {
-      const status = (await deps.invoke("restart_prep_status")) as {
-        record?: unknown;
-        view?: unknown;
-      } | null;
-      // An event that landed while this read was out is newer than any of it.
+      // `restart_prep_current`: the record and view as the runner holds them
+      // in memory — exactly what an event carries — with no live cohort
+      // capture. `null` is "no readable record", not proof none ever ran.
+      const current = await deps.invoke("restart_prep_current");
+      // An event or applied reply that landed while this read was out is newer.
       if (eventSeq !== seq) return;
-      if (typeof status !== "object" || status === null) {
-        set({ readError: "the status came back in an unrecognized shape", loaded: true });
-        return;
-      }
-      if (status.record === null || status.record === undefined) {
+      if (current === null || current === undefined) {
         set({ record: null, view: null, readError: null, loaded: true });
         return;
       }
-      const record = asPrepareRecord(status.record);
-      const view = status.view as PrepView | null | undefined;
-      if (!record || typeof view !== "object" || view === null) {
+      const changed = asPrepChanged(current);
+      if (!changed) {
         set({ readError: "the record came back in an unrecognized shape", loaded: true });
         return;
       }
-      set({ record, view, readError: null, loaded: true });
+      set({ record: changed.record, view: changed.view, readError: null, loaded: true });
     } catch (err) {
       if (eventSeq !== seq) return;
       set({
@@ -613,6 +616,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
       );
       if (!reply) throw new Error("the dismiss reply came back in an unrecognized shape");
       if (eventSeq === seq && snap.record?.prepare_id === reply.prepare_id) {
+        eventSeq += 1;
         set({ record: reply });
       }
       if (reply.state !== "done") throw new Error(`the record reads ${reply.state}, not done`);
@@ -648,6 +652,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
       // event that landed meanwhile (a notice tick queued behind the toggle
       // runs, and announces, the moment the toggle lets go).
       if (eventSeq === seq && snap.record?.prepare_id === reply.prepare_id) {
+        eventSeq += 1;
         set({ record: reply });
       }
       const row = reply.cohort.rows.find((r) => r.session.claudeSessionId === claudeSessionId);

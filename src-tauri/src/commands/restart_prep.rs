@@ -26,6 +26,16 @@ pub async fn restart_prep_status(
     crate::restart_prep::status_from_app_blocking(app).await
 }
 
+/// `restart_prep_current` — the persisted prepare record and its view, as
+/// this process holds them (the payload `restart-prep-changed` carries). What
+/// the panel reads: unlike `restart_prep_status` it takes no live cohort
+/// capture. Read-only.
+#[tauri::command]
+pub async fn restart_prep_current(
+) -> Result<Option<crate::restart_prep::prepare::PrepChanged>, String> {
+    crate::restart_prep::prepare::current_from_app()
+}
+
 /// `restart_prep_prepare` — prepare this runner for a restart. Idempotent
 /// while a prepare is active (it returns that prepare).
 #[tauri::command]
@@ -77,6 +87,7 @@ pub async fn restart_prep_set_held(
 
 crate::ipc_group!(
     restart_prep_status,
+    restart_prep_current,
     restart_prep_prepare,
     restart_prep_cancel,
     restart_prep_extend,

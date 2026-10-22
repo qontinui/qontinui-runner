@@ -971,12 +971,38 @@ impl RestartPrep {
                 rec.hold_until.as_deref().unwrap_or("?")
             ));
         }
-        let rec = self.update(&rec.prepare_id, |r| {
-            r.hold_until_ms = Some(until);
-            r.hold_until = Some(rfc3339(until));
-        })?;
-        info!(prepare = %rec.prepare_id, until = %rfc3339(until), "restart_prep: hold extended");
-        self.take_hold(door, &rec).await
+        // The requested `until` goes to coord; the RECORD takes only what was
+        // answered, so the panel never shows an expiry nobody granted.
+        let mut asked = rec.clone();
+        asked.hold_until_ms = Some(until);
+        asked.hold_until = Some(rfc3339(until));
+        let (hold, coord_until) = self.hold_outcome(door, &asked).await;
+        let granted = match (&hold, coord_until) {
+            // Coord named its own deadline.
+            (_, Some(u)) => Some(u),
+            // Held with no deadline in the answer: the one that was sent, or
+            // the runner-local hold, which is ours to set.
+            (HoldStatus::Confirmed | HoldStatus::Local | HoldStatus::LocalSecondary, None) => {
+                Some(until)
+            }
+            // Not confirmed: coord's lane still ends where it did.
+            _ => rec.hold_until_ms,
+        };
+        info!(
+            prepare = %rec.prepare_id,
+            requested = %rfc3339(until),
+            granted = granted.map(rfc3339).as_deref().unwrap_or("-"),
+            hold = %hold.label(),
+            "restart_prep: hold extension answered"
+        );
+        self.update(&rec.prepare_id, |r| {
+            if hold == HoldStatus::Confirmed {
+                r.release = None;
+            }
+            r.hold = hold;
+            r.hold_until_ms = granted;
+            r.hold_until = granted.map(rfc3339);
+        })
     }
 
     /// Cancel the prepare (and the same-build banner's Release hold): release
@@ -1211,6 +1237,15 @@ pub async fn prepare_from_app(
     // The first notice pass now rather than on the loop's next tick.
     tauri::async_runtime::spawn(super::notice::tick_live());
     Ok(changed_payload(ctl, rec))
+}
+
+/// The Tauri `restart_prep_current` body: the record and its view as this
+/// process holds them — the same state every `restart-prep-changed` carries,
+/// read from memory (which the notice loop keeps ahead of a failed disk
+/// write), with no live cohort capture. `None`: no readable record.
+pub fn current_from_app() -> Result<Option<PrepChanged>, String> {
+    let ctl = install_live().ok_or("restart prepare is not available in this build")?;
+    Ok(ctl.record().map(|rec| changed_payload(ctl, rec)))
 }
 
 /// The Tauri `restart_prep_extend` body.
@@ -2174,11 +2209,16 @@ mod tests {
         *door.hold_reply.lock().unwrap() = Some(HoldCall::Unreachable {
             cause: "timeout".to_string(),
         });
+        let before = ctl.record().unwrap().hold_until_ms;
         let ext = ctl.extend(&*door, now).await.unwrap();
         assert!(
             matches!(ext.hold, HoldStatus::Unconfirmed { .. }),
             "{:?}",
             ext.hold
+        );
+        assert_eq!(
+            ext.hold_until_ms, before,
+            "an extension coord did not grant shows no new expiry"
         );
     }
 

@@ -216,9 +216,7 @@ describe("the store", () => {
   });
 
   it("listens to restart-prep-changed instead of polling", async () => {
-    const f = fakeDeps((cmd) =>
-      Promise.resolve(cmd === "restart_prep_status" ? { record: null, view: null } : null),
-    );
+    const f = fakeDeps((cmd) => Promise.resolve(cmd === "restart_prep_current" ? null : null));
     const store = createRestartPrepStore(f.deps);
     const release = store.retain();
     const releaseAgain = store.retain();
@@ -226,7 +224,7 @@ describe("the store", () => {
     await Promise.resolve();
     // One read on mount, one more once the listener is registered — and no
     // more after that: the events carry every change.
-    expect(f.calls.map(([c]) => c)).toEqual(["restart_prep_status", "restart_prep_status"]);
+    expect(f.calls.map(([c]) => c)).toEqual(["restart_prep_current", "restart_prep_current"]);
     expect(store.getSnapshot().loaded).toBe(true);
     f.emit(changed(record({ verdict: verdict({ ready_to_restart: true }) })));
     expect(store.getSnapshot().record?.verdict?.ready_to_restart).toBe(true);
@@ -246,7 +244,7 @@ describe("the store", () => {
         ? new Promise((r) => {
             release = r;
           })
-        : Promise.resolve({ record: null, view: null }),
+        : Promise.resolve(null),
     );
     const store = createRestartPrepStore(f.deps);
     store.retain();
@@ -263,7 +261,7 @@ describe("the store", () => {
       cohort: { captured_at_ms: 1, captured_at: "", reason: "", rows: [row("s1"), row("s2")] },
     });
     const f = fakeDeps(async (cmd, args) => {
-      if (cmd === "restart_prep_status") return { record: current, view: changed(current).view };
+      if (cmd === "restart_prep_current") return changed(current);
       if (cmd === "restart_prep_set_held") {
         current = {
           ...current,
@@ -298,8 +296,8 @@ describe("the store", () => {
     const rec = record();
     let answer!: (v: unknown) => void;
     const f = fakeDeps((cmd) =>
-      cmd === "restart_prep_status"
-        ? Promise.resolve({ record: rec, view: changed(rec).view })
+      cmd === "restart_prep_current"
+        ? Promise.resolve(changed(rec))
         : new Promise((r) => {
             answer = r;
           }),
@@ -319,6 +317,24 @@ describe("the store", () => {
     expect(store.getSnapshot().record?.state).toBe("ready");
     expect(store.getSnapshot().record?.cohort.rows[0].pause_state).toBe("paused");
     expect(store.getSnapshot().held.s1?.phase).toBe("done");
+  });
+
+  it("a read that started before an applied action reply does not land over it", async () => {
+    let answerRead!: (v: unknown) => void;
+    const f = fakeDeps((cmd) =>
+      cmd === "restart_prep_current"
+        ? new Promise((r) => {
+            answerRead = r;
+          })
+        : Promise.resolve(changed(record({ state: "ready" }))),
+    );
+    const store = createRestartPrepStore(f.deps);
+    const read = store.refresh();
+    await store.prepare();
+    expect(store.getSnapshot().record?.state).toBe("ready");
+    answerRead(changed(record({ state: "preparing" })));
+    await read;
+    expect(store.getSnapshot().record?.state).toBe("ready");
   });
 
   it("a failed read that raced a good event does not turn it UNKNOWN", async () => {
@@ -342,9 +358,7 @@ describe("the store", () => {
 
   it("a held toggle the record does not show is a failure, not a done", async () => {
     const rec = record();
-    const f = fakeDeps(async (cmd) =>
-      cmd === "restart_prep_status" ? { record: rec, view: changed(rec).view } : rec,
-    );
+    const f = fakeDeps(async (cmd) => (cmd === "restart_prep_current" ? changed(rec) : rec));
     const store = createRestartPrepStore(f.deps);
     await store.refresh();
     await expect(store.setHeld("s1", true)).rejects.toThrow("does not show the change");
@@ -357,10 +371,10 @@ describe("the store", () => {
     const reads: string[] = [];
     const store = createRestartPrepStore({
       invoke: async (cmd) => {
-        expect(cmd).toBe("restart_prep_status");
+        expect(cmd).toBe("restart_prep_current");
         const rec = record({ state });
         reads.push(state);
-        return { record: rec, view: changed(rec).view };
+        return changed(rec);
       },
       listen: () =>
         new Promise((resolve) => {
@@ -381,8 +395,7 @@ describe("the store", () => {
   it("dismisses only a waiting restore, and reads the record back as done", async () => {
     const restoring = record({ state: "restoring" });
     const f = fakeDeps(async (cmd, args) => {
-      if (cmd === "restart_prep_status")
-        return { record: restoring, view: changed(restoring).view };
+      if (cmd === "restart_prep_current") return changed(restoring);
       expect(cmd).toBe("restart_prep_dismiss");
       expect(args).toEqual({ prepareId: "prep-1" });
       return { ...restoring, state: "done" };
@@ -398,7 +411,7 @@ describe("the store", () => {
 
   it("a listener that cannot be set up is reported, not silent", async () => {
     const store = createRestartPrepStore({
-      invoke: () => Promise.resolve({ record: null, view: null }),
+      invoke: () => Promise.resolve(null),
       listen: () => Promise.reject(new Error("no event plugin")),
     });
     store.retain();
