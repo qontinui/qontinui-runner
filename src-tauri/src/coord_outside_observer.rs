@@ -3191,10 +3191,7 @@ mod tests {
             1,
             json!([dead_row("merge_scheduler.dispatch", true, false)]),
         );
-        let b_dead = ledger_body(
-            1,
-            json!([dead_row("gate_evaluation_sweep", true, false)]),
-        );
+        let b_dead = ledger_body(1, json!([dead_row("gate_evaluation_sweep", true, false)]));
         let mut state = ObserverState::default();
         state.observe(&classify_ledger(&a_dead));
         state.take_cleared();
