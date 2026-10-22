@@ -4,9 +4,9 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 188
+# total: 189
 #   guarded: 22
-#   literal: 65
+#   literal: 66
 #   registry: 44
 #   delegated: 9
 #   builtin: 15
@@ -57,12 +57,13 @@ src/components/settings/Settings.tsx:169	literal	component	reset	schema=no	arity
 src/components/settings/Settings.tsx:191	guarded	component	switch-tab	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx:223	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no	arity=0	effect=-
-src/components/terminal/RestartPrepPanel.tsx:184	literal	component	prepare	schema=no	arity=0	effect=destructive
-src/components/terminal/RestartPrepPanel.tsx:276	literal	component	toggle	schema=no	arity=0	effect=write
-src/components/terminal/RestartPrepPanel.tsx:431	literal	component	refresh	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:439	literal	component	close	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:459	literal	component	cancel	schema=no	arity=0	effect=destructive
-src/components/terminal/RestartPrepPanel.tsx:483	literal	component	extend	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:186	literal	component	prepare	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:280	literal	component	toggle	schema=no	arity=0	effect=write
+src/components/terminal/RestartPrepPanel.tsx:441	literal	component	refresh	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:449	literal	component	close	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:469	literal	component	cancel	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:493	literal	component	extend	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:516	literal	component	dismiss	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:344	literal	component	resume-selected	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:355	literal	component	capture-now	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx:365	literal	component	refresh	schema=no	arity=0	effect=read

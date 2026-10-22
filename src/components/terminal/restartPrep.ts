@@ -317,8 +317,18 @@ export function blockerLine(b: Blocker): string {
   return `${b.display_name?.trim() || b.session || "prepare"} — ${b.reason}`;
 }
 
-/** The text and tone of a row's state chip, from what the backend observed. */
-export function rowStateChip(row: CohortRow): { text: string; tone: "ok" | "wait" | "unknown" } {
+/**
+ * The text and tone of a row's state chip, from what the backend observed.
+ *
+ * `recordState` is the prepare's state: the notice loop reads `pause_state`
+ * only while the prepare is in its window, so outside it (after a restart, or
+ * a cancel) that value is the LAST reading, not a current one, and is shown
+ * as such — a dead session never reads "paused" in green.
+ */
+export function rowStateChip(
+  row: CohortRow,
+  recordState?: PrepState,
+): { text: string; tone: "ok" | "wait" | "unknown" } {
   if (row.restore) {
     const v = row.restore.verdict;
     const tone =
@@ -326,6 +336,15 @@ export function rowStateChip(row: CohortRow): { text: string; tone: "ok" | "wait
     return { text: `restore: ${v}`, tone };
   }
   const s = row.pause_state;
+  if (recordState === "restoring") {
+    return {
+      text: `waiting to be restored${s ? ` (was ${s.replace(/_/g, " ")})` : ""}`,
+      tone: "wait",
+    };
+  }
+  if (recordState === "cancelled" || recordState === "done") {
+    return { text: s ? `last read: ${s.replace(/_/g, " ")}` : "not read", tone: "unknown" };
+  }
   if (!s) return { text: "unknown: not read yet", tone: "unknown" };
   if (s === "unknown") return { text: "unknown", tone: "unknown" };
   const text = s.replace(/_/g, " ");
@@ -370,6 +389,7 @@ export interface RestartPrepSnapshot {
   prepare: ActionState;
   cancel: ActionState;
   extend: ActionState;
+  dismiss: ActionState;
   /**
    * Why the `restart-prep-changed` listener could not be set up, or `null`.
    * Without it the panel shows only what each read and action returned, and
@@ -406,6 +426,12 @@ export interface RestartPrepStore {
   cancel(): Promise<PrepChanged>;
   /** Extend the spawn hold's `until` by 6 h (re-sent to coord as the same hold). */
   extend(): Promise<PrepChanged>;
+  /**
+   * Dismiss a rebuilt runner's restore of the cohort (`restoring` → `done`):
+   * its waiting rows stop being placeholders and go to Past Sessions. What
+   * ends a restore the operator will not finish, and frees the next prepare.
+   */
+  dismiss(): Promise<PrepareRecord>;
   /** The held toggle: hold a row for a hand restore, or release it. */
   setHeld(claudeSessionId: string, held: boolean): Promise<PrepareRecord>;
   openPanel(): { changed: boolean };
@@ -422,6 +448,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     prepare: IDLE,
     cancel: IDLE,
     extend: IDLE,
+    dismiss: IDLE,
     eventsError: null,
     held: {},
   };
@@ -503,6 +530,10 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
           listening = false;
         } else {
           stopListening = stop;
+          // Read again now that nothing can slip past: a change emitted
+          // between the first read and this registration was announced to
+          // nobody, and a settled prepare may not announce again.
+          void refresh();
         }
       })
       .catch((err) => {
@@ -566,6 +597,34 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     return run;
   };
 
+  const dismiss = async (): Promise<PrepareRecord> => {
+    const record = snap.record;
+    if (!record || record.state !== "restoring") {
+      const message = "no restore is waiting — nothing to dismiss";
+      set({ dismiss: { phase: "failed", message } });
+      throw new Error(message);
+    }
+    if (snap.dismiss.phase === "in-flight") throw new Error("the dismiss is already in flight");
+    set({ dismiss: { phase: "in-flight" } });
+    const seq = eventSeq;
+    try {
+      const reply = asPrepareRecord(
+        await deps.invoke("restart_prep_dismiss", { prepareId: record.prepare_id }),
+      );
+      if (!reply) throw new Error("the dismiss reply came back in an unrecognized shape");
+      if (eventSeq === seq && snap.record?.prepare_id === reply.prepare_id) {
+        set({ record: reply });
+      }
+      if (reply.state !== "done") throw new Error(`the record reads ${reply.state}, not done`);
+      set({ dismiss: { phase: "done", message: "dismissed" } });
+      return reply;
+    } catch (err) {
+      const message = describeThrown(err, "the dismiss failed");
+      set({ dismiss: { phase: "failed", message } });
+      throw new Error(message, { cause: err });
+    }
+  };
+
   const setHeld = async (claudeSessionId: string, held: boolean): Promise<PrepareRecord> => {
     const record = snap.record;
     const mark = (s: ActionState): void => set({ held: { ...snap.held, [claudeSessionId]: s } });
@@ -615,6 +674,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     prepare: (reason = "") => runAction("prepare", "restart_prep_prepare", { reason }),
     cancel: () => runAction("cancel", "restart_prep_cancel"),
     extend: () => runAction("extend", "restart_prep_extend"),
+    dismiss,
     setHeld,
     openPanel() {
       const changed = !snap.panelOpen;

@@ -42,6 +42,7 @@ function snapshot(over: Partial<RestartPrepSnapshot> = {}): RestartPrepSnapshot 
     prepare: { phase: "idle" },
     cancel: { phase: "idle" },
     extend: { phase: "idle" },
+    dismiss: { phase: "idle" },
     eventsError: null,
     held: {},
     ...over,
@@ -65,6 +66,7 @@ function frozenStore(snap: RestartPrepSnapshot): RestartPrepStore & {
     prepare: never,
     cancel: never,
     extend: never,
+    dismiss: never,
     setHeld: never,
     openPanel: () => ({ changed: false }),
     closePanel: () => {},
@@ -316,5 +318,32 @@ describe("the panel says what it cannot see", () => {
     const html = renderPanel(snap);
     expect(html).toContain('data-headline-kind="unknown"');
     expect(html).not.toContain(READY_HEADLINE);
+  });
+});
+
+describe("a rebuilt runner's waiting restore", () => {
+  it("offers Dismiss (destructive) and never shows a pre-restart chip as current", () => {
+    registered.length = 0;
+    const rec = record({
+      state: "restoring",
+      cohort: {
+        captured_at_ms: 1,
+        captured_at: "",
+        reason: "",
+        rows: [row("s1", { pause_state: "paused" })],
+      },
+    });
+    const html = renderPanel(snapshot({ record: rec }));
+    expect(html).toContain('data-ui-bridge-id="terminal.restart-prep-dismiss"');
+    expect(html).toContain("waiting to be restored (was paused)");
+    expect(html).not.toContain('data-ui-bridge-id="terminal.restart-prep-cancel"');
+    const dismiss = registered.find((c) => c.id === "terminal.restart-prep-dismiss");
+    expect(dismiss?.actions).toEqual([
+      expect.objectContaining({ id: "dismiss", effect: "destructive" }),
+    ]);
+    // Not offered while the prepare is running.
+    expect(renderPanel(snapshot())).not.toContain(
+      'data-ui-bridge-id="terminal.restart-prep-dismiss"',
+    );
   });
 });

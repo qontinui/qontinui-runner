@@ -31,6 +31,7 @@ import {
   rowStateChip,
   type ActionState,
   type CohortRow,
+  type PrepState,
   type RestartPrepSnapshot,
   type RestartPrepStore,
 } from "./restartPrep";
@@ -39,6 +40,7 @@ export const PREPARE_RESTART_BUTTON_ID = "terminal.prepare-restart-button";
 export const RESTART_PREP_PANEL_ID = "terminal.restart-prep-panel";
 export const RESTART_PREP_CANCEL_ID = "terminal.restart-prep-cancel";
 export const RESTART_PREP_EXTEND_ID = "terminal.restart-prep-extend";
+export const RESTART_PREP_DISMISS_ID = "terminal.restart-prep-dismiss";
 export const restartPrepRowId = (sessionId: string): string =>
   `terminal.restart-prep-row-${sessionId}`;
 export const restartPrepHeldId = (sessionId: string): string =>
@@ -244,14 +246,16 @@ function RestartPrepRow({
   heldState,
   canToggle,
   store,
+  recordState,
 }: {
+  recordState: PrepState;
   row: CohortRow;
   heldState: ActionState | undefined;
   canToggle: boolean;
   store: RestartPrepStore;
 }) {
   const id = row.session.claudeSessionId;
-  const chip = rowStateChip(row);
+  const chip = rowStateChip(row, recordState);
   const toggling = heldState?.phase === "in-flight";
   /** Rejects (to a UI Bridge caller) when the toggle cannot act — never a silent no-op. */
   const toggle = (): Promise<unknown> => {
@@ -420,6 +424,12 @@ export function RestartPrepPanel({
     });
   };
   const extendBusy = busy(snap.extend);
+  const restoring = rec?.state === "restoring";
+  const dismissBusy = busy(snap.dismiss);
+  const dismiss = (): Promise<unknown> =>
+    restoring
+      ? store.dismiss()
+      : Promise.reject(new Error("no restore is waiting — nothing to dismiss"));
 
   useUIComponent({
     id: RESTART_PREP_PANEL_ID,
@@ -496,6 +506,33 @@ export function RestartPrepPanel({
     },
   });
 
+  useUIComponent({
+    id: RESTART_PREP_DISMISS_ID,
+    name: "Dismiss the waiting restore",
+    description:
+      "End a rebuilt runner's restore of the prepared sessions: the ones still waiting stop being " +
+      "placeholders and go to Past Sessions (resumable by hand there), and a new prepare may start.",
+    actions: [
+      {
+        id: "dismiss",
+        label: "Dismiss",
+        description: "Dismiss the sessions still waiting to be restored.",
+        // `destructive` (CONTRACT.md Dim 1): the waiting placeholders lose the
+        // shield that keeps them from the orphan close, and dismissing cannot be
+        // undone — the sessions come back only by hand from Past Sessions.
+        effect: "destructive",
+        handler: () => dismiss(),
+      },
+    ],
+    state: () => {
+      const now = store.getSnapshot();
+      return {
+        phase: now.dismiss.phase,
+        enabled: now.record?.state === "restoring" && !busy(now.dismiss),
+      };
+    },
+  });
+
   const headlineClass =
     headline?.kind === "ready"
       ? "text-[#9ece6a]"
@@ -546,7 +583,7 @@ export function RestartPrepPanel({
         </div>
       )}
 
-      {snap.prepare.phase === "failed" && (
+      {snap.prepare.phase === "failed" && !active && (
         <div className="px-2 pb-1 text-[#f7768e]">
           Prepare failed: {snap.prepare.message ?? "unknown error"}
         </div>
@@ -600,8 +637,31 @@ export function RestartPrepPanel({
           heldState={snap.held[row.session.claudeSessionId]}
           canToggle={canToggle}
           store={store}
+          recordState={rec.state}
         />
       ))}
+
+      {restoring && (
+        <div className="flex items-center gap-2 px-2 py-1 border-t border-[#2a2d3d]">
+          <button
+            type="button"
+            data-ui-bridge-id={RESTART_PREP_DISMISS_ID}
+            data-dismiss-phase={snap.dismiss.phase}
+            disabled={dismissBusy}
+            onClick={() => swallow(dismiss())}
+            className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#f7768e] bg-[#f7768e]/10 hover:bg-[#f7768e]/20 disabled:opacity-60 disabled:cursor-wait"
+          >
+            {dismissBusy && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
+            {dismissBusy ? "Dismissing…" : "Dismiss the waiting restore"}
+          </button>
+          <span className="text-[#565f89]">
+            Sessions not yet restored go to Past Sessions, resumable by hand.
+          </span>
+          {snap.dismiss.phase === "failed" && (
+            <span className="text-[#f7768e]">{snap.dismiss.message}</span>
+          )}
+        </div>
+      )}
 
       {active && (
         <div className="flex items-center gap-2 px-2 py-1 border-t border-[#2a2d3d]">

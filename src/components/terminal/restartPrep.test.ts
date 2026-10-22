@@ -215,7 +215,7 @@ describe("the store", () => {
     expect(store.getSnapshot().prepare).toEqual({ phase: "failed", message: "coord unreachable" });
   });
 
-  it("listens to restart-prep-changed instead of polling, and reads once on mount", async () => {
+  it("listens to restart-prep-changed instead of polling", async () => {
     const f = fakeDeps((cmd) =>
       Promise.resolve(cmd === "restart_prep_status" ? { record: null, view: null } : null),
     );
@@ -224,7 +224,9 @@ describe("the store", () => {
     const releaseAgain = store.retain();
     await Promise.resolve();
     await Promise.resolve();
-    expect(f.calls.map(([c]) => c)).toEqual(["restart_prep_status"]);
+    // One read on mount, one more once the listener is registered — and no
+    // more after that: the events carry every change.
+    expect(f.calls.map(([c]) => c)).toEqual(["restart_prep_status", "restart_prep_status"]);
     expect(store.getSnapshot().loaded).toBe(true);
     f.emit(changed(record({ verdict: verdict({ ready_to_restart: true }) })));
     expect(store.getSnapshot().record?.verdict?.ready_to_restart).toBe(true);
@@ -347,6 +349,51 @@ describe("the store", () => {
     await store.refresh();
     await expect(store.setHeld("s1", true)).rejects.toThrow("does not show the change");
     expect(store.getSnapshot().held.s1?.phase).toBe("failed");
+  });
+
+  it("reads again once the listener is registered, so a change in the gap is not lost", async () => {
+    let registered!: () => void;
+    let state: "preparing" | "ready" = "preparing";
+    const reads: string[] = [];
+    const store = createRestartPrepStore({
+      invoke: async (cmd) => {
+        expect(cmd).toBe("restart_prep_status");
+        const rec = record({ state });
+        reads.push(state);
+        return { record: rec, view: changed(rec).view };
+      },
+      listen: () =>
+        new Promise((resolve) => {
+          registered = () => resolve(() => {});
+        }),
+    });
+    store.retain();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(store.getSnapshot().record?.state).toBe("preparing");
+    // The backend moved on before the listener was up: nobody heard it.
+    state = "ready";
+    registered();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(reads).toEqual(["preparing", "ready"]);
+    expect(store.getSnapshot().record?.state).toBe("ready");
+  });
+
+  it("dismisses only a waiting restore, and reads the record back as done", async () => {
+    const restoring = record({ state: "restoring" });
+    const f = fakeDeps(async (cmd, args) => {
+      if (cmd === "restart_prep_status")
+        return { record: restoring, view: changed(restoring).view };
+      expect(cmd).toBe("restart_prep_dismiss");
+      expect(args).toEqual({ prepareId: "prep-1" });
+      return { ...restoring, state: "done" };
+    });
+    const store = createRestartPrepStore(f.deps);
+    await store.refresh();
+    await store.dismiss();
+    expect(store.getSnapshot().record?.state).toBe("done");
+    expect(store.getSnapshot().dismiss).toEqual({ phase: "done", message: "dismissed" });
+    await expect(store.dismiss()).rejects.toThrow("nothing to dismiss");
+    expect(f.calls.filter(([c]) => c === "restart_prep_dismiss")).toHaveLength(1);
   });
 
   it("a listener that cannot be set up is reported, not silent", async () => {

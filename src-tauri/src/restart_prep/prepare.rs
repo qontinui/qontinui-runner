@@ -954,6 +954,15 @@ impl RestartPrep {
         let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
             return Err("no prepare is in progress — nothing to extend".to_string());
         };
+        // The hold waits for a rebuild (D1). A rebuilt runner whose boot
+        // release did not settle owes a release, never a longer drain.
+        if rec.prepared_build != running_build() {
+            return Err(
+                "this runner was rebuilt since the prepare — release the hold rather than \
+                 extending it"
+                    .to_string(),
+            );
+        }
         let from = rec.hold_until_ms.unwrap_or(now_ms).max(now_ms);
         let until = (from + DEFAULT_HOLD_MS).min(now_ms + MAX_HOLD_MS);
         if rec.hold_until_ms.is_some_and(|u| until <= u) {
@@ -2205,6 +2214,25 @@ mod tests {
         }
         assert_eq!(last.hold_until_ms, Some(now + MAX_HOLD_MS));
         assert!(ctl.extend(&*door, now).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_prep_extend_refuses_on_a_rebuilt_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Confirmed,
+            T0 + DEFAULT_HOLD_MS,
+        );
+        let door = MockDoor::primary();
+        let err = ctl.extend(&*door, T0).await.unwrap_err();
+        assert!(err.contains("rebuilt"), "{err}");
+        assert_eq!(door.hold_count(), 0, "no longer drain is requested");
+        assert_eq!(
+            ctl.record().unwrap().hold_until_ms,
+            Some(T0 + DEFAULT_HOLD_MS)
+        );
     }
 
     #[tokio::test]
