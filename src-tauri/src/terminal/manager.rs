@@ -2001,7 +2001,9 @@ mod handoff_e2e {
         std::thread::spawn(move || {
             let _ = tx.send(waiting.wait());
         });
-        rx.recv_timeout(Duration::from_secs(10))
+        // The code is the kill's; only that the wait settled matters here.
+        let _killed_exit = rx
+            .recv_timeout(Duration::from_secs(10))
             .expect("the killed LocalPty child exits");
         assert!(!alive(local_pid), "the LocalPty child is gone");
         for (_, child, _) in &before {
