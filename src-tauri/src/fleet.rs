@@ -45,6 +45,12 @@ use qontinui_runner_lib::profiles::connected_coord_base;
 
 use crate::database::pg::PgDb;
 
+/// The `svc:imagegen` host probe: a cached, bounded `GET /v1/models` of the
+/// local llama-swap, advertising the token only when an entry DECLARES image
+/// output (plan `2026-10-13-image-generation-and-visual-judgment`, Phase 25).
+/// Appended in [`host_capabilities`].
+pub(crate) mod imagegen_probe;
+
 /// Per-machine resource samples (plan §A1/§A2). Driven from
 /// [`spawn_budget_republisher`] so it inherits that function's
 /// shared-machine-state ownership gate instead of restating it — see the
@@ -1567,18 +1573,27 @@ fn slow_host_probes() -> SlowHostProbes {
 }
 
 /// The probed host-fact capability set — `os:*`, `runtime:*`, the webview
-/// token. Deliberately WITHOUT the credential-presence family: that one is
-/// joined in [`heartbeat_capabilities`] only, so a caller asking for host facts
-/// (tests among them) can never start a live `gh` / `aws` probe.
+/// token, plus `svc:imagegen` when the local image upstream declares an
+/// image-output model ([`imagegen_probe`]; plan
+/// `2026-10-13-image-generation-and-visual-judgment`, Phase 25). Deliberately
+/// WITHOUT the credential-presence family: that one is joined in
+/// [`heartbeat_capabilities`] only, so a caller asking for host facts (tests
+/// among them) can never start a live `gh` / `aws` probe.
+///
+/// The image probe is an HTTP request on a cache miss, so this function
+/// BLOCKS: the heartbeat assembles its capability base
+/// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
     let slow = slow_host_probes();
-    build_host_capabilities(
+    let mut caps = build_host_capabilities(
         current_os_label(),
         slow.powershell,
         slow.docker,
         webview_runtime_available(),
         host_mem_total_bytes(),
-    )
+    );
+    caps.extend(imagegen_probe::capability_tokens());
+    caps
 }
 
 /// The heartbeat's host capability set: [`host_capabilities`] plus the
@@ -1823,6 +1838,9 @@ static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
 /// heartbeat then appends the skill tokens ([`skill_capability_tokens`]),
 /// which depend on its bearer. Its own function so the heartbeat's exact
 /// expression is what the seam test exercises.
+///
+/// BLOCKS on a host-probe cache miss (via [`host_capabilities`]), so the
+/// heartbeat runs it on the blocking pool, never inline on its async worker.
 fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
     build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
 }
@@ -3065,7 +3083,22 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     itself retractable, so a stale label set left behind by a device that
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let mut capabilities = heartbeat_device_capabilities(ci.enabled, &ci.repo_allowlist);
+    // The host probes block (a `docker version` fork, and on a cache miss a
+    // bounded `GET /v1/models` of the image upstream), so the capability base
+    // is assembled on the blocking pool rather than on this async task's
+    // worker. A join failure (a panicking probe) still advertises the CI tokens
+    // and the OS fact, the one host token that needs no probe.
+    let (ci_enabled, repo_allowlist) = (ci.enabled, ci.repo_allowlist.clone());
+    let mut capabilities =
+        spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
+            .await
+            .unwrap_or_else(|_| {
+                build_device_capabilities(
+                    ci.enabled,
+                    &ci.repo_allowlist,
+                    &[format!("os:{}", current_os_label())],
+                )
+            });
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
     // heartbeat presents is a live device JWT.
@@ -9090,7 +9123,8 @@ mod tests {",
     ///
     /// Enters exactly where the population enters: the capability vector
     /// `heartbeat_to_coord` puts on the register payload is
-    /// `heartbeat_device_capabilities(ci.enabled, &ci.repo_allowlist)`, and
+    /// `heartbeat_device_capabilities(ci_enabled, &repo_allowlist)` (copies of
+    /// the CI-node settings, run on the blocking pool), and
     /// this test calls that same function (CI-node off and on) with the
     /// family cache seeded as a
     /// finished probe run would leave it. It never runs a probe: the cache is
@@ -9876,6 +9910,67 @@ Add-Content -LiteralPath $Out -Value $lines
             caps,
             vec!["os:linux", "probes:cred"],
             "unknown for a whole TTL drops the token; the marker stays"
+        );
+    }
+
+    /// `svc:imagegen` rides the heartbeat's host set exactly when the image
+    /// probe's verdict is positive (plan
+    /// `2026-10-13-image-generation-and-visual-judgment`, Phase 25). The
+    /// verdict is forced on this test's thread, so this pins the WIRING into
+    /// `host_capabilities`, independent of whether this host runs llama-swap;
+    /// the probe's own verdicts are tested in `fleet::imagegen_probe`.
+    #[test]
+    fn host_capabilities_append_the_imagegen_probe() {
+        let token = imagegen_probe::IMAGEGEN_CAPABILITY;
+        imagegen_probe::force_verdict_for_test(Some(true));
+        let with = host_capabilities();
+        imagegen_probe::force_verdict_for_test(Some(false));
+        let without = host_capabilities();
+        imagegen_probe::force_verdict_for_test(None);
+        assert!(
+            with.iter().any(|c| c == token),
+            "a positive image probe must advertise {token}, got {with:?}"
+        );
+        assert!(
+            !without.iter().any(|c| c == token),
+            "a negative image probe must advertise nothing, got {without:?}"
+        );
+        assert!(
+            with.iter()
+                .any(|c| c == &format!("os:{}", current_os_label())),
+            "the token is appended to the host facts, never in place of them"
+        );
+        // And it reaches the heartbeat's vector whether or not CI-node mode is on.
+        for ci in [false, true] {
+            assert!(build_device_capabilities(ci, &[], &with)
+                .iter()
+                .any(|c| c == token));
+        }
+    }
+
+    /// The heartbeat runs the host probes on the blocking pool, never inline
+    /// on its async worker: `host_capabilities` blocks on a cache miss (a
+    /// `docker version` fork, the image probe's HTTP request), and the
+    /// heartbeat reaches it through `heartbeat_device_capabilities`. A source
+    /// contract, because a blocking call inline in an async fn compiles and
+    /// passes every behavioural test while it stalls a runtime worker.
+    #[test]
+    fn heartbeat_runs_the_host_probes_on_the_blocking_pool() {
+        let src = include_str!("fleet.rs");
+        let (_, from_fn) = src
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
+        assert!(
+            body.contains("spawn_blocking_tracked(move || heartbeat_device_capabilities("),
+            "heartbeat_to_coord must assemble its capability base via spawn_blocking_tracked"
+        );
+        assert!(
+            !body.contains("host_capabilities()")
+                && !body.contains("heartbeat_device_capabilities(ci.enabled"),
+            "heartbeat_to_coord must not run the host probes inline"
         );
     }
 
