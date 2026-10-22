@@ -60,11 +60,11 @@ src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no
 src/components/terminal/RestartPrepPanel.tsx:216	literal	component	open-panel	schema=no	arity=0	effect=read
 src/components/terminal/RestartPrepPanel.tsx:224	literal	component	prepare	schema=no	arity=0	effect=destructive
 src/components/terminal/RestartPrepPanel.tsx:323	literal	component	toggle	schema=no	arity=0	effect=write
-src/components/terminal/RestartPrepPanel.tsx:508	literal	component	refresh	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:516	literal	component	close	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:536	literal	component	cancel	schema=no	arity=0	effect=destructive
-src/components/terminal/RestartPrepPanel.tsx:563	literal	component	extend	schema=no	arity=0	effect=destructive
-src/components/terminal/RestartPrepPanel.tsx:586	literal	component	dismiss	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:507	literal	component	refresh	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:515	literal	component	close	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:535	literal	component	cancel	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:562	literal	component	extend	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:585	literal	component	dismiss	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:344	literal	component	resume-selected	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:355	literal	component	capture-now	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx:365	literal	component	refresh	schema=no	arity=0	effect=read

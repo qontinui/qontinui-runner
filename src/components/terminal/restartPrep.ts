@@ -288,7 +288,10 @@ export function restartPrepHeadline({
       blockers: [],
     };
   }
-  const blockers = Array.isArray(verdict.blockers) ? verdict.blockers : [];
+  if (!Array.isArray(verdict.blockers)) {
+    return { kind: "unknown", text: "UNKNOWN: the verdict's blockers (unreadable)", blockers: [] };
+  }
+  const blockers = verdict.blockers;
   if (view && view.verdict_current !== true) {
     return {
       kind: "unknown",
@@ -403,6 +406,8 @@ export interface ActionState {
 }
 
 const IDLE: ActionState = { phase: "idle" };
+
+const MALFORMED_EVENT = "a restart-prep-changed event came in an unrecognized shape";
 
 /** The hold labels (`HoldStatus::label`) under which spawns are held as asked. */
 const HELD_LABELS = new Set(["confirmed", "local", "local (secondary)"]);
@@ -519,9 +524,11 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     if (!changed) {
       // Never applied half-read — and never silently: the panel would keep
       // showing the old state as if it were live.
-      set({ eventsError: "a restart-prep-changed event came in an unrecognized shape" });
+      set({ eventsError: MALFORMED_EVENT });
       return;
     }
+    // A good event after a malformed one: the channel is live again.
+    if (snap.eventsError === MALFORMED_EVENT) set({ eventsError: null });
     eventSeq += 1;
     applyChanged(changed);
   };
@@ -630,9 +637,12 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         if (action === "extend" && !HELD_LABELS.has(reply.view.hold)) {
           // The backend extended only the runner-local backstop: coord did
           // not take the new deadline, so its drain still ends where it did.
+          // "Did not confirm", never "did not extend": a read-back miss or a
+          // timeout can follow a write that landed. What IS known: the
+          // runner-local backstop holds spawns to the new expiry.
           throw new Error(
-            `coord did not extend the hold (hold ${reply.view.hold}); only the runner-local ` +
-              `hold now runs to ${reply.record.hold_until ?? "?"} — Extend again to retry`,
+            `coord did not confirm the extension (hold ${reply.view.hold}); the runner-local ` +
+              `hold keeps spawns held to ${reply.record.hold_until ?? "?"} — Extend again to retry`,
           );
         }
         const expiry =

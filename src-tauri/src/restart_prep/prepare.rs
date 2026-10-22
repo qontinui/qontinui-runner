@@ -925,10 +925,13 @@ impl RestartPrep {
         // keeps them from the orphan close, the held marks and the restore
         // verdicts all live in this record. A new prepare would overwrite it.
         if let Some(rec) = self.record().filter(|r| r.state == PrepState::Restoring) {
+            // The rows NOT yet back — restored ones are no longer waiting.
+            let waiting = super::restore::RestoringCohort::of(&rec)
+                .map(|c| c.ids().len())
+                .unwrap_or(0);
             return Err(format!(
-                "the last prepare's sessions ({}) are still waiting to be restored — restore \
-                 or dismiss them before preparing again",
-                rec.cohort.rows.len()
+                "the last prepare's sessions ({waiting}) are still waiting to be restored — \
+                 restore or dismiss them before preparing again"
             ));
         }
         // A fresh prepare is not the one a past same-build boot saw: the flag

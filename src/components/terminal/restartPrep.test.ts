@@ -91,6 +91,12 @@ describe("restartPrepHeadline — exactly one of three readings", () => {
     expect(read(record({ verdict: verdict({ ready_to_restart: false }) }))?.kind).toBe("unknown");
   });
 
+  it("is UNKNOWN when the verdict's blockers cannot be read", () => {
+    const bad = verdict({ ready_to_restart: true });
+    (bad as unknown as { blockers: unknown }).blockers = "nonsense";
+    expect(read(record({ verdict: bad }))?.kind).toBe("unknown");
+  });
+
   it("headlines nothing when no prepare is in its window", () => {
     expect(read(null)).toBeNull();
     for (const state of ["restoring", "done", "cancelled"] as const) {
@@ -441,11 +447,9 @@ describe("the store", () => {
     };
     const f = fakeDeps(async () => reply);
     const store = createRestartPrepStore(f.deps);
-    await expect(store.extend()).rejects.toThrow("coord did not extend the hold");
+    await expect(store.extend()).rejects.toThrow("coord did not confirm the extension");
     expect(store.getSnapshot().extend.phase).toBe("failed");
-    expect(store.getSnapshot().extend.message).toContain(
-      "only the runner-local hold now runs to T+12h",
-    );
+    expect(store.getSnapshot().extend.message).toContain("keeps spawns held to T+12h");
     // The record still shows what the backend holds.
     expect(store.getSnapshot().record?.hold_until).toBe("T+12h");
   });
@@ -476,6 +480,9 @@ describe("the store", () => {
     await Promise.resolve();
     f.emit({ record: { nonsense: true } });
     expect(store.getSnapshot().eventsError).toMatch(/unrecognized shape/);
+    // The next good event clears it: the channel is live again.
+    f.emit(changed(record()));
+    expect(store.getSnapshot().eventsError).toBeNull();
   });
 
   it("a listener that cannot be set up is reported, not silent", async () => {

@@ -448,7 +448,6 @@ export function panelStateOf(snap: RestartPrepSnapshot): Record<string, unknown>
     headlineKind: headline?.kind ?? null,
     state: snap.record?.state ?? null,
     hold: snap.view?.hold ?? null,
-    // `null` while unread — never a count of zero.
     // `null` while unread, and for no readable record — never a count of zero.
     rows: snap.loaded && snap.readError === null ? (snap.record?.cohort.rows.length ?? null) : null,
     listenerError: snap.eventsError,
