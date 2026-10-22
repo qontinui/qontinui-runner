@@ -372,7 +372,7 @@ fn sdk_arm_payloads(
         WaitBudget::SdkDispatch,
         WaitFill::EngineDirect,
     )?;
-    Ok(ArmPayloads::per_arm(websocket, http))
+    Ok(ArmPayloads::PerArm { websocket, http })
 }
 
 /// `/sdk/` POST bodies: validated, a caller's `decodeTimeoutMs` held to the
