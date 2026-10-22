@@ -62,7 +62,11 @@ export interface ErrorBannerState {
 
 export type ErrorBannerAction =
   | { type: "received"; error: ErrorEventPayload; at: number }
-  | { type: "dismissed"; errorCode: string }
+  /**
+   * Dismiss one banner. `slot` says WHICH: an `info` and a fault may share a
+   * code, and dismissing one must never act on the other.
+   */
+  | { type: "dismissed"; errorCode: string; slot: "info" | "fault" }
   | { type: "reopened"; errorCode: string }
   | { type: "cleared"; errorCode: string }
   /**
@@ -75,7 +79,11 @@ export type ErrorBannerAction =
 
 /** What renders: full banners in flow, and residual chips in the status bar. */
 export interface ErrorBannerView {
-  banners: ErrorEventPayload[];
+  /** Undismissed faults, each an in-flow banner. */
+  faults: ErrorEventPayload[];
+  /** The transient `info`, if one is up: its own banner, never a fault's. */
+  info: ErrorEventPayload | null;
+  /** Dismissed faults, each a status-bar chip. */
   residuals: TrackedFault[];
 }
 
@@ -93,12 +101,22 @@ export function errorBannerReducer(
       const code = action.error.error_code;
       const existing = state.faults.find((f) => f.error.error_code === code);
       if (existing) {
-        // A re-report of a tracked fault: refresh what it says, keep its
-        // dismissal (a re-report is not a new fault).
+        // A re-report of a tracked fault: refresh what it says. An identical
+        // re-report keeps its dismissal (it is not a new fault); one whose
+        // message CHANGED re-opens the banner. One code can cover several
+        // instances (COORD_LIVENESS_WORKER_DEAD names the worker in its
+        // message), and a second worker dying is news.
+        const reopen = existing.error.message !== action.error.message;
         return {
           ...state,
           faults: state.faults.map((f) =>
-            f === existing ? { ...f, error: action.error, lastSeenAt: action.at } : f,
+            f === existing
+              ? {
+                  error: action.error,
+                  lastSeenAt: action.at,
+                  dismissed: reopen ? false : f.dismissed,
+                }
+              : f,
           ),
         };
       }
@@ -108,8 +126,10 @@ export function errorBannerReducer(
       };
     }
     case "dismissed":
-      if (state.info && state.info.error.error_code === action.errorCode) {
-        return { ...state, info: null };
+      if (action.slot === "info") {
+        return state.info && state.info.error.error_code === action.errorCode
+          ? { ...state, info: null }
+          : state;
       }
       return setDismissed(state, action.errorCode, true);
     case "reopened":
@@ -145,9 +165,11 @@ function setDismissed(
 }
 
 export function errorBannerView(state: ErrorBannerState): ErrorBannerView {
-  const banners = state.faults.filter((f) => !f.dismissed).map((f) => f.error);
-  if (state.info) banners.push(state.info.error);
-  return { banners, residuals: state.faults.filter((f) => f.dismissed) };
+  return {
+    faults: state.faults.filter((f) => !f.dismissed).map((f) => f.error),
+    info: state.info ? state.info.error : null,
+    residuals: state.faults.filter((f) => f.dismissed),
+  };
 }
 
 /** The dismiss control's accessible name — the button carries only an icon. */

@@ -120,10 +120,12 @@ describe("StatusIndicator error banner", () => {
     await act(async () => emit("error", NO_LEADER));
     await act(async () => dismiss()!.click());
     await act(async () => emit("error", INFO));
+    const info = () => host.querySelector('[data-ui-bridge-id="app-error-banner-info-INFO_SAVED"]');
+    expect(info()).not.toBeNull();
     await act(async () => {
       vi.advanceTimersByTime(5000);
     });
-    expect(host.querySelector('[data-ui-bridge-id="app-error-banner-INFO_SAVED"]')).toBeNull();
+    expect(info()).toBeNull();
     expect(residual()).not.toBeNull();
   });
 });
