@@ -488,6 +488,16 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
     project_dir(config_dir, project_path, Some(session_id)).join(format!("{}.jsonl", session_id))
 }
 
+/// The session's side-car directory `<config_dir>/projects/<enc>/<session_id>/`
+/// (subagent transcripts, `tool-results/`, `custom-title.json`), whether or not
+/// it exists. Derived from [`session_transcript_path`] with `.jsonl` dropped,
+/// so the two path rules cannot drift.
+pub fn session_sidecar_dir(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
+    let mut path = session_transcript_path(config_dir, project_path, session_id);
+    path.set_file_name(session_id);
+    path
+}
+
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────
 //
 // The `--resume` name a user actually sees is NOT the first-message preview

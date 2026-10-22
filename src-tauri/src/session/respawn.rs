@@ -62,7 +62,7 @@
 //! 5. **The transcript, into the TARGET account's project dir**
 //!    (`<config-dir>/projects/<slug>/<sid>.jsonl`, plus its `<sid>/` directory of
 //!    subagent transcripts, best-effort). Local copy first — reusing
-//!    [`crate::terminal::account_migration::copy_transcript`] verbatim — then
+//!    [`crate::terminal::session_carry::copy_transcript`] verbatim — then
 //!    coord's warm→cold `?stream=transcript` tier for the cross-machine case.
 //!    Neither yielding bytes is a hard failure: `--resume` against a
 //!    non-existent transcript would start an EMPTY conversation wearing the
@@ -426,7 +426,7 @@ fn resolve_working_dir(
 /// afterwards (copied now, or already there), `Ok(false)` when no local dir
 /// holds it.
 ///
-/// Reuses [`crate::terminal::account_migration::copy_transcript`] rather than
+/// Reuses [`crate::terminal::session_carry::copy_transcript`] rather than
 /// re-implementing the copy: same idempotent "skip when the destination is
 /// already at least as large" behaviour, same never-touch-the-source rule, and
 /// the same best-effort carry of the session's `<sid>/` directory (subagent
@@ -480,7 +480,7 @@ fn materialize_from(
         if !candidate.exists() {
             continue;
         }
-        match crate::terminal::account_migration::copy_transcript(
+        match crate::terminal::session_carry::copy_transcript(
             src,
             config_dir,
             working_dir,
