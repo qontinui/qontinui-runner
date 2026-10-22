@@ -2191,11 +2191,21 @@ pub async fn terminal_migrate_session_account(
     let record = store
         .get(&claude_session_id)
         .ok_or_else(|| format!("unknown session: {claude_session_id}"))?;
-    let src = record
-        .config_dir
-        .clone()
-        .or_else(crate::ai_provider::get_resolved_config_dir)
-        .ok_or("the session's current account is unknown — cannot migrate")?;
+    // Which session does the pane PROVABLY run, under which account? Resolved
+    // from the provider's live registry before anything is lifted or spawned
+    // (plan 2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions,
+    // Phase 3). A session live in another process is refused even here; an
+    // unresolved identity falls back to the record, since the click is the
+    // operator's own confirmation.
+    let subject = crate::terminal::account_migration::resolve_migration_subject(
+        &app,
+        &store,
+        &record,
+        crate::terminal::migration_identity::MigrationTrigger::OperatorCommand,
+    )
+    .await
+    .map_err(|reason| format!("migration refused: {reason}"))?;
+    let (record, src) = (subject.record, subject.src_config_dir);
 
     let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
@@ -2218,7 +2228,7 @@ pub async fn terminal_migrate_session_account(
     }
 
     let outcome =
-        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
+        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst, subject.old_writer)
             .await
             .map_err(|e| {
                 // The session never reached `dst`: it must not count as a handoff.
@@ -2231,8 +2241,8 @@ pub async fn terminal_migrate_session_account(
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
-            "migrated session {claude_session_id} to {}",
-            outcome.to_config_dir
+            "migrated session {} to {}",
+            record.claude_session_id, outcome.to_config_dir
         )),
         data: Some(serde_json::json!({
             "newTerminalId": outcome.new_terminal_id,
