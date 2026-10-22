@@ -39,6 +39,7 @@ pub mod network;
 pub mod page;
 pub mod recovery_executor;
 pub mod relay;
+pub mod removed_routes;
 pub mod request;
 pub mod routing;
 pub mod screenshots;
@@ -609,6 +610,252 @@ mod manifest_drift_tests {
         );
     }
 
+    /// The runner-only allow-list of [`sdk_manifest_routes_are_exposed_by_runner`]:
+    /// routes the runner serves that the SDK contract does not declare. Every entry
+    /// must be served — [`runner_only_baseline_entries_are_served`] pins that, so a
+    /// deleted route cannot linger here and silently mask nothing.
+    fn runner_only_baseline() -> HashSet<(&'static str, &'static str)> {
+        // ── Runner-only allow-list ──────────────────────────────────────
+        //
+        // Routes the runner exposes that aren't part of the SDK contract.
+        // Captured here as a *baseline snapshot* of accepted divergence so
+        // this test stays focused on catching NEW drift, not re-litigating
+        // the long tail of pre-existing differences. Two reasons a path
+        // belongs here:
+        //
+        //   (a) Architecturally runner-only — IPC plumbing (`pong`,
+        //       `ipc-response`), Tauri-invoke proxy (`commands`, `invoke/*`),
+        //       discoverability surfaces (`_routes`, `_help`), debug
+        //       analytics (`/analytics/*`, `/explore/*`, `/diagnostics/*`,
+        //       `/circuit-breaker/*`, `/discover-states`, `/history/*`,
+        //       `/graph/*`).
+        //   (b) Pre-existing convenience the runner shipped before the SDK
+        //       documented an equivalent — listed here so the TEST CAN PASS
+        //       today and only flag NEW drift going forward. Promote to
+        //       UI_BRIDGE_ROUTES (and remove from this list) when wiring
+        //       the SDK side.
+        //
+        // The `/control/ai/*` aliases under `/control/` mirror SDK `/ai/*`
+        // routes — `add_dual!` registers both for the same handler. SDK
+        // declares only the `/ai/` form, hence the runner's `/control/ai/`
+        // siblings are intentionally runner-only.
+        [
+            // Runner infrastructure
+            ("GET", "/ui-bridge/_routes"),
+            ("GET", "/ui-bridge/_help"),
+            ("GET", "/ui-bridge/commands"),
+            ("POST", "/ui-bridge/invoke/{}"),
+            // Gated-flow family (mcp/ui_bridge/gated_flow.rs): identity
+            // introspection + the observe-only tier. Runner-only — no SDK
+            // UI_BRIDGE_ROUTES analog.
+            ("GET", "/ui-bridge/session"),
+            ("POST", "/ui-bridge/observe/{}"),
+            ("GET", "/ui-bridge/views"),
+            ("POST", "/ui-bridge/control/view/open"),
+            ("POST", "/ui-bridge/pong"),
+            ("POST", "/ui-bridge/ipc-response"),
+            // Relay-tab protocol (plan 2026-06-12-co-pilot-automation item 6a).
+            // These are relay ADAPTER routes — the SDK serves them from its
+            // nextjs/express adapters, not from UI_BRIDGE_ROUTES, so they are
+            // runner-only from the contract diff's point of view. (POST
+            // /heartbeat IS in UI_BRIDGE_ROUTES and stays out of this list.)
+            ("GET", "/ui-bridge/tabs"),
+            ("GET", "/ui-bridge/commands/stream"),
+            ("POST", "/ui-bridge/commands"),
+            ("POST", "/ui-bridge/relay/dispatch"),
+            // Device-bridge snapshot consumer — capture a cloud-relayed device's
+            // UI Bridge snapshot by deviceId (mcp/ui_bridge/cloud_snapshot.rs).
+            // Runner-only: the SDK contract has no "reach a cloud device by id"
+            // analog — the runner is the relay client that owns the tunnel.
+            ("GET", "/ui-bridge/cloud-devices"),
+            ("GET", "/ui-bridge/cloud-snapshot"),
+            ("GET", "/ui-bridge/cloud-auth-status"),
+            // NOTE: vision/* routes are intentionally NOT in any baseline.
+            // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
+            // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
+            // runner-side. They're aligned on both sides — no allow-list
+            // entry needed. (Earlier commits placed them in sdk_only_baseline
+            // then runner_only_baseline; both were wrong polarity once the
+            // ^0.8.0 bump landed the SDK declarations.)
+            ("POST", "/ui-bridge/batch"),
+            ("POST", "/ui-bridge/control/batch"),
+            ("POST", "/ui-bridge/render-log"),
+            ("POST", "/ui-bridge/control/render-log"),
+            ("POST", "/ui-bridge/control/assert"),
+            ("GET", "/ui-bridge/control/keyboard-shortcuts"),
+            // (b) Document/window-level key dispatch (mcp/ui_bridge/keyboard.rs).
+            // The SDK's `keyboard` action is element-scoped and therefore
+            // cannot fire a global shortcut whose listener is on `window`
+            // (e.g. Ctrl+Shift+B → session-manager sidebar). The runner shipped
+            // the element-free equivalent first because a runner-side route
+            // works immediately, whereas an SDK change reaches nothing until
+            // @qontinui/ui-bridge is published AND consumers bump their pin.
+            //
+            // The SDK side is now wired — but under its OWN path,
+            // `POST /control/page/send-keys` (`sendKeysToPage`, ui-bridge
+            // 912a3e301, 2026-08-20), with a richer contract (combo-string
+            // grammar, `document` default, per-key `outcomes[]`). The runner
+            // exposes that route too (`keyboard.rs`), so it is part of the
+            // bidirectional diff and correctly absent from every allow-list.
+            // `/control/key` stays runner-only: it is the pre-existing
+            // literal-key form and the SDK never declared this path.
+            ("POST", "/ui-bridge/control/key"),
+            ("GET", "/ui-bridge/control/element/{}/tree"),
+            ("POST", "/ui-bridge/control/element/{}/assert"),
+            ("POST", "/ui-bridge/control/batch-actions"),
+            ("POST", "/ui-bridge/circuit-breaker/reset"),
+            // Terminal sessions — runner-only (terminal tabs are a Tauri-host
+            // construct; SDK/web/supervisor consumers don't host PTY tabs).
+            // Pairs with `terminal-launch-menu` component actions.
+            ("GET", "/ui-bridge/control/terminal-sessions"),
+            ("GET", "/ui-bridge/control/terminal-sessions/{}"),
+            // NOTE: /ui-bridge/control/runner-windows was here (runner-only
+            // allow-list) until the SDK declared it in UI_BRIDGE_ROUTES as the
+            // `listWindows` discovery method (plan 2026-06-07-multi-window-sdk-
+            // automation, Phase 2). Now that both sides declare it, it must NOT
+            // be allow-listed — leave it in the bidirectional diff so SDK and
+            // runner stay in lockstep.
+            // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
+            ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
+            ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmark/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmark/{}/diff"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}/diff"),
+            ("GET", "/ui-bridge/control/ai/bookmarks"),
+            ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
+            ("GET", "/ui-bridge/control/ai/change-buffer/size"),
+            ("POST", "/ui-bridge/control/ai/bookmarks"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/disable"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/drain"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/enable"),
+            ("POST", "/ui-bridge/control/ai/execute-with-diff"),
+            ("POST", "/ui-bridge/control/ai/find"),
+            ("POST", "/ui-bridge/control/ai/image-diff"),
+            ("POST", "/ui-bridge/control/ai/scoped-diff"),
+            ("POST", "/ui-bridge/control/ai/search"),
+            ("POST", "/ui-bridge/control/ai/structured-changes"),
+            ("POST", "/ui-bridge/control/ai/summarize-diff"),
+            ("POST", "/ui-bridge/control/ai/wait-for-change"),
+            // /ai/* runner extensions not in SDK contract
+            ("GET", "/ui-bridge/ai/elements/last-discovered"),
+            ("GET", "/ui-bridge/ai/forms"),
+            // NOTE: `/ai/idle-status` was previously in this allow-list
+            // because the SDK only declared `/control/idle-status`. The web
+            // SDK now declares the `/ai/` alias too (alongside `/control/`),
+            // so the route is part of the contract and intentionally omitted
+            // here. Both paths point at the same handler via `add_dual!` at
+            // `errors.rs::routes` — bodies are byte-identical modulo
+            // per-request timestamp/ms-precision drift.
+            ("POST", "/ui-bridge/ai/analyze/data"),
+            ("POST", "/ui-bridge/ai/analyze/regions"),
+            ("POST", "/ui-bridge/ai/analyze/structured-data"),
+            ("POST", "/ui-bridge/ai/design-audit"),
+            ("POST", "/ui-bridge/ai/expect"),
+            ("POST", "/ui-bridge/ai/fill-form"),
+            ("POST", "/ui-bridge/ai/image-diff"),
+            ("POST", "/ui-bridge/ai/media/audit/{}"),
+            // page-summary is a runner-only `/ai/*` read extension (not in the
+            // SDK contract). It accepts GET as well as POST so verification
+            // drivers can read it with GET without tripping the auto-405 →
+            // envelope_audit panic (plan
+            // 2026-06-05-ui-bridge-verification-read-freshness).
+            ("GET", "/ui-bridge/ai/page-summary"),
+            ("POST", "/ui-bridge/ai/page-summary"),
+            ("POST", "/ui-bridge/ai/wait-for-idle"),
+            ("POST", "/ui-bridge/ai/wait-for-navigation"),
+            ("POST", "/ui-bridge/ai/wait-for-route"),
+            // Analytics / debug surfaces (runner-only by design)
+            ("GET", "/ui-bridge/analytics/action-baselines"),
+            ("GET", "/ui-bridge/analytics/annotation-gaps"),
+            ("GET", "/ui-bridge/analytics/decay-curve"),
+            ("GET", "/ui-bridge/analytics/failure-taxonomy"),
+            ("GET", "/ui-bridge/analytics/fragility-heatmap"),
+            ("GET", "/ui-bridge/analytics/health-score"),
+            ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
+            ("GET", "/ui-bridge/analytics/recommendations"),
+            ("GET", "/ui-bridge/analytics/regressions"),
+            ("GET", "/ui-bridge/analytics/stall-frequency"),
+            ("GET", "/ui-bridge/analytics/state-coverage"),
+            ("GET", "/ui-bridge/diagnostics/readiness"),
+            ("GET", "/ui-bridge/explore/results"),
+            ("GET", "/ui-bridge/explore/status"),
+            ("POST", "/ui-bridge/explore"),
+            ("POST", "/ui-bridge/explore/stop"),
+            ("POST", "/ui-bridge/discover-states"),
+            ("GET", "/ui-bridge/graph/element-reliability"),
+            ("GET", "/ui-bridge/history/element/{}"),
+            ("GET", "/ui-bridge/history/elements"),
+            ("GET", "/ui-bridge/history/flaky"),
+            // Runner-side /control/* convenience routes not yet in UI_BRIDGE_ROUTES
+            ("DELETE", "/ui-bridge/control/network/stubs"),
+            ("DELETE", "/ui-bridge/control/network/stubs/{}"),
+            ("GET", "/ui-bridge/control/action-plan/cache"),
+            ("GET", "/ui-bridge/control/action-plan/cache/stats"),
+            ("GET", "/ui-bridge/control/design/evaluate/contexts"),
+            ("GET", "/ui-bridge/control/design/style-guide"),
+            ("GET", "/ui-bridge/control/elements/last-discovered"),
+            ("GET", "/ui-bridge/control/health-signals"),
+            ("GET", "/ui-bridge/control/network/stubs"),
+            ("GET", "/ui-bridge/control/page/playbook"),
+            ("GET", "/ui-bridge/control/spec/{}"),
+            ("GET", "/ui-bridge/control/tabs"),
+            // Tauri-command audit trail — runner-only, no SDK consumer
+            // (mobile / web don't have Tauri commands to record). See
+            // `mcp/ui_bridge/tauri_audit.rs` and `crate::tauri_command_audit`.
+            ("GET", "/ui-bridge/control/tauri-command-history"),
+            ("GET", "/ui-bridge/control/toasts"),
+            ("GET", "/ui-bridge/control/windows"),
+            ("POST", "/ui-bridge/control/action-plan"),
+            ("POST", "/ui-bridge/control/activate-tab/{}"),
+            ("POST", "/ui-bridge/control/annotations"),
+            ("POST", "/ui-bridge/control/capture-element-images"),
+            ("POST", "/ui-bridge/control/clear-storage"),
+            ("POST", "/ui-bridge/control/design/evaluate"),
+            ("POST", "/ui-bridge/control/design/evaluate/baseline"),
+            ("POST", "/ui-bridge/control/design/evaluate/diff"),
+            ("POST", "/ui-bridge/control/design/style-guide/clear"),
+            ("POST", "/ui-bridge/control/design/style-guide/load"),
+            ("POST", "/ui-bridge/control/intents/execute"),
+            ("POST", "/ui-bridge/control/intents/execute-from-query"),
+            ("POST", "/ui-bridge/control/intents/find"),
+            ("POST", "/ui-bridge/control/navigate-and-wait"),
+            ("POST", "/ui-bridge/control/navigate-tab"),
+            ("POST", "/ui-bridge/control/network/stubs"),
+            ("POST", "/ui-bridge/control/network/verify-stub"),
+            // NOTE: `/control/page-health` was previously runner-only; SDK
+            // iter-1 (ui-bridge PR #30) ported `page-health.ts` and added the
+            // route to `UI_BRIDGE_ROUTES`. Runner side still exposes it at
+            // `screenshots.rs::routes` — the entry is now part of the
+            // contract and intentionally omitted here.
+            ("POST", "/ui-bridge/control/page/close-request"),
+            // Force-close — runner-only by design (plan
+            // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 3).
+            // It is the in-process door out that does NOT route through the tao
+            // event loop, so it only means anything for a native desktop shell;
+            // the web and mobile SDK consumers have no process to force-exit.
+            ("POST", "/ui-bridge/control/page/force-close"),
+            ("POST", "/ui-bridge/control/page/evaluate-batch"),
+            ("POST", "/ui-bridge/control/page/evaluate-raw"),
+            ("POST", "/ui-bridge/control/page/evaluate-safe"),
+            ("POST", "/ui-bridge/control/page/hard-refresh"),
+            ("POST", "/ui-bridge/control/page/set-tab"),
+            ("POST", "/ui-bridge/control/page/summary"),
+            ("POST", "/ui-bridge/control/query-selector"),
+            ("POST", "/ui-bridge/control/spec/{}/run"),
+            ("POST", "/ui-bridge/control/tab/activate"),
+            ("POST", "/ui-bridge/control/wait-for-element"),
+            ("POST", "/ui-bridge/control/wait-for-element-stable"),
+            ("POST", "/ui-bridge/control/wait-for-element-state"),
+            ("POST", "/ui-bridge/control/wait-for-navigation"),
+            ("POST", "/ui-bridge/control/wait-for-route"),
+            ("POST", "/ui-bridge/control/wait-for-route-change"),
+            ("POST", "/ui-bridge/control/with-diff"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
     /// Phase 2a (plan 2026-05-03 ui-bridge-runner-wireup-discipline).
     ///
     /// Diff the SDK's authoritative `UI_BRIDGE_ROUTES` array against the
@@ -715,250 +962,7 @@ mod manifest_drift_tests {
             sdk_routes.len()
         );
 
-        // ── Runner-only allow-list ──────────────────────────────────────
-        //
-        // Routes the runner exposes that aren't part of the SDK contract.
-        // Captured here as a *baseline snapshot* of accepted divergence so
-        // this test stays focused on catching NEW drift, not re-litigating
-        // the long tail of pre-existing differences. Two reasons a path
-        // belongs here:
-        //
-        //   (a) Architecturally runner-only — IPC plumbing (`pong`,
-        //       `ipc-response`), Tauri-invoke proxy (`commands`, `invoke/*`),
-        //       discoverability surfaces (`_routes`, `_help`), debug
-        //       analytics (`/analytics/*`, `/explore/*`, `/diagnostics/*`,
-        //       `/circuit-breaker/*`, `/discover-states`, `/history/*`,
-        //       `/graph/*`).
-        //   (b) Pre-existing convenience the runner shipped before the SDK
-        //       documented an equivalent — listed here so the TEST CAN PASS
-        //       today and only flag NEW drift going forward. Promote to
-        //       UI_BRIDGE_ROUTES (and remove from this list) when wiring
-        //       the SDK side.
-        //
-        // The `/control/ai/*` aliases under `/control/` mirror SDK `/ai/*`
-        // routes — `add_dual!` registers both for the same handler. SDK
-        // declares only the `/ai/` form, hence the runner's `/control/ai/`
-        // siblings are intentionally runner-only.
-        let runner_only_baseline: HashSet<(&str, &str)> = [
-            // Runner infrastructure
-            ("GET", "/ui-bridge/_routes"),
-            ("GET", "/ui-bridge/_help"),
-            ("GET", "/ui-bridge/commands"),
-            ("POST", "/ui-bridge/invoke/{}"),
-            // Gated-flow family (mcp/ui_bridge/gated_flow.rs): identity
-            // introspection + the observe-only tier. Runner-only — no SDK
-            // UI_BRIDGE_ROUTES analog.
-            ("GET", "/ui-bridge/session"),
-            ("POST", "/ui-bridge/observe/{}"),
-            ("GET", "/ui-bridge/views"),
-            ("POST", "/ui-bridge/control/view/open"),
-            ("POST", "/ui-bridge/pong"),
-            ("POST", "/ui-bridge/ipc-response"),
-            // Relay-tab protocol (plan 2026-06-12-co-pilot-automation item 6a).
-            // These are relay ADAPTER routes — the SDK serves them from its
-            // nextjs/express adapters, not from UI_BRIDGE_ROUTES, so they are
-            // runner-only from the contract diff's point of view. (POST
-            // /heartbeat IS in UI_BRIDGE_ROUTES and stays out of this list.)
-            ("GET", "/ui-bridge/tabs"),
-            ("GET", "/ui-bridge/commands/stream"),
-            ("POST", "/ui-bridge/commands"),
-            ("POST", "/ui-bridge/relay/dispatch"),
-            // Device-bridge snapshot consumer — capture a cloud-relayed device's
-            // UI Bridge snapshot by deviceId (mcp/ui_bridge/cloud_snapshot.rs).
-            // Runner-only: the SDK contract has no "reach a cloud device by id"
-            // analog — the runner is the relay client that owns the tunnel.
-            ("GET", "/ui-bridge/cloud-devices"),
-            ("GET", "/ui-bridge/cloud-snapshot"),
-            ("GET", "/ui-bridge/cloud-auth-status"),
-            // NOTE: vision/* routes are intentionally NOT in any baseline.
-            // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
-            // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
-            // runner-side. They're aligned on both sides — no allow-list
-            // entry needed. (Earlier commits placed them in sdk_only_baseline
-            // then runner_only_baseline; both were wrong polarity once the
-            // ^0.8.0 bump landed the SDK declarations.)
-            ("POST", "/ui-bridge/batch"),
-            ("POST", "/ui-bridge/control/batch"),
-            ("POST", "/ui-bridge/render-log"),
-            ("POST", "/ui-bridge/control/render-log"),
-            ("POST", "/ui-bridge/control/assert"),
-            ("GET", "/ui-bridge/control/keyboard-shortcuts"),
-            // (b) Document/window-level key dispatch (mcp/ui_bridge/keyboard.rs).
-            // The SDK's `keyboard` action is element-scoped and therefore
-            // cannot fire a global shortcut whose listener is on `window`
-            // (e.g. Ctrl+Shift+B → session-manager sidebar). The runner shipped
-            // the element-free equivalent first because a runner-side route
-            // works immediately, whereas an SDK change reaches nothing until
-            // @qontinui/ui-bridge is published AND consumers bump their pin.
-            //
-            // The SDK side is now wired — but under its OWN path,
-            // `POST /control/page/send-keys` (`sendKeysToPage`, ui-bridge
-            // 912a3e301, 2026-08-20), with a richer contract (combo-string
-            // grammar, `document` default, per-key `outcomes[]`). The runner
-            // exposes that route too (`keyboard.rs`), so it is part of the
-            // bidirectional diff and correctly absent from every allow-list.
-            // `/control/key` stays runner-only: it is the pre-existing
-            // literal-key form and the SDK never declared this path.
-            ("POST", "/ui-bridge/control/key"),
-            ("GET", "/ui-bridge/control/element/{}/tree"),
-            ("POST", "/ui-bridge/control/element/{}/assert"),
-            ("POST", "/ui-bridge/control/batch-actions"),
-            ("POST", "/ui-bridge/circuit-breaker/reset"),
-            // Terminal sessions — runner-only (terminal tabs are a Tauri-host
-            // construct; SDK/web/supervisor consumers don't host PTY tabs).
-            // Pairs with `terminal-launch-menu` component actions.
-            ("GET", "/ui-bridge/control/terminal-sessions"),
-            ("GET", "/ui-bridge/control/terminal-sessions/{}"),
-            // NOTE: /ui-bridge/control/runner-windows was here (runner-only
-            // allow-list) until the SDK declared it in UI_BRIDGE_ROUTES as the
-            // `listWindows` discovery method (plan 2026-06-07-multi-window-sdk-
-            // automation, Phase 2). Now that both sides declare it, it must NOT
-            // be allow-listed — leave it in the bidirectional diff so SDK and
-            // runner stay in lockstep.
-            // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
-            ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
-            ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/control/ai/bookmark/{}"),
-            ("GET", "/ui-bridge/control/ai/bookmark/{}/diff"),
-            ("GET", "/ui-bridge/control/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/control/ai/bookmarks/{}/diff"),
-            ("GET", "/ui-bridge/control/ai/bookmarks"),
-            ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
-            ("GET", "/ui-bridge/control/ai/change-buffer/size"),
-            ("POST", "/ui-bridge/control/ai/bookmarks"),
-            ("POST", "/ui-bridge/control/ai/change-buffer/disable"),
-            ("POST", "/ui-bridge/control/ai/change-buffer/drain"),
-            ("POST", "/ui-bridge/control/ai/change-buffer/enable"),
-            ("POST", "/ui-bridge/control/ai/execute-with-diff"),
-            ("POST", "/ui-bridge/control/ai/find"),
-            ("POST", "/ui-bridge/control/ai/image-diff"),
-            ("POST", "/ui-bridge/control/ai/scoped-diff"),
-            ("POST", "/ui-bridge/control/ai/search"),
-            ("POST", "/ui-bridge/control/ai/structured-changes"),
-            ("POST", "/ui-bridge/control/ai/summarize-diff"),
-            ("POST", "/ui-bridge/control/ai/wait-for-change"),
-            // /ai/* runner extensions not in SDK contract
-            ("GET", "/ui-bridge/ai/element-screenshot"),
-            ("GET", "/ui-bridge/ai/elements/last-discovered"),
-            ("GET", "/ui-bridge/ai/forms"),
-            // NOTE: `/ai/idle-status` was previously in this allow-list
-            // because the SDK only declared `/control/idle-status`. The web
-            // SDK now declares the `/ai/` alias too (alongside `/control/`),
-            // so the route is part of the contract and intentionally omitted
-            // here. Both paths point at the same handler via `add_dual!` at
-            // `errors.rs::routes` — bodies are byte-identical modulo
-            // per-request timestamp/ms-precision drift.
-            ("POST", "/ui-bridge/ai/analyze/data"),
-            ("POST", "/ui-bridge/ai/analyze/regions"),
-            ("POST", "/ui-bridge/ai/analyze/structured-data"),
-            ("POST", "/ui-bridge/ai/design-audit"),
-            ("POST", "/ui-bridge/ai/expect"),
-            ("POST", "/ui-bridge/ai/fill-form"),
-            ("POST", "/ui-bridge/ai/image-diff"),
-            ("POST", "/ui-bridge/ai/media/audit/{}"),
-            // page-summary is a runner-only `/ai/*` read extension (not in the
-            // SDK contract). It accepts GET as well as POST so verification
-            // drivers can read it with GET without tripping the auto-405 →
-            // envelope_audit panic (plan
-            // 2026-06-05-ui-bridge-verification-read-freshness).
-            ("GET", "/ui-bridge/ai/page-summary"),
-            ("POST", "/ui-bridge/ai/page-summary"),
-            ("POST", "/ui-bridge/ai/wait-for-idle"),
-            ("POST", "/ui-bridge/ai/wait-for-navigation"),
-            ("POST", "/ui-bridge/ai/wait-for-route"),
-            // Analytics / debug surfaces (runner-only by design)
-            ("GET", "/ui-bridge/analytics/action-baselines"),
-            ("GET", "/ui-bridge/analytics/annotation-gaps"),
-            ("GET", "/ui-bridge/analytics/decay-curve"),
-            ("GET", "/ui-bridge/analytics/failure-taxonomy"),
-            ("GET", "/ui-bridge/analytics/fragility-heatmap"),
-            ("GET", "/ui-bridge/analytics/health-score"),
-            ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
-            ("GET", "/ui-bridge/analytics/recommendations"),
-            ("GET", "/ui-bridge/analytics/regressions"),
-            ("GET", "/ui-bridge/analytics/stall-frequency"),
-            ("GET", "/ui-bridge/analytics/state-coverage"),
-            ("GET", "/ui-bridge/diagnostics/readiness"),
-            ("GET", "/ui-bridge/explore/results"),
-            ("GET", "/ui-bridge/explore/status"),
-            ("POST", "/ui-bridge/explore"),
-            ("POST", "/ui-bridge/explore/stop"),
-            ("POST", "/ui-bridge/discover-states"),
-            ("GET", "/ui-bridge/graph/element-reliability"),
-            ("GET", "/ui-bridge/history/element/{}"),
-            ("GET", "/ui-bridge/history/elements"),
-            ("GET", "/ui-bridge/history/flaky"),
-            // Runner-side /control/* convenience routes not yet in UI_BRIDGE_ROUTES
-            ("DELETE", "/ui-bridge/control/network/stubs"),
-            ("DELETE", "/ui-bridge/control/network/stubs/{}"),
-            ("GET", "/ui-bridge/control/action-plan/cache"),
-            ("GET", "/ui-bridge/control/action-plan/cache/stats"),
-            ("GET", "/ui-bridge/control/annotated-screenshot"),
-            ("GET", "/ui-bridge/control/design/evaluate/contexts"),
-            ("GET", "/ui-bridge/control/design/style-guide"),
-            ("GET", "/ui-bridge/control/element-screenshot"),
-            ("GET", "/ui-bridge/control/elements/last-discovered"),
-            ("GET", "/ui-bridge/control/health-signals"),
-            ("GET", "/ui-bridge/control/network/stubs"),
-            ("GET", "/ui-bridge/control/page/playbook"),
-            ("GET", "/ui-bridge/control/spec/{}"),
-            ("GET", "/ui-bridge/control/tabs"),
-            // Tauri-command audit trail — runner-only, no SDK consumer
-            // (mobile / web don't have Tauri commands to record). See
-            // `mcp/ui_bridge/tauri_audit.rs` and `crate::tauri_command_audit`.
-            ("GET", "/ui-bridge/control/tauri-command-history"),
-            ("GET", "/ui-bridge/control/toasts"),
-            ("GET", "/ui-bridge/control/windows"),
-            ("POST", "/ui-bridge/control/action-plan"),
-            ("POST", "/ui-bridge/control/activate-tab/{}"),
-            ("POST", "/ui-bridge/control/annotations"),
-            ("POST", "/ui-bridge/control/capture-element-images"),
-            ("POST", "/ui-bridge/control/clear-storage"),
-            ("POST", "/ui-bridge/control/design/evaluate"),
-            ("POST", "/ui-bridge/control/design/evaluate/baseline"),
-            ("POST", "/ui-bridge/control/design/evaluate/diff"),
-            ("POST", "/ui-bridge/control/design/style-guide/clear"),
-            ("POST", "/ui-bridge/control/design/style-guide/load"),
-            ("POST", "/ui-bridge/control/diagnose-stuck"),
-            ("POST", "/ui-bridge/control/intents/execute"),
-            ("POST", "/ui-bridge/control/intents/execute-from-query"),
-            ("POST", "/ui-bridge/control/intents/find"),
-            ("POST", "/ui-bridge/control/navigate-and-wait"),
-            ("POST", "/ui-bridge/control/navigate-tab"),
-            ("POST", "/ui-bridge/control/network/stubs"),
-            ("POST", "/ui-bridge/control/network/verify-stub"),
-            // NOTE: `/control/page-health` was previously runner-only; SDK
-            // iter-1 (ui-bridge PR #30) ported `page-health.ts` and added the
-            // route to `UI_BRIDGE_ROUTES`. Runner side still exposes it at
-            // `screenshots.rs::routes` — the entry is now part of the
-            // contract and intentionally omitted here.
-            ("POST", "/ui-bridge/control/page/close-request"),
-            // Force-close — runner-only by design (plan
-            // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 3).
-            // It is the in-process door out that does NOT route through the tao
-            // event loop, so it only means anything for a native desktop shell;
-            // the web and mobile SDK consumers have no process to force-exit.
-            ("POST", "/ui-bridge/control/page/force-close"),
-            ("POST", "/ui-bridge/control/page/evaluate-batch"),
-            ("POST", "/ui-bridge/control/page/evaluate-raw"),
-            ("POST", "/ui-bridge/control/page/evaluate-safe"),
-            ("POST", "/ui-bridge/control/page/hard-refresh"),
-            ("POST", "/ui-bridge/control/page/set-tab"),
-            ("POST", "/ui-bridge/control/page/summary"),
-            ("POST", "/ui-bridge/control/query-selector"),
-            ("POST", "/ui-bridge/control/screenshot"),
-            ("POST", "/ui-bridge/control/spec/{}/run"),
-            ("POST", "/ui-bridge/control/tab/activate"),
-            ("POST", "/ui-bridge/control/wait-for-element"),
-            ("POST", "/ui-bridge/control/wait-for-element-stable"),
-            ("POST", "/ui-bridge/control/wait-for-element-state"),
-            ("POST", "/ui-bridge/control/wait-for-navigation"),
-            ("POST", "/ui-bridge/control/wait-for-route"),
-            ("POST", "/ui-bridge/control/wait-for-route-change"),
-            ("POST", "/ui-bridge/control/with-diff"),
-        ]
-        .into_iter()
-        .collect();
+        let runner_only_baseline = runner_only_baseline();
 
         // Allow-listed prefixes. `/ui-bridge/sdk/*` is the WS-transport outer
         // wrapper layer in `mcp/sdk_client.rs` — runner-only by architectural
@@ -1054,6 +1058,66 @@ mod manifest_drift_tests {
                     .map(|(m, p)| format!("{} {}", m, p))
                     .collect::<Vec<_>>()
                     .join("\n  "),
+            );
+        }
+    }
+
+    /// Entries still in [`runner_only_baseline`] that the runner no longer
+    /// serves, each removed by an open PR this branch is stacked behind. They
+    /// are exempt here only so this branch is green before that PR lands;
+    /// delete each line once its PR has merged.
+    const BASELINE_PENDING_REMOVAL: &[(&str, &str, &str)] = &[
+        (
+            "POST",
+            "/ui-bridge/ai/media/audit/{}",
+            "qontinui-runner#2266 deletes this entry (the /ai/media family went to /vision/*)",
+        ),
+        (
+            "POST",
+            "/ui-bridge/control/capture-element-images",
+            "qontinui-runner#2266 deletes this entry with the dead element-capture path",
+        ),
+    ];
+
+    /// Every runner-only baseline entry names a route the runner actually
+    /// serves. The baseline exists to excuse real runner-only routes from the
+    /// SDK diff; an entry for a deleted route excuses nothing and misleads a
+    /// reader into thinking the route is live (five such entries outlived the
+    /// vision-pipeline deletion of the screenshot family). Runs without the
+    /// ui-bridge sibling checkout, unlike the SDK diff itself.
+    #[test]
+    fn runner_only_baseline_entries_are_served() {
+        let served: HashSet<(String, String)> = route_manifest()
+            .iter()
+            .map(|(m, p)| ((*m).to_string(), canonicalise_path(p)))
+            .collect();
+        let baseline = runner_only_baseline();
+        assert!(baseline.len() > 50, "baseline unexpectedly small");
+
+        let mut unserved: Vec<String> = baseline
+            .iter()
+            .filter(|(m, p)| !served.contains(&((*m).to_string(), (*p).to_string())))
+            .filter(|(m, p)| {
+                !BASELINE_PENDING_REMOVAL
+                    .iter()
+                    .any(|(pm, pp, _)| pm == m && pp == p)
+            })
+            .map(|(m, p)| format!("{m} {p}"))
+            .collect();
+        unserved.sort();
+        assert!(
+            unserved.is_empty(),
+            "runner_only_baseline lists routes the runner does not serve (not in \
+             route_manifest()); delete them from the baseline:\n  {}",
+            unserved.join("\n  ")
+        );
+
+        // A pending-removal exemption may only cover a route that really is
+        // unserved — it must never hide a live route from the check above.
+        for (m, p, reason) in BASELINE_PENDING_REMOVAL {
+            assert!(
+                !served.contains(&((*m).to_string(), (*p).to_string())),
+                "{m} {p} is served, so its pending-removal exemption ({reason}) is wrong"
             );
         }
     }
