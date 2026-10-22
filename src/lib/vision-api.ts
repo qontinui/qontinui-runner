@@ -147,9 +147,7 @@ function uint8ToBase64(bytes: Uint8Array): string {
  * (e.g. client-side thumbnail cropping). When you can fetch via the cache
  * URL directly, prefer `captureVision` to avoid moving multi-MB base64 strings.
  */
-export async function captureScreenshotBase64(
-  req: VisionCaptureRequest = {},
-): Promise<{
+export async function captureScreenshotBase64(req: VisionCaptureRequest = {}): Promise<{
   /** Base64-encoded image bytes (no `data:` prefix). */
   screenshot: string;
   width: number;
@@ -165,11 +163,11 @@ export async function captureScreenshotBase64(
     if (!(e instanceof VisionCaptureError && e.code === "INLINE_TOO_LARGE")) {
       throw e;
     }
-    // The capture is cached; this second call is a cache hit.
+    // The capture is cached; this second call is normally a cache hit (unless
+    // `force` is set or a UI mutation happened in between).
     meta = await captureVision({ ...req, inline: false });
   }
-  const screenshot =
-    meta.base64 ?? uint8ToBase64(await fetchVisionCacheBytes(meta.sha256));
+  const screenshot = meta.base64 ?? uint8ToBase64(await fetchVisionCacheBytes(meta.sha256));
   return {
     screenshot,
     width: meta.width,

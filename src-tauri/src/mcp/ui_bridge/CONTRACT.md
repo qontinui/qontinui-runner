@@ -515,10 +515,12 @@ have different values. Do not use it as a content hash.
 
 The cache lives in the runner's instance-scoped DataLocal directory —
 `<data_local>/com.qontinui.runner/vision_cache`, under the instance root for a
-subject runner and with an `instance-<name>` subdir for a named secondary
-(`instance_env::runner_data_local_base` + `instance::scope_path`). It is never
-the source checkout or the process CWD; an unresolvable base fails runner
-start-up loudly. `tmp_vision_cache/` is only ever written by runner builds that
+subject runner and at `<data_local>/com.qontinui.runner/instance-<name>/vision_cache`
+for a named secondary (`instance::scope_path` applied to
+`instance_env::runner_data_local_base`, then `vision_cache` joined). It is never
+the source checkout or the process CWD. An unresolvable base panics while the
+API router is built: the panic is logged and the HTTP API never comes up, but
+the runner process itself keeps running. `tmp_vision_cache/` is only ever written by runner builds that
 predate this.
 
 ### 404 discriminator: empty body vs structured envelope
