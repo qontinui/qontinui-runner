@@ -617,8 +617,16 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
 /// to make a divergence go green.
 #[test]
 fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
-    use std::collections::HashSet;
-    let modal_ids: ModalIdentities = HashSet::from(["modal-1".to_string()]).into();
+    // One admitted modal whose registry id and DOM id are both `modal-1`, so
+    // the bare form matches through `bridgeId` and `div#modal-1` through
+    // `domId` (each kind only in its own form, SDK `a24b971`).
+    let modal_ids: ModalIdentities = modal_ids_from_context(&serde_json::json!({
+        "modals": [{
+            "id": "modal-1", "bridgeId": "modal-1", "domId": "modal-1",
+            "blocking": true, "blockingSource": "element",
+        }]
+    }))
+    .expect("modals array present");
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
     // Default (`includeExpected: false`): the modal overlay is DROPPED and COUNTED.
@@ -661,7 +669,7 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
     assert_eq!(included["expectedOverlayDetection"], "modal-stack");
     assert_eq!(included["includeExpected"], true, "echoed verbatim");
 
-    // The unregistered-occluder DOM-id form `<tag>#<modal.id>` matches too.
+    // The unregistered-occluder DOM-id form `<tag>#<modal.domId>` matches too.
     let dom_id = build_visibility_report(
         &[occluded_element("btn-save", "div#modal-1", 40.0, "Save")],
         0.02,
@@ -906,18 +914,18 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
 fn expected_overlay_admission_is_blocking_source_element_exactly() {
     let ctx = serde_json::json!({
         "modals": [
-            { "id": "dialog", "bridgeId": "bridge-dialog", "blocking": true, "blockingSource": "element" },
-            { "id": "backdrop", "bridgeId": "bridge-backdrop", "blocking": true, "blockingSource": "backdrop" },
-            { "id": "legacy", "bridgeId": "bridge-legacy", "blocking": true },
-            { "id": "drawer", "bridgeId": "bridge-drawer", "blocking": false },
-            { "id": "menu", "bridgeId": "bridge-menu" },
+            { "id": "dialog", "bridgeId": "bridge-dialog", "domId": "dialog", "blocking": true, "blockingSource": "element" },
+            { "id": "backdrop", "bridgeId": "bridge-backdrop", "domId": "backdrop", "blocking": true, "blockingSource": "backdrop" },
+            { "id": "legacy", "bridgeId": "bridge-legacy", "domId": "legacy", "blocking": true },
+            { "id": "drawer", "bridgeId": "bridge-drawer", "domId": "drawer", "blocking": false },
+            { "id": "menu", "bridgeId": "bridge-menu", "domId": "menu" },
         ]
     });
     let ids = modal_ids_from_context(&ctx).expect("modals array present");
     assert_eq!(
-        ids.ids,
+        ids.dom_ids,
         std::collections::HashSet::from(["dialog".to_string()]),
-        "only the element-declared modal's id is admitted"
+        "only the element-declared modal's DOM id is admitted"
     );
     assert_eq!(
         ids.bridge_ids,
@@ -927,8 +935,8 @@ fn expected_overlay_admission_is_blocking_source_element_exactly() {
 
     // Absent field = not admitted, end to end: the occlusion stays reported.
     for modal in [
-        serde_json::json!({ "id": "menu", "blocking": true }),
-        serde_json::json!({ "id": "menu", "blocking": true, "blockingSource": "backdrop" }),
+        serde_json::json!({ "id": "menu", "bridgeId": "menu", "blocking": true }),
+        serde_json::json!({ "id": "menu", "bridgeId": "menu", "blocking": true, "blockingSource": "backdrop" }),
     ] {
         let none = modal_ids_from_context(&serde_json::json!({ "modals": [modal.clone()] }))
             .expect("a stack that admits nothing is still an answer");
@@ -943,6 +951,59 @@ fn expected_overlay_admission_is_blocking_source_element_exactly() {
         assert_eq!(report["verdict"], "occlusions_found", "{modal}");
         assert_eq!(report["expectedOverlaysFiltered"], 0, "{modal}");
         assert_eq!(report["expectedOverlayDetection"], "modal-stack", "{modal}");
+    }
+}
+
+/// The expected-overlay MATCHER, against the SDK's `isTrackedOverlay`
+/// (`visibility-report.ts`, ui-bridge `a24b971`). `ModalInfo.id` is not read
+/// at all; each identity kind matches only its own `occludedBy` form:
+/// `bridgeId` by exact equality, `domId` as `<tag>#X`, `testId` as
+/// `<tag>[data-testid="X"]`. An absent field never matches, and neither does
+/// a generated `modal-N`. P8 is the case that forced it: an `aside#sidebar`
+/// beside an admitted dialog whose testid is `sidebar` is NOT expected.
+#[test]
+fn expected_overlay_matcher_keys_each_identity_kind_to_its_own_form() {
+    let ctx = serde_json::json!({
+        "modals": [
+            {
+                "id": "sidebar", "testId": "sidebar", "type": "dialog",
+                "blocking": true, "blockingSource": "element",
+            },
+            { "id": "modal-2", "blocking": true, "blockingSource": "element" },
+            {
+                "id": "dlg", "domId": "dlg", "bridgeId": "bridge-dlg",
+                "blocking": true, "blockingSource": "element",
+            },
+        ]
+    });
+    let ids = modal_ids_from_context(&ctx).expect("modals array present");
+    let expected = |occluder: &str| {
+        let r = build_visibility_report(
+            &[occluded_element("btn-save", occluder, 40.0, "Save")],
+            0.02,
+            true,
+            Some(&ids),
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        r["occlusions"][0]["isExpectedOverlay"] == true
+    };
+
+    for (occluder, want) in [
+        // P8.
+        ("aside#sidebar", false),
+        ("sidebar", false),
+        ("div[data-testid=\"sidebar\"]", true),
+        // A generated id is no identity.
+        ("modal-2", false),
+        ("div#modal-2", false),
+        // DOM id and registry id, each in its own form only.
+        ("div#dlg", true),
+        ("dlg", false),
+        ("bridge-dlg", true),
+        ("div#bridge-dlg", false),
+        ("div[data-testid=\"dlg\"]", false),
+    ] {
+        assert_eq!(expected(occluder), want, "occludedBy `{occluder}`");
     }
 }
 
