@@ -3132,7 +3132,7 @@ mod tests {
     fn session_review_route_entries_cover_every_registration() {
         let needle = format!(".{}(", "route");
         let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
-        let src = include_str!("session_review.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("session_review.rs"));
         let (_, body) = src
             .split_once(fn_header.as_str())
             .expect("routes() signature");

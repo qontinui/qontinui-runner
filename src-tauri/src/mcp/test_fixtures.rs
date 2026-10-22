@@ -3020,7 +3020,7 @@ mod tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_documented_inject_body_is_postable() {
-        let src = include_str!("test_fixtures.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("test_fixtures.rs"));
         let bodies: Vec<&str> = src
             .lines()
             .filter(|l| l.starts_with("//! |") && l.contains("liveStatus\":"))
@@ -3078,7 +3078,7 @@ mod tests {
     /// silently ship the seam. Pin the exact line.
     #[test]
     fn module_cfg_gate_is_first_non_comment_line() {
-        let src = include_str!("test_fixtures.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("test_fixtures.rs"));
         let first_significant = src
             .lines()
             .map(str::trim)
@@ -3152,7 +3152,7 @@ mod tests {
     /// would break the acceptance harness without any compile error.
     #[test]
     fn all_test_routes_remain_wired() {
-        let src = include_str!("test_fixtures.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("test_fixtures.rs"));
         for route in [
             "/ui-bridge/test/inject-session",
             "/ui-bridge/test/clear-sessions",

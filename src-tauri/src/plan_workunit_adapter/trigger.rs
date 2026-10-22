@@ -7590,7 +7590,7 @@ Body.
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn read_blobs_wrapper_is_a_pure_delegation() {
-        let src = include_str!("trigger.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("trigger.rs"));
         let at = src
             .find("fn read_blobs(&self, repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {\n        if ids.is_empty()")
             .expect("the ProcessGit impl of read_blobs is findable by signature");

@@ -7882,7 +7882,7 @@ mod tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn ws_dispatch_action_names_are_well_formed() {
-        let src = include_str!("sdk_client.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("sdk_client.rs"));
         let patterns = [
             "dispatch_app_request(&state, \"",
             "try_ws_dispatch(&state, \"",
@@ -8232,7 +8232,7 @@ mod tests {
     /// `ws_dispatch_action_names_are_well_formed`).
     #[test]
     fn gated_handlers_ask_before_falling_back_to_ipc() {
-        let src = include_str!("sdk_client.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("sdk_client.rs"));
         for handler in [
             "handle_element_action",
             "handle_ai_execute",
@@ -8318,11 +8318,7 @@ mod tests {
     /// ungated (or live-state-gated) fallback fails here without being listed.
     #[test]
     fn every_dispatching_fallback_is_gated_or_an_exempt_read() {
-        let src = include_str!("sdk_client.rs");
-        let production = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .unwrap_or_default();
+        let production = crate::source_pin::ProdSource::of(include_str!("sdk_client.rs"));
         let mut exempt_seen = Vec::new();
         for chunk in production.split("\nasync fn ").skip(1) {
             let name = chunk.split('(').next().unwrap_or_default();
@@ -8438,7 +8434,7 @@ mod tests {
 
     #[test]
     fn execute_with_diff_route_applies_the_guard() {
-        let src = include_str!("sdk_client.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("sdk_client.rs"));
         let body = src
             .split("\nasync fn handle_ct_execute_with_diff(")
             .nth(1)
