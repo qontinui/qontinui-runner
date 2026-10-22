@@ -29,6 +29,17 @@
 //!    provisional until it does). No guessing. The cmdline query is TARGETED at
 //!    exactly the anchor pids of unbound terminals — never a table-wide fetch —
 //!    and fails open (unavailable ⇒ fall through to rung 3).
+//! 2½. **Provider registry** ([`provider_rung`]): Claude Code's own
+//!    `<config>/sessions/<pid>.json` for the anchor pid, VALID per
+//!    [`registry_row_validity`](crate::session::claude_session_registry::registry_row_validity)
+//!    (live claude pid + matching `procStart`), names the id the process runs
+//!    right now — including after an in-pane `/clear` / `/resume`. Bound
+//!    `authoritative`, confirmed iff a transcript exists. Rung 3 runs only when
+//!    there is no valid row, and a valid row's id is CLAIMED for every other
+//!    pane so rung 3 cannot hand it to a sibling in the same cwd (the
+//!    2026-10-20 `314176b7`/`601a25ac` mis-bind). A CONFIRMED record whose
+//!    pane's valid row names another id is re-bound by the unguarded
+//!    [`refresh_titles_pass`].
 //! 3. **Observed** (rung 3): the claude descendant's **process start** anchors a
 //!    transcript correlation — a candidate qualifies only when its FIRST event is
 //!    at/after that start (minus skew). A UNIQUENESS gate is the safety: bind only
@@ -80,6 +91,12 @@ use crate::session::session_lifecycle_store::{
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+mod provider_rung;
+pub use provider_rung::{
+    decide_provider_rung, decide_registry_rebind, rebind_confirmed_from_registry,
+    valid_provider_row, valid_rows_for_ptys, RegistryRebind, ValidProviderRow,
+};
 
 /// One live PTY the reconcile considers, projected from
 /// [`crate::terminal::manager::TerminalManager::list`].
@@ -212,6 +229,10 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 ///   anchor; only an anchored bind earns
 ///   `Observed`.
 ///
+/// - **Rung 2½ (provider registry):** `provider_row = Some(row)` (a VALID
+///   `<config>/sessions/<pid>.json` row for the anchor pid) ⇒ `Bind`
+///   `Authoritative` for that id — see [`provider_rung::decide_provider_rung`].
+///
 /// `anchor_start_unix` is the claude anchor's creation time (epoch seconds);
 /// `claimed_ids` are session ids already bound to OTHER live terminals — removing
 /// them lets two same-second launches converge across ticks (each terminal claims
@@ -223,6 +244,7 @@ pub fn decide_bind_for_live_pty(
     cmdline_session_id: Option<&str>,
     candidates: &[TranscriptCandidate],
     claimed_ids: &HashSet<String>,
+    provider_row: Option<&ValidProviderRow>,
 ) -> ReconcileAction {
     // A confirmed record (the hook fired / a prior bind confirmed it) is owned
     // by the deterministic path — never re-bind it.
@@ -249,6 +271,13 @@ pub fn decide_bind_for_live_pty(
             origin: BindOrigin::Authoritative,
             confirmed: matching.is_some(),
         };
+    }
+
+    // RUNG 2½ — the provider's own live registry names the id this pid is
+    // running under (a VALID row only — see `provider_rung`). Same grade as a
+    // typed id; rung 3's guess runs only when there is no such row.
+    if let Some(row) = provider_row {
+        return provider_rung::decide_provider_rung(pty, row, candidates);
     }
 
     // RUNG 3 — observed. Keep only post-start, unclaimed candidates; the start
@@ -431,6 +460,21 @@ pub fn run_reconcile<I: TranscriptIndex>(
     index: &I,
     cmdline_ids: &HashMap<u32, String>,
 ) -> Vec<ReconcileAction> {
+    run_reconcile_with_provider(store, live, snapshot, index, cmdline_ids, &HashMap::new())
+}
+
+/// [`run_reconcile`] with the provider-registry rung armed: `provider_rows`
+/// maps an anchor pid to its VALID provider row
+/// ([`valid_rows_for_ptys`]). Every row's id is pre-claimed so rung 3 never
+/// binds a session the provider says another live pane is running.
+pub fn run_reconcile_with_provider<I: TranscriptIndex>(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    snapshot: &ProcessSnapshot,
+    index: &I,
+    cmdline_ids: &HashMap<u32, String>,
+    provider_rows: &HashMap<u32, ValidProviderRow>,
+) -> Vec<ReconcileAction> {
     let live_terminal_ids: HashSet<String> = live.iter().map(|p| p.terminal_id.clone()).collect();
     // Session ids already owned by a CONFIRMED open row can't be re-bound to a
     // different live terminal — seed the claim set so the uniqueness gate sees
@@ -442,6 +486,9 @@ pub fn run_reconcile<I: TranscriptIndex>(
         .filter(|r| r.confirmed_at.is_some())
         .map(|r| r.claude_session_id)
         .collect();
+    // The provider says these ids are running in specific live pids right now:
+    // no OTHER pane's rung-3 guess may take one.
+    claimed_ids.extend(provider_rows.values().map(|r| r.session_id.clone()));
     let mut actions = Vec::new();
 
     // 1) Bind live PTYs lacking a confirmed record.
@@ -490,6 +537,8 @@ pub fn run_reconcile<I: TranscriptIndex>(
             .and_then(|pid| cmdline_ids.get(&pid))
             .map(|s| s.as_str());
         let candidates = index.candidates_for(&pty.working_dir);
+        let provider_row = pty.ai_pid.and_then(|pid| provider_rows.get(&pid));
+        let via_provider = cmdline_sid.is_none() && provider_row.is_some();
         let action = decide_bind_for_live_pty(
             pty,
             existing.as_ref(),
@@ -497,6 +546,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
             cmdline_sid,
             &candidates,
             &claimed_ids,
+            provider_row,
         );
         match &action {
             ReconcileAction::Bind {
@@ -544,6 +594,15 @@ pub fn run_reconcile<I: TranscriptIndex>(
                             working_dir = %pty.working_dir,
                             confirmed = *confirmed,
                             "session binder: bound a launch-agnostic session via process-start-anchored transcript correlation"
+                        );
+                    }
+                    BindOrigin::Authoritative if via_provider => {
+                        tracing::info!(
+                            terminal_id = %pty.terminal_id,
+                            claude_session = %session_id,
+                            pid = ?pty.ai_pid,
+                            confirmed = *confirmed,
+                            "session binder: bound a session from the provider's live registry"
                         );
                     }
                     BindOrigin::Authoritative => {
@@ -858,19 +917,33 @@ impl crate::session::snapshot_history::TranscriptProbe for DiskTranscriptIndex {
 
 /// What the provider itself says about one live session: the id it is actually
 /// running under, and the name the operator sees in the TUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderSessionMeta {
     /// The provider's own session id for this process — the cross-check that
     /// stops a stale/pid-reused file from retitling the wrong session.
     pub session_id: String,
     /// The in-provider session name (`/rename`), when set.
     pub name: Option<String>,
+    /// `procStart` verbatim — the input to
+    /// [`registry_row_validity`](crate::session::claude_session_registry::registry_row_validity).
+    pub proc_start: Option<String>,
+    /// `pidDomain` verbatim (`win32:<host>`).
+    pub pid_domain: Option<String>,
+    /// The config dir the file was found under.
+    pub config_dir: Option<String>,
 }
 
 /// Lookup of [`ProviderSessionMeta`] by the live claude process's pid. Injected
 /// so the title correlation is unit-testable without disk.
 pub trait ProviderSessionIndex {
     fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta>;
+    /// EVERY file naming `pid` across config dirs. A reused pid can have a
+    /// stale file in one account beside its own in another, so a caller that
+    /// needs the VALID row must see them all. Defaults to
+    /// [`Self::meta_for_pid`].
+    fn metas_for_pid(&self, pid: u32) -> Vec<ProviderSessionMeta> {
+        self.meta_for_pid(pid).into_iter().collect()
+    }
 }
 
 /// Real [`ProviderSessionIndex`], backed by the provider's OWN live-session
@@ -919,25 +992,51 @@ struct ProviderSessionFile {
     session_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    proc_start: Option<String>,
+    #[serde(default)]
+    pid_domain: Option<String>,
+}
+
+impl DiskProviderSessionIndex {
+    /// Parse the provider file for `pid` under one config dir. `None` for an
+    /// absent/unparseable file; `Some(None)` for a parseable one with no
+    /// usable `sessionId` (which [`ProviderSessionIndex::meta_for_pid`]
+    /// historically treated as a terminal answer).
+    fn read_one(dir: &Path, pid: u32) -> Option<Option<ProviderSessionMeta>> {
+        let path = dir.join("sessions").join(format!("{pid}.json"));
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let parsed = serde_json::from_str::<ProviderSessionFile>(&raw).ok()?;
+        Some(
+            parsed
+                .session_id
+                .filter(|s| !s.trim().is_empty())
+                .map(|session_id| ProviderSessionMeta {
+                    session_id,
+                    name: parsed.name.filter(|n| !n.trim().is_empty()),
+                    proc_start: parsed.proc_start,
+                    pid_domain: parsed.pid_domain,
+                    config_dir: Some(dir.to_string_lossy().into_owned()),
+                }),
+        )
+    }
 }
 
 impl ProviderSessionIndex for DiskProviderSessionIndex {
     fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta> {
         for dir in &self.config_dirs {
-            let path = dir.join("sessions").join(format!("{pid}.json"));
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(parsed) = serde_json::from_str::<ProviderSessionFile>(&raw) else {
-                continue;
-            };
-            let session_id = parsed.session_id.filter(|s| !s.trim().is_empty())?;
-            return Some(ProviderSessionMeta {
-                session_id,
-                name: parsed.name.filter(|n| !n.trim().is_empty()),
-            });
+            if let Some(found) = Self::read_one(dir, pid) {
+                return found;
+            }
         }
         None
+    }
+
+    fn metas_for_pid(&self, pid: u32) -> Vec<ProviderSessionMeta> {
+        self.config_dirs
+            .iter()
+            .filter_map(|dir| Self::read_one(dir, pid).flatten())
+            .collect()
     }
 }
 
@@ -1001,8 +1100,15 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
         let Some(rec) = store.find_open_by_terminal(&pty.terminal_id) else {
             continue;
         };
-        let meta = index.meta_for_pid(ai_pid);
-        let Some(title) = decide_title_refresh(&rec, meta.as_ref()) else {
+        // Every file naming the pid: a stale file in one account must not hide
+        // the record's own row in another. An id MISMATCH is no longer this
+        // fn's to drop silently — `rebind_confirmed_from_registry` acts on it.
+        let metas = index.metas_for_pid(ai_pid);
+        let meta = metas
+            .iter()
+            .find(|m| m.session_id == rec.claude_session_id)
+            .or(metas.first());
+        let Some(title) = decide_title_refresh(&rec, meta) else {
             continue;
         };
         store.update_title_by_terminal(&pty.terminal_id, &title);
@@ -1035,13 +1141,43 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
 /// The cost it adds to the poll tick is one small read per live claude anchor
 /// (the provider file is tiny and in the OS cache), not a transcript scan.
 /// Fail-open: a missing/unreadable provider index refreshes nothing.
+///
+/// It also carries the provider-registry RE-BIND of a confirmed record
+/// ([`rebind_confirmed_from_registry`], plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+/// Phase 4): for the same reason — a confirmed fleet never enters the bind
+/// pass — an in-pane `/clear` / `/resume` or a rung-3 mis-bind is only
+/// correctable here. The re-bind runs first so the title refresh then sees the
+/// corrected record.
 pub fn refresh_titles_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
-) -> Vec<TitleRefresh> {
+) -> TitlesPassOutcome {
     let live = anchor_live_ptys(live, snapshot);
-    refresh_titles(store, &live, &DiskProviderSessionIndex::discover())
+    let index = DiskProviderSessionIndex::discover();
+    let rebinds = if snapshot.names.is_empty() {
+        Vec::new() // unreadable table: no row can be validated this tick
+    } else {
+        rebind_confirmed_from_registry(store, &live, &index, snapshot, |cfg, wd, sid| {
+            !cfg.is_empty()
+                && crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid)
+                    .exists()
+        })
+    };
+    TitlesPassOutcome {
+        titles: refresh_titles(store, &live, &index),
+        rebinds,
+    }
+}
+
+/// What one [`refresh_titles_pass`] tick did.
+#[derive(Debug, Default)]
+pub struct TitlesPassOutcome {
+    pub titles: Vec<TitleRefresh>,
+    /// `Bind` actions for re-bound confirmed records — feed them to the same
+    /// `session-bound` emitter the bind pass uses.
+    pub rebinds: Vec<ReconcileAction>,
 }
 
 /// Parse an ISO-8601 timestamp into Unix epoch seconds (best-effort).
@@ -1153,7 +1289,16 @@ pub async fn run_reconcile_pass(
         .map(|r| (r.claude_session_id, r.working_dir))
         .collect();
     let index = PrescannedTranscriptIndex::scan_off_runtime(scan_dirs, probes).await;
-    let actions = run_reconcile(store, &live, snapshot, &index, &cmdline_ids);
+    // Rung 2½ — the provider's own registry, for the unbound anchors only (a
+    // few tiny files; validity needs the table, so an unreadable one yields no
+    // rows and every pane falls through to rung 3 as before).
+    let provider_rows = if snapshot.names.is_empty() || unbound.is_empty() {
+        HashMap::new()
+    } else {
+        valid_rows_for_ptys(live.iter(), &DiskProviderSessionIndex::discover(), snapshot)
+    };
+    let actions =
+        run_reconcile_with_provider(store, &live, snapshot, &index, &cmdline_ids, &provider_rows);
 
     let bound = actions
         .iter()
@@ -1488,7 +1633,7 @@ mod tests {
         assert!(wire.get("configDir").is_some(), "camelCase configDir");
     }
 
-    fn pty(id: &str, pid: Option<u32>, wd: &str) -> LivePty {
+    pub(super) fn pty(id: &str, pid: Option<u32>, wd: &str) -> LivePty {
         LivePty {
             terminal_id: id.to_string(),
             pid,
@@ -1501,7 +1646,7 @@ mod tests {
     }
 
     /// A PTY whose claude anchor is already resolved (anchor pid + its start).
-    fn pty_anchored(id: &str, ai_pid: u32, ai_start: i64, wd: &str) -> LivePty {
+    pub(super) fn pty_anchored(id: &str, ai_pid: u32, ai_start: i64, wd: &str) -> LivePty {
         LivePty {
             ai_pid: Some(ai_pid),
             ai_start_unix: Some(ai_start),
@@ -1510,16 +1655,16 @@ mod tests {
     }
 
     /// An empty claim set (the common test case).
-    fn no_claims() -> HashSet<String> {
+    pub(super) fn no_claims() -> HashSet<String> {
         HashSet::new()
     }
 
     /// No cmdline evidence (the common test case — rung 3 only).
-    fn no_cmdlines() -> HashMap<u32, String> {
+    pub(super) fn no_cmdlines() -> HashMap<u32, String> {
         HashMap::new()
     }
 
-    fn cand(id: &str, cfg: &str, started: Option<i64>) -> TranscriptCandidate {
+    pub(super) fn cand(id: &str, cfg: &str, started: Option<i64>) -> TranscriptCandidate {
         TranscriptCandidate {
             session_id: id.to_string(),
             config_dir: cfg.to_string(),
@@ -1528,9 +1673,9 @@ mod tests {
     }
 
     /// A fake transcript index over in-memory fixtures.
-    struct FakeIndex {
-        by_wd: HashMap<String, Vec<TranscriptCandidate>>,
-        existing_ids: HashSet<String>,
+    pub(super) struct FakeIndex {
+        pub(super) by_wd: HashMap<String, Vec<TranscriptCandidate>>,
+        pub(super) existing_ids: HashSet<String>,
     }
     impl TranscriptIndex for FakeIndex {
         fn candidates_for(&self, working_dir: &str) -> Vec<TranscriptCandidate> {
@@ -1542,7 +1687,11 @@ mod tests {
     }
 
     /// A registry record fixture — `id` on `terminal`, titled `title`.
-    fn title_rec(id: &str, terminal: &str, title: Option<&str>) -> TerminalSessionRecord {
+    pub(super) fn title_rec(
+        id: &str,
+        terminal: &str,
+        title: Option<&str>,
+    ) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
             config_dir: None,
@@ -1584,6 +1733,7 @@ mod tests {
         ProviderSessionMeta {
             session_id: session_id.to_string(),
             name: name.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -1708,12 +1858,16 @@ mod tests {
         let index = DiskProviderSessionIndex {
             config_dirs: vec![dir.path().to_path_buf()],
         };
+        let cfg = Some(dir.path().to_string_lossy().into_owned());
         assert_eq!(
             index.meta_for_pid(31520),
-            Some(meta(
-                "ef07e29d-ed7d-4bb3-a85c-d6e3fe92c2f3",
-                Some("coord-push-to-branch-mcp")
-            ))
+            Some(ProviderSessionMeta {
+                config_dir: cfg.clone(),
+                ..meta(
+                    "ef07e29d-ed7d-4bb3-a85c-d6e3fe92c2f3",
+                    Some("coord-push-to-branch-mcp")
+                )
+            })
         );
         // An absent pid is a clean None, never an error.
         assert_eq!(index.meta_for_pid(9999), None);
@@ -1724,7 +1878,25 @@ mod tests {
             r#"{"pid":42,"sessionId":"abc","status":"idle"}"#,
         )
         .unwrap();
-        assert_eq!(index.meta_for_pid(42), Some(meta("abc", None)));
+        assert_eq!(
+            index.meta_for_pid(42),
+            Some(ProviderSessionMeta {
+                config_dir: cfg.clone(),
+                ..meta("abc", None)
+            })
+        );
+
+        // The real file shape carries procStart/pidDomain (2026-10-21), which
+        // the validity rule reads.
+        std::fs::write(
+            dir.path().join("sessions").join("46416.json"),
+            r#"{"pid":46416,"sessionId":"0c4e3025","procStart":"134369923919058648","pidDomain":"win32:spaceship","kind":"interactive"}"#,
+        )
+        .unwrap();
+        let got = index.metas_for_pid(46416);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].proc_start.as_deref(), Some("134369923919058648"));
+        assert_eq!(got[0].pid_domain.as_deref(), Some("win32:spaceship"));
 
         // Garbage never panics or poisons the pass.
         std::fs::write(dir.path().join("sessions").join("43.json"), "not json").unwrap();
@@ -1739,8 +1911,15 @@ mod tests {
         let p = pty("term-1", Some(100), "C:/repo");
         // Transcript present for the typed id → confirmed, config carried over.
         let candidates = vec![cand("typed-id", "C:/cfg", Some(1_500))];
-        let action =
-            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &candidates, &no_claims());
+        let action = decide_bind_for_live_pty(
+            &p,
+            None,
+            1_000,
+            Some("typed-id"),
+            &candidates,
+            &no_claims(),
+            None,
+        );
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1753,7 +1932,7 @@ mod tests {
         );
         // No transcript yet → provisional (unconfirmed, empty config).
         let action2 =
-            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &[], &no_claims());
+            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &[], &no_claims(), None);
         assert_eq!(
             action2,
             ReconcileAction::Bind {
@@ -1778,7 +1957,8 @@ mod tests {
             // Ours: started just after the anchor — the unique survivor.
             cand("ours", "C:/cfg", Some(1_010)),
         ];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1799,7 +1979,8 @@ mod tests {
             cand("a", "C:/cfg", Some(1_010)),
             cand("b", "C:/cfg", Some(2_000)),
         ];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::SkipAmbiguous {
@@ -1819,7 +2000,7 @@ mod tests {
             cand("b", "C:/cfg", Some(2_000)),
         ];
         let claimed: HashSet<String> = ["a".to_string()].into_iter().collect();
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &claimed);
+        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &claimed, None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1838,7 +2019,8 @@ mod tests {
     fn decide_leaves_alone_when_only_pre_start_candidates() {
         let p = pty("term-1", Some(100), "C:/repo");
         let candidates = vec![cand("foreign", "C:/cfg", Some(500))];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::LeaveAlone {
@@ -1869,6 +2051,7 @@ mod tests {
             Some("typed-id"),
             &candidates,
             &no_claims(),
+            None,
         );
         assert_eq!(
             action,
@@ -1891,7 +2074,7 @@ mod tests {
         // Grading it `observed` here would auto-resume a possibly-foreign
         // session on the weakest evidence in the ladder.
         let one = vec![cand("a", "C:/cfg", Some(500))];
-        let action = decide_bind_for_live_pty(&p, None, 0, None, &one, &no_claims());
+        let action = decide_bind_for_live_pty(&p, None, 0, None, &one, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1907,7 +2090,7 @@ mod tests {
             cand("a", "C:/cfg", Some(500)),
             cand("b", "C:/cfg", Some(900)),
         ];
-        let action2 = decide_bind_for_live_pty(&p, None, 0, None, &two, &no_claims());
+        let action2 = decide_bind_for_live_pty(&p, None, 0, None, &two, &no_claims(), None);
         assert_eq!(
             action2,
             ReconcileAction::SkipAmbiguous {
