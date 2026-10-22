@@ -2297,6 +2297,12 @@ mod tests {
              under one, D2)",
         ),
         (
+            "fleet.rs",
+            1,
+            "`CredProbeEnv::from_process`: gh's own `~/.config/gh/hosts.yml` fallback, the \
+             user's gh login read for presence only (never its value), not runner state",
+        ),
+        (
             "coord_doctor.rs",
             1,
             "Claude Code's own `~/.claude/.credentials.json` — the user's Claude login, read \
