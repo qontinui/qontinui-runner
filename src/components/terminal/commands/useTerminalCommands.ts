@@ -344,7 +344,7 @@ function countCardRows(spec: ResultCardSpec): number {
 /**
  * `/close`'s report for the one session it closed.
  *
- * `closeTerminal` is still `(id: string) => void`, and it is left that way on
+ * `closeTerminal` still returns `void`, and it is left that way on
  * purpose: it is called from a dozen places across `ZoneGrid`,
  * `TerminalTabBar`, the hover actions and the restart path, and widening it
  * would put a return value nobody reads on all of them. What made `/close`
@@ -952,21 +952,22 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   // ── 7. /close ─────────────────────────────────────────────────────────
   // `destructive: true` is live TODAY through `rank.ts::safeToReroute` — no
   // Tier-2 pattern may reroute a literal slash for another command into it.
-  // It will additionally gate the Phase 4 executor's confirm modal, though
-  // per plan §5(3) single-target close is expected to use Undo instead of a
-  // confirm, which is what `undoable: true` is for.
+  // Per plan §5(3) a single-target close uses Undo instead of a confirm: the
+  // manager's `closeTerminal` owns it (the tab leaves its zone at once, the
+  // PTY is killed only after the 10 s Undo toast expires — see
+  // `pendingCloseReducer.ts`), so this command gets it by calling the default
+  // close rather than by declaring anything.
   useCommandAction({
     id: "terminal.close",
     slash: "/close",
     label: "Close session",
-    // Kills a live PTY. `undoable` restores the ZONE assignment, not the
-    // process or its scrollback.
+    // Kills a live PTY — after the 10 s Undo window, during which Undo puts
+    // the session back in its zone with the process untouched.
     destructive: true,
     description:
       "Close a session by tab id (preferred when known) or 1-based zone index. " +
       "Without args, closes the currently focused session.",
     paramSchema: SCHEMA.close,
-    undoable: true,
     patterns: [/^close(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       // D4 — a tab id that names no live session used to render `✓`.
