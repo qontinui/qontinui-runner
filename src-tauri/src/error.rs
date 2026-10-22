@@ -184,6 +184,32 @@ pub fn emit_user_facing_error(
     })
 }
 
+/// Payload of the `"error-cleared"` channel: the fault behind an earlier
+/// `"error"` event, identified by its `error_code`, has been observed over.
+#[derive(Debug, Serialize, Clone)]
+pub struct ErrorCleared<'a> {
+    pub error_code: &'a str,
+}
+
+/// Tell the frontend that the fault behind an earlier [`emit_user_facing_error`]
+/// is over. `StatusIndicator` removes the card — or the residual a dismissed
+/// card collapsed to — for that `error_code`. An emitter that never calls this
+/// leaves the residual standing with its last-seen time, which is the honest
+/// state when nothing observes the fault clearing.
+///
+/// Logged and returned on failure, exactly as [`emit_user_facing_error`].
+pub fn emit_user_facing_error_cleared(
+    app: &tauri::AppHandle,
+    error_code: &str,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    app.emit("error-cleared", ErrorCleared { error_code }).map_err(|e| {
+        let msg = format!("Failed to emit error-cleared event: {e}");
+        tracing::warn!(error_code = %error_code, "{msg}");
+        msg
+    })
+}
+
 // ErrorSeverity is re-exported from crate::error_monitor::types above
 
 impl AppError {
