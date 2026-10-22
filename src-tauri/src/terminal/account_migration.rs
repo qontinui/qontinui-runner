@@ -59,6 +59,10 @@ use tracing::{info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::graceful_exit::ProcIdentity;
+use crate::terminal::migration_identity::{
+    migration_verdict, resolve_migration_identity, roster_spelling, MigrationTrigger,
+    MigrationVerdict,
+};
 use crate::terminal::session_carry::{copy_transcript, CarriedSubagent};
 
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
@@ -131,22 +135,6 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    // Source account: the dir the session launched under, else the runner's
-    // currently-resolved global dir (pre-existing sessions registered before
-    // config_dir capture).
-    let Some(src) = record
-        .config_dir
-        .clone()
-        .or_else(crate::ai_provider::get_resolved_config_dir)
-    else {
-        warn!(
-            terminal_id,
-            session = %record.claude_session_id,
-            "usage-limit hint but the session's account is unknown — cannot migrate"
-        );
-        return;
-    };
-
     let ai_settings = crate::settings::get_ai_settings();
     if !ai_settings.claude_cli.auto_migrate_on_token_exhaustion {
         info!(
@@ -158,6 +146,25 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     if crate::settings::get_claude_config_dirs().len() < 2 {
         return; // nothing to migrate to
     }
+
+    // IDENTITY, before the exhaustion probe: which session does this pane
+    // PROVABLY run, and under which account? The lifecycle record is the
+    // binder's guess; on 2026-10-21 a mis-bound one made this path close a
+    // pane running something else and resume a session still live in another
+    // pane — a fork. The provider's own `sessions/<pid>.json` decides, and an
+    // unresolved or elsewhere-held identity does not migrate. The source
+    // account is the registry row's, not the record's.
+    let (record, src, old_writer) =
+        match resolve_migration_subject(&app, &store, &record, MigrationTrigger::UsageLimitHint)
+            .await
+        {
+            Ok(subject) => (subject.record, subject.src_config_dir, subject.old_writer),
+            Err(reason) => {
+                let src = record.config_dir.clone().unwrap_or_default();
+                emit_skipped(&app, &record, &src, &reason);
+                return;
+            }
+        };
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
     // quote one; a resume repaint can re-render a historical one). Re-probe
@@ -227,7 +234,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    match migrate_session_off_runtime(&app, &record, &src, &dst).await {
+    match migrate_session_off_runtime(&app, &record, &src, &dst, old_writer).await {
         Ok(outcome) => {
             info!(
                 session = %record.claude_session_id,
@@ -733,11 +740,13 @@ pub async fn migrate_session_off_runtime(
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
-) -> Result<MigrationOutcome, String> {
     // The old pane's `claude`, identified BEFORE anything is closed: the
     // detached delta sync waits for exactly this process to leave the table.
-    // Taken here because the snapshot is async and `migrate_session` is not.
-    let old_writer = old_pane_claude(app, &record.terminal_id).await;
+    // Taken by [`resolve_migration_subject`] from the same snapshot that
+    // resolved the identity, because a snapshot is async and
+    // `migrate_session` is not.
+    old_writer: Option<ProcIdentity>,
+) -> Result<MigrationOutcome, String> {
     let (app, record) = (app.clone(), record.clone());
     let (src, dst) = (src_config_dir.to_string(), dst_config_dir.to_string());
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
@@ -747,20 +756,124 @@ pub async fn migrate_session_off_runtime(
     .map_err(|e| format!("migration task did not complete: {e}"))?
 }
 
-/// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
-/// `terminal_id`, from one process-table snapshot. `None` when the pane is
-/// gone, remote (no local pid), hosts no `claude`, or the table is unreadable.
-async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<ProcIdentity> {
+/// The session a migration acts on, as the provider's registry proves it.
+pub(crate) struct MigrationSubject {
+    /// The lifecycle record to migrate — already corrected to the provider's
+    /// id on `Rebound`.
+    pub record: TerminalSessionRecord,
+    /// The account to migrate OUT of: the registry row's (in the roster's
+    /// spelling), or the record's on the operator's unresolved fallback.
+    pub src_config_dir: String,
+    /// The old pane's `claude` anchor, for the post-close delta sync.
+    pub old_writer: Option<ProcIdentity>,
+}
+
+/// Resolve which session `record`'s pane provably runs (plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+/// Phase 3) and decide what the migration does with it — the step both async
+/// callers of [`migrate_session`] take ABOVE the continuation GUARD window.
+///
+/// `Err(reason)` is a refusal; `reason` is the typed skip reason
+/// (`session-live-in-another-process(pid N)` / `identity-unresolved(<why>)`).
+/// On `Rebound` the lifecycle record is corrected first (authoritative origin,
+/// confirmed iff the new id's transcript exists), so the respawn's re-key
+/// lands on the right row.
+pub(crate) async fn resolve_migration_subject(
+    app: &tauri::AppHandle,
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    record: &TerminalSessionRecord,
+    trigger: MigrationTrigger,
+) -> Result<MigrationSubject, String> {
     use tauri::Manager;
-    let manager = app
-        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
-        .inner()
-        .clone();
-    let root = manager.get(terminal_id)?.pane_root_pid()?;
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    let (pid, started_at) =
-        crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)?;
-    Some(ProcIdentity { pid, started_at })
+    let pane_root = app
+        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+        .and_then(|m| m.inner().get(&record.terminal_id))
+        .and_then(|session| session.pane_root_pid());
+    let (identity, old_writer) =
+        resolve_migration_identity(pane_root, &record.claude_session_id).await;
+    match migration_verdict(identity, &record.claude_session_id, trigger) {
+        MigrationVerdict::Proceed {
+            sid,
+            config_dir,
+            rebound_from,
+        } => {
+            let src = roster_spelling(&config_dir, &crate::settings::get_claude_config_dirs());
+            let record = match rebound_from {
+                None => record.clone(),
+                Some(from) => {
+                    let confirmed_at = record.working_dir.as_deref().and_then(|wd| {
+                        super::transcript::session_transcript_path(Path::new(&src), wd, &sid)
+                            .exists()
+                            .then(|| chrono::Utc::now().timestamp_millis())
+                    });
+                    let corrected = rebound_record(record, &sid, &src, confirmed_at);
+                    store.record_open(corrected.clone());
+                    warn!(
+                        terminal_id = %record.terminal_id,
+                        record_session = %from,
+                        provider_session = %sid,
+                        account = %src,
+                        "account migration: the pane runs a different session than its record — record corrected from the provider's live registry, migrating the provider's id"
+                    );
+                    corrected
+                }
+            };
+            Ok(MigrationSubject {
+                record,
+                src_config_dir: src,
+                old_writer,
+            })
+        }
+        MigrationVerdict::ProceedOnRecord { why } => {
+            let src = record
+                .config_dir
+                .clone()
+                .or_else(crate::ai_provider::get_resolved_config_dir)
+                .ok_or("the session's current account is unknown — cannot migrate")?;
+            warn!(
+                terminal_id = %record.terminal_id,
+                session = %record.claude_session_id,
+                why = %why,
+                "account migration (operator command): the pane's identity is unresolved — migrating the record's session as the operator asked"
+            );
+            Ok(MigrationSubject {
+                record: record.clone(),
+                src_config_dir: src,
+                old_writer,
+            })
+        }
+        MigrationVerdict::Refuse { reason } => {
+            warn!(
+                terminal_id = %record.terminal_id,
+                session = %record.claude_session_id,
+                pane_claude_pid = ?old_writer.as_ref().map(|w| w.pid),
+                reason = %reason,
+                "account migration refused: the pane's session identity is not proven safe to move"
+            );
+            Err(reason)
+        }
+    }
+}
+
+/// Pure: `record` re-keyed onto the provider's id `sid` under `config_dir`,
+/// stamped authoritative (the provider's own pid -> session index is the same
+/// evidence grade as a typed `--session-id`). Placement, terminal and working
+/// dir are kept; the old session's name is not carried onto the new id.
+fn rebound_record(
+    record: &TerminalSessionRecord,
+    sid: &str,
+    config_dir: &str,
+    confirmed_at: Option<i64>,
+) -> TerminalSessionRecord {
+    TerminalSessionRecord {
+        claude_session_id: sid.to_string(),
+        config_dir: Some(config_dir.to_string()),
+        origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
+        confirmed_at,
+        session_name: None,
+        name_source: None,
+        ..record.clone()
+    }
 }
 
 /// Perform the migration mechanics: transcript copy → trust for the
@@ -1000,6 +1113,13 @@ pub fn migrate_session(
     // There is no close-reason to record because the row is never closed —
     // which is also what keeps boot-restore from ever offering the old pane.
     store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
+    // The duplicate-host detector must not read this hand-off (old pane still
+    // alive, resumed pane already up) as a fork.
+    crate::terminal::migration_handoff::note_migration_respawn(
+        &new_terminal_id,
+        &record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
     if let Err(e) = terminal_manager.close(&record.terminal_id) {
         // Old pane was already gone (user closed it after exhaustion) — not
         // fatal, the replacement is what matters. Its exit-close then either
@@ -1347,6 +1467,65 @@ mod tests {
     }
 
     // ---- continue nudge (plan 2026-10-21-…-forks-live-sessions, Phase 2) ----
+
+    fn record(sid: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: sid.to_string(),
+            config_dir: Some(".claude-tiohorst".to_string()),
+            working_dir: Some("D:/w".to_string()),
+            page_id: "page-1".to_string(),
+            zone_index: 3,
+            title: Some("t".to_string()),
+            terminal_id: "314176b7".to_string(),
+            opened_at: 1,
+            last_seen_at: 2,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some("observed".to_string()),
+            restore_pending_at: None,
+            confirmed_at: Some(5),
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: Some("old name".to_string()),
+            name_source: Some("operator".to_string()),
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
+            finish_reason: None,
+            finish_synced: false,
+            spawn_device_default: None,
+            adopted_from: None,
+        }
+    }
+
+    /// The `Rebound` correction re-keys the record onto the provider's id and
+    /// account, authoritative, on the SAME terminal and placement, and drops
+    /// the old session's name.
+    ///
+    /// Mutation check: leaving `origin` as the record's (`observed`), or
+    /// keeping `config_dir`, fails this.
+    #[test]
+    fn a_rebound_record_is_the_provider_identity_on_the_same_pane() {
+        let r = rebound_record(&record("0c4e3025"), "506a0190", ".claude-lukas", None);
+        assert_eq!(r.claude_session_id, "506a0190");
+        assert_eq!(r.config_dir.as_deref(), Some(".claude-lukas"));
+        assert_eq!(
+            r.origin.as_deref(),
+            Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE)
+        );
+        assert_eq!(r.confirmed_at, None);
+        assert_eq!(r.session_name, None);
+        assert_eq!(r.terminal_id, "314176b7");
+        assert_eq!((r.page_id.as_str(), r.zone_index), ("page-1", 3));
+    }
 
     fn agent(id: &str, description: Option<&str>) -> CarriedSubagent {
         CarriedSubagent {
