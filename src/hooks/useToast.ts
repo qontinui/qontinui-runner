@@ -42,7 +42,7 @@ const DISMISS_MS = 4000;
  * how long it takes to *read* an actionable message, which leaves no time to
  * reach for the button — a link nobody can click is not a link.
  */
-const ACTION_DISMISS_MS = 10000;
+export const ACTION_DISMISS_MS = 10000;
 
 let toastCounter = 0;
 
