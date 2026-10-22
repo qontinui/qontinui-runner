@@ -1194,8 +1194,10 @@ fn validate_min_ratio(min_ratio: f64) -> Result<(), String> {
 /// `2026-10-22-occlusion-sweep-is-blind-to-canvas-painted-text`, D3): a canvas
 /// surface paints its text as pixels, so its `textContent` is empty and the
 /// DOM rule would call the occlusion blank. Such an entry reads
-/// `hidesText: true, textSource: "painted"`; every other entry reads
-/// `textSource: "dom"` with `hidesText` from the DOM text as before.
+/// `hidesText: true, textSource: "painted"`. Every other entry takes
+/// `hidesText` from the DOM text as before, and carries `textSource: "dom"`
+/// only when that text is non-empty: the SDK's `textSource` is present
+/// exactly when `hidesText` is true, so a blank occlusion has no key at all.
 fn occlusion_entry(
     element_id: &str,
     label: Option<&str>,
@@ -1215,7 +1217,6 @@ fn occlusion_entry(
         // says `unavailable` so the `false` is not read as a classification.
         "isExpectedOverlay": is_expected_overlay,
         "hidesText": hides_text(text, paints_text),
-        "textSource": if paints_text { "painted" } else { "dom" },
         // Always `hit-test`: the numbers come from the registry's
         // `elementFromPoint` sampling. The geometric arm lives in
         // ui-bridge-auto and is not consulted here.
@@ -1228,14 +1229,30 @@ fn occlusion_entry(
     if !text.is_empty() {
         obj.insert("text".to_string(), serde_json::json!(text));
     }
+    if let Some(source) = text_source(text, paints_text) {
+        obj.insert("textSource".to_string(), serde_json::json!(source));
+    }
     entry
+}
+
+/// The SDK's `textSource`: `painted` for a `paintsText` surface, `dom` for
+/// non-empty DOM text, absent otherwise. Present exactly when `hides_text`.
+fn text_source(text: &str, paints_text: bool) -> Option<&'static str> {
+    if paints_text {
+        Some("painted")
+    } else if !text.is_empty() {
+        Some("dom")
+    } else {
+        None
+    }
 }
 
 /// The one `hidesText` rule, shared by the entry and the report's sort key so
 /// the two can never disagree: painted text always counts, DOM text counts when
-/// non-empty.
+/// non-empty. Defined through `text_source` so `hidesText` and the presence of
+/// `textSource` cannot drift apart either (the SDK derives one from the other).
 fn hides_text(text: &str, paints_text: bool) -> bool {
-    paints_text || !text.is_empty()
+    text_source(text, paints_text).is_some()
 }
 
 /// The webview's modal stack, reduced to the identities an occluder can match.
@@ -2180,7 +2197,11 @@ mod visibility_tests {
         assert!(painted.get("text").is_none(), "no DOM text to echo");
         for blank in &entries[1..] {
             assert_eq!(blank["hidesText"], json!(false));
-            assert_eq!(blank["textSource"], json!("dom"));
+            assert!(
+                blank.get("textSource").is_none(),
+                "the SDK's `textSource` is present exactly when `hidesText` is \
+                 true; a blank occlusion carries no key: {blank}"
+            );
         }
     }
 

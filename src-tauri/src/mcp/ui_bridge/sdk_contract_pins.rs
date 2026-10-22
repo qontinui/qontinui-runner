@@ -317,6 +317,30 @@ fn occlusion_entry_pins_the_painted_text_source() {
     assert_eq!(entry["textSource"], "painted");
 }
 
+/// The blank arm: no DOM text and no `paintsText`. The SDK spreads
+/// `textSource` in only when it is defined (`visibility-report.ts`), so the
+/// key is ABSENT — not `"dom"` — and `hidesText` is false. A consumer keying on
+/// `textSource` presence would otherwise read every blank box as DOM text.
+#[test]
+fn occlusion_entry_omits_text_source_when_nothing_is_hidden() {
+    let report = build_visibility_report(
+        &[serde_json::json!({
+            "id": "spacer",
+            "state": { "occludedBy": "div.toast", "occludedPct": 30.0 },
+        })],
+        0.02,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
+    let entry = &report["occlusions"][0];
+    assert_eq!(entry["hidesText"], false);
+    assert!(
+        entry.get("textSource").is_none(),
+        "`textSource` is present exactly when `hidesText` is true: {entry}"
+    );
+}
+
 /// The report-level keys, against the SDK's `VisibilityReport` interface.
 ///
 /// This test also records the two directions in which the Rust twin and the
