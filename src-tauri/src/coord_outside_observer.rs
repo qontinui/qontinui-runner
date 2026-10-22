@@ -3186,6 +3186,28 @@ mod tests {
     }
 
     #[test]
+    fn one_dead_worker_recovering_as_another_dies_clears_once_and_reports_the_new_death() {
+        let a_dead = ledger_body(
+            1,
+            json!([dead_row("merge_scheduler.dispatch", true, false)]),
+        );
+        let b_dead = ledger_body(
+            1,
+            json!([dead_row("gate_evaluation_sweep", true, false)]),
+        );
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&a_dead));
+        state.take_cleared();
+        // Same read: A recovered, B died. The caller emits the clear FIRST and
+        // the report after it, so B's card is the one left standing.
+        let reports = state.observe(&classify_ledger(&b_dead));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].class, FaultClass::WorkerDead);
+        assert_eq!(reports[0].worker.as_deref(), Some("gate_evaluation_sweep"));
+    }
+
+    #[test]
     fn a_healthy_fleet_reports_nothing() {
         let body = ledger_body(0, json!([]));
         let mut state = ObserverState::default();

@@ -1,4 +1,3 @@
-import React from "react";
 import { AlertCircle, AlertTriangle, Info, X } from "lucide-react";
 import { getSeverityColors } from "@/design-system";
 import {
@@ -43,7 +42,7 @@ export function ErrorBanner({
   return (
     <div
       role="alert"
-      data-ui-bridge-id="app-error-banner"
+      data-ui-bridge-id={`app-error-banner-${error.error_code}`}
       data-content-role="status"
       data-content-label="app error"
       className={`flex items-start gap-3 px-4 py-2 border-b ${severityClasses(error.severity)}`}
@@ -54,7 +53,7 @@ export function ErrorBanner({
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-3 flex-wrap">
           <h3 className="font-semibold">{error.title}</h3>
-          <p className="text-sm">{error.message}</p>
+          <p className="text-sm max-h-16 overflow-y-auto">{error.message}</p>
         </div>
         {error.details && (
           <details className="mt-1">
@@ -74,7 +73,7 @@ export function ErrorBanner({
         onClick={onDismiss}
         aria-label={label}
         title={label}
-        data-ui-bridge-id="app-error-banner-dismiss"
+        data-ui-bridge-id={`app-error-banner-dismiss-${error.error_code}`}
         className="shrink-0 ml-2 p-1 hover:bg-black/10 rounded"
       >
         <X className="w-4 h-4" />
@@ -107,7 +106,7 @@ export function ErrorResidual({
       onClick={onReopen}
       aria-label={`Show ${error.title} (${text})`}
       title={`${error.title} — click to show`}
-      data-ui-bridge-id="app-error-residual"
+      data-ui-bridge-id={`app-error-residual-${error.error_code}`}
       data-content-role="status"
       data-content-label="dismissed app error"
       className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-xs font-medium ${severityClasses(error.severity)}`}
