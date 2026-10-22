@@ -172,7 +172,8 @@ qontinui-runner-win32 = { path = "../crates/runner-win32" }
 # the frame protocol, the client, and the spawner the runner starts holders
 # with. The holder BINARY ships beside the runner as a Tauri externalBin.
 qontinui-pty-holder = { path = "../crates/pty-holder" }
-qontinui-types = { path = "../../qontinui-schemas/rust" }
+# `host-probe`: `ci_node::host_sizing::probe` reads the live host (sysinfo).
+qontinui-types = { path = "../../qontinui-schemas/rust", features = ["host-probe"] }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core" }
 socket2 = "0.6"
