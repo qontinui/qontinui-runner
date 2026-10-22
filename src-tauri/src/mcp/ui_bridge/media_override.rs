@@ -58,6 +58,7 @@
 //! asset-store URLs) and the response carries the page's original URLs. Neither
 //! is logged here — the log lines name the target only.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::Json};
@@ -416,21 +417,60 @@ fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<Value>>) {
     )
 }
 
+/// The direct route's three request bodies, over what a test can construct:
+/// the request body, the IPC budget, and `send` — the request to the runner's
+/// own webview (`ui_bridge_request_sync` in the axum handler, a recording
+/// closure in a test). Validation and the budget fit run HERE, before `send`,
+/// so a test entering through these functions observes them.
+pub(crate) async fn direct_apply<S, F>(body: Value, budget_ms: u64, send: S) -> HandlerResult
+where
+    S: FnOnce(&'static str, Value) -> F,
+    F: Future<Output = Result<Value, String>>,
+{
+    let body = prepare_override_body(
+        body,
+        WaitBudget::UiBridgeIpc(budget_ms),
+        WaitFill::EngineDirect,
+    )
+    .map_err(bad_request)?;
+    info!("UI Bridge API: media override on {}", target_label(&body));
+    wrap_ipc_result_keeping_failure_data(send("media_override_apply", body).await)
+}
+
+/// [`direct_apply`] for `DELETE`: restore one override or all, verified.
+pub(crate) async fn direct_restore<S, F>(body: Value, budget_ms: u64, send: S) -> HandlerResult
+where
+    S: FnOnce(&'static str, Value) -> F,
+    F: Future<Output = Result<Value, String>>,
+{
+    let body = prepare_restore_body(
+        body,
+        WaitBudget::UiBridgeIpc(budget_ms),
+        WaitFill::EngineDirect,
+    )
+    .map_err(bad_request)?;
+    info!("UI Bridge API: media override restore");
+    wrap_ipc_result_keeping_failure_data(send("media_override_restore", body).await)
+}
+
+/// [`direct_apply`] for `GET`: the overrides still active.
+pub(crate) async fn direct_list<S, F>(send: S) -> HandlerResult
+where
+    S: FnOnce(&'static str, Value) -> F,
+    F: Future<Output = Result<Value, String>>,
+{
+    wrap_ipc_result_keeping_failure_data(send("media_override_list", serde_json::json!({})).await)
+}
+
 /// POST /ui-bridge/control/media/override — swap one image slot in the runner's webview.
 pub async fn ui_bridge_media_override_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<Value>,
 ) -> HandlerResult {
-    let body = prepare_override_body(
-        body,
-        WaitBudget::UiBridgeIpc(get_ui_bridge_timeout_ms()),
-        WaitFill::EngineDirect,
-    )
-    .map_err(bad_request)?;
-    info!("UI Bridge API: media override on {}", target_label(&body));
-    wrap_ipc_result_keeping_failure_data(
-        ui_bridge_request_sync(&state, "media_override_apply", body).await,
-    )
+    direct_apply(body, get_ui_bridge_timeout_ms(), |kind, body| async move {
+        ui_bridge_request_sync(&state, kind, body).await
+    })
+    .await
 }
 
 /// DELETE /ui-bridge/control/media/override — restore one override or all, verified.
@@ -441,25 +481,17 @@ pub async fn ui_bridge_media_override_restore_handler(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    let body = prepare_restore_body(
-        body,
-        WaitBudget::UiBridgeIpc(get_ui_bridge_timeout_ms()),
-        WaitFill::EngineDirect,
-    )
-    .map_err(bad_request)?;
-    info!("UI Bridge API: media override restore");
-    wrap_ipc_result_keeping_failure_data(
-        ui_bridge_request_sync(&state, "media_override_restore", body).await,
-    )
+    direct_restore(body, get_ui_bridge_timeout_ms(), |kind, body| async move {
+        ui_bridge_request_sync(&state, kind, body).await
+    })
+    .await
 }
 
 /// GET /ui-bridge/control/media/override — the overrides still active.
 pub async fn ui_bridge_media_override_list_handler(
     State(state): State<Arc<ApiState>>,
 ) -> HandlerResult {
-    wrap_ipc_result_keeping_failure_data(
-        ui_bridge_request_sync(&state, "media_override_list", serde_json::json!({})).await,
-    )
+    direct_list(|kind, body| async move { ui_bridge_request_sync(&state, kind, body).await }).await
 }
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
@@ -840,6 +872,102 @@ mod tests {
             sdk_override_bodies(json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 29_000.0}))
                 .unwrap_err();
         assert!(err.contains("30000 ms budget"), "{err}");
+    }
+
+    // ── the direct route, entered through its handler body ────────────────
+
+    type Sent = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, Value)>>>;
+
+    /// A stand-in for the runner's webview: records every request it is sent
+    /// and answers `{success: true}`.
+    fn webview() -> (
+        Sent,
+        impl FnOnce(&'static str, Value) -> std::future::Ready<Result<Value, String>>,
+    ) {
+        let sent: Sent = Default::default();
+        let log = sent.clone();
+        let send = move |kind: &'static str, body: Value| {
+            log.lock().unwrap().push((kind, body));
+            std::future::ready(Ok(json!({"success": true})))
+        };
+        (sent, send)
+    }
+
+    fn refused_before_sending(result: HandlerResult, sent: &Sent, needle: &str) {
+        let (status, Json(body)) = result.expect_err("must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body.error.unwrap_or_default();
+        assert!(error.contains(needle), "{error} lacks {needle}");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing may reach the webview"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_apply_refuses_an_invalid_body_before_the_webview_sees_it() {
+        let (sent, send) = webview();
+        let result = direct_apply(json!({"slotId": "a"}), 10_000, send).await;
+        refused_before_sending(
+            result,
+            &sent,
+            "one of src, srcset, sources or backgroundImage",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_apply_refuses_an_over_budget_wait_before_the_webview_sees_it() {
+        let (sent, send) = webview();
+        let body = json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 9_000});
+        let result = direct_apply(body, 10_000, send).await;
+        refused_before_sending(result, &sent, "10000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_direct_apply_sends_the_webview_the_absent_wait_filled() {
+        let (sent, send) = webview();
+        assert!(
+            direct_apply(json!({"slotId": "a", "src": "x"}), 10_000, send)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(
+                "media_override_apply",
+                json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 8_000})
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_restore_refuses_an_invalid_body_before_the_webview_sees_it() {
+        let (sent, send) = webview();
+        let result = direct_restore(json!({"overrideId": ""}), 10_000, send).await;
+        refused_before_sending(result, &sent, "overrideId must be a non-empty string");
+        let (sent, send) = webview();
+        let result = direct_restore(json!({"verifyTimeoutMs": 9_000}), 10_000, send).await;
+        refused_before_sending(result, &sent, "10000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_direct_restore_sends_the_webview_the_absent_wait_filled() {
+        let (sent, send) = webview();
+        assert!(direct_restore(json!({}), 10_000, send).await.is_ok());
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![("media_override_restore", json!({"verifyTimeoutMs": 8_000}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_list_asks_the_webview_for_the_active_overrides() {
+        let (sent, send) = webview();
+        assert!(direct_list(send).await.is_ok());
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![("media_override_list", json!({}))]
+        );
     }
 
     #[test]
