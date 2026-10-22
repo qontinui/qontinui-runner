@@ -9533,6 +9533,10 @@ mod media_override_dispatch_tests {
     async fn the_sdk_list_asks_the_active_app_for_its_overrides() {
         let (d, c) = http_app().await;
         let out = sdk_media_override_list(&d, &c).await;
-        assert_eq!(out["got"], Value::Null, "the HTTP arm's GET carries no body: {out}");
+        assert_eq!(
+            out["got"],
+            Value::Null,
+            "the HTTP arm's GET carries no body: {out}"
+        );
     }
 }
