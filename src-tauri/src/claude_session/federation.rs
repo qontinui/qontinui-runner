@@ -285,6 +285,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_refused_or_undetermined_tenant_is_tenant_refused_not_the_default() {
+        // A decision that stated no tenant because the workspace or repo named
+        // one this device cannot act on (or that could not be established)
+        // skips federation. It must never fall through to the device default,
+        // which would federate another project's pool.
+        for decision in [
+            crate::session::NewSessionTenant::Refused,
+            crate::session::NewSessionTenant::Undetermined,
+        ] {
+            assert_eq!(
+                build_federation_ctx(
+                    "s",
+                    "/w",
+                    &crate::settings::ClaudeCliSettings::default(),
+                    decision,
+                )
+                .err(),
+                Some(FederationSkipReason::TenantRefused),
+                "{decision:?}"
+            );
+        }
+    }
+
+    #[test]
     fn derives_account_name_from_hotmail_dir() {
         assert_eq!(
             derive_account_name("C:\\claude\\.claude-hotmail"),

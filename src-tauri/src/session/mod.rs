@@ -2101,6 +2101,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_workspace_declaration_outranks_the_repo_as_on_the_proxy() {
+        // The proxy's precedence: a workspace declaration (rows 1a-1c) is read
+        // before the repo (row 1d), so a session whose workspace names C is C
+        // even inside a repo owned by B, on a machine pinned to A.
+        let decide = |declaration| {
+            let decision = decide_new_session_tenant(
+                declaration,
+                resolved(REPO_B),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                || Some(MACHINE_A),
+                |_| Ok(()),
+            );
+            new_session_tenant_from_decision("/w", decision, || Some(MACHINE_A))
+        };
+        assert_eq!(
+            decide(workspace_tenant::WorkspaceDeclaration::Declared {
+                tenant: OTHER_C,
+                source: workspace_tenant::TenantDeclarationSource::Env,
+            }),
+            NewSessionTenant::Stated(OTHER_C)
+        );
+        // A declaration that cannot be read as a tenant still outranks the
+        // repo: it refuses, and neither the repo's tenant nor the machine
+        // default fills it.
+        assert_eq!(
+            decide(workspace_tenant::WorkspaceDeclaration::Unusable {
+                source: workspace_tenant::TenantDeclarationSource::Env,
+                detail: "not a uuid".into(),
+            }),
+            NewSessionTenant::Refused
+        );
+    }
+
+    #[test]
+    fn a_repo_tenant_is_stated_even_on_an_unresolvable_machine() {
+        // An unresolvable machine states no tenant of its own, but the repo
+        // tier is not a machine row: a paired repo owner still names the
+        // session's tenant.
+        assert_eq!(
+            new_session_decision(
+                resolved(REPO_B),
+                tenant_pin::TenantPin::Unresolvable,
+                Some(MACHINE_A),
+                &[REPO_B],
+            ),
+            NewSessionTenant::Stated(REPO_B)
+        );
+    }
+
     /// In-memory transport that records every call for test inspection.
     /// Doesn't talk to a real PTY / subprocess — that's the point: tests
     /// should not depend on Tauri runtime, OS shells, or external
