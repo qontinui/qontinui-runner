@@ -197,22 +197,20 @@ export function patchPendingTab(
 }
 
 /**
- * Whether Undo may put the tab back into the zone it held.
+ * Whether Undo may put the tab back into the zone it held: only when that
+ * zone is EMPTY now.
  *
- * Only when the zone is empty, or its occupant ARRIVED after the close — a
- * tab that held no zone when the close happened (a new tab, or an unzoned one
- * the layout auto-filled into the vacancy). A tab that already held a zone
- * and was moved there since is a layout the operator arranged, and is not
- * overwritten: the restored tab is then placed by the layout's ordinary
- * auto-assignment instead (`reconcileAssignments`).
- *
- * `zonedAtClose` is the set of tab ids that held a zone at close time.
+ * Whatever sits there — a tab the operator opened or dragged in during the
+ * window, or one the layout auto-filled into the vacancy — is left alone:
+ * `assignTabToZone` would overwrite it, and under a preset layout the
+ * displaced tab would drop out of the grid. The restored tab is then placed
+ * by the layout's ordinary auto-assignment (`reconcileAssignments`), which
+ * fills EMPTY zones only — so on a full grid it lands unzoned, reachable from
+ * the "N more" unzoned chip and the control panel's Unassigned list like any
+ * other overflow session.
  */
-export function mayRestoreIntoZone(
-  occupantId: string | null,
-  zonedAtClose: ReadonlySet<string>,
-): boolean {
-  return occupantId === null || !zonedAtClose.has(occupantId);
+export function mayRestoreIntoZone(occupantId: string | null): boolean {
+  return occupantId === null;
 }
 
 /** The toast text for a close: the name the operator knows the session by. */
