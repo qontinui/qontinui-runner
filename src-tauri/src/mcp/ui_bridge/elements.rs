@@ -7036,31 +7036,7 @@ mod type_action_param_validation_tests {
         // 400 for them. Pass-through verified for every other action
         // name in the supported list.
         let params = Some(json!({ "value": "foo" }));
-        for action in &[
-            "setValue",
-            "select",
-            "click",
-            "doubleClick",
-            "double_click",
-            "double",
-            "right",
-            "middle",
-            "sendKeys",
-            "clear",
-            "focus",
-            "blur",
-            "hover",
-            "scroll",
-            "scrollIntoView",
-            "scroll_into_view",
-            "check",
-            "uncheck",
-            "toggle",
-            "drag",
-            "submit",
-            "reset",
-            "autocomplete",
-        ] {
+        for action in SUPPORTED_ACTION_NAMES.iter().filter(|a| **a != "type") {
             assert_eq!(
                 validate_type_action_params(action, &params, &empty_extra()),
                 Ok(()),
