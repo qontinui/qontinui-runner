@@ -451,7 +451,7 @@ pub const OWED_BIND_BACKOFF: [Duration; 5] = [
 /// the mark local-only until some unrelated append) and it retries on
 /// [`OWED_BIND_BACKOFF`] until the session is bound. A record whose transcript
 /// is not on disk has nothing to tail and is left alone; consent withheld
-/// (`cloud_sync_enabled` off) binds nothing. Detached; never blocks the caller.
+/// (the egress transcript gate closed) binds nothing. Detached; never blocks the caller.
 pub fn spawn_owed_finish_bind(
     tailer: &Arc<SessionTranscriptTailer>,
     rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
@@ -463,7 +463,9 @@ pub fn spawn_owed_finish_bind(
         let Some(identity) = identity_from_path(&path) else {
             continue;
         };
-        if !crate::settings::get_cloud_sync_enabled() {
+        if !crate::egress::transcript_sync_permitted() {
+            // Consent withheld (the user's toggle or the tenant switch): no
+            // coord traffic, no binding — the same gate spawn_ensure_bound uses.
             return;
         }
         let tailer = tailer.clone();
@@ -473,7 +475,7 @@ pub fn spawn_owed_finish_bind(
                 if tailer.is_bound(&identity.claude_session_id) {
                     return;
                 }
-                bind_one(&tailer, identity.clone(), &path, true).await;
+                bind_one(&tailer, identity.clone(), &path).await;
                 if tailer.is_bound(&identity.claude_session_id) {
                     return;
                 }
