@@ -51,6 +51,7 @@ import { useCanaryAlerts } from "./hooks/useCanaryAlerts";
 import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
 import { useObservationServices } from "./hooks/useObservationServices";
 import { useToast } from "./hooks/useToast";
+import { ToastProvider } from "./contexts/ToastContext";
 import { useErrorNotifications } from "./hooks/useErrorNotifications";
 import { useAccountMigrationNotifications } from "./hooks/useAccountMigrationNotifications";
 import { useResourceGuardNotifications } from "./hooks/useResourceGuardNotifications";
@@ -901,27 +902,31 @@ function AppContent() {
                     another page. WindowAssignmentsProvider sits above so
                     tab-ownership filtering can read "which window owns which
                     session" (a no-op in the single-window case).
+                    ToastProvider hands the app's one toast system to the
+                    terminal manager, which raises the Undo-close toast.
 
                     `TerminalPageProvider` still carries the ACTIVE page id to
                     TerminalPage (== session.pageId) so the page's render logic
                     is untouched; the `key={activePageId}` remount is gone.
                   */}
-                      <WindowAssignmentsProvider>
-                        <TerminalSessionProvider
-                          pages={terminalPages.pages}
-                          activePageId={terminalPages.activePageId}
-                          onNavigateToBuilder={navigateToBuilder}
-                          onNavigateToActive={navigateToActive}
-                        >
-                          <TerminalPageProvider value={terminalPages.activePageId}>
-                            <TerminalPage
-                              onNavigateToBuilder={navigateToBuilder}
-                              onNavigateToActive={navigateToActive}
-                              onSessionCountChange={setTerminalSessionCount}
-                            />
-                          </TerminalPageProvider>
-                        </TerminalSessionProvider>
-                      </WindowAssignmentsProvider>
+                      <ToastProvider showToast={showToast}>
+                        <WindowAssignmentsProvider>
+                          <TerminalSessionProvider
+                            pages={terminalPages.pages}
+                            activePageId={terminalPages.activePageId}
+                            onNavigateToBuilder={navigateToBuilder}
+                            onNavigateToActive={navigateToActive}
+                          >
+                            <TerminalPageProvider value={terminalPages.activePageId}>
+                              <TerminalPage
+                                onNavigateToBuilder={navigateToBuilder}
+                                onNavigateToActive={navigateToActive}
+                                onSessionCountChange={setTerminalSessionCount}
+                              />
+                            </TerminalPageProvider>
+                          </TerminalSessionProvider>
+                        </WindowAssignmentsProvider>
+                      </ToastProvider>
                     </div>
                   </div>
                 </AdvisoryStackProvider>

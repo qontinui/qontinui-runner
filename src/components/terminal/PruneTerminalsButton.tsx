@@ -49,7 +49,7 @@ export function PruneTerminalsButton() {
     setArmed(false);
     // Request first: the compaction waits for these ids to leave the tab list.
     requestCompaction(plan.keepIds, plan.closeIds);
-    for (const id of plan.closeIds) closeTerminal(id);
+    for (const id of plan.closeIds) closeTerminal(id, { immediate: true });
   }, [closeCount, armed, plan, requestCompaction, closeTerminal]);
 
   if (!actionable) return null;
