@@ -72,6 +72,7 @@ export function changed(rec: PrepareRecord): PrepChanged {
       same_build_hold: false,
       hold_expired_at: null,
       release_failed: null,
+      verdict_current: true,
     },
   };
 }

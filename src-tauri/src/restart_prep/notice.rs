@@ -515,6 +515,11 @@ pub struct PrepVerdict {
     pub cohort_captured_at_ms: i64,
     pub evaluated_at_ms: i64,
     pub evaluated_at: String,
+    /// The runner PROCESS that evaluated it ([`super::running_process`]). A
+    /// verdict persisted by a process that has since restarted describes
+    /// sessions that are gone; `None` on a verdict written before this field.
+    #[serde(default)]
+    pub evaluated_by: Option<String>,
 }
 
 fn prepare_wide(reason: String) -> Blocker {
@@ -646,6 +651,7 @@ pub fn verdict_of(
         cohort_captured_at_ms: rec.cohort.captured_at_ms,
         evaluated_at_ms: now_ms,
         evaluated_at: rfc3339(now_ms),
+        evaluated_by: Some(super::running_process().to_string()),
     }
 }
 

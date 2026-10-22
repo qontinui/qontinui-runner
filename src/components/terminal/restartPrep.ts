@@ -146,6 +146,13 @@ export interface PrepView {
   same_build_hold: boolean;
   hold_expired_at: string | null;
   release_failed: string | null;
+  /**
+   * The record's verdict was evaluated by THIS runner process. After a
+   * restart it is false until the notice loop's first reading here: the
+   * persisted verdict and row states describe the previous process's
+   * sessions. Absent (an older backend): not known to be current.
+   */
+  verdict_current?: boolean;
 }
 
 /** `restart_prep::prepare::PrepChanged` — the event payload and the action replies. */
@@ -275,6 +282,13 @@ export function restartPrepHeadline({
     };
   }
   const blockers = Array.isArray(verdict.blockers) ? verdict.blockers : [];
+  if (view && view.verdict_current !== true) {
+    return {
+      kind: "unknown",
+      text: "UNKNOWN: the verdict (evaluated before this runner restarted — waiting for its first reading here)",
+      blockers,
+    };
+  }
   // Both strings are the backend's one hold label (`HoldStatus::label`, or
   // "hold expired at …"), so they compare directly.
   if (view && verdict.hold !== view.hold) {
@@ -328,6 +342,8 @@ export function blockerLine(b: Blocker): string {
 export function rowStateChip(
   row: CohortRow,
   recordState?: PrepState,
+  /** `PrepView.verdict_current`: the row states were read by this process. */
+  current?: boolean,
 ): { text: string; tone: "ok" | "wait" | "unknown" } {
   if (row.restore) {
     const v = row.restore.verdict;
@@ -346,6 +362,10 @@ export function rowStateChip(
     return { text: s ? `last read: ${s.replace(/_/g, " ")}` : "not read", tone: "unknown" };
   }
   if (!s) return { text: "unknown: not read yet", tone: "unknown" };
+  if (current === false) {
+    // In its window, but read by the process before a restart.
+    return { text: `last read: ${s.replace(/_/g, " ")}`, tone: "unknown" };
+  }
   if (s === "unknown") return { text: "unknown", tone: "unknown" };
   const text = s.replace(/_/g, " ");
   const tone = s === "paused" || s === "finished" || s === "closed" ? "ok" : "wait";
@@ -586,7 +606,11 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         const reply = asPrepChanged(await deps.invoke(cmd, args));
         if (!reply) throw new Error(`the ${action} reply came back in an unrecognized shape`);
         applyReply(reply, seq);
-        set({ [action]: { phase: "done", message: `hold ${reply.view.hold}` } });
+        const expiry =
+          action === "extend" && reply.record.hold_until
+            ? `; expires ${reply.record.hold_until}`
+            : "";
+        set({ [action]: { phase: "done", message: `hold ${reply.view.hold}${expiry}` } });
         return reply;
       } catch (err) {
         const message = describeThrown(err, `the ${action} failed`);

@@ -184,6 +184,14 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
       "open the progress panel. While a prepare is running it only opens the panel.",
     actions: [
       {
+        id: "open-panel",
+        label: "Open the restart-prep panel",
+        description: "Show the restart prepare's progress (or the last one's outcome).",
+        // `read` — shows the panel; nothing about the prepare changes.
+        effect: "read",
+        handler: () => store.openPanel(),
+      },
+      {
         id: "prepare",
         label: "Prepare for restart",
         description:
@@ -247,15 +255,18 @@ function RestartPrepRow({
   canToggle,
   store,
   recordState,
+  current,
 }: {
   recordState: PrepState;
+  /** The record's verdict (and row states) were read by this process. */
+  current: boolean;
   row: CohortRow;
   heldState: ActionState | undefined;
   canToggle: boolean;
   store: RestartPrepStore;
 }) {
   const id = row.session.claudeSessionId;
-  const chip = rowStateChip(row, recordState);
+  const chip = rowStateChip(row, recordState, current);
   const toggling = heldState?.phase === "in-flight";
   /** Rejects (to a UI Bridge caller) when the toggle cannot act — never a silent no-op. */
   const toggle = (): Promise<unknown> => {
@@ -304,7 +315,10 @@ function RestartPrepRow({
       data-pause-state={row.pause_state ?? "unread"}
       className="flex items-center gap-1.5 px-2 py-1 text-[10px] border-t border-[#2a2d3d]"
     >
-      <span className="truncate min-w-0 flex-1 text-[#c0caf5]" title={`${rowName(row)}\n${id}`}>
+      <span
+        className="truncate min-w-[6rem] flex-1 text-[#c0caf5]"
+        title={`${rowName(row)}\n${id}`}
+      >
         {rowName(row)}
       </span>
       <span className="shrink-0 px-1 rounded bg-[#7aa2f7]/10 text-[#7aa2f7]">
@@ -313,8 +327,12 @@ function RestartPrepRow({
       <span className="shrink-0 px-1 rounded bg-[#bb9af7]/10 text-[#bb9af7]" title={effortTitle}>
         {effortBadge(row)}
       </span>
-      <span className="shrink-0 text-[#565f89]" title={`page ${row.session.pageId}`}>
-        {row.session.pageId} · zone {row.session.zoneIndex + 1}
+      {/* The page id is a UUID: it truncates, never the name beside it. */}
+      <span
+        className="min-w-0 max-w-[7rem] truncate text-[#565f89]"
+        title={`page ${row.session.pageId}, zone ${row.session.zoneIndex + 1}`}
+      >
+        zone {row.session.zoneIndex + 1} · page {row.session.pageId}
       </span>
       <span
         className={`shrink-0 px-1 rounded ${CHIP_CLASS[chip.tone]}`}
@@ -461,8 +479,6 @@ export function RestartPrepPanel({
 
   useUIComponent({
     id: RESTART_PREP_CANCEL_ID,
-    // A fixed name: `useUIComponent` registers its name once, so one that
-    // switched between "Cancel" and "Release hold" would go stale.
     name: "Cancel the restart prepare / release its hold",
     description:
       "Release the spawn hold and lift the account freeze; sessions that were told to pause are " +
@@ -470,7 +486,10 @@ export function RestartPrepPanel({
     actions: [
       {
         id: "cancel",
-        label: releaseLabel,
+        // A fixed label: `useUIComponent` re-registers actions only when its
+        // component key changes, so a label that switched between "Cancel"
+        // and "Release hold" would go stale on the bridge.
+        label: "Cancel / release hold",
         description: "Cancel the prepare (or release a same-build restart's hold).",
         // `destructive` (CONTRACT.md Dim 2 + Dim 1): it releases this device's coord
         // drain — machine/fleet state — and types "resume your work" into every
@@ -611,6 +630,9 @@ export function RestartPrepPanel({
               {extendBusy ? "Extending…" : "Extend 6 h"}
             </button>
           )}
+          {snap.extend.phase === "done" && (
+            <div className="text-[#565f89]">Extended — {snap.extend.message}</div>
+          )}
           {snap.extend.phase === "failed" && (
             <div className="text-[#f7768e]">Extend failed: {snap.extend.message}</div>
           )}
@@ -640,6 +662,7 @@ export function RestartPrepPanel({
           canToggle={canToggle}
           store={store}
           recordState={rec.state}
+          current={view?.verdict_current === true}
         />
       ))}
 

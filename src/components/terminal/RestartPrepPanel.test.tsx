@@ -231,7 +231,7 @@ describe("the panel rows and controls", () => {
     expect(html).toMatch(/data-ui-bridge-id="terminal.restart-prep-held-s1"[^>]*data-held="true"/);
     expect(html).toMatch(/data-ui-bridge-id="terminal.restart-prep-held-s2"[^>]*data-held="false"/);
     expect(html).toContain("account unknown");
-    expect(html).toContain("page-a · zone 3");
+    expect(html).toContain("zone 3 · page page-a");
     expect(html).toContain('data-ui-bridge-id="terminal.restart-prep-cancel"');
 
     const effects = Object.fromEntries(
@@ -253,6 +253,7 @@ describe("the panel rows and controls", () => {
       <PrepareRestartButton store={frozenStore(snapshot({ panelOpen: false }))} />,
     );
     expect(registered.find((c) => c.id === "terminal.prepare-restart-button")?.actions).toEqual([
+      expect.objectContaining({ id: "open-panel", effect: "read" }),
       expect.objectContaining({ id: "prepare", effect: "destructive" }),
     ]);
   });

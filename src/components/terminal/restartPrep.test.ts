@@ -102,6 +102,27 @@ describe("restartPrepHeadline — exactly one of three readings", () => {
   });
 });
 
+describe("a verdict from before a restart", () => {
+  it("is UNKNOWN in the headline and 'last read' on every chip", () => {
+    const rec = record({ verdict: verdict({ ready_to_restart: true }) });
+    const view = { ...changed(rec).view, verdict_current: false };
+    const h = restartPrepHeadline({ record: rec, view, readError: null, loaded: true });
+    expect(h?.kind).toBe("unknown");
+    expect(h?.text).toMatch(/before this runner restarted/);
+    // An older backend that sends no flag is not known to be current either.
+    const { verdict_current: _drop, ...older } = changed(rec).view;
+    void _drop;
+    expect(
+      restartPrepHeadline({ record: rec, view: older, readError: null, loaded: true })?.kind,
+    ).toBe("unknown");
+    expect(rowStateChip(row("a", { pause_state: "paused" }), "preparing", false)).toEqual({
+      text: "last read: paused",
+      tone: "unknown",
+    });
+    expect(rowStateChip(row("a", { pause_state: "paused" }), "preparing", true).tone).toBe("ok");
+  });
+});
+
 describe("row chips read the backend's observation", () => {
   it("colours a restore by its verdict", () => {
     const at = { at_ms: 1, at: "", effort_applied: null, effort: null };
@@ -201,7 +222,10 @@ describe("the store", () => {
     expect(store.getSnapshot().cancel.phase).toBe("in-flight");
     resolvers.restart_prep_extend(changed(record({ hold_until: "later" })));
     await e1;
-    expect(store.getSnapshot().extend).toEqual({ phase: "done", message: "hold confirmed" });
+    expect(store.getSnapshot().extend).toEqual({
+      phase: "done",
+      message: "hold confirmed; expires later",
+    });
     resolvers.restart_prep_cancel("not a reply");
     await expect(c1).rejects.toThrow("unrecognized shape");
     expect(store.getSnapshot().cancel.phase).toBe("failed");

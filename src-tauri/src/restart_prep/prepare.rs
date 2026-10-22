@@ -412,6 +412,11 @@ pub struct PrepView {
     /// route absent): the prepare is still in force and the hold still
     /// stands. The outcome, verbatim; Release hold retries it.
     pub release_failed: Option<String>,
+    /// The verdict in the record was evaluated by THIS runner process. False
+    /// after a restart until the notice loop's first tick here: the persisted
+    /// verdict and row states then describe the previous process's sessions,
+    /// and the panel reads them as the last reading, never as current.
+    pub verdict_current: bool,
 }
 
 /// Whether `hold` puts the runner-local hold on `drain_gate`.
@@ -466,6 +471,8 @@ pub fn view_of(rec: &PrepareRecord, same_build_restart: bool, now_ms: i64) -> Pr
         local_hold: active && holds_locally(&rec.hold),
         same_build_hold: same_build_restart && active && spawns_held(&rec.hold),
         hold_expired_at: expired_at,
+        verdict_current: rec.verdict.as_ref().and_then(|v| v.evaluated_by.as_deref())
+            == Some(super::running_process()),
         release_failed: rec
             .release
             .as_ref()
@@ -980,12 +987,11 @@ impl RestartPrep {
         let granted = match (&hold, coord_until) {
             // Coord named its own deadline.
             (_, Some(u)) => Some(u),
-            // Held with no deadline in the answer: the one that was sent, or
-            // the runner-local hold, which is ours to set.
-            (HoldStatus::Confirmed | HoldStatus::Local | HoldStatus::LocalSecondary, None) => {
-                Some(until)
-            }
-            // Not confirmed: coord's lane still ends where it did.
+            // Held with no deadline in the answer (the one that was sent), or
+            // held by the runner-local hold — the `local` ones, and the backstop
+            // under an unconfirmed one ([`holds_locally`]) — whose deadline is
+            // ours to set: spawns stay held to the new `until` either way.
+            (h, None) if spawns_held(h) => Some(until),
             _ => rec.hold_until_ms,
         };
         info!(
@@ -2216,9 +2222,13 @@ mod tests {
             "{:?}",
             ext.hold
         );
-        assert_eq!(
-            ext.hold_until_ms, before,
-            "an extension coord did not grant shows no new expiry"
+        assert!(
+            ext.hold_until_ms > before,
+            "the runner-local backstop under an unconfirmed hold is extended"
+        );
+        assert!(
+            ctl.local_hold_reason(T0 + 12 * 60 * 60 * 1000).is_some(),
+            "and spawns stay held past the old expiry"
         );
     }
 
@@ -2316,5 +2326,32 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(fresh.prepare_id, rec.prepare_id);
+    }
+
+    /// A verdict persisted by another runner process (the one before a
+    /// restart) is never current; the one this process evaluates is.
+    #[test]
+    fn restart_prep_a_verdict_from_another_process_is_not_current() {
+        let mut rec = PrepareRecord::new("prep-v".to_string(), T0, cohort(&["s1"]));
+        assert!(!view_of(&rec, false, T0).verdict_current, "no verdict yet");
+        let ev = crate::restart_prep::notice::CensusEvidence {
+            census_error: None,
+            by_session: Default::default(),
+            live_terminals: Default::default(),
+            unattributed_live: 0,
+            device_drain: None,
+        };
+        let mut v = crate::restart_prep::notice::verdict_of(&rec, &ev, None, T0);
+        rec.verdict = Some(v.clone());
+        assert!(view_of(&rec, false, T0).verdict_current, "evaluated here");
+        v.evaluated_by = Some("a-process-before-the-restart".to_string());
+        rec.verdict = Some(v.clone());
+        assert!(!view_of(&rec, false, T0).verdict_current);
+        v.evaluated_by = None;
+        rec.verdict = Some(v);
+        assert!(
+            !view_of(&rec, false, T0).verdict_current,
+            "unstamped is not current"
+        );
     }
 }
