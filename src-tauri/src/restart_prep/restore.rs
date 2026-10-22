@@ -42,7 +42,7 @@
 //! [`restoring_cohort_ids`] once per lifecycle poll tick, so a placeholder is
 //! never orphan-closed while it waits for its Restore click.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -205,22 +205,51 @@ impl RestoringCohort {
     }
 }
 
-/// Set once this process has served a restoring cohort's rows as placeholders
-/// to a caller that draws them (`terminal_session_list_open` with
-/// `placeholders: true`). Until then the webview's boot restore owns every
-/// open cohort row — it auto-restores it, keeping the old terminal id until
-/// its handshake verifies — so the resume core must not admit one beside it.
-static PLACEHOLDERS_SERVED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The cohort rows this process has served as placeholders, keyed by
+/// `(prepare_id, claude_session_id)`: exactly the rows [`note_placeholders_served`]
+/// was handed by the restore set (`terminal_session_list_open` with
+/// `placeholders: true`), which withheld each of them from the webview's boot
+/// restore. An open cohort row NOT in the set is the boot restore's: the
+/// resume core refuses it (`boot_restore_owns_row`), because the boot restore
+/// may be starting a `claude` the live-holder guard cannot see yet. Additive
+/// for the life of the process: a row once withheld stays the operator's, so
+/// a failed Restore can be retried.
+///
+/// The guarantee is PER READ, not across reads. Each read decides from its own
+/// liveness verdict, so a row an EARLIER read put in `sessions` (a
+/// `placeholders: false` read returns every row there) is served — and then
+/// admitted — by a later `placeholders: true` read once its recorded terminal
+/// is not running, even if the boot restore is still bringing it back. That
+/// is unreachable while no reader passes `placeholders: true`; the reader that
+/// does (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+/// Phase 7) must be the ONLY reader that auto-resumes rows while a cohort is
+/// `restoring` — never a `placeholders: false` read beside it.
+static PLACEHOLDERS_SERVED: std::sync::Mutex<BTreeSet<(String, String)>> =
+    std::sync::Mutex::new(BTreeSet::new());
 
-/// Record that the restore set withheld the cohort rows as placeholders.
-pub fn note_placeholders_served() {
-    PLACEHOLDERS_SERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+fn placeholders_served_set() -> std::sync::MutexGuard<'static, BTreeSet<(String, String)>> {
+    PLACEHOLDERS_SERVED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
-/// Whether [`note_placeholders_served`] has run in this process.
-pub fn placeholders_served() -> bool {
-    PLACEHOLDERS_SERVED.load(std::sync::atomic::Ordering::SeqCst)
+/// Record that the restore set withheld the rows `claude_session_ids` of
+/// prepare `prepare_id` as placeholders.
+pub fn note_placeholders_served<'a>(
+    prepare_id: &str,
+    claude_session_ids: impl IntoIterator<Item = &'a str>,
+) {
+    let mut served = placeholders_served_set();
+    for id in claude_session_ids {
+        served.insert((prepare_id.to_string(), id.to_string()));
+    }
+}
+
+/// Whether the row `claude_session_id` of prepare `prepare_id` was served as a
+/// placeholder by [`note_placeholders_served`] in this process. Per read, not
+/// across reads: see `PLACEHOLDERS_SERVED` for what that leaves to Phase 7.
+pub fn placeholder_served(prepare_id: &str, claude_session_id: &str) -> bool {
+    placeholders_served_set().contains(&(prepare_id.to_string(), claude_session_id.to_string()))
 }
 
 /// The live record's restoring cohort. `None` with no controller (every unit

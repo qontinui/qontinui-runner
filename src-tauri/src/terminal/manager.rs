@@ -742,6 +742,14 @@ impl TerminalManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
+    /// Whether this manager holds `id` AND its process is still running. A
+    /// pane whose child exited stays held until its tab is closed (see
+    /// `terminal::exit_notice`), so [`Self::get`] alone does not say the
+    /// terminal is live.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|s| s.is_alive())
+    }
+
     /// Test seam: mark `id` as being built, as `create` does for the length
     /// of a spawn.
     #[cfg(test)]

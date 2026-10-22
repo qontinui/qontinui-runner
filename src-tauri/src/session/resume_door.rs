@@ -71,8 +71,16 @@
 //! While the operator restart prepare's record is `restoring`
 //! ([`crate::restart_prep::restore::RestoringCohort`]), the core is widened in
 //! one way: a cohort row that is `open` but has NO live terminal here — the
-//! shape every cohort row has after a restart — is admitted alongside
-//! `closed`. An open row outside the cohort is still `skipped(not_closed)`, an
+//! shape every cohort row has after a restart; a pane whose process exited
+//! does not count as live — is admitted alongside `closed`, once the restore
+//! set has served THAT row as a placeholder. Until it has, the webview's boot
+//! restore owns the row (`skipped(boot_restore_owns_row)`): the restore set
+//! left it in `sessions`, and the boot restore may be starting a `claude` the
+//! live-process guard cannot see yet. The record is per read: a row an
+//! earlier read handed the boot restore can still be served by a later one
+//! (see `PLACEHOLDERS_SERVED` in [`crate::restart_prep::restore`] for the
+//! constraint that puts on the Phase 7 reader).
+//! An open row outside the cohort is still `skipped(not_closed)`, an
 //! open cohort row whose terminal IS live is `skipped(live_terminal)` — or
 //! `skipped(holder_adoption_pending | holder_sweep_pending)` while a PTY
 //! holder that kept its pane alive across the restart may still be adopted —
@@ -270,20 +278,22 @@ struct Candidate {
 struct CohortMember {
     prepare_id: String,
     /// Why the row's recorded terminal rules out a cold resume of an OPEN row:
-    /// `live_terminal` (live in this runner), `holder_adoption_pending` (a PTY
-    /// holder kept its pane alive across the restart and the runner is still
-    /// adopting it), `holder_alive_not_adopted` (a live holder the sweep left
-    /// running with no tab), `holder_sweep_pending` (the holder census is not
-    /// in, so none of that can be ruled out yet). `None` when nothing does.
+    /// `live_terminal` (held by this runner with its process running),
+    /// `holder_adoption_pending` (a PTY holder kept its pane alive across the
+    /// restart and the runner is still adopting it), `holder_alive_not_adopted`
+    /// (a live holder the sweep left running with no tab), `holder_sweep_pending`
+    /// (the holder census is not in, so none of that can be ruled out yet).
+    /// `None` when nothing does.
     terminal_blocker: Option<&'static str>,
     /// The level to pass as `--effort`.
     effort: Option<String>,
     /// Held for a hand restore (D6): only the operator origin restores it.
     held: bool,
-    /// Whether the restore set has withheld the cohort's rows from the
-    /// webview's boot restore ([`crate::restart_prep::restore::placeholders_served`]).
-    /// Until it has, the boot restore owns an open row.
-    placeholders_served: bool,
+    /// Whether the restore set withheld THIS row from the webview's boot
+    /// restore by serving it as a placeholder
+    /// ([`crate::restart_prep::restore::placeholder_served`]). Until it has,
+    /// the boot restore owns the row while it is open.
+    placeholder_served: bool,
 }
 
 /// The cohort membership of `id`, when `cohort` holds it. `terminal_blocker`
@@ -293,7 +303,7 @@ fn cohort_member(
     id: &str,
     rec: Option<&TerminalSessionRecord>,
     terminal_blocker: impl Fn(&str) -> Option<&'static str>,
-    placeholders_served: bool,
+    placeholder_served: bool,
 ) -> Option<CohortMember> {
     let cohort = cohort?;
     let target = cohort.target(id)?;
@@ -302,8 +312,22 @@ fn cohort_member(
         terminal_blocker: rec.and_then(|r| terminal_blocker(&r.terminal_id)),
         effort: target.effort.clone(),
         held: target.held,
-        placeholders_served,
+        placeholder_served,
     })
+}
+
+/// [`cohort_member`] with [`CohortMember::placeholder_served`] read from what
+/// the restore set actually served in this process — per row, so an open row
+/// it left to the boot restore is never admitted beside it.
+fn served_cohort_member(
+    cohort: Option<&RestoringCohort>,
+    id: &str,
+    rec: Option<&TerminalSessionRecord>,
+    terminal_blocker: impl Fn(&str) -> Option<&'static str>,
+) -> Option<CohortMember> {
+    let served =
+        cohort.is_some_and(|c| crate::restart_prep::restore::placeholder_served(&c.prepare_id, id));
+    cohort_member(cohort, id, rec, terminal_blocker, served)
 }
 
 /// [`CohortMember::terminal_blocker`] in the running app: the terminal
@@ -320,7 +344,12 @@ fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'st
     {
         return Some("holder_adoption_pending");
     }
-    if tm.get(terminal_id).is_some() {
+    // Held AND running: a pane whose process exited keeps its tab, and so
+    // its manager entry, until the tab is closed — counting it would refuse
+    // every Retry of a restore that failed (the resume door runs `claude` as
+    // the pane's own process, so its exit is the pane's). The live-holder guard's process
+    // read still stops a second `claude` on the transcript.
+    if tm.is_running(terminal_id) {
         return Some("live_terminal");
     }
     if sweep::holder_left_running(terminal_id) {
@@ -355,7 +384,7 @@ fn classify(
     match (rec.state.as_str(), cohort) {
         ("closed", _) => {}
         ("open", Some(member)) => {
-            if !member.placeholders_served {
+            if !member.placeholder_served {
                 return Err("boot_restore_owns_row".to_string());
             }
             if let Some(blocker) = member.terminal_blocker {
@@ -962,13 +991,9 @@ async fn run_batch(
         // Re-read per id: an overlapping call may have restored a row since
         // this batch began, and a restored row is no longer in the cohort.
         let cohort = crate::restart_prep::restore::restoring_cohort();
-        let member = cohort_member(
-            cohort.as_ref(),
-            id,
-            rec.as_ref(),
-            |t| live_terminal_blocker(&tm, t),
-            crate::restart_prep::restore::placeholders_served(),
-        );
+        let member = served_cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| {
+            live_terminal_blocker(&tm, t)
+        });
         // One call per id at a time, held through spawn, verify AND the
         // recording of the verdict below — so the lifecycle poll's `running`
         // observation (skipped while the id is in flight) can never land
@@ -1493,6 +1518,95 @@ mod tests {
         assert!(classify(ID, Some(&closed), unserved.as_ref(), true).is_ok());
     }
 
+    /// A cohort row id no other test uses: the served set is process-wide.
+    fn fresh_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Review round 6, finding 1: "served" is per ROW, read from the set the
+    /// restore set writes — not one process-wide flag. An open cohort row is
+    /// the boot restore's until the restore set served THAT row as a
+    /// placeholder; serving another row, or the same id under another
+    /// prepare, admits nothing.
+    #[test]
+    fn an_open_cohort_row_is_admitted_only_once_the_restore_set_served_that_row() {
+        use crate::restart_prep::restore::note_placeholders_served;
+        let (served, left_to_boot) = (fresh_id(), fresh_id());
+        let cohort = restoring(&[&served, &left_to_boot]);
+        let admit = |id: &str| {
+            let mut open = rec("open");
+            open.claude_session_id = id.to_string();
+            let member = served_cohort_member(Some(&cohort), id, Some(&open), no_blocker);
+            classify(id, Some(&open), member.as_ref(), true).map(|_| ())
+        };
+        assert_eq!(admit(&served), Err("boot_restore_owns_row".to_string()));
+        note_placeholders_served(&cohort.prepare_id, [served.as_str()]);
+        assert_eq!(admit(&served), Ok(()));
+        // The row the restore set left in `sessions` (its terminal looked live)
+        // was never served: still the boot restore's while it is open.
+        assert_eq!(
+            admit(&left_to_boot),
+            Err("boot_restore_owns_row".to_string())
+        );
+        note_placeholders_served("another-prepare", [left_to_boot.as_str()]);
+        assert_eq!(
+            admit(&left_to_boot),
+            Err("boot_restore_owns_row".to_string())
+        );
+        // A row outside the cohort is no member at all, served or not.
+        let outsider = fresh_id();
+        note_placeholders_served(&cohort.prepare_id, [outsider.as_str()]);
+        assert_eq!(
+            served_cohort_member(Some(&cohort), &outsider, None, no_blocker),
+            None
+        );
+        assert_eq!(served_cohort_member(None, &served, None, no_blocker), None);
+    }
+
+    /// Review round 6, finding 2: a pane whose child exited stays in the
+    /// manager until its tab is closed. It is no live terminal, so a Retry
+    /// after a failed restore is not `skipped(live_terminal)`; a pane whose
+    /// process runs still is.
+    #[test]
+    fn an_exited_pane_is_no_live_terminal_but_a_running_one_is() {
+        /// Leaves the pane exited when it drops, even on an assertion panic:
+        /// `Drop` closes a session it believes alive, and this one has no PTY.
+        struct ExitOnDrop(Arc<crate::terminal::session::TerminalSession>);
+        impl Drop for ExitOnDrop {
+            fn drop(&mut self) {
+                self.0.set_alive_for_test(false);
+            }
+        }
+        let tm = TerminalManager::new();
+        let terminal_id = format!("term-{}", fresh_id());
+        let pane = ExitOnDrop(Arc::new(
+            crate::terminal::session::tests::make_test_session(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            ))),
+        ));
+        tm.insert_for_test(&terminal_id, pane.0.clone());
+        assert!(!pane.0.is_alive(), "the test pane starts exited");
+        assert!(
+            tm.get(&terminal_id).is_some(),
+            "an exited pane is still held"
+        );
+        assert!(!tm.is_running(&terminal_id));
+        // Only the `live_terminal` arm is asserted: the holder census and
+        // adoption state are process-wide, so an exited pane may still read
+        // `holder_sweep_pending` while another test runs a sweep. That arm is
+        // what this finding changed.
+        assert_ne!(
+            live_terminal_blocker(&tm, &terminal_id),
+            Some("live_terminal")
+        );
+        pane.0.set_alive_for_test(true);
+        assert!(tm.is_running(&terminal_id));
+        assert_eq!(
+            live_terminal_blocker(&tm, &terminal_id),
+            Some("live_terminal")
+        );
+    }
+
     #[test]
     fn an_open_cohort_row_whose_terminal_is_live_or_being_adopted_is_refused() {
         let cohort = restoring(&[ID]);
@@ -1677,6 +1791,9 @@ mod tests {
         let (note_at, _) = batch.match_indices("note_restore(").next().expect("note");
         let (drop_at, _) = batch.match_indices("drop(claim)").next().expect("drop");
         assert!(claim_at < note_at && note_at < drop_at);
+        // Admission reads the per-row served set, never a passed-in constant.
+        assert!(batch.contains("served_cohort_member("));
+        assert!(!batch.contains(" cohort_member(") && !batch.contains("::cohort_member("));
     }
 
     #[test]

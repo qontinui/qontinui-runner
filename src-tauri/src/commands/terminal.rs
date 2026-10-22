@@ -1847,8 +1847,11 @@ pub fn terminal_session_list_open(
 
 /// [`restore_set_body`] in the running app: the live restoring cohort, its
 /// rows read from the lifecycle store, and a terminal counted live when this
-/// runner's manager holds it or a PTY holder kept it alive across the restart
-/// and its adoption is pending.
+/// runner's manager holds it with its process still running (a pane whose
+/// child exited keeps its tab, and so its manager entry, until the tab is
+/// closed) or a PTY holder kept it alive across the restart and its adoption
+/// is pending. A `placeholders: false` caller gets no cohort, so no row is
+/// served as a placeholder.
 fn live_restore_set_body(
     store: &SessionLifecycleStore,
     rows: Vec<RestoreCandidate>,
@@ -1858,11 +1861,6 @@ fn live_restore_set_body(
         return restore_set_body(rows, None, |_| None, |_| false, |_| None, false);
     }
     let cohort = crate::restart_prep::restore::restoring_cohort();
-    if cohort.is_some() {
-        // From here the open cohort rows are the operator's to restore, not
-        // the boot restore's: the resume core may admit them.
-        crate::restart_prep::restore::note_placeholders_served();
-    }
     use tauri::Manager;
     let terminals = crate::tauri_app_handle::current().and_then(|app| {
         app.try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1881,12 +1879,7 @@ fn live_restore_set_body(
                 }
             })
         },
-        |terminal_id| {
-            terminals
-                .as_ref()
-                .is_some_and(|tm| tm.get(terminal_id).is_some())
-                || crate::terminal::holder_boot_sweep::adoption_pending(terminal_id)
-        },
+        |terminal_id| restore_set_terminal_live(terminals.as_deref(), terminal_id),
         |terminal_id| {
             crate::terminal::holder_boot_sweep::holder_left_running(terminal_id)
                 .then_some("holder_alive_not_adopted")
@@ -1895,6 +1888,19 @@ fn live_restore_set_body(
             .held
             .is_none(),
     )
+}
+
+/// Whether a cohort row's recorded terminal is live for the restore set: this
+/// runner holds it with its process still running — a pane whose child
+/// exited keeps its tab, and so its manager entry, until the tab is closed,
+/// and counting it would keep a failed restore out of the placeholders — or a
+/// PTY holder kept it alive across the restart and its adoption is pending.
+fn restore_set_terminal_live(
+    terminals: Option<&crate::terminal::TerminalManager>,
+    terminal_id: &str,
+) -> bool {
+    terminals.is_some_and(|tm| tm.is_running(terminal_id))
+        || crate::terminal::holder_boot_sweep::adoption_pending(terminal_id)
 }
 
 /// The body [`terminal_session_list_open`] answers with its restore set.
@@ -1911,14 +1917,22 @@ fn live_restore_set_body(
 /// poll holds those rows open meanwhile (`in_active_cohort`).
 ///
 /// A cohort row whose terminal is live (`terminal_live`: this runner holds
-/// it, or a PTY holder kept it alive and its adoption is pending) is running,
-/// not waiting: it stays wherever the ordinary restore set put it and is no
-/// placeholder. A row whose live PTY holder the sweep LEFT running with no tab
+/// it with its process running, or a PTY holder kept it alive and its
+/// adoption is pending — [`restore_set_terminal_live`]) is running, not
+/// waiting: it stays wherever the ordinary restore set put it and is no
+/// placeholder. Each row's liveness is judged once, so no row is in both
+/// lists. A row whose live PTY holder the sweep LEFT running with no tab
 /// is neither: its `claude` may still run the session, so it is kept out of
 /// the auto-restore and returned as a placeholder carrying `blocker`
 /// (`placeholder_blocker`, `holder_alive_not_adopted`) — the resume core
 /// refuses it the same way. With no restoring cohort — a crash boot, or no prepare at
 /// all — the body is exactly `{"sessions": [...]}`, as before.
+///
+/// Every row returned under `placeholders` is recorded
+/// ([`crate::restart_prep::restore::note_placeholders_served`]): from here it
+/// is the operator's to restore, not the boot restore's, so the resume core
+/// may admit it while it is still `open`. A cohort row left in `sessions` is
+/// not recorded — the boot restore owns it.
 fn restore_set_body(
     rows: Vec<RestoreCandidate>,
     cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
@@ -1931,19 +1945,47 @@ fn restore_set_body(
         return serde_json::json!({ "sessions": rows });
     };
     let waiting = cohort.ids();
+    let mut ids: Vec<&String> = waiting.iter().collect();
+    ids.sort();
+    // ONE liveness verdict per cohort id, judged once from one record, and
+    // both lists built from it: two independent reads could see a pane's
+    // `claude` exit in between and put the row in `sessions` (the webview
+    // auto-resumes it) AND serve it as a placeholder (the resume core admits
+    // it) — the double resume the per-row served set exists to prevent. The
+    // fresh record decides; a row it no longer finds is judged by the record
+    // in `rows`, and is never a placeholder.
+    let mut live_cohort: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Keyed by the cohort's own id: the one the resume core looks up.
+    let mut served: Vec<(&String, RestoreCandidate)> = Vec::new();
+    for id in ids {
+        match placeholder_of(id) {
+            Some(r) if terminal_live(&r.record.terminal_id) => {
+                live_cohort.insert(id.as_str());
+            }
+            Some(r) => served.push((id, r)),
+            None => {
+                if rows.iter().any(|row| {
+                    row.record.claude_session_id == *id && terminal_live(&row.record.terminal_id)
+                }) {
+                    live_cohort.insert(id.as_str());
+                }
+            }
+        }
+    }
     let sessions: Vec<RestoreCandidate> = rows
         .into_iter()
         .filter(|r| {
-            !waiting.contains(&r.record.claude_session_id) || terminal_live(&r.record.terminal_id)
+            let id = r.record.claude_session_id.as_str();
+            !waiting.contains(id) || live_cohort.contains(id)
         })
         .collect();
-    let mut ids: Vec<&String> = waiting.iter().collect();
-    ids.sort();
-    let placeholders: Vec<serde_json::Value> = ids
+    crate::restart_prep::restore::note_placeholders_served(
+        &cohort.prepare_id,
+        served.iter().map(|(id, _)| id.as_str()),
+    );
+    let placeholders: Vec<serde_json::Value> = served
         .into_iter()
-        .filter_map(|id| placeholder_of(id))
-        .filter(|r| !terminal_live(&r.record.terminal_id))
-        .map(|r| {
+        .map(|(_, r)| {
             let blocker = placeholder_blocker(&r.record.terminal_id);
             let mut v = serde_json::to_value(&r).unwrap_or(serde_json::Value::Null);
             if let (Some(obj), Some(b)) = (v.as_object_mut(), blocker) {
@@ -3369,6 +3411,153 @@ mod tests {
         );
         assert!(held["placeholders"][1].get("blocker").is_none());
         assert!(prepared["placeholders"][0].get("blocker").is_none());
+    }
+
+    /// Review round 6, finding 1: the restore set records exactly the rows it
+    /// served as placeholders — the set the resume core reads per row. A row
+    /// it left in `sessions` because its terminal looked live is not
+    /// recorded, and a `placeholders: false` read (no cohort) records nothing.
+    #[test]
+    fn restore_set_body_records_only_the_rows_it_served_as_placeholders() {
+        use crate::restart_prep::restore::placeholder_served;
+        // Ids no other test uses: the served set is process-wide.
+        let (waiting, running) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let cohort = crate::restart_prep::restore::restoring_cohort_for_test(&[&waiting, &running]);
+        let row = |id: &str| {
+            let mut record = restore_candidate_record(id);
+            record.terminal_id = format!("term-{id}");
+            RestoreCandidate {
+                record,
+                transcript_exists: Some(true),
+            }
+        };
+        let rows = || vec![row(&waiting), row(&running)];
+        let running_terminal = format!("term-{running}");
+        let running_live = |t: &str| t == running_terminal;
+        let no_blocker = |_: &str| None;
+
+        let unserved = restore_set_body(
+            rows(),
+            None,
+            |id| Some(row(id)),
+            running_live,
+            no_blocker,
+            false,
+        );
+        assert!(unserved.get("placeholders").is_none());
+        assert!(!placeholder_served(&cohort.prepare_id, &waiting));
+        assert!(!placeholder_served(&cohort.prepare_id, &running));
+
+        let served = restore_set_body(
+            rows(),
+            Some(&cohort),
+            |id| Some(row(id)),
+            running_live,
+            no_blocker,
+            false,
+        );
+        assert_eq!(
+            served["placeholders"][0]["claudeSessionId"],
+            waiting.as_str()
+        );
+        assert_eq!(served["placeholders"].as_array().map(Vec::len), Some(1));
+        assert!(placeholder_served(&cohort.prepare_id, &waiting));
+        assert!(
+            !placeholder_served(&cohort.prepare_id, &running),
+            "a row left in `sessions` stays the boot restore's"
+        );
+    }
+
+    /// Review round 6 (second pass): each cohort row's liveness is judged ONCE,
+    /// and both lists are built from that one verdict. A pane whose `claude`
+    /// exits between two reads must not land the row in `sessions` (the
+    /// webview auto-resumes it) AND serve it as a placeholder (the resume core
+    /// admits it).
+    #[test]
+    fn restore_set_body_never_puts_a_cohort_row_in_both_lists() {
+        use crate::restart_prep::restore::placeholder_served;
+        use std::cell::Cell;
+        let flips = uuid::Uuid::new_v4().to_string();
+        let cohort = crate::restart_prep::restore::restoring_cohort_for_test(&[&flips]);
+        let row = |id: &str| {
+            let mut record = restore_candidate_record(id);
+            record.terminal_id = format!("term-{id}");
+            RestoreCandidate {
+                record,
+                transcript_exists: Some(true),
+            }
+        };
+        // Live on the first look, exited on every look after it.
+        let looks = Cell::new(0usize);
+        let exits_after_first_look = |_: &str| {
+            looks.set(looks.get() + 1);
+            looks.get() == 1
+        };
+        let body = restore_set_body(
+            vec![row(&flips)],
+            Some(&cohort),
+            |id| Some(row(id)),
+            exits_after_first_look,
+            |_| None,
+            false,
+        );
+        let ids = |key: &str| -> Vec<String> {
+            body[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array: {body}"))
+                .iter()
+                .map(|r| {
+                    r["claudeSessionId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        };
+        let (sessions, placeholders) = (ids("sessions"), ids("placeholders"));
+        assert!(
+            !(sessions.contains(&flips) && placeholders.contains(&flips)),
+            "a row in both lists is resumed twice: {body}"
+        );
+        assert_eq!(sessions, [flips.clone()], "judged live once: {body}");
+        assert!(
+            !placeholder_served(&cohort.prepare_id, &flips),
+            "a row in `sessions` is the boot restore's"
+        );
+    }
+
+    /// Review round 6, finding 2, at the restore set's site: a terminal is
+    /// live only while its process runs, not while its exited pane keeps a
+    /// tab — so a row whose restore failed comes back as a placeholder.
+    #[test]
+    fn the_restore_set_counts_only_a_running_pane_live() {
+        /// Leaves the pane exited when it drops, even on an assertion panic:
+        /// `Drop` closes a session it believes alive, and this one has no PTY.
+        struct ExitOnDrop(Arc<crate::terminal::session::TerminalSession>);
+        impl Drop for ExitOnDrop {
+            fn drop(&mut self) {
+                self.0.set_alive_for_test(false);
+            }
+        }
+        let tm = crate::terminal::TerminalManager::new();
+        let terminal_id = format!("term-{}", uuid::Uuid::new_v4());
+        let pane = ExitOnDrop(Arc::new(
+            crate::terminal::session::tests::make_test_session(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            ))),
+        ));
+        tm.insert_for_test(&terminal_id, pane.0.clone());
+        assert!(
+            tm.get(&terminal_id).is_some(),
+            "an exited pane is still held"
+        );
+        assert!(!restore_set_terminal_live(Some(&tm), &terminal_id));
+        pane.0.set_alive_for_test(true);
+        assert!(restore_set_terminal_live(Some(&tm), &terminal_id));
+        assert!(!restore_set_terminal_live(None, &terminal_id));
     }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
