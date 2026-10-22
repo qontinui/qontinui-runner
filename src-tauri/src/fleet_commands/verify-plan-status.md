@@ -201,39 +201,71 @@ List them in your final report so the user can spot any whose status drifted.
 
 #### Depends-On lookup
 
-A plan MAY declare upstream dependencies inline in its status blockquote
-using a `Depends-On:` suffix:
+A plan MAY declare upstream dependencies inline in its status block
+using a `Depends-On:` suffix — in any stamp shape (blockquoted, plain
+`**Status:** X`, or list-form `- **Depends-On**: <stem>`):
 
 ```markdown
 > **Status: VETTED 2026-05-21.** <summary>. Depends-On: 2026-05-20-default-tenant-propagation, 2026-05-19-some-other-plan.
 ```
 
-Parser rule:
+Read the stems, and each dependency's lifecycle word, through the stamp
+parse owner (`_status-writers.md`) — the same reader `/vet-plan` and
+`/implement-plan` call:
 
-1. Look at the status blockquote (the first `> **Status:` block under the
-   H1) and find EVERY case-sensitive `Depends-On:` occurrence — a block
-   often carries one in the headline sentence and another in a trailing
-   `History:` / re-vet line.
+```bash
+stamp_reader=<workspace-root>/qontinui-claude-config/scripts/lint-plan-status.py
+if [ -r "$stamp_reader" ] && command -v python3 >/dev/null; then
+  python3 "$stamp_reader" --depends-on "<plan path>"   # one stem per line
+  python3 "$stamp_reader" --stamp "<dep plan path>"    # <TOKEN>\t<block>, per dep
+fi
+```
+
+`--depends-on` exit 0 prints the stems (none is the common case); exit 3
+means the plan's window holds no status stamp — UNKNOWN, report it, never
+read it as "no dependencies". `--stamp` prints the dependency's lifecycle
+word as its TOKEN (`SHIPPED`, `IN PROGRESS`, …) from any stamp shape; its
+exit 3 is UNKNOWN too — record the dep as `UNKNOWN (no status stamp)` and
+surface it, never as `DRAFT`. Any other exit from either is no answer;
+apply the fallback rule below by hand, as you do where the script or
+`python3` is absent.
+
+Fallback rule (what `--depends-on` implements):
+
+1. Locate the HEADER REGION: start at the first body status stamp (a
+   frontmatter `status:` key only when there is none) — any shape, within
+   the first 60 lines — and take every PHYSICAL line from it down to, not
+   including, the first `##`-level heading (or line 60, whichever comes
+   first). Strip `>` and `**` markers per line, and find EVERY
+   case-sensitive `Depends-On:` occurrence in that region — the headline
+   sentence, a trailing `History:` / re-vet line, or a
+   `- **Depends-On**: <stem>` metadata line below the stamp's own block.
+   A `Depends-On:` below the first `##` heading is body prose and is never
+   read.
 2. For each occurrence, consider only the remainder of that PHYSICAL line
    — never the following blockquote lines or paragraphs, which may name
    unrelated plans in prose.
 3. Within that line, keep only date-prefixed plan-stem-shaped tokens
    (`YYYY-MM-DD-<kebab-slug>`, e.g. `2026-06-02-some-plan`). Prose, bare
    dates (`2026-05-21.`), and trailing punctuation never produce tokens
-   — a stem requires at least one `-word` segment after the date. Each
-   token is a bare plan **stem** — no `.md` extension, no path.
+   — a stem requires at least one `-word` segment after the date. A token
+   joined to a word character or `-` on either side
+   (`2026-06-02-fix-API-thing`, `x2026-06-02-fix`) is no stem — reject it
+   whole, never truncate. Each token is a bare plan **stem** — no `.md`
+   extension, no path.
 4. Union the stems across all occurrences, deduped, order-preserving.
 
    (A naive first-occurrence + split-on-commas parse mis-handled real
    status blocks whose prose contained a second `Depends-On:` or commas —
-   it produced phantom missing-dep aborts. Fixed in the canonical resolver
-   2026-06-04; this inline fallback mirrors it.)
+   it produced phantom missing-dep aborts.)
 
 For each dep stem, resolve to a plan file using the [Plan stem resolution
-chain](#plan-stem-resolution-chain) below. Capture each dep's status (read
-the dep file's status blockquote and parse the lifecycle word — one of
-`DRAFT`, `VETTED`, `IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`,
-`SUPERSEDED`, `OBSOLETE`). If the dep file can't be found in either
+chain](#plan-stem-resolution-chain) below. Capture each dep's status — the
+`--stamp` TOKEN above, or, where the script is absent or gave no answer,
+the lifecycle word of the dep file's first body stamp (a frontmatter
+`status:` only when there is none) read by hand — one of `DRAFT`, `VETTED`,
+`IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`, `SUPERSEDED`,
+`OBSOLETE`. If the dep file can't be found in either
 directory, record the dep as `MISSING (no plan file)` and surface it as a
 drifted-status item in the final report.
 
@@ -292,24 +324,52 @@ If a plan references commits in its body (e.g. "shipped in 879c36bb4"),
 confirm the SHA exists with `git rev-parse 879c36bb4 2>/dev/null` and is
 in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEAD`.
 
-> **Canonical "is it shipped / landed?" check — ask the twin, not a local tree.**
-> Before deciding a plan or PR has (or hasn't) landed, call the
-> **`coord_query_delivery`** MCP tool (HTTP: `GET
-> /coord/twin/delivery/verdict?plan_slug=<stem>` on the SSO surface). It returns
-> a `DriftVerdict` (`instance="delivery"`) that joins the plan's lifecycle
-> status ⋈ its cited PRs' merged-state (observed against **origin**, not your
-> checkout) ⋈ best-effort deploy state — **with `staleness_seconds`**, so a
-> stale answer is visibly stale. Read `components.status`, `components.prs[]`
-> (`{repo,pr,merged}`), `components.all_merged`, and `drift_class`
-> (`delivery:shipped_but_unmerged` = stamped shipped but a cited PR is still
-> open; `delivery:merged_but_unstamped` = PRs merged under a not-yet-shipped
-> plan). NEVER judge landed-state from a local working tree — a local tree can
-> be days stale (the 2026-06-15 stale-checkout incident this tool was built to
-> prevent; pair with the `fetch-origin-before-judging-landed-state` lesson). The
-> tool observes origin so you don't have to fetch-and-guess. The local `git`
-> checks above remain valid for locating *which commit* implements a claim once
-> the twin confirms it landed — they are not the authority on *whether* it
-> landed.
+> **Canonical "is it shipped / landed?" check — ask coord, not a local tree.**
+> Before deciding a plan or PR has (or hasn't) landed, read coord's derived
+> delivery. **There are two doors, and which one you can open depends on your
+> principal.**
+>
+> - **The agent door, and the one this skill's case-1 guard reads for every
+>   principal:**
+>   `coord_work_unit_list_citations(<stem>)` → `.delivery` (HTTP twin
+>   `GET /coord/agent-work-units/<stem>/citations`, device or agent JWT). It is
+>   coord's own delivery reduction over the plan's PR citations: `shipped`,
+>   `evidence_complete`, `evidence_gaps`, `phases_declared_indices`,
+>   `phases_delivered` and `phases_remaining`, with each citation's merged-state
+>   observed against **origin**. Read it through `/vet-plan` §0.25's arm table,
+>   in that table's order (4, 3, 2, 1, 5, then 6). §5 "Settling case 1" below
+>   says which arm lets this skill write. When it reads arm 2 because
+>   `evidence_gaps` names a stale or never-observed citation, run
+>   `coord_work_unit_refresh_citations(<stem>)` once and read again. That door
+>   is the write-through read devices are granted for exactly this case. An
+>   agent-minted (bootstrap) credential is refused it. That refusal leaves the
+>   arm-2 read standing as UNKNOWN. It is never a verdict, and never permission
+>   to write.
+> - **The operator door:** the **`coord_query_delivery`** twin tool (HTTP:
+>   `GET /coord/twin/delivery/verdict?work_unit_slug=<stem>` on the SSO surface;
+>   `plan_slug` is a deprecated alias of that parameter). coord withholds it from
+>   device and agent principals on purpose (`TWIN_QUERY_TOOLS_WITHHELD` in
+>   qontinui-coord `agent_tool_access.rs`). Its HTTP twin answers a device JWT
+>   `401 invalid operator token`. So an agent session uses the door above. A
+>   refusal here is a fact about your principal, never about the plan.
+>   `coord_query_delivery` returns a `DriftVerdict` (`instance="delivery"`)
+>   that joins the plan's lifecycle status ⋈ its cited PRs' merged-state
+>   (observed against **origin**, not your checkout) ⋈ best-effort deploy
+>   state — **with `staleness_seconds`**, so a stale answer is visibly stale.
+>   Read `components.status`, `components.prs[]` (`{repo,pr,merged}`),
+>   `components.all_merged`, `drift_class` and `drift_subclass`
+>   (`delivery:shipped_but_unmerged` = stamped shipped but a cited PR is still
+>   open; `delivery:merged_but_unstamped` = PRs merged under a not-yet-shipped
+>   plan).
+>
+> NEVER judge landed-state from a local working tree — a local tree can be
+> days stale (the 2026-06-15 stale-checkout incident this check was built to
+> prevent; pair with the `fetch-origin-before-judging-landed-state` lesson).
+> Both doors observe origin, so you don't have to fetch and guess. The local
+> `git` checks above remain valid for locating *which commit* implements a
+> claim once coord's delivery read confirms it landed. For this skill's
+> `SHIPPED` write, only the agent door's arm 1 confirms it (§5). The git checks
+> are not the authority on *whether* it landed.
 
 For plans that span multiple repos (a plan may touch several application repos,
 the agent config, and the plans repository itself), check each repo's
@@ -534,26 +594,60 @@ The cases map onto this skill's verbs:
 | `/vet-plan` case | Disposition here |
 |---|---|
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
-| 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (a `delivery:` drift class): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
+| 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (coord's delivery read says landed and your evidence scan does not; on the operator door, a `delivery:` drift subclass): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
 | 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
 | 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
 | 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
 | — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
 
-**Settling case 1 — and this command has no mandatory capture step, so there
-are FOUR branches, not three.** The `coord_query_delivery` twin documented
-above settles case 1 on its own: a `delivery:merged_but_unstamped` verdict on a
-plan stamped `IN PROGRESS` **is** case 1.
+**Settling case 1.** Case 1 is settled by the delivery read §3 names,
+`coord_work_unit_list_citations(<stem>).delivery`, for every principal. Read
+it through `/vet-plan` §0.25's arm table, in its stated order: 4, 3, 2, 1, 5,
+then 6. That table is the one authority for the read. Do not restate its
+predicate here, because a shorter copy is a weaker one. **Case 1 holds only on
+arm 1, with every one of its conjuncts.** Those include the phase
+corroboration and the absence of a `NO PHASE ATTRIBUTION` gap, so
+`shipped: true` with `evidence_complete: true` alone is not enough. Arms 2, 3
+and 6 do not establish landing. Arm 6 includes `/vet-plan`'s partial-delivery
+sub-case. Arms 4 and 5 say the work has not landed. **None of them is case
+1**, so none of them lets this skill write `SHIPPED` on delivery grounds. The
+table's other rows (0, 2, 2b, 3 and the default) still decide on their own
+terms. One exception applies before you settle: an arm-2 read whose
+`evidence_gaps` names a stale or never-observed citation gets one
+`coord_work_unit_refresh_citations(<stem>)` and one re-read. The re-read's arm
+is the answer. On a device bound to more than one tenant, `/vet-plan` §0.25's
+per-tenant fold applies too, and a `FOUND` names the tenant that holds the
+delivered unit.
 
-- **You already issued the read** (§3 sent you there) — consume it. Do not
-  issue a second one.
+An operator's `coord_query_delivery` verdict of `delivery:merged_but_unstamped`
+is a **lead, not case 1**. coord documents that drift class as a fact about
+stamp-merge agreement, never about feature completeness. It carries no phase
+corroboration, so it would close a five-phase plan after its Phase-1 PR merged.
+Follow it with the arm-1 read above before writing anything. An agent cannot
+open that door (§3), so a refusal from it decides nothing.
+
+This command has no mandatory capture step, so the arm-1 read has **FOUR
+branches, not three**:
+
+- **You already issued the read** (§3 sent you there) — consume it,
+  including any refresh and re-read §3 already ran. Do not issue a second
+  read, and run the refresh at most once per plan per pass.
 - **You have NOT issued one.** Issue it now. This is the ordinary path: §3
   scopes its read to "before deciding a plan or PR has (or hasn't) landed",
   which a sweep may never have reached for this plan.
-- **The tool is not visible** — masked, absent, or on a dead transport
-  (`"Command failed with no output"`) — or the read is unreachable,
-  unparseable, or non-2xx. **UNKNOWN.**
+- **The agent-door read cannot be completed.**
+  `coord_work_unit_list_citations` is masked, absent or on a dead transport
+  (`"Command failed with no output"`), or it returns an unreachable,
+  unparseable or non-2xx answer, **and** its HTTP twin
+  `GET /coord/agent-work-units/<stem>/citations` fails too. **UNKNOWN.** On a dead transport, run `/coord-revive` and re-issue
+  the read over the door it reports LIVE before you conclude anything.
 - **Anything else.** UNKNOWN.
+
+**Name the arm in the `History:` line when you write `SHIPPED` over an
+`IN PROGRESS` stamp**, for example `case 1: list_citations arm 1, tenant <id>
+(shipped, evidence_complete, phases_remaining [] corroborated by non-empty
+phases_declared_indices ⊆ phases_delivered, no NO PHASE ATTRIBUTION gap)`.
+Then a later reader can check the verdict without re-deriving it.
 
 **UNKNOWN lands on the unidentified default (do not overwrite), never on "not
 started"** — `verification-and-evidence` `unknown-must-not-render-as-a-default`.
