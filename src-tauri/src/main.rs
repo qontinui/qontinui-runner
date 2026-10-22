@@ -5207,11 +5207,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 ai_start_unix: None,
                             })
                             .collect();
-                        session::reconcile::refresh_titles_pass(
+                        //
+                        // The same unguarded pass re-binds a CONFIRMED record
+                        // whose pane's VALID provider-registry row names a
+                        // different session (in-pane /clear, or a rung-3
+                        // mis-bind) — plan 2026-10-21-account-migration-…
+                        // Phase 4. Its binds reach the tab like the bind pass's.
+                        let titles_outcome = session::reconcile::refresh_titles_pass(
                             &poll_lifecycle_store,
                             &live_for_titles,
                             &snap,
                         );
+                        emit_session_bound(&poll_app_handle, &titles_outcome.rebinds);
 
                         poll_lifecycle_store.prune(
                             chrono::Utc::now().timestamp_millis(),
