@@ -51,6 +51,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tracing::{info, warn};
 
 use super::account_migration::{probe_idle_prompt, IdlePromptProbe, ReadyDebounce};
@@ -244,6 +245,11 @@ pub(crate) trait PaneOps: Send + Sync {
     fn close(&self, terminal_id: &str) -> Result<(), String>;
     /// Is the pane still there with its child running?
     fn alive(&self, terminal_id: &str) -> bool;
+    /// Does the pane still HOST a CLI — a live `claude` process in its
+    /// inclusive subtree? `alive` only says the PTY child runs: a restored pane
+    /// is a shell that `claude --resume` was typed into, so its CLI can have
+    /// exited while the shell lives on. `false` whenever it cannot be shown.
+    fn hosts_claude<'a>(&'a self, terminal_id: &'a str) -> BoxFuture<'a, bool>;
 }
 
 /// [`PaneOps`] over the real [`crate::terminal::TerminalManager`].
@@ -255,6 +261,28 @@ impl PaneOps for ManagerPanes {
     }
     fn alive(&self, terminal_id: &str) -> bool {
         self.0.get(terminal_id).is_some_and(|s| s.is_alive())
+    }
+    fn hosts_claude<'a>(&'a self, terminal_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Some(pid) = self
+                .0
+                .get(terminal_id)
+                .filter(|s| s.is_alive())
+                .and_then(|s| s.child_pid())
+            else {
+                return false;
+            };
+            // The lifecycle poll's own liveness signal. Reference 0 disables
+            // the PID-reuse guard: the pid is the child of a pane this runner
+            // holds and whose child is still running, so it cannot have been
+            // recycled under it. An empty (failed) snapshot finds no claude —
+            // no evidence, so no rollback onto the pane.
+            let snapshot =
+                crate::process_capture::process_tree::snapshot_process_table_public().await;
+            crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
+                pid, &snapshot, 0,
+            )
+        })
     }
 }
 
@@ -269,12 +297,14 @@ pub(crate) enum RespawnOutcome {
         terminal_id: String,
         attempts: usize,
     },
-    /// `terminal_id` runs but never painted, and there was no old pane to fall
-    /// back on: it keeps the row. UNKNOWN, never resolved to the destructive arm.
+    /// `terminal_id` runs but never painted, and there was no old pane PROVEN to
+    /// still host a CLI to fall back on: it keeps the row. An old pane that is
+    /// alive without a CLI (a bare shell) is left open, marked superseded by
+    /// `terminal_id`. UNKNOWN, never resolved to the destructive arm.
     Unconfirmed { terminal_id: String },
-    /// A migration's new CLI on `terminal_id` never painted while the OLD CLI
-    /// still ran: the session was kept on the old pane (restored exactly) and
-    /// the unproven pane superseded and closed.
+    /// A migration's new CLI on `terminal_id` never painted while the OLD pane
+    /// still hosted a running CLI: the session was kept on the old pane
+    /// (restored exactly) and the unproven pane superseded and closed.
     UnconfirmedRolledBack { terminal_id: String },
     /// The USER closed a pane (an `explicit` close). Of the pane being proven:
     /// nothing is retried; with an old pane still running the pre-respawn
@@ -332,6 +362,10 @@ struct SessionCloseHold<'s> {
     session: String,
     old: Option<TerminalSessionRecord>,
     current: Option<String>,
+    /// Every pane this respawn spawned — the current one and each it retired.
+    /// Only a user close naming one of THESE is the user's answer to the
+    /// respawn; the old pane has its own check ([`Self::old_pane`]).
+    spawned: Vec<String>,
     settled: bool,
 }
 
@@ -349,25 +383,29 @@ impl<'s> SessionCloseHold<'s> {
             session: session.to_string(),
             old: old.cloned(),
             current: None,
+            spawned: Vec::new(),
             settled: false,
         }
     }
 
     fn set_current(&mut self, terminal_id: &str) {
         self.current = Some(terminal_id.to_string());
+        if !self.spawned.iter().any(|t| t == terminal_id) {
+            self.spawned.push(terminal_id.to_string());
+        }
     }
 
-    fn old_terminal(&self) -> Option<&str> {
-        self.old.as_ref().map(|o| o.terminal_id.as_str())
-    }
-
-    /// Did the USER close ANY pane this respawn spawned — the one under proof
-    /// or one it already retired? (The old pane is [`Self::old_pane`]'s.) Read
-    /// session-wide, so a user close landing on a pane after it was retired is
-    /// not lost while a retry runs.
+    /// Did the USER close a pane this respawn SPAWNED — the one under proof or
+    /// one it already retired? (The old pane is [`Self::old_pane`]'s.) Every
+    /// spawned pane is read, so a user close landing on a pane after it was
+    /// retired is not lost while a retry runs. A close naming a terminal the
+    /// respawn never spawned — a stale tab still carrying the session id, which
+    /// the hold files under the session because no open row owns it — is NOT
+    /// the user's answer: it stays held and is dropped with the hold, as
+    /// applying it would have closed nothing.
     fn user_closed(&self) -> bool {
         self.store
-            .peek_held_user_close(&self.session, self.old_terminal())
+            .peek_held_user_close(&self.session, &self.spawned)
             .is_some()
     }
 
@@ -375,7 +413,7 @@ impl<'s> SessionCloseHold<'s> {
     fn take_user_close(&self) -> Option<HeldClose> {
         let c = self
             .store
-            .peek_held_user_close(&self.session, self.old_terminal())?;
+            .peek_held_user_close(&self.session, &self.spawned)?;
         self.take(&c.terminal_id)
     }
 
@@ -678,6 +716,20 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
             );
         }
         let verdict = effects.await_liveness(&current).await;
+        // Does the old pane still HOST a CLI? Asked only where the answer is
+        // used (an unpainted pane during a migration), and BEFORE the
+        // user-close checks below, so a close landing during this await is
+        // still seen. `Running` only says the old PTY child lives with no
+        // close held: a restored pane is a shell that `claude --resume` was
+        // typed into, and its CLI may have exited while the shell lives.
+        let old_hosts_cli = match (&verdict, old) {
+            (LivenessVerdict::Unconfirmed | LivenessVerdict::Pending, Some(o))
+                if hold.old_pane() == Some(OldPane::Running) =>
+            {
+                panes.hosts_claude(&o.terminal_id).await
+            }
+            _ => false,
+        };
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
             return RespawnOutcome::ClosedByUser { attempts };
@@ -718,7 +770,14 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 };
             }
             LivenessVerdict::Unconfirmed | LivenessVerdict::Pending => {
-                if let (Some(old), Some(OldPane::Running)) = (old, hold.old_pane()) {
+                let old_running = match (old, hold.old_pane()) {
+                    (Some(old), Some(OldPane::Running)) => Some(old),
+                    _ => None,
+                };
+                // Rolling back onto an old pane whose CLI exited would close
+                // the new pane's RUNNING CLI and land the session on a bare
+                // shell — so the rollback needs the old pane to still host one.
+                if let (Some(old), true) = (old_running, old_hosts_cli) {
                     // A migration whose new CLI never painted, while the old
                     // CLI still runs: keep the session where it is PROVEN to
                     // live. Leaving the row on the unpainted pane would strand
@@ -738,8 +797,19 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                         terminal_id: current,
                     };
                 }
-                // No old pane to fall back on: the new pane is the session's
-                // only host and keeps the row. UNKNOWN, not dead.
+                // No old pane to fall back on — none, gone, or a shell whose
+                // CLI exited: the new pane is the session's only host and keeps
+                // the row. UNKNOWN, not dead. An old pane still alive as a bare
+                // shell is left open (nothing is killed on an UNKNOWN), marked
+                // superseded so its later close ends nothing.
+                if let Some(o) = old_running {
+                    store.mark_terminal_superseded(&o.terminal_id, &current);
+                    if hold.has_held(&o.terminal_id) {
+                        // Its close already arrived (and is dropped with the
+                        // hold): no later close will consume the mark.
+                        store.unmark_terminal_superseded(&o.terminal_id);
+                    }
+                }
                 hold.finish_replaying(Some(&current));
                 warn!(
                     terminal_id = %current,
@@ -1068,6 +1138,8 @@ mod tests {
         closed: std::sync::Mutex<Vec<String>>,
         /// Panes whose close fails (already gone).
         gone: std::sync::Mutex<Vec<String>>,
+        /// Panes still alive whose subtree holds no `claude` (a bare shell).
+        no_claude: std::sync::Mutex<Vec<String>>,
     }
 
     impl PaneOps for FakePanes {
@@ -1081,6 +1153,16 @@ mod tests {
         fn alive(&self, terminal_id: &str) -> bool {
             !self.gone.lock().unwrap().iter().any(|g| g == terminal_id)
                 && !self.closed.lock().unwrap().iter().any(|c| c == terminal_id)
+        }
+        fn hosts_claude<'a>(&'a self, terminal_id: &'a str) -> BoxFuture<'a, bool> {
+            let hosts = self.alive(terminal_id)
+                && !self
+                    .no_claude
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == terminal_id);
+            Box::pin(async move { hosts })
         }
     }
 
@@ -1127,6 +1209,10 @@ mod tests {
         /// When set, the USER closes `new-1` (already retired) while `new-2`
         /// is being proven.
         user_close_retired_while_proving: bool,
+        /// When set, the USER dismisses a STALE tab (`stale`, a dead pane
+        /// still carrying this session id, owning no open row) while each
+        /// pane is being proven.
+        user_close_stale_while_proving: bool,
     }
 
     impl Fake<'_> {
@@ -1157,6 +1243,7 @@ mod tests {
                 old_vanishes_in_spawn: false,
                 exit_on_first_alive: false,
                 user_close_retired_while_proving: false,
+                user_close_stale_while_proving: false,
             }
         }
     }
@@ -1217,6 +1304,12 @@ mod tests {
                 let o = self
                     .store
                     .record_close_checked(SID, Some(terminal_id), "pty-exit");
+                self.exit_close_outcomes.push(o);
+            }
+            if self.user_close_stale_while_proving {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("stale"), "explicit");
                 self.exit_close_outcomes.push(o);
             }
             if self.user_close_retired_while_proving && terminal_id == "new-2" {
@@ -2199,16 +2292,135 @@ mod tests {
     }
 
     /// Note: the take and the release of the current pane's close are ONE
-    /// store operation.
+    /// store operation. A close of the current pane is injected at the START
+    /// of the release (the store's test hook): taken and released in one lock
+    /// it is APPLIED; with a separate take before the release it would land in
+    /// between, be held, come back with the rest and be dropped — leaving the
+    /// row open on a pane that exited.
     #[test]
     fn take_and_release_is_one_store_operation() {
         let (_d, store) = fresh_store();
+        store.record_open(record("new-1", "/dst"));
         store.hold_session_closes(SID);
-        store.record_close_checked(SID, Some("old"), "pty-exit");
         store.record_close_checked(SID, Some("x"), "explicit");
-        let (mine, rest) = store.release_session_hold_taking(SID, Some("old"));
-        assert_eq!(mine.map(|c| c.terminal_id), Some("old".to_string()));
-        assert_eq!(rest.len(), 1);
+        store.set_release_hook(|s| {
+            s.record_close_checked(SID, Some("new-1"), "pty-exit");
+        });
+        let applied = finish_replaying(&store, SID, Some("new-1"));
+        assert_eq!(
+            applied.map(|c| c.terminal_id),
+            Some("new-1".to_string()),
+            "the close that landed as the release began is applied, not dropped"
+        );
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.close_reason.as_deref()),
+            ("closed", Some("pty-exit"))
+        );
         assert_eq!(store.held_session_count(), 0);
+    }
+
+    // ---- round 5 -----------------------------------------------------------
+
+    /// Finding 1: the user dismisses a STALE tab (a dead pane still carrying
+    /// this session id, owning no open row) while the resumed pane is being
+    /// proven. That close is filed under the session, but it names a terminal
+    /// this respawn never spawned: it is not the user's answer, and the
+    /// healthy resumed pane keeps the session.
+    #[tokio::test]
+    async fn a_close_of_a_pane_the_respawn_never_spawned_does_not_end_it() {
+        for old in [None, Some(record("old", "/src"))] {
+            let (_d, store, closes) = observed_store();
+            let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
+            fx.user_close_stale_while_proving = true;
+            let out = confirm_respawn(&mut fx, &store, old.as_ref(), MAX_RESPAWN_ATTEMPTS).await;
+            assert_eq!(
+                out,
+                RespawnOutcome::Alive {
+                    terminal_id: "new-1".into(),
+                    attempts: 1
+                },
+                "old = {:?}",
+                old.as_ref().map(|o| &o.terminal_id)
+            );
+            assert!(
+                matches!(fx.exit_close_outcomes[0], CloseOutcome::HeldInFlight { .. }),
+                "fixture: the stale close is filed under the session"
+            );
+            assert!(!fx.closed().contains(&"new-1".to_string()));
+            let row = store.get(SID).unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.terminal_id.as_str()),
+                ("open", "new-1")
+            );
+            assert_eq!(
+                closes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no coord Closed, nonce kept"
+            );
+            assert_eq!(store.held_session_count(), 0);
+        }
+    }
+
+    /// Finding 1: the same stale close while a DEAD pane waits for its retry
+    /// spawns the retry — the stale close stops nothing.
+    #[tokio::test]
+    async fn a_stale_tab_close_does_not_stop_a_retry() {
+        let (_d, store, closes) = observed_store();
+        let mut fx = Fake::new(
+            &store,
+            vec![LivenessVerdict::Died(Some(127)), LivenessVerdict::Alive],
+        );
+        fx.exit_close = true;
+        fx.user_close_stale_while_proving = true;
+        let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Alive {
+                terminal_id: "new-2".into(),
+                attempts: 2
+            }
+        );
+        assert_eq!(store.get(SID).unwrap().state, "open");
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Finding 2: the old pane is alive but no longer HOSTS a CLI (a restored
+    /// pane is a shell that `claude --resume` was typed into; the CLI exited,
+    /// the shell lives). An unconfirmed migration must not roll the session
+    /// back onto a bare shell: the new pane keeps the row, and the old pane is
+    /// marked superseded so its later close ends nothing.
+    #[tokio::test]
+    async fn an_unconfirmed_migration_whose_old_pane_hosts_no_cli_keeps_the_new_pane() {
+        let (_d, store, closes) = observed_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Unconfirmed]);
+        fx.panes.no_claude.lock().unwrap().push("old".into());
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Unconfirmed {
+                terminal_id: "new-1".into()
+            }
+        );
+        assert!(
+            !fx.closed().contains(&"new-1".to_string()),
+            "the running new CLI is not killed"
+        );
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (
+                row.state.as_str(),
+                row.terminal_id.as_str(),
+                row.config_dir.as_deref()
+            ),
+            ("open", "new-1", Some("/dst"))
+        );
+        assert!(
+            superseded(&store, "old"),
+            "the old shell's later close ends nothing"
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(store.get(SID).unwrap().state, "open");
     }
 }

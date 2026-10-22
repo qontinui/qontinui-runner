@@ -924,6 +924,10 @@ pub struct SessionLifecycleStore {
     /// knows yet. Process-local, like `superseded_terminals`. LOCK ORDER —
     /// never held together with `map`.
     held_sessions: Mutex<HashMap<String, SessionHold>>,
+    /// Test seam: run once at the START of the next hold release, before its
+    /// lock is taken — a close "landing" at exactly that instant.
+    #[cfg(test)]
+    release_hook: Mutex<Option<ReleaseHook>>,
     /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
@@ -1192,6 +1196,8 @@ impl SessionLifecycleStore {
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
             held_sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            release_hook: Mutex::new(None),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
@@ -1782,20 +1788,37 @@ impl SessionLifecycleStore {
             .remove(terminal_id.trim())
     }
 
-    /// A USER close held for ANY pane of the session other than `except`
+    /// A USER close held for one of `among` — the panes a respawn spawned
     /// (peek). A user close of a pane the respawn already retired is still the
-    /// user's answer, so it is looked for session-wide, not per terminal.
+    /// user's answer, so every pane it spawned is looked at, not only the
+    /// current one. A close naming any OTHER terminal (a stale tab still
+    /// carrying the session id) is not: it stays held, and is dropped with the
+    /// hold.
     pub fn peek_held_user_close(
         &self,
         claude_session_id: &str,
-        except: Option<&str>,
+        among: &[String],
     ) -> Option<HeldClose> {
         let held = self.held_sessions.lock().ok()?;
-        held.get(claude_session_id)?
-            .arrivals
-            .values()
-            .find(|c| c.is_user_close() && Some(c.terminal_id.as_str()) != except)
+        let arrivals = &held.get(claude_session_id)?.arrivals;
+        among
+            .iter()
+            .filter_map(|t| arrivals.get(t.trim()))
+            .find(|c| c.is_user_close())
             .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_release_hook(&self, hook: impl FnOnce(&Self) + Send + 'static) {
+        *self.release_hook.lock().unwrap() = Some(ReleaseHook(Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn run_release_hook(&self) {
+        let hook = self.release_hook.lock().unwrap().take();
+        if let Some(ReleaseHook(h)) = hook {
+            h(self);
+        }
     }
 
     /// End a [`Self::hold_session_closes`] and, IN THE SAME LOCK, take the close
@@ -1806,6 +1829,8 @@ impl SessionLifecycleStore {
         claude_session_id: &str,
         terminal_id: Option<&str>,
     ) -> (Option<HeldClose>, Vec<HeldClose>) {
+        #[cfg(test)]
+        self.run_release_hook();
         match self.held_sessions.lock() {
             Ok(mut held) => match held.remove(claude_session_id) {
                 Some(mut h) => {
@@ -1827,6 +1852,8 @@ impl SessionLifecycleStore {
     /// End a [`Self::hold_session_closes`]. Returns every close still held, so
     /// the caller decides what each one means; none is applied here.
     pub fn release_session_hold(&self, claude_session_id: &str) -> Vec<HeldClose> {
+        #[cfg(test)]
+        self.run_release_hook();
         match self.held_sessions.lock() {
             Ok(mut held) => held
                 .remove(claude_session_id)
@@ -3913,6 +3940,16 @@ impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.
     pub fn is_user_close(&self) -> bool {
         self.reason == USER_CLOSE_REASON
+    }
+}
+
+#[cfg(test)]
+struct ReleaseHook(Box<dyn FnOnce(&SessionLifecycleStore) + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for ReleaseHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReleaseHook")
     }
 }
 

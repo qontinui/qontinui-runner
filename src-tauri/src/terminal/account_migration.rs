@@ -40,7 +40,9 @@
 //!    lifecycle row onto the new PTY; the old pane's exit is answered as
 //!    `TerminalSuperseded` and closes nothing. A failed respawn leaves the
 //!    old pane in place; a respawn that dies is retried and then rolled back
-//!    onto the old pane; one that runs but never paints keeps both panes.
+//!    onto the old pane; one that runs but never paints is rolled back onto
+//!    the old pane while that pane still hosts its CLI, and otherwise keeps
+//!    the row on the new pane.
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
 //! dry), settings kill-switch
@@ -752,8 +754,9 @@ pub enum MigrationError {
         attempts: usize,
     },
     /// The resumed child runs but never painted by the deadline. With the old
-    /// pane still running the migration was ROLLED BACK onto it (the unproven
-    /// pane closed); with the old pane gone the new pane keeps the row.
+    /// pane still hosting its CLI the migration was ROLLED BACK onto it (the
+    /// unproven pane closed); with the old pane gone, or alive only as a shell
+    /// whose CLI exited, the new pane keeps the row.
     Unconfirmed {
         new_terminal_id: String,
         rolled_back: bool,
@@ -784,7 +787,7 @@ impl std::fmt::Display for MigrationError {
             } => write!(
                 f,
                 "migration-unconfirmed: the resumed pane {new_terminal_id} is running but never \
-                 painted its prompt — kept, the old pane being gone"
+                 painted its prompt — kept, the old pane no longer hosting a CLI"
             ),
         }
     }
@@ -861,9 +864,11 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
                 // never touch an already-running session; this gate fires only
                 // when something NEW is created). The bound on what it adds:
                 // at most ONE extra `claude` at a time — a retry replaces a
-                // pane whose child already exited — and the old pane, which the
-                // `migration-unconfirmed` arm deliberately keeps beside the new
-                // one, idles at its limit prompt and consumes nothing. A
+                // pane whose child already exited. The `migration-unconfirmed`
+                // arm never leaves two CLIs running: with the old pane still
+                // hosting its CLI it rolls back and closes the new pane; the
+                // old pane it leaves beside the new one is a bare shell whose
+                // CLI already exited, and consumes nothing. A
                 // RESPAWN, by contrast, creates something genuinely new (its
                 // source is already closed) and passes `false`.
                 resource_override: true,
