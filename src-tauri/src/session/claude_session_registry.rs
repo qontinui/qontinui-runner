@@ -39,13 +39,22 @@
 //!   exits, so this answers "what is open right now" and says nothing about
 //!   already-dead sessions. That is the right shape for the write-down →
 //!   rebuild → resume loop; use `past_sessions` for history.
-//! - **A session id may have several live processes.** 22 of 80 did at time of
-//!   writing, each carrying its own auto-generated `<dir>-<2hex>` name. The
-//!   registry is keyed by PID, so this reader returns one entry per *process*
-//!   and lets the caller collapse by `session_id` if it wants.
+//! - **A session id may have several rows.** "22 of 80" session ids did when
+//!   this was first written (2026-07-23) — but that count filtered rows by PID
+//!   membership only, with NO `procStart` check, so it counted stale files
+//!   whose pid Windows had since handed to another process. The 2026-10-21
+//!   census (plan
+//!   `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`,
+//!   Phase 1 findings) found 3 duplicate groups over 40 raw rows and **1** over
+//!   the 19 VALID rows — and that one was a true fork. The registry is keyed by
+//!   PID, so this reader returns one entry per *file* and lets the caller
+//!   collapse by `session_id` if it wants; a caller that needs to know whether
+//!   a row is evidence uses [`registry_row_validity`] / [`read_registry_rows`].
 //! - **Liveness is re-checked here.** A crashed process cannot clean up after
 //!   itself, so an entry whose PID is absent from the live process table is
-//!   dropped rather than reported as open.
+//!   dropped rather than reported as open. PID membership alone does not prove
+//!   the row is the process's own (pid reuse) — that is what
+//!   [`registry_row_validity`] adds.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -90,6 +99,15 @@ struct RegistryFile {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: Option<i64>,
+    /// The writing process's creation time in the [`Self::pid_domain`]'s clock
+    /// — on Windows a FILETIME (100-ns ticks since 1601 UTC) as a decimal
+    /// STRING (`"procStart":"134369923919058648"`). Absent on older CLI builds,
+    /// which makes the row's validity UNKNOWN (see [`registry_row_validity`]).
+    #[serde(default)]
+    proc_start: Option<String>,
+    /// `"win32:<host>"` on Windows. Names the clock `proc_start` is in.
+    #[serde(default)]
+    pid_domain: Option<String>,
 }
 
 /// One live Claude Code process, as the operator sees it.
@@ -273,6 +291,207 @@ pub fn read_live_sessions(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Registry-row VALIDITY — the one answer to "is this row evidence?"
+// ---------------------------------------------------------------------------
+
+/// Tolerance, in FILETIME ticks (100 ns), between a row's `procStart` and the
+/// snapshot's creation time for the same pid. CIM truncates `CreationDate` to
+/// the microsecond (10 ticks) while Claude Code writes the full-resolution
+/// value, so a VALID row differs by 0-9 ticks; a reused pid differs by days.
+/// `< 10` is "the same microsecond", which also absorbs a rounding (rather
+/// than truncating) source.
+pub const PROC_START_TOLERANCE_TICKS: u64 = 10;
+
+/// Why a row is positively NOT evidence of a live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleRow {
+    /// The pid is not a countable live claude in the snapshot (dead, reused by
+    /// a non-claude image, or a qontinui shim).
+    PidNotLiveClaude,
+    /// The pid IS a live claude, but its creation time is not the row's
+    /// `procStart` — the pid was reused by a later claude (2026-10-21: pid
+    /// 38920 was a live claude for paktis `f2a062c0` while a stale tiohorst
+    /// row still named it with `b4c069ec`).
+    ProcStartMismatch,
+}
+
+/// Why a row's validity could not be established either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownRow {
+    /// The process table read failed (empty snapshot).
+    ProcessTableUnreadable,
+    /// The row carries no `procStart` (older CLI) — the pid is a live claude,
+    /// but nothing proves the row is that process's own.
+    NoProcStart,
+    /// `procStart` is not a number.
+    MalformedProcStart,
+    /// `pidDomain` names a clock this runner does not compare against.
+    UnsupportedPidDomain,
+    /// The snapshot has no comparable creation time for the pid (non-Windows,
+    /// or CIM reported none).
+    CreationTimeUnavailable,
+}
+
+impl UnknownRow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnknownRow::ProcessTableUnreadable => "process table unreadable",
+            UnknownRow::NoProcStart => "registry row carries no procStart",
+            UnknownRow::MalformedProcStart => "registry row procStart is malformed",
+            UnknownRow::UnsupportedPidDomain => "registry row pidDomain is not comparable",
+            UnknownRow::CreationTimeUnavailable => "process creation time unavailable",
+        }
+    }
+}
+
+/// Three-valued verdict on one `<config_dir>/sessions/<pid>.json` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowValidity {
+    /// The row is the live claude process's own — evidence.
+    Valid,
+    /// Positively not evidence — ignore the row.
+    Stale(StaleRow),
+    /// Cannot tell. Never evidence FOR an action.
+    Unknown(UnknownRow),
+}
+
+impl RowValidity {
+    pub fn is_valid(self) -> bool {
+        matches!(self, RowValidity::Valid)
+    }
+}
+
+/// THE registry-row validity rule (plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`,
+/// Phase 3 "Registry-row validity"; shared by the migration identity check,
+/// the binder's provider rung and the duplicate-host detector).
+///
+/// A row is VALID iff (a) its pid is a countable claude in `snapshot`
+/// ([`is_countable_claude`](crate::process_capture::process_tree::is_countable_claude))
+/// AND (b) its `procStart` is that pid's creation time to the microsecond
+/// ([`PROC_START_TOLERANCE_TICKS`]). Registry `status`/`updatedAt` are NOT
+/// liveness signals and are not read (a working pid read `busy` for 4 h).
+///
+/// Order matters: an unreadable table is UNKNOWN before anything else; a pid
+/// that is not a live claude is STALE even when the row has no `procStart`
+/// (no procStart could make a dead pid live).
+pub fn registry_row_validity(
+    pid: u32,
+    proc_start: Option<&str>,
+    pid_domain: Option<&str>,
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> RowValidity {
+    if snapshot.names.is_empty() {
+        return RowValidity::Unknown(UnknownRow::ProcessTableUnreadable);
+    }
+    if !crate::process_capture::process_tree::is_countable_claude(pid, snapshot) {
+        return RowValidity::Stale(StaleRow::PidNotLiveClaude);
+    }
+    let Some(raw) = proc_start.map(str::trim).filter(|s| !s.is_empty()) else {
+        return RowValidity::Unknown(UnknownRow::NoProcStart);
+    };
+    // Only the Windows FILETIME clock is compared today. An absent domain is
+    // accepted: the value is compared against the FILETIME map, which is empty
+    // off Windows, so it degrades to UNKNOWN there rather than mismatching.
+    if let Some(domain) = pid_domain {
+        if !domain.starts_with("win32:") {
+            return RowValidity::Unknown(UnknownRow::UnsupportedPidDomain);
+        }
+    }
+    let Ok(row_ticks) = raw.parse::<u64>() else {
+        return RowValidity::Unknown(UnknownRow::MalformedProcStart);
+    };
+    let Some(&snap_ticks) = snapshot.creation_filetimes.get(&pid) else {
+        return RowValidity::Unknown(UnknownRow::CreationTimeUnavailable);
+    };
+    if row_ticks.abs_diff(snap_ticks) < PROC_START_TOLERANCE_TICKS {
+        RowValidity::Valid
+    } else {
+        RowValidity::Stale(StaleRow::ProcStartMismatch)
+    }
+}
+
+/// One registry file with its validity against ONE process-table snapshot —
+/// the input the migration identity check and the duplicate-host detector
+/// decide over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRow {
+    pub pid: u32,
+    pub session_id: String,
+    /// The owning account's config dir (the dir the `sessions/` lives in).
+    pub config_dir: std::path::PathBuf,
+    /// `kind` verbatim (`interactive` for a real window); `None` when absent.
+    pub kind: Option<String>,
+    pub validity: RowValidity,
+}
+
+impl RegistryRow {
+    /// `kind == "interactive"` — the class the 2026-10-21 census showed forks
+    /// live in. An ABSENT kind counts as interactive, matching
+    /// [`parse_registry_file`]'s default: dropping it would hide a live window.
+    pub fn is_interactive(&self) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == "interactive")
+    }
+}
+
+/// Parse one registry file into a [`RegistryRow`], validated against
+/// `snapshot`. `None` for malformed JSON or an empty `sessionId`.
+pub fn parse_registry_row(
+    bytes: &str,
+    config_dir: &Path,
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Option<RegistryRow> {
+    let raw: RegistryFile = serde_json::from_str(bytes).ok()?;
+    if raw.session_id.trim().is_empty() {
+        return None;
+    }
+    let validity = registry_row_validity(
+        raw.pid,
+        raw.proc_start.as_deref(),
+        raw.pid_domain.as_deref(),
+        snapshot,
+    );
+    Some(RegistryRow {
+        pid: raw.pid,
+        session_id: raw.session_id,
+        config_dir: config_dir.to_path_buf(),
+        kind: raw.kind,
+        validity,
+    })
+}
+
+/// Read EVERY `<config_dir>/sessions/*.json` (no pid filter) and validate each
+/// against `snapshot`. Fail-open per file like [`read_live_sessions`]. An
+/// unreadable process table is NOT fail-open: every row then reads
+/// [`UnknownRow::ProcessTableUnreadable`], which is how a consumer tells "no
+/// evidence" from "no duplicates". Sorted by `(config_dir, pid)`.
+pub fn read_registry_rows(
+    config_dirs: &[std::path::PathBuf],
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Vec<RegistryRow> {
+    let mut out = Vec::new();
+    for dir in config_dirs {
+        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
+            continue; // no sessions dir on this account — normal
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(row) = parse_registry_row(&bytes, dir, snapshot) {
+                out.push(row);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.config_dir.cmp(&b.config_dir).then(a.pid.cmp(&b.pid)));
+    out
+}
+
 /// Find the live-registry row for ONE session id, WITHOUT taking a
 /// process-table snapshot.
 ///
@@ -294,7 +513,7 @@ pub fn read_live_sessions(
 /// SessionStart hook fires. `None` means UNKNOWN: callers must leave the stored
 /// value alone (the sticky rule), never blank it.
 ///
-/// When several files name the same id (22 of 80 did on the operator's box),
+/// When several files name the same id (a "22 of 80" count once said so, measured without a procStart check — see the module doc),
 /// an OPERATOR-named row wins over a `nameSource: "derived"` one — a `/rename`
 /// is the string the operator actually sees, and letting an auto-name preempt
 /// it is the precedence bug this module's doc comment warns about.
@@ -444,7 +663,7 @@ mod tests {
         let root = tmpdir("find-by-id");
         let acct = root.join(".claude-paktis");
         let sessions = acct.join("sessions");
-        // Same session id reported by two live processes — the shape 22 of 80
+        // Same session id reported by two live processes — the shape the uncorrected "22 of 80" count described
         // rows had on the operator's box.
         fs::write(
             sessions.join("11.json"),
@@ -650,7 +869,7 @@ mod tests {
 
     #[test]
     fn several_live_processes_may_share_one_session_id() {
-        // 22 of 80 session ids did at time of writing. Each process keeps its
+        // The unchecked "22 of 80" count (module doc) — at least one true fork per the 2026-10-21 census. Each process keeps its
         // own auto-generated name, so the reader must return BOTH rows rather
         // than collapsing them — the caller decides how to present it.
         let root = tmpdir("shared");
@@ -677,5 +896,153 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got.iter().filter(|s| s.session_id == "same-id").count(), 2);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── Registry-row validity (plan 2026-10-21 Phase 3) ──────────────────
+
+    use crate::process_capture::process_tree::ProcessSnapshot;
+
+    /// A snapshot holding `claude.exe` pids with the given CIM (µs-truncated)
+    /// FILETIME creation times, plus one non-claude process so the table is
+    /// never empty.
+    fn snap_with(claudes: &[(u32, u64)]) -> ProcessSnapshot {
+        let mut s = ProcessSnapshot::default();
+        s.names.insert(1, "System".to_string());
+        for (pid, ft) in claudes {
+            s.names.insert(*pid, "claude.exe".to_string());
+            s.creation_filetimes.insert(*pid, *ft);
+        }
+        s
+    }
+
+    const W: Option<&str> = Some("win32:spaceship");
+
+    /// Measured 2026-10-21: registry `…058648`, CIM `…058640` — the same
+    /// process, 8 ticks apart. VALID. A 10-tick (1 µs) gap is not.
+    ///
+    /// Mutation check: changing `< PROC_START_TOLERANCE_TICKS` to `== 0`
+    /// fails the first assertion; to `<= 10` fails the boundary one.
+    #[test]
+    fn validity_matches_at_microsecond_granularity() {
+        let snap = snap_with(&[(28448, 134_369_923_919_058_640)]);
+        assert_eq!(
+            registry_row_validity(28448, Some("134369923919058648"), W, &snap),
+            RowValidity::Valid
+        );
+        assert_eq!(
+            registry_row_validity(28448, Some("134369923919058650"), W, &snap),
+            RowValidity::Stale(StaleRow::ProcStartMismatch),
+            "a 10-tick gap is a different microsecond"
+        );
+    }
+
+    /// The pid-38920 fixture: a live claude now holding paktis `f2a062c0`
+    /// under a valid row, while a stale tiohorst row still names it with
+    /// `b4c069ec` and a procStart 0.8 days older. Only procStart tells them
+    /// apart — the pid IS a countable claude.
+    #[test]
+    fn a_reused_pid_row_is_stale_even_though_the_pid_is_a_live_claude() {
+        let snap = snap_with(&[(38920, 134_369_938_253_255_450)]);
+        assert_eq!(
+            registry_row_validity(38920, Some("134369938253255456"), W, &snap),
+            RowValidity::Valid,
+            "paktis f2a062c0 — the pid's own row"
+        );
+        assert_eq!(
+            registry_row_validity(38920, Some("134369219930444954"), W, &snap),
+            RowValidity::Stale(StaleRow::ProcStartMismatch),
+            "tiohorst b4c069ec — a dead session's file on a reused pid"
+        );
+    }
+
+    #[test]
+    fn validity_dead_pid_is_stale_and_unknowns_are_typed() {
+        let snap = snap_with(&[(7, 1_000)]);
+        // Dead pid: stale even with no procStart.
+        assert_eq!(
+            registry_row_validity(99, None, W, &snap),
+            RowValidity::Stale(StaleRow::PidNotLiveClaude)
+        );
+        // Pid alive but not a claude image (reused by another program).
+        assert_eq!(
+            registry_row_validity(1, Some("1000"), W, &snap),
+            RowValidity::Stale(StaleRow::PidNotLiveClaude)
+        );
+        // Older CLI: no procStart → UNKNOWN, never valid.
+        assert_eq!(
+            registry_row_validity(7, None, W, &snap),
+            RowValidity::Unknown(UnknownRow::NoProcStart)
+        );
+        assert_eq!(
+            registry_row_validity(7, Some("abc"), W, &snap),
+            RowValidity::Unknown(UnknownRow::MalformedProcStart)
+        );
+        assert_eq!(
+            registry_row_validity(7, Some("1000"), Some("linux:box"), &snap),
+            RowValidity::Unknown(UnknownRow::UnsupportedPidDomain)
+        );
+        // A claude whose creation time the snapshot does not carry.
+        let mut no_ft = snap_with(&[]);
+        no_ft.names.insert(7, "claude.exe".to_string());
+        assert_eq!(
+            registry_row_validity(7, Some("1000"), W, &no_ft),
+            RowValidity::Unknown(UnknownRow::CreationTimeUnavailable)
+        );
+        // Unreadable table outranks everything.
+        assert_eq!(
+            registry_row_validity(7, Some("1000"), W, &ProcessSnapshot::default()),
+            RowValidity::Unknown(UnknownRow::ProcessTableUnreadable)
+        );
+    }
+
+    /// `read_registry_rows` keeps every file (no pid filter) and stamps each
+    /// with its validity — including the incident's real file shape, which
+    /// carries `procStart`/`pidDomain` as strings.
+    #[test]
+    fn read_registry_rows_validates_every_file() {
+        let root = tmpdir("validated");
+        let acct = root.join(".claude-paktis");
+        let sdir = acct.join("sessions");
+        fs::write(
+            sdir.join("46416.json"),
+            r#"{"pid":46416,"sessionId":"0c4e3025","cwd":"D:\\qontinui-root","procStart":"134369000000000005","pidDomain":"win32:spaceship","kind":"interactive","entrypoint":"cli","status":"busy"}"#,
+        )
+        .unwrap();
+        fs::write(sdir.join("51.json"), r#"{"pid":51,"sessionId":"dead"}"#).unwrap();
+        fs::write(sdir.join("52.json"), "{garbage").unwrap();
+        let snap = snap_with(&[(46416, 134_369_000_000_000_000)]);
+
+        let rows = read_registry_rows(&[acct.clone()], &snap);
+        assert_eq!(
+            rows.len(),
+            2,
+            "the malformed file is skipped, the dead one kept"
+        );
+        let live = rows.iter().find(|r| r.pid == 46416).unwrap();
+        assert_eq!(live.validity, RowValidity::Valid);
+        assert_eq!(live.session_id, "0c4e3025");
+        assert_eq!(live.config_dir, acct);
+        assert!(live.is_interactive());
+        let dead = rows.iter().find(|r| r.pid == 51).unwrap();
+        assert_eq!(
+            dead.validity,
+            RowValidity::Stale(StaleRow::PidNotLiveClaude)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_row_kind_absent_counts_as_interactive_but_sdk_does_not() {
+        let snap = snap_with(&[]);
+        let r = |kind: Option<&str>| RegistryRow {
+            pid: 1,
+            session_id: "s".into(),
+            config_dir: PathBuf::from("c"),
+            kind: kind.map(str::to_string),
+            validity: registry_row_validity(1, None, None, &snap),
+        };
+        assert!(r(None).is_interactive());
+        assert!(r(Some("interactive")).is_interactive());
+        assert!(!r(Some("sdk")).is_interactive());
     }
 }

@@ -54,6 +54,20 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// `creation_filetimes[pid] -> Windows FILETIME` — 100-ns ticks since
+    /// 1601-01-01 UTC, the same domain Claude Code writes as `procStart` in
+    /// `<config_dir>/sessions/<pid>.json` (`pidDomain: "win32:<host>"`). CIM
+    /// reports `CreationDate` truncated to the MICROSECOND, so a live row's
+    /// `procStart` differs from the value here by 0-9 ticks (measured
+    /// 2026-10-21: `…058648` in the registry vs `…058640` from CIM). The
+    /// registry-row validity check
+    /// ([`crate::session::claude_session_registry::registry_row_validity`])
+    /// compares at that granularity.
+    ///
+    /// Populated on Windows only. Empty elsewhere (and for a pid CIM reported
+    /// no creation time for), which that check reads as UNKNOWN — never as a
+    /// match and never as a mismatch.
+    pub creation_filetimes: HashMap<u32, u64>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -603,7 +617,7 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 async fn snapshot_process_table() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
+        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,@{n='CreationFileTime';e={if($_.CreationDate){$_.CreationDate.ToFileTimeUtc()}}}) | \
         ConvertTo-Json -Compress -Depth 3";
 
     let probe = match spawn_blocking_tracked(|| {
@@ -649,6 +663,11 @@ struct WmiProcessRow {
     /// absent means "not a shim", see [`ProcessSnapshot::exe_paths`]).
     #[serde(rename = "ExecutablePath", default)]
     executable_path: Option<String>,
+    /// `CreationDate.ToFileTimeUtc()` — FILETIME ticks, µs-truncated. `null`
+    /// for a process CIM reports no creation time for (see
+    /// [`ProcessSnapshot::creation_filetimes`]).
+    #[serde(rename = "CreationFileTime", default)]
+    creation_file_time: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -679,6 +698,9 @@ fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
         }
         if let Some(path) = row.executable_path.filter(|p| !p.trim().is_empty()) {
             snap.exe_paths.insert(row.process_id, path);
+        }
+        if let Some(ft) = row.creation_file_time.filter(|ft| *ft > 0) {
+            snap.creation_filetimes.insert(row.process_id, ft);
         }
     }
     snap
@@ -1720,6 +1742,26 @@ mod tests {
             Some(&[3u32][..])
         );
         assert_eq!(snap.creation_times.get(&2).copied(), Some(1715911100));
+    }
+
+    /// The FILETIME creation time (the registry-row validity input) is parsed
+    /// from the computed `CreationFileTime` column; `null` and an absent key
+    /// stay ABSENT (UNKNOWN), never 0.
+    #[cfg(windows)]
+    #[test]
+    fn parse_powershell_snapshot_captures_creation_filetime() {
+        let json = r#"[
+            {"ProcessId":28448,"ParentProcessId":0,"Name":"claude.exe","CreationFileTime":134369923919058640},
+            {"ProcessId":4,"ParentProcessId":0,"Name":"System","CreationFileTime":null},
+            {"ProcessId":5,"ParentProcessId":0,"Name":"x.exe"}
+        ]"#;
+        let snap = parse_powershell_snapshot(json);
+        assert_eq!(
+            snap.creation_filetimes.get(&28448).copied(),
+            Some(134_369_923_919_058_640)
+        );
+        assert!(!snap.creation_filetimes.contains_key(&4));
+        assert!(!snap.creation_filetimes.contains_key(&5));
     }
 
     #[cfg(windows)]
