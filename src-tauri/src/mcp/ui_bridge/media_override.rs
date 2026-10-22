@@ -686,6 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn the_app_server_arm_refuses_an_over_budget_wait_on_its_own() {
+        // `sdk_arm_bodies` builds the WS body first, so the tests through it
+        // only ever see the WS arm's refusal. Pin the HTTP arm's directly:
+        // leaving a wait absent must not also stop refusing an oversized one.
+        let err = prepare_override_body(
+            json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 28_001}),
+            SDK_DISPATCH_BUDGET_MS,
+            WaitFill::AppServerFits,
+        )
+        .unwrap_err();
+        assert!(err.contains("decodeTimeoutMs 28001"), "{err}");
+        let err = prepare_restore_body(
+            json!({"verifyTimeoutMs": 28_001.0}),
+            SDK_DISPATCH_BUDGET_MS,
+            WaitFill::AppServerFits,
+        )
+        .unwrap_err();
+        assert!(err.contains("verifyTimeoutMs 28001"), "{err}");
+        // And it validates: a malformed body is refused, not passed through.
+        assert!(prepare_restore_body(
+            json!({"overrideId": ""}),
+            SDK_DISPATCH_BUDGET_MS,
+            WaitFill::AppServerFits
+        )
+        .is_err());
+    }
+
+    #[test]
     fn the_sdk_arms_both_refuse_and_both_keep_a_callers_wait() {
         // Over the runner's own ceiling: refused before either arm is built.
         let err =
