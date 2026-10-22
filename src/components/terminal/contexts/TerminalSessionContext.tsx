@@ -57,6 +57,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useMemo,
   createRef,
@@ -191,6 +192,24 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
 }
 
 export const TerminalSessionContext = createContext<TerminalSessionContextValue | null>(null);
+
+/**
+ * Read ANY page's session value by id, not only the active page's — `null` for
+ * a page with no mounted scope. Every page keeps an always-mounted scope (see
+ * {@link TerminalSessionProvider}), so a page the operator is not looking at
+ * still has a live `zoneLayout` and `tabs`; this is how `/layout --page` sets
+ * that page's grid without switching the operator's view to it.
+ *
+ * The getter is stable and reads a ref, so consumers do not re-render whenever
+ * some other page's state moves.
+ */
+export type PageSessionGetter = (pageId: string) => TerminalSessionContextValue | null;
+
+const PageSessionGetterContext = createContext<PageSessionGetter>(() => null);
+
+export function usePageSessionGetter(): PageSessionGetter {
+  return useContext(PageSessionGetterContext);
+}
 
 interface PageSessionScopeProps {
   pageId: string;
@@ -1006,8 +1025,20 @@ export function TerminalSessionProvider({
 
   const activeValue = values[activePageId] ?? null;
 
+  // Layout effect, not a passive one, so the ref matches what the provider last
+  // committed. A scope publishes its value from a passive effect, so a lookup
+  // can still trail that scope by one render; callers read the result back.
+  const valuesRef = useRef(values);
+  useLayoutEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
+  const getPageSession = useCallback<PageSessionGetter>(
+    (pageId) => valuesRef.current[pageId] ?? null,
+    [],
+  );
+
   return (
-    <>
+    <PageSessionGetterContext.Provider value={getPageSession}>
       {scopedPages.map((p) => (
         <PageSessionScope
           key={p.id}
@@ -1036,7 +1067,7 @@ export function TerminalSessionProvider({
           </div>
         </div>
       )}
-    </>
+    </PageSessionGetterContext.Provider>
   );
 }
 

@@ -416,6 +416,7 @@ async function build(): Promise<RealRegistryHarness> {
     sharedSessionIds: () => new Set(),
   }));
   vi.doMock("../contexts", () => ({
+    usePageSessionGetter: () => () => null,
     useTerminalSession: () => ({
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       activeId: "tab-a",
