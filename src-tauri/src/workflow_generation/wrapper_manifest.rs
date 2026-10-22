@@ -45,7 +45,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::Method;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -160,14 +159,10 @@ async fn collect_live_ws_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         let components = match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => unwrap_components_payload(value),
