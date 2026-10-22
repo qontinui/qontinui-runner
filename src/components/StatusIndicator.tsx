@@ -71,7 +71,9 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 }) => {
   const [banner, dispatchBanner] = useReducer(errorBannerReducer, INITIAL_ERROR_BANNER_STATE);
   const infoTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
-  const [now, setNow] = useState(() => Date.now());
+  // Bumped only to re-render the residuals' "last seen" age; the age itself is
+  // read from the clock at render time, so it is never stale.
+  const [, setTick] = useState(0);
   const [isBeta] = useState(true);
   const [runnerName, setRunnerName] = useState<string>(() => {
     return instanceStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
@@ -138,14 +140,15 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   }, []);
 
   const bannerView = errorBannerView(banner);
+  const hasResiduals = bannerView.residuals.length > 0;
+  const now = Date.now();
 
-  // Keep the residual's "last seen" age honest while it is on screen.
+  // Keep the residuals' "last seen" age honest while one is on screen.
   useEffect(() => {
-    if (bannerView !== "residual") return;
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), RESIDUAL_TICK_MS);
+    if (!hasResiduals) return;
+    const id = setInterval(() => setTick((t) => t + 1), RESIDUAL_TICK_MS);
     return () => clearInterval(id);
-  }, [bannerView, banner.lastSeenAt]);
+  }, [hasResiduals]);
 
   return (
     <div className="relative">
@@ -205,14 +208,15 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         <DoctorHealthBadge />
 
         {/* A dismissed fault stays visible here until it is observed cleared */}
-        {bannerView === "residual" && banner.current && banner.lastSeenAt !== null && (
+        {bannerView.residuals.map((f) => (
           <ErrorResidual
-            error={banner.current}
-            lastSeenAt={banner.lastSeenAt}
+            key={f.error.error_code}
+            error={f.error}
+            lastSeenAt={f.lastSeenAt}
             now={now}
-            onReopen={() => dispatchBanner({ type: "reopened" })}
+            onReopen={() => dispatchBanner({ type: "reopened", errorCode: f.error.error_code })}
           />
-        )}
+        ))}
 
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (
@@ -271,12 +275,13 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       </div>
 
       {/* Error Display — in flow, under the status bar, never over a pane */}
-      {bannerView === "banner" && banner.current && (
+      {bannerView.banners.map((error) => (
         <ErrorBanner
-          error={banner.current}
-          onDismiss={() => dispatchBanner({ type: "dismissed" })}
+          key={error.error_code}
+          error={error}
+          onDismiss={() => dispatchBanner({ type: "dismissed", errorCode: error.error_code })}
         />
-      )}
+      ))}
     </div>
   );
 };
