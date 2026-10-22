@@ -1773,6 +1773,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("POST", "/checks/repair-associations"),
     ("GET", "/control/sessions/restore-census"),
     ("GET", "/control/sessions/restore-health"),
+    // Not a runner route: the in-process MOCK of coord's per-binding seed
+    // door in `device_jwt_refresher`'s `tenant_seed_arm_tests` (plan
+    // 2026-09-20 Phase 7), like `/devices/{device_id}/refresh-token` below.
+    ("POST", "/coord/devices/{device_id}/tenant-token"),
     ("GET", "/current-execution/steps"),
     ("POST", "/devices/{device_id}/refresh-token"),
     ("GET", "/evaluation/cache-stats"),
