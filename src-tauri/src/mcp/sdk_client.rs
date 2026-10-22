@@ -327,15 +327,25 @@ async fn try_ws_dispatch(
         return Ok(None);
     }
 
-    // WebSocket ONLY: a registration that turned HTTP since the read above is
-    // refused (`NotWebsocket`) rather than sent down the HTTP arm, and reads
-    // as "not WebSocket" — the caller falls through to the HTTP endpoint, as
-    // it would had the read above seen HTTP.
-    match state
-        .app_dispatcher
-        .dispatch_websocket(&app_id, action, payload)
-        .await
-    {
+    ws_only_outcome(
+        &app_id,
+        state
+            .app_dispatcher
+            .dispatch_websocket(&app_id, action, payload)
+            .await,
+    )
+}
+
+/// A WebSocket-only dispatch's result in [`try_ws_dispatch`]'s tri-state. A
+/// registration that turned HTTP since the caller's read is refused
+/// (`NotWebsocket`) rather than sent down the HTTP arm, and reads as "not
+/// WebSocket" — the caller falls through to the HTTP endpoint, as it would had
+/// its read seen HTTP.
+fn ws_only_outcome(
+    app_id: &str,
+    result: Result<serde_json::Value, DispatchError>,
+) -> Result<Option<serde_json::Value>, String> {
+    match result {
         Ok(value) => Ok(Some(value)),
         Err(DispatchError::NotWebsocket(_)) => Ok(None),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
@@ -8321,6 +8331,20 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(arms.for_transport(AppTransport::Websocket), ws_payload);
+    }
+
+    #[test]
+    fn a_websocket_dispatch_to_an_app_no_longer_websocket_reads_as_not_websocket() {
+        use super::super::app_dispatch::DispatchError;
+        assert_eq!(
+            ws_only_outcome("w", Err(DispatchError::NotWebsocket("w".into()))),
+            Ok(None)
+        );
+        assert_eq!(
+            ws_only_outcome("w", Ok(serde_json::json!(1))),
+            Ok(Some(serde_json::json!(1)))
+        );
+        assert!(ws_only_outcome("w", Err(DispatchError::NotRegistered("w".into()))).is_err());
     }
 
     // ------------------------------------------------------------------
