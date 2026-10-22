@@ -15,10 +15,11 @@
  * replace or sweep tabs on the operator's behalf, and a ten-second ghost PTY
  * behind each of them would be a leak with nothing to undo.
  *
- * Same shape as `hiddenWorkerReducer.ts`, and for the same reason: the runner's
- * vitest environment is `node` with no React Testing Library, so the hook's
- * state transitions are only testable once they are pure. `useTerminalManager`
- * owns the timers, the toast and the Tauri calls; this module owns what the
+ * Same shape as `hiddenWorkerReducer.ts`: the transitions are kept pure so they
+ * can be table-tested on their own (`pendingCloseReducer.test.ts`).
+ * `useTerminalManager` owns the timers, the toast and the Tauri calls — pinned
+ * by rendering the real hook under jsdom
+ * (`useTerminalManager.pendingClose.test.ts`); this module owns what the
  * pending set becomes and what each close is routed to.
  */
 
@@ -64,8 +65,11 @@ export const EMPTY_PENDING_CLOSE_STATE: PendingCloseState = { pending: new Map()
  *  - `hide-worker`      a Conductor worker view: hide it (the reversible close
  *                       `hiddenWorkerReducer` already owns); no PTY to kill.
  *  - `remove-view`      a plan tab: drop it; it has no PTY.
- *  - `kill-now`         an opted-out close, or an id with no tab to snapshot
- *                       (there would be nothing for Undo to put back).
+ *  - `kill-now`         an opted-out close, an id with no tab to snapshot
+ *                       (there would be nothing for Undo to put back), or an
+ *                       exited session ("Dismiss exited session"): its
+ *                       process is already gone, so there is no turn to save
+ *                       and an Undo would only restore a tombstone.
  *  - `defer`            a single-target user close: remove now, kill later.
  */
 export type CloseRoute =
@@ -85,7 +89,7 @@ export function routeClose(
   if (state.pending.has(id)) return immediate ? "expedite-pending" : "already-pending";
   if (tab?.sessionBacked === true) return "hide-worker";
   if (id.startsWith("plan-") || tab?.type === "plan") return "remove-view";
-  if (immediate || !tab) return "kill-now";
+  if (immediate || !tab || !tab.isAlive) return "kill-now";
   return "defer";
 }
 
@@ -172,6 +176,43 @@ export function restorePendingTab(tabs: TerminalTab[], entry: PendingClose): Ter
   if (tabs.some((t) => t.id === entry.tab.id)) return tabs;
   const at = Math.min(Math.max(0, entry.index), tabs.length);
   return [...tabs.slice(0, at), entry.tab, ...tabs.slice(at)];
+}
+
+/**
+ * Patch a pending close's tab snapshot, so a field another writer pins while
+ * the close counts down — a late `claudeSessionId` above all — reaches the
+ * close record the expiry builds from it, and the tab Undo puts back.
+ * Returns the SAME state when `id` is not pending.
+ */
+export function patchPendingTab(
+  state: PendingCloseState,
+  id: string,
+  updates: Partial<TerminalTab>,
+): PendingCloseState {
+  const entry = state.pending.get(id);
+  if (!entry) return state;
+  const pending = new Map(state.pending);
+  pending.set(id, { ...entry, tab: { ...entry.tab, ...updates } });
+  return { pending };
+}
+
+/**
+ * Whether Undo may put the tab back into the zone it held.
+ *
+ * Only when the zone is empty, or its occupant ARRIVED after the close — a
+ * tab that held no zone when the close happened (a new tab, or an unzoned one
+ * the layout auto-filled into the vacancy). A tab that already held a zone
+ * and was moved there since is a layout the operator arranged, and is not
+ * overwritten: the restored tab is then placed by the layout's ordinary
+ * auto-assignment instead (`reconcileAssignments`).
+ *
+ * `zonedAtClose` is the set of tab ids that held a zone at close time.
+ */
+export function mayRestoreIntoZone(
+  occupantId: string | null,
+  zonedAtClose: ReadonlySet<string>,
+): boolean {
+  return occupantId === null || !zonedAtClose.has(occupantId);
 }
 
 /** The toast text for a close: the name the operator knows the session by. */
