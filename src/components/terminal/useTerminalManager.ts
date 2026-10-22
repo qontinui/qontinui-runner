@@ -27,10 +27,12 @@ import {
   excludePendingCloses,
   expirePendingClose,
   flushPendingCloses,
+  patchPendingTab,
   pendingCloseMessage,
   restorePendingTab,
   routeClose,
   undoPendingClose,
+  type CloseRoute,
   type PendingCloseState,
 } from "./pendingCloseReducer";
 import { useShowToast } from "@/contexts/ToastContext";
@@ -1764,6 +1766,10 @@ export function useTerminalManager(
       const { state, restored } = undoPendingClose(pendingCloseStateRef.current, id);
       pendingCloseStateRef.current = state;
       if (!restored) return;
+      // Synchronously, not via the post-commit effect: a close of this tab
+      // landing before that effect would otherwise find no tab, route to
+      // `kill-now`, and kill it with no close record.
+      tabsRef.current = restorePendingTab(tabsRef.current, restored);
       setTabs((prev) => restorePendingTab(prev, restored));
       if (restored.wasActive) setActiveId(id);
       restored.restoreZone?.();
@@ -1791,6 +1797,10 @@ export function useTerminalManager(
         });
       }
     };
+    // `pagehide` relies on Tauri IPC still being delivered while the webview
+    // unloads. If the call is dropped the PTY simply stays alive, and the next
+    // load's reconnect brings its tab back — the safe direction: a close the
+    // operator can repeat, never a session killed that they did not close.
     window.addEventListener("pagehide", flush);
     return () => {
       window.removeEventListener("pagehide", flush);
@@ -1799,7 +1809,10 @@ export function useTerminalManager(
   }, [sendKill]);
 
   const closeTerminal = useCallback(
-    (id: string, options: CloseTerminalOptions = {}) => {
+    (id: string, options: CloseTerminalOptions = {}): CloseRoute => {
+      // Returns the route taken, so a caller that reports the close (`/close`)
+      // can say "pending, undo 10 s" rather than claim a kill that has not
+      // happened. Every other caller ignores it.
       // Read off the tabs snapshot rather than inside a state updater, which
       // React may run later than this handler.
       const closingTab = tabsRef.current.find((t) => t.id === id);
@@ -1811,10 +1824,10 @@ export function useTerminalManager(
       );
       switch (route) {
         case "already-pending":
-          return;
+          return route;
         case "expedite-pending":
           expireClose(id);
-          return;
+          return route;
         case "hide-worker":
           // A Conductor worker's tab is a VIEW: closing it hides the cell and
           // nothing more. The Conductor owns the worker's lifetime, and its
@@ -1832,20 +1845,20 @@ export function useTerminalManager(
             }),
           );
           removeTab(id);
-          return;
+          return route;
         case "remove-view":
           // A plan tab has no PTY: removing it is the whole close.
           removeTab(id);
-          return;
+          return route;
         case "kill-now": {
           const closeRecord = buildSessionCloseRecord(tabsRef.current, id);
           removeTab(id);
           killTerminal(id, closeRecord);
-          return;
+          return route;
         }
         case "defer": {
           // `routeClose` only defers a tab it found, so `closingTab` is set.
-          if (!closingTab) return;
+          if (!closingTab) return route;
           pendingCloseStateRef.current = beginPendingClose(pendingCloseStateRef.current, {
             tab: closingTab,
             index: tabsRef.current.findIndex((t) => t.id === id),
@@ -1862,7 +1875,7 @@ export function useTerminalManager(
             label: "Undo",
             onClick: () => undoClose(id),
           });
-          return;
+          return route;
         }
       }
     },
@@ -1893,6 +1906,10 @@ export function useTerminalManager(
         >
       >,
     ) => {
+      // A tab whose close is pending is not in `tabs`; patch its snapshot
+      // instead, so a `claudeSessionId` pinned during the Undo window reaches
+      // the close record (and the tab Undo restores).
+      pendingCloseStateRef.current = patchPendingTab(pendingCloseStateRef.current, id, updates);
       setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)));
     },
     [],
