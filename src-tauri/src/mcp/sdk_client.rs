@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::DispatchError;
+use super::app_dispatch::{ArmPayloads, DispatchError};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -376,24 +376,41 @@ async fn dispatch_app_request_typed(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, DispatchError> {
-    // The legacy split fed `ws_payload` to the WS arm and `http_body` to
-    // the HTTP arm. Most call sites pass identical bodies; when they
-    // differ, prefer `http_body` for the HTTP path to mirror legacy
-    // behavior. `dispatch_active` chooses the transport, so we pick the
-    // correct payload up-front.
-    let payload = {
-        let guard = state.sdk_connection.lock().await;
-        let app_id = guard.active_connection().map(|c| c.app_info.app_id.clone());
-        drop(guard);
-        match app_id {
-            Some(id) => match state.app_registry.get_live(&id).await.map(|e| e.transport) {
-                Some(AppTransport::Websocket) => ws_payload,
-                _ => http_body.unwrap_or(serde_json::Value::Null),
-            },
-            None => http_body.unwrap_or(serde_json::Value::Null),
-        }
-    };
+    // `ws_payload` goes to the WS arm and `http_body` (or `null`) to the HTTP
+    // arm. `dispatch_active` picks the body from the same registry read that
+    // picks the arm (`ArmPayloads`), so the two cannot disagree.
+    dispatch_app_request_arms_typed(
+        state,
+        action,
+        http_method,
+        http_path,
+        ArmPayloads::per_arm(ws_payload, http_body.unwrap_or(serde_json::Value::Null)),
+    )
+    .await
+}
 
+/// [`dispatch_app_request`] for a command whose two arms take different
+/// bodies, built as one [`ArmPayloads`] so a caller cannot hand one arm's body
+/// to the other.
+pub async fn dispatch_app_request_arms(
+    state: &Arc<ApiState>,
+    action: &str,
+    http_method: Method,
+    http_path: &str,
+    payloads: ArmPayloads,
+) -> Result<serde_json::Value, String> {
+    dispatch_app_request_arms_typed(state, action, http_method, http_path, payloads)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
+async fn dispatch_app_request_arms_typed(
+    state: &Arc<ApiState>,
+    action: &str,
+    http_method: Method,
+    http_path: &str,
+    payloads: ArmPayloads,
+) -> Result<serde_json::Value, DispatchError> {
     state
         .app_dispatcher
         .dispatch_active(
@@ -401,7 +418,7 @@ async fn dispatch_app_request_typed(
             action,
             http_method,
             http_path,
-            payload,
+            payloads,
         )
         .await
 }
@@ -430,23 +447,6 @@ pub async fn sdk_request(
         .map_err(dispatch_err_to_string)
 }
 
-/// Pick the right payload for a per-app-id dispatch based on the registered
-/// transport. Extracted so unit tests can verify the WS-vs-HTTP decision
-/// without building a full `ApiState`.
-async fn select_app_payload(
-    registry: &super::app_registry::AppRegistry,
-    app_id: &str,
-    ws_payload: serde_json::Value,
-    http_body: Option<serde_json::Value>,
-) -> serde_json::Value {
-    // `get_live`: this picks the payload SHAPE by transport, and must agree
-    // with what `dispatch` (which reads `get_live`) will actually do.
-    match registry.get_live(app_id).await.map(|e| e.transport) {
-        Some(AppTransport::Websocket) => ws_payload,
-        _ => http_body.unwrap_or(serde_json::Value::Null),
-    }
-}
-
 /// Dispatch directly to a specific registered app by `app_id`, bypassing the
 /// active-SDK-connection probe.
 ///
@@ -454,8 +454,8 @@ async fn select_app_payload(
 /// drive a wrapper without first making it the active SDK connection — the
 /// per-app-id half of Item A of the wrapper-framework Phase 1.5 plan. Picks
 /// the right payload (`ws_payload` for WS-transport apps, `http_body` for
-/// HTTP-transport apps) based on the registry's transport entry, then
-/// delegates to `AppDispatcher::dispatch`.
+/// HTTP-transport apps) from the same registry read `AppDispatcher::dispatch`
+/// routes on ([`ArmPayloads`]).
 ///
 /// `http_body` falls back to `serde_json::Value::Null` when `None` to match
 /// the existing convention in `dispatch_app_request`.
@@ -468,10 +468,10 @@ pub async fn dispatch_app_request_by_id(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let payload = select_app_payload(&state.app_registry, app_id, ws_payload, http_body).await;
+    let payloads = ArmPayloads::per_arm(ws_payload, http_body.unwrap_or(serde_json::Value::Null));
     state
         .app_dispatcher
-        .dispatch(app_id, action, http_method, http_path, payload)
+        .dispatch(app_id, action, http_method, http_path, payloads)
         .await
         .map_err(dispatch_err_to_string)
 }
@@ -3429,7 +3429,7 @@ async fn handle_media_override(
     // The WS arm is engine-direct and gets an absent decode wait filled; the
     // HTTP arm's app server fits it to its own relay budget (see
     // `media_override::WaitFill`).
-    let bodies = match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
+    let payloads = match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
         Ok(b) => b,
         Err(e) => {
             return Json(
@@ -3437,13 +3437,12 @@ async fn handle_media_override(
             )
         }
     };
-    match dispatch_app_request(
+    match dispatch_app_request_arms(
         &state,
         "mediaOverride",
-        bodies.ws,
         Method::POST,
         "/control/media/override",
-        Some(bodies.http),
+        payloads,
     )
     .await
     {
@@ -3464,7 +3463,7 @@ async fn handle_media_override_restore(
     // the override's own `decodeTimeoutMs`, which an override applied elsewhere
     // (the injected runtime allows 60 s) can set past 30 s. The WS arm fills an
     // absent one; the HTTP arm's app server fits it to its own relay budget.
-    let bodies = match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
+    let payloads = match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
         Ok(b) => b,
         Err(e) => {
             return Json(
@@ -3472,13 +3471,12 @@ async fn handle_media_override_restore(
             )
         }
     };
-    match dispatch_app_request(
+    match dispatch_app_request_arms(
         &state,
         "mediaOverrideRestore",
-        bodies.ws,
         Method::DELETE,
         "/control/media/override",
-        Some(bodies.http),
+        payloads,
     )
     .await
     {
@@ -8272,112 +8270,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Per-app-id payload selection (Item A — `?app_id=` query param)
-    // ------------------------------------------------------------------
-
-    use crate::mcp::app_discovery::DiscoveredApp;
-    use crate::mcp::app_registry::{AppRegistry, AppTransport};
-
-    fn sample_discovered(app_id: &str) -> DiscoveredApp {
-        DiscoveredApp {
-            app_id: app_id.to_string(),
-            app_name: "T".into(),
-            app_type: "web".into(),
-            framework: None,
-            url: "http://127.0.0.1:0".into(),
-            port: 0,
-            base_path: "".into(),
-            version: None,
-            capabilities: vec![],
-            element_count: None,
-            component_count: None,
-            discovered_at: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn select_app_payload_ws_transport_uses_ws_payload() {
-        let registry = AppRegistry::new();
-        registry
-            .upsert(
-                sample_discovered("wapp"),
-                None,
-                AppTransport::Websocket,
-                Some(1),
-                None,
-            )
-            .await;
-
-        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
-        let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "wapp",
-            ws_payload.clone(),
-            Some(http_body.clone()),
-        )
-        .await;
-        assert_eq!(
-            chosen, ws_payload,
-            "WS-transport apps must receive ws_payload"
-        );
-    }
-
-    #[tokio::test]
-    async fn select_app_payload_http_transport_uses_http_body() {
-        let registry = AppRegistry::new();
-        registry
-            .upsert(
-                sample_discovered("happ"),
-                None,
-                AppTransport::Http,
-                None,
-                None,
-            )
-            .await;
-
-        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
-        let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "happ",
-            ws_payload.clone(),
-            Some(http_body.clone()),
-        )
-        .await;
-        assert_eq!(
-            chosen, http_body,
-            "HTTP-transport apps must receive http_body"
-        );
-    }
-
-    #[tokio::test]
-    async fn select_app_payload_missing_app_falls_back_to_http_body_or_null() {
-        let registry = AppRegistry::new();
-
-        // Caller passed Some(http_body) — use it.
-        let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "nope",
-            serde_json::json!({"never": "used"}),
-            Some(http_body.clone()),
-        )
-        .await;
-        assert_eq!(chosen, http_body);
-
-        // Caller passed None — fall back to Null (matches dispatch_app_request).
-        let chosen = select_app_payload(
-            &registry,
-            "nope",
-            serde_json::json!({"never": "used"}),
-            None,
-        )
-        .await;
-        assert_eq!(chosen, serde_json::Value::Null);
-    }
-
-    // ------------------------------------------------------------------
     // Per-tab routing (Item #4) — `?tabId=` thread-through
     // ------------------------------------------------------------------
 
@@ -8687,6 +8579,7 @@ mod tests {
             let dispatches = [
                 "dispatch_app_request(",
                 "dispatch_app_request_typed(",
+                "dispatch_app_request_arms(",
                 "dispatch_app_request_by_id(",
                 "dispatch_active(",
                 "sdk_request(",
