@@ -1,11 +1,12 @@
 /**
- * The deferred-kill close — BEHAVIOUR, not markup.
+ * The deferred-kill close — the pure transitions.
  *
  * Closing a zone removes the tab at once and holds the PTY kill back for the
  * Undo window. These tests pin the state transitions `useTerminalManager`
- * drives through `pendingCloseReducer.ts` (the runner's vitest environment is
- * `node` with no React Testing Library, so the hook itself cannot be driven —
- * same shape as `hiddenWorkerReducer.test.ts`).
+ * drives through `pendingCloseReducer.ts`, as a plain table. The hook's wiring
+ * of them — the timers, the Tauri calls, the toast, unmount — is pinned
+ * separately by rendering the real hook under jsdom in
+ * `useTerminalManager.pendingClose.test.ts`.
  */
 
 import { describe, it, expect } from "vitest";
@@ -16,6 +17,8 @@ import {
   excludePendingCloses,
   expirePendingClose,
   flushPendingCloses,
+  mayRestoreIntoZone,
+  patchPendingTab,
   pendingCloseMessage,
   restorePendingTab,
   routeClose,
@@ -172,6 +175,13 @@ describe("routeClose", () => {
     ["an opted-out (immediate) close kills immediately", "t1", tab("t1"), true, "kill-now"],
     ["an id with no tab to snapshot kills immediately", "ghost", undefined, false, "kill-now"],
     [
+      "an exited session (Dismiss exited session) kills immediately",
+      "t1",
+      tab("t1", { isAlive: false, exitCode: 0 }),
+      false,
+      "kill-now",
+    ],
+    [
       "a Conductor worker view is hidden, never killed",
       "w1",
       tab("w1", { sessionBacked: true, taskRunId: "w1" }),
@@ -194,5 +204,29 @@ describe("pendingCloseMessage", () => {
   it("names the session by its spawn name, else its title", () => {
     expect(pendingCloseMessage(tab("a", { spawnName: "fix-parser" }))).toBe("Closed fix-parser");
     expect(pendingCloseMessage(tab("a"))).toBe("Closed Terminal a");
+  });
+});
+
+describe("patchPendingTab", () => {
+  it("a claudeSessionId pinned during the window reaches the snapshot the kill uses", () => {
+    const s = close(EMPTY_PENDING_CLOSE_STATE, tab("b"));
+    const patched = patchPendingTab(s, "b", { claudeSessionId: "late-sess" });
+    expect(expirePendingClose(patched, "b").kill?.tab.claudeSessionId).toBe("late-sess");
+  });
+
+  it("an id that is not pending leaves the state untouched", () => {
+    const s = close(EMPTY_PENDING_CLOSE_STATE, tab("b"));
+    expect(patchPendingTab(s, "zzz", { claudeSessionId: "x" })).toBe(s);
+  });
+});
+
+describe("mayRestoreIntoZone", () => {
+  const zonedAtClose = new Set(["a", "b", "c"]);
+  it.each([
+    ["an empty zone is reclaimed", null, true],
+    ["a tab that arrived after the close (unzoned then) is displaced", "new-tab", true],
+    ["a tab that already held a zone and was moved there is left alone", "c", false],
+  ] as const)("%s", (_label, occupant, expected) => {
+    expect(mayRestoreIntoZone(occupant, zonedAtClose)).toBe(expected);
   });
 });

@@ -75,6 +75,7 @@ import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
+import { mayRestoreIntoZone } from "../pendingCloseReducer";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
@@ -318,13 +319,21 @@ const PageSessionScope = memo(function PageSessionScope({
   }, [zoneLayout.assignments]);
   const closeTerminalInZone = useCallback<typeof managerCloseTerminal>(
     (id, options = {}) => {
-      const zone = Object.entries(zoneAssignmentsRef.current).find(([, tabId]) => tabId === id);
+      const atClose = zoneAssignmentsRef.current;
+      const zone = Object.entries(atClose).find(([, tabId]) => tabId === id);
       const zoneIndex = zone ? Number(zone[0]) : null;
-      managerCloseTerminal(id, {
+      const zonedAtClose: ReadonlySet<string> = new Set(Object.values(atClose));
+      // Undo reclaims the zone only if nothing the operator arranged sits
+      // there now (`mayRestoreIntoZone`); otherwise the layout's auto-assign
+      // places the restored tab like any other unzoned one.
+      const restoreZone = () => {
+        if (zoneIndex === null) return;
+        const occupant = zoneAssignmentsRef.current[zoneIndex] ?? null;
+        if (mayRestoreIntoZone(occupant, zonedAtClose)) assignTabToZone(zoneIndex, id);
+      };
+      return managerCloseTerminal(id, {
         ...options,
-        restoreZone:
-          options.restoreZone ??
-          (zoneIndex === null ? undefined : () => assignTabToZone(zoneIndex, id)),
+        restoreZone: options.restoreZone ?? (zoneIndex === null ? undefined : restoreZone),
       });
     },
     [managerCloseTerminal, assignTabToZone],
