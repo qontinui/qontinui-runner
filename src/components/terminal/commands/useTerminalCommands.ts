@@ -353,11 +353,16 @@ function countCardRows(spec: ResultCardSpec): number {
  * `route` is what `closeTerminal` did. A `defer`red close has NOT killed the
  * PTY yet — it is killed when the 10 s Undo window expires — so it is reported
  * as pending ("closing", with the undo window in the detail) rather than as a
- * kill that has not happened.
+ * kill that has not happened. A Conductor worker's view is only HIDDEN (the
+ * worker keeps running; the hidden-workers chip brings it back), so it is
+ * reported as hidden, not closed.
  */
 function closedOne(tabId: string, route: CloseRoute | undefined): EffectReport {
   if (route === "defer") {
     return effect("closing", "session", 1, { detail: `${tabId} (undo 10 s)` });
+  }
+  if (route === "hide-worker") {
+    return effect("hid", "session", 1, { detail: `${tabId} (worker keeps running)` });
   }
   return effect("closed", "session", 1, { detail: tabId });
 }
