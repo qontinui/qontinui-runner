@@ -63,9 +63,18 @@ fn store(state: &ApiState) -> Result<Arc<SessionOrgStore>, Box<HandlerError>> {
 pub async fn get_session_org_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<SessionOrgSnapshot>>, HandlerError> {
-    Ok(Json(ApiResponse::success(
-        store(&state).map_err(|e| *e)?.snapshot(),
-    )))
+    let store = store(&state).map_err(|e| *e)?;
+    // `snapshot` takes the store's std mutex, which an apply holds through its
+    // fsync — wait for it off the async workers, as the POST does.
+    let snapshot = spawn_blocking_tracked(move || store.snapshot())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("session org read task failed: {e}"))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(snapshot)))
 }
 
 /// `POST /terminal/session-org`.

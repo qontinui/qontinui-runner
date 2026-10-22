@@ -40,11 +40,15 @@
 //! and disk never disagree.
 //!
 //! A MISSING file is a fresh install: a known, empty org. An UNREADABLE file is
-//! not: it loads as [`SessionOrgStatus::Unknown`], the bytes are moved aside to
-//! `session-org.corrupt-<ms>.json` so nothing is lost, and every op is refused
-//! until a client sends [`SessionOrgOp::ResetAfterUnknown`]. An automatic op
-//! (a focus-driven `markSeen`) therefore cannot silently turn "we could not read
-//! your groups" into "you have no groups".
+//! not: it loads as [`SessionOrgStatus::Unknown`] and is LEFT IN PLACE, so every
+//! later start reads it as Unknown too. Every op is refused until a client sends
+//! [`SessionOrgOp::ResetAfterUnknown`], which moves the bytes aside to
+//! `session-org.corrupt-<ms>.json` before writing a fresh org, so nothing is
+//! lost. An automatic op (a focus-driven `markSeen`) — or a restart — therefore
+//! cannot silently turn "we could not read your groups" into "you have no
+//! groups". A file whose `version` is newer than this build's
+//! [`SCHEMA_VERSION`] is Unknown the same way: an older build would drop the
+//! fields it does not know on its first write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -56,7 +60,9 @@ use tracing::warn;
 use crate::session::pane_store::PaneKey;
 
 /// On-disk schema version. Bumped only for a change an older build would
-/// misread; unknown fields are already ignored by serde.
+/// misread. A file carrying a NEWER version loads as Unknown (see the module
+/// doc): serde ignores unknown fields, so an older build would otherwise drop
+/// them on its first write.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Recently-closed entries kept. The list is reported as `shown / total`
@@ -427,13 +433,13 @@ impl std::fmt::Debug for SessionOrgStore {
 
 impl SessionOrgStore {
     /// Open the store at `path`. A missing file is a known, empty org; an
-    /// unreadable one is Unknown, moved aside (see the module doc).
+    /// unreadable one is Unknown, left in place (see the module doc).
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let loaded = load(&path, now_ms());
+        let loaded = load(&path);
         Ok(Self {
             path,
             state: Mutex::new(loaded),
@@ -575,7 +581,7 @@ fn unknown_snapshot(reason: String, preserved_at: Option<&Path>) -> SessionOrgSn
     }
 }
 
-fn load(path: &Path, now: i64) -> Loaded {
+fn load(path: &Path) -> Loaded {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -590,21 +596,31 @@ fn load(path: &Path, now: i64) -> Loaded {
             };
         }
     };
+    // Both Unknown arms leave the file IN PLACE: moving it aside here would
+    // let the next start find no file and load a known, empty org. The bytes
+    // move aside only on an explicit `ResetAfterUnknown`.
     match serde_json::from_slice::<SessionOrg>(&bytes) {
+        Ok(org) if org.version > SCHEMA_VERSION => {
+            warn!(
+                version = org.version,
+                supported = SCHEMA_VERSION,
+                path = %path.display(),
+                "session_org: file written by a newer build — org is Unknown, file left in place"
+            );
+            Loaded::Unknown {
+                reason: format!(
+                    "written by a newer build (schema version {}, this build reads up to {SCHEMA_VERSION})",
+                    org.version
+                ),
+                preserved_at: Some(path.to_path_buf()),
+            }
+        }
         Ok(org) => Loaded::Known(org),
         Err(e) => {
-            let aside = corrupt_aside_path(path, now);
-            let preserved_at = match std::fs::rename(path, &aside) {
-                Ok(()) => Some(aside),
-                Err(rename_err) => {
-                    warn!(error = %rename_err, "session_org: could not move the unreadable file aside — left in place");
-                    Some(path.to_path_buf())
-                }
-            };
-            warn!(error = %e, path = %path.display(), "session_org: unreadable file — org is Unknown, file preserved");
+            warn!(error = %e, path = %path.display(), "session_org: unreadable file — org is Unknown, file left in place");
             Loaded::Unknown {
                 reason: format!("unreadable file: {e}"),
-                preserved_at,
+                preserved_at: Some(path.to_path_buf()),
             }
         }
     }
@@ -1142,14 +1158,16 @@ mod tests {
         assert_eq!(org.groups[0].title, "Renamed");
     }
 
-    /// Enumerate: a corrupt file loads Unknown, is preserved aside byte for
-    /// byte, refuses every op (including an automatic markSeen), and only an
-    /// explicit reset starts a new org.
+    /// Enumerate: a corrupt file loads Unknown, stays in place byte for byte
+    /// (so a restart reads it as Unknown again, never as an empty org), refuses
+    /// every op (including an automatic markSeen), and only an explicit reset
+    /// moves it aside and starts a new org.
     #[test]
     fn session_org_corrupt_file_is_unknown_preserved_and_never_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
-        std::fs::write(&path, b"{\"groups\": [ not json").unwrap();
+        let bad: &[u8] = b"{\"groups\": [ not json";
+        std::fs::write(&path, bad).unwrap();
         let store = SessionOrgStore::open(&path).unwrap();
 
         let snap = store.snapshot();
@@ -1158,9 +1176,16 @@ mod tests {
             snap.org.is_none(),
             "an unreadable org must not render as empty"
         );
-        let aside = PathBuf::from(snap.preserved_at.clone().unwrap());
-        assert_ne!(aside, path);
-        assert_eq!(std::fs::read(&aside).unwrap(), b"{\"groups\": [ not json");
+        assert_eq!(
+            snap.preserved_at.as_deref(),
+            Some(path.display().to_string().as_str())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bad);
+
+        // A restart before anyone resets reads the same bytes as Unknown.
+        let restarted = SessionOrgStore::open(&path).unwrap();
+        assert_eq!(restarted.snapshot().status, SessionOrgStatus::Unknown);
+        drop(restarted);
 
         let resp = store
             .apply_at(
@@ -1173,7 +1198,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.results[0].error.as_deref(), Some("org_unknown"));
         assert_eq!(resp.snapshot.status, SessionOrgStatus::Unknown);
-        assert!(!path.exists(), "a refused op must not write a fresh file");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bad,
+            "a refused op must not write a fresh file"
+        );
 
         let resp = store
             .apply_at(
@@ -1187,7 +1216,43 @@ mod tests {
         assert!(resp.results.iter().all(|r| r.ok));
         assert_eq!(resp.snapshot.status, SessionOrgStatus::Known);
         assert_eq!(known(&store_in(dir.path())).groups.len(), 1);
-        assert!(aside.exists(), "the preserved file outlives the reset");
+        let aside = corrupt_aside_path(&path, T0);
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            bad,
+            "the reset preserves the unreadable bytes aside"
+        );
+    }
+
+    /// A file written by a newer build (a higher schema version) is Unknown and
+    /// left in place: an older build would drop the fields it does not know on
+    /// its first write.
+    #[test]
+    fn session_org_newer_schema_version_is_unknown_and_left_in_place() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE_NAME);
+        let mut newer = serde_json::to_value(SessionOrg::default()).unwrap();
+        newer["version"] = serde_json::json!(SCHEMA_VERSION + 1);
+        newer["futureField"] = serde_json::json!({"keep": true});
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = SessionOrgStore::open(&path).unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.status, SessionOrgStatus::Unknown);
+        assert!(snap.org.is_none());
+        assert!(snap.reason.unwrap().contains("newer build"));
+        let resp = store
+            .apply_at(
+                &[SessionOrgOp::MarkSeen {
+                    session_key: "s1".into(),
+                    at: T0,
+                }],
+                T0,
+            )
+            .unwrap();
+        assert_eq!(resp.results[0].error.as_deref(), Some("org_unknown"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     /// A read error (here: a directory where the file should be) is Unknown
