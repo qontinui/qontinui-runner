@@ -3,7 +3,10 @@
  *
  * The Rust `/control/visibility` twin (`visibility_canvas.rs`) reads `null` as
  * coverage `unavailable` / `page-sdk-lacks-coverage`, the throw marker as
- * `accessor-threw`, and anything else as the census. All of them withhold a
+ * `accessor-threw`, and anything else as the census. The split mirrors the
+ * SDK's in-page handler (`inPageCanvasCoverage`): no accessor at all is
+ * `page-sdk-lacks-coverage`; an accessor that answers `undefined` (which is
+ * what the SDK registry's own catch returns) is `accessor-threw`. All of them withhold a
  * `clear` verdict except a census with no unattributed canvas, so a failure
  * that leaked through as `{ canvases: 0, attributed: 0, unattributed: [] }`
  * would mint a false `clear`. Both directions are pinned here.
@@ -44,10 +47,21 @@ describe("readCanvasCoverage", () => {
       ["no bridge (undefined)", undefined],
       ["no registry", {}],
       ["no getCanvasCoverage accessor (pre-0.36 SDK)", { registry: {} }],
-      ["accessor answering undefined", { registry: { getCanvasCoverage: () => undefined } }],
-      ["accessor answering null", { registry: { getCanvasCoverage: () => null } }],
+      ["a non-function getCanvasCoverage", { registry: { getCanvasCoverage: 42 } }],
     ])("%s", (_label, bridge) => {
       expect(readCanvasCoverage(bridge)).toBeNull();
+    });
+  });
+
+  describe("an accessor that answers nothing is accessor-threw, not a missing accessor", () => {
+    it.each([
+      ["accessor answering undefined (the SDK registry's own catch)", () => undefined],
+      ["accessor answering null", () => null],
+    ])("%s", (_label, getCanvasCoverage) => {
+      expect(readCanvasCoverage({ registry: { getCanvasCoverage } })).toEqual({
+        state: "unavailable",
+        reason: "accessor-threw",
+      });
     });
   });
 
