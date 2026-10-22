@@ -85,6 +85,7 @@ import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
 import { useProjectPageActivation } from "./components/terminal/useProjectPageActivation";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
+import { useTabBarCommands } from "./components/terminal/commands/useTabBarCommands";
 import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
 import { TerminalSessionProvider } from "./components/terminal/contexts";
@@ -298,6 +299,12 @@ function AppContent() {
   });
   const { popOutPage } = useTerminalWindowActions();
   const [showReorganize, setShowReorganize] = useState(false);
+  useTabBarCommands({
+    pageCount: terminalPages.visiblePages.length,
+    closeEmptyPages: terminalPages.closeEmptyPages,
+    openReorganize: () => setShowReorganize(true),
+    reorganizeOpen: showReorganize,
+  });
 
   const handleReorganize = useCallback(
     async (plan: ReorganizePlan) => {
