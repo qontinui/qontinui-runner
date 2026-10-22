@@ -182,11 +182,18 @@ impl LoopController {
             .map(|s| s.inner().clone());
         let execution_id = config.execution_id.clone();
         if let Some(reg) = registrar.as_deref() {
-            reg.register_session(
+            // The run's tenant follows its project's workspace + repo
+            // (plan 2026-09-20 Phase 5); no project path is today's answer.
+            // Registered from the project path as CONFIGURED: `run_inner` may
+            // later re-point it at a runner worktree of the same repo, whose
+            // owning tenant is the same.
+            reg.register_session_in(
                 &execution_id,
                 &format!("unified workflow: {}", config.workflow_name),
                 None,
-            );
+                config.project_path.as_deref().map(std::path::Path::new),
+            )
+            .await;
         }
 
         let result = self
@@ -304,7 +311,7 @@ impl LoopController {
         // CREATE ARTIFACT DIRECTORY
         // =====================================================================
         if config.artifact_dir.is_none() {
-            if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+            if let Some(app_data_dir) = qontinui_runner_lib::instance_env::runner_app_data_dir() {
                 let artifact_dir = app_data_dir.join("artifacts").join(&config.execution_id);
                 if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
                     warn!(

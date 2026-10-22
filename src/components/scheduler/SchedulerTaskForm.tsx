@@ -100,7 +100,20 @@ interface SchedulerTaskFormProps {
 }
 
 type ScheduleType = "once" | "cron" | "interval" | "condition";
-type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent";
+// The published @qontinui/shared-types ScheduledTaskType predates the Script variant
+// (qontinui-schemas ScheduledTaskType::Script), so it is narrowed structurally here.
+interface ScriptTask {
+  task_type: "Script";
+  command: string;
+  working_directory?: string | null;
+  timeout_seconds?: number | null;
+}
+const asScriptTask = (t: unknown): ScriptTask | undefined =>
+  (t as { task_type?: string } | null | undefined)?.task_type === "Script"
+    ? (t as ScriptTask)
+    : undefined;
+
+type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent" | "script";
 
 const CRON_PRESETS = [
   { label: "Every minute (testing)", value: "* * * * *" },
@@ -174,6 +187,7 @@ export function SchedulerTaskForm({
   const initTask = task?.task ?? prefill?.task;
   const [taskType, setTaskType] = useState<TaskType>(() => {
     if (!initTask) return "workflow";
+    if (asScriptTask(initTask)) return "script";
     switch (initTask.task_type) {
       case "Workflow":
         return "workflow";
@@ -408,6 +422,11 @@ export function SchedulerTaskForm({
   // Build the task type
   const buildTaskType = (): ScheduledTaskType => {
     switch (taskType) {
+      case "script":
+        // Script tasks are managed by scripts (e.g. schedule-fleet-bundle-sync.sh);
+        // the form shows them read-only and round-trips the stored task unchanged.
+        if (asScriptTask(initTask)) return initTask as unknown as ScheduledTaskType;
+        throw new Error("Script tasks cannot be created from this form");
       case "workflow":
         return {
           task_type: "Workflow",
@@ -544,6 +563,8 @@ export function SchedulerTaskForm({
     if (scheduleType === "condition" && !requireIdle && !requireRepoInactive) return false;
 
     switch (taskType) {
+      case "script":
+        return asScriptTask(initTask) !== undefined;
       case "workflow":
         return workflowId.trim() !== "" || workflowName.trim() !== "";
       case "prompt":
@@ -1047,6 +1068,18 @@ export function SchedulerTaskForm({
               />
               <span className="text-sm">Force run even if no findings</span>
             </label>
+          </div>
+        )}
+
+        {taskType === "script" && asScriptTask(initTask) && (
+          <div className="space-y-2 text-sm" data-testid="script-task-readonly">
+            <p className="text-text-secondary">
+              Script task (read-only here): the runner runs this command directly, with no AI
+              session. Success is exit code 0.
+            </p>
+            <pre className="whitespace-pre-wrap rounded bg-black/20 p-2">{asScriptTask(initTask)?.command}</pre>
+            <div>Working directory: {asScriptTask(initTask)?.working_directory ?? "(runner default)"}</div>
+            <div>Timeout: {asScriptTask(initTask)?.timeout_seconds || 600}s</div>
           </div>
         )}
 

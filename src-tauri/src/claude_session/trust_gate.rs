@@ -1963,8 +1963,65 @@ fn finish(
     }
 }
 
+/// Real-git fixtures shared by the trust tests here and in
+/// [`super::spawn_preconditions`], so the worktree layout both modules assert
+/// on is built one way.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use std::path::{Path, PathBuf};
+
+    /// Run `git` in `dir`, scrubbed of the repo-selecting variables a git hook
+    /// exports — without that, a `cargo test` run from a hook would init and
+    /// add worktrees in the OUTER repository — and of the machine's global and
+    /// system config, so a `commit.gpgsign` or `core.hooksPath` there cannot
+    /// fail the fixture or run hooks inside it. The global path is a file that
+    /// does not exist, which git reads as empty on every platform.
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env("GIT_CONFIG_GLOBAL", dir.join("no-global-gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A real primary + `git worktree add` fixture: `(tempdir, primary, worktree)`.
+    pub(crate) fn linked_worktree_fixture(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        git(&primary, &["init", "-q"]);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let wt = tmp.path().join("wt");
+        let mut args: Vec<&str> = extra.to_vec();
+        args.extend(["worktree", "add", "-q", wt.to_str().unwrap()]);
+        git(&primary, &args);
+        (tmp, primary, wt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::linked_worktree_fixture;
     use super::*;
 
     // ------------------------------------------------- allocation index lookup
@@ -2573,42 +2630,6 @@ THE AUTONOMY DIAL. One of:
         ));
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    }
-
-    /// A real primary + `git worktree add` fixture: `(tempdir, primary, worktree)`.
-    fn linked_worktree_fixture(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let primary = tmp.path().join("repo");
-        std::fs::create_dir(&primary).unwrap();
-        git(&primary, &["init", "-q"]);
-        git(
-            &primary,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "i",
-            ],
-        );
-        let wt = tmp.path().join("wt");
-        let mut args: Vec<&str> = extra.to_vec();
-        args.extend(["worktree", "add", "-q", wt.to_str().unwrap()]);
-        git(&primary, &args);
-        (tmp, primary, wt)
-    }
-
     #[test]
     fn verified_primary_checkout_accepts_a_real_linked_worktree() {
         let (_tmp, primary, wt) = linked_worktree_fixture(&[]);
@@ -2744,6 +2765,25 @@ THE AUTONOMY DIAL. One of:
         );
         assert!(workspace_trust::is_runner_minted(&cfg, &pk));
         assert!(workspace_trust::is_runner_minted(&cfg, &wk));
+    }
+
+    /// The spawn instrument's explicit-trust reading keys the very entry this
+    /// gate mints: untrusted before `finish`, trusted after, same key. If the
+    /// two ever derived the primary differently, the reading would stay
+    /// `untrusted` here.
+    #[test]
+    fn the_explicit_trust_reading_keys_the_entry_finish_mints() {
+        use crate::claude_session::spawn_preconditions::explicit_trust_for;
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = explicit_trust_for(&wt, Some(cfg.as_path())).unwrap();
+        assert!(matches!(before.verdict, TrustVerdict::Untrusted { .. }));
+
+        let r = run_finish(&wt, &acct, AutonomyTier::Proceed);
+        assert_eq!(r.primary_checkout_write_outcome.as_deref(), Some("Trusted"));
+
+        let after = explicit_trust_for(&wt, Some(cfg.as_path())).unwrap();
+        assert_eq!(after.primary_key, before.primary_key);
+        assert_eq!(after.verdict, TrustVerdict::Trusted);
     }
 
     /// The laundering sequence: a stamped primary does not satisfy conjunct 2
