@@ -39,7 +39,40 @@ import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
-import { buildCreatePlainTerminalAction } from "@/components/terminal/createPlainTerminalAction";
+import {
+  assertComponentActionEffectConsistency,
+  componentSignatureId,
+  normalizeDeclaredComponentSignature,
+  type ActionParams,
+  type EffectSignature,
+  type SemanticSnapshot,
+} from "@qontinui/ui-bridge";
+
+import {
+  buildCreatePlainTerminalAction,
+  CREATE_PLAIN_TERMINAL_ACTION_ID,
+} from "@/components/terminal/createPlainTerminalAction";
+import { buildTerminalLaunchMenuActions } from "@/components/terminal/terminalLaunchMenuActions";
+import {
+  CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE,
+  CREATE_TERMINAL_SIGNATURE,
+  GET_ZONE_VIEW_STATE_SIGNATURE,
+  LIST_RUNNER_WINDOWS_SIGNATURE,
+  LIST_TERMINALS_SIGNATURE,
+  MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
+  OPEN_TERMINAL_WINDOW_SIGNATURE,
+  POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
+  POP_OUT_PAGE_SIGNATURE,
+  zoneViewSignature,
+} from "@/components/terminal/terminalPageSignatures";
+import {
+  DELETE_PROFILE_SIGNATURE,
+  LIST_LAYOUTS_SIGNATURE,
+  LIST_PROFILES_SIGNATURE,
+  SAVE_PROFILE_SIGNATURE,
+  SELECT_LAYOUT_SIGNATURE,
+  loadProfileSignature,
+} from "@/components/terminal/zonePickerSignatures";
 
 const SRC_ROOT = resolve(__dirname, "../..");
 
@@ -70,6 +103,8 @@ interface FoundAction {
   action: string;
   /** `undefined` when the registration declares no `effect`. */
   effect: string | undefined;
+  /** Whether the action literal declares a `signature` property at all. */
+  hasSignature: boolean;
   where: string;
 }
 
@@ -217,6 +252,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: `<unreadable actions factory: ${actionsNode.getText().slice(0, 60)}>`,
               effect: undefined,
+              hasSignature: false,
               where,
             });
           }
@@ -239,6 +275,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
                 component: componentId,
                 action: `<unreadable element: ${el.getText().slice(0, 60)}>`,
                 effect: undefined,
+                hasSignature: false,
                 where,
               });
               continue;
@@ -248,6 +285,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: literalText(objectProperty(literal, "id")) ?? "<unreadable id>",
               effect: literalText(objectProperty(literal, "effect")) ?? undefined,
+              hasSignature: objectProperty(literal, "signature") !== undefined,
               where,
             });
           }
@@ -311,5 +349,186 @@ describe("component-action effect coverage", () => {
     const action = buildCreatePlainTerminalAction(async () => "tab-1");
     expect(action.effect).toBe("write");
     expect(VALID_EFFECTS.has(action.effect)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Effect-calculus signatures on the terminal page's four components
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary`,
+// Phase 2. `predict` on an action with no `signature` answers UNCLASSIFIED, so
+// every action on these four components must declare one. The set is read from
+// the walk, never pinned as a count: a sibling PR adding an action here must
+// add its signature or go red.
+
+/** The four component ids whose every action must declare a `signature`. */
+const SIGNATURE_COMPONENTS = [
+  "terminal-page",
+  "terminal-launch-menu",
+  "zone-layout-picker",
+  "zone-profile-picker",
+] as const;
+
+/** Non-vacuity floor: the actions those four registered on 2026-10-22. */
+const MIN_SIGNATURE_ACTIONS = 22;
+
+/**
+ * The runtime signature each action registers, built the way its registration
+ * builds it (factories called with stubs). Keyed `<componentId>.<actionId>`.
+ */
+function runtimeSignatures(): Map<string, EffectSignature | undefined> {
+  const facts = () => ({ maximizedZone: null, zoneCount: 4 });
+  const launch = buildTerminalLaunchMenuActions({
+    callRegistry: async () => [] as never,
+    launchAiSession: async () => [],
+  });
+  const plain = buildCreatePlainTerminalAction(async () => "tab-1");
+  const entries: [string, EffectSignature | undefined][] = [
+    ["terminal-page.create-terminal", CREATE_TERMINAL_SIGNATURE],
+    [`terminal-page.${plain.id}`, plain.signature],
+    ["terminal-page.list-terminals", LIST_TERMINALS_SIGNATURE],
+    ["terminal-page.open-terminal-window", OPEN_TERMINAL_WINDOW_SIGNATURE],
+    ["terminal-page.pop-out-active-terminal", POP_OUT_ACTIVE_TERMINAL_SIGNATURE],
+    ["terminal-page.pop-out-page", POP_OUT_PAGE_SIGNATURE],
+    ["terminal-page.move-terminal-to-window", MOVE_TERMINAL_TO_WINDOW_SIGNATURE],
+    ["terminal-page.maximize-zone", zoneViewSignature("maximize", facts)],
+    ["terminal-page.restore-zone", zoneViewSignature("restore", facts)],
+    ["terminal-page.toggle-maximize-zone", zoneViewSignature("toggle", facts)],
+    ["terminal-page.get-zone-view-state", GET_ZONE_VIEW_STATE_SIGNATURE],
+    ["terminal-page.list-runner-windows", LIST_RUNNER_WINDOWS_SIGNATURE],
+    ["terminal-page.close-empty-terminal-windows", CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE],
+    ...launch.map((a): [string, EffectSignature | undefined] => [
+      `terminal-launch-menu.${a.id}`,
+      a.signature,
+    ]),
+    ["zone-layout-picker.select-layout", SELECT_LAYOUT_SIGNATURE],
+    ["zone-layout-picker.list-layouts", LIST_LAYOUTS_SIGNATURE],
+    ["zone-profile-picker.load-profile", loadProfileSignature({}, 0)],
+    ["zone-profile-picker.save-profile", SAVE_PROFILE_SIGNATURE],
+    ["zone-profile-picker.delete-profile", DELETE_PROFILE_SIGNATURE],
+    ["zone-profile-picker.list-profiles", LIST_PROFILES_SIGNATURE],
+  ];
+  return new Map(entries);
+}
+
+function snapshotOf(ids: string[]): SemanticSnapshot {
+  return { elements: ids.map((id) => ({ id })) } as unknown as SemanticSnapshot;
+}
+
+/** Pre-snapshots that exercise every branch the conditional `predicts` take. */
+const PRE_SNAPSHOTS: SemanticSnapshot[] = [
+  snapshotOf([]),
+  snapshotOf(["terminal-input-t1", "terminal-input-t2", "terminal-zone-header-0"]),
+];
+
+/** Param bags covering the conditional `predicts` (and the empty bag). */
+const PARAM_BAGS: Record<string, unknown>[] = [
+  {},
+  { zoneIndex: 0 },
+  { layoutId: "single" },
+  { terminalId: "t1", windowLabel: "term-1" },
+  { terminalId: "t9", windowLabel: "main" },
+  { name: "p" },
+];
+
+/**
+ * The walk reports an action id written as an identifier by the identifier's
+ * NAME (it is for reporting). The one such id on these components resolves
+ * here, so keys compare against the runtime ids.
+ */
+const ID_CONSTANTS: Record<string, string> = { CREATE_PLAIN_TERMINAL_ACTION_ID };
+
+describe("component-action signature coverage (terminal page)", () => {
+  const { actions } = collect();
+  const scoped = actions
+    .filter((a) => (SIGNATURE_COMPONENTS as readonly string[]).includes(a.component))
+    .map((a) => ({ ...a, action: ID_CONSTANTS[a.action] ?? a.action }));
+
+  it("found all four components and at least the 22 actions they registered (non-vacuity floor)", () => {
+    expect([...new Set(scoped.map((a) => a.component))].sort()).toEqual(
+      [...SIGNATURE_COMPONENTS].sort(),
+    );
+    expect(scoped.length).toBeGreaterThanOrEqual(MIN_SIGNATURE_ACTIONS);
+  });
+
+  it("every action on the four components declares a `signature`", () => {
+    const missing = scoped
+      .filter((a) => !a.hasSignature)
+      .map((a) => `${a.component}.${a.action} (${a.where})`);
+    expect(
+      missing,
+      `${missing.length} action(s) declare no \`signature\`, so \`predict\` answers ` +
+        "UNCLASSIFIED for them. Declare one in terminalPageSignatures.ts / " +
+        "zonePickerSignatures.ts and add it at the registration.",
+    ).toEqual([]);
+  });
+
+  it("every action's RUNTIME signature exists and names itself <componentId>.<actionId>", () => {
+    const runtime = runtimeSignatures();
+    // The table must cover exactly what the walk found — an action added to a
+    // registration without a table row reds here, as does a stale row.
+    expect([...runtime.keys()].sort()).toEqual(
+      scoped.map((a) => `${a.component}.${a.action}`).sort(),
+    );
+    for (const a of scoped) {
+      const sig = runtime.get(`${a.component}.${a.action}`);
+      expect(sig, `${a.component}.${a.action} has no runtime signature`).toBeDefined();
+      const normalized = normalizeDeclaredComponentSignature(sig, a.component, a.action);
+      expect(normalized?.id).toBe(componentSignatureId(a.component, a.action));
+      expect(normalized?.provenance).toBe("declared");
+    }
+  });
+
+  it("every signature agrees with its declared `effect` (the SDK's authoring lint)", () => {
+    const runtime = runtimeSignatures();
+    const messages: string[] = [];
+    for (const a of scoped) {
+      const sig = runtime.get(`${a.component}.${a.action}`);
+      if (!sig) continue;
+      for (const pre of PRE_SNAPSHOTS) {
+        for (const bag of PARAM_BAGS) {
+          const params: ActionParams = { action: a.action, params: bag };
+          messages.push(
+            ...assertComponentActionEffectConsistency(
+              a.effect as "read" | "write" | "destructive" | undefined,
+              sig,
+              params,
+              pre,
+              a.component,
+              a.action,
+            ),
+          );
+        }
+      }
+    }
+    expect([...new Set(messages)]).toEqual([]);
+  });
+
+  it("query actions (list-* / get-*) predict an explicit empty delta, idempotent", () => {
+    const runtime = runtimeSignatures();
+    const queries = scoped.filter((a) => /^(list|get)-/.test(a.action));
+    expect(queries.length).toBeGreaterThanOrEqual(5);
+    for (const a of queries) {
+      const sig = runtime.get(`${a.component}.${a.action}`);
+      expect(a.effect).toBe("read");
+      expect(sig?.reversibility).toBe("idempotent");
+      for (const pre of PRE_SNAPSHOTS) {
+        expect(sig?.predicts({ action: a.action, params: {} }, pre)).toEqual({
+          errorsAppear: "none",
+        });
+      }
+    }
+  });
+
+  it("every destructive action is one-way, including the two the plan names", () => {
+    const runtime = runtimeSignatures();
+    for (const a of scoped.filter((x) => x.effect === "destructive")) {
+      expect(runtime.get(`${a.component}.${a.action}`)?.reversibility, a.action).toBe("one-way");
+    }
+    expect(runtime.get("terminal-page.close-empty-terminal-windows")?.reversibility).toBe(
+      "one-way",
+    );
+    expect(runtime.get("zone-profile-picker.delete-profile")?.reversibility).toBe("one-way");
   });
 });
