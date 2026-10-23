@@ -191,11 +191,7 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
                 && lines[row + 1..]
                     .iter()
                     .position(|l| l.contains(PROMPT_MARKER))
-                    .is_some_and(|gap| {
-                        lines[row + 1..row + 1 + gap]
-                            .iter()
-                            .all(|l| is_spacer_row(l))
-                    })
+                    .is_some_and(|gap| is_turn_to_input_gap(&lines[row + 1..row + 1 + gap]))
         };
         if let Some(&(_, glyph)) = glyph_rows.iter().find(|(row, _)| !exempt(*row)) {
             return IdleVerdict::Glyph(glyph);
@@ -216,11 +212,47 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
     }
 }
 
-/// A row that separates the completed-turn line from the input area without
-/// saying anything: blank, or the input box's border.
-fn is_spacer_row(line: &str) -> bool {
-    line.chars()
-        .all(|c| c.is_whitespace() || matches!(c, '─' | '━' | '╭' | '╮' | '╰' | '╯' | '│'))
+/// Do `rows` — everything between a completed-turn line and the input row
+/// below it — hold only what Claude Code puts there after a turn ends?
+///
+/// Measured over 40 finished panes' grids (Claude Code 2.1.309, plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`
+/// census): blank rows; the `/clear to save …` context hint (often with an
+/// update notice); the input box's top edge, which carries the session's
+/// name (`──── my-session ─`); and, on some panes, a `※ recap: …`
+/// paragraph between the turn line and the hint. Any other row means the
+/// turn line is not the one that just ended, and the glyph stays busy.
+fn is_turn_to_input_gap(rows: &[String]) -> bool {
+    let mut in_recap = false;
+    rows.iter().all(|row| {
+        let trimmed = row.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if is_box_edge_row(trimmed) || is_context_hint_row(trimmed) {
+            in_recap = false;
+            return true;
+        }
+        if trimmed.starts_with('※') {
+            in_recap = true;
+        }
+        in_recap
+    })
+}
+
+/// The context hint row. Recognised by its START — `new task?` and a
+/// `/clear` — not by the full `/clear to save` text: on a narrow pane the row
+/// is cut short with `…` (12 of the 40 census panes), so the full phrase is
+/// not there to match.
+fn is_context_hint_row(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("new task?") && lower.contains("/clear")
+}
+
+/// The input box's border row, titled or not: it starts with a box-drawing
+/// corner or rule.
+fn is_box_edge_row(trimmed: &str) -> bool {
+    trimmed.starts_with(['─', '━', '╭', '╰'])
 }
 
 /// [`snapshot_idle_verdict`] as a `bool`, for the consumers that only need
@@ -524,6 +556,30 @@ mod tests {
             &edge(),
         ]);
         assert_eq!(snapshot_idle_verdict(&stray, 5), IdleVerdict::Glyph('✶'));
+
+        // The layout the census measured on real finished panes: a recap
+        // paragraph, the context hint and the box's titled top edge between
+        // the completed-turn line and the input row.
+        let measured = lines(&[
+            "● Pushed; CI is green.",
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "",
+            "※ recap: fixed the build and opened the PR; CI is green.",
+            "  (disable recaps in /config)",
+            "  new task? /clear to save 399.4k tokens · ✔ Update installed · Restart to apply",
+            "──────────────── my-session ─",
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(snapshot_idle_verdict(&measured, 7), IdleVerdict::Idle);
+        // A narrow pane cuts the hint short; it is still the hint.
+        let mut narrow = measured.clone();
+        narrow[5] = "new task? /clear to 399.…".to_string();
+        assert_eq!(snapshot_idle_verdict(&narrow, 7), IdleVerdict::Idle);
+        // ...but prose that is not a recap block, in the same place, is not.
+        let mut prose = measured.clone();
+        prose[3] = "● Next I will run the migration.".to_string();
+        assert_eq!(snapshot_idle_verdict(&prose, 7), IdleVerdict::Glyph('✻'));
 
         // An echoed earlier user prompt (`❯ …`) ABOVE the completed-turn line
         // is transcript, not the input; the input row below still counts.
