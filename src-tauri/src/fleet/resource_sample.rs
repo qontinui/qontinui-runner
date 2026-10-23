@@ -3158,9 +3158,9 @@ MemAvailable:   15335424 kB
         s.workloads = Some(vec![WorkloadEntry {
             class: workload_census::WorkloadClass::CargoBuild.as_str(),
             cpu_pct: None,
-            rss_bytes: 1,
+            rss_bytes: Some(1),
             gpu_mem_bytes: None,
-            proc_count: 1,
+            proc_count: Some(1),
             root_count: None,
         }]);
         let v = serde_json::to_value(&s).expect("serializes");

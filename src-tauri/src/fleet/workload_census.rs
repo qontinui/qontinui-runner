@@ -85,7 +85,9 @@
 //!
 //! `rss_bytes` sums resident set sizes, so pages shared between processes of a
 //! class (or across classes) are counted once per process. It is a pressure
-//! indicator, not an exact partition of physical memory.
+//! indicator, not an exact partition of physical memory. It is `null` only
+//! where the class could not be measured at all — today the `claude_session`
+//! placeholder below — and `proc_count` is `null` on the same terms.
 //!
 //! ## What a count means
 //!
@@ -215,11 +217,14 @@ pub(crate) struct WorkloadEntry {
     /// Share of the lane's total CPU capacity, 0–100. `null` on a tick with no
     /// previous observation to diff against.
     pub(crate) cpu_pct: Option<f64>,
-    pub(crate) rss_bytes: u64,
+    /// Resident set sizes summed over the class. `null` = not measured: the
+    /// census could not tell which processes belong to the class.
+    pub(crate) rss_bytes: Option<u64>,
     /// Per-process VRAM summed over the class. `null` = not measured.
     pub(crate) gpu_mem_bytes: Option<u64>,
-    /// User-space processes in the class (kernel threads excluded).
-    pub(crate) proc_count: u32,
+    /// User-space processes in the class (kernel threads excluded). `null` =
+    /// not measured, on the same terms as `rss_bytes`.
+    pub(crate) proc_count: Option<u32>,
     /// The class's roots — one per Claude Code process with no Claude Code
     /// ancestor (`claude_session`), one per `Runner.Worker` (`gh_actions_job`)
     /// — so the class reconciles against the session and CI-job ledgers.
@@ -547,9 +552,9 @@ pub(crate) fn census(
             Some(WorkloadEntry {
                 class: class.as_str(),
                 cpu_pct: cpu_known.then(|| (a.cpu.clamp(0.0, 100.0) * 100.0).round() / 100.0),
-                rss_bytes: a.rss,
+                rss_bytes: Some(a.rss),
                 gpu_mem_bytes: vram_by_pid.map(|_| a.vram),
-                proc_count: a.procs,
+                proc_count: Some(a.procs),
                 root_count: class.has_roots().then_some(a.roots),
             })
         })
@@ -1204,7 +1209,7 @@ impl HostCensus {
 /// Claude Code sessions: the npm install runs as `node` there, and only its
 /// argv — never read — says what it is. So instead of an absent class, which reads
 /// as "measured, no session", it publishes a `claude_session` entry whose
-/// `root_count` and `cpu_pct` are `null`. With a native root seen, the class
+/// `root_count`, `cpu_pct`, `proc_count` and `rss_bytes` are all `null`. With a native root seen, the class
 /// is measured as everywhere else. PURE.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn claude_sessions_unknown_without_native_root(entries: &mut Vec<WorkloadEntry>) {
@@ -1215,9 +1220,9 @@ fn claude_sessions_unknown_without_native_root(entries: &mut Vec<WorkloadEntry>)
     let unknown = WorkloadEntry {
         class,
         cpu_pct: None,
-        rss_bytes: 0,
+        rss_bytes: None,
         gpu_mem_bytes: None,
-        proc_count: 0,
+        proc_count: None,
         root_count: None,
     };
     match entries.iter_mut().find(|e| e.class == class) {
@@ -1688,12 +1693,12 @@ mod tests {
         let out = census(&table, true, None, &no_units());
         let get = |c: &str| out.iter().find(|e| e.class == c).cloned();
         let job = get("gh_actions_job").expect("job class");
-        assert_eq!(job.proc_count, 6, "busy unit's 4 + the busy Windows pair");
+        assert_eq!(job.proc_count, Some(6), "busy unit's 4 + the busy Windows pair");
         assert_eq!(job.root_count, Some(2), "one per Runner.Worker");
         let idle = get("gh_actions_runner_idle").expect("idle class");
-        assert_eq!(idle.proc_count, 3);
+        assert_eq!(idle.proc_count, Some(3));
         assert_eq!(idle.root_count, None, "an idle runner has no root to count");
-        assert_eq!(get("other").expect("systemd").proc_count, 1);
+        assert_eq!(get("other").expect("systemd").proc_count, Some(1));
     }
 
     /// `root_count` reconciles against the session ledger: one per Claude
@@ -1713,7 +1718,7 @@ mod tests {
         ];
         let out = census(&table, true, None, &no_units());
         let claude = out.iter().find(|e| e.class == "claude_session").expect("claude");
-        assert_eq!(claude.proc_count, 5);
+        assert_eq!(claude.proc_count, Some(5));
         assert_eq!(claude.root_count, Some(2));
         let runner = out.iter().find(|e| e.class == "qontinui_runner").expect("runner");
         assert_eq!(runner.root_count, None);
@@ -1728,7 +1733,7 @@ mod tests {
         let table = vec![kthreadd, kworker, rec(10, 1, "python3", None, 1.0, 5)];
         let out = census(&table, true, None, &no_units());
         let other = out.iter().find(|e| e.class == "other").expect("other");
-        assert_eq!(other.proc_count, 1, "kernel threads are no workload process");
+        assert_eq!(other.proc_count, Some(1), "kernel threads are no workload process");
         assert_eq!(other.cpu_pct, Some(5.0), "but their CPU time is still load");
     }
 
@@ -1776,7 +1781,7 @@ mod tests {
         assert_eq!(class_cpu(&out, "gh_actions_job"), Some(0.3));
         assert_eq!(class_cpu(&out, "gh_actions_runner_idle"), Some(0.1));
         let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
-        assert_eq!(job.proc_count, 0, "no job process is alive at the reading");
+        assert_eq!(job.proc_count, Some(0), "no job process is alive at the reading");
 
         // No worker seen at either end, but more than a listener spends: a
         // job started and finished inside the interval.
@@ -1885,8 +1890,17 @@ mod tests {
         assert_eq!(claude.class, "claude_session", "kept in vocabulary order: {out:?}");
         assert_eq!(claude.root_count, None, "never 0 while a session may be running");
         assert_eq!(claude.cpu_pct, None);
-        assert_eq!(claude.proc_count, 0);
+        assert_eq!(claude.proc_count, None, "unmeasured, never 0");
+        assert_eq!(claude.rss_bytes, None, "unmeasured, never 0");
         assert_eq!(out.iter().filter(|e| e.class == "claude_session").count(), 1);
+        let v = serde_json::to_value(&out).expect("serializes");
+        for field in ["cpu_pct", "root_count", "proc_count", "rss_bytes"] {
+            assert!(v[0][field].is_null(), "{field} is UNKNOWN: null on the wire, never 0");
+        }
+        // The measured `other` beside it still sends integers.
+        let other = v.as_array().expect("array").iter().find(|e| e["class"] == "other").expect("other");
+        assert_eq!(other["proc_count"], serde_json::json!(2));
+        assert_eq!(other["rss_bytes"], serde_json::json!(110));
 
         // A native root is measured as everywhere else.
         let native = vec![rec(20, 1, "claude.exe", None, 2.0, 50), rec(21, 20, "git.exe", None, 1.0, 5)];
@@ -1907,9 +1921,9 @@ mod tests {
         ];
         let out = census(&table, true, None, &no_units());
         let other = out.iter().find(|e| e.class == "other").expect("other");
-        assert_eq!(other.proc_count, 2);
+        assert_eq!(other.proc_count, Some(2));
         assert_eq!(other.cpu_pct, Some(42.0));
-        assert_eq!(other.rss_bytes, 5100);
+        assert_eq!(other.rss_bytes, Some(5100));
         let claude = out.iter().find(|e| e.class == "claude_session").expect("claude");
         assert_eq!(claude.cpu_pct, Some(10.0));
         // Empty classes are not listed at all.
@@ -1940,6 +1954,10 @@ mod tests {
         assert_eq!(v[0]["cpu_pct"], 12.35);
         assert!(v[0]["gpu_mem_bytes"].is_null(), "no VRAM measurement is UNKNOWN");
         assert!(v[0]["root_count"].is_null(), "a build has no root to count");
+        assert!(v[0]["proc_count"].is_u64(), "a measured count is a JSON integer");
+        assert_eq!(v[0]["proc_count"], 1);
+        assert!(v[0]["rss_bytes"].is_u64(), "measured memory is a JSON integer");
+        assert_eq!(v[0]["rss_bytes"], 7);
     }
 
     #[test]
@@ -1968,7 +1986,7 @@ mod tests {
         let out = census(&table, true, None, &no_units());
         assert!(out.len() <= MAX_WORKLOAD_ENTRIES);
         assert_eq!(out.len(), WorkloadClass::ALL.len());
-        let total: u32 = out.iter().map(|e| e.proc_count).sum();
+        let total: u32 = out.iter().map(|e| e.proc_count.expect("measured")).sum();
         assert_eq!(total, 2000, "every process lands in exactly one class");
     }
 
@@ -2123,9 +2141,9 @@ mod tests {
             .expect("second tick");
         let job = second.iter().find(|e| e.class == "gh_actions_job").expect("job");
         assert_eq!(job.cpu_pct, Some(60.0), "the unit's figure, exited child included");
-        assert_eq!(job.proc_count, 3, "listener, worker and the rustc under it");
+        assert_eq!(job.proc_count, Some(3), "listener, worker and the rustc under it");
         assert_eq!(job.root_count, Some(1));
-        assert_eq!(job.rss_bytes, 3 * 10 * 4096);
+        assert_eq!(job.rss_bytes, Some(3 * 10 * 4096));
         let other = second.iter().find(|e| e.class == "other").expect("init");
         assert_eq!(other.cpu_pct, Some(0.0));
     }
@@ -2391,7 +2409,7 @@ mod tests {
         assert!(second.len() <= MAX_WORKLOAD_ENTRIES);
         let total: f64 = second.iter().filter_map(|e| e.cpu_pct).sum();
         assert!(total <= 100.0 + 0.1 * second.len() as f64, "{total}");
-        let procs: u32 = second.iter().map(|e| e.proc_count).sum();
+        let procs: u32 = second.iter().map(|e| e.proc_count.expect("measured")).sum();
         println!("host census: {procs} processes, first tick {d1:?}, second tick {d2:?}; {second:?}");
     }
 }
