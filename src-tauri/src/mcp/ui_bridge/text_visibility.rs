@@ -694,7 +694,7 @@ mod tests {
             std::future::ready(Ok(json!({"success": true, "hidden": true})))
         };
         let bump = move || l2.lock().unwrap().push(("<bump>", Value::Null));
-        direct_set(json!({"hidden": true}), send, bump, |_| {})
+        let _forwarded = direct_set(json!({"hidden": true}), send, bump, |_| {})
             .await
             .expect("forwarded");
         let kinds: Vec<&str> = log.lock().unwrap().iter().map(|(k, _)| *k).collect();
