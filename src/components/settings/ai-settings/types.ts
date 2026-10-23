@@ -1,6 +1,7 @@
 import type {
   AiSettings,
   AiProvider,
+  AccountSelectionMode,
   CliExecutionMode,
   GeminiAuthMethod,
   AiConnectionTestResult,
@@ -149,6 +150,30 @@ export const PROVIDER_OPTIONS: {
     label: "Gemini API",
     description: "Direct Gemini API access with per-token billing",
   },
+];
+
+export const SELECTION_MODE_OPTIONS: {
+  mode: AccountSelectionMode;
+  label: string;
+  hint: string;
+}[] = [
+  { mode: "manual", label: "Manual", hint: "Select account above" },
+  {
+    mode: "alternating_handoff",
+    label: "Alternating Handoff",
+    hint: "Handoffs alternate between the top under-pace account and each of the others",
+  },
+  {
+    mode: "weighted_random",
+    label: "Weighted Random",
+    hint: "Random under-pace account, weighted by expected usage times how far behind it is",
+  },
+  {
+    mode: "highest_expected_usage",
+    label: "Highest Expected Usage",
+    hint: "Auto-select the under-pace account closest to its reset",
+  },
+  { mode: "least_usage", label: "Least Usage", hint: "Auto-select & failover on rate-limit" },
 ];
 
 export const EXECUTION_MODE_OPTIONS: {
