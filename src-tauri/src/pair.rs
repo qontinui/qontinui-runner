@@ -317,11 +317,12 @@ pub fn ensure_device_initialized_at(path: &std::path::Path) {
 /// Path to the paired-user JSON written by `device pair` and read by
 /// `device init` to attach a `user_id` to the register payload. Lives
 /// alongside `auth_tokens.enc`: under `QONTINUI_SECURE_STORAGE_DIR` when
-/// that env var is set and non-empty, else the Tauri app's local data
-/// directory (`data_local_dir()/com.qontinui.runner/`) — so the CLI bin
-/// and the GUI runner read the same file.
+/// that env var is set and non-empty, else `<root>/secure` under an instance
+/// root, else the Tauri app's local data directory
+/// (`data_local_dir()/com.qontinui.runner/`) — so the CLI bin and the GUI
+/// runner read the same file (`instance_env::secure_storage_dir`).
 pub(crate) fn paired_user_path() -> Option<PathBuf> {
-    paired_user_path_with(std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok())
+    crate::instance_env::secure_storage_dir().map(|d| d.join("paired_user.json"))
 }
 
 /// Env-free core of [`paired_user_path`] so unit tests can pin the
@@ -330,11 +331,15 @@ pub(crate) fn paired_user_path() -> Option<PathBuf> {
 /// `QONTINUI_SECURE_STORAGE_DIR` value; `None` (unset) and `Some("")`
 /// (set-but-empty) both fall back to
 /// `data_local_dir()/com.qontinui.runner/`.
+///
+/// The no-instance-root rule only: it is the bare-default candidate of
+/// [`binding_store_candidate_paths_with`], which a subject never consults
+/// (`pair/subject_isolation.rs`). [`paired_user_path`] itself goes through the
+/// root-aware [`crate::instance_env::secure_storage_dir`].
 fn paired_user_path_with(override_dir: Option<String>) -> Option<PathBuf> {
-    let base = override_dir
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let base = crate::instance_env::secure_storage_dir_from(override_dir, None, || {
+        crate::instance_env::PlatformDir::DataLocal.machine_dir()
+    })?;
     Some(base.join("paired_user.json"))
 }
 
