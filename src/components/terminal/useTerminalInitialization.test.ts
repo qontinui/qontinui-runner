@@ -629,7 +629,27 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
 // renderer `commands::config::render_ai_resume_command`; these pin the
 // frontend half — what is asked for, and that nothing is typed on a refusal.
 describe("buildResumeCmd (backend-rendered resume)", () => {
-  beforeEach(() => mockInvoke.mockReset());
+  // `isWindows` comes from `navigator.platform`, and Node has a real global
+  // `navigator` that reports the HOST — so without a pin these expectations
+  // passed on Linux CI and failed on every Windows dev box.
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("tells the backend the host is Windows when the platform says so", async () => {
+    vi.stubGlobal("navigator", { platform: "Win32" });
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "W" } });
+    await buildResumeCmd("sess-1", undefined, "summary");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: true,
+      fullResume: false,
+    });
+  });
 
   it("asks the backend with the recorded dir and the full-resume policy, then appends Enter", async () => {
     mockInvoke.mockResolvedValueOnce({
