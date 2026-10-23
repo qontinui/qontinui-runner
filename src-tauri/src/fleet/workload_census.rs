@@ -222,7 +222,10 @@ impl WorkloadClass {
 
     /// Whether the class has roots to count ([`WorkloadEntry::root_count`]).
     fn has_roots(self) -> bool {
-        matches!(self, WorkloadClass::ClaudeSession | WorkloadClass::GhActionsJob)
+        matches!(
+            self,
+            WorkloadClass::ClaudeSession | WorkloadClass::GhActionsJob
+        )
     }
 }
 
@@ -477,7 +480,8 @@ impl ClassTotal {
     /// The class's share, rounded to hundredths — `None` on a tick with no CPU
     /// delta, or when any member's CPU was unreadable.
     fn cpu_pct(&self, cpu_known: bool) -> Option<f64> {
-        (cpu_known && !self.cpu_unknown).then(|| (self.cpu.clamp(0.0, 100.0) * 100.0).round() / 100.0)
+        (cpu_known && !self.cpu_unknown)
+            .then(|| (self.cpu.clamp(0.0, 100.0) * 100.0).round() / 100.0)
     }
 
     /// The class's resident total — `None` when any member's was unreadable.
@@ -635,9 +639,7 @@ pub(crate) fn unit_placement(text: &str) -> Option<(String, Option<String>)> {
         .iter()
         .rposition(|seg| seg.ends_with(".service") || seg.ends_with(".scope"))?;
     let unit = segs.get(idx)?.to_string();
-    let unit_path = v2
-        .then(|| segs.get(..=idx).map(|s| s.join("/")))
-        .flatten();
+    let unit_path = v2.then(|| segs.get(..=idx).map(|s| s.join("/"))).flatten();
     Some((unit, unit_path))
 }
 
@@ -762,7 +764,12 @@ const BOOT_TIME_TOLERANCE_SECS: u64 = 5;
 /// appeared, vanished or moved by more than [`BOOT_TIME_TOLERANCE_SECS`], or a
 /// jiffy total that went backwards (a reboot soon after the previous boot
 /// moves `btime` little, but always restarts the total). PURE.
-fn counters_restarted(prev_boot: Option<u64>, prev_total: u64, boot: Option<u64>, total: u64) -> bool {
+fn counters_restarted(
+    prev_boot: Option<u64>,
+    prev_total: u64,
+    boot: Option<u64>,
+    total: u64,
+) -> bool {
     let boot_moved = match (prev_boot, boot) {
         (Some(a), Some(b)) => a.abs_diff(b) > BOOT_TIME_TOLERANCE_SECS,
         (None, None) => false,
@@ -875,13 +882,21 @@ impl CpuTimeCensus {
         // concerned: pids, start times, cgroup usage and the jiffy total all
         // restarted, and a restarted total can exceed the old one.
         if self.prev.as_ref().is_some_and(|prev| {
-            counters_restarted(prev.boot_time, prev.total_jiffies, tick.boot_time, tick.total_jiffies)
+            counters_restarted(
+                prev.boot_time,
+                prev.total_jiffies,
+                tick.boot_time,
+                tick.total_jiffies,
+            )
         }) {
             self.prev = None;
         }
         // The interval in jiffies of the whole lane, and the reading it starts at.
         let interval = self.prev.as_ref().and_then(|prev| {
-            let span = tick.total_jiffies.checked_sub(prev.total_jiffies).filter(|s| *s > 0)?;
+            let span = tick
+                .total_jiffies
+                .checked_sub(prev.total_jiffies)
+                .filter(|s| *s > 0)?;
             Some((span as f64, prev))
         });
         let cpu_known = interval.is_some();
@@ -895,7 +910,9 @@ impl CpuTimeCensus {
                 unit: tick.units.get(&s.pid).cloned(),
                 // Without an interval the census ignores CPU altogether.
                 cpu_pct: match interval {
-                    Some((span, prev)) => interval_cpu_ticks(prev, s).map(|t| t as f64 / span * 100.0),
+                    Some((span, prev)) => {
+                        interval_cpu_ticks(prev, s).map(|t| t as f64 / span * 100.0)
+                    }
                     None => Some(0.0),
                 },
                 rss_bytes: s.rss_pages.map(|p| p.saturating_mul(tick.page_size)),
@@ -939,7 +956,12 @@ impl CpuTimeCensus {
                 .filter(|s| s.start_time.is_none())
                 .map(|s| s.pid)
                 .collect(),
-            zombies: tick.stats.iter().filter(|s| s.zombie).map(|s| (s.pid, s.start_time)).collect(),
+            zombies: tick
+                .stats
+                .iter()
+                .filter(|s| s.zombie)
+                .map(|s| (s.pid, s.start_time))
+                .collect(),
             unit_usage_usec: tick.unit_usage_usec,
             busy_units,
         });
@@ -1046,7 +1068,10 @@ impl HostCensus {
     /// Read the process table and aggregate it. `vram_by_pid` is the seam for
     /// a per-process VRAM measurement; `None` publishes `gpu_mem_bytes: null`.
     /// `None` when procfs could not be read.
-    pub(crate) fn take(&mut self, vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+    pub(crate) fn take(
+        &mut self,
+        vram_by_pid: Option<&HashMap<u32, u64>>,
+    ) -> Option<Vec<WorkloadEntry>> {
         let started = std::time::Instant::now();
         let tick = self.read_tick()?;
         let procs = tick.stats.len();
@@ -1106,7 +1131,8 @@ impl HostCensus {
                 ["/sys/fs/cgroup", "/sys/fs/cgroup/unified"]
                     .iter()
                     .find_map(|root| {
-                        let body = std::fs::read_to_string(format!("{root}{path}/cpu.stat")).ok()?;
+                        let body =
+                            std::fs::read_to_string(format!("{root}{path}/cpu.stat")).ok()?;
                         parse_usage_usec(&body)
                     })
                     .map(|usage| (unit, usage))
@@ -1165,7 +1191,10 @@ impl HostCensus {
     /// Read the process table and aggregate it. `vram_by_pid` is the seam for
     /// a per-process VRAM measurement; `None` publishes `gpu_mem_bytes: null`.
     /// `None` when the table could not be read whole.
-    pub(crate) fn take(&mut self, vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+    pub(crate) fn take(
+        &mut self,
+        vram_by_pid: Option<&HashMap<u32, u64>>,
+    ) -> Option<Vec<WorkloadEntry>> {
         let started = std::time::Instant::now();
         let tick = self.read_tick()?;
         let procs = tick.stats.len();
@@ -1225,7 +1254,9 @@ fn macos_all_pids() -> Option<Vec<libc::pid_t>> {
     for _ in 0..3 {
         capacity = capacity.saturating_add(capacity / 4).saturating_add(64);
         let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-        let bytes = libc::c_int::try_from(capacity.checked_mul(std::mem::size_of::<libc::pid_t>())?).ok()?;
+        let bytes =
+            libc::c_int::try_from(capacity.checked_mul(std::mem::size_of::<libc::pid_t>())?)
+                .ok()?;
         // SAFETY: `pids` is writable for `bytes` bytes and outlives the call;
         // the return value is the number of pids written.
         let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
@@ -1280,7 +1311,8 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
     } else {
         // SAFETY: `proc_bsdshortinfo` is a plain C struct; all-zero is valid.
         let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-        let short_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdshortinfo>()).ok()?;
+        let short_size =
+            libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdshortinfo>()).ok()?;
         // SAFETY: as above, for `proc_bsdshortinfo`.
         let got = unsafe {
             libc::proc_pidinfo(
@@ -1295,7 +1327,13 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
             return None;
         }
         // `pbsi_comm` is the executable's name cut at 16 bytes, never argv.
-        (short.pbsi_pid, short.pbsi_ppid, c_chars_to_string(&short.pbsi_comm), None, short.pbsi_status)
+        (
+            short.pbsi_pid,
+            short.pbsi_ppid,
+            c_chars_to_string(&short.pbsi_comm),
+            None,
+            short.pbsi_status,
+        )
     };
 
     // SAFETY: as above, for `proc_taskinfo`.
@@ -1314,7 +1352,10 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
     let reading = (task_got == task_size).then(|| {
         let mach = u128::from(task.pti_total_user.saturating_add(task.pti_total_system));
         let ns = mach * u128::from(numer) / u128::from(denom);
-        (u64::try_from(ns / 1_000).unwrap_or(u64::MAX), task.pti_resident_size)
+        (
+            u64::try_from(ns / 1_000).unwrap_or(u64::MAX),
+            task.pti_resident_size,
+        )
     });
     let (cpu_ticks, rss_pages, zombie) = macos_task_reading(status, reading);
 
@@ -1373,7 +1414,10 @@ impl HostCensus {
     /// Refresh the table and aggregate it. `vram_by_pid` is the seam for a
     /// per-process VRAM measurement; `None` publishes `gpu_mem_bytes: null`.
     /// `None` when the CPU count is unknown.
-    pub(crate) fn take(&mut self, vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+    pub(crate) fn take(
+        &mut self,
+        vram_by_pid: Option<&HashMap<u32, u64>>,
+    ) -> Option<Vec<WorkloadEntry>> {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
         let cpu_count = self.cpu_count? as f64;
@@ -1397,7 +1441,8 @@ impl HostCensus {
                 ppid: p.parent().map(|pp| pp.as_u32()),
                 name: normalize_exe_name(&p.name().to_string_lossy()),
                 unit: None,
-                cpu_pct: windows_cpu_readable(p.pid().as_u32()).then(|| f64::from(p.cpu_usage()) / cpu_count),
+                cpu_pct: windows_cpu_readable(p.pid().as_u32())
+                    .then(|| f64::from(p.cpu_usage()) / cpu_count),
                 rss_bytes: Some(p.memory()),
                 kernel_thread: false,
             })
@@ -1449,7 +1494,10 @@ fn windows_cpu_readable(pid: u32) -> bool {
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn claude_sessions_unknown_without_native_root(entries: &mut Vec<WorkloadEntry>) {
     let class = WorkloadClass::ClaudeSession.as_str();
-    if entries.iter().any(|e| e.class == class && e.root_count.is_some_and(|n| n > 0)) {
+    if entries
+        .iter()
+        .any(|e| e.class == class && e.root_count.is_some_and(|n| n > 0))
+    {
         return;
     }
     let unknown = WorkloadEntry {
@@ -1482,7 +1530,10 @@ impl HostCensus {
         Self
     }
 
-    pub(crate) fn take(&mut self, _vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+    pub(crate) fn take(
+        &mut self,
+        _vram_by_pid: Option<&HashMap<u32, u64>>,
+    ) -> Option<Vec<WorkloadEntry>> {
         None
     }
 }
@@ -1615,7 +1666,8 @@ pub(crate) const GUEST_CENSUS_BUDGET: Duration =
 /// rather than a silent undercount. On a guest where this section does not
 /// run, its marker is missing and the lane publishes no census — UNKNOWN,
 /// never empty.
-const GUEST_CENSUS_SCRIPT: &str = concat!(
+const GUEST_CENSUS_SCRIPT: &str =
+    concat!(
     "echo ", guest_marker!(), "; ",
     "getconf PAGESIZE; getconf CLK_TCK; head -n 1 /proc/stat; grep btime /proc/stat; ",
     "timeout -s KILL ", guest_stat_secs!(), " cat /proc/[0-9]*/stat 2>/dev/null; ",
@@ -1674,7 +1726,10 @@ fn guest_step_complete(part: &str) -> bool {
 fn tail_blocks(text: &str) -> Vec<(&str, String)> {
     let mut blocks: Vec<(&str, String)> = Vec::new();
     for line in text.lines() {
-        if let Some(header) = line.strip_prefix("==> ").and_then(|r| r.strip_suffix(" <==")) {
+        if let Some(header) = line
+            .strip_prefix("==> ")
+            .and_then(|r| r.strip_suffix(" <=="))
+        {
             blocks.push((header, String::new()));
         } else if let Some((_, body)) = blocks.last_mut() {
             body.push_str(line);
@@ -1857,7 +1912,12 @@ mod tests {
     fn classifier_table() {
         use WorkloadClass::*;
         let cases: &[(&str, &[&str], Option<&str>, WorkloadClass)] = &[
-            ("claude", &["qontinui-runner", "systemd"], None, ClaudeSession),
+            (
+                "claude",
+                &["qontinui-runner", "systemd"],
+                None,
+                ClaudeSession,
+            ),
             ("bash", &["claude", "qontinui-runner"], None, ClaudeSession),
             ("cargo", &["bash", "claude"], None, CargoBuild),
             ("rustc", &["cargo", "bash"], None, CargoBuild),
@@ -1867,7 +1927,12 @@ mod tests {
             ("qontinui-runner", &["systemd"], None, QontinuiRunner),
             ("bash", &["qontinui-runner"], None, QontinuiRunner),
             ("qontinui-superv", &["systemd"], None, Supervisor),
-            ("qontinui-runner", &["qontinui-superv"], None, QontinuiRunner),
+            (
+                "qontinui-runner",
+                &["qontinui-superv"],
+                None,
+                QontinuiRunner,
+            ),
             ("dockerd", &["systemd"], None, Docker),
             ("containerd-shim", &["systemd"], None, Docker),
             ("com.docker.backend", &["explorer"], None, Docker),
@@ -1884,10 +1949,20 @@ mod tests {
             ("sshd", &["systemd"], Some("ssh.service"), Other),
             // Unit fallback: a daemon re-parented to init inside its service.
             ("sh", &["systemd"], Some("docker.service"), Docker),
-            ("sh", &["systemd"], Some("qontinui-runner.service"), QontinuiRunner),
+            (
+                "sh",
+                &["systemd"],
+                Some("qontinui-runner.service"),
+                QontinuiRunner,
+            ),
             // The chain wins over the unit: Claude sessions live in the
             // runner's service cgroup.
-            ("bash", &["claude", "qontinui-runner"], Some("qontinui-runner.service"), ClaudeSession),
+            (
+                "bash",
+                &["claude", "qontinui-runner"],
+                Some("qontinui-runner.service"),
+                ClaudeSession,
+            ),
         ];
         for (exe, chain, unit, want) in cases {
             assert_eq!(
@@ -1903,16 +1978,32 @@ mod tests {
         use WorkloadClass::*;
         let unit = Some("actions.runner.qontinui-qontinui-coord.merytshost-1.service");
         // A worker anywhere in the lineage is a job.
-        assert_eq!(classify(&view("runner.worker", &["runner.listener"], unit)), GhActionsJob);
         assert_eq!(
-            classify(&view("cargo", &["bash", "runner.worker", "runner.listener"], None)),
+            classify(&view("runner.worker", &["runner.listener"], unit)),
+            GhActionsJob
+        );
+        assert_eq!(
+            classify(&view(
+                "cargo",
+                &["bash", "runner.worker", "runner.listener"],
+                None
+            )),
             GhActionsJob,
             "a build a job runs is CI load, not a local build"
         );
         // Listener alone: idle, by unit or by name.
-        assert_eq!(classify(&view("runner.listener", &["runsvc.sh"], unit)), GhActionsRunnerIdle);
-        assert_eq!(classify(&view("runsvc.sh", &["systemd"], unit)), GhActionsRunnerIdle);
-        assert_eq!(classify(&view("runner.listener", &["explorer"], None)), GhActionsRunnerIdle);
+        assert_eq!(
+            classify(&view("runner.listener", &["runsvc.sh"], unit)),
+            GhActionsRunnerIdle
+        );
+        assert_eq!(
+            classify(&view("runsvc.sh", &["systemd"], unit)),
+            GhActionsRunnerIdle
+        );
+        assert_eq!(
+            classify(&view("runner.listener", &["explorer"], None)),
+            GhActionsRunnerIdle
+        );
         // Same runner with a worker present: the whole unit is busy.
         let mut busy = view("runner.listener", &["runsvc.sh"], unit);
         busy.ci_worker_present = true;
@@ -1929,7 +2020,11 @@ mod tests {
     fn containers_a_job_runs_are_the_jobs() {
         use WorkloadClass::*;
         assert_eq!(
-            classify(&view("postgres", &["containerd-shim", "podman", "bash", "runner.worker"], None)),
+            classify(&view(
+                "postgres",
+                &["containerd-shim", "podman", "bash", "runner.worker"],
+                None
+            )),
             GhActionsJob
         );
         let unit = Some("actions.runner.o-r.host-1.service");
@@ -1937,7 +2032,11 @@ mod tests {
         in_unit.ci_worker_present = true;
         assert_eq!(classify(&in_unit), GhActionsJob);
         assert_eq!(
-            classify(&view("postgres", &["containerd-shim", "systemd"], Some("docker-abc.scope"))),
+            classify(&view(
+                "postgres",
+                &["containerd-shim", "systemd"],
+                Some("docker-abc.scope")
+            )),
             Docker,
             "a system dockerd container has nothing argv-free tying it to the job"
         );
@@ -1963,7 +2062,11 @@ mod tests {
         let out = census(&table, true, None, &no_units());
         let get = |c: &str| out.iter().find(|e| e.class == c).cloned();
         let job = get("gh_actions_job").expect("job class");
-        assert_eq!(job.proc_count, Some(6), "busy unit's 4 + the busy Windows pair");
+        assert_eq!(
+            job.proc_count,
+            Some(6),
+            "busy unit's 4 + the busy Windows pair"
+        );
         assert_eq!(job.root_count, Some(2), "one per Runner.Worker");
         let idle = get("gh_actions_runner_idle").expect("idle class");
         assert_eq!(idle.proc_count, Some(3));
@@ -1987,10 +2090,16 @@ mod tests {
             rec(7, 2, "claude", None, 1.0, 1),
         ];
         let out = census(&table, true, None, &no_units());
-        let claude = out.iter().find(|e| e.class == "claude_session").expect("claude");
+        let claude = out
+            .iter()
+            .find(|e| e.class == "claude_session")
+            .expect("claude");
         assert_eq!(claude.proc_count, Some(5));
         assert_eq!(claude.root_count, Some(2));
-        let runner = out.iter().find(|e| e.class == "qontinui_runner").expect("runner");
+        let runner = out
+            .iter()
+            .find(|e| e.class == "qontinui_runner")
+            .expect("runner");
         assert_eq!(runner.root_count, None);
     }
 
@@ -2003,7 +2112,11 @@ mod tests {
         let table = vec![kthreadd, kworker, rec(10, 1, "python3", None, 1.0, 5)];
         let out = census(&table, true, None, &no_units());
         let other = out.iter().find(|e| e.class == "other").expect("other");
-        assert_eq!(other.proc_count, Some(1), "kernel threads are no workload process");
+        assert_eq!(
+            other.proc_count,
+            Some(1),
+            "kernel threads are no workload process"
+        );
         assert_eq!(other.cpu_pct, Some(5.0), "but their CPU time is still load");
     }
 
@@ -2017,11 +2130,19 @@ mod tests {
             rec(12, 11, "Runner.Worker", Some(unit), 9.0, 1),
         ];
         let out = census(&table, true, None, &unit_share(unit, 60.0));
-        let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
+        let job = out
+            .iter()
+            .find(|e| e.class == "gh_actions_job")
+            .expect("job");
         assert_eq!(job.cpu_pct, Some(60.0));
         // Never below what the processes themselves measured.
         let out = census(&table, true, None, &unit_share(unit, 4.0));
-        assert_eq!(out.iter().find(|e| e.class == "gh_actions_job").and_then(|e| e.cpu_pct), Some(10.0));
+        assert_eq!(
+            out.iter()
+                .find(|e| e.class == "gh_actions_job")
+                .and_then(|e| e.cpu_pct),
+            Some(10.0)
+        );
         // A unit whose processes span classes cannot place its surplus.
         let mixed_unit = "qontinui-runner.service";
         let mixed = vec![
@@ -2050,8 +2171,15 @@ mod tests {
         let out = census(&idle, true, None, &after_job);
         assert_eq!(class_cpu(&out, "gh_actions_job"), Some(0.3));
         assert_eq!(class_cpu(&out, "gh_actions_runner_idle"), Some(0.1));
-        let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
-        assert_eq!(job.proc_count, Some(0), "no job process is alive at the reading");
+        let job = out
+            .iter()
+            .find(|e| e.class == "gh_actions_job")
+            .expect("job");
+        assert_eq!(
+            job.proc_count,
+            Some(0),
+            "no job process is alive at the reading"
+        );
 
         // No worker seen at either end, but more than a listener spends: a
         // job started and finished inside the interval.
@@ -2080,14 +2208,22 @@ mod tests {
         let mut g = GuestCensus::default();
         g.take(&guest_section(
             [0, 0, 0, 1000, 0, 0, 0, 0],
-            &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2), (3, 2, "Runner.Worker", 0, 3)],
+            &[
+                (1, 0, "init", 0, 1),
+                (2, 1, "Runner.Listener", 10, 2),
+                (3, 2, "Runner.Worker", 0, 3),
+            ],
             &cg(&[2, 3]),
             &usage(1_000_000),
         ))
         .expect("first tick");
         g.take(&guest_section(
             [100, 0, 0, 1900, 0, 0, 0, 0],
-            &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2), (3, 2, "Runner.Worker", 100, 3)],
+            &[
+                (1, 0, "init", 0, 1),
+                (2, 1, "Runner.Listener", 10, 2),
+                (3, 2, "Runner.Worker", 100, 3),
+            ],
             &cg(&[2, 3]),
             &usage(2_000_000),
         ))
@@ -2102,9 +2238,15 @@ mod tests {
                 &usage(2_030_000),
             ))
             .expect("third tick");
-        let job = third.iter().find(|e| e.class == "gh_actions_job").expect("job tail");
+        let job = third
+            .iter()
+            .find(|e| e.class == "gh_actions_job")
+            .expect("job tail");
         assert_eq!(job.cpu_pct, Some(0.3));
-        let idle = third.iter().find(|e| e.class == "gh_actions_runner_idle").expect("idle");
+        let idle = third
+            .iter()
+            .find(|e| e.class == "gh_actions_runner_idle")
+            .expect("idle");
         assert_eq!(idle.cpu_pct, Some(0.0));
     }
 
@@ -2112,7 +2254,8 @@ mod tests {
     /// exceed the old one — so a changed `btime` drops every baseline.
     #[test]
     fn a_rebooted_guest_starts_over_with_unknown_cpu() {
-        let procs: &[(u32, u32, &str, u64, u64)] = &[(1, 0, "init", 0, 1), (50, 1, "rustc", 10, 100)];
+        let procs: &[(u32, u32, &str, u64, u64)] =
+            &[(1, 0, "init", 0, 1), (50, 1, "rustc", 10, 100)];
         let mut g = GuestCensus::default();
         g.take(&guest_section([0, 0, 0, 1000, 0, 0, 0, 0], procs, "", ""))
             .expect("first tick");
@@ -2137,7 +2280,10 @@ mod tests {
                 .replacen("btime 1700000000", "btime 1700009999", 1),
             )
             .expect("second tick of the new boot");
-        let build = next.iter().find(|e| e.class == "cargo_build").expect("build");
+        let build = next
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
         assert_eq!(build.cpu_pct, Some(10.0));
     }
 
@@ -2153,27 +2299,50 @@ mod tests {
     #[test]
     fn sessions_are_unknown_without_a_native_claude_root() {
         // An npm session: `node` with a shell under it. Nothing says Claude.
-        let npm = vec![rec(10, 1, "node.exe", None, 3.0, 100), rec(11, 10, "bash.exe", None, 1.0, 10)];
+        let npm = vec![
+            rec(10, 1, "node.exe", None, 3.0, 100),
+            rec(11, 10, "bash.exe", None, 1.0, 10),
+        ];
         let mut out = census(&npm, true, None, &no_units());
         claude_sessions_unknown_without_native_root(&mut out);
         let claude = &out[0];
-        assert_eq!(claude.class, "claude_session", "kept in vocabulary order: {out:?}");
-        assert_eq!(claude.root_count, None, "never 0 while a session may be running");
+        assert_eq!(
+            claude.class, "claude_session",
+            "kept in vocabulary order: {out:?}"
+        );
+        assert_eq!(
+            claude.root_count, None,
+            "never 0 while a session may be running"
+        );
         assert_eq!(claude.cpu_pct, None);
         assert_eq!(claude.proc_count, None, "unmeasured, never 0");
         assert_eq!(claude.rss_bytes, None, "unmeasured, never 0");
-        assert_eq!(out.iter().filter(|e| e.class == "claude_session").count(), 1);
+        assert_eq!(
+            out.iter().filter(|e| e.class == "claude_session").count(),
+            1
+        );
         let v = serde_json::to_value(&out).expect("serializes");
         for field in ["cpu_pct", "root_count", "proc_count", "rss_bytes"] {
-            assert!(v[0][field].is_null(), "{field} is UNKNOWN: null on the wire, never 0");
+            assert!(
+                v[0][field].is_null(),
+                "{field} is UNKNOWN: null on the wire, never 0"
+            );
         }
         // The measured `other` beside it still sends integers.
-        let other = v.as_array().expect("array").iter().find(|e| e["class"] == "other").expect("other");
+        let other = v
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|e| e["class"] == "other")
+            .expect("other");
         assert_eq!(other["proc_count"], serde_json::json!(2));
         assert_eq!(other["rss_bytes"], serde_json::json!(110));
 
         // A native root is measured as everywhere else.
-        let native = vec![rec(20, 1, "claude.exe", None, 2.0, 50), rec(21, 20, "git.exe", None, 1.0, 5)];
+        let native = vec![
+            rec(20, 1, "claude.exe", None, 2.0, 50),
+            rec(21, 20, "git.exe", None, 1.0, 5),
+        ];
         let mut out = census(&native, true, None, &no_units());
         let before = out.clone();
         claude_sessions_unknown_without_native_root(&mut out);
@@ -2194,7 +2363,10 @@ mod tests {
         assert_eq!(other.proc_count, Some(2));
         assert_eq!(other.cpu_pct, Some(42.0));
         assert_eq!(other.rss_bytes, Some(5100));
-        let claude = out.iter().find(|e| e.class == "claude_session").expect("claude");
+        let claude = out
+            .iter()
+            .find(|e| e.class == "claude_session")
+            .expect("claude");
         assert_eq!(claude.cpu_pct, Some(10.0));
         // Empty classes are not listed at all.
         assert_eq!(out.len(), 2);
@@ -2206,27 +2378,51 @@ mod tests {
         let out = census(&table, false, None, &no_units());
         assert_eq!(out[0].cpu_pct, None);
         let v = serde_json::to_value(&out).expect("serializes");
-        assert!(v[0]["cpu_pct"].is_null(), "UNKNOWN is null on the wire, never 0");
+        assert!(
+            v[0]["cpu_pct"].is_null(),
+            "UNKNOWN is null on the wire, never 0"
+        );
     }
 
     #[test]
     fn the_wire_shape_is_coords() {
-        let out = census(&[rec(1, 0, "cargo", None, 12.346, 7)], true, None, &no_units());
+        let out = census(
+            &[rec(1, 0, "cargo", None, 12.346, 7)],
+            true,
+            None,
+            &no_units(),
+        );
         let v = serde_json::to_value(&out).expect("serializes");
         let obj = v[0].as_object().expect("object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["class", "cpu_pct", "gpu_mem_bytes", "proc_count", "root_count", "rss_bytes"]
+            [
+                "class",
+                "cpu_pct",
+                "gpu_mem_bytes",
+                "proc_count",
+                "root_count",
+                "rss_bytes"
+            ]
         );
         assert_eq!(v[0]["class"], "cargo_build");
         assert_eq!(v[0]["cpu_pct"], 12.35);
-        assert!(v[0]["gpu_mem_bytes"].is_null(), "no VRAM measurement is UNKNOWN");
+        assert!(
+            v[0]["gpu_mem_bytes"].is_null(),
+            "no VRAM measurement is UNKNOWN"
+        );
         assert!(v[0]["root_count"].is_null(), "a build has no root to count");
-        assert!(v[0]["proc_count"].is_u64(), "a measured count is a JSON integer");
+        assert!(
+            v[0]["proc_count"].is_u64(),
+            "a measured count is a JSON integer"
+        );
         assert_eq!(v[0]["proc_count"], 1);
-        assert!(v[0]["rss_bytes"].is_u64(), "measured memory is a JSON integer");
+        assert!(
+            v[0]["rss_bytes"].is_u64(),
+            "measured memory is a JSON integer"
+        );
         assert_eq!(v[0]["rss_bytes"], 7);
     }
 
@@ -2238,7 +2434,11 @@ mod tests {
         ];
         let vram = HashMap::from([(1, 8_000_000_000u64)]);
         let out = census(&table, true, Some(&vram), &no_units());
-        let by = |c: &str| out.iter().find(|e| e.class == c).and_then(|e| e.gpu_mem_bytes);
+        let by = |c: &str| {
+            out.iter()
+                .find(|e| e.class == c)
+                .and_then(|e| e.gpu_mem_bytes)
+        };
         assert_eq!(by("gpu_inference"), Some(8_000_000_000));
         assert_eq!(by("claude_session"), Some(0), "measured, and none");
     }
@@ -2246,9 +2446,26 @@ mod tests {
     #[test]
     fn the_census_never_exceeds_sixteen_entries() {
         let names = [
-            "claude", "Runner.Worker", "Runner.Listener", "cargo", "qontinui-runner",
-            "qontinui-supervisor", "dockerd", "vmmem", "llama-server", "chrome",
-            "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+            "claude",
+            "Runner.Worker",
+            "Runner.Listener",
+            "cargo",
+            "qontinui-runner",
+            "qontinui-supervisor",
+            "dockerd",
+            "vmmem",
+            "llama-server",
+            "chrome",
+            "x1",
+            "x2",
+            "x3",
+            "x4",
+            "x5",
+            "x6",
+            "x7",
+            "x8",
+            "x9",
+            "x10",
         ];
         let table: Vec<ProcRecord> = (0..2000u32)
             .map(|i| rec(i + 1, 0, names[i as usize % names.len()], None, 0.01, 1))
@@ -2271,13 +2488,27 @@ mod tests {
         let table = vec![
             rec(1, 0, &argv, None, 5.0, 10),
             rec(2, 1, "claude", Some("qontinui-runner.service"), 5.0, 10),
-            rec(3, 2, "bash", Some(format!("{TOKEN}.scope").as_str()), 5.0, 10),
+            rec(
+                3,
+                2,
+                "bash",
+                Some(format!("{TOKEN}.scope").as_str()),
+                5.0,
+                10,
+            ),
         ];
         let out = census(&table, true, None, &no_units());
-        assert_eq!(out.len(), 2, "the argv-named process is `other`, nothing more");
+        assert_eq!(
+            out.len(),
+            2,
+            "the argv-named process is `other`, nothing more"
+        );
         let json = serde_json::to_string(&out).expect("serializes");
         assert!(!json.contains(TOKEN), "{json}");
-        assert!(!json.contains("curl"), "process names never leave the host either");
+        assert!(
+            !json.contains("curl"),
+            "process names never leave the host either"
+        );
         assert!(!json.contains("Bearer"), "{json}");
 
         // Guest path: a stat line whose comm is token-shaped.
@@ -2333,14 +2564,19 @@ mod tests {
             unit_placement("1:name=systemd:/system.slice/docker.service\n"),
             Some(("docker.service".to_string(), None))
         );
-        assert_eq!(parse_usage_usec("usage_usec 1234\nuser_usec 1000\n"), Some(1234));
+        assert_eq!(
+            parse_usage_usec("usage_usec 1234\nuser_usec 1000\n"),
+            Some(1234)
+        );
         assert_eq!(parse_usage_usec("nr_periods 0\n"), None);
     }
 
     #[test]
     fn stat_lines_parse_comm_with_spaces_and_parens() {
-        let s = parse_proc_stat("42 (tmux: server) (x)) S 1 42 42 0 -1 0 0 0 0 0 300 200 0 0 20 0 1 0 5555 100000 250")
-            .expect("parses");
+        let s = parse_proc_stat(
+            "42 (tmux: server) (x)) S 1 42 42 0 -1 0 0 0 0 0 300 200 0 0 20 0 1 0 5555 100000 250",
+        )
+        .expect("parses");
         assert_eq!(s.pid, 42);
         assert_eq!(s.ppid, 1);
         assert_eq!(s.comm, "tmux: server) (x)");
@@ -2350,12 +2586,19 @@ mod tests {
         assert!(!s.kernel_thread);
         assert!(parse_proc_stat("garbage").is_none());
         // flags carries PF_KTHREAD (0x00208040 = 2129984).
-        let k = parse_proc_stat("9 (kworker/0:1) I 2 0 0 0 -1 2129984 0 0 0 0 0 7 0 0 20 0 1 0 30 0 0")
-            .expect("parses");
+        let k =
+            parse_proc_stat("9 (kworker/0:1) I 2 0 0 0 -1 2129984 0 0 0 0 0 7 0 0 20 0 1 0 30 0 0")
+                .expect("parses");
         assert!(k.kernel_thread);
     }
 
-    fn pstat(pid: u32, comm: &str, start: Option<u64>, cpu: Option<u64>, rss: Option<u64>) -> ProcStat {
+    fn pstat(
+        pid: u32,
+        comm: &str,
+        start: Option<u64>,
+        cpu: Option<u64>,
+        rss: Option<u64>,
+    ) -> ProcStat {
         ProcStat {
             pid,
             ppid: 1,
@@ -2394,15 +2637,26 @@ mod tests {
         root_daemon.cpu_pct = None;
         root_daemon.rss_bytes = None;
         let out = census(
-            &[rec(1, 0, "init", None, 2.0, 10), root_daemon, rec(20, 1, "rustc", None, 30.0, 500)],
+            &[
+                rec(1, 0, "init", None, 2.0, 10),
+                root_daemon,
+                rec(20, 1, "rustc", None, 30.0, 500),
+            ],
             true,
             None,
             &no_units(),
         );
         let other = out.iter().find(|e| e.class == "other").expect("other");
         assert_eq!((other.cpu_pct, other.rss_bytes), (None, None));
-        assert_eq!(other.proc_count, Some(2), "an unreadable process is still counted");
-        let build = out.iter().find(|e| e.class == "cargo_build").expect("build");
+        assert_eq!(
+            other.proc_count,
+            Some(2),
+            "an unreadable process is still counted"
+        );
+        let build = out
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
         assert_eq!((build.cpu_pct, build.rss_bytes), (Some(30.0), Some(500)));
     }
 
@@ -2419,9 +2673,15 @@ mod tests {
             None,
             &unit_share(unit, 40.0),
         );
-        let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
+        let job = out
+            .iter()
+            .find(|e| e.class == "gh_actions_job")
+            .expect("job");
         assert_eq!(job.cpu_pct, None);
-        assert!(!out.iter().any(|e| e.cpu_pct.is_some_and(|c| c > 1.0)), "{out:?}");
+        assert!(
+            !out.iter().any(|e| e.cpu_pct.is_some_and(|c| c > 1.0)),
+            "{out:?}"
+        );
     }
 
     /// A process alive but unreadable leaves no baseline, so when it becomes
@@ -2430,24 +2690,54 @@ mod tests {
     #[test]
     fn an_unread_cpu_time_is_never_a_baseline() {
         let mut c = CpuTimeCensus::default();
-        c.take(cpu_tick(1000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(7, "rustc", Some(5), None, None)]), None)
-            .expect("first tick");
+        c.take(
+            cpu_tick(
+                1000,
+                vec![
+                    pstat(1, "init", Some(1), Some(0), Some(1)),
+                    pstat(7, "rustc", Some(5), None, None),
+                ],
+            ),
+            None,
+        )
+        .expect("first tick");
         let second = c
             .take(
-                cpu_tick(2000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(7, "rustc", Some(5), Some(900), Some(4))]),
+                cpu_tick(
+                    2000,
+                    vec![
+                        pstat(1, "init", Some(1), Some(0), Some(1)),
+                        pstat(7, "rustc", Some(5), Some(900), Some(4)),
+                    ],
+                ),
                 None,
             )
             .expect("second tick");
-        let build = second.iter().find(|e| e.class == "cargo_build").expect("build");
-        assert_eq!(build.cpu_pct, None, "no baseline: UNKNOWN, never a 90% lifetime spike");
+        let build = second
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
+        assert_eq!(
+            build.cpu_pct, None,
+            "no baseline: UNKNOWN, never a 90% lifetime spike"
+        );
         assert_eq!(build.rss_bytes, Some(4));
         let third = c
             .take(
-                cpu_tick(3000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(7, "rustc", Some(5), Some(1000), Some(4))]),
+                cpu_tick(
+                    3000,
+                    vec![
+                        pstat(1, "init", Some(1), Some(0), Some(1)),
+                        pstat(7, "rustc", Some(5), Some(1000), Some(4)),
+                    ],
+                ),
                 None,
             )
             .expect("third tick");
-        let build = third.iter().find(|e| e.class == "cargo_build").expect("build");
+        let build = third
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
         assert_eq!(build.cpu_pct, Some(10.0));
     }
 
@@ -2457,20 +2747,59 @@ mod tests {
     #[test]
     fn an_undated_process_is_counted_without_cpu() {
         let mut c = CpuTimeCensus::default();
-        c.take(cpu_tick(1000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(9, "rustc", None, None, None)]), None)
-            .expect("first tick");
+        c.take(
+            cpu_tick(
+                1000,
+                vec![
+                    pstat(1, "init", Some(1), Some(0), Some(1)),
+                    pstat(9, "rustc", None, None, None),
+                ],
+            ),
+            None,
+        )
+        .expect("first tick");
         let second = c
-            .take(cpu_tick(2000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(9, "rustc", None, None, None)]), None)
+            .take(
+                cpu_tick(
+                    2000,
+                    vec![
+                        pstat(1, "init", Some(1), Some(0), Some(1)),
+                        pstat(9, "rustc", None, None, None),
+                    ],
+                ),
+                None,
+            )
             .expect("second tick");
-        let build = second.iter().find(|e| e.class == "cargo_build").expect("build");
-        assert_eq!((build.cpu_pct, build.rss_bytes, build.proc_count), (None, None, Some(1)));
+        let build = second
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
+        assert_eq!(
+            (build.cpu_pct, build.rss_bytes, build.proc_count),
+            (None, None, Some(1))
+        );
         let other = second.iter().find(|e| e.class == "other").expect("init");
         assert_eq!(other.cpu_pct, Some(0.0), "readable classes are unaffected");
         let third = c
-            .take(cpu_tick(3000, vec![pstat(1, "init", Some(1), Some(0), Some(1)), pstat(9, "rustc", Some(8), Some(800), Some(2))]), None)
+            .take(
+                cpu_tick(
+                    3000,
+                    vec![
+                        pstat(1, "init", Some(1), Some(0), Some(1)),
+                        pstat(9, "rustc", Some(8), Some(800), Some(2)),
+                    ],
+                ),
+                None,
+            )
             .expect("third tick");
-        let build = third.iter().find(|e| e.class == "cargo_build").expect("build");
-        assert_eq!(build.cpu_pct, None, "possibly the undated process: no lifetime credit");
+        let build = third
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
+        assert_eq!(
+            build.cpu_pct, None,
+            "possibly the undated process: no lifetime credit"
+        );
     }
 
     /// xnu refuses a zombie's task info only because it has no task left: it
@@ -2480,8 +2809,14 @@ mod tests {
     fn a_zombie_reads_as_zero_not_unknown() {
         const SRUN: u32 = 2;
         assert_eq!(macos_task_reading(SZOMB, None), (None, Some(0), true));
-        assert_eq!(macos_task_reading(SZOMB, Some((900, 4096))), (None, Some(0), true));
-        assert_eq!(macos_task_reading(SRUN, Some((900, 4096))), (Some(900), Some(4096), false));
+        assert_eq!(
+            macos_task_reading(SZOMB, Some((900, 4096))),
+            (None, Some(0), true)
+        );
+        assert_eq!(
+            macos_task_reading(SRUN, Some((900, 4096))),
+            (Some(900), Some(4096), false)
+        );
         assert_eq!(macos_task_reading(SRUN, None), (None, None, false));
     }
 
@@ -2504,47 +2839,102 @@ mod tests {
         let mut c = CpuTimeCensus::default();
         let init = || pstat(1, "init", Some(1), Some(0), Some(1));
         let build_of = |out: Vec<WorkloadEntry>| {
-            let b = out.into_iter().find(|e| e.class == "cargo_build").expect("build");
+            let b = out
+                .into_iter()
+                .find(|e| e.class == "cargo_build")
+                .expect("build");
             (b.cpu_pct, b.rss_bytes, b.proc_count)
         };
-        c.take(cpu_tick(1000, vec![init(), pstat(7, "rustc", Some(5), Some(500), Some(4))]), None)
-            .expect("first tick");
+        c.take(
+            cpu_tick(
+                1000,
+                vec![init(), pstat(7, "rustc", Some(5), Some(500), Some(4))],
+            ),
+            None,
+        )
+        .expect("first tick");
         // The tick it is first seen dead: what it did since 1000 is lost.
-        let dying = c.take(cpu_tick(2000, vec![init(), zombie(7, "rustc", Some(5))]), None).expect("dying tick");
-        assert_eq!(build_of(dying), (None, Some(0), Some(1)), "the dying interval is UNKNOWN");
+        let dying = c
+            .take(
+                cpu_tick(2000, vec![init(), zombie(7, "rustc", Some(5))]),
+                None,
+            )
+            .expect("dying tick");
+        assert_eq!(
+            build_of(dying),
+            (None, Some(0), Some(1)),
+            "the dying interval is UNKNOWN"
+        );
         // Every later tick it is already dead: 0, measured.
         for total in [3000, 4000] {
-            let out = c.take(cpu_tick(total, vec![init(), zombie(7, "rustc", Some(5))]), None).expect("zombie tick");
+            let out = c
+                .take(
+                    cpu_tick(total, vec![init(), zombie(7, "rustc", Some(5))]),
+                    None,
+                )
+                .expect("zombie tick");
             assert_eq!(build_of(out), (Some(0.0), Some(0), Some(1)));
         }
         let key = (7, 5);
-        assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&key).copied()), Some(Some(500)), "baseline carried");
+        assert_eq!(
+            c.prev.as_ref().and_then(|p| p.ticks.get(&key).copied()),
+            Some(Some(500)),
+            "baseline carried"
+        );
 
         // A zombie first seen with no baseline: UNKNOWN now, no baseline after,
         // then 0 once it was already a zombie at the interval's start.
         let first = zombie(8, "rustc", Some(6));
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), None);
-        c.take(cpu_tick(5000, vec![init(), first.clone()]), None).expect("tick");
-        assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&(8, 6)).copied()), Some(None), "alive, no baseline");
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), Some(0));
+        assert_eq!(
+            interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first),
+            None
+        );
+        c.take(cpu_tick(5000, vec![init(), first.clone()]), None)
+            .expect("tick");
+        assert_eq!(
+            c.prev.as_ref().and_then(|p| p.ticks.get(&(8, 6)).copied()),
+            Some(None),
+            "alive, no baseline"
+        );
+        assert_eq!(
+            interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first),
+            Some(0)
+        );
         let reread = pstat(8, "rustc", Some(6), Some(900), Some(4));
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &reread), None, "never a lifetime");
+        assert_eq!(
+            interval_cpu_ticks(c.prev.as_ref().expect("prev"), &reread),
+            None,
+            "never a lifetime"
+        );
 
         // An undated zombie (another user's) follows the same rule by pid.
         let undated = zombie(9, "rustc", None);
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated), None);
-        c.take(cpu_tick(6000, vec![init(), undated.clone()]), None).expect("tick");
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated), Some(0));
+        assert_eq!(
+            interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated),
+            None
+        );
+        c.take(cpu_tick(6000, vec![init(), undated.clone()]), None)
+            .expect("tick");
+        assert_eq!(
+            interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated),
+            Some(0)
+        );
     }
 
     #[test]
     fn only_a_real_restart_drops_the_baselines() {
         let b = 1_700_000_000;
         assert!(!counters_restarted(Some(b), 100, Some(b), 200));
-        assert!(!counters_restarted(Some(b), 100, Some(b + 1), 200), "a clock step is no reboot");
+        assert!(
+            !counters_restarted(Some(b), 100, Some(b + 1), 200),
+            "a clock step is no reboot"
+        );
         assert!(!counters_restarted(Some(b), 100, Some(b - 5), 200));
         assert!(counters_restarted(Some(b), 100, Some(b + 6), 200));
-        assert!(counters_restarted(Some(b), 100, Some(b), 50), "the jiffy total went backwards");
+        assert!(
+            counters_restarted(Some(b), 100, Some(b), 50),
+            "the jiffy total went backwards"
+        );
         assert!(counters_restarted(Some(b), 100, None, 200));
         assert!(counters_restarted(None, 100, Some(b), 200));
         assert!(!counters_restarted(None, 100, None, 200));
@@ -2579,15 +2969,23 @@ mod tests {
         cgroups: &str,
         units: &str,
     ) -> String {
-        let cpu = total.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
+        let cpu = total
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut s = format!("\n4096\n100\ncpu  {cpu} 0 0\nbtime 1700000000\n");
         for (pid, ppid, comm, ticks, start) in procs {
             s.push_str(&format!(
                 "{pid} ({comm}) S {ppid} 0 0 0 -1 0 0 0 0 0 {ticks} 0 0 0 20 0 1 0 {start} 0 10\n"
             ));
         }
-        s.push_str(&format!("{GUEST_RC_MARKER} 1\n{GUEST_CGROUP_MARKER}\n{cgroups}"));
-        s.push_str(&format!("{GUEST_RC_MARKER} 0\n{GUEST_UNIT_MARKER}\n{units}{GUEST_RC_MARKER} 0\n"));
+        s.push_str(&format!(
+            "{GUEST_RC_MARKER} 1\n{GUEST_CGROUP_MARKER}\n{cgroups}"
+        ));
+        s.push_str(&format!(
+            "{GUEST_RC_MARKER} 0\n{GUEST_UNIT_MARKER}\n{units}{GUEST_RC_MARKER} 0\n"
+        ));
         s
     }
 
@@ -2604,7 +3002,11 @@ mod tests {
         let first = g
             .take(&guest_section(
                 [0, 0, 0, 1000, 0, 0, 0, 0],
-                &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2), (3, 2, "Runner.Worker", 0, 3)],
+                &[
+                    (1, 0, "init", 0, 1),
+                    (2, 1, "Runner.Listener", 10, 2),
+                    (3, 2, "Runner.Worker", 0, 3),
+                ],
                 &cg,
                 &usage(1_000_000),
             ))
@@ -2627,9 +3029,20 @@ mod tests {
                 &usage(7_000_000),
             ))
             .expect("second tick");
-        let job = second.iter().find(|e| e.class == "gh_actions_job").expect("job");
-        assert_eq!(job.cpu_pct, Some(60.0), "the unit's figure, exited child included");
-        assert_eq!(job.proc_count, Some(3), "listener, worker and the rustc under it");
+        let job = second
+            .iter()
+            .find(|e| e.class == "gh_actions_job")
+            .expect("job");
+        assert_eq!(
+            job.cpu_pct,
+            Some(60.0),
+            "the unit's figure, exited child included"
+        );
+        assert_eq!(
+            job.proc_count,
+            Some(3),
+            "listener, worker and the rustc under it"
+        );
         assert_eq!(job.root_count, Some(1));
         assert_eq!(job.rss_bytes, Some(3 * 10 * 4096));
         let other = second.iter().find(|e| e.class == "other").expect("init");
@@ -2641,8 +3054,13 @@ mod tests {
     #[test]
     fn a_process_first_seen_is_counted_whole() {
         let mut g = GuestCensus::default();
-        g.take(&guest_section([0, 0, 0, 1000, 0, 0, 0, 0], &[(1, 0, "init", 0, 1)], "", ""))
-            .expect("first tick");
+        g.take(&guest_section(
+            [0, 0, 0, 1000, 0, 0, 0, 0],
+            &[(1, 0, "init", 0, 1)],
+            "",
+            "",
+        ))
+        .expect("first tick");
         let second = g
             .take(&guest_section(
                 [300, 0, 0, 1700, 0, 0, 0, 0],
@@ -2651,7 +3069,10 @@ mod tests {
                 "",
             ))
             .expect("second tick");
-        let build = second.iter().find(|e| e.class == "cargo_build").expect("build");
+        let build = second
+            .iter()
+            .find(|e| e.class == "cargo_build")
+            .expect("build");
         assert_eq!(build.cpu_pct, Some(25.0));
     }
 
@@ -2668,18 +3089,28 @@ mod tests {
         let (head, census) = split_guest_output(&probe);
         assert_eq!(head, "MemTotal: 1 kB\n");
         assert!(
-            GuestCensus::default().take(census.expect("section")).is_none(),
+            GuestCensus::default()
+                .take(census.expect("section"))
+                .is_none(),
             "a section with no process is UNKNOWN, never an empty census"
         );
 
         // A process-table read killed by its in-guest bound is partial: no census.
         let killed = guest_section([0, 0, 0, 1000, 0, 0, 0, 0], &[(1, 0, "init", 0, 1)], "", "")
-            .replacen(&format!("{GUEST_RC_MARKER} 1"), &format!("{GUEST_RC_MARKER} 137"), 1);
+            .replacen(
+                &format!("{GUEST_RC_MARKER} 1"),
+                &format!("{GUEST_RC_MARKER} 137"),
+                1,
+            );
         assert!(GuestCensus::default().take(&killed).is_none());
 
         // A killed unit read only forgoes the unit figures.
-        let units_killed = guest_section([0, 0, 0, 1000, 0, 0, 0, 0], &[(1, 0, "init", 0, 1)], "", "")
-            .replacen(&format!("{GUEST_UNIT_MARKER}\n{GUEST_RC_MARKER} 0"), &format!("{GUEST_UNIT_MARKER}\n{GUEST_RC_MARKER} 124"), 1);
+        let units_killed =
+            guest_section([0, 0, 0, 1000, 0, 0, 0, 0], &[(1, 0, "init", 0, 1)], "", "").replacen(
+                &format!("{GUEST_UNIT_MARKER}\n{GUEST_RC_MARKER} 0"),
+                &format!("{GUEST_UNIT_MARKER}\n{GUEST_RC_MARKER} 124"),
+                1,
+            );
         assert!(GuestCensus::default().take(&units_killed).is_some());
     }
 
@@ -2709,7 +3140,10 @@ mod tests {
     #[test]
     fn the_guest_probe_never_reads_argv_or_environment() {
         for w in GUEST_PROBE_WORDS {
-            assert!(!w.contains("cmdline") && !w.contains("environ") && !w.contains("cwd"), "{w}");
+            assert!(
+                !w.contains("cmdline") && !w.contains("environ") && !w.contains("cwd"),
+                "{w}"
+            );
         }
     }
 
@@ -2728,18 +3162,26 @@ mod tests {
         let section: u64 = GUEST_SECTION_SECS.parse().expect("whole seconds");
         assert_eq!(section, secs + GUEST_UNBOUNDED_SLACK_SECS);
         assert_eq!(Some(&GUEST_LONGEST_STEP_SECS), parsed.iter().max());
-        assert_eq!(GUEST_CENSUS_BUDGET, Duration::from_secs(section + GUEST_LONGEST_STEP_SECS));
+        assert_eq!(
+            GUEST_CENSUS_BUDGET,
+            Duration::from_secs(section + GUEST_LONGEST_STEP_SECS)
+        );
         assert_eq!(
             GUEST_PROBE_WORDS[..7],
             [";", "timeout", "-s", "KILL", GUEST_SECTION_SECS, "sh", "-c"],
             "the whole section runs under its own bound"
         );
-        assert_eq!(GUEST_CENSUS_SCRIPT.matches("timeout -s KILL ").count(), bounds.len());
+        assert_eq!(
+            GUEST_CENSUS_SCRIPT.matches("timeout -s KILL ").count(),
+            bounds.len()
+        );
         for b in bounds {
             assert!(GUEST_CENSUS_SCRIPT.contains(&format!("timeout -s KILL {b} ")));
         }
         assert_eq!(
-            GUEST_CENSUS_SCRIPT.matches(&format!("{GUEST_RC_MARKER} \\$?")).count(),
+            GUEST_CENSUS_SCRIPT
+                .matches(&format!("{GUEST_RC_MARKER} \\$?"))
+                .count(),
             bounds.len()
         );
     }
@@ -2752,7 +3194,10 @@ mod tests {
         let (script, words) = GUEST_PROBE_WORDS.split_last().expect("words");
         assert_eq!(*script, GUEST_CENSUS_SCRIPT, "the script is the last word");
         for w in words {
-            assert!(!w.contains([' ', '\t', '"', '$', '\\', '\'', '*']), "{w}: quoted or expanded");
+            assert!(
+                !w.contains([' ', '\t', '"', '$', '\\', '\'', '*']),
+                "{w}: quoted or expanded"
+            );
         }
         assert!(!GUEST_CENSUS_SCRIPT.contains('"'));
         assert_eq!(
@@ -2761,7 +3206,10 @@ mod tests {
             "every backslash escapes a `$`"
         );
         assert!(!GUEST_CENSUS_SCRIPT.ends_with('\\'));
-        assert!(GUEST_CENSUS_SCRIPT.contains(' '), "Rust quotes only an argument with a space");
+        assert!(
+            GUEST_CENSUS_SCRIPT.contains(' '),
+            "Rust quotes only an argument with a space"
+        );
         assert!(
             !GUEST_CENSUS_SCRIPT.replace("\\$?", "").contains('$'),
             "no unescaped `$` for the login shell to expand"
@@ -2800,7 +3248,11 @@ mod tests {
         let line = windows_command_line(&words);
         let mut ran = 0;
         for shell in ["sh", "bash", "zsh", "fish"] {
-            let out = match std::process::Command::new(shell).arg("-c").arg(&line).output() {
+            let out = match std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&line)
+                .output()
+            {
                 Ok(out) => out,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => panic!("{shell}: {e}"),
@@ -2813,7 +3265,10 @@ mod tests {
             let tick = parse_guest_section(section).unwrap_or_else(|| panic!("{shell}: {section}"));
             assert!(tick.boot_time.is_some(), "{shell}: btime");
             assert!(tick.stats.len() > 1, "{shell}: process table");
-            assert!(!guest_step_killed(section), "{shell}: a bounded step was killed");
+            assert!(
+                !guest_step_killed(section),
+                "{shell}: a bounded step was killed"
+            );
         }
         assert!(ran >= 1, "no POSIX shell to run the probe under");
     }
@@ -2850,7 +3305,10 @@ mod tests {
             "KERN_PROCARGS",
             "proc_pidpath",
         ] {
-            assert!(!prod.contains(forbidden), "production code must not use {forbidden}");
+            assert!(
+                !prod.contains(forbidden),
+                "production code must not use {forbidden}"
+            );
         }
         // Every macOS-only item, from its `cfg` to its closing brace.
         let macos: Vec<&str> = prod
@@ -2860,7 +3318,10 @@ mod tests {
             .collect();
         assert!(macos.len() >= 4, "the macOS host lane must exist");
         for item in macos {
-            assert!(!item.contains("sysinfo::"), "the macOS lane must not use sysinfo: {item}");
+            assert!(
+                !item.contains("sysinfo::"),
+                "the macOS lane must not use sysinfo: {item}"
+            );
         }
     }
 
@@ -2916,6 +3377,8 @@ mod tests {
         assert!(total <= 100.0 + 0.1 * second.len() as f64, "{total}");
         // `filter_map`: the macOS/Windows `claude_session` placeholder has none.
         let procs: u32 = second.iter().filter_map(|e| e.proc_count).sum();
-        println!("host census: {procs} processes, first tick {d1:?}, second tick {d2:?}; {second:?}");
+        println!(
+            "host census: {procs} processes, first tick {d1:?}, second tick {d2:?}; {second:?}"
+        );
     }
 }

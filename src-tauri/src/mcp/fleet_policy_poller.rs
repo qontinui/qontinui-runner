@@ -3621,27 +3621,41 @@ mod tests {
     fn the_workload_census_switch_decodes_tolerantly() {
         use CensusSwitchAnswer::{Stated, Unreadable};
         assert_eq!(
-            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":false}}"#),
+            census_switch_of(
+                r#"{"controls_available":true,"controls":{"workload_census_enabled":false}}"#
+            ),
             Stated(Some(false))
         );
         assert_eq!(
-            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":true}}"#),
+            census_switch_of(
+                r#"{"controls_available":true,"controls":{"workload_census_enabled":true}}"#
+            ),
             Stated(Some(true))
         );
         assert_eq!(
-            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":null}}"#),
+            census_switch_of(
+                r#"{"controls_available":true,"controls":{"workload_census_enabled":null}}"#
+            ),
             Stated(None)
         );
-        assert_eq!(census_switch_of(r#"{"controls_available":true,"controls":{}}"#), Stated(None));
         assert_eq!(
-            census_switch_of(r#"{"controls_available":false,"controls":{"workload_census_enabled":false}}"#),
+            census_switch_of(r#"{"controls_available":true,"controls":{}}"#),
+            Stated(None)
+        );
+        assert_eq!(
+            census_switch_of(
+                r#"{"controls_available":false,"controls":{"workload_census_enabled":false}}"#
+            ),
             Unreadable
         );
         assert_eq!(
             census_switch_of(r#"{"controls_available":false,"controls":null}"#),
             Unreadable
         );
-        assert_eq!(census_switch_of(r#"{"controls_available":true}"#), Unreadable);
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":true}"#),
+            Unreadable
+        );
         let odd = r#"{"controls_available":true,
             "controls":{"workload_census_enabled":"no","min_free_bytes_sessions_host":4096}}"#;
         assert_eq!(census_switch_of(odd), Stated(None));
@@ -3660,9 +3674,16 @@ mod tests {
         };
         for status in [401, 404] {
             let reset = ControlsOutcome::Reset(status);
-            assert_eq!(next_workload_census_switch(Some(false), &reset), Some(false));
+            assert_eq!(
+                next_workload_census_switch(Some(false), &reset),
+                Some(false)
+            );
             assert_eq!(next_workload_census_switch(Some(true), &reset), None);
-            assert_eq!(next_workload_census_switch(None, &reset), None, "never answered: on");
+            assert_eq!(
+                next_workload_census_switch(None, &reset),
+                None,
+                "never answered: on"
+            );
         }
         let kept = ControlsOutcome::Kept("timeout".to_string());
         assert_eq!(next_workload_census_switch(Some(false), &kept), Some(false));
@@ -3670,9 +3691,18 @@ mod tests {
             next_workload_census_switch(Some(false), &ControlsOutcome::SkippedNoJwt),
             Some(false)
         );
-        assert_eq!(next_workload_census_switch(Some(false), &updated(Some(true))), Some(true));
-        assert_eq!(next_workload_census_switch(Some(false), &updated(None)), None);
-        assert_eq!(next_workload_census_switch(None, &updated(Some(false))), Some(false));
+        assert_eq!(
+            next_workload_census_switch(Some(false), &updated(Some(true))),
+            Some(true)
+        );
+        assert_eq!(
+            next_workload_census_switch(Some(false), &updated(None)),
+            None
+        );
+        assert_eq!(
+            next_workload_census_switch(None, &updated(Some(false))),
+            Some(false)
+        );
     }
 
     /// A 2xx whose controls coord could not read (`controls_available: false`)
@@ -3686,9 +3716,16 @@ mod tests {
                 r#"{"domain":"fleet_resources","controls_available":false,"controls":null}"#,
             ),
         });
-        assert_eq!(next_workload_census_switch(Some(false), &unreadable), Some(false));
+        assert_eq!(
+            next_workload_census_switch(Some(false), &unreadable),
+            Some(false)
+        );
         assert_eq!(next_workload_census_switch(Some(true), &unreadable), None);
-        assert_eq!(next_workload_census_switch(None, &unreadable), None, "never answered: on");
+        assert_eq!(
+            next_workload_census_switch(None, &unreadable),
+            None,
+            "never answered: on"
+        );
     }
 
     #[test]
