@@ -9958,11 +9958,17 @@ Add-Content -LiteralPath $Out -Value $lines
     /// Only the PRODUCTION half of the file is scanned (cut at the test module
     /// header, via `prod_part`), so the string literals in this test can never
     /// satisfy or trip it. Whitespace is squeezed out so a rustfmt rewrap does
-    /// not hide a call. Besides `host_capabilities()` itself and the two
-    /// functions that reach it (`heartbeat_capabilities()`, and
-    /// `heartbeat_device_capabilities(..)` outside its blocking-pool call), the
-    /// body must not call the two blocking probes it wraps, `slow_host_probes()`
-    /// and the image probe's `capability_tokens()`, inline either.
+    /// not hide a call. The body must make exactly ONE call that reaches the
+    /// host probes, the blocking-pool assembly of the capability base,
+    /// `spawn_blocking_tracked(move || heartbeat_device_capabilities(..))`.
+    /// With that call cut out, the rest must not call
+    /// `heartbeat_device_capabilities`, `heartbeat_capabilities`,
+    /// `host_capabilities`, or the two blocking probes those wrap,
+    /// `slow_host_probes` and the image probe's `capability_tokens`. A name
+    /// counts as a call only where it is not the tail of a longer identifier
+    /// ([`calls_fn`]), so the heartbeat's own `skill_capability_tokens(...)`
+    /// is not mistaken for the image probe, while `imagegen_probe::capability_tokens(`
+    /// and a bare `capability_tokens(` after a `use` both are caught.
     #[test]
     fn heartbeat_runs_the_host_probes_on_the_blocking_pool() {
         let src = include_str!("fleet.rs");
@@ -9978,22 +9984,58 @@ Add-Content -LiteralPath $Out -Value $lines
             .split_once("\n}\n")
             .expect("heartbeat_to_coord ends");
         let body = squeezed(body);
-        assert!(
-            body.contains("spawn_blocking_tracked(move||heartbeat_device_capabilities("),
-            "heartbeat_to_coord must assemble its capability base via spawn_blocking_tracked"
+        // The ONE sanctioned call that reaches the host probes: the capability
+        // base, assembled on the blocking pool.
+        let offload = "spawn_blocking_tracked(move||heartbeat_device_capabilities(ci_enabled,&repo_allowlist))";
+        assert_eq!(
+            body.matches(offload).count(),
+            1,
+            "heartbeat_to_coord must assemble its capability base exactly once, via \
+             spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))"
         );
+        let rest = body.replacen(offload, "", 1);
         for inline in [
-            "host_capabilities()",
-            "heartbeat_capabilities()",
-            "heartbeat_device_capabilities(ci.enabled",
-            "capability_tokens()",
-            "slow_host_probes()",
+            "heartbeat_device_capabilities",
+            "heartbeat_capabilities",
+            "host_capabilities",
+            "capability_tokens",
+            "slow_host_probes",
         ] {
             assert!(
-                !body.contains(inline),
-                "heartbeat_to_coord must not call {inline} inline on its async worker"
+                !calls_fn(&rest, inline),
+                "heartbeat_to_coord must not call {inline}(..) inline on its async worker"
             );
         }
+        // The matcher itself: a path-qualified or bare call counts; a longer
+        // identifier ending in the name does not.
+        assert!(calls_fn(
+            "x=imagegen_probe::capability_tokens();",
+            "capability_tokens"
+        ));
+        assert!(calls_fn(
+            "x.extend(capability_tokens());",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "x.extend(skill_capability_tokens(a,b));",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "spawn_blocking_tracked(host_capabilities)",
+            "host_capabilities"
+        ));
+    }
+
+    /// True when `src` contains `name(` where `name` is a whole identifier, not
+    /// the tail of a longer one (`skill_capability_tokens(` does not call
+    /// `capability_tokens`). A `::` path prefix still counts as a call.
+    fn calls_fn(src: &str, name: &str) -> bool {
+        let needle = format!("{name}(");
+        src.match_indices(&needle).any(|(at, _)| {
+            src.get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
     }
 
     /// PATH resolution must not hallucinate. A name that cannot exist
