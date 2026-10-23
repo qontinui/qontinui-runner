@@ -95,7 +95,9 @@
 //! to read. An unreadable process also leaves no CPU baseline, so it is never
 //! later credited its whole lifetime as if it had just started. An unreaped
 //! zombie is not unreadable: xnu refuses its task info only because it has no
-//! task left, so it counts as `0` CPU and `0` resident bytes.
+//! task left, so it counts as `0` resident bytes, and as `0` CPU over any
+//! interval it spent wholly dead. The interval it died in is UNKNOWN: the CPU
+//! it used between the previous reading and its exit can no longer be read.
 //!
 //! `rss_bytes` sums resident set sizes, so pages shared between processes of a
 //! class (or across classes) are counted once per process. It is a pressure
@@ -680,9 +682,10 @@ struct ProcStat {
     rss_pages: Option<u64>,
     kernel_thread: bool,
     /// An unreaped zombie (macOS `SZOMB`): it has no task left, so its CPU
-    /// time can be neither read nor added to — over any interval it is `0`,
-    /// never UNKNOWN. Always `false` on Linux, where a zombie's `stat` still
-    /// carries its CPU time.
+    /// time can be neither read nor added to — `0` over an interval it was
+    /// already a zombie at the start of, UNKNOWN over the one it died in.
+    /// Always `false` on Linux, where a zombie's `stat` still carries its CPU
+    /// time.
     zombie: bool,
 }
 
@@ -804,6 +807,9 @@ struct PrevTick {
     /// `None`). A dated process under one of them next tick may be that same
     /// process, so it is not taken as new.
     undated: HashSet<u32>,
+    /// `(pid, start time)` of the processes that were already zombies in that
+    /// reading — the only ones whose next interval is known to be `0`.
+    zombies: HashSet<(u32, Option<u64>)>,
     unit_usage_usec: HashMap<String, u64>,
     /// Runner units that had a `Runner.Worker` in that reading.
     busy_units: HashSet<String>,
@@ -814,11 +820,17 @@ struct PrevTick {
 /// A process absent from the previous reading started inside the interval, so
 /// ALL of its CPU time belongs to it. `None` — UNKNOWN, never zero and never a
 /// lifetime — when its CPU time is unreadable now, it has no start time to key
-/// a baseline by, or it was alive last time without a readable baseline. A
-/// zombie accrued nothing: `0`, whatever its baseline.
+/// a baseline by, or it was alive last time without a readable baseline.
+///
+/// A zombie's CPU time is unreadable, so it is `0` only over an interval it
+/// spent wholly dead — it was already a zombie in the previous reading. Any
+/// other zombie died inside the interval (or is first seen in it), and what it
+/// used between the interval's start and its exit is lost: UNKNOWN, never a
+/// measured `0` that understates its class. An undated zombie is matched by
+/// pid alone; a zombie holds its pid until reaped.
 fn interval_cpu_ticks(prev: &PrevTick, s: &ProcStat) -> Option<u64> {
     if s.zombie {
-        return Some(0);
+        return prev.zombies.contains(&(s.pid, s.start_time)).then_some(0);
     }
     let now = s.cpu_ticks?;
     let start = s.start_time?;
@@ -927,6 +939,7 @@ impl CpuTimeCensus {
                 .filter(|s| s.start_time.is_none())
                 .map(|s| s.pid)
                 .collect(),
+            zombies: tick.stats.iter().filter(|s| s.zombie).map(|s| (s.pid, s.start_time)).collect(),
             unit_usage_usec: tick.unit_usage_usec,
             busy_units,
         });
@@ -2480,34 +2493,47 @@ mod tests {
         }
     }
 
-    /// An unreaped zombie leaves its class measured: `0` over every interval,
-    /// with its baseline carried forward (so nothing it did before dying is
-    /// lost or re-counted) — and, with no baseline to carry, none invented, so
-    /// it can never be credited a lifetime.
+    /// An unreaped zombie: the interval it died in is UNKNOWN — the CPU it used
+    /// between the last live reading and its exit is unreadable, so its class
+    /// is not reported as a measured figure that leaves that work out — and
+    /// every later interval, spent wholly dead, is a measured `0`. Its live
+    /// baseline is carried forward, and with none to carry none is invented,
+    /// so it can never be credited a lifetime.
     #[test]
-    fn a_zombie_keeps_its_class_measured_and_never_spikes() {
+    fn a_zombie_s_dying_interval_is_unknown_and_its_later_ones_zero() {
         let mut c = CpuTimeCensus::default();
         let init = || pstat(1, "init", Some(1), Some(0), Some(1));
+        let build_of = |out: Vec<WorkloadEntry>| {
+            let b = out.into_iter().find(|e| e.class == "cargo_build").expect("build");
+            (b.cpu_pct, b.rss_bytes, b.proc_count)
+        };
         c.take(cpu_tick(1000, vec![init(), pstat(7, "rustc", Some(5), Some(500), Some(4))]), None)
             .expect("first tick");
-        for total in [2000, 3000] {
+        // The tick it is first seen dead: what it did since 1000 is lost.
+        let dying = c.take(cpu_tick(2000, vec![init(), zombie(7, "rustc", Some(5))]), None).expect("dying tick");
+        assert_eq!(build_of(dying), (None, Some(0), Some(1)), "the dying interval is UNKNOWN");
+        // Every later tick it is already dead: 0, measured.
+        for total in [3000, 4000] {
             let out = c.take(cpu_tick(total, vec![init(), zombie(7, "rustc", Some(5))]), None).expect("zombie tick");
-            let build = out.iter().find(|e| e.class == "cargo_build").expect("build");
-            assert_eq!((build.cpu_pct, build.rss_bytes, build.proc_count), (Some(0.0), Some(0), Some(1)));
+            assert_eq!(build_of(out), (Some(0.0), Some(0), Some(1)));
         }
         let key = (7, 5);
         assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&key).copied()), Some(Some(500)), "baseline carried");
 
-        // A zombie first seen with no baseline: 0 now, no baseline after.
+        // A zombie first seen with no baseline: UNKNOWN now, no baseline after,
+        // then 0 once it was already a zombie at the interval's start.
         let first = zombie(8, "rustc", Some(6));
-        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), Some(0));
-        c.take(cpu_tick(4000, vec![init(), first]), None).expect("tick");
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), None);
+        c.take(cpu_tick(5000, vec![init(), first.clone()]), None).expect("tick");
         assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&(8, 6)).copied()), Some(None), "alive, no baseline");
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), Some(0));
         let reread = pstat(8, "rustc", Some(6), Some(900), Some(4));
         assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &reread), None, "never a lifetime");
 
-        // An undated zombie (another user's) is still 0, not UNKNOWN.
+        // An undated zombie (another user's) follows the same rule by pid.
         let undated = zombie(9, "rustc", None);
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated), None);
+        c.take(cpu_tick(6000, vec![init(), undated.clone()]), None).expect("tick");
         assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated), Some(0));
     }
 
