@@ -50,23 +50,36 @@
 //!   token claims "image work placed here can be served"; over-advertising it
 //!   is the failure with teeth (a placed asset session that cannot generate),
 //!   under-advertising only places the work elsewhere.
-//! * The probe is bounded in wall-clock time, and it runs on the blocking pool
-//!   (`heartbeat_to_coord` runs `host_capabilities` through
-//!   `spawn_blocking_tracked`), never on an async worker. reqwest's blocking
-//!   `timeout` bounds the send and EACH body `read()` separately, so on its own
-//!   a server trickling one byte just inside every timeout could hold the probe
-//!   for as long as it takes to fill the body cap. So the probe takes a
-//!   deadline of [`REQUEST_TIMEOUT`] before it sends, reads the body in its own
-//!   loop and gives up as soon as the deadline has passed, and refuses a
-//!   declared `Content-Length` over the cap before reading anything. The
-//!   deadline is checked between reads, and a read already in flight can wait
-//!   one more `REQUEST_TIMEOUT`, so a probe costs less than
-//!   2 × [`REQUEST_TIMEOUT`] (4 s), connect ([`CONNECT_TIMEOUT`]) included.
+//! * The probe runs on the blocking pool (`heartbeat_to_coord` runs
+//!   `host_capabilities` through `spawn_blocking_tracked`), never on an async
+//!   worker, and its network part is bounded. reqwest's blocking `timeout`
+//!   bounds the send and EACH body `read()` separately, so on its own a server
+//!   trickling one byte just inside every timeout could hold the probe for as
+//!   long as it takes to fill the body cap. So once the client is built, the
+//!   probe takes a deadline of [`REQUEST_TIMEOUT`], reads the body in its own
+//!   loop, and refuses a declared `Content-Length` over the cap before reading
+//!   anything. The deadline is checked AFTER each read, never before one, so a
+//!   body that has already arrived is never thrown away: a read that ends past
+//!   the deadline keeps the body if it is complete (its declared length is
+//!   met, or it parses as a whole JSON document) and gives up otherwise.
+//! * **What is bounded, exactly.** From the moment the client is built, a probe
+//!   costs less than 2 × [`REQUEST_TIMEOUT`] (4 s): the send, connect
+//!   ([`CONNECT_TIMEOUT`]) and name resolution included, plus at most one read
+//!   that started before the deadline. That holds for a hostname endpoint as
+//!   well as an IP literal, because names resolve through
+//!   `outbound_net::os_dns` (`getaddrinfo` on its own detached thread, capped at
+//!   `os_dns::LOOKUP_TIMEOUT`), not reqwest's default resolver, whose lookup on
+//!   the client's blocking pool a dropped client would wait for. BUILDING the
+//!   client is not bounded: `reqwest::blocking::Client::build` starts the
+//!   client's runtime thread and sets up TLS and waits for both with no
+//!   timeout. That is why the deadline starts after the build, so a slow build
+//!   on a loaded box cannot spend the deadline of a healthy response.
 //! * Verdicts are cached ASYMMETRICALLY, because over-advertising is the costly
 //!   direction. A `true` is cached for [`POSITIVE_VERDICT_TTL`] (25 s), under
 //!   one default heartbeat interval (30 s), so a positive verdict is re-probed
 //!   on every tick (sub-millisecond on loopback), and a stopped image upstream
-//!   leaves `coord.devices.capabilities` on the next heartbeat. A `false` is
+//!   is advertised at most [`POSITIVE_VERDICT_TTL`] after the last successful
+//!   probe started (then the next heartbeat carries the withdrawal). A `false` is
 //!   cached for the parent's `HOST_PROBE_TTL` (300 s), like the PATH and
 //!   Docker probes, so a host with no image upstream pays one probe per TTL,
 //!   and a newly started one is advertised within that TTL.
@@ -105,17 +118,19 @@ const IMAGE_MARKER_VALUE: &str = "image_generation";
 /// bounds a configured remote host that drops SYNs.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The probe's deadline, taken before the send, and reqwest's per-operation
-/// timeout (the send, connect included, and each body read). `/v1/models` is
-/// served from llama-swap's config without touching any model, so it never
-/// waits on a swap or a load. The wall-clock bound this buys is in the module
-/// docs: less than twice this value.
+/// The probe's deadline, taken once the client is built, and reqwest's
+/// per-operation timeout (the send, connect and resolution included, and each
+/// body read). `/v1/models` is served from llama-swap's config without
+/// touching any model, so it never waits on a swap or a load. The wall-clock
+/// bound this buys, and what it leaves out, is in the module docs: less than
+/// twice this value after the client is built.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a POSITIVE verdict is cached: under one default heartbeat interval
 /// (`COORD_HEARTBEAT_INTERVAL_SECS`, 30 s), so every tick re-probes a host
-/// that advertised the token and a stopped image upstream is withdrawn on the
-/// next heartbeat. A NEGATIVE verdict is cached for the parent's
+/// that advertised the token, and a stopped image upstream is advertised at
+/// most this long after the last successful probe started. A NEGATIVE verdict
+/// is cached for the parent's
 /// `HOST_PROBE_TTL`. See the module docs for why the two differ.
 pub(crate) const POSITIVE_VERDICT_TTL: Duration = Duration::from_secs(25);
 
@@ -155,6 +170,14 @@ thread_local! {
     /// runs an image upstream nor races another test thread's real probe
     /// writing the shared cache.
     static FORCED_VERDICT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how long a client build takes on THIS thread, slept right
+    /// after the real build, so a test can stand in for a loaded box whose
+    /// `Client::build` is slow.
+    static TEST_BUILD_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// Force (`Some`) or release (`None`) this thread's verdict. Test-only.
@@ -210,12 +233,14 @@ fn resolve_endpoint(raw: Option<&str>) -> String {
 
 /// `GET <base>/v1/models` and decide. Every failure is `false`. `timeout` is
 /// both reqwest's per-operation timeout and the deadline the body loop checks,
-/// so the call returns in less than 2 × `timeout` (see the module docs).
+/// so once the client is built the call returns in less than 2 × `timeout`
+/// (see the module docs for what that bound leaves out).
 fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> bool {
-    // Taken BEFORE the send: the deadline covers connect, headers and body.
-    let deadline = Instant::now() + timeout;
     let url = format!("{base}/v1/models");
     let client = match reqwest::blocking::Client::builder()
+        // Resolve through the OS on os_dns's detached threads: dropping this
+        // client then never waits on a lookup still running (see module docs).
+        .dns_resolver(qontinui_runner_lib::outbound_net::os_dns::os_resolver())
         .connect_timeout(connect_timeout)
         .timeout(timeout)
         // A local service: an operator's HTTP(S)_PROXY must not intercept it.
@@ -230,6 +255,11 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
             return false;
         }
     };
+    #[cfg(test)]
+    std::thread::sleep(TEST_BUILD_DELAY.with(std::cell::Cell::get));
+    // Taken AFTER the build, which has no timeout of its own: a slow build on a
+    // loaded box must not spend the deadline of the request that follows it.
+    let deadline = Instant::now() + timeout;
     let mut resp = match client.get(&url).send() {
         Ok(r) => r,
         Err(e) => {
@@ -246,11 +276,12 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
         debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: GET {url} answered {status} — not advertised");
         return false;
     }
-    if resp.content_length().is_some_and(|n| n > MAX_BODY_BYTES) {
+    let declared_len = resp.content_length();
+    if declared_len.is_some_and(|n| n > MAX_BODY_BYTES) {
         debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} declares a body over {MAX_BODY_BYTES} bytes — not advertised");
         return false;
     }
-    let Some(body) = read_body_by_deadline(&mut resp, deadline, &url) else {
+    let Some(body) = read_body_by_deadline(&mut resp, declared_len, deadline, &url) else {
         return false;
     };
     match image_model_ids(&body) {
@@ -271,18 +302,24 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
     }
 }
 
-/// Read the whole body, giving up (`None`) once `deadline` has passed, when the
-/// body grows past [`MAX_BODY_BYTES`], or on a read error. The deadline is
-/// checked before every read: reqwest bounds each read on its own, not the
-/// sum of them, so this loop is what bounds a trickling server.
-fn read_body_by_deadline(resp: &mut impl Read, deadline: Instant, url: &str) -> Option<Vec<u8>> {
+/// Read the whole body, giving up (`None`) when the body grows past
+/// [`MAX_BODY_BYTES`], on a read error, or when a read ends past `deadline`
+/// with the body still incomplete. reqwest bounds each read on its own, not
+/// the sum of them, so this loop is what bounds a trickling server.
+///
+/// The deadline is checked AFTER each read, never before one, so bytes that
+/// have already arrived are never thrown away: a read ending past the deadline
+/// keeps the body when it is already complete ([`body_is_complete`]). A new
+/// read starts only while the deadline has not passed.
+fn read_body_by_deadline(
+    resp: &mut impl Read,
+    declared_len: Option<u64>,
+    deadline: Instant,
+    url: &str,
+) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        if Instant::now() >= deadline {
-            debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} body not complete by the deadline — not advertised");
-            return None;
-        }
         match resp.read(&mut chunk) {
             Ok(0) => return Some(body),
             Ok(n) => {
@@ -298,7 +335,23 @@ fn read_body_by_deadline(resp: &mut impl Read, deadline: Instant, url: &str) -> 
                 return None;
             }
         }
+        if Instant::now() >= deadline {
+            if body_is_complete(&body, declared_len) {
+                return Some(body);
+            }
+            debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} body not complete by the deadline — not advertised");
+            return None;
+        }
     }
+}
+
+/// True when `body` is already the whole response: its declared length is met,
+/// or it parses as one complete JSON document. A model list is a JSON object,
+/// and no proper prefix of a JSON object parses, so a body that parses is not a
+/// truncated one. Pure.
+fn body_is_complete(body: &[u8], declared_len: Option<u64>) -> bool {
+    declared_len.is_some_and(|n| body.len() as u64 >= n)
+        || serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok()
 }
 
 /// The ids of the `/v1/models` entries that declare image output. `None` when
@@ -524,6 +577,124 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "the refusal must come before any read, took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Serve ONE response: the head at once, then each `(at, bytes)` chunk at
+    /// `at` after the connection was accepted, then hold the connection open
+    /// for `hold` before closing it. Returns the base URL.
+    fn serve_scheduled(head: String, chunks: Vec<(Duration, Vec<u8>)>, hold: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let accepted = Instant::now();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if stream
+                    .write_all(head.as_bytes())
+                    .and_then(|_| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                for (at, bytes) in chunks {
+                    std::thread::sleep(at.saturating_sub(accepted.elapsed()));
+                    if stream
+                        .write_all(&bytes)
+                        .and_then(|_| stream.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                std::thread::sleep(hold);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The marked model list split into `parts` byte ranges of near-equal size.
+    /// No proper prefix of it parses as JSON, so only the last part completes it.
+    fn marked_list_in_parts(parts: usize) -> Vec<Vec<u8>> {
+        let bytes = LLAMA_SWAP_WITH_IMAGE.as_bytes();
+        let size = bytes.len().div_ceil(parts);
+        bytes.chunks(size).map(<[u8]>::to_vec).collect()
+    }
+
+    /// Head of a response with NO declared length: the body runs to the close.
+    const UNDECLARED_LENGTH_HEAD: &str =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+
+    /// Bytes that have already arrived are never thrown away. The body's last
+    /// part lands 300 ms AFTER the deadline, inside one read that started
+    /// before it, and the connection then stays open (so this is not the EOF
+    /// path). The body is complete, so it is kept and the token advertised.
+    /// A deadline checked BEFORE each read, or a check after it that ignores
+    /// completeness, would discard it and cache `false` for HOST_PROBE_TTL.
+    #[test]
+    fn a_body_completed_just_past_the_deadline_is_kept() {
+        let parts = marked_list_in_parts(2);
+        let base = serve_scheduled(
+            UNDECLARED_LENGTH_HEAD.to_string(),
+            vec![
+                (Duration::from_millis(600), parts[0].clone()),
+                (Duration::from_millis(1300), parts[1].clone()),
+            ],
+            Duration::from_secs(5),
+        );
+        let ok = probe_endpoint(
+            &base,
+            Duration::from_millis(500),
+            Duration::from_millis(1000),
+        );
+        assert!(
+            ok,
+            "a complete body that lands just past the deadline must advertise"
+        );
+    }
+
+    /// The deadline starts once the client is BUILT. `Client::build` has no
+    /// timeout of its own and is slow on a loaded box; here it takes 1.5 s of
+    /// a 2 s deadline (the test seam), and the response then completes
+    /// 1.5 s after the connection, inside the deadline counted from the build.
+    /// A deadline taken before the build would expire mid-body (at +0.5 s, with
+    /// two of three parts missing) and cache `false` for a healthy upstream.
+    #[test]
+    fn a_slow_client_build_does_not_spend_the_deadline() {
+        let parts = marked_list_in_parts(3);
+        let base = serve_scheduled(
+            UNDECLARED_LENGTH_HEAD.to_string(),
+            vec![
+                (Duration::from_millis(200), parts[0].clone()),
+                (Duration::from_millis(900), parts[1].clone()),
+                (Duration::from_millis(1500), parts[2].clone()),
+            ],
+            Duration::ZERO,
+        );
+        TEST_BUILD_DELAY.with(|d| d.set(Duration::from_millis(1500)));
+        let ok = probe_endpoint(&base, Duration::from_millis(500), Duration::from_secs(2));
+        TEST_BUILD_DELAY.with(|d| d.set(Duration::ZERO));
+        assert!(
+            ok,
+            "a slow client build must not spend the response's deadline"
+        );
+    }
+
+    #[test]
+    fn completeness_is_a_met_length_or_a_whole_json_document() {
+        let full = LLAMA_SWAP_WITH_IMAGE.as_bytes();
+        assert!(body_is_complete(full, None));
+        assert!(body_is_complete(full, Some(full.len() as u64)));
+        let half = &full[..full.len() / 2];
+        assert!(
+            !body_is_complete(half, None),
+            "a prefix of the list never parses"
+        );
+        assert!(!body_is_complete(half, Some(full.len() as u64)));
+        assert!(
+            body_is_complete(half, Some(half.len() as u64)),
+            "a met declared length"
         );
     }
 
