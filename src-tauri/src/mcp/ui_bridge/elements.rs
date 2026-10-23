@@ -6930,7 +6930,10 @@ mod type_action_param_validation_tests {
     //! The handler-side wiring (`api_error_detailed(msg, detail)` + HTTP
     //! 400) is too IPC-coupled for a pure unit test, so the helper-level
     //! tests act as the regression guard for the envelope shape.
-    use super::{api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError};
+    use super::{
+        api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError,
+        SUPPORTED_ACTION_NAMES,
+    };
     use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
     use serde_json::{json, Map};
 
