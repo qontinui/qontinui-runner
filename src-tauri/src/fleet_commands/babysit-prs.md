@@ -58,7 +58,28 @@ gh pr list --repo <owner/repo> --state open --head "$BRANCH" --json number,title
 Include PRs the session opened via stacked worktrees. Build a table:
 `repo | PR | branch | head_sha | labels | deps` — record `coord:stacked-on=` /
 `coord:upstream-of=` labels as dependency edges (parents land before children).
-Skip drafts. If zero PRs found and none given, report and exit.
+Skip drafts, **and skip PRs coord reports held**: read each PR's card with
+`coord_pr_status {repo, number}` and apply the hold-read rule. A `hold` object
+(`{held_by, reason, kind, since}`, placed with `coord_set_pr_hold`) is held;
+`hold: null` is not held. A card with `hold_unknown: true`, or no card at all, is
+UNKNOWN. A card with NO `hold` key depends on whether COORD serves the hold —
+check ONCE whether coord's own `tools/list` offers `coord_set_pr_hold`, read
+through a door that does not filter it. Your session's visible tool list does
+not answer this: a runner proxy filters it through its own allowlist, so a tool
+absent there may still be served. Ask that proxy what it withheld:
+`GET <proxy base>/coord-mcp/tool-policy` — `coordMcpDrift.driftedTools` names
+the tools coord granted and the proxy filtered (trust it only when its
+`observedAt` is after you started the check, i.e. before your own
+`tools/list`), and `deliberateExclusions` /
+`deliberateExclusionPrefixes` name the ones it filters on purpose, which leave
+the answer unknown. If coord's list is read and lacks it, no PR can be
+coord-held, so the missing key means not held and a draft is the hold signal;
+if coord serves it (whether or not your door passes it), or you cannot tell,
+the missing key is UNKNOWN. Treat every UNKNOWN as held, never as releasable, and
+say so in the table. Once the GitHub Free downgrade is in effect a draft no longer
+exists on a private repo, so `isDraft` alone misses every hold there. A
+held PR is not stuck: do not "recover" it, and never release a hold you did not
+place. If zero PRs found and none given, report and exit.
 
 **Then declare the hand-off of each PR's worktree** once its branch is pushed,
 so a session that waits days on the train stops holding a worktree slot. Run
@@ -670,8 +691,19 @@ run, and the same content flattened into `coord_pr_status` `blockers`
 (`escalate-path hits: agent: …; operator: …`). It is computed from the head's
 FILES (`qontinui-coord` `pr_merge::escalate_evidence::clearable_by` /
 `escalate_hit_rows`), so it is present even while an earlier tier masks the
-escalate one — the line then reads "pending behind `<code>`"; clear that tier
-first. One PR can carry hits with different values; each is handled on its own:
+escalate one — the line then reads "pending behind `<code>`". That names a
+masking tier only when `<code>` is a real block code; then clear that tier
+first. **`none` is not one:** coord renders the verdict code `none` as a masking
+tier (`qontinui-coord` `mcp/tools.rs`, the `masking` match beside the
+`hit_table_blocker_line` call, which treats only `escalate-path-matched` and an
+absent code as unmasked; an absent code renders no line at all), so ``pending behind `none` `` names no tier at all.
+`none` is the PASS code: the predicate has already decided those hits do not
+block, and the line beside it is a card display defect. Do not wait for a
+`none` tier to clear (it never will), and do not spend a review on those hits
+for this reason — if the PR still does not land, re-evaluate it once (Step 5,
+lever 1) and treat the hits as blocking only if the fresh code is
+`escalate-path-matched`. The steward's Step 2 row **Green candidates discarded
+at the land seam** is the same case seen from the train. One PR can carry hits with different values; each is handled on its own:
 
 - **`agent`** (`infra`, `dependencies`, `other`, `migrations`, off the secret
   floor, in every disposition including `block_hard`) — you clear it. Call `coord_submit_escalate_evidence` (on the device default tool
