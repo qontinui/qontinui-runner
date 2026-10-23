@@ -518,6 +518,11 @@ async fn capture_runner_window(state: &Arc<ApiState>, take_permit: bool) -> Resu
         .await
         .map_err(|e| e.to_string())?;
 
+    // The probe above runs BEFORE the permit is taken, so a caller queued for a
+    // permit does not hold one across a blocking event-loop round-trip. The
+    // trade-off: if the window moves or resizes while this waits, the
+    // monitor-crop fallback crops at the probed (stale) geometry. CapturePreview
+    // reads the webview itself and is unaffected.
     let _permit = if take_permit {
         Some(
             state
@@ -2450,6 +2455,13 @@ pub(crate) const VISION_CAPTURE_PERMITS: u32 = 2;
 /// capture permit ([`super::text_visibility::capture_text_hidden_pair`]), so no
 /// other runner-window capture lands while the text is hidden. A DOM read
 /// (snapshot, discover) during the hide is not covered by the permits.
+///
+/// The lock and the permits are held until the restore attempt has returned —
+/// on a cancel, until the guard's spawned restore has landed and bumped. If
+/// that restore FAILS (the webview unreachable, say), the page may stay
+/// text-hidden until the arm's TTL ([`super::text_visibility::CAPTURE_TTL_MS`])
+/// restores it; the scheduled TTL bump then retires any capture cached in
+/// between.
 async fn capture_text_hidden_arm(
     state: &Arc<ApiState>,
 ) -> (Option<Frame>, Option<String>, TextHidden) {
@@ -2461,16 +2473,17 @@ async fn capture_text_hidden_arm(
         async move { super::request::ui_bridge_request_sync(&state, kind, body).await }
     };
     let acquire = || async {
-        state
-            .vision_capture_semaphore
-            .acquire_many(VISION_CAPTURE_PERMITS)
+        Arc::clone(&state.vision_capture_semaphore)
+            .acquire_many_owned(VISION_CAPTURE_PERMITS)
             .await
             .map_err(|e| format!("capture semaphore acquire: {e}"))
     };
     let abort_state = Arc::clone(state);
-    // Spawned holding the arm's lock: the next arm waits for this restore.
-    let abort_restore = move |lock: PairLockGuard| {
-        tokio::spawn(async move {
+    // Spawned holding the arm's lock AND its permits, released only after the
+    // restore and the bump: no other arm starts, and no other capture sees the
+    // text-hidden page, until the restore has landed.
+    let abort_restore = move |lock: PairLockGuard, permits: tokio::sync::OwnedSemaphorePermit| {
+        let restore = async move {
             let _ = super::request::ui_bridge_request_sync(
                 &abort_state,
                 REQUEST_TYPE,
@@ -2478,8 +2491,21 @@ async fn capture_text_hidden_arm(
             )
             .await;
             bump_mutation_id(&abort_state);
+            drop(permits);
             drop(lock);
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(restore);
+            }
+            // No runtime to restore on (a shutdown): the arm's TTL restores the
+            // page instead.
+            Err(e) => warn!(
+                "vision: no tokio runtime to restore the webview's text on ({e}); the \
+                 {} ms TTL will restore it",
+                super::text_visibility::CAPTURE_TTL_MS
+            ),
+        }
     };
     let out = capture_text_hidden_pair(
         send,
@@ -4962,6 +4988,95 @@ mod capture_fallback_tests {
 #[cfg(test)]
 mod text_hidden_tests {
     use super::*;
+
+    // ── the fixes, pinned at their production call sites (by source) ──────
+
+    /// The body of the first `fn` whose signature starts with `sig`, up to the
+    /// first line that closes a top-level item.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let (_, rest) = src
+            .split_once(sig)
+            .unwrap_or_else(|| panic!("{sig} not found"));
+        rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+    }
+
+    fn pos(body: &str, needle: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` not found in:\n{body}"))
+    }
+
+    /// Both handlers refuse an untrusted origin BEFORE any frame is captured,
+    /// any text hidden or any frame B decoded — all of which happen in
+    /// `capture_frames`.
+    #[test]
+    fn both_handlers_gate_the_origin_before_any_capture_or_decode() {
+        let src = include_str!("vision_routes.rs");
+        for handler in [
+            "async fn vision_analyze_handler(",
+            "async fn vision_assert_handler(",
+        ] {
+            let body = fn_body(src, handler);
+            assert!(
+                body.contains(
+                    "Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>"
+                ),
+                "{handler} must take the requester principal"
+            );
+            let gate = pos(body, "refuse_untrusted_frame_b(");
+            assert!(
+                body[gate..].contains("principal.as_deref()"),
+                "{handler} must gate on the requester it was given"
+            );
+            assert!(
+                gate < pos(body, "capture_frames("),
+                "{handler} must refuse before capturing, hiding or decoding"
+            );
+            assert!(gate < pos(body, "check_text_hidden_request("), "{handler}");
+        }
+    }
+
+    /// The arm takes EVERY capture permit, owned so the guard can hand them on,
+    /// and its abort restore carries the lock and the permits, releasing them
+    /// only after the restore request and the bump; the TTL bump is the real
+    /// scheduler.
+    #[test]
+    fn the_arm_wiring_is_the_real_one() {
+        let src = include_str!("vision_routes.rs");
+        let body = fn_body(src, "async fn capture_text_hidden_arm(");
+        assert!(
+            body.contains(".acquire_many_owned(VISION_CAPTURE_PERMITS)"),
+            "{body}"
+        );
+
+        let (_, abort) = body
+            .split_once("let abort_restore = move |lock: PairLockGuard, permits")
+            .expect("the abort restore takes the lock and the permits");
+        let (abort, call) = abort
+            .split_once("let out = capture_text_hidden_pair(")
+            .expect("abort restore precedes the call");
+        let request = pos(abort, "ui_bridge_request_sync(");
+        let bump = pos(abort, "bump_mutation_id(&abort_state);");
+        assert!(request < bump, "restore, then bump");
+        assert!(
+            bump < pos(abort, "drop(permits);"),
+            "permits released after the bump"
+        );
+        assert!(
+            bump < pos(abort, "drop(lock);"),
+            "lock released after the bump"
+        );
+        assert!(abort.contains("runtime.spawn(restore)"), "{abort}");
+
+        assert!(
+            call.contains("capture_runner_window_frame_permitted(state)"),
+            "{call}"
+        );
+        assert!(
+            call.contains("schedule_mutation_bump(state, delay_ms)"),
+            "{call}"
+        );
+        assert!(call.contains("abort_restore,"), "{call}");
+    }
 
     // ── frame B (text hidden): request checks, decoding, pass-through ─────
 

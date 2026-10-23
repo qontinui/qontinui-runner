@@ -8814,4 +8814,20 @@ mod text_visibility_dispatch_tests {
         assert_eq!(frame["action"], json!("textVisibility"), "{frame}");
         assert_eq!(frame["payload"], json!({"hidden": false}), "{frame}");
     }
+
+    /// The real handler wires the real TTL-restore bump (pinned by source: a
+    /// handler needs an `ApiState`, which no test builds).
+    #[test]
+    fn the_sdk_handler_wires_the_real_ttl_bump() {
+        let src = include_str!("sdk_client.rs");
+        let (_, body) = src
+            .split_once("async fn handle_text_visibility(")
+            .expect("handler");
+        let (body, _) = body.split_once("\n}\n").expect("handler ends");
+        assert!(
+            body.contains("text_visibility::schedule_mutation_bump(&state, delay_ms)"),
+            "{body}"
+        );
+        assert!(body.contains("bump_after_ttl,"), "{body}");
+    }
 }
