@@ -1621,6 +1621,13 @@ pub struct TerminalSession {
     /// Written after bytes reach the wire; read by the phantom-turn detector
     /// via [`Self::last_input`]. See [`PtyInputSlots`].
     last_input: Mutex<PtyInputSlots>,
+    /// WALL-CLOCK time (unix millis) of the last INPUT written to this PTY —
+    /// a write or a submit from any producer, operator or runner; never a
+    /// terminal control response. `0` means none since this process created
+    /// the session. The wind-down grace clock's input floor
+    /// ([`Self::last_input_at_ms`]): it catches operator activity that leaves
+    /// the screen as it was between two observations.
+    last_input_wall_ms: std::sync::atomic::AtomicI64,
 }
 
 /// The settled screen behind a [`TerminalSession::idle_quiescence_probe`].
@@ -2546,6 +2553,7 @@ impl TerminalSession {
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            last_input_wall_ms: std::sync::atomic::AtomicI64::new(0),
             pinned_session_id,
             wire_flow,
         })
@@ -3683,6 +3691,14 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// When input was last written to this PTY (wall clock, unix millis),
+    /// through either choke point and from any producer; `None` when none has
+    /// been since this process created the session. Never a terminal control
+    /// response.
+    pub fn last_input_at_ms(&self) -> Option<i64> {
+        Some(self.last_input_wall_ms.load(Ordering::Acquire)).filter(|&ms| ms > 0)
+    }
+
     /// A snapshot of who last wrote to this PTY, through either choke point.
     pub fn last_input(&self) -> PtyInputSlots {
         self.last_input
@@ -3696,6 +3712,13 @@ impl TerminalSession {
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
     fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
+        if slot != InputSlot::ControlResponse {
+            // Every producer counts, the runner's own automated writes
+            // included: for the wind-down floor an extra restart only fails
+            // closed.
+            self.last_input_wall_ms
+                .fetch_max(chrono::Utc::now().timestamp_millis(), Ordering::AcqRel);
+        }
         let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
         match slot {
             InputSlot::Write => slots.last_write = Some(obs),
@@ -5735,6 +5758,7 @@ pub(crate) mod tests {
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            last_input_wall_ms: std::sync::atomic::AtomicI64::new(0),
             pinned_session_id: "test-pinned-session".to_string(),
         }
     }
@@ -6198,6 +6222,25 @@ pub(crate) mod tests {
             panic!("still idle");
         };
         assert!(restarted > first, "{restarted} > {first}");
+    }
+
+    /// The input floor: input written to the PTY is timestamped even when the
+    /// screen ends up exactly as it was (a draft typed and deleted), while a
+    /// terminal emulator's own control replies are not input.
+    #[test]
+    fn input_is_timestamped_but_control_responses_are_not() {
+        let session = make_live_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(session.last_input_at_ms(), None);
+        session.write(b"\x1b[I", PtyWriteCaller::Test).unwrap();
+        assert_eq!(
+            session.last_input_at_ms(),
+            None,
+            "a focus report is not input"
+        );
+        let before = chrono::Utc::now().timestamp_millis();
+        session.write(b"x\x7f", PtyWriteCaller::Test).unwrap();
+        let at = session.last_input_at_ms().expect("a keystroke is input");
+        assert!(at >= before, "{at} >= {before}");
     }
 
     /// The grace floor: the first observation by this process starts it, an

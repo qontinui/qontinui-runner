@@ -442,6 +442,9 @@ pub struct TerminalObservation {
     /// Since when this process has seen the pane's screen unchanged — the
     /// grace clock's per-process floor. `None` when it could not be read.
     pub screen_quiet_since_ms: Option<i64>,
+    /// When input was last written to the pane's PTY — the grace clock's
+    /// input floor. `None` when none has been since this process made it.
+    pub last_input_at_ms: Option<i64>,
 }
 
 impl TerminalObservation {
@@ -451,6 +454,7 @@ impl TerminalObservation {
         grid: GridIdle::Unknown,
         prompt: PromptScreen::Unknown,
         screen_quiet_since_ms: None,
+        last_input_at_ms: None,
     };
 }
 
@@ -555,6 +559,7 @@ pub fn wind_down_for_process(
         grid: observation.grid,
         prompt: observation.prompt,
         screen_quiet_since_ms: observation.screen_quiet_since_ms,
+        last_input_at_ms: observation.last_input_at_ms,
         // No record read for this pid (none found, a failed or timed-out
         // read) is UNKNOWN, which is never closable.
         record: records
@@ -623,6 +628,7 @@ pub fn observe_terminals(
                         grid: session.observe_grid_idle(),
                         prompt: prompt_screen_from(&screen),
                         screen_quiet_since_ms,
+                        last_input_at_ms: session.last_input_at_ms(),
                     }
                 }
                 None => TerminalObservation::UNOBSERVABLE,
@@ -745,6 +751,7 @@ mod tests {
                 grid: GridIdle::Idle { since_ms: 1_000 },
                 prompt: PromptScreen::Ready,
                 screen_quiet_since_ms: Some(1_000),
+                last_input_at_ms: None,
             },
         )]
         .into();
@@ -887,6 +894,7 @@ mod tests {
                     grid: GridIdle::Idle { since_ms: 1 },
                     prompt: PromptScreen::Ready,
                     screen_quiet_since_ms: Some(1),
+                    last_input_at_ms: None,
                 },
             )]
             .into();

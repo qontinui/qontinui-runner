@@ -3122,6 +3122,7 @@ mod tests {
         grid: GridIdle::Idle { since_ms: 1_000 },
         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
         screen_quiet_since_ms: Some(1_000),
+        last_input_at_ms: None,
     };
 
     #[test]
@@ -3266,6 +3267,7 @@ mod tests {
                     },
                     prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
                     screen_quiet_since_ms: Some(1_000),
+                    last_input_at_ms: None,
                 },
             );
         }
@@ -3441,6 +3443,7 @@ mod tests {
                         },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
                         screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 (
@@ -3453,6 +3456,7 @@ mod tests {
                         grid: GridIdle::Idle { since_ms: 1 },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
                         screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 (
@@ -3465,6 +3469,7 @@ mod tests {
                         grid: GridIdle::Idle { since_ms: 1 },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
                         screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
             ]
@@ -3691,6 +3696,7 @@ mod tests {
                         },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
                         screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 ("t2".to_string(), IDLE_LONG_AGO),

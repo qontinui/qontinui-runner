@@ -618,6 +618,7 @@ mod tests {
             grid,
             prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
             screen_quiet_since_ms: Some(1_000),
+            last_input_at_ms: None,
         }
     }
 

@@ -62,6 +62,14 @@
 //!    eligible. When coord serves no transition time the declaration does not
 //!    bound the window.
 //!
+//!    Two per-process floors sit under that. The INPUT floor is the last time
+//!    anything was written to the pane's PTY — an operator's keystroke,
+//!    paste or submit, or the runner's own nudge or injection (counting those
+//!    only fails closed). It sees an operator who typed a draft and deleted
+//!    it, or opened `/status` and dismissed it, between two observations
+//!    that found the screen identical — which outside a drain, when only
+//!    `/restart-readiness` polls observe a pane, can be an hour of work.
+//!
 //!    The screen-quiet floor ([`ScreenQuietTracker`]) is the latest time THIS
 //!    PROCESS observed the pane's screen change, or its first observation of
 //!    the pane. It keeps two properties the transcript clock alone loses:
@@ -74,7 +82,8 @@
 //!    line that is redrawn unchanged does not reset it, and it skips the
 //!    context-hint row whose update notice churns on an idle pane
 //!    (`looping_agent::idle::screen_fingerprint`). A change that comes and
-//!    goes entirely between two observations is not seen.
+//!    goes entirely between two observations is not seen by it — the input
+//!    floor is what covers that.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -315,6 +324,11 @@ pub struct EligibilityInputs {
     /// ([`ScreenQuietTracker`]) — the per-process floor of the grace clock.
     /// `None` when the pane could not be observed.
     pub screen_quiet_since_ms: Option<i64>,
+    /// When input was last written to the pane's PTY (wall clock), by an
+    /// operator or by the runner itself; `None` when none has been since this
+    /// process created the pane. The grace clock's INPUT floor: it catches
+    /// activity that left the screen as it was between two observations.
+    pub last_input_at_ms: Option<i64>,
     /// Claude Code's own record and the transcript's last-message time.
     pub record: SessionRecord,
     /// `None` when the process snapshot could not answer.
@@ -507,8 +521,11 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
     // message, the sideband report, the screen-quiet floor, and (terminal
     // sessions only) the `finished` declaration.
     let mut since_ms = sideband_set_at.map_or(last_message_ms, |s| s.max(last_message_ms));
-    if let Some(quiet_since) = inputs.screen_quiet_since_ms {
-        since_ms = since_ms.max(quiet_since);
+    for floor in [inputs.screen_quiet_since_ms, inputs.last_input_at_ms]
+        .into_iter()
+        .flatten()
+    {
+        since_ms = since_ms.max(floor);
     }
     if finished_required {
         if let Some(finished_at) = inputs.finished_at_ms {
@@ -582,9 +599,10 @@ impl WindDownView {
 /// The first observation starts the window at its own instant — a pane this
 /// process has just started watching has been quiet for no time at all, as
 /// far as it can prove. A fingerprint that differs from the previous
-/// observation's restarts it. An observation older than the last one recorded
-/// (a concurrent observer arriving late) returns the recorded floor unchanged,
-/// so the floor never moves backwards.
+/// observation's restarts it — at that observation's instant, or at the
+/// last observation's when this one is dated earlier (a concurrent observer
+/// arriving late), so a change is never dropped and the floor never moves
+/// backwards. The same screen observed late returns the recorded floor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScreenQuietTracker {
     last: Option<QuietObservation>,
@@ -606,13 +624,24 @@ impl ScreenQuietTracker {
     /// `observed_at_ms`, and return since when it has been unchanged.
     pub fn observe(&mut self, fingerprint: u64, observed_at_ms: i64) -> i64 {
         let quiet_since_ms = match self.last {
+            // A DIFFERENT screen always restarts the window, even on an
+            // observation dated before the last: at the later of the two
+            // instants, since the earlier observation may have seen the old
+            // screen after this one saw the new. A late observer costs at
+            // worst a spurious restart, which fails closed.
+            Some(last) if last.fingerprint != fingerprint => {
+                observed_at_ms.max(last.observed_at_ms)
+            }
+            // The same screen, observed late: the recorded floor stands.
             Some(last) if observed_at_ms < last.observed_at_ms => return last.quiet_since_ms,
-            Some(last) if last.fingerprint == fingerprint => last.quiet_since_ms,
-            _ => observed_at_ms,
+            Some(last) => last.quiet_since_ms,
+            None => observed_at_ms,
         };
         self.last = Some(QuietObservation {
             fingerprint,
-            observed_at_ms,
+            observed_at_ms: self.last.map_or(observed_at_ms, |last| {
+                last.observed_at_ms.max(observed_at_ms)
+            }),
             quiet_since_ms,
         });
         quiet_since_ms
@@ -742,6 +771,7 @@ mod tests {
             grid: GridIdle::Idle { since_ms: 1_000 },
             prompt: PromptScreen::Ready,
             screen_quiet_since_ms: Some(1_000),
+            last_input_at_ms: None,
             record: IDLE_RECORD,
             has_live_children: Some(false),
             finished_at_ms: None,
@@ -1109,9 +1139,52 @@ mod tests {
         );
         i.screen_quiet_since_ms = Some(t.observe(1, changed + 30_000));
         assert_eq!(i.screen_quiet_since_ms, Some(changed + 30_000));
-        // A late, older observation never moves the floor backwards.
-        assert_eq!(t.observe(9, changed), changed + 30_000);
+        // The same screen observed late never moves the floor backwards.
+        assert_eq!(t.observe(1, changed), changed + 30_000);
         assert_eq!(t.observe(1, changed + 60_000), changed + 30_000);
+    }
+
+    /// Review L-1: a CHANGED screen restarts the window even on an observation
+    /// dated before the last one (a late concurrent observer) — never dropped,
+    /// never moved backwards.
+    #[test]
+    fn a_changed_screen_on_a_backward_dated_observation_still_restarts() {
+        let mut t = ScreenQuietTracker::new();
+        assert_eq!(t.observe(1, 1_000), 1_000);
+        assert_eq!(t.observe(1, 900_000), 1_000);
+        // Dated before the last observation, but the screen differs.
+        assert_eq!(t.observe(2, 800_000), 900_000);
+        // And a later observation of the same new screen keeps that restart.
+        assert_eq!(t.observe(2, 950_000), 900_000);
+    }
+
+    /// Review M-1: input written to the PTY between two observations that
+    /// found the SAME screen (a draft typed then deleted, `/status` opened
+    /// and dismissed) restarts the window.
+    #[test]
+    fn input_between_identical_screen_observations_restarts_the_window() {
+        let mut t = ScreenQuietTracker::new();
+        let mut i = eligible_terminal();
+        i.screen_quiet_since_ms = Some(t.observe(1, 1_000));
+        i.screen_quiet_since_ms = Some(t.observe(1, 1_000 + GRACE_MS));
+        assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible());
+        let typed_at = 1_000 + GRACE_MS + 10_000;
+        let next = typed_at + 20_000;
+        i.screen_quiet_since_ms = Some(t.observe(1, next));
+        assert_eq!(
+            i.screen_quiet_since_ms,
+            Some(1_000),
+            "the screen saw nothing"
+        );
+        i.last_input_at_ms = Some(typed_at);
+        assert_eq!(
+            eligibility(&i, next),
+            Eligibility::NotYet {
+                since_ms: typed_at,
+                until_ms: typed_at + GRACE_MS
+            }
+        );
+        assert!(eligibility(&i, typed_at + GRACE_MS).is_eligible());
     }
 
     /// An old transcript ALONE never makes a session eligible early, and an
