@@ -62,3 +62,10 @@ export const ZONE_HEADER_HEIGHT_PX = 20;
 
 /** Height of a zone's output-filter bar, when open. */
 export const ZONE_FILTER_BAR_HEIGHT_PX = 26;
+
+/**
+ * Height of the maximized view's header strip. It used to be implicit (`py-1`
+ * around a 10px line); the prompts column has to start exactly below it, so
+ * the value is stated once and shared by both.
+ */
+export const MAXIMIZED_HEADER_HEIGHT_PX = 26;

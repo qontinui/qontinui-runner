@@ -650,6 +650,49 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // this door works on a windowed runner only. Step failures come back as
     // `ok: false` in the result, never as an invoke error, so read `ok` /
     // `failedStep` rather than `success`.
+    // ---- Remote-session interactivity read/resize doors (plan
+    // 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold,
+    // Phase C) ----
+    //
+    // The Phase C live sweep drives the remote-attach picker and a remote tab
+    // over the UI Bridge. These three commands are already registered in Tauri
+    // (`commands/fleet_sessions.rs`, `commands/remote_attach.rs`,
+    // `commands/terminal.rs`); this block only allowlists them over HTTP. All
+    // three take Tauri-managed state or run a coord round-trip through the
+    // webview's `invoke()`, so they are `Dispatch::Frontend` (a headless
+    // `QONTINUI_SERVER_MODE` runner answers 503 `SERVER_MODE_NO_WEBVIEW`). None
+    // is a PTY spawn site and none takes a path or a PTY handle other than the
+    // caller's own `terminalId`.
+    ProxyableCommand {
+        name: "fleet_sessions_list",
+        dispatch: Dispatch::Frontend,
+        description: "List the tenant's coord sessions across devices (wrapper around coord's `GET /coord/sessions/fleet`; already registered in Tauri, this entry only allowlists it over HTTP). Returns coord's body verbatim. A transport failure or non-200 from coord is an invoke error carrying the status and body, never an empty list. `args` is required (may be `{}`): all filters optional -- `deviceId`, `state`, `includeClosed` (default false), `limit`, and `cursor`, an OPAQUE `nextCursor` from a previous page of the SAME scope (forwarded unchanged; coord answers 400 `cursor_scope_mismatch` otherwise). Default order is `started_at DESC`, not activity recency.",
+        args_schema: r#"{"type":"object","required":["args"],"properties":{"args":{"type":"object","properties":{"deviceId":{"type":["string","null"]},"state":{"type":["string","null"]},"includeClosed":{"type":"boolean"},"limit":{"type":["integer","null"]},"cursor":{"type":["string","null"]}}}}}"#,
+        response_schema: r#"{"type":"object","description":"coord's /coord/sessions/fleet body, verbatim (rows plus `nextCursor` and the effective `limit`)"}"#,
+        // A real coord round-trip on every call; the startup probe would add a
+        // boot-time network read for no schema-drift benefit.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_remote_identities",
+        dispatch: Dispatch::Frontend,
+        description: "Return the remote identity (target device / session) of every remote-attached terminal tab, keyed by terminal id (already registered in Tauri; this entry only allowlists it over HTTP). READ-ONLY. A terminal absent from `data` is a local tab, or one that never attached remotely. This exists because `terminal_list`'s shared-schema `TerminalInfo` cannot carry the remote identity.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","description":"map of terminalId -> remote identity"}}}"#,
+        probe_with_empty_args: true,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_resize",
+        dispatch: Dispatch::Frontend,
+        description: "Resize an existing terminal's PTY to `cols` x `rows` (already registered in Tauri; this entry only allowlists it over HTTP). Errors with `Terminal not found: <id>` for an unknown `terminalId`. Does not create, attach or close anything.",
+        args_schema: r#"{"type":"object","required":["terminalId","cols","rows"],"properties":{"terminalId":{"type":"string"},"cols":{"type":"integer","minimum":1,"maximum":65535},"rows":{"type":"integer","minimum":1,"maximum":65535}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
+        // Required args and it mutates a live PTY -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     ProxyableCommand {
         name: "create_new_project",
         dispatch: Dispatch::Frontend,
@@ -925,6 +968,18 @@ mod tests {
         assert!(!entry.probe_with_empty_args);
         let args: serde_json::Value = serde_json::from_str(entry.args_schema).unwrap();
         assert_eq!(args["required"], serde_json::json!(["req"]));
+    }
+
+    #[test]
+    fn is_allowlisted_recognizes_remote_session_interactivity_commands() {
+        for name in [
+            "fleet_sessions_list",
+            "terminal_remote_identities",
+            "terminal_resize",
+        ] {
+            assert!(is_allowlisted(name), "{name} must be allowlisted");
+            assert_eq!(dispatch_for(name), Some(Dispatch::Frontend), "{name}");
+        }
     }
 
     #[test]

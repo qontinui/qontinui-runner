@@ -452,6 +452,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/writePtyById.test.ts",
   "components/terminal/writeWhenReady.test.ts",
   "components/terminal/zone-grid/CompactZoneCard.tsx",
+  "components/terminal/zone-grid/ZoneCell.tsx",
   "components/terminal/zone-grid/ZoneContextMenu.tsx",
   "components/terminal/zone-grid/ZoneLabel.tsx",
   "components/triggers/TriggerHistory.tsx",
