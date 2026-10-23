@@ -92,20 +92,19 @@ fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
 /// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
 /// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
 /// defaulting it would silently re-point every runner on the machine. A sent
-/// value is parsed: `manual` and `least_usage` select those modes, anything
-/// else (including `highest_expected_usage`) is `HighestExpectedUsage`, the
-/// settings.rs default. Plan
+/// value is parsed with `AccountSelectionMode::from_wire`; an unknown spelling
+/// is `AccountSelectionMode::default()` (settings.rs). Plan
 /// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 1.
 fn resolve_saved_selection_mode(
     sent: Option<&str>,
     stored: AccountSelectionMode,
 ) -> AccountSelectionMode {
+    // A named mode is taken as given; an unknown spelling resolves to the
+    // default (`AccountSelectionMode::default()` in settings.rs).
     match sent {
         None => stored,
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        Some(_) => AccountSelectionMode::HighestExpectedUsage,
+        Some(raw) => AccountSelectionMode::from_wire(raw).unwrap_or_default(),
     }
 }
 
@@ -1673,7 +1672,8 @@ mod usage_twin_report {
         /// stored by coord in its own `coord.prepaid_balances` table.
         prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
-        /// (`"manual"` | `"least_usage"` — see
+        /// (`"manual"` | `"least_usage"` | `"highest_expected_usage"` |
+        /// `"weighted_random"` | `"alternating_handoff"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
         /// per-account: the roster file holds one mode for the whole box.
         ///
@@ -2519,6 +2519,8 @@ mod save_selection_mode_tests {
             AccountSelectionMode::Manual,
             AccountSelectionMode::LeastUsage,
             AccountSelectionMode::HighestExpectedUsage,
+            AccountSelectionMode::WeightedRandom,
+            AccountSelectionMode::AlternatingHandoff,
         ] {
             assert_eq!(resolve_saved_selection_mode(None, stored), stored);
         }
@@ -2539,10 +2541,18 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
             AccountSelectionMode::Manual
         );
-        // An unknown spelling keeps the historical fallback to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("weighted_random"), stored),
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("alternating_handoff"), stored),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        // An unknown spelling falls back to the default.
         assert_eq!(
             resolve_saved_selection_mode(Some("bogus"), stored),
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
     }
 }
