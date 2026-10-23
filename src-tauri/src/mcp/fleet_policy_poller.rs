@@ -444,6 +444,50 @@ fn set_floors(floors: SessionFloorsByLane) {
     }
 }
 
+/// Everything this poller caches from one [`CONTROLS_DOMAIN`] answer: the
+/// session floors and the workload-census switch. One value so a poll applies
+/// both from the same response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FleetResourceControls {
+    floors: SessionFloorsByLane,
+    /// The tenant's `workload_census_enabled` control (plan
+    /// `2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware`,
+    /// Decision 6). Tri-state on the wire; only an explicit `false` turns the
+    /// census off — absent / NULL / an unreadable value is "no opinion", and
+    /// the census ships enabled.
+    workload_census_enabled: Option<bool>,
+}
+
+/// The cached `workload_census_enabled` control. Resting value `None` — no
+/// fleet opinion, which leaves the census ON.
+static WORKLOAD_CENSUS_ENABLED: OnceLock<RwLock<Option<bool>>> = OnceLock::new();
+
+fn workload_census_cache() -> &'static RwLock<Option<bool>> {
+    WORKLOAD_CENSUS_ENABLED.get_or_init(|| RwLock::new(None))
+}
+
+/// Whether the tenant allows the workload class census
+/// ([`crate::fleet::workload_census`]). `false` only when coord explicitly
+/// answered `workload_census_enabled: false`; before the first poll, after an
+/// auth/absent reset, and behind a poisoned lock the census stays on.
+pub(crate) fn fleet_workload_census_enabled() -> bool {
+    workload_census_cache()
+        .read()
+        .map(|g| *g != Some(false))
+        .unwrap_or(true)
+}
+
+fn set_workload_census_enabled(v: Option<bool>) {
+    if let Ok(mut g) = workload_census_cache().write() {
+        *g = v;
+    }
+}
+
+fn set_fleet_resource_controls(controls: FleetResourceControls) {
+    set_floors(controls.floors);
+    set_workload_census_enabled(controls.workload_census_enabled);
+}
+
 // ===========================================================================
 // Process-global cache #3 — the tenant-wide plan-capture level
 // ===========================================================================
@@ -2143,6 +2187,32 @@ struct ControlsPayload {
     max_threads_sessions: Option<i64>,
     #[serde(default)]
     max_threads_sessions_critical: Option<i64>,
+    /// The tenant's workload-census switch. Decoded leniently: a value that is
+    /// not a JSON boolean is "no opinion" rather than a decode error, because a
+    /// decode error here would cost this whole response — the session floors
+    /// included.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    workload_census_enabled: Option<bool>,
+}
+
+/// `Some(b)` for a JSON boolean, `None` for anything else (null, a string, a
+/// number). Never fails, so one odd column cannot fail the controls decode.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(v.as_bool())
+}
+
+/// The workload-census switch from a decoded response. PURE. `None` (no fleet
+/// opinion) on every path where coord did not hand us a controls object that
+/// states it.
+fn workload_census_enabled_from(body: &FleetPolicyResponse) -> Option<bool> {
+    if body.controls_available == Some(false) {
+        return None;
+    }
+    body.controls.as_ref()?.workload_census_enabled
 }
 
 /// One control column → a floor this runner will honour. PURE.
@@ -2362,12 +2432,13 @@ enum PollOutcome {
 /// keeps them from drifting apart the next time one of them is edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlsOutcome {
-    /// Coord returned 2xx — cache replaced with these floors (possibly "none",
-    /// which is a legitimate answer, not an error).
-    Updated(SessionFloorsByLane),
+    /// Coord returned 2xx — cache replaced with these controls (possibly "no
+    /// floors", which is a legitimate answer, not an error).
+    Updated(FleetResourceControls),
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
-    /// Coord said 401 / 404 — cache RESET to no floors (fail-safe).
+    /// Coord said 401 / 404 — cache RESET to no floors and no census opinion
+    /// (fail-safe).
     Reset(u16),
     /// Network / decode / other non-2xx error — LAST-GOOD floors kept.
     Kept(String),
@@ -2585,8 +2656,10 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         let controls_outcome = poll_controls_once().await;
 
         match &controls_outcome {
-            ControlsOutcome::Updated(floors) => set_floors(*floors),
-            ControlsOutcome::Reset(_) => set_floors(SessionFloorsByLane::default()),
+            ControlsOutcome::Updated(controls) => set_fleet_resource_controls(*controls),
+            ControlsOutcome::Reset(_) => {
+                set_fleet_resource_controls(FleetResourceControls::default())
+            }
             // Skipped / Kept leave the cache as-is (last-good or "no floors").
             ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => {}
         }
@@ -2594,11 +2667,16 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         let controls_changed = is_new_outcome(last_logged_controls.as_ref(), &controls_outcome);
         if controls_changed {
             match &controls_outcome {
-                ControlsOutcome::Updated(floors) => {
+                ControlsOutcome::Updated(controls) => {
                     info!(
-                        "fleet_policy_poller: fleet session floors ({}) = {}",
+                        "fleet_policy_poller: fleet session floors ({}) = {}; workload census = {}",
                         CONTROLS_DOMAIN,
-                        describe_floors(floors)
+                        describe_floors(&controls.floors),
+                        match controls.workload_census_enabled {
+                            Some(false) => "off (tenant)",
+                            Some(true) => "on (tenant)",
+                            None => "on (no fleet opinion)",
+                        }
                     );
                 }
                 ControlsOutcome::SkippedNoJwt => {
@@ -3320,7 +3398,10 @@ async fn poll_egress_with<F, Fut>(
 /// current.
 async fn poll_controls_once() -> ControlsOutcome {
     match fetch_fleet_policy(CONTROLS_DOMAIN).await {
-        Ok(body) => ControlsOutcome::Updated(session_floors_from(&body)),
+        Ok(body) => ControlsOutcome::Updated(FleetResourceControls {
+            floors: session_floors_from(&body),
+            workload_census_enabled: workload_census_enabled_from(&body),
+        }),
         Err(FetchError::NoJwt) => ControlsOutcome::SkippedNoJwt,
         Err(FetchError::AuthOrAbsent(status)) => ControlsOutcome::Reset(status),
         Err(FetchError::Failed(e)) => ControlsOutcome::Kept(e),
@@ -3480,6 +3561,38 @@ mod tests {
     fn floors_of(json: &str) -> SessionFloorsByLane {
         let body: FleetPolicyResponse = serde_json::from_str(json).expect("decode");
         session_floors_from(&body)
+    }
+
+    fn census_switch_of(json: &str) -> Option<bool> {
+        let body: FleetPolicyResponse = serde_json::from_str(json).expect("decode");
+        workload_census_enabled_from(&body)
+    }
+
+    /// Tri-state, absent = on: only an explicit `false` is an opinion that
+    /// turns the census off, and an odd value must not cost the floors.
+    #[test]
+    fn the_workload_census_switch_decodes_tolerantly() {
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":false}}"#),
+            Some(false)
+        );
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":true}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":null}}"#),
+            None
+        );
+        assert_eq!(census_switch_of(r#"{"controls_available":true,"controls":{}}"#), None);
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":false,"controls":{"workload_census_enabled":false}}"#),
+            None
+        );
+        let odd = r#"{"controls_available":true,
+            "controls":{"workload_census_enabled":"no","min_free_bytes_sessions_host":4096}}"#;
+        assert_eq!(census_switch_of(odd), None);
+        assert_eq!(floors_of(odd).host.warn_free_bytes, Some(4096));
     }
 
     #[test]

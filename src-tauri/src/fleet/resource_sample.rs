@@ -16,7 +16,7 @@
 //! runner's samples would be indistinguishable from the primary's while
 //! describing a different workload. On 2026-07-28 exactly that shape (a temp
 //! runner writing the shared device row) left coord's shadow lane electing no
-//! device for six days; the write-up is on `fleet::budget_publish_allowed`.
+//! device for six days; the write-up is on `fleet::machine_state_publish_allowed`.
 //! Hanging the sampler off the already-gated loop inherits the gate rather than
 //! restating it — a rule keyed in one place is the whole point of that helper.
 //!
@@ -42,6 +42,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use qontinui_runner_lib::wedge_diagnostics::{spawn_blocking_tracked, tracked_blocking_by_thread};
+
+use crate::fleet::workload_census::{self, WorkloadEntry};
 use serde::Serialize;
 use tracing::{debug, warn};
 
@@ -445,6 +447,21 @@ pub(crate) struct ResourceSample {
     /// are different facts about a device.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sock_source: Option<String>,
+    /// The lane's workload class census —
+    /// [`crate::fleet::workload_census`], one `{class, cpu_pct, rss_bytes,
+    /// gpu_mem_bytes, proc_count}` per non-empty class, at most
+    /// [`crate::fleet::workload_census::MAX_WORKLOAD_ENTRIES`].
+    ///
+    /// **Both lanes, and they are not summable.** The host lane's `wsl_vm`
+    /// entry is the whole VM as the host sees it; the `wsl` lane breaks the
+    /// same load down from inside the guest. Adding them counts the VM twice.
+    ///
+    /// `None` — absent from the wire, NULL in coord — when the census is
+    /// switched off (`QONTINUI_WORKLOAD_CENSUS=0` or the tenant's
+    /// `workload_census_enabled = false`) or the lane could not take one. Never
+    /// `Some(vec![])`: an empty census reads as "measured, nothing running".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workloads: Option<Vec<WorkloadEntry>>,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -616,6 +633,7 @@ impl ResourceSample {
             sock_established_local: None,
             sock_time_wait_local: None,
             sock_source: None,
+            workloads: None,
             source: "runner".to_string(),
         }
     }
@@ -1076,6 +1094,14 @@ fn collect_host_lane() -> ResourceSample {
         }
     }
 
+    // The workload axis (plan
+    // `2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware`,
+    // Phase 2): which class of workload the CPU and memory above is spent on.
+    // One long-lived process table refreshed once per tick, so the tick is the
+    // CPU diff window; the census logs its own duration against its ≤ 50 ms
+    // p95 budget.
+    s.workloads = workload_census::host_workloads();
+
     s
 }
 
@@ -1313,16 +1339,25 @@ const WSL_PROC_FILES: &[&str] = &[
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     let distro = wsl_distro().await?;
     // Scoped so the `&distro` borrow ends before the name is moved below.
+    // The workload census rides the same fork: its words are appended to the
+    // one `cat` only while the census is on, and its output follows a marker
+    // the memory and saturation parsers never see.
+    let census_on = workload_census::census_enabled();
     let out = {
         let mut args = vec!["-d", distro.as_str(), "--", "cat"];
         args.extend_from_slice(WSL_PROC_FILES);
+        if census_on {
+            args.extend_from_slice(workload_census::GUEST_PROBE_WORDS);
+        }
         wsl_probe(&args).await?
     };
     // procfs is plain ASCII even though `wsl --list` is UTF-16.
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut sample = parse_meminfo(&text, distro)?;
-    sample.set_saturation(parse_proc_saturation(&text));
+    let (procfs, census) = workload_census::split_guest_output(&text);
+    let mut sample = parse_meminfo(procfs, distro)?;
+    sample.set_saturation(parse_proc_saturation(procfs));
     attach_wsl_disk(&mut sample);
+    sample.workloads = workload_census::guest_workloads(census.filter(|_| census_on));
     Some(sample)
 }
 
@@ -3098,5 +3133,71 @@ MemAvailable:   15335424 kB
             host.contains("memory_status()"),
             "the host lane must fill mem_* and commit_* from the shared reading"
         );
+    }
+
+    /// The workload census is wired into both lanes under coord's exact key,
+    /// and an unmeasured census is absent from the wire — never `[]`.
+    #[test]
+    fn the_workload_census_rides_the_sample_under_coords_key() {
+        let empty = ResourceSample::empty(Lane::Wsl, Some("d".to_string()));
+        let v = serde_json::to_value(&empty).expect("serializes");
+        assert!(
+            !v.as_object().expect("object").contains_key("workloads"),
+            "no census is NULL in coord, never an empty array"
+        );
+
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.workloads = Some(vec![WorkloadEntry {
+            class: workload_census::WorkloadClass::CargoBuild.as_str(),
+            cpu_pct: None,
+            rss_bytes: 1,
+            gpu_mem_bytes: None,
+            proc_count: 1,
+        }]);
+        let v = serde_json::to_value(&s).expect("serializes");
+        assert_eq!(v["workloads"][0]["class"], "cargo_build");
+        assert!(v["workloads"][0]["cpu_pct"].is_null());
+
+        assert!(
+            collect_host_lane_src().contains("workload_census::host_workloads()"),
+            "the host lane must take the census"
+        );
+    }
+
+    /// The census words ride the WSL lane's ONE probe, and its output is split
+    /// off before the procfs parsers read the rest.
+    #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
+    fn the_wsl_lane_takes_its_census_on_the_same_fork() {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find("async fn collect_wsl_lane()")
+            .expect("the WSL lane collector must exist");
+        let body = &prod[start..];
+        let end = body[1..]
+            .find("\n#[cfg(")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(body.contains("GUEST_PROBE_WORDS"));
+        assert!(body.contains("split_guest_output("));
+        assert!(body.contains("guest_workloads("));
+
+        // The procfs parsers read the same lines with the census appended.
+        let probe = "MemTotal: 2048 kB\nMemAvailable: 1024 kB\n192146\n0.5 0.4 0.3 2/900 77\n\
+             @@qontinui-workload-census@@\n4096\ncpu  1 2 3 4 5 6 7 8 0 0\n\
+             1 (init) S 0 1 1 0 -1 0 0 0 0 0 5 5 0 0 20 0 1 0 1 1000 10\n";
+        let (procfs, census) = workload_census::split_guest_output(probe);
+        let sample = parse_meminfo(procfs, "d".to_string()).expect("lane");
+        assert_eq!(sample.mem_total_bytes, Some(2048 * 1024));
+        assert!(parse_proc_saturation(procfs).is_some());
+        assert!(census.is_some());
     }
 }
