@@ -198,11 +198,14 @@ async fn save_app_mode(
 
 /// GET /settings/ai
 ///
-/// Returns the stored settings FLATTENED together with three read-only derived
+/// Returns the stored settings FLATTENED together with four read-only derived
 /// keys — see [`settings::AiSettingsView`]: `effective_account_selection_mode`,
-/// `account_selection_source` (`fleet` | `local` | `pinned`) and
-/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion).
-/// A client echoing them back on PUT is harmless.
+/// `account_selection_source` (`fleet` | `local` | `pinned`),
+/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion)
+/// and `fleet_account_selection_answered` (`false` = coord has not answered
+/// yet, so that `null` means "not yet asked" and an unpinned `local` source is
+/// provisional — read the two together). A client echoing them back on PUT is
+/// harmless.
 async fn get_ai_settings(
 ) -> Result<Json<ApiResponse<settings::AiSettingsView>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = spawn_blocking_tracked(settings::AiSettingsView::current)
@@ -1552,8 +1555,10 @@ mod tests {
                 crate::claude_accounts::AccountSelectionSource::Fleet,
                 Some(AccountSelectionMode::HighestExpectedUsage),
             ),
+            true,
         );
         let body = serde_json::to_value(&view).unwrap();
+        assert_eq!(body["fleet_account_selection_answered"], true);
         assert_eq!(
             body["fleet_account_selection_mode"],
             "highest_expected_usage"
@@ -1575,6 +1580,28 @@ mod tests {
             .is_none());
         assert!(merged_json.get("account_selection_source").is_none());
         assert!(merged_json.get("fleet_account_selection_mode").is_none());
+        assert!(merged_json
+            .get("fleet_account_selection_answered")
+            .is_none());
+    }
+
+    #[test]
+    fn ai_settings_view_serializes_an_unanswered_fleet_domain() {
+        let view = crate::settings::AiSettingsView::from_parts(
+            stored(),
+            (
+                AccountSelectionMode::Manual,
+                crate::claude_accounts::AccountSelectionSource::Local,
+                None,
+            ),
+            false,
+        );
+        let body = serde_json::to_value(&view).unwrap();
+        // `false` must be SENT, not skipped: an absent key reads as an older
+        // runner on the client, which keeps the provisional `local`.
+        assert_eq!(body["fleet_account_selection_answered"], false);
+        assert!(body["fleet_account_selection_mode"].is_null());
+        assert_eq!(body["account_selection_source"], "local");
     }
 
     #[test]
