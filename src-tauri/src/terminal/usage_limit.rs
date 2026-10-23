@@ -31,6 +31,16 @@
 //! window, so a persistently-painted error keeps the (probe-guarded) migration
 //! path armed without hammering it. This preserves the original hook's effective
 //! behavior (where TUI repaints re-fed the bytes under the same debounce).
+//!
+//! ## A migration-respawned pane replays its banner
+//!
+//! A pane the account migration respawned (`claude --resume`) re-renders the
+//! old transcript, limit banner included, so its first matches are the replay,
+//! not news. Until that pane has produced one new turn ([`screen_shows_turn`])
+//! or [`super::migration_handoff::REPLAY_SUPPRESSION_WINDOW`] has passed, a
+//! match on it fires no hint (plan
+//! `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+//! Phase 2b).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -89,6 +99,28 @@ fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
 /// Normalizes then delegates — the public matcher seam used by the unit tests.
 pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
     normalized_indicates_usage_limit(&normalize(window))
+}
+
+/// Painted by the Claude CLI's spinner row while a turn is in progress.
+const TURN_MARKER: &str = "esc to interrupt";
+
+/// How many rows from the bottom of the screen [`screen_shows_turn`] reads:
+/// the spinner sits just above the input box, so conversation text higher up
+/// that merely QUOTES the marker is not read as a turn.
+const TURN_MARKER_ROWS: usize = 8;
+
+/// Whether the rendered screen shows a turn in progress — the spinner's
+/// `esc to interrupt` within the bottom [`TURN_MARKER_ROWS`] non-blank rows.
+pub fn screen_shows_turn(screen: &str) -> bool {
+    let bottom: Vec<&str> = screen
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(TURN_MARKER_ROWS)
+        .collect();
+    bottom
+        .iter()
+        .any(|row| normalize(row).contains(TURN_MARKER))
 }
 
 // ── Firing policy (per-terminal debounce) ─────────────────────────────────────
@@ -166,7 +198,24 @@ pub fn scan_grids_once() {
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            let matched = normalized_indicates_usage_limit(&normalize(&text));
+            let mut matched = normalized_indicates_usage_limit(&normalize(&text));
+            // A migration-respawned pane replays the old banner: ignore its
+            // matches until it has produced a turn (or the window passed).
+            // Asked on EVERY scan of the pane, so a turn is seen even on a
+            // screen with no match.
+            if super::migration_handoff::usage_limit_match_is_replay(
+                tid,
+                screen_shows_turn(&text),
+                now,
+            ) && matched.is_some()
+            {
+                debug!(
+                    terminal_id = %tid,
+                    pattern = ?matched,
+                    "usage-limit match on a migration-respawned pane before its first new turn — treated as the replayed banner, no hint"
+                );
+                matched = None;
+            }
             // `entry` defaults to "never fired" → the first appearance fires
             // immediately; thereafter the debounce gates re-fires.
             let last_fired = map.entry(tid.clone()).or_insert(None);
@@ -178,6 +227,7 @@ pub fn scan_grids_once() {
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
         gate.retain_live(&live);
+        super::migration_handoff::retain_live_panes(&live);
     } // fire-state + scan-gate locks released
 
     for (tid, pattern) in to_fire {
@@ -367,5 +417,60 @@ mod tests {
             Some("usage limit reached")
         );
         assert_eq!(last, Some(t1));
+    }
+
+    // ---- Phase 2b: what counts as a new turn --------------------------------
+
+    /// Mutation check: reading the whole screen instead of the bottom rows
+    /// fails the quoted-marker arm; dropping the marker check fails the
+    /// spinner arm.
+    #[test]
+    fn a_turn_is_the_spinner_near_the_bottom_not_a_quote_above_it() {
+        let rule = "─".repeat(40);
+        let working = format!(
+            "● earlier answer
+
+✻ Compiling… (esc to interrupt)
+{rule}
+❯ 
+{rule}
+  ⏵⏵ bypass permissions on
+"
+        );
+        assert!(screen_shows_turn(&working));
+
+        let idle = format!(
+            "● done
+{rule}
+❯ 
+{rule}
+  ⏵⏵ bypass permissions on
+"
+        );
+        assert!(!screen_shows_turn(&idle));
+
+        // The replayed limit-wait banner is not a turn.
+        let banner = format!(
+            "Usage limit reached · continuing automatically at 6pm · esc to cancel
+{rule}
+❯ 
+{rule}
+"
+        );
+        assert!(!screen_shows_turn(&banner));
+
+        // The marker quoted high up in the conversation is not a turn either.
+        let mut quoted = String::from(
+            "● the spinner reads `esc to interrupt` while busy
+",
+        );
+        for i in 0..12 {
+            quoted.push_str(&format!(
+                "line {i}
+"
+            ));
+        }
+        quoted.push_str(&idle);
+        assert!(!screen_shows_turn(&quoted));
     }
 }

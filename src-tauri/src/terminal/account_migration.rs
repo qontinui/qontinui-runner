@@ -94,6 +94,8 @@ use crate::terminal::session_carry::{
     copy_transcript, CarriedSubagent, DeltaSyncOutcome, TranscriptCopy,
 };
 
+mod followup;
+
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
 /// chain means every account is exhausted and migrating is pure churn.
@@ -650,66 +652,45 @@ impl ReadyDebounce {
     }
 }
 
-/// Watch the freshly-respawned terminal until the resumed CLI paints its idle
-/// prompt, then submit [`CONTINUE_NUDGE`]. Detached and strictly best-effort:
-/// bounded (~3 min), one submission max, and it stands down when the session
-/// is already busy or the terminal goes away. Deliberately does NOT stand
-/// down on a visible usage-limit message: a `--resume` repaint can re-render
-/// the OLD account's historical banner (see the `usage_limit` module doc),
-/// and a genuinely-dry target is caught by the grid scanner firing a fresh
-/// migration hint on this terminal anyway.
-///
-/// It first waits for the step-4b delta sync (`sync_done`) to report, bounded
-/// by [`NUDGE_SYNC_WAIT`], so the resumed session is not told to `SendMessage`
-/// a subagent whose last lines are still being topped up. The sync starts no
-/// later than [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`] after
-/// it was spawned (its writer-exit wait counts no look that completes after
-/// that) and this wait starts after the sync was spawned, so the nudge
-/// normally goes after the sync. The bounded exception: a sync whose copy
-/// itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
-/// blocking pool) — the nudge then goes first, and the log says the sync had
-/// not reported. See [`run_continue_nudge`].
-///
-/// The subagents the nudge names are recomputed once that wait is over
-/// ([`crate::terminal::session_carry::resumable_subagents_now`]), so one the
-/// sync first copied is named and one still missing is not; the carry-time
-/// list is the fallback when that recompute fails.
-fn spawn_continue_nudge(
-    terminal_id: String,
-    carried: TranscriptCopy,
-    sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
-) {
-    let fallback = carried.subagents.clone();
-    tauri::async_runtime::spawn(run_continue_nudge(
-        terminal_id.clone(),
-        sync_done,
-        NUDGE_SYNC_WAIT,
-        fallback,
-        move || async move {
-            // A directory listing plus a few stats: still disk I/O, so off
-            // the async workers.
-            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                crate::terminal::session_carry::resumable_subagents_now(&carried)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| format!("subagent recompute task did not complete: {e}"))?
-        },
-        move |prompt| prompt_when_idle(terminal_id, prompt, "continue-nudge"),
-    ));
-}
+// The continue nudge ([`continue_nudge`]) is delivered by the migration's
+// detached follow-up ([`followup`]) through [`prompt_when_idle`]: bounded
+// (~3 min), one submission max, standing down when the session is already
+// busy or the terminal goes away. Deliberately NOT standing down on a visible
+// usage-limit message: a `--resume` repaint can re-render the OLD account's
+// historical banner (see the `usage_limit` module doc). When it gives up, the
+// follow-up decides between one `Esc` + retry and a reported stall (Phase 2b).
+//
+// The follow-up starts only once the step-4b delta sync has reported, bounded
+// by [`NUDGE_SYNC_WAIT`] — see [`run_after_delta_sync`] — so the resumed
+// session is not told to `SendMessage` a subagent whose last lines are still
+// being topped up, and the tail is read only after the old writer is proven
+// gone. One ordering: delta sync, tail rescue, nudge, catch-up. The sync
+// starts no later than [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`]
+// after it was spawned (its writer-exit wait counts no look that completes
+// after that) and this wait starts after the sync was spawned, so the
+// follow-up normally goes after the sync. The bounded exception: a sync whose
+// copy itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
+// blocking pool) — the follow-up then goes without it (the tail is not read;
+// the nudge still goes), and the log says the sync had not reported.
+//
+// The subagents the nudge names are recomputed once that gate is over
+// ([`nudge_text_after_sync`] over
+// [`crate::terminal::session_carry::resumable_subagents_now`]), so one the
+// sync first copied is named and one still missing is not; the carry-time list
+// is the fallback when that recompute fails.
 
 /// Time the delta sync gets to finish its copy and report after its
 /// writer-exit wait ([`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`])
-/// has ended, before the continue nudge stops waiting for it.
+/// has ended, before the migration's follow-up stops waiting for it.
 const DELTA_SYNC_REPORT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long the continue nudge waits for the delta sync to report: the sync's
-/// writer-exit wait plus [`DELTA_SYNC_REPORT_MARGIN`].
+/// How long the migration's follow-up (tail rescue, continue nudge, catch-up)
+/// waits for the delta sync to report: the sync's writer-exit wait plus
+/// [`DELTA_SYNC_REPORT_MARGIN`].
 const NUDGE_SYNC_WAIT: std::time::Duration =
     crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT.saturating_add(DELTA_SYNC_REPORT_MARGIN);
 
-/// What the continue nudge heard from the delta sync before it started.
+/// What the migration's follow-up heard from the delta sync before it started.
 #[derive(Debug, PartialEq, Eq)]
 enum SyncGate {
     /// No sync was started (no writer identity to wait on).
@@ -720,6 +701,20 @@ enum SyncGate {
     Dropped,
     /// Nothing within the deadline.
     TimedOut,
+}
+
+impl SyncGate {
+    /// Whether the old pane's `claude` is PROVEN gone. The sync runs — and so
+    /// can report `Synced` or `Failed` — only after its writer-exit wait
+    /// succeeded. Every other gate leaves the writer possibly live (no
+    /// identity to watch, still alive at the deadline, a task that died, no
+    /// report in time), so nothing may read the source transcript's tail.
+    fn writer_proven_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::Reported(DeltaSyncOutcome::Synced(_) | DeltaSyncOutcome::Failed(_))
+        )
+    }
 }
 
 /// Wait up to `deadline` for the delta sync's outcome.
@@ -737,42 +732,54 @@ async fn await_delta_sync(
     }
 }
 
-/// The continue nudge's body: wait for the delta sync (bounded by
-/// `deadline`), log what it heard, then `recompute` the resumable subagents
-/// and `deliver` the [`continue_nudge`] naming them. A sync that times out,
-/// fails or never reports holds the nudge no longer than `deadline`; the
-/// nudge still goes, and the log says why. A failed recompute falls back to
-/// `carry_time_subagents`, the list the carry produced.
-async fn run_continue_nudge<R, RF, D, DF>(
+/// The follow-up's gate: wait for the delta sync (bounded by `deadline`), log
+/// what it heard, then run `then` with it. A sync that times out, fails or
+/// never reports holds the follow-up no longer than `deadline`; the nudge
+/// still goes, and the log says why.
+async fn run_after_delta_sync<D, DF>(
     terminal_id: String,
     sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
     deadline: std::time::Duration,
-    carry_time_subagents: Vec<CarriedSubagent>,
-    recompute: R,
-    deliver: D,
+    then: D,
 ) where
-    R: FnOnce() -> RF,
-    RF: std::future::Future<Output = Result<Vec<CarriedSubagent>, String>>,
-    D: FnOnce(String) -> DF,
+    D: FnOnce(SyncGate) -> DF,
     DF: std::future::Future<Output = ()>,
 {
-    match await_delta_sync(sync_done, deadline).await {
+    let gate = await_delta_sync(sync_done, deadline).await;
+    match &gate {
         SyncGate::NoSync | SyncGate::Reported(DeltaSyncOutcome::Synced(_)) => {}
         SyncGate::Reported(other) => info!(
             terminal_id,
             outcome = ?other,
-            "continue-nudge: the delta sync did not complete — nudging anyway"
+            "migration follow-up: the delta sync did not complete — nudging anyway"
         ),
         SyncGate::Dropped => warn!(
             terminal_id,
-            "continue-nudge: the delta sync ended without reporting — nudging anyway"
+            "migration follow-up: the delta sync ended without reporting — nudging anyway"
         ),
         SyncGate::TimedOut => warn!(
             terminal_id,
             wait_s = deadline.as_secs(),
-            "continue-nudge: the delta sync did not report within its deadline — nudging anyway"
+            "migration follow-up: the delta sync did not report within its deadline — nudging anyway"
         ),
     }
+    then(gate).await;
+}
+
+/// The continue nudge's text once the follow-up's gate is over:
+/// [`continue_nudge`] naming the subagents `recompute` finds resumable at the
+/// destination NOW — after the delta sync — rather than the carry's list. A
+/// failed recompute falls back to `carry_time_subagents`, the list the carry
+/// produced.
+async fn nudge_text_after_sync<R, RF>(
+    terminal_id: &str,
+    carry_time_subagents: Vec<CarriedSubagent>,
+    recompute: R,
+) -> String
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<Vec<CarriedSubagent>, String>>,
+{
     let subagents = match recompute().await {
         Ok(now) => now,
         Err(e) => {
@@ -784,7 +791,21 @@ async fn run_continue_nudge<R, RF, D, DF>(
             carry_time_subagents
         }
     };
-    deliver(continue_nudge(&subagents)).await;
+    continue_nudge(&subagents)
+}
+
+/// The production `recompute` for [`nudge_text_after_sync`]: the subagents
+/// resumable at the destination now
+/// ([`crate::terminal::session_carry::resumable_subagents_now`]). A directory
+/// listing plus a few stats: still disk I/O, so off the async workers.
+async fn resumable_subagents_after_sync(
+    carried: TranscriptCopy,
+) -> Result<Vec<CarriedSubagent>, String> {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        crate::terminal::session_carry::resumable_subagents_now(&carried).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("subagent recompute task did not complete: {e}"))?
 }
 
 /// How many carried subagents [`continue_nudge`] names before summarising the
@@ -838,82 +859,155 @@ fn continue_nudge(subagents: &[CarriedSubagent]) -> String {
     )
 }
 
-/// The generalized idle-watcher behind [`spawn_continue_nudge`]: wait for the
-/// resumed CLI to paint its idle prompt, then submit `prompt` once.
-///
-/// Extracted so the respawn receiver
-/// ([`crate::session::respawn`]) can deliver coord's optional
-/// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
-/// instead of growing a second one that would drift from it. `label` only
-/// names the caller in the log lines.
-pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
-    tauri::async_runtime::spawn(prompt_when_idle(terminal_id, prompt, label));
+/// How one [`prompt_when_idle`] run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdlePromptOutcome {
+    /// The prompt was typed and submitted.
+    Submitted,
+    /// The session was already mid-turn ([`IdleWait::stand_down_on_busy`]):
+    /// it picked itself up, nothing was typed.
+    AlreadyBusy,
+    /// The terminal (or the app) went away.
+    TerminalGone,
+    /// The PTY write failed.
+    SubmitFailed(String),
+    /// The deadline passed with no submission; `last_refusal` is why the last
+    /// read was not ready.
+    GaveUp { last_refusal: String },
 }
 
-/// The body of [`spawn_prompt_when_idle`]; its ~3 min bound starts when this
-/// future is first polled.
-async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+/// How long, and how patiently, [`prompt_when_idle`] waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleWait {
+    pub deadline: std::time::Duration,
+    /// `true`: a mid-turn read ends the wait (the session picked itself up,
+    /// so a nudge is moot). `false`: wait THROUGH the turn for the next idle
+    /// prompt — for a message that must arrive regardless (the Phase 2b
+    /// transcript-tail catch-up).
+    pub stand_down_on_busy: bool,
+}
+
+impl IdleWait {
+    /// The continue nudge and coord's respawn `initial_prompt`: ~3 min,
+    /// standing down on a busy session.
+    pub(crate) const NUDGE: Self = Self {
+        deadline: std::time::Duration::from_secs(180),
+        stand_down_on_busy: true,
+    };
+}
+
+/// What one grid read tells the watcher loop to do.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleStep {
+    Submit,
+    StandDown,
+    /// Read again; carries why this read was not ready.
+    Wait(String),
+}
+
+/// Pure: one rendered screen through [`probe_idle_prompt`] and the
+/// [`ReadyDebounce`], under `wait`'s busy policy.
+fn idle_step(
+    screen: crate::terminal::graceful_exit::ScreenText,
+    debounce: &mut ReadyDebounce,
+    wait: IdleWait,
+) -> IdleStep {
+    match probe_idle_prompt(&screen) {
+        IdlePromptProbe::Busy if wait.stand_down_on_busy => IdleStep::StandDown,
+        IdlePromptProbe::Busy => {
+            debounce.reset();
+            IdleStep::Wait("the session is mid-turn".to_string())
+        }
+        IdlePromptProbe::NotYet(why) => {
+            debounce.reset();
+            IdleStep::Wait(why)
+        }
+        IdlePromptProbe::Ready if !debounce.settled(screen) => IdleStep::Wait(
+            "idle prompt seen once; waiting for an identical second read".to_string(),
+        ),
+        IdlePromptProbe::Ready => IdleStep::Submit,
+    }
+}
+
+/// The generalized idle-watcher: wait for the resumed CLI to paint its idle
+/// prompt, then submit `prompt` once, and say how it ended.
+///
+/// One watcher for every caller — the migration's continue nudge and
+/// transcript-tail catch-up ([`followup`]) and the respawn receiver's coord
+/// `initial_prompt` ([`spawn_prompt_when_idle`]) — so they never drift.
+/// `label` only names the caller in the log lines.
+pub(crate) async fn prompt_when_idle(
+    terminal_id: &str,
+    prompt: &str,
+    label: &'static str,
+    wait: IdleWait,
+) -> IdlePromptOutcome {
     use tauri::Manager;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + wait.deadline;
     let mut debounce = ReadyDebounce::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let Some(app) = crate::tauri_app_handle::current() else {
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
         let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>() else {
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
-        let Some(session) = tm.get(&terminal_id) else {
+        let Some(session) = tm.get(terminal_id) else {
             info!(
                 terminal_id,
                 label, "prompt-when-idle: terminal gone — standing down"
             );
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
-        let screen = session.grid_screen();
-        let refusal = match probe_idle_prompt(&screen) {
-            IdlePromptProbe::Busy => {
+        let refusal = match idle_step(session.grid_screen(), &mut debounce, wait) {
+            IdleStep::StandDown => {
                 info!(
                     terminal_id,
                     label, "prompt-when-idle: session already working — no prompt needed"
                 );
-                return;
+                return IdlePromptOutcome::AlreadyBusy;
             }
-            IdlePromptProbe::NotYet(why) => {
-                debounce.reset();
-                why
-            }
-            IdlePromptProbe::Ready if !debounce.settled(screen) => {
-                "idle prompt seen once; waiting for an identical second read".to_string()
-            }
-            IdlePromptProbe::Ready => {
-                // Composes both sides of the 2026-08-29 rebase: OUR generalized
-                // `prompt`/`label` seam (one impl for the migration nudge and the
-                // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-                // returning `()` in fee48d4c, which now reports the neutralized body.
-                match session.submit_prompt(
-                    &prompt,
+            IdleStep::Wait(why) => why,
+            IdleStep::Submit => {
+                // `submit_prompt` reports the neutralized body (fee48d4c).
+                return match session.submit_prompt(
+                    prompt,
                     crate::terminal::session::PtyWriteCaller::AccountMigration,
                 ) {
-                    Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                    Err(e) => {
-                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                    Ok(_) => {
+                        info!(terminal_id, label, "prompt-when-idle submitted");
+                        IdlePromptOutcome::Submitted
                     }
-                }
-                return;
+                    Err(e) => {
+                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed");
+                        IdlePromptOutcome::SubmitFailed(e)
+                    }
+                };
             }
         };
         if std::time::Instant::now() >= deadline {
             warn!(
                 terminal_id,
                 label,
+                wait_s = wait.deadline.as_secs(),
                 last_refusal = %refusal,
-                "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
+                "prompt-when-idle: resumed CLI never painted its idle prompt within the wait — giving up"
             );
-            return;
+            return IdlePromptOutcome::GaveUp {
+                last_refusal: refusal,
+            };
         }
     }
+}
+
+/// [`prompt_when_idle`] detached, with the [`IdleWait::NUDGE`] policy — the
+/// respawn receiver ([`crate::session::respawn`]) delivers coord's optional
+/// `initial_prompt` through it.
+pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        prompt_when_idle(&terminal_id, &prompt, label, IdleWait::NUDGE).await;
+    });
 }
 
 /// One resumed-Claude PTY spawn, described.
@@ -1632,6 +1726,13 @@ fn migrate_session(
         );
     }
 
+    // The usage-limit watcher must not read the new pane's replayed banner as
+    // news until the pane has produced a turn (Phase 2b).
+    crate::terminal::migration_handoff::note_respawned_pane(
+        &new_terminal_id,
+        std::time::Instant::now(),
+    );
+
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
     // and its exit — detached, because `close` does not wait for the `claude`
     // and this fn is synchronous. It waits (bounded) until `old_writer` is
@@ -1645,17 +1746,27 @@ fn migrate_session(
         carried.clone(),
     );
 
-    // 5. Optionally nudge the resumed session to pick the task back up once
-    // the CLI paints its idle prompt — a bare `--resume` restores context but
-    // then sits at the input box with nobody typing. The nudge waits for 4b's
-    // outcome first, bounded by 4b's writer-exit wait plus a report margin
-    // (`NUDGE_SYNC_WAIT`), so it normally goes after the sync.
-    if crate::settings::get_ai_settings()
+    // 5. The detached follow-up ([`followup`]), gated on 4b's outcome: once
+    // 4b proves the old writer gone, rescue the main transcript's tail beside
+    // the session; then (when enabled) nudge the resumed session to pick the
+    // task back up once the CLI paints its idle prompt — a bare `--resume`
+    // restores context but then sits at the input box with nobody typing —
+    // recovering or reporting a nudge that gives up; last, deliver the tail's
+    // catch-up.
+    let auto_continue = crate::settings::get_ai_settings()
         .claude_cli
-        .auto_continue_after_migration
-    {
-        spawn_continue_nudge(new_terminal_id.clone(), carried.clone(), sync_done);
-    }
+        .auto_continue_after_migration;
+    followup::spawn_post_migration(
+        followup::PostMigration {
+            src_config_dir: src_config_dir.to_string(),
+            dst_config_dir: dst_config_dir.to_string(),
+            claude_session_id: record.claude_session_id.clone(),
+            new_terminal_id: new_terminal_id.clone(),
+            carried: carried.clone(),
+            auto_continue,
+        },
+        sync_done,
+    );
 
     let outcome = MigrationOutcome {
         new_terminal_id: new_terminal_id.clone(),
@@ -2546,19 +2657,14 @@ mod tests {
 
     fn delivery_flag() -> (
         Arc<AtomicBool>,
-        impl FnOnce(String) -> std::future::Ready<()> + Send + 'static,
+        impl FnOnce(SyncGate) -> std::future::Ready<()> + Send + 'static,
     ) {
         let delivered = Arc::new(AtomicBool::new(false));
         let flag = delivered.clone();
-        (delivered, move |_prompt| {
+        (delivered, move |_gate| {
             flag.store(true, Ordering::SeqCst);
             std::future::ready(())
         })
-    }
-
-    /// A recompute that finds no subagent.
-    fn no_subagents() -> std::future::Ready<Result<Vec<CarriedSubagent>, String>> {
-        std::future::ready(Ok(Vec::new()))
     }
 
     /// The nudge is not delivered while the delta sync is still running — not
@@ -2568,12 +2674,10 @@ mod tests {
     async fn the_continue_nudge_is_not_delivered_before_the_delta_sync_reports() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (delivered, deliver) = delivery_flag();
-        let nudge = tokio::spawn(run_continue_nudge(
+        let nudge = tokio::spawn(run_after_delta_sync(
             "t-1".to_string(),
             Some(rx),
             NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
             deliver,
         ));
         tokio::time::sleep(NUDGE_SYNC_WAIT - Duration::from_secs(1)).await;
@@ -2600,15 +2704,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         let (delivered, deliver) = delivery_flag();
         let started = tokio::time::Instant::now();
-        run_continue_nudge(
-            "t-2".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-2".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         assert!(started.elapsed() >= NUDGE_SYNC_WAIT);
         assert!(started.elapsed() < NUDGE_SYNC_WAIT + Duration::from_secs(1));
@@ -2649,17 +2745,10 @@ mod tests {
         let (delivered, deliver) = delivery_flag();
         let delivered_at = Arc::new(std::sync::Mutex::new(None));
         let at = delivered_at.clone();
-        run_continue_nudge(
-            "t-4".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            move |prompt| {
-                *at.lock().unwrap() = Some(tokio::time::Instant::now());
-                deliver(prompt)
-            },
-        )
+        run_after_delta_sync("t-4".to_string(), Some(rx), NUDGE_SYNC_WAIT, move |gate| {
+            *at.lock().unwrap() = Some(tokio::time::Instant::now());
+            deliver(gate)
+        })
         .await;
         sync.await.unwrap();
         assert!(delivered.load(Ordering::SeqCst));
@@ -2680,15 +2769,7 @@ mod tests {
     async fn with_no_delta_sync_to_wait_for_the_nudge_goes_at_once() {
         let started = tokio::time::Instant::now();
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge(
-            "t-3".to_string(),
-            None,
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-3".to_string(), None, NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
@@ -2700,45 +2781,21 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge(
-            "t-3b".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-3b".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     // ---- the nudge names the subagents as they are after the sync (S4) -------
 
-    /// Run the nudge with the sync already reported; returns the typed prompt.
+    /// The nudge text from a carry-time list and what the recompute returned.
+    /// The follow-up builds it only after its delta-sync gate
+    /// (`followup::run`), so the recompute sees what the sync copied.
     async fn nudge_text(
         carry_time: Vec<CarriedSubagent>,
         recomputed: Result<Vec<CarriedSubagent>, String>,
     ) -> String {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tx.send(DeltaSyncOutcome::Synced(DeltaSync::default()))
-            .unwrap();
-        let typed = Arc::new(std::sync::Mutex::new(None));
-        let sink = typed.clone();
-        run_continue_nudge(
-            "t-5".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            carry_time,
-            move || std::future::ready(recomputed),
-            move |prompt| {
-                *sink.lock().unwrap() = Some(prompt);
-                std::future::ready(())
-            },
-        )
-        .await;
-        let text = typed.lock().unwrap().take().expect("delivered");
-        text
+        nudge_text_after_sync("t-6", carry_time, move || std::future::ready(recomputed)).await
     }
 
     /// The carry-time list named `a1` and missed `n9` (written by the old pane
@@ -2762,5 +2819,114 @@ mod tests {
 
         let text = nudge_text(vec![agent("a1", None)], Ok(Vec::new())).await;
         assert_eq!(text, CONTINUE_NUDGE, "nothing resumable now: nothing named");
+    }
+
+    /// The follow-up reads the transcript tail only when the delta sync's
+    /// report proves the old writer gone. Mutation check: widening
+    /// `writer_proven_gone` to `WriterNotGone` (or to any gate) fails here.
+    #[test]
+    fn only_a_sync_that_ran_proves_the_old_writer_gone() {
+        assert!(
+            SyncGate::Reported(DeltaSyncOutcome::Synced(DeltaSync::default())).writer_proven_gone()
+        );
+        assert!(
+            SyncGate::Reported(DeltaSyncOutcome::Failed("io".to_string())).writer_proven_gone()
+        );
+        for gate in [
+            SyncGate::Reported(DeltaSyncOutcome::WriterNotGone),
+            SyncGate::NoSync,
+            SyncGate::Dropped,
+            SyncGate::TimedOut,
+        ] {
+            assert!(!gate.writer_proven_gone(), "{gate:?} proved nothing");
+        }
+    }
+
+    /// The gate hands its verdict to the follow-up, so the tail decision is
+    /// made on what the sync actually reported.
+    #[tokio::test(start_paused = true)]
+    async fn the_follow_up_receives_the_sync_report() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(DeltaSyncOutcome::WriterNotGone).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        run_after_delta_sync("t-5".to_string(), Some(rx), NUDGE_SYNC_WAIT, move |gate| {
+            *sink.lock().unwrap() = Some(gate);
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(SyncGate::Reported(DeltaSyncOutcome::WriterNotGone))
+        );
+    }
+
+    // ---- Phase 2b: the watcher's busy policy -------------------------------
+
+    fn busy_screen() -> crate::terminal::graceful_exit::ScreenText {
+        let rule = "─".repeat(75);
+        v2_screen(
+            &["✻ Compiling… (esc to interrupt)", &rule, "❯\u{a0}", &rule],
+            2,
+            2,
+        )
+    }
+
+    /// Mutation check: dropping the `stand_down_on_busy` guard makes the
+    /// catch-up stand down on a busy pane (the second assert fails).
+    #[test]
+    fn the_nudge_stands_down_on_a_busy_pane_but_the_catch_up_waits_through_it() {
+        let mut debounce = ReadyDebounce::default();
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, IdleWait::NUDGE),
+            IdleStep::StandDown
+        );
+        let through = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, through),
+            IdleStep::Wait("the session is mid-turn".to_string())
+        );
+    }
+
+    /// The debounce still governs submission: a busy read between two ready
+    /// reads restarts it.
+    #[test]
+    fn a_busy_read_restarts_the_ready_debounce() {
+        let rule = "─".repeat(75);
+        let ready = v2_screen(
+            &[
+                "● Done.",
+                &rule,
+                "❯\u{a0}",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            2,
+            2,
+        );
+        let wait = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        let mut debounce = ReadyDebounce::default();
+        assert!(matches!(
+            idle_step(ready.clone(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(matches!(
+            idle_step(busy_screen(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(
+            matches!(
+                idle_step(ready.clone(), &mut debounce, wait),
+                IdleStep::Wait(_)
+            ),
+            "the busy read reset the debounce"
+        );
+        assert_eq!(idle_step(ready, &mut debounce, wait), IdleStep::Submit);
     }
 }

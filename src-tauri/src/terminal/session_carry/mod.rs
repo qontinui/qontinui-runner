@@ -55,12 +55,16 @@
 //! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
 //!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
-//!   writer may be live.
+//!   writer may be live. Its outcome gates the account migration's follow-up
+//!   (`account_migration::followup`), which then rescues the main
+//!   transcript's TAIL ([`tail::rescue_tail`], Phase 2b) — the lines the old
+//!   writer appended after the carry — only once the writer is proven gone.
 //!
 //! Plans `2026-10-12-account-migration-leaves-subagent-transcripts-behind`
 //! (the carry) and
 //! `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
-//! Phase 2 (this module, `delta_sync`, the subagent list).
+//! Phase 2 (this module, `delta_sync`, the subagent list) and Phase 2b (the
+//! tail rescue).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -70,6 +74,8 @@ use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
 use crate::terminal::graceful_exit::ProcIdentity;
+
+pub(crate) mod tail;
 
 #[cfg(test)]
 mod tests;
@@ -88,6 +94,11 @@ pub(crate) struct TranscriptCopy {
     /// The destination's `<sid>/` side-car dir the carry wrote into (beside
     /// [`Self::path`] — for a long cwd, the source's `<prefix>-<hash>` name).
     pub dst_session_dir: PathBuf,
+    /// How far into the SOURCE `<sid>.jsonl` the destination is known to
+    /// reach: the bytes this carry wrote, or the source's size when the
+    /// destination already held it. Everything the old writer appends past it
+    /// after the carry is the tail [`tail::rescue_tail`] rescues (Phase 2b).
+    pub transcript_offset: u64,
     /// The session's sibling directory (`<sid>/`), carried best-effort.
     pub session_dir: SessionDirCarry,
     /// Every regular file under `<sid>/` the carry looked at, with the source's
@@ -686,6 +697,16 @@ where
             Some(_) => false,
         }
     };
+    // Where the tail starts. When this carry wrote `dst`, the old writer may
+    // have appended between the stat above and the copy: the copied length,
+    // not the stat, is the offset. Nothing else writes `dst` yet — the respawn
+    // comes after the carry.
+    let transcript_offset = match &main_carry {
+        MainCarry::Copied | MainCarry::ExtendedPrefix | MainCarry::DivergedPreserved { .. } => {
+            std::fs::metadata(&dst).map_or(src_len, |meta| meta.len())
+        }
+        MainCarry::Present | MainCarry::KeptExisting => src_len,
+    };
     let live_source_wins = main == MainTranscript::LiveSourceWins;
     // A main transcript moved aside already kept the fork's
     // `custom-title.json` beside it ([`preserve_diverged_main`]).
@@ -752,6 +773,7 @@ where
         main: main_carry,
         src_session_dir,
         dst_session_dir,
+        transcript_offset,
         session_dir,
         files,
         subagents,
