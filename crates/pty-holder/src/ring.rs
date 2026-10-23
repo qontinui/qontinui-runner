@@ -36,6 +36,23 @@ impl OutputRing {
         }
     }
 
+    /// A ring of `capacity` holding exactly `bytes`, the first of which is at
+    /// absolute offset `start` — a successor holder's copy of its
+    /// predecessor's ring (plan Phase 8). Bytes past the capacity are dropped
+    /// from the FRONT, advancing the start, exactly as [`OutputRing::push`]
+    /// would have.
+    pub fn restore(capacity: usize, start: u64, bytes: &[u8]) -> Self {
+        let mut ring = OutputRing::new(capacity);
+        ring.start = start;
+        ring.push(bytes);
+        ring
+    }
+
+    /// Every byte held, oldest first, with the absolute offset of the first.
+    pub fn contents(&self) -> (u64, Vec<u8>) {
+        (self.start, self.buf.iter().copied().collect())
+    }
+
     /// Absolute offset of the oldest byte still held.
     pub fn start_offset(&self) -> u64 {
         self.start
@@ -136,6 +153,20 @@ mod tests {
                 assert_eq!(got, all[from as usize..want_end], "from {from} max {max}");
             }
         }
+    }
+
+    #[test]
+    fn pty_holder_handoff_ring_restore_keeps_absolute_offsets() {
+        let mut r = OutputRing::new(8);
+        r.push(b"0123456789");
+        let (start, bytes) = r.contents();
+        assert_eq!((start, bytes.as_slice()), (2, &b"23456789"[..]));
+        let back = OutputRing::restore(8, start, &bytes);
+        assert_eq!((back.start_offset(), back.end_offset()), (2, 10));
+        assert_eq!(back.slice_from(0, 100), (2, b"23456789".to_vec()));
+        // A smaller capacity keeps the newest bytes, at their true offsets.
+        let small = OutputRing::restore(4, start, &bytes);
+        assert_eq!(small.slice_from(0, 100), (6, b"6789".to_vec()));
     }
 
     #[test]

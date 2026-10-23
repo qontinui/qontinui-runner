@@ -26152,7 +26152,9 @@ mod spawn_tenant_credential_tests {
                 .code,
             TENANT_REPO_UNSETTLED_CODE
         );
-        tokio::runtime::Runtime::new()
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
             .unwrap()
             .block_on(establish_session_expectation(&a_nonce));
         let a_tenant = session_tenant_or_refuse(Some(&a_nonce)).unwrap();

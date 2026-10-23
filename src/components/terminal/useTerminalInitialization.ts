@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -216,25 +217,52 @@ export function ownsReleasedPage(
   return !bindings[pageId];
 }
 
+/** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
+export const ABORT_RETRY_LIMIT = 3;
+/**
+ * The first such re-run's delay; each later one doubles it (2 s, 4 s, 8 s), so
+ * the last retry fires ~14 s after the first abort — well inside the ~3 min
+ * (4 × 45 s ticks) before the lifecycle poll retires an unmatched record.
+ */
+export const ABORT_RETRY_BASE_MS = 2_000;
+
+/** How a restore run of a page ended. */
+export type RestoreRunOutcome = "restored" | "aborted" | "deferred";
+
 /**
  * Serializes the targeted re-runs of each page's restore (review round 7,
  * U1). A late sweep settle and a released holder can both ask for a re-run of
  * the same page, for the same session, while a run is still in flight; two
  * runs racing would each cold-resume it. Ids scheduled while a run of the
  * page is in flight are only merged, and the run's end triggers ONE re-run
- * for all of them (none when that run restored nothing — its full retry
- * covers every id). A page this window has not begun restoring is not re-run
+ * for all of them. A page this window has not begun restoring is not re-run
  * at all: its first full restore, whenever it runs, covers every id — and a
- * window that does not own the page never restores it. Exported for tests.
+ * window that does not own the page never restores it.
+ *
+ * An ABORTED run (indeterminate reconnect) restored nothing, but its page
+ * stays known and every id it owed is KEPT (review V1, coord finding
+ * c7d478a8): dropping them left a released session unresumed until the
+ * operator re-activated the page, and the lifecycle poll retires such a
+ * record within minutes. The queue re-runs the page itself, at most
+ * {@link ABORT_RETRY_LIMIT} times in a row with a doubling backoff; past
+ * that, the ids wait for the next schedule or activation — never a loop. A
+ * page with no completed restore re-runs IN FULL, which covers the ids. A
+ * drain-deferred run drops them: the drain lift re-runs the page in full.
+ * Exported for tests.
  */
 export class RestoreRerunQueue {
   private readonly inFlight = new Set<string>();
   private readonly restored = new Set<string>();
+  /** Consecutive aborted runs per page; a page in here is known. */
+  private readonly aborted = new Map<string, number>();
   private readonly pending = new Map<string, Set<string>>();
+  /** The ids each in-flight run took, given back if it aborts. */
+  private readonly taken = new Map<string, Set<string>>();
 
   /** Merge `sessionIds` for `pageId`; true when the caller must trigger a re-run now. */
   schedule(pageId: string, sessionIds: readonly string[]): boolean {
-    const known = this.restored.has(pageId) || this.inFlight.has(pageId);
+    const known =
+      this.restored.has(pageId) || this.inFlight.has(pageId) || this.aborted.has(pageId);
     if (!known || sessionIds.length === 0) return false;
     const merged = this.pending.get(pageId) ?? new Set<string>();
     for (const id of sessionIds) merged.add(id);
@@ -242,27 +270,54 @@ export class RestoreRerunQueue {
     return !this.inFlight.has(pageId);
   }
 
-  /**
-   * A run of `pageId` starts. Returns the ids it alone must restore, or
-   * `undefined` for a full restore.
-   */
-  begin(pageId: string): ReadonlySet<string> | undefined {
-    this.inFlight.add(pageId);
-    const only = this.pending.get(pageId);
-    this.pending.delete(pageId);
-    return only;
+  /** Whether ids for `pageId` are still owed a re-run. */
+  owes(pageId: string): boolean {
+    return (this.pending.get(pageId)?.size ?? 0) > 0;
+  }
+
+  /** Whether a restore of `pageId` has completed — a re-run of it merges. */
+  restoredOnce(pageId: string): boolean {
+    return this.restored.has(pageId);
   }
 
   /**
-   * The run of `pageId` ended; `restored` is false when it restored nothing
-   * (aborted or deferred — the full retry covers every id). True when ids
-   * were scheduled meanwhile: the caller triggers one re-run.
+   * A run of `pageId` starts. Returns the ids it alone must restore, or
+   * `undefined` for a full restore — always, until a restore of the page has
+   * completed.
    */
-  finish(pageId: string, restored: boolean): boolean {
+  begin(pageId: string): ReadonlySet<string> | undefined {
+    this.inFlight.add(pageId);
+    const ids = this.pending.get(pageId);
+    this.pending.delete(pageId);
+    if (ids) this.taken.set(pageId, ids);
+    else this.taken.delete(pageId);
+    return this.restored.has(pageId) ? ids : undefined;
+  }
+
+  /**
+   * The run of `pageId` ended with `outcome`. Returns `null` for no re-run,
+   * or the delay in ms after which the caller triggers ONE re-run (`0`: now).
+   */
+  finish(pageId: string, outcome: RestoreRunOutcome): number | null {
     this.inFlight.delete(pageId);
-    if (restored) this.restored.add(pageId);
-    else this.pending.delete(pageId);
-    return (this.pending.get(pageId)?.size ?? 0) > 0;
+    const taken = this.taken.get(pageId);
+    this.taken.delete(pageId);
+    if (outcome === "deferred") {
+      this.pending.delete(pageId);
+      return null;
+    }
+    if (outcome === "restored") {
+      this.restored.add(pageId);
+      this.aborted.delete(pageId);
+      return (this.pending.get(pageId)?.size ?? 0) > 0 ? 0 : null;
+    }
+    const kept = this.pending.get(pageId) ?? new Set<string>();
+    for (const id of taken ?? []) kept.add(id);
+    if (kept.size > 0) this.pending.set(pageId, kept);
+    const streak = (this.aborted.get(pageId) ?? 0) + 1;
+    this.aborted.set(pageId, streak);
+    if (kept.size === 0 || streak > ABORT_RETRY_LIMIT) return null;
+    return ABORT_RETRY_BASE_MS * 2 ** (streak - 1);
   }
 }
 
@@ -285,6 +340,108 @@ export class ColdResumeGuard {
   release(sessionId: string): void {
     this.claimed.delete(sessionId);
   }
+}
+
+/**
+ * One backoff timer per page for an aborted restore's retry (review V1, r1).
+ * Setting a page's timer replaces the previous one; a run of the page
+ * beginning cancels it (see {@link beginRestoreRun}). While inactive — the
+ * hook unmounted — nothing is scheduled and every pending timer is cleared,
+ * so a run that ends after unmount cannot leave one behind. Exported for
+ * tests.
+ */
+export class RerunTimers {
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private active = true;
+
+  /** Mount (`true`) / unmount (`false`); unmounting clears every timer. */
+  setActive(active: boolean): void {
+    this.active = active;
+    if (!active) {
+      for (const t of this.timers.values()) clearTimeout(t);
+      this.timers.clear();
+    }
+  }
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  set(pageId: string, delayMs: number, fire: () => void): void {
+    if (!this.active) return;
+    this.cancel(pageId);
+    const timer = setTimeout(() => {
+      this.timers.delete(pageId);
+      fire();
+    }, delayMs);
+    this.timers.set(pageId, timer);
+  }
+
+  cancel(pageId: string): void {
+    const timer = this.timers.get(pageId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.timers.delete(pageId);
+  }
+}
+
+/** The hook's restore re-run wiring, extracted so it is driven by tests. */
+export interface RestoreRerunWiring {
+  queue: RestoreRerunQueue;
+  timers: RerunTimers;
+  /** Put `pageId` into the hook's `drainDeferredPages`: its next run MERGES. */
+  markMerging: (pageId: string) => void;
+  /** Re-run `pageId`'s restore; `merge` marks it a merging re-run. */
+  trigger: (pageId: string, merge: boolean) => void;
+}
+
+/** A run of `pageId` starts: its pending backoff retry is moot. See {@link RestoreRerunQueue.begin}. */
+export function beginRestoreRun(
+  w: RestoreRerunWiring,
+  pageId: string,
+): ReadonlySet<string> | undefined {
+  w.timers.cancel(pageId);
+  return w.queue.begin(pageId);
+}
+
+/** Merge `sessionIds` for a re-run of `pageId`, triggering it when no run is in flight. */
+export function scheduleRestoreRerun(
+  w: RestoreRerunWiring,
+  pageId: string,
+  sessionIds: readonly string[],
+): void {
+  // A page whose restore only ever aborted re-runs as its first restore
+  // (unless the aborted run was itself a merging one — it is then in
+  // `drainDeferredPages`, which makes the re-run merge however triggered).
+  if (w.queue.schedule(pageId, sessionIds)) w.trigger(pageId, w.queue.restoredOnce(pageId));
+}
+
+/**
+ * A run of `pageId` ended with `outcome`. An aborted merging re-run puts its
+ * page back into `drainDeferredPages`, so EVERY retry path — a schedule, an
+ * activation, the backoff timer — re-runs it merging. Then: one re-run now
+ * for ids scheduled meanwhile, or a backoff retry for the ids an abort still
+ * owes. The retry re-reads the queue when it fires: nothing owed (a run took
+ * them meanwhile), nothing runs; merging is decided then, not at scheduling.
+ * Once unmounted, nothing is scheduled.
+ */
+export function settleRestoreRun(
+  w: RestoreRerunWiring,
+  pageId: string,
+  outcome: RestoreRunOutcome,
+  wasMergingRun: boolean,
+): void {
+  if (outcome === "aborted" && wasMergingRun) w.markMerging(pageId);
+  const after = w.queue.finish(pageId, outcome);
+  if (after === null || !w.timers.isActive) return;
+  if (after === 0) {
+    w.trigger(pageId, true);
+    return;
+  }
+  w.timers.set(pageId, after, () => {
+    if (!w.queue.owes(pageId)) return;
+    w.trigger(pageId, w.queue.restoredOnce(pageId));
+  });
 }
 
 /** The restore set for a page, or the coord device drain's deferral of it. */
@@ -396,46 +553,41 @@ export function recordBelongsToRestore(
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
  *
- * Autonomous resume (`--permission-mode bypassPermissions`, matching the
- * zone-profile + shell-integration resume builders): a boot-restored session
- * is unattended, so a bare `claude --resume` would stall forever on its first
- * permission prompt. Aligned with PR #547 — whichever lands second resolves
- * the textual conflict by keeping this union form.
+ * Every resume, for every provider, is RENDERED BY THE BACKEND
+ * (`build_ai_resume_command`), never assembled here. The backend owns the two decisions a typed resume must not
+ * get wrong: which `CLAUDE_CONFIG_DIR` the session runs under (a declared model
+ * gateway replaces the recorded subscription dir, so a subscription token can
+ * never ride a gateway-routed session) and the permission posture (bypass, or
+ * the operator's allow-list). The resume-summary env thresholds ride along
+ * under the default `"full"` policy.
  *
- * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
- * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
- * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
- * the resume-summary env thresholds are applied ONLY when the resolved program
- * is Claude — they are CLI-specific and harmless to omit for other providers.
+ * A non-Claude provider is rendered there too (review N7): the backend
+ * applies the gateway's provider refusal and validates/quotes the session id.
  */
-export function buildResumeCmd(
+export async function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
-): string {
-  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
-  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
-  // boot restore is not Claude-hardcoded.
-  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
-  const program = argv[0];
-  const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
-  const env: Array<[string, string]> = [];
-  if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
-  if (isClaude && policy === "full") {
-    env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
-    env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
-  }
-  if (env.length === 0) return `${base}\r`;
+): Promise<string> {
+  // Every provider is rendered by the backend (review N7): a provider that
+  // cannot route through a declared model gateway is refused there, and the
+  // session id is validated/quoted there — never assembled here.
+  const resumeProvider = provider ?? "claude";
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  const resp = await invoke<CommandResponse>("build_ai_resume_command", {
+    sessionId,
+    provider: resumeProvider,
+    configDir: configDir ?? null,
+    isWindows,
+    fullResume: policy === "full",
+  });
+  const command = (resp?.data as { command?: string } | null | undefined)?.command;
+  if (!resp?.success || !command) {
+    throw new Error(resp?.message ?? "build_ai_resume_command returned no command");
+  }
+  return `${command}\r`;
 }
 
 /**
@@ -486,7 +638,17 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  let resumeCmd: string;
+  try {
+    resumeCmd = await buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  } catch (err) {
+    // The backend refused to render a resume (e.g. an unresolved model
+    // gateway). Type nothing; park the tab for an explicit retry and keep the
+    // restore-pending marker, exactly like an unverified resume.
+    console.warn(`[TerminalPage] resume not rendered for ${claudeSessionId}:`, err);
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    return "failed";
+  }
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -1030,10 +1192,15 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
-    assignTabToZone: (zoneIdx: number, tabId: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
+    /**
+     * Place a restored session at its recorded GRID zone — into the grid in
+     * grid mode, into the grid snapshot in tmux mode (never onto the screen).
+     */
+    placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    assignments: Record<number, string>;
+    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
+    gridView: { assignments: Record<number, string> };
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -1068,8 +1235,10 @@ interface UseTerminalInitializationParams {
     clearSavedLayout: () => void;
     hasSavedLayout: () => boolean;
   };
+  /** The grid as persisted: `useZoneLayout().gridView` plus the zone cosmetics. */
   layoutState: {
     layoutId: string;
+    assignments: Record<number, string>;
     zoneLabels: Record<number, string>;
     zoneNotes: Record<number, string>;
     pinnedZones: Set<number>;
@@ -1184,23 +1353,38 @@ export function useTerminalInitialization({
   // `recheckRefusedAfterSweep`), per page, and the page runs in flight. A
   // re-run triggered for them (the same epoch bump as a drain re-run)
   // restores exactly these records — one run per page at a time.
-  const rerunQueue = useRef(new RestoreRerunQueue());
   // Sessions a run is creating a tab for right now.
   const coldResumeGuard = useRef(new ColdResumeGuard());
-  const triggerRerun = useCallback((forPage: string) => {
-    drainDeferredPages.current.add(forPage);
+  // Re-run `forPage`'s restore: merging into its live tabs (`merge`, like a
+  // drain re-run), or — retrying an aborted first restore — as that restore.
+  const triggerRerun = useCallback((forPage: string, merge = true) => {
+    if (merge) drainDeferredPages.current.add(forPage);
     didInitPages.current.delete(forPage);
     setDrainResumeEpoch((n) => n + 1);
   }, []);
+  // The re-run queue, an aborted restore's backoff retries (review V1) and
+  // how they trigger a re-run. Stable for the hook's lifetime.
+  const [rerun] = useState<RestoreRerunWiring>(() => ({
+    queue: new RestoreRerunQueue(),
+    timers: new RerunTimers(),
+    markMerging: (forPage) => drainDeferredPages.current.add(forPage),
+    trigger: triggerRerun,
+  }));
+  // Active while mounted (re-armed on a StrictMode re-mount); unmounting
+  // clears the timers and stops a run that ends later from scheduling one.
+  useEffect(() => {
+    rerun.timers.setActive(true);
+    return () => rerun.timers.setActive(false);
+  }, [rerun]);
   // Re-run the restore of `forPage` (merging, like a drain re-run) for
   // exactly `sessionIds` — after a late sweep settle, or a session a dead
   // holder handed back. The active page re-runs now (or when its run in
   // flight ends); another page when it is next activated.
   const scheduleRecheckRerun = useCallback(
     (forPage: string, sessionIds: string[]) => {
-      if (rerunQueue.current.schedule(forPage, sessionIds)) triggerRerun(forPage);
+      scheduleRestoreRerun(rerun, forPage, sessionIds);
     },
-    [triggerRerun],
+    [rerun],
   );
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1249,7 +1433,7 @@ export function useTerminalInitialization({
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
     // A re-run for the holder sweep's late settle restores only these. Ids
     // scheduled while this run is in flight wait for its end.
-    const recheckOnly = rerunQueue.current.begin(initPageId);
+    const recheckOnly = beginRestoreRun(rerun, initPageId);
     // Sessions this run claimed for a cold resume; released when it ends.
     const coldClaims: string[] = [];
     // The drain withheld the restore set: this run restored nothing.
@@ -1418,7 +1602,7 @@ export function useTerminalInitialization({
             saved.layoutId === FLOW_GRID_ID ||
             LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
           ) {
-            zoneLayout.setLayoutId(saved.layoutId);
+            zoneLayout.setLayoutId(saved.layoutId, { source: "restore" });
           }
         }
 
@@ -1457,8 +1641,15 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-              zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                zoneLayout.gridView.assignments,
+              )
+            ) {
+              zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
             updateTab(tabId, {
@@ -1536,8 +1727,15 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-            zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              zoneLayout.gridView.assignments,
+            )
+          ) {
+            zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
           updateTab(tabId, {
@@ -1662,7 +1860,7 @@ export function useTerminalInitialization({
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
             if (tabId && session.zoneIndex >= 0) {
-              zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+              zoneLayout.placeRestoredTab(session.zoneIndex, tabId);
               applyZoneCosmetics(session.zoneIndex);
             }
           }
@@ -1841,17 +2039,21 @@ export function useTerminalInitialization({
           });
         }
         for (const id of coldClaims) coldResumeGuard.current.release(id);
-        // Re-runs scheduled while this run was in flight: one, now.
-        if (rerunQueue.current.finish(initPageId, !restoreAborted && !restoreDeferred)) {
-          triggerRerun(initPageId);
-        }
+        // Re-runs scheduled while this run was in flight: one, now — or,
+        // after an abort, a bounded retry for the ids it still owes.
+        settleRestoreRun(
+          rerun,
+          initPageId,
+          restoreAborted ? "aborted" : restoreDeferred ? "deferred" : "restored",
+          isDrainRerun,
+        );
       }
     })();
   }, [
     pageId,
     drainResumeEpoch,
     scheduleRecheckRerun,
-    triggerRerun,
+    rerun,
     reconnectToExistingSessions,
     createTerminal,
     adoptWorkerTab,
@@ -1877,7 +2079,7 @@ export function useTerminalInitialization({
     sessionPersistence.saveSessionLayout({
       layoutId: layoutState.layoutId,
       tabs,
-      assignments: zoneLayout.assignments,
+      assignments: layoutState.assignments,
       zoneLabels: layoutState.zoneLabels,
       zoneNotes: layoutState.zoneNotes,
       pinnedZones: layoutState.pinnedZones,
@@ -1886,7 +2088,7 @@ export function useTerminalInitialization({
   }, [
     pageId,
     tabs,
-    zoneLayout.assignments,
+    layoutState.assignments,
     layoutState.layoutId,
     layoutState.focusedZone,
     layoutState.zoneLabels,
@@ -1900,10 +2102,6 @@ export function useTerminalInitialization({
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
-  const zoneLayoutRef = useRef(zoneLayout);
-  useEffect(() => {
-    zoneLayoutRef.current = zoneLayout;
-  }, [zoneLayout]);
   const layoutStateRef = useRef(layoutState);
   useEffect(() => {
     layoutStateRef.current = layoutState;
@@ -1919,7 +2117,7 @@ export function useTerminalInitialization({
         sessionPersistence.saveSessionLayout({
           layoutId: ls.layoutId,
           tabs: currentTabs,
-          assignments: zoneLayoutRef.current.assignments,
+          assignments: ls.assignments,
           zoneLabels: ls.zoneLabels,
           zoneNotes: ls.zoneNotes,
           pinnedZones: ls.pinnedZones,
@@ -1946,7 +2144,8 @@ export function useTerminalInitialization({
       const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
       const pathMap = await sessionPersistence.saveScrollbackBuffers(terminalTabs);
       const tabIdToSessionIndex: Record<string, number> = {};
-      const currentAssignments = zoneLayoutRef.current.assignments;
+      // The same assignments the layout save walks, so the indices line up.
+      const currentAssignments = layoutStateRef.current.assignments;
       const assignedTabIds = new Set(Object.values(currentAssignments));
       let idx = 0;
       for (const [, tabId] of Object.entries(currentAssignments)) {

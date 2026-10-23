@@ -345,6 +345,37 @@ impl Client {
         }
     }
 
+    /// `prepare_upgrade` (plan Phase 8, a FROZEN envelope verb, so it works
+    /// on a holder that speaks none of this runner's data-path versions):
+    /// hand the pane to a successor holder started from the holder's own
+    /// executable path. Waits for the whole exchange. Its worst case is the
+    /// sum of the holder's bounds — input freeze 2 s, quiesce 2 s, ack 15 s,
+    /// input drain 2 s, commit write 15 s, `serving` 5 s: about 41 s — so give
+    /// `deadline` at least 45 s. A client that gives up first gets an error
+    /// for an upgrade whose outcome is UNKNOWN: it may have committed or been
+    /// rolled back; probe the pane (`hello_ack.holder_pid`) to learn which.
+    ///
+    /// After [`UpgradeOutcome::Upgraded`] this connection is dead (the old
+    /// holder exits) and every other connection to the pane drops; a client
+    /// reattaches at its own last offset and finds the successor. After
+    /// `Failed`/`Unsupported` the old holder still serves, untouched.
+    pub fn prepare_upgrade(&mut self, deadline: Instant) -> Result<UpgradeOutcome, ConnectError> {
+        match self.request(&Request::PrepareUpgrade, deadline)? {
+            Reply::Upgraded {
+                successor_pid,
+                handoff_offset,
+            } => Ok(UpgradeOutcome::Upgraded {
+                successor_pid,
+                handoff_offset,
+            }),
+            Reply::UpgradeFailed { reason } => Ok(UpgradeOutcome::Failed(reason)),
+            Reply::Unsupported { reason, .. } => Ok(UpgradeOutcome::Unsupported(reason)),
+            other => self.poison_on_err(Err(ConnectError::Protocol(format!(
+                "expected upgraded / upgrade_failed / unsupported, got {other:?}"
+            )))),
+        }
+    }
+
     /// Send a raw frame. For tests of the holder's refusal paths; a runner
     /// sends typed requests. Poisons on failure, like [`Client::request`].
     pub fn send_raw_frame(
@@ -449,6 +480,22 @@ impl Client {
             writer: StreamWriter { conn: writer },
         })
     }
+}
+
+/// How a `prepare_upgrade` ended ([`Client::prepare_upgrade`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeOutcome {
+    /// `successor_pid` serves the pane now, from stream offset
+    /// `handoff_offset`; same child, same offsets.
+    Upgraded {
+        successor_pid: u32,
+        handoff_offset: u64,
+    },
+    /// Rolled back: the old holder keeps serving; nothing was lost.
+    Failed(String),
+    /// This holder cannot be upgraded in place — a Windows holder (plan D12:
+    /// leave it running, or end and resume it) or one built before Phase 8.
+    Unsupported(String),
 }
 
 /// An attached connection, split. Drop both halves to close it (the child
@@ -836,6 +883,24 @@ pub fn census_with_versions(
     skip: &[PaneId],
     versions: &[u32],
 ) -> io::Result<Vec<CensusEntry>> {
+    census_with_skip(pane_dir, timeout, || skip.to_vec(), versions)
+}
+
+/// [`census_with_versions`] with the skip list read LATE: `skip` is called
+/// once, AFTER the pane directory has been enumerated and before any pane is
+/// probed. A caller whose set of panes-being-spawned changes concurrently
+/// (the runner's in-flight terminal ids) reads it here, so a pane that began
+/// spawning before the walk saw its lock file is in the list the walk is
+/// filtered by — never probed, so never robbed of its lock. A pane that
+/// begins spawning after this read had no lock file when the directory was
+/// enumerated, so the walk cannot see it; the caller must account for it
+/// separately (the runner adds a row for every in-flight id afterwards).
+pub fn census_with_skip(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: impl FnOnce() -> Vec<PaneId>,
+    versions: &[u32],
+) -> io::Result<Vec<CensusEntry>> {
     let deadline = Instant::now() + timeout;
     match check_private_dir(pane_dir) {
         Ok(()) => {}
@@ -860,6 +925,7 @@ pub fn census_with_versions(
         };
         stems.push(stem);
     }
+    let skip = skip();
 
     let (tx, rx) = mpsc::channel::<CensusEntry>();
     let mut rows: Vec<CensusEntry> = Vec::new();

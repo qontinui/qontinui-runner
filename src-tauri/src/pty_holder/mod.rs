@@ -14,8 +14,14 @@
 //!   typed `unprotected` outcome, Windows job breakaway, verified-pid
 //!   teardown, reaping).
 //! - The pane side is the bin's `terminal::daemon_pane_io::DaemonPaneIo`, the
-//!   third `PaneIo` impl, chosen per spawn by the default-OFF
-//!   `terminal.pty_holder` setting (`settings::TerminalSettings`).
+//!   third `PaneIo` impl, chosen per spawn by the `terminal.pty_holder`
+//!   setting (`settings::TerminalSettings`; default ON on Linux since Phase
+//!   5, OFF on Windows and macOS).
+//!
+//! Phase 5 makes `/restart-readiness` count holder panes: the bin's
+//! `terminal::holder_census` takes the same census the boot sweep classifies
+//! by, fresh on every pass, and `session::tracking_health` inserts it into its
+//! partition.
 //!
 //! The Phase 0 survival spike (`--pty-holder-spike` in `main()`, its module and
 //! its integration test) was deleted here: its spawn requirements now live in

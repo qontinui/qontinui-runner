@@ -21,6 +21,7 @@ import {
   reorderPagesArray,
   keyboardReorderTarget,
   computeVisiblePages,
+  emptyPageIds,
   pageIdsFromTerminals,
   pageIdsFromSessions,
   applyPageDefaultWorkingDir,
@@ -441,5 +442,27 @@ describe("page persistence round-trip (defaultWorkingDir)", () => {
 
   it("still injects the implicit default page when nothing is persisted", () => {
     expect(loadPages()).toEqual([{ id: "default", name: "Terminal", createdAt: 0 }]);
+  });
+});
+
+describe("emptyPageIds (close empty tabs)", () => {
+  const a: TerminalPageConfig = { id: "a", name: "A", createdAt: 1 };
+  const b: TerminalPageConfig = { id: "b", name: "B", createdAt: 2 };
+  const c: TerminalPageConfig = { id: "c", name: "C", createdAt: 3 };
+
+  it("returns only pages with no live or restorable session", () => {
+    expect(emptyPageIds([a, b, c], new Set(["b"]))).toEqual(["a", "c"]);
+  });
+
+  it("never selects the internal default page", () => {
+    expect(emptyPageIds([DEFAULT, a, b], new Set(["b"]))).toEqual(["a"]);
+  });
+
+  it("keeps the first page when every page is empty", () => {
+    expect(emptyPageIds([a, b, c], new Set())).toEqual(["b", "c"]);
+  });
+
+  it("returns nothing when all pages are occupied", () => {
+    expect(emptyPageIds([a, b], new Set(["a", "b"]))).toEqual([]);
   });
 });
