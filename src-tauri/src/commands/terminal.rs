@@ -2000,12 +2000,10 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
 ///
-/// `target_config_dir: None` auto-picks the configured account whose spare
-/// weekly capacity is closest to expiring — among accounts under their
-/// projected pace, the one furthest through its 7-day window, since unused
-/// capacity does not roll over past the reset
-/// (`ai_provider::config::cmp_rank`) — excluding the session's current
-/// account.
+/// `target_config_dir: None` auto-picks a target with the selection mode's
+/// handoff strategy (`ai_provider::pick_migration_target`), excluding the
+/// session's current account; an explicit target is recorded as a handoff
+/// too.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -2022,6 +2020,7 @@ pub async fn terminal_migrate_session_account(
         .or_else(crate::ai_provider::get_resolved_config_dir)
         .ok_or("the session's current account is unknown — cannot migrate")?;
 
+    let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
         Some(d) => {
             if !crate::settings::get_claude_config_dirs().contains(&d) {
@@ -2036,8 +2035,16 @@ pub async fn terminal_migrate_session_account(
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
+    // A picked target is already in the handoff ledger; an explicit one is not.
+    if explicit_target {
+        crate::ai_provider::record_handoff(&dst);
+    }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
+        .inspect_err(|_| {
+            // The session never reached `dst`: it must not count as a handoff.
+            crate::ai_provider::unrecord_handoff(&dst);
+        })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(

@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
         assert_eq!(parsed.config_dir, None);
         // A roster written before the pin existed decodes UNPINNED.
@@ -717,21 +717,14 @@ mod tests {
     /// not pass by agreeing with itself.
     #[test]
     fn resolver_grid_pinned_keeps_local_unpinned_takes_the_fleet() {
-        let modes = [
-            AccountSelectionMode::Manual,
-            AccountSelectionMode::LeastUsage,
-            AccountSelectionMode::HighestExpectedUsage,
-        ];
-        let fleets = [
-            None,
-            Some(AccountSelectionMode::Manual),
-            Some(AccountSelectionMode::LeastUsage),
-            Some(AccountSelectionMode::HighestExpectedUsage),
-        ];
+        let modes = AccountSelectionMode::ALL;
+        let fleets: Vec<Option<AccountSelectionMode>> = std::iter::once(None)
+            .chain(modes.into_iter().map(Some))
+            .collect();
         let mut cells = 0;
         for local in modes {
             for pinned in [true, false] {
-                for fleet in fleets {
+                for &fleet in &fleets {
                     let expected = match (pinned, fleet) {
                         (true, _) => (local, AccountSelectionSource::Pinned),
                         (false, Some(f)) => (f, AccountSelectionSource::Fleet),
@@ -751,7 +744,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cells, 24);
+        assert_eq!(cells, 60);
 
         // Literal anchors for the two cells the design turns on.
         assert_eq!(
