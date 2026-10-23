@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 pub use qontinui_pty_holder::pane::PaneId;
 pub use qontinui_pty_holder::spawn::{
     spawn_holder, HostFacts, ResolvedRoute, RouteRequest, SpawnError, SpawnRequest, SpawnedHolder,
-    Unprotected, DEFAULT_REPORT_TIMEOUT,
+    Unprotected, DEFAULT_REPORT_TIMEOUT, NEW_TAB_SPAWN_BUDGET,
 };
 pub use qontinui_pty_holder::spec::ChildSpec;
 

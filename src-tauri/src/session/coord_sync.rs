@@ -98,9 +98,13 @@
 //! while coord keeps taking OTHER rows is quarantined after
 //! [`QUARANTINE_AFTER_SERVING_FAILURES`] such failures (a retried 429 never
 //! counts — coord pacing this runner is not coord refusing the row). The kinds
-//! that retry a 429 are `output_chunk` (any 429 but `warm_quota_exceeded`) and
-//! the session LIFECYCLE kinds `started` / `state_change` / `closed`
-//! ([`is_lifecycle_kind`]), whose loss would leave coord's row wrong for good;
+//! that retry a 429 are `output_chunk` (any 429 whose body `error` is not
+//! `warm_quota_exceeded` or `transcript_sync_disabled` — those two are standing
+//! tenant answers and ACK-drop the chunk, except a `transcript_sync_disabled`
+//! carrying `column_missing: true`, coord's deploy-window stand-in, which is
+//! retried) and the session LIFECYCLE kinds
+//! `started` / `state_change` / `closed` / `finished` ([`is_lifecycle_kind`]),
+//! whose loss would leave coord's row wrong for good;
 //! every other kind treats a 429 as coord refusing the row and ACK-drops it:
 //! its rows move to the `<outbox>.quarantine.jsonl` sidecar with a `warn!`,
 //! and stop being retried. Only a row coord itself took counts as "taking" —
@@ -323,6 +327,17 @@ impl CoordSync {
                 held: Mutex::new(HashSet::new()),
             }),
         }
+    }
+
+    /// Test-only: rebuild this (not yet shared) facade's dual-write gate with
+    /// a fast flag-poll cadence, so a test can watch the real poll loop
+    /// follow a pin switch in milliseconds rather than a minute.
+    #[cfg(test)]
+    pub fn with_flag_poll_interval_for_test(mut self, interval: Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("call before the facade is shared")
+            .dual_write = DualWriteGate::new_for_test(None, interval);
+        self
     }
 
     /// Borrow the local outbox. Phase 2 surface — unchanged.
@@ -612,15 +627,15 @@ impl CoordSync {
     /// `/tenant-policy?tenant_id=<id>` on a slow cadence and caches the
     /// `session_coordination_enabled` flag into the [`DualWriteGate`].
     ///
-    /// Short-circuits to a permanent no-op when no `active_tenant_id`
-    /// resolved from `machine.json` (single-tenant operators, MSI today)
-    /// — the gate then never opens regardless of any tenant's flag.
-    /// Returns `None` in that case so `main.rs` doesn't hold a dead
-    /// handle.
-    pub fn start_flag_poll_task(&self) -> Option<JoinHandle<()>> {
-        let tenant_id = self.inner.dual_write.tenant_id()?;
+    /// ALWAYS spawned, including on a machine with no `active_tenant_id`:
+    /// the loop re-reads the pin every tick ([`run_flag_poll_loop`]), so a
+    /// machine that is unpinned at boot and pinned later — by
+    /// `PUT /tenant/active`, the Tauri switcher, or a hand edit — is followed
+    /// without a restart. An unpinned tick asks coord nothing, so the idle
+    /// cost is one local file read per interval.
+    pub fn start_flag_poll_task(&self) -> JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
-        Some(tokio::spawn(run_flag_poll_loop(inner, tenant_id)))
+        tokio::spawn(run_flag_poll_loop(inner))
     }
 
     /// Phase 10 dual-write entry point — called by the **legacy** session
@@ -1017,15 +1032,116 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
-/// `PATCH`) and its end (`closed` → `PATCH {state:"closed"}`). A 429 on one of
-/// these is retried rather than ACK-dropped (see `push_record`), because each
-/// is a one-shot fact no later row repeats. `heartbeat` is deliberately NOT
+/// `PATCH`), its end (`closed` → `PATCH {state:"closed"}`) and its work axis
+/// (`finished` → `PATCH {progress:{session_status:"finished"}}`, coord's
+/// work axis — read by coord's prompting gate and, through
+/// `GET /coord/sessions/work-status`, by this runner's restart-readiness
+/// verdict and drained-runner wind-down; resume offers do NOT read it, they
+/// come from the local lifecycle store). A 429 on one of these is retried
+/// rather than ACK-dropped (see `push_record`), because each is a one-shot
+/// fact no later row repeats. `heartbeat` is deliberately NOT
 /// here: the next heartbeat supersedes a dropped one within a tick, and
 /// retrying it would only hold the session's chain behind a stale stamp.
 fn is_lifecycle_kind(kind: &str) -> bool {
     kind == SessionEventKind::Started.as_str()
         || kind == SessionEventKind::StateChange.as_str()
         || kind == SessionEventKind::Closed.as_str()
+        || kind == SessionEventKind::Finished.as_str()
+}
+
+/// The `error` reasons coord answers an `output_chunk` 429 with that are
+/// STANDING tenant answers rather than pacing: `warm_quota_exceeded` (the
+/// tenant's warm transcript quota is spent) and `transcript_sync_disabled`
+/// (the tenant has transcript sync turned off). Retrying either cannot succeed
+/// until the tenant's state changes, and because a session's rows push in
+/// order it would hold that session's later lifecycle rows behind the chunk
+/// indefinitely — so both ACK-drop the chunk. Any other 429 (an edge or proxy
+/// rate limit, or a body that is not coord's JSON) stays retryable.
+///
+/// One exception, read from the body rather than the code: coord sends the
+/// SAME `transcript_sync_disabled` code with `"column_missing": true` during
+/// the deploy window in which `coord.tenant_policies.transcript_sync_enabled`
+/// is not provisioned yet (`transcript_sync_refusal` in qontinui-coord
+/// `crates/coord/src/sessions.rs` fails closed there). That is not an admin
+/// decision and clears on its own when the migration lands, so it stays a
+/// retried `Transport` — only `column_missing` false or absent ACK-drops.
+const OUTPUT_CHUNK_TERMINAL_429_REASONS: [&str; 2] =
+    ["warm_quota_exceeded", "transcript_sync_disabled"];
+
+/// coord's JSON answer to a 429 on `POST /sessions/:id/output`, parsed from
+/// its `error` field (never a substring of the raw body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputChunk429 {
+    /// coord's `error` code, verbatim.
+    pub error: String,
+    /// `true` only when the body carries `"column_missing": true` — the
+    /// deploy-window stand-in for `transcript_sync_disabled`.
+    pub column_missing: bool,
+}
+
+impl OutputChunk429 {
+    /// The reason this refusal ACK-drops the chunk, or `None` when it is
+    /// retryable (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]).
+    fn terminal_reason(&self) -> Option<&'static str> {
+        if self.error == "transcript_sync_disabled" && self.column_missing {
+            return None;
+        }
+        OUTPUT_CHUNK_TERMINAL_429_REASONS
+            .iter()
+            .copied()
+            .find(|r| *r == self.error)
+    }
+
+    /// Human-readable reason for a log line.
+    fn label(&self) -> String {
+        if self.column_missing {
+            format!("{} (coord column not provisioned yet)", self.error)
+        } else {
+            self.error.clone()
+        }
+    }
+}
+
+/// Parse an `output_chunk` 429 response body into coord's `error` code (and
+/// its `column_missing` flag). `None` when the body is not JSON or carries no
+/// string `error` — an intermediary's page, or a bare edge rate limit.
+pub(crate) fn parse_output_chunk_429(body: &str) -> Option<OutputChunk429> {
+    let parsed: JsonValue = serde_json::from_str(body).ok()?;
+    let error = parsed.get("error")?.as_str()?.to_string();
+    let column_missing = parsed
+        .get("column_missing")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    Some(OutputChunk429 {
+        error,
+        column_missing,
+    })
+}
+
+/// Return the parsed `error` field of an `output_chunk` 429 body when it is
+/// a terminal refusal (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]). Reads the
+/// parsed field, not a substring, so a `detail` string or an intermediary's
+/// page that merely mentions a reason does not turn a retryable 429 into a
+/// drop.
+fn output_chunk_terminal_429_reason(body: &str) -> Option<&'static str> {
+    parse_output_chunk_429(body)?.terminal_reason()
+}
+
+/// Whether an `output_chunk` 429 is coord's ingest-side egress refusal. Reads
+/// the parsed `error` field, never a substring: a proxy page or a
+/// `{"error":"rate_limited","detail":"…egress_off…"}` body that merely
+/// mentions the reason stays retryable rather than losing the chunk.
+fn output_chunk_429_is_egress_off(body: &str) -> bool {
+    parse_output_chunk_429(body).is_some_and(|p| p.error == "egress_off")
+}
+
+/// The reason to NAME in a log line for an `output_chunk` 429: coord's parsed
+/// `error` code (annotated when it is the deploy-window `column_missing`
+/// stand-in), or a generic "rate limited" when the body carries none.
+pub(crate) fn output_chunk_429_log_reason(body: &str) -> String {
+    parse_output_chunk_429(body)
+        .map(|p| p.label())
+        .unwrap_or_else(|| "rate limited".to_string())
 }
 
 /// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
@@ -1468,7 +1584,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
         // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
-        // kinds of `is_lifecycle_kind`) is coord pacing this runner, not
+        // kinds of `is_lifecycle_kind`: `started` / `state_change` / `closed`
+        // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
         if serving && !rate_limited {
@@ -1621,6 +1738,25 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // behaviour, and degrades to unauthenticated on a multi-bound one instead
     // of filing another tenant's session row.
     let scope = record_session_tenant(inner, rec);
+
+    // The last line of the per-tenant egress switches for BOTH session-output
+    // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
+    // Phase 7): a chunk queued before a flip to `off` is ACKed and DROPPED —
+    // counted, never held — so the backlog does not leave afterwards and a
+    // later flip to `on` does not release it either. Evaluated in the OWNING
+    // session's tenant scope, the same tenant whose credential the push uses.
+    if kind == "output_chunk" {
+        if let Some(flow) = output_chunk_egress_refusal(&rec.payload, scope.into()) {
+            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                flow = flow.key(),
+                "coord_sync: output chunk refused by the egress switch — ACK-and-drop"
+            );
+            return PushOutcome::Acked;
+        }
+    }
 
     let result = match kind {
         "started" => {
@@ -1906,21 +2042,41 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
-                if detail.contains("warm_quota_exceeded") {
-                    // Tenant warm-quota exceeded (gate 2, enforced
-                    // coord-side). Retrying can't help until quota frees,
-                    // and stalling the batch would head-of-line-block this
-                    // session's lifecycle events — ACK-drop with an info
-                    // line instead of the error-level PermanentFailure path.
+                if output_chunk_429_is_egress_off(&detail) {
+                    // Coord's ingest-side second line of the egress switch
+                    // refused it. The runner's own gate above should have
+                    // caught it first (a flip coord saw before our next
+                    // poll); retrying can never succeed while the switch is
+                    // off, so ACK-drop like the quota arm.
+                    OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(
                         session = %rec.session_id,
                         seq = rec.seq,
-                        "coord_sync: output chunk rejected by warm quota (429) — dropping"
+                        "coord_sync: output chunk refused by coord's egress switch (429) — dropping"
                     );
                     return PushOutcome::Acked;
                 }
-                // Any other 429 (proxy / edge rate limit) is transient —
-                // keep the row and retry, same as a 5xx.
+                if let Some(reason) = output_chunk_terminal_429_reason(&detail) {
+                    // A standing tenant answer (warm quota spent, or
+                    // transcript sync turned off), enforced coord-side.
+                    // Retrying can't help until the tenant's state changes,
+                    // and stalling the batch would head-of-line-block this
+                    // session's lifecycle events — ACK-drop with an info
+                    // line instead of the error-level PermanentFailure path.
+                    // No suppression latch: on a multi-bound device one
+                    // tenant's refusal must not silence another's transcript.
+                    tracing::info!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        reason,
+                        "coord_sync: output chunk refused by coord (429 {reason}) — dropping"
+                    );
+                    return PushOutcome::Acked;
+                }
+                // Any other 429 (proxy / edge rate limit, or the
+                // deploy-window `transcript_sync_disabled` with
+                // `column_missing: true`) is transient — keep the row and
+                // retry, same as a 5xx.
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
@@ -1930,10 +2086,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 // A rate-limited lifecycle row is coord PACING this runner,
                 // not refusing the row. Dropping it would leave coord's
                 // session row wrong for good (never created, stuck in a
-                // stale state, or never closed — so its claim is held until
-                // the staleness watcher reaps it), so keep the row and retry
-                // on the session's backoff, like `output_chunk`'s non-quota
-                // 429 above. Decided HERE rather than in the shared
+                // stale state, never closed — so its claim is held until
+                // the staleness watcher reaps it — or never marked finished,
+                // so coord's work axis keeps reading it as unfinished: coord
+                // keeps prompting it, and restart-readiness / the drained
+                // wind-down keep counting it as work in flight. The local
+                // mark stays `finish_synced: false`, but nothing re-sends it
+                // short of a late bind or a re-finish), so keep the row and
+                // retry on the session's backoff, like `output_chunk`'s
+                // retryable 429 above. Decided HERE rather than in the shared
                 // `classify_coord_write_status`, whose closeout-spool caller
                 // deliberately keeps 429 permanent. The drain's quarantine
                 // accounting reads the `429` prefix as `rate_limited` and never
@@ -2764,6 +2925,46 @@ fn progress_body(payload: &JsonValue) -> JsonValue {
     json!({ "progress": JsonValue::Object(progress) })
 }
 
+/// Output chunks the drain ACKed and dropped because their egress switch was
+/// off (both streams). Process-global, read by tests and diagnostics; the
+/// per-flow tally is in `/health` `egress.<flow>.refused`.
+pub(crate) static OUTPUT_CHUNKS_DROPPED_EGRESS_OFF: AtomicU64 = AtomicU64::new(0);
+
+/// The egress flow that refuses this output chunk right now, if any.
+///
+/// Stream `pty` is terminal streaming; every other stream — `transcript`, and
+/// an absent stream, which [`output_chunk_body`] defaults to `transcript` — is
+/// transcript sync, whose verdict includes the user's own consent.
+fn output_chunk_egress_refusal(
+    payload: &JsonValue,
+    scope: crate::egress::SessionScope,
+) -> Option<crate::egress::Flow> {
+    use crate::egress::Flow;
+    let stream = payload
+        .get("stream")
+        .and_then(|v| v.as_str())
+        .unwrap_or(crate::session::transcript_emitter::TRANSCRIPT_STREAM);
+    let (flow, allowed) = if stream == PTY_STREAM {
+        (
+            Flow::TerminalStream,
+            crate::egress::permit_or_count_session(Flow::TerminalStream, scope),
+        )
+    } else {
+        // Counted as an egress refusal only when the TENANT switch refused; a
+        // user who turned their own consent off is not the switch's doing.
+        crate::egress::permit_or_count_session(Flow::TranscriptSync, scope);
+        (
+            Flow::TranscriptSync,
+            crate::egress::transcript_sync_gate_session(scope).is_open(),
+        )
+    };
+    (!allowed).then_some(flow)
+}
+
+/// The `stream` value of raw terminal output on `POST /sessions/:id/output`
+/// (coord's `session_output.stream` default).
+const PTY_STREAM: &str = "pty";
+
 /// Build the `POST /sessions/:id/output` body from an `output_chunk`
 /// outbox payload. The transcript emitter records `{stream, chunk_offset,
 /// payload_b64}` — forward exactly the subset coord's ingest understands.
@@ -2981,61 +3182,107 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
 /// Poll coord's `/tenant-policy?tenant_id=<id>` and cache the
 /// `session_coordination_enabled` flag into the [`DualWriteGate`].
 ///
-/// Only spawned when a tenant resolved (see
-/// [`CoordSync::start_flag_poll_task`]). Robust to coord being down: a
-/// fetch failure leaves the cached value untouched (so a transient outage
-/// never spuriously flips the gate) and the loop simply tries again next
-/// tick. The flag is a rollout knob that changes rarely, so the default
-/// 60s cadence is plenty.
-async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>, tenant_id: Uuid) {
+/// **The pin is re-read at the top of every tick** (plan
+/// `2026-10-10-remote-create-residuals-followups` Phase 3). The loop used to
+/// take the tenant `DualWriteGate::new` froze at boot, so a
+/// `PUT /tenant/active` reached this gate only at the next runner start. Now
+/// each tick resolves `machine.json`'s `active_tenant_id` and hands it to
+/// [`flag_poll_tick`], which retargets the gate when it moved. A switch
+/// therefore takes effect within about one `QONTINUI_SESSION_FLAG_POLL_SECS`
+/// interval (plus at most one fetch already in flight for the old tenant,
+/// bounded by the 30 s request timeout), whichever writer made it — neither
+/// tenant door needs a handle to this loop. It assumes ONE loop per gate:
+/// `start_flag_poll_task` is called once (main.rs), and
+/// [`DualWriteGate::retarget`] is `pub(super)` so nothing outside `session`
+/// can drive the gate's tenant from a second place.
+///
+/// Robust to coord being down: a fetch failure leaves the cached value
+/// untouched (so a transient outage never spuriously flips the gate) and the
+/// loop simply tries again next tick. The flag is a rollout knob that changes
+/// rarely, so the default 60s cadence is plenty.
+async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>) {
     let interval = inner.dual_write.poll_interval();
     tracing::info!(
-        %tenant_id,
         ?interval,
-        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips)"
+        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips; \
+         follows the machine pin each tick)"
     );
     let mut refusals = TenantPolicyAuthReporter::default();
     loop {
-        match fetch_session_coordination_flag(&inner, tenant_id).await {
-            Ok(enabled) => {
-                if let Some(line) = refusals.clear() {
-                    tracing::info!(%tenant_id, "{line}");
-                }
-                inner.dual_write.apply(enabled);
+        let pin = crate::session::dual_write::resolve_active_tenant_id();
+        flag_poll_tick(&inner, &mut refusals, pin).await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// One pass of [`run_flag_poll_loop`] for the pin that pass read.
+///
+/// Split out so a test can drive single passes deterministically against a
+/// fake coord, with the pin rewritten between them through the real write
+/// path, instead of racing a sleeping loop.
+///
+/// Order is the contract when the pin moved: the gate is CLOSED and rebound
+/// ([`DualWriteGate::retarget`]) BEFORE the new tenant's flag is fetched, so
+/// a failed first fetch leaves the gate closed rather than holding the old
+/// tenant's answer; and the refusal reporter starts fresh, because a standing
+/// refusal about the old tenant says nothing about the new one.
+async fn flag_poll_tick(
+    inner: &Arc<CoordSyncInner>,
+    refusals: &mut TenantPolicyAuthReporter,
+    pin: Option<Uuid>,
+) {
+    if let Some(previous) = inner.dual_write.retarget(pin) {
+        *refusals = TenantPolicyAuthReporter::default();
+        tracing::info!(
+            ?previous,
+            tenant = ?pin,
+            "coord_sync: cutover-flag poll retargeted to the machine pin; the cached flag is \
+             closed until this tenant's own flag is read"
+        );
+    }
+    let Some(tenant_id) = pin else {
+        // Unpinned: nothing to ask coord about. The gate is closed (retarget
+        // closed it if a tenant was bound before) and the next tick re-reads.
+        return;
+    };
+    match fetch_session_coordination_flag(inner, tenant_id).await {
+        Ok(enabled) => {
+            if let Some(line) = refusals.clear() {
+                tracing::info!(%tenant_id, "{line}");
             }
-            Err(FlagPollError::Unauthorized { status, reason }) => {
-                // Resolving the presented credential costs a local file read,
-                // so it happens HERE — on the report path the throttle has
-                // already decided to take — and not on every pass. Note what
-                // it does and does not establish: it names what this device
-                // would resolve NOW, a moment AFTER the request that was
-                // refused, not what that request carried. The two differ if
-                // the refresher lands a slot in between, which is why the
-                // line says "currently resolves" and coord's own stated
-                // `reason` travels beside it.
-                if let Some(line) = refusals.observe(status, &reason, tenant_id, || {
-                    crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
-                }) {
-                    tracing::warn!(%tenant_id, "{line}");
-                }
-            }
-            Err(FlagPollError::Other(e)) => {
-                // Leave the cached value as-is — a coord hiccup must not
-                // flip the gate in either direction.
-                //
-                // But DO end any standing refusal: coord answering some other
-                // way is coord answering differently, and leaving the key in
-                // place silences the next genuine refusal (`403`, `403`xN,
-                // `500`, `403` — the second `403` went unreported).
-                refusals.interrupted();
-                tracing::debug!(
-                    %tenant_id,
-                    error = %e,
-                    "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
-                );
+            inner.dual_write.apply(enabled);
+        }
+        Err(FlagPollError::Unauthorized { status, reason }) => {
+            // Resolving the presented credential costs a local file read,
+            // so it happens HERE — on the report path the throttle has
+            // already decided to take — and not on every pass. Note what
+            // it does and does not establish: it names what this device
+            // would resolve NOW, a moment AFTER the request that was
+            // refused, not what that request carried. The two differ if
+            // the refresher lands a slot in between, which is why the
+            // line says "currently resolves" and coord's own stated
+            // `reason` travels beside it.
+            if let Some(line) = refusals.observe(status, &reason, tenant_id, || {
+                crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
+            }) {
+                tracing::warn!(%tenant_id, "{line}");
             }
         }
-        tokio::time::sleep(interval).await;
+        Err(FlagPollError::Other(e)) => {
+            // Leave the cached value as-is — a coord hiccup must not
+            // flip the gate in either direction.
+            //
+            // But DO end any standing refusal: coord answering some other
+            // way is coord answering differently, and leaving the key in
+            // place silences the next genuine refusal (`403`, `403`xN,
+            // `500`, `403` — the second `403` went unreported).
+            refusals.interrupted();
+            tracing::debug!(
+                %tenant_id,
+                error = %e,
+                "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
+            );
+        }
     }
 }
 
@@ -3674,6 +3921,12 @@ mod tests {
         next_patch_429: usize,
         /// When >0, the next N `POST /sessions` return 429, recording nothing.
         next_post_429: usize,
+        /// When set, EVERY `POST /sessions/:id/output` answers 429 with this
+        /// raw body, recording nothing in `outputs` — a standing tenant answer
+        /// such as coord's `transcript_sync_disabled`, not a one-off pace.
+        output_429_body: Option<String>,
+        /// How many output POSTs were answered from `output_429_body`.
+        output_429_served: usize,
         /// When true, every PATCH answers coord's 403
         /// `close_requires_device_identity`, recording nothing.
         patch_forbidden: bool,
@@ -3875,7 +4128,17 @@ mod tests {
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
                      Json(body): Json<JsonValue>| async move {
-                        state.lock().await.outputs.push((id, body.clone()));
+                        let mut g = state.lock().await;
+                        if let Some(refusal) = g.output_429_body.clone() {
+                            g.output_429_served += 1;
+                            return (
+                                AxumStatus::TOO_MANY_REQUESTS,
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                refusal,
+                            )
+                                .into_response();
+                        }
+                        g.outputs.push((id, body.clone()));
                         (AxumStatus::OK, Json(json!({"id": id}))).into_response()
                     },
                 ),
@@ -4915,6 +5178,13 @@ mod tests {
                 json!({ "id": s, "state": "active" }),
             ),
             (SessionEventKind::Closed, json!({ "id": s })),
+            // `finished` (plan 2026-10-10-remote-create-residuals-followups,
+            // Phase 1): a one-shot work-axis PATCH, so a lost one leaves
+            // coord prompting a session that is done.
+            (
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            ),
         ] {
             rec.lock().await.next_patch_429 = 1;
             let row = outbox.record(m, s, kind, payload).unwrap();
@@ -4932,7 +5202,15 @@ mod tests {
             let second = push_record(&coord.inner, &row).await;
             assert!(matches!(second, PushOutcome::Acked), "{kind:?}: {second:?}");
         }
-        assert_eq!(rec.lock().await.patches.len(), 2);
+        {
+            let g = rec.lock().await;
+            assert_eq!(g.patches.len(), 3, "{:?}", g.patches);
+            assert_eq!(
+                g.patches[2].1,
+                json!({ "progress": { "session_status": "finished" } }),
+                "the finished row was DELIVERED on retry"
+            );
+        }
 
         // `started` rides POST /sessions and is a lifecycle kind too.
         rec.lock().await.next_post_429 = 1;
@@ -5050,6 +5328,373 @@ mod tests {
         assert_eq!(g.patches.len(), 2, "{:?}", g.patches);
         assert_eq!(g.patches[0].1, json!({ "state": "closed" }));
         assert_eq!(g.patches[1].1, json!({ "heartbeat": true }));
+    }
+
+    /// Plan 2026-10-10-remote-create-residuals-followups, Phase 2: coord
+    /// answers an `output_chunk` with 429 `transcript_sync_disabled` for as
+    /// long as the tenant has transcript sync off. That is a standing tenant
+    /// setting, not pacing — the chunk is ACK-dropped, and the session's
+    /// `closed` row queued behind it in the same chain is then delivered
+    /// instead of waiting behind a chunk that can never land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcript_sync_disabled_429_is_dropped_and_unblocks_the_session() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_429_body = Some(
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": false,
+                "detail": "this tenant has transcript sync turned off",
+            })
+            .to_string(),
+        );
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let chunk = outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Closed, json!({ "id": s }))
+            .unwrap();
+
+        // Row level: the refusal is an ACK-drop, not a retry.
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "a transcript_sync_disabled 429 must ACK-drop the chunk"
+        );
+
+        // Drain level: the chunk does not hold the close behind it.
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert!(g.output_429_served >= 2, "the drain pushed the chunk too");
+        assert!(
+            g.outputs.is_empty(),
+            "coord accepted no chunk: {:?}",
+            g.outputs
+        );
+        assert_eq!(g.patches.len(), 1, "{:?}", g.patches);
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "state": "closed" }),
+            "the close queued behind the refused chunk was delivered"
+        );
+    }
+
+    /// Drain-only twin of the test above (plan
+    /// 2026-10-10-remote-create-residuals-followups, Phase 2 review): enters
+    /// ONLY through `start_drain_task`, never a row-level helper, so it proves
+    /// the production path end to end. coord answers every chunk 429
+    /// `transcript_sync_disabled` (an admin decision, `column_missing: false`);
+    /// the chunk must be ACK-dropped and the `closed` row queued behind it in
+    /// the same session delivered. Before the fix the chunk was a retried
+    /// `Transport` forever and the close never left the outbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcript_sync_disabled_chunk_does_not_hold_the_close_behind_it_in_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_429_body = Some(
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": false,
+                "detail": "this tenant has transcript sync turned off",
+            })
+            .to_string(),
+        );
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Closed, json!({ "id": s }))
+            .unwrap();
+
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(
+            g.output_429_served, 1,
+            "the chunk was offered exactly once, then ACK-dropped"
+        );
+        assert!(
+            g.outputs.is_empty(),
+            "coord accepted no chunk: {:?}",
+            g.outputs
+        );
+        assert_eq!(g.patches.len(), 1, "{:?}", g.patches);
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "state": "closed" }),
+            "the close queued behind the refused chunk was delivered"
+        );
+        drop(g);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "nothing is left pending behind the dropped chunk"
+        );
+    }
+
+    /// Plan 2026-10-10-remote-create-residuals-followups, Phase 1, entered
+    /// ONLY through `start_drain_task`: coord answers the first `finished`
+    /// PATCH 429 and the second 200. The drain must keep the row and deliver
+    /// it on retry — so a SECOND PATCH happens and is recorded. Before the
+    /// fix the 429 reached `write_failure_outcome`, the row was ACK-dropped,
+    /// and coord never recorded a finished PATCH at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_429_on_a_finished_row_is_retried_by_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 1;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            )
+            .unwrap();
+
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(g.next_patch_429, 0, "the one-shot 429 was served");
+        assert_eq!(
+            g.patches.len(),
+            1,
+            "the finished row was PATCHed again after the 429 and delivered: {:?}",
+            g.patches
+        );
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "progress": { "session_status": "finished" } })
+        );
+    }
+
+    /// The other standing `output_chunk` refusal, `warm_quota_exceeded`, is
+    /// still an ACK-drop through the same parser; a 429 whose body names
+    /// neither reason in its `error` field — an edge rate limit, or a page
+    /// that only MENTIONS a reason in prose — stays retryable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_chunk_429_drops_only_on_a_parsed_terminal_reason() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        let chunk = outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+
+        rec.lock().await.output_429_body = Some(
+            json!({ "error": "warm_quota_exceeded", "tenant_warm_bytes": 10, "quota": 5 })
+                .to_string(),
+        );
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "warm_quota_exceeded ACK-drops the chunk"
+        );
+
+        // `transcript_sync_disabled` with `column_missing: false` (an admin
+        // turned it off) ACK-drops; so does one with the flag absent.
+        for body in [
+            json!({ "error": "transcript_sync_disabled", "column_missing": false }),
+            json!({ "error": "transcript_sync_disabled" }),
+        ] {
+            rec.lock().await.output_429_body = Some(body.to_string());
+            assert!(
+                matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+                "{body}: a standing transcript_sync_disabled ACK-drops the chunk"
+            );
+        }
+
+        for body in [
+            // coord's deploy-window stand-in: the column is not provisioned
+            // yet, so the refusal clears by itself — retried, not dropped.
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": true,
+                "detail": "transcript sync is treated as off (fail closed)",
+            })
+            .to_string(),
+            json!({ "error": "rate_limited" }).to_string(),
+            "upstream says transcript_sync_disabled and warm_quota_exceeded".to_string(),
+            json!({ "detail": "transcript_sync_disabled" }).to_string(),
+        ] {
+            rec.lock().await.output_429_body = Some(body.clone());
+            match push_record(&coord.inner, &chunk).await {
+                PushOutcome::Transport(msg) => assert_eq!(
+                    classify_push_failure(&msg, false).0,
+                    "rate_limited",
+                    "{body}: a retryable 429 never counts toward quarantine"
+                ),
+                other => panic!("{body}: must be retried, got {other:?}"),
+            }
+        }
+    }
+
+    /// Coord's ingest-side egress refusal is recognised by its parsed `error`
+    /// field only: `{"error":"egress_off"}` is ACK-dropped and counted, while a
+    /// body that merely MENTIONS egress_off (in `detail`, or a proxy page)
+    /// stays retryable, so the chunk is not lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_chunk_egress_off_429_drops_only_on_the_parsed_error() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let chunk = outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+
+        for body in [
+            json!({ "error": "rate_limited", "detail": "egress_off for another flow" }).to_string(),
+            json!({ "detail": "egress_off" }).to_string(),
+            "<html>proxy says egress_off</html>".to_string(),
+        ] {
+            rec.lock().await.output_429_body = Some(body.clone());
+            match push_record(&coord.inner, &chunk).await {
+                PushOutcome::Transport(msg) => assert_eq!(
+                    classify_push_failure(&msg, false).0,
+                    "rate_limited",
+                    "{body}: a 429 that only mentions egress_off is retried"
+                ),
+                other => panic!("{body}: must be retried, got {other:?}"),
+            }
+        }
+
+        rec.lock().await.output_429_body =
+            Some(json!({ "error": "egress_off", "flow": "transcript_sync" }).to_string());
+        let before = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed);
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "a parsed egress_off 429 ACK-drops the chunk"
+        );
+        assert!(
+            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed) > before,
+            "the egress_off drop is counted"
+        );
+    }
+
+    #[test]
+    fn output_chunk_429_is_egress_off_reads_the_error_field() {
+        assert!(output_chunk_429_is_egress_off(r#"{"error":"egress_off"}"#));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"error":"rate_limited","detail":"egress_off"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"detail":"egress_off"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off("egress_off"));
+        assert!(!output_chunk_429_is_egress_off(""));
+    }
+
+    #[test]
+    fn output_chunk_terminal_429_reason_reads_the_error_field() {
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"transcript_sync_disabled"}"#),
+            Some("transcript_sync_disabled")
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"warm_quota_exceeded","quota":1}"#),
+            Some("warm_quota_exceeded")
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"rate_limited"}"#),
+            None
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(
+                r#"{"error":"transcript_sync_disabled","column_missing":false}"#
+            ),
+            Some("transcript_sync_disabled"),
+            "column_missing false is an admin decision — terminal"
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(
+                r#"{"error":"transcript_sync_disabled","column_missing":true}"#
+            ),
+            None,
+            "column_missing true is the deploy window — retryable"
+        );
+        assert_eq!(output_chunk_terminal_429_reason(r#"{"error":42}"#), None);
+        assert_eq!(
+            output_chunk_terminal_429_reason("transcript_sync_disabled"),
+            None
+        );
+        assert_eq!(output_chunk_terminal_429_reason(""), None);
     }
 
     /// Phase 3 review: a 404 on the `closed` PATCH (coord no longer has the
@@ -7562,6 +8207,213 @@ mod tests {
         );
     }
 
+    /// A machine fixture with an identity (so the tenant write path accepts
+    /// it), pinned to `pin` when given, and bound to both `a` and `b`.
+    fn two_binding_machine(
+        amb: &crate::test_env::IsolatedAmbient,
+        pin: Option<Uuid>,
+        a: Uuid,
+        b: Uuid,
+    ) {
+        let pin_field = pin
+            .map(|t| format!(r#","active_tenant_id":"{t}""#))
+            .unwrap_or_default();
+        amb.write_machine_json(&format!(
+            r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box"{pin_field}}}"#
+        ));
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            format!(
+                r#"{{"user_id":"u","tenant_id":"{a}","default_tenant_id":"{a}",
+                    "bindings":[{{"tenant_id":"{a}","user_id":"u"}},
+                                {{"tenant_id":"{b}","user_id":"u"}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// PLAN `2026-10-10-remote-create-residuals-followups` Phase 3 — a tenant
+    /// switch through the `PUT /tenant/active` write path retargets the
+    /// dual-write flag poll WITHOUT a restart.
+    ///
+    /// Drives single passes exactly as [`run_flag_poll_loop`] does (pin read,
+    /// then [`flag_poll_tick`]) so the order is deterministic. Three
+    /// observables, each a mutation proof:
+    /// * the next poll's `?tenant_id=` is the NEW tenant — freeze the pin at
+    ///   construction again and the second query repeats tenant A;
+    /// * the gate was CLOSED before that fetch — the post-switch fetch fails
+    ///   (500, which keeps the cached flag), so if the reset were dropped or
+    ///   moved after the fetch the gate would still hold tenant A's `true`;
+    /// * the refusal reporter restarted — A's standing `403` is not carried
+    ///   into B's episode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_switch_retargets_the_flag_poll_without_a_restart() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, Some(a), a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let gate = &coord.inner.dual_write;
+        let mut refusals = TenantPolicyAuthReporter::default();
+        let pin = crate::session::dual_write::resolve_active_tenant_id;
+
+        // Tenant A, flag ON.
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert_eq!(gate.tenant_id(), Some(a));
+        assert!(gate.enabled(), "tenant A's flag was fetched as true");
+
+        // A standing refusal about A.
+        rec.lock().await.tenant_policy_status = Some(403);
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert!(refusals.reported.is_some(), "A's 403 is a standing refusal");
+        assert!(gate.enabled(), "a refusal keeps the cached flag");
+
+        // The PUT /tenant/active write path, then a pass whose fetch fails.
+        let written = crate::commands::tenant::apply_active_tenant(&b.to_string())
+            .expect("B is bound, so the switch is accepted");
+        assert_eq!(written, b.to_string());
+        rec.lock().await.tenant_policy_status = Some(500);
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+
+        assert_eq!(gate.tenant_id(), Some(b), "the gate follows the new pin");
+        assert!(
+            !gate.enabled(),
+            "the gate must be closed BEFORE the new tenant's fetch: a failed first fetch must \
+             not leave tenant A's flag standing under tenant B"
+        );
+        assert!(
+            refusals.reported.is_none(),
+            "a standing refusal about tenant A says nothing about tenant B"
+        );
+
+        // B's own flag opens it.
+        rec.lock().await.tenant_policy_status = None;
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert!(gate.enabled(), "tenant B's own flag is read and applied");
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.tenant_policy_queries,
+            vec![a.to_string(), a.to_string(), b.to_string(), b.to_string()],
+            "every poll after the switch must ask about the NEW tenant"
+        );
+    }
+
+    /// The poll's tenant comes from the PIN, read by the running loop — not
+    /// from whatever the gate was constructed with. The gate here is built
+    /// with no tenant (as `DualWriteGate::new` now builds it), the machine is
+    /// pinned to B, and the started task must ask coord about B. Before the
+    /// fix the task took the tenant the gate was built with and, holding none,
+    /// spawned nothing. Written against APIs that exist on both sides of the
+    /// change (the handle is ignored, no test-only cadence), so a revert fails
+    /// this by ASSERTION rather than by compilation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_started_flag_poll_asks_coord_about_the_pinned_tenant() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, Some(b), a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+
+        let _ = coord.start_flag_poll_task();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if rec
+                .lock()
+                .await
+                .tenant_policy_queries
+                .iter()
+                .any(|q| q == &b.to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the started flag poll never asked coord about the pinned tenant; queries: {:?}",
+                rec.lock().await.tenant_policy_queries
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The task is spawned even with NO pin at boot, and the REAL loop picks
+    /// up a pin written later — the case where `start_flag_poll_task` used to
+    /// spawn nothing at all. Bounded wait on an observable (the fake coord's
+    /// recorded query), never a fixed sleep standing in for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_flag_poll_spawns_unpinned_and_follows_a_later_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, None, a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .with_flag_poll_interval_for_test(Duration::from_millis(20));
+
+        let handle = coord.start_flag_poll_task();
+        // Several unpinned ticks: nothing is asked of coord.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            rec.lock().await.tenant_policy_queries.is_empty(),
+            "an unpinned machine asks coord nothing"
+        );
+        assert_eq!(coord.inner.dual_write.tenant_id(), None);
+
+        crate::commands::tenant::apply_active_tenant(&b.to_string())
+            .expect("B is bound, so the switch is accepted");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if coord.inner.dual_write.enabled() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the running poll never followed the new pin; queries: {:?}",
+                rec.lock().await.tenant_policy_queries
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert_eq!(coord.inner.dual_write.tenant_id(), Some(b));
+        let g = rec.lock().await;
+        assert!(
+            !g.tenant_policy_queries.is_empty()
+                && g.tenant_policy_queries.iter().all(|q| q == &b.to_string()),
+            "the loop polls the tenant the pin names now: {:?}",
+            g.tenant_policy_queries
+        );
+    }
+
     /// The other half of the same observable: a tenant this device holds NO
     /// usable slot for sends the request UNAUTHENTICATED and lets coord
     /// answer. Substituting the legacy slot would be the original bug wearing
@@ -8215,6 +9067,148 @@ mod tests {
             !body.contains("tracing::warn!") && !body.contains("tracing::info!"),
             "the fetch must not log a refusal itself — only the loop can tell a standing \
              refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
+        );
+    }
+}
+
+/// The drain as the last line of the egress switches (plan
+/// `2026-10-10-spec-front-end-phase-9-generic-boundary`, Phase 7): a queued
+/// output chunk whose switch is off is ACKed and dropped without a single
+/// request reaching coord. The transcript pair is transcript sync's registered
+/// flow test (`crate::egress::FLOW_TESTS`).
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    /// One output-chunk record on `stream`, read back from a real outbox.
+    fn chunk_record(dir: &std::path::Path, stream: &str) -> OutboxRecord {
+        let outbox = OutboxWriter::open(dir.join("outbox.jsonl")).unwrap();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::OutputChunk,
+                json!({"stream": stream, "chunk_offset": 0, "payload_b64": "aGVsbG8="}),
+            )
+            .unwrap();
+        outbox.pending().unwrap().pop().expect("the record")
+    }
+
+    fn coord_at(dir: &std::path::Path, base: String) -> CoordSync {
+        let outbox = Arc::new(OutboxWriter::open(dir.join("drain.jsonl")).unwrap());
+        CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+    }
+
+    async fn drive(stream: &str, level: Level, flow: Flow) -> (bool, usize, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = ConnCounter::start();
+        let coord = coord_at(dir.path(), counter.http_base());
+        let rec = chunk_record(dir.path(), stream);
+        let _pin = pin(flow, level);
+        let before = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed);
+        let outcome = push_record(&coord.inner, &rec).await;
+        let dropped = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed) - before;
+        let acked = matches!(outcome, PushOutcome::Acked);
+        (
+            acked,
+            counter.wait_for(1, Duration::from_millis(300)),
+            dropped,
+        )
+    }
+
+    #[tokio::test]
+    pub(crate) async fn transcript_chunk_pinned_off_makes_zero_requests() {
+        let (acked, connects, dropped) =
+            drive("transcript", Level::Off, Flow::TranscriptSync).await;
+        assert!(
+            acked,
+            "a refused chunk is ACKed, never held for a later flip"
+        );
+        assert_eq!(connects, 0, "nothing may reach coord with the switch off");
+        assert!(dropped >= 1, "the drop is counted");
+    }
+
+    #[tokio::test]
+    pub(crate) async fn transcript_chunk_pinned_on_makes_a_request() {
+        // The user's consent half reads settings.json — isolated, default on.
+        let _amb = crate::test_env::isolated_ambient();
+        let (acked, connects, _) = drive("transcript", Level::On, Flow::TranscriptSync).await;
+        assert!(connects >= 1, "with the switch on the chunk is posted");
+        assert!(!acked, "the fake answers 503, so the row is kept for retry");
+    }
+
+    #[tokio::test]
+    async fn pty_chunk_pinned_off_makes_zero_requests() {
+        let (acked, connects, dropped) = drive("pty", Level::Off, Flow::TerminalStream).await;
+        assert!(acked);
+        assert_eq!(connects, 0);
+        assert!(dropped >= 1);
+    }
+
+    #[tokio::test]
+    async fn pty_chunk_pinned_on_makes_a_request() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_, connects, _) = drive("pty", Level::On, Flow::TerminalStream).await;
+        assert!(connects >= 1);
+    }
+
+    /// The streams follow their OWN switches: terminal off does not stop a
+    /// transcript chunk, and transcript off does not stop a pty chunk.
+    #[tokio::test]
+    async fn each_stream_follows_its_own_switch() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        let (_, connects, _) = drive("transcript", Level::On, Flow::TranscriptSync).await;
+        assert!(
+            connects >= 1,
+            "transcript must not obey the terminal switch"
+        );
+        drop(_t);
+        let _x = pin(Flow::TranscriptSync, Level::Off);
+        let (_, connects, _) = drive("pty", Level::On, Flow::TerminalStream).await;
+        assert!(connects >= 1, "pty must not obey the transcript switch");
+    }
+
+    /// A non-output kind is never touched by the egress check.
+    #[test]
+    fn only_output_chunks_are_subject_to_the_drain_check() {
+        let _t = pin(Flow::TranscriptSync, Level::Off);
+        let _p = pin(Flow::TerminalStream, Level::Off);
+        assert_eq!(
+            output_chunk_egress_refusal(
+                &json!({"stream": "pty"}),
+                crate::egress::SessionScope::DeviceDefault
+            ),
+            Some(Flow::TerminalStream)
+        );
+        assert_eq!(
+            output_chunk_egress_refusal(&json!({}), crate::egress::SessionScope::DeviceDefault),
+            Some(Flow::TranscriptSync),
+            "an absent stream is a transcript chunk"
+        );
+        let src = include_str!("coord_sync.rs");
+        let body = src.split_once("async fn push_record(").unwrap().1;
+        let check = body
+            .find("output_chunk_egress_refusal(&rec.payload, scope.into())")
+            .unwrap();
+        let scope = body
+            .find("let scope = record_session_tenant(inner, rec);")
+            .unwrap();
+        assert!(
+            scope < check,
+            "the owning session's tenant is resolved before the check"
+        );
+        let dispatch = body.find("let result = match kind").unwrap();
+        assert!(
+            check < dispatch,
+            "the check must run before any request is built"
         );
     }
 }
