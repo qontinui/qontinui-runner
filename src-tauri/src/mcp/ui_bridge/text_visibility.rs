@@ -519,7 +519,9 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   dev-only direct-route (`control/text-visibility`) hide.
 /// - A refused hide (`success: false`), or a request that provably never left
 ///   the runner ([`hide_never_sent`]): nothing was hidden, nothing restored, and
-///   the permits are released at once.
+///   the permits are released at once. A never-sent hide refuses frame A as
+///   well: with no hook answer, nothing checked whether another caller hid the
+///   page after the probe (the UNKNOWN case's reason).
 ///
 /// Accepted remainder: a hide by another caller that appears after the probe
 /// AND is gone again before the hook reads `wasHidden` — made and restored (or
@@ -632,6 +634,16 @@ where
         } else {
             hide_failure_message(&hide)
         };
+        // Unsent: no hook answer, so nothing checked whether another caller hid
+        // the page after the probe, during frame A — the same unknown as a lost
+        // `wasHidden`.
+        if never_sent {
+            frame_a = Err(
+                "frame A was not kept: the hide request never left the runner, so whether \
+                 another caller's hide covered frame A is unknown"
+                    .into(),
+            );
+        }
         return TextHiddenPair {
             frame_a,
             frame_b: Err(error),
@@ -1563,7 +1575,11 @@ mod tests {
             assert!(err.contains("never left the runner"), "{error}: {err}");
             assert!(!has(&events, "show"), "{error}: {events:?}");
             assert!(!has(&events, "abort-restore"), "{error}: {events:?}");
-            assert_eq!(out.frame_a, Ok("frame-a"), "{error}");
+            let err = out.frame_a.expect_err("no hook answer checked frame A");
+            assert!(
+                err.contains("hide request never left the runner"),
+                "{error}: {err}"
+            );
         }
         for error in [
             "UI Bridge request timed out after 10000ms",
