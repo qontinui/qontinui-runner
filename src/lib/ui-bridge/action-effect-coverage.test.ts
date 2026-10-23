@@ -388,6 +388,7 @@ const STUB_ARGS: Record<string, unknown[]> = {
   popOutPageSignature: ["default", 1],
   selectLayoutSignature: [1],
   loadProfileSignature: [{}, 0],
+  workModeSignature: [() => "grid"],
 };
 
 /**
