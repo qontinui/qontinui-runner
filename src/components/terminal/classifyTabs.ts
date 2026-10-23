@@ -1,4 +1,5 @@
 import type { ZoneAssignments } from "./useZoneLayout";
+import type { TerminalWorkMode } from "./terminalWorkMode";
 
 /**
  * Per-tab mount classification for a single render pass (Layer 1 of
@@ -8,8 +9,8 @@ import type { ZoneAssignments } from "./useZoneLayout";
  * Preset (non-flow) layouts use the two-way vocabulary — exactly one owner
  * per tab:
  *  - `"assigned"` — the tab owns a zone → mount the inline `TerminalInstance`.
- *  - `"hidden"`   — transient unassigned tab → `HiddenTerminal` keeps the PTY
- *                   session alive off-grid.
+ *  - `"hidden"`   — transient unassigned tab → a parked zone cell
+ *                   (`buildZoneCells`) keeps the PTY session alive off-grid.
  *
  * Flow mode (`FLOW_GRID_ID`, the synthesized scrolling grid) splits the
  * assigned case in two so offscreen zones don't each keep a live xterm parser
@@ -25,8 +26,33 @@ import type { ZoneAssignments } from "./useZoneLayout";
  *                           flips it to `assigned-live`, the instance cold-mounts
  *                           and the grid-snapshot + PTY-ring scrollback replay
  *                           repaints full history for free.
+ *
+ * tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode` D2) zones
+ * only the shown tab, and nothing is `hidden`:
+ *  - `"assigned"`            — the shown tab (zone 0) → its visible cell.
+ *  - `"offscreen"`           — a WARM off-screen PTY tab (one of the most
+ *                              recently shown, `tmuxMountedTabIds`) → a parked
+ *                              cell that keeps its `TerminalInstance` mounted
+ *                              with `visible={false}`, so a swap to it is a
+ *                              prop flip, not a remount.
+ *  - `"offscreen-unmounted"` — every other off-screen tab, and any parked
+ *                              plan tab or Conductor worker (`sessionBacked`)
+ *                              tab → mounts NOTHING. A cold PTY tab mounts on
+ *                              reveal and rebuilds from the scrollback ring;
+ *                              the bound is what keeps a page of dozens of
+ *                              sessions from mounting a parser for each (the
+ *                              flow grid's OOM, incident #535). A plan or
+ *                              worker tab has no PTY to keep warm, and an
+ *                              off-screen `TerminalInstance` for one would
+ *                              attach to a terminal id naming no process.
  */
-export type TabClassification = "assigned" | "assigned-live" | "assigned-virtual" | "hidden";
+export type TabClassification =
+  | "assigned"
+  | "assigned-live"
+  | "assigned-virtual"
+  | "hidden"
+  | "offscreen"
+  | "offscreen-unmounted";
 
 /**
  * Number of `TerminalInstance` mount owners a classification implies. The
@@ -36,7 +62,18 @@ export type TabClassification = "assigned" | "assigned-live" | "assigned-virtual
  * the invariant is "exactly one OR zero", never two.
  */
 export function mountOwnerCount(classification: TabClassification): 0 | 1 {
-  return classification === "assigned-virtual" ? 0 : 1;
+  return classification === "assigned-virtual" || classification === "offscreen-unmounted" ? 0 : 1;
+}
+
+/**
+ * The tabs a classification mounts a pane owner for (`mountOwnerCount` 1) —
+ * what `ZoneGrid` reports to `useZoneLayout().reportMountedTabs`, so entering
+ * tmux keeps the panes the grid had mounted warm.
+ */
+export function mountedTabIds(classification: ReadonlyMap<string, TabClassification>): Set<string> {
+  const out = new Set<string>();
+  for (const [tabId, c] of classification) if (mountOwnerCount(c) === 1) out.add(tabId);
+  return out;
 }
 
 /**
@@ -51,14 +88,33 @@ export function mountOwnerCount(classification: TabClassification): 0 | 1 {
  *                       `nearViewport` is ignored for them.
  * @param nearViewport   tab-ids whose zone cell is at/near the viewport (within
  *                       the observer overscan). Only consulted in flow mode.
+ * @param workMode       the page's work mode. In `tmux` the shown tab is
+ *                       zone 0's and every other tab is parked; `isFlowMode`
+ *                       and `nearViewport` are ignored (the layout is pinned
+ *                       to `single`).
+ * @param tmuxMounted    tmux only: the tabs to keep mounted (the shown tab and
+ *                       the warm MRU, `tmuxMountedTabIds`). Omitted, every
+ *                       off-screen PTY tab is warm.
  */
 export function classifyTabs(
-  tabs: readonly { id: string }[],
+  tabs: readonly { id: string; type?: string; sessionBacked?: boolean }[],
   assignments: ZoneAssignments,
   isFlowMode: boolean,
   nearViewport: ReadonlySet<string>,
+  workMode: TerminalWorkMode = "grid",
+  tmuxMounted?: ReadonlySet<string>,
 ): Map<string, TabClassification> {
   const m = new Map<string, TabClassification>();
+  if (workMode === "tmux") {
+    const shown = assignments[0];
+    for (const t of tabs) {
+      if (t.id === shown) m.set(t.id, "assigned");
+      else if (t.type === "plan" || t.sessionBacked) m.set(t.id, "offscreen-unmounted");
+      else if (tmuxMounted && !tmuxMounted.has(t.id)) m.set(t.id, "offscreen-unmounted");
+      else m.set(t.id, "offscreen");
+    }
+    return m;
+  }
   const assignedIds = new Set(Object.values(assignments).filter((id): id is string => id != null));
   for (const t of tabs) {
     if (!assignedIds.has(t.id)) {
