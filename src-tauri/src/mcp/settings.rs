@@ -276,6 +276,20 @@ fn apply_ai_settings_patch(
             e
         ))
     })?;
+    // `AccountSelectionMode` deserializes leniently (an unknown spelling is the
+    // default) so an older runner can read a roster a newer one wrote. A caller
+    // SENDING an unknown mode is a bad body, not a newer runner, so it is
+    // refused here rather than silently saved as the default.
+    if let Some(mode) = patch
+        .pointer("/claude_cli/account_selection_mode")
+        .and_then(|m| m.as_str())
+    {
+        if settings::AccountSelectionMode::from_wire(mode).is_none() {
+            return Err(PutAiSettingsError::InvalidBody(format!(
+                "Invalid AI settings body: unknown claude_cli.account_selection_mode {mode:?}"
+            )));
+        }
+    }
     serde_json::from_value(merge_json_patch_keep_absent(base, patch))
         .map_err(|e| PutAiSettingsError::InvalidBody(format!("Invalid AI settings body: {}", e)))
 }
@@ -1054,8 +1068,8 @@ pub struct DiscoveryPortsPayload {
 ///
 /// `dirs` is the list of Claude Code config directories (each containing a
 /// `.credentials.json` for one account) that the runner is allowed to
-/// rotate among in `AccountSelectionMode::LeastUsage` or
-/// `AccountSelectionMode::HighestExpectedUsage`. On `PUT`, entries
+/// rotate among in any automatic `AccountSelectionMode` (every mode but
+/// `Manual`). On `PUT`, entries
 /// without a `projects/` subdirectory are filtered out — the response
 /// echoes the accepted list so callers can detect the drop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1578,6 +1592,17 @@ mod tests {
                 ),
                 "a bad body is the caller's fault (422), not the server's: {body}"
             );
+        }
+    }
+
+    #[test]
+    fn put_ai_settings_accepts_every_known_selection_mode() {
+        let stored = stored();
+        for mode in AccountSelectionMode::ALL {
+            let body = json!({"claude_cli": {"account_selection_mode": mode.as_str()}});
+            let saved =
+                apply_ai_settings_patch(&stored, body).expect("a known mode is a valid body");
+            assert_eq!(saved.claude_cli.account_selection_mode, mode);
         }
     }
 

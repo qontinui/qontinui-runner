@@ -181,8 +181,8 @@
 //!   time a device JWT lapses (the same reasoning as plan capture's 401 arm).
 //! - A 2xx NO-ROW answer (`resolved_scope == "none"`) ⇒ `None`: coord's
 //!   domain default for an unlisted domain is `off`, which is not a mode.
-//! - Any level that is not one of the three `AccountSelectionMode` wire
-//!   spellings (`manual` / `least_usage` / `highest_expected_usage`) ⇒ `None`.
+//! - Any level that is not an `AccountSelectionMode` wire spelling
+//!   (`AccountSelectionMode::ALL`) ⇒ `None`.
 //! - Unpaired ⇒ SKIPPED quietly, cache untouched.
 //! - A poisoned lock ⇒ `None`.
 //!
@@ -286,7 +286,8 @@ const PLAN_CAPTURE_UNRECOGNISED_LEVEL: &str = "off";
 /// `domain` column is plain `TEXT` with no allowlist, and `put_fleet_policy`
 /// does not validate `level`, so `highest_expected_usage` is stored as-is.
 ///
-/// Its vocabulary is [`AccountSelectionMode::as_str`]'s three wire spellings;
+/// Its vocabulary is [`AccountSelectionMode::as_str`]'s wire spellings
+/// ([`AccountSelectionMode::ALL`]);
 /// its resting value is NO fleet opinion (`None`), not a mode — see
 /// [`normalize_account_selection_level`]. Scope band is **tenant-wide**: the
 /// mode is a machine-global fact (it lives in `claude-accounts.json`), and a
@@ -970,14 +971,7 @@ pub(crate) fn isolated_ambient_with_fleet_pin() -> (
 /// cannot identify is "no fleet opinion", never a guessed mode — a guessed mode
 /// would be force-applied over every unpinned machine.
 fn normalize_account_selection_level(raw: Option<&str>) -> Option<AccountSelectionMode> {
-    let level = raw?.trim().to_ascii_lowercase();
-    [
-        AccountSelectionMode::Manual,
-        AccountSelectionMode::LeastUsage,
-        AccountSelectionMode::HighestExpectedUsage,
-    ]
-    .into_iter()
-    .find(|mode| mode.as_str() == level)
+    AccountSelectionMode::from_wire(raw?)
 }
 
 /// The WRITE, if any, that `outcome` implies for the account-selection cache.
@@ -4838,8 +4832,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_wire_spellings_name_a_fleet_mode() {
+    fn only_the_wire_spellings_name_a_fleet_mode() {
         use AccountSelectionMode::*;
+        for mode in AccountSelectionMode::ALL {
+            assert_eq!(
+                normalize_account_selection_level(Some(mode.as_str())),
+                Some(mode)
+            );
+        }
+        assert_eq!(
+            normalize_account_selection_level(Some(" Alternating_Handoff ")),
+            Some(AlternatingHandoff)
+        );
         assert_eq!(
             normalize_account_selection_level(Some("manual")),
             Some(Manual)

@@ -234,12 +234,14 @@ pub fn get_effective_config_dir(
     // was given.
     let mode = crate::claude_accounts::resolve_for_cli_settings(cli_settings);
     let (candidate, source) = match mode {
-        // Both auto modes (`LeastUsage` and `HighestExpectedUsage`) pin their
-        // choice via the same `RESOLVED_CONFIG_DIR` set by `pick_best_account`
-        // — the source names predate `HighestExpectedUsage` but still apply:
-        // they describe "the auto-picker resolved / fell back", not which
-        // ranking the picker used.
-        AccountSelectionMode::LeastUsage | AccountSelectionMode::HighestExpectedUsage => {
+        // Every auto mode pins its choice via the same `RESOLVED_CONFIG_DIR`
+        // set by `pick_best_account` — the source names predate the other
+        // auto modes but still apply: they describe "the auto-picker resolved
+        // / fell back", not which ranking the picker used.
+        AccountSelectionMode::LeastUsage
+        | AccountSelectionMode::HighestExpectedUsage
+        | AccountSelectionMode::WeightedRandom
+        | AccountSelectionMode::AlternatingHandoff => {
             match get_resolved_config_dir() {
                 // The resolved dir (set by the credential-aware picker) wins.
                 Some(dir) => (Some(dir), ClaudeConfigDirSource::LeastUsageResolved),
@@ -581,6 +583,16 @@ pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
 /// still has a full week of headroom ahead of it is saved for later rather
 /// than spent down first.
 pub fn usage_rank_highest_expected(config_dir: &str) -> Option<f64> {
+    under_pace_shortfall(config_dir).map(|(expected, _)| expected)
+}
+
+/// `Some((expected, shortfall))` for an account that is usable (not exhausted)
+/// and under its projected weekly pace, from a fresh sample: `expected` is the
+/// expected utilization at this point in the window and `shortfall` is
+/// `expected - actual`, always `> 0`. `None` in every case
+/// [`usage_rank_highest_expected`] excludes. The input of the
+/// `WeightedRandom` and `AlternatingHandoff` selection modes.
+pub fn under_pace_shortfall(config_dir: &str) -> Option<(f64, f64)> {
     let snap = USAGE_SNAPSHOT.lock().ok()?;
     let map = snap.as_ref()?;
     let sample = map.get(config_dir)?;
@@ -595,7 +607,7 @@ pub fn usage_rank_highest_expected(config_dir: &str) -> Option<f64> {
     if delta >= 0.0 {
         return None;
     }
-    Some(expected)
+    Some((expected, -delta))
 }
 
 /// Whether an account was last seen **exhausted** (out of tokens / rejected),
