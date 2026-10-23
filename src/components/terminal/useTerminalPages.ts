@@ -45,7 +45,7 @@ const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
  * fixes it as active, and never mutates the shared page list / active-page key —
  * it is a read-only detached view of one page. Returns null in the main window.
  */
-function readPinnedPageId(): string | null {
+export function readPinnedPageId(): string | null {
   try {
     const v = new URLSearchParams(window.location.search).get("page");
     return v && v.trim() ? v : null;
@@ -170,6 +170,24 @@ export function computeVisiblePages(
 ): TerminalPageConfig[] {
   const visible = pages.filter((p) => p.id !== "default" || occupiedPageIds.has("default"));
   return visible.length > 0 ? visible : pages;
+}
+
+/**
+ * Pure: the ids of pages the "Close empty tabs" button should remove — pages
+ * hosting no live terminal and no restorable session (`occupiedPageIds`).
+ *
+ * The internal "default" page is never a candidate (it is the fallback home for
+ * API-created terminals and `removePage` never deletes its storage), and at
+ * least one page always survives: when EVERY page is empty the first is kept,
+ * because the strip must never go blank.
+ */
+export function emptyPageIds(
+  pages: TerminalPageConfig[],
+  occupiedPageIds: ReadonlySet<string>,
+): string[] {
+  const empty = pages.filter((p) => p.id !== "default" && !occupiedPageIds.has(p.id));
+  if (empty.length === pages.length) empty.shift();
+  return empty.map((p) => p.id);
 }
 
 /** Trim + treat blank as absent. Shared by the page-default helpers. */
@@ -384,6 +402,76 @@ export function reconcilePages(
   return [...persisted, ...synthesized];
 }
 
+/**
+ * The page ids hosting ≥1 live terminal (`terminal_list`) or restorable session
+ * (`terminal_session_list_open`). Returns `null` when a source could not be read
+ * (occupancy UNKNOWN) unless `bestEffort`, which returns whatever was read.
+ */
+export async function readOccupiedPageIds(bestEffort = false): Promise<Set<string> | null> {
+  const ids = new Set<string>();
+  let complete = true;
+
+  // Source 1: live terminals. Empty on a cold restart.
+  try {
+    const result = await invoke<{
+      success: boolean;
+      data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
+    }>("terminal_list");
+    if (result.success && result.data) {
+      for (const id of pageIdsFromTerminals(result.data.terminals)) ids.add(id);
+    } else {
+      complete = false;
+    }
+  } catch {
+    complete = false;
+  }
+
+  // Source 2: durable restore records — the cold-restart source; a minted page
+  // holding only not-yet-restored continuations gets no tab from source 1.
+  try {
+    const resp = await invoke<{
+      data?: { sessions?: Array<{ pageId?: string }> };
+    }>("terminal_session_list_open");
+    const sessions = resp?.data?.sessions;
+    if (Array.isArray(sessions)) {
+      for (const id of pageIdsFromSessions(sessions)) ids.add(id);
+    } else {
+      complete = false;
+    }
+  } catch {
+    complete = false;
+  }
+
+  return complete || bestEffort ? ids : null;
+}
+
+/**
+ * The close loop behind "Close empty tabs", with its two effects injected so the
+ * ordering is testable without React or Tauri.
+ *
+ * Occupancy is read once to pick candidates, then RE-READ immediately before
+ * each close: a terminal may have landed on a candidate while earlier pages were
+ * being removed (`removePage` kills the page's terminals, so a stale decision is
+ * destructive). FAIL-CLOSED: an unreadable occupancy closes nothing. Returns how
+ * many pages were closed.
+ */
+export async function closeEmptyPagesWith(
+  visiblePages: TerminalPageConfig[],
+  read: () => Promise<Set<string> | null>,
+  remove: (id: string) => Promise<void>,
+): Promise<number> {
+  const ids = await read();
+  if (!ids) return 0;
+  let closed = 0;
+  for (const id of emptyPageIds(visiblePages, ids)) {
+    const fresh = await read();
+    if (!fresh || fresh.has(id)) continue;
+    await remove(id);
+    closed++;
+  }
+  return closed;
+}
+
 export function useTerminalPages() {
   // A page-pinned pop-out window is fixed to one page for its whole lifetime.
   const [pinnedPageId] = useState<string | null>(readPinnedPageId);
@@ -398,6 +486,12 @@ export function useTerminalPages() {
   useEffect(() => {
     allPagesRef.current = allPages;
   }, [allPages]);
+  // Page ids the operator closed this session. `reconcile` skips them: the
+  // backend can still report a just-closed page (a PTY not yet dead, or its
+  // restore record not yet marked closed), and without this guard the
+  // reconcile that `terminal-exit` triggers re-mints the tab as "Page N".
+  // Cleared for an id when it is explicitly reopened (`addPage`/`openPage`).
+  const closedPageIdsRef = useRef<Set<string>>(new Set());
   const [activePageId, setActivePageIdState] = useState<string>(() =>
     isPinned ? pinnedPageId! : instanceStorage.getItem(ACTIVE_PAGE_KEY) || "default",
   );
@@ -451,10 +545,21 @@ export function useTerminalPages() {
     () => computeVisiblePages(pages, occupiedPageIds),
     [pages, occupiedPageIds],
   );
+  // The keep-one-page rule in `closeEmptyPages` must run against what the strip
+  // actually shows, not `pages` (which includes the hidden empty "default").
+  const emptyPageCount = useMemo(
+    () => emptyPageIds(visiblePages, occupiedPageIds).length,
+    [visiblePages, occupiedPageIds],
+  );
+  const visiblePagesRef = useRef(visiblePages);
+  useEffect(() => {
+    visiblePagesRef.current = visiblePages;
+  }, [visiblePages]);
 
   const addPage = useCallback(
     (name: string) => {
       const id = crypto.randomUUID();
+      closedPageIdsRef.current.delete(id);
       const newPage: TerminalPageConfig = { id, name, createdAt: Date.now() };
       setPages((prev) => {
         const updated = [...prev, newPage];
@@ -468,6 +573,13 @@ export function useTerminalPages() {
   );
 
   const removePage = useCallback(async (id: string) => {
+    // Mark closed BEFORE any await so a reconcile fired by the first
+    // `terminal-exit` cannot resurrect the page.
+    // Never for "default" (the internal API-terminal home, not a closable tab)
+    // or the last remaining page (which `setPages` below refuses to remove).
+    if (id !== "default" && allPagesRef.current.length > 1) {
+      closedPageIdsRef.current.add(id);
+    }
     // Close all PTYs belonging to this page
     try {
       const result = await invoke<{
@@ -513,6 +625,20 @@ export function useTerminalPages() {
       return currentActive;
     });
   }, []);
+
+  /**
+   * Close every docked page that hosts no terminal ("Close empty tabs").
+   *
+   * Occupancy is re-read from the backend rather than trusting the cached
+   * `occupiedPageIds` (a terminal may have landed since the last debounced
+   * reconcile). FAIL-CLOSED: if either source cannot be read, occupancy is
+   * UNKNOWN and nothing is closed — an unread source must not read as "empty".
+   * Returns the number of pages closed.
+   */
+  const closeEmptyPages = useCallback(
+    () => closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, removePage),
+    [removePage],
+  );
 
   const renamePage = useCallback((id: string, name: string) => {
     setPages((prev) => {
@@ -612,6 +738,7 @@ export function useTerminalPages() {
   const openPage = useCallback(
     (id: string, name: string) => {
       if (!id) return;
+      closedPageIdsRef.current.delete(id);
       setPages((prev) => {
         if (prev.some((p) => p.id === id)) return prev; // already present — just activate below
         const updated = [...prev, { id, name, createdAt: Date.now() }];
@@ -644,37 +771,7 @@ export function useTerminalPages() {
   // already persisted (see `reconcilePages`). Best-effort: a failed invoke must
   // not throw out of the effect.
   const reconcile = useCallback(async () => {
-    const ids = new Set<string>();
-
-    // Source 1: live terminals (terminal_list). Empty on a cold restart.
-    try {
-      const result = await invoke<{
-        success: boolean;
-        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
-      }>("terminal_list");
-      if (result.success && result.data) {
-        for (const id of pageIdsFromTerminals(result.data.terminals)) ids.add(id);
-      }
-    } catch {
-      // Best effort
-    }
-
-    // Source 2: durable restore records (terminal_session_list_open). This is
-    // the cold-restart source — a minted page holding only not-yet-restored
-    // continuations gets no tab from terminal_list alone, and fetchOpenRecords
-    // would then drop those records. Unioning the durable pageIds rebuilds the
-    // tab from durable state.
-    try {
-      const resp = await invoke<{
-        data?: { sessions?: Array<{ pageId?: string }> };
-      }>("terminal_session_list_open");
-      const sessions = resp?.data?.sessions;
-      if (Array.isArray(sessions)) {
-        for (const id of pageIdsFromSessions(sessions)) ids.add(id);
-      }
-    } catch {
-      // Best effort
-    }
+    const ids = (await readOccupiedPageIds(true)) ?? new Set<string>();
 
     // Record occupancy from the SAME unioned id set: `ids` is exactly the page
     // ids that currently host ≥1 live terminal (terminal_list) or restorable
@@ -683,8 +780,17 @@ export function useTerminalPages() {
     // memo sees a new reference and recomputes.
     setOccupiedPageIds(new Set(ids));
 
+    // Drop pages the operator closed from the TAB reconcile only (occupancy
+    // above stays unfiltered). A closed id the backend no longer lists has
+    // finished dying: forget it, so a later terminal on that id gets a tab.
+    const reconcileIds = new Set(ids);
+    for (const closed of [...closedPageIdsRef.current]) {
+      if (!ids.has(closed)) closedPageIdsRef.current.delete(closed);
+      else reconcileIds.delete(closed);
+    }
+
     setPages((prev) => {
-      const next = reconcilePages(prev, ids);
+      const next = reconcilePages(prev, reconcileIds);
       if (next === prev) return prev; // nothing missing — no persist / no re-render
       savePages(next);
       return next;
@@ -785,6 +891,9 @@ export function useTerminalPages() {
     addPage,
     openPage,
     removePage,
+    closeEmptyPages,
+    /** Tabs the Close-empty button would close, per the last-known occupancy (a hint; the click re-reads). */
+    emptyPageCount,
     renamePage,
     reorderPage,
     setPageDefaultWorkingDir,

@@ -46,6 +46,7 @@ import { isSurfaceVisible } from "@/lib/surfaceVisible";
 
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { SessionManagerToggle } from "./SessionManagerToggle";
+import { TerminalWorkModeToggle } from "./TerminalWorkModeToggle";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 
 import {
@@ -962,6 +963,11 @@ export function CommandBar() {
             UI-Bridge addressable) affordance lives. Ctrl+Shift+B and
             `/sessions` remain; this is additive. */}
         <SessionManagerToggle />
+        {/* Grid / tmux work mode — beside the Session Manager toggle because
+            the two govern the same navigation: in tmux mode the sidebar is
+            the only way to reach an off-screen session, and entering the
+            mode opens it. Ctrl+Shift+Y and `/terminal.mode` do the same. */}
+        <TerminalWorkModeToggle />
         {/* F2 — tenant for the next spawn, immediately left of the console
             the operator types `/spawn-ai` into. Self-hides on single-tenant
             devices. */}

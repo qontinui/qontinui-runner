@@ -743,7 +743,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   const onLoadWorkspace = useCallback(
     async (workspace: SavedWorkspace) => {
       if (workspace.layoutId !== zoneLayout.layoutId) {
-        zoneLayout.setLayoutId(workspace.layoutId);
+        zoneLayout.setLayoutId(workspace.layoutId, { source: "operator" });
       }
       for (const [index, session] of workspace.sessions.entries()) {
         // Serial, like the cold restore: name the burst in the resource-guard
