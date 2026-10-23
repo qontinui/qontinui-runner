@@ -7,12 +7,14 @@
  *
  * It runs the SDK's own engine (`@qontinui/ui-bridge` `setTextVisibility`) —
  * the same code the relay dispatcher and the injected runtime run — behind the
- * SDK's dev-controls gate. The gate is shared with the media override; the
- * runner's webview opts in only under a Vite dev server, and every runner —
- * published, dev and temp alike — is an exe-mode build, so on every runner
- * this message answers the typed refusal below. The gate is not a security
- * boundary: hiding text adds nothing beyond the existing `page_evaluate` / eval
- * surface.
+ * SDK's dev-controls gate, which it shares with the media override. It works
+ * only where this webview opted in: a Vite dev runner, once
+ * qontinui-runner#2311's `features.devControls: import.meta.env.DEV` is in
+ * `App.tsx`. Everywhere else — every exe-mode runner — it answers the typed
+ * `capability_unavailable_in_build` refusal below. Text over a web page is
+ * measured through inject-cli (`/verify-web`), not here. The gate is not a
+ * security boundary: hiding text adds nothing beyond the existing
+ * `page_evaluate` / eval surface.
  *
  * After a hide or restore that CHANGED the page, the reply waits for a paint
  * ({@link nextPaint}), so the frame the runner captures next shows the new

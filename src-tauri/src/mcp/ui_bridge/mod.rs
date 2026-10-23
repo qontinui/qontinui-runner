@@ -516,7 +516,10 @@ mod manifest_drift_tests {
                 families.push(stem.to_string());
             }
         }
-        assert!(families.len() > 20, "found only {families:?}: the scan is broken");
+        assert!(
+            families.len() > 20,
+            "found only {families:?}: the scan is broken"
+        );
         let mut problems = Vec::new();
         for f in &families {
             if !mod_rs.contains(&format!(".merge({f}::routes())")) {

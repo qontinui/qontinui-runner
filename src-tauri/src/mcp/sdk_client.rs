@@ -3138,12 +3138,16 @@ pub(crate) async fn sdk_text_visibility(
     dispatcher: &super::app_dispatch::AppDispatcher,
     sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
     body: serde_json::Value,
+    bump: impl Fn(),
 ) -> serde_json::Value {
     use crate::mcp::ui_bridge::text_visibility;
     if let Err(e) = text_visibility::validate_text_visibility_body(&body) {
         return serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e });
     }
-    match dispatcher
+    // The app's rendered pixels change between these two bumps, so a vision
+    // capture cached on either side of the change is not reused across it.
+    bump();
+    let out = match dispatcher
         .dispatch_active(
             sdk_connection,
             text_visibility::SDK_ACTION,
@@ -3155,7 +3159,9 @@ pub(crate) async fn sdk_text_visibility(
     {
         Ok(data) => data,
         Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
-    }
+    };
+    bump();
+    out
 }
 
 /// POST /ui-bridge/sdk/control/text-visibility — Hide or restore every glyph in the SDK app
@@ -3163,7 +3169,8 @@ async fn handle_text_visibility(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    Json(sdk_text_visibility(&state.app_dispatcher, &state.sdk_connection, body).await)
+    let bump = || crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
+    Json(sdk_text_visibility(&state.app_dispatcher, &state.sdk_connection, body, bump).await)
 }
 
 /// GET /ui-bridge/sdk/debug/metrics — Debug metrics
@@ -8717,7 +8724,7 @@ mod text_visibility_dispatch_tests {
                 "ttlMs must be an integer",
             ),
         ] {
-            let out = sdk_text_visibility(&d, &c, body).await;
+            let out = sdk_text_visibility(&d, &c, body, || {}).await;
             assert_eq!(out["code"], json!("INVALID_REQUEST"), "{out}");
             assert!(
                 out["error"].as_str().unwrap_or("").contains(needle),
@@ -8734,9 +8741,18 @@ mod text_visibility_dispatch_tests {
     async fn an_http_app_is_sent_the_body_at_its_text_visibility_route() {
         let (d, c) = http_target().await;
         let body = json!({"hidden": true, "ttlMs": 5_000});
-        let out = sdk_text_visibility(&d, &c, body.clone()).await;
+        let bumps = std::sync::atomic::AtomicU32::new(0);
+        let out = sdk_text_visibility(&d, &c, body.clone(), || {
+            bumps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
         assert_eq!(out["path"], json!("/control/text-visibility"), "{out}");
         assert_eq!(out["got"], body, "{out}");
+        assert_eq!(
+            bumps.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the vision mutation id is bumped before and after the change"
+        );
     }
 
     #[tokio::test]
@@ -8758,10 +8774,9 @@ mod text_visibility_dispatch_tests {
             AppDispatcher::new(registry, relay),
             active("wapp", "ws-app://wapp"),
         );
-        let pending =
-            tokio::spawn(
-                async move { sdk_text_visibility(&d, &c, json!({"hidden": false})).await },
-            );
+        let pending = tokio::spawn(async move {
+            sdk_text_visibility(&d, &c, json!({"hidden": false}), || {}).await
+        });
         let frame = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
             .await
             .expect("no frame within 5 s")

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -489,6 +489,18 @@ pub struct MutationOccurredResponse {
 /// — the bounded permit pool (size 2) prevents thrash under multi-agent load;
 /// it is harmless overhead for CapturePreview.
 pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
+    let _permit = state
+        .vision_capture_semaphore
+        .acquire()
+        .await
+        .map_err(|e| format!("capture semaphore acquire: {}", e))?;
+    capture_runner_window_frame_permitted(state).await
+}
+
+/// [`capture_runner_window_frame`] for a caller already holding a permit from
+/// `state.vision_capture_semaphore` — the `captureTextHidden` arm, which takes
+/// one permit before frame A and holds it through frame B.
+async fn capture_runner_window_frame_permitted(state: &Arc<ApiState>) -> Result<Frame, String> {
     use tauri::Manager;
 
     let window = state
@@ -509,12 +521,6 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
     let y = geometry.y;
     let w = geometry.width;
     let h = geometry.height;
-
-    let _permit = state
-        .vision_capture_semaphore
-        .acquire()
-        .await
-        .map_err(|e| format!("capture semaphore acquire: {}", e))?;
 
     // Prefer occlusion-immune WebView2 CapturePreview on Windows.
     #[cfg(windows)]
@@ -641,9 +647,16 @@ fn record_capture_fallback_inner(
 /// (contract, region, element, annotations, redact) all participate via
 /// Debug-format hashing so any parameter change flips the key.
 fn compose_capture_cache_key(state: &Arc<ApiState>, req: &CaptureRequest) -> [u8; 32] {
-    let mut_id = state
-        .vision_mutation_id
-        .load(std::sync::atomic::Ordering::Relaxed);
+    capture_cache_key(
+        state
+            .vision_mutation_id
+            .load(std::sync::atomic::Ordering::Relaxed),
+        req,
+    )
+}
+
+/// [`compose_capture_cache_key`] over an already-read mutation id.
+fn capture_cache_key(mut_id: u64, req: &CaptureRequest) -> [u8; 32] {
     let s = format!("v=1|mut={mut_id}|req={req:?}");
     qontinui_vision_core::sha256_of(s.as_bytes())
 }
@@ -2087,13 +2100,14 @@ impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
 /// `unknown{needs_multi_frame_input}`.
 ///
 /// Exactly one of the two fields: a base64 PNG, or the sha256 of a
-/// `vision/cache` entry (what `vision/capture` returns — take it with
-/// `contract: "png_strict"`, which neither resizes nor re-encodes lossily). A
-/// PNG carries no device pixel ratio, so frame B is read at the scale factor
-/// of the frame this call captured, as `vision-audit --frame-text-hidden`
-/// reads it at `--frame`'s. Whether the two PAIR (one size, one scale factor)
-/// is vision-core's question: a pair that does not answers `unknown` with the
-/// reason, not an error here.
+/// `vision/cache` PNG entry (what `vision/capture` returns — take it with
+/// `contract: "png_strict"`, which neither resizes nor re-encodes lossily).
+/// Only a PNG with frame A's exact pixel size is accepted, and it is decoded
+/// under limits sized to that frame. A PNG carries no device pixel ratio, so
+/// frame B is read at the scale factor of the frame this call captured, as
+/// `vision-audit --frame-text-hidden` reads it at `--frame`'s. A base64 frame
+/// rides in the request body, which these two routes accept up to
+/// [`VISION_FRAME_BODY_LIMIT`] (32 MiB); pass a larger one by `sha256`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TextHiddenFrameRequest {
@@ -2103,13 +2117,25 @@ pub struct TextHiddenFrameRequest {
     pub sha256: Option<String>,
 }
 
+/// The request-body ceiling of `vision/analyze` and `vision/assert`, raised
+/// from axum's 2 MiB `Json` default so a base64 frame B fits.
+pub(crate) const VISION_FRAME_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// The decode ceiling for a supplied frame B: its pixels as RGBA, with room
+/// for the decoder's own buffers. Frame A's size bounds it first.
+const TEXT_HIDDEN_FRAME_MAX_ALLOC: u64 = 512 * 1024 * 1024;
+
 /// Refuse a frame-B request that cannot be honoured, before anything is
-/// captured or hidden.
+/// captured or hidden. `reads_frame_b` says whether the analysis asked for
+/// reads frame B at all (the `image` analyzer, or a `text_over_image_contrast`
+/// assertion): hiding the runner's text for a frame nothing reads alters the
+/// page for nothing, so `captureTextHidden` is refused without one.
 fn check_text_hidden_request(
     supplied: Option<&TextHiddenFrameRequest>,
     ids: Option<&[String]>,
     capture: bool,
     target: Option<&str>,
+    reads_frame_b: bool,
 ) -> Result<(), String> {
     if ids.is_some() && supplied.is_none() {
         return Err(if capture {
@@ -2125,7 +2151,7 @@ fn check_text_hidden_request(
     if capture && supplied.is_some() {
         return Err(
             "textHiddenFrame and captureTextHidden are exclusive: frame B is either \
-                    supplied or captured here, not both"
+             supplied or captured here, not both"
                 .into(),
         );
     }
@@ -2136,6 +2162,14 @@ fn check_text_hidden_request(
                  targets '{target}'; capture frame B there (inject-cli for a web page) and \
                  pass it as textHiddenFrame"
             ));
+        }
+        if !reads_frame_b {
+            return Err(
+                "captureTextHidden hides the page's text for frame B, and nothing in this \
+                 request reads frame B: use the `image` analyzer or a \
+                 `text_over_image_contrast` assertion"
+                    .into(),
+            );
         }
     }
     if let Some(f) = supplied {
@@ -2152,31 +2186,74 @@ fn check_text_hidden_request(
     Ok(())
 }
 
-/// Decode a caller-supplied frame B at `scale_factor` (frame A's). `cache_root`
-/// is the `vision/cache` root a `sha256` is looked up under.
+/// Decode a caller-supplied frame B: a PNG of exactly `expected` (frame A's
+/// width and height) pixels, read at `scale_factor` (frame A's). The header is
+/// read first and anything else refused before a pixel is decoded; the decode
+/// runs under [`image::Limits`] sized to frame A. `cache_root` is the
+/// `vision/cache` root a `sha256` is looked up under. Blocking: call it from
+/// the blocking pool.
 fn decode_text_hidden_frame(
     supplied: &TextHiddenFrameRequest,
     scale_factor: f64,
+    expected: (u32, u32),
     cache_root: &StdPath,
 ) -> Result<Frame, String> {
     use base64::Engine as _;
+    use std::io::Cursor;
     let bytes = match (&supplied.png_base64, &supplied.sha256) {
         (Some(b64), None) => base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|e| format!("textHiddenFrame.pngBase64 is not base64: {e}"))?,
         (None, Some(sha)) => {
-            let (path, _ext) = find_cache_file(cache_root, sha)
+            // Cache entries are named by the lowercase hex digest.
+            let sha = sha.to_ascii_lowercase();
+            let (path, ext) = find_cache_file(cache_root, &sha)
                 .map_err(|e| format!("textHiddenFrame.sha256: vision cache unreadable: {e}"))?
                 .ok_or_else(|| {
                     format!("textHiddenFrame.sha256: no vision cache entry for {sha}")
                 })?;
+            if !ext.eq_ignore_ascii_case("png") {
+                return Err(format!(
+                    "textHiddenFrame.sha256: the vision cache entry for {sha} is .{ext}, not a \
+                     PNG; capture frame B with contract \"png_strict\""
+                ));
+            }
             std::fs::read(&path)
                 .map_err(|e| format!("textHiddenFrame.sha256: read {}: {e}", path.display()))?
         }
         _ => return Err("textHiddenFrame takes exactly one of pngBase64 or sha256".into()),
     };
-    let rgba = image::load_from_memory(&bytes)
-        .map_err(|e| format!("textHiddenFrame is not a decodable image: {e}"))?
+    let header = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("textHiddenFrame: unreadable header: {e}"))?;
+    if header.format() != Some(image::ImageFormat::Png) {
+        return Err(format!(
+            "textHiddenFrame must be a PNG (got {})",
+            header.format().map_or_else(
+                || "an unrecognised format".to_string(),
+                |f| format!("{f:?}")
+            )
+        ));
+    }
+    let dims = header
+        .into_dimensions()
+        .map_err(|e| format!("textHiddenFrame: unreadable PNG header: {e}"))?;
+    if dims != expected {
+        return Err(format!(
+            "textHiddenFrame is {}x{} px and the frame is {}x{} px: frame B must be the same \
+             page captured at the same size",
+            dims.0, dims.1, expected.0, expected.1
+        ));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(expected.0);
+    limits.max_image_height = Some(expected.1);
+    limits.max_alloc = Some(TEXT_HIDDEN_FRAME_MAX_ALLOC);
+    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Png);
+    reader.limits(limits);
+    let rgba = reader
+        .decode()
+        .map_err(|e| format!("textHiddenFrame is not a decodable PNG: {e}"))?
         .to_rgba8();
     Ok(Frame::from_rgba(
         rgba,
@@ -2206,67 +2283,148 @@ struct TextHidden {
     run: Option<super::text_visibility::TextVisibilityRun>,
 }
 
-/// Resolve frame B. `frame_a` is the frame this call already captured, and
-/// `frame_a_error` why there is none; it is captured BEFORE anything is
-/// hidden, so frame A always shows the text.
-async fn resolve_text_hidden(
+/// Frame A and, when the request asked for one, frame B: the runner arm under
+/// `captureTextHidden`, else frame A from `target` and a supplied frame B.
+/// Frame A is best-effort (see the handlers); its error is returned beside it.
+async fn capture_frames(
     state: &Arc<ApiState>,
+    target: &Option<String>,
     supplied: Option<&TextHiddenFrameRequest>,
     ids: Option<Vec<String>>,
     capture: bool,
-    frame_a: Option<&Frame>,
-    frame_a_error: Option<&str>,
-) -> TextHidden {
-    if supplied.is_none() && !capture {
-        return TextHidden::default();
+) -> (Option<Frame>, Option<String>, TextHidden) {
+    if capture {
+        return capture_text_hidden_arm(state).await;
     }
-    let Some(frame_a) = frame_a else {
-        // A twin of nothing: and on the capture arm, altering the page for a
-        // frame B nothing can be paired with would buy nothing.
-        return TextHidden {
-            error: Some(format!(
-                "frame B is the text-hidden twin of the frame, and no frame was captured ({})",
-                frame_a_error.unwrap_or("no reason given")
-            )),
-            ..Default::default()
-        };
+    let frame_result = match resolve_frame_provider(state, target).await {
+        Ok(provider) => provider.frame(state).await,
+        Err(e) => Err(e),
     };
-    if let Some(supplied) = supplied {
-        return match decode_text_hidden_frame(
-            supplied,
-            frame_a.source.scale_factor,
-            state.vision_cache.root(),
-        ) {
-            Ok(f) => TextHidden {
-                frame: Some(f),
-                ids,
+    let (frame, frame_error) = match frame_result {
+        Ok(f) => (Some(f), None),
+        Err(e) => {
+            warn!("vision: frame capture failed, continuing snapshot-only: {e}");
+            (None, Some(e))
+        }
+    };
+    let Some(supplied) = supplied else {
+        return (frame, frame_error, TextHidden::default());
+    };
+    let Some(frame_a) = frame.as_ref() else {
+        let error = format!(
+            "frame B is the text-hidden twin of the frame, and no frame was captured ({})",
+            frame_error.as_deref().unwrap_or("no reason given")
+        );
+        return (
+            frame,
+            frame_error,
+            TextHidden {
+                error: Some(error),
                 ..Default::default()
             },
-            Err(e) => TextHidden {
-                error: Some(e),
-                ..Default::default()
-            },
-        };
+        );
+    };
+    let supplied = supplied.clone();
+    let scale = frame_a.source.scale_factor;
+    let expected = (frame_a.width, frame_a.height);
+    let cache_root = state.vision_cache.root().to_path_buf();
+    // The file read and the decode are blocking work: off the tokio worker.
+    let decoded = spawn_blocking_tracked(move || {
+        decode_text_hidden_frame(&supplied, scale, expected, &cache_root)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("textHiddenFrame decode task: {e}")));
+    let text_hidden = match decoded {
+        Ok(f) => TextHidden {
+            frame: Some(f),
+            ids,
+            ..Default::default()
+        },
+        Err(e) => TextHidden {
+            error: Some(e),
+            ..Default::default()
+        },
+    };
+    (frame, frame_error, text_hidden)
+}
+
+/// Frame B must come from the backend that took frame A: the WebView2
+/// `CapturePreview` path and the monitor crop composite differently, so their
+/// pixels differ where no glyph is, and the difference would read as glyphs.
+fn pair_backends_agree(a: &Frame, b: &Frame) -> Result<(), String> {
+    if a.source.capture_backend == b.source.capture_backend {
+        return Ok(());
     }
+    Err(format!(
+        "frame B discarded: frame A was captured by {} and frame B by {}; two backends \
+         composite differently, so their difference is not the glyphs",
+        capture_backend_label(a).unwrap_or_else(|| "no runner-window backend".into()),
+        capture_backend_label(b).unwrap_or_else(|| "no runner-window backend".into()),
+    ))
+}
+
+/// The runner arm (`captureTextHidden`): frame A and frame B of the runner's
+/// own window around a hide of its webview's text, under one lock and one
+/// capture permit ([`super::text_visibility::capture_text_hidden_pair`]).
+async fn capture_text_hidden_arm(
+    state: &Arc<ApiState>,
+) -> (Option<Frame>, Option<String>, TextHidden) {
+    use super::text_visibility::{capture_text_hidden_pair, REQUEST_TYPE};
     let send = |kind: &'static str, body: serde_json::Value| {
         let state = Arc::clone(state);
         async move { super::request::ui_bridge_request_sync(&state, kind, body).await }
     };
-    let out =
-        super::text_visibility::capture_text_hidden(send, || capture_runner_window_frame(state))
+    let acquire = || async {
+        state
+            .vision_capture_semaphore
+            .acquire()
+            .await
+            .map_err(|e| format!("capture semaphore acquire: {e}"))
+    };
+    let abort_state = Arc::clone(state);
+    let abort_restore = move || {
+        tokio::spawn(async move {
+            let _ = super::request::ui_bridge_request_sync(
+                &abort_state,
+                REQUEST_TYPE,
+                serde_json::json!({"hidden": false}),
+            )
             .await;
-    let (frame, error) = match out.frame {
+            bump_mutation_id(&abort_state);
+        });
+    };
+    let out = capture_text_hidden_pair(
+        send,
+        acquire,
+        || capture_runner_window_frame_permitted(state),
+        || bump_mutation_id(state),
+        abort_restore,
+    )
+    .await;
+    let (frame, frame_error) = match out.frame_a {
         Ok(f) => (Some(f), None),
         Err(e) => (None, Some(e)),
     };
-    TextHidden {
+    let (frame_b, error) = match (out.frame_b, frame.as_ref()) {
+        (Ok(b), Some(a)) => match pair_backends_agree(a, &b) {
+            Ok(()) => (Some(b), None),
+            Err(e) => (None, Some(e)),
+        },
+        (Ok(_), None) => (None, Some("frame B without a frame A".into())),
+        (Err(e), _) => (None, Some(e)),
+    };
+    (
         frame,
-        // Follow-up: fill from the hide's report once the SDK reports the ids
-        // it hid; ui-bridge#265's hide reports counts only.
-        ids: None,
-        error,
-        run: Some(out.run),
-    }
+        frame_error,
+        TextHidden {
+            frame: frame_b,
+            // Follow-up: fill from the hide's report once the SDK reports the
+            // ids it hid; ui-bridge#265's hide reports counts only.
+            ids: None,
+            error,
+            run: out.run,
+        },
+    )
 }
 
 /// Run `analyzer` over frame A, its text-hidden twin and the snapshot. The one
@@ -2354,10 +2512,12 @@ pub struct AnalyzeRequest {
     /// webview (`control/text-visibility`), captures frame B, and restores the
     /// page, all inside this request; the response's `textVisibility` says
     /// what the page answered and whether it ended restored. Only for the
-    /// runner's own window (`target` absent), and exclusive with
-    /// `textHiddenFrame`. The hide is a dev control the webview serves only on
-    /// a Vite dev build, so an exe-mode runner refuses it
-    /// (`capability_unavailable_in_build`, reported in `textHiddenFrameError`).
+    /// runner's own window (`target` absent), exclusive with
+    /// `textHiddenFrame`, and only when something in the request reads frame
+    /// B. The hide is a dev control: it works only where the webview opted
+    /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
+    /// everywhere else — every exe-mode runner — answers
+    /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
     #[serde(default)]
     pub capture_text_hidden: bool,
 }
@@ -2368,9 +2528,10 @@ impl RequestHints for AnalyzeRequest {
             "Required field: `analyzer` (one of: \"layout\", \"typography\", \"color\", \
              \"dynamic\", \"elements\", \"image\"). \
              Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`, \
-             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden) with an \
-             optional `textHiddenIds`, or `captureTextHidden: true` (the runner hides its \
-             own webview's text for frame B)."
+             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
+             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
+             only with the `image` analyzer)."
                 .to_string(),
             "Use `vision/assert` for targeted pass/fail checks; \
              use `vision/analyze` for broad findings across a frame."
@@ -2716,10 +2877,12 @@ pub struct AssertRequest {
     /// webview (`control/text-visibility`), captures frame B, and restores the
     /// page, all inside this request; the response's `textVisibility` says
     /// what the page answered and whether it ended restored. Only for the
-    /// runner's own window (`target` absent), and exclusive with
-    /// `textHiddenFrame`. The hide is a dev control the webview serves only on
-    /// a Vite dev build, so an exe-mode runner refuses it
-    /// (`capability_unavailable_in_build`, reported in `textHiddenFrameError`).
+    /// runner's own window (`target` absent), exclusive with
+    /// `textHiddenFrame`, and only when something in the request reads frame
+    /// B. The hide is a dev control: it works only where the webview opted
+    /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
+    /// everywhere else — every exe-mode runner — answers
+    /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
     #[serde(default)]
     pub capture_text_hidden: bool,
 }
@@ -2740,9 +2903,10 @@ impl RequestHints for AssertRequest {
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id), \
-             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden) with an \
-             optional `textHiddenIds`, or `captureTextHidden: true` (the runner hides its \
-             own webview's text for frame B; text_over_image_contrast reads it)."
+             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
+             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
+             only with a text_over_image_contrast assertion, which reads it)."
                 .to_string(),
         ])
     }
@@ -3002,28 +3166,18 @@ async fn vision_analyze_handler(
         req.text_hidden_ids.as_deref(),
         req.capture_text_hidden,
         req.target.as_deref(),
+        // Only the `image` analyzer reads frame B (each image's `textContrast`).
+        req.analyzer == qontinui_vision_core::Analyzer::Image,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
-    let frame_result = match resolve_frame_provider(&state, &req.target).await {
-        Ok(provider) => provider.frame(&state).await,
-        Err(e) => Err(e),
-    };
-    let (frame, frame_error) = match frame_result {
-        Ok(f) => (Some(f), None),
-        Err(e) => {
-            warn!("vision/analyze: frame capture failed, continuing snapshot-only: {e}");
-            (None, Some(e))
-        }
-    };
-    // Frame B, after frame A: the runner arm hides text only once frame A,
+    // Frame A, then frame B: the runner arm hides text only once frame A,
     // which must show it, is taken.
-    let text_hidden = resolve_text_hidden(
+    let (frame, frame_error, text_hidden) = capture_frames(
         &state,
+        &req.target,
         req.text_hidden_frame.as_ref(),
         req.text_hidden_ids.clone(),
         req.capture_text_hidden,
-        frame.as_ref(),
-        frame_error.as_deref(),
     )
     .await;
 
@@ -3104,27 +3258,22 @@ async fn vision_assert_handler(
         req.text_hidden_ids.as_deref(),
         req.capture_text_hidden,
         req.target.as_deref(),
+        // Only `text_over_image_contrast` reads frame B.
+        req.assertions.iter().any(|a| {
+            matches!(
+                a,
+                qontinui_vision_core::Assertion::TextOverImageContrast { .. }
+            )
+        }),
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
-    let frame_result = match resolve_frame_provider(&state, &req.target).await {
-        Ok(provider) => provider.frame(&state).await,
-        Err(e) => Err(e),
-    };
-    let (frame, frame_error) = match frame_result {
-        Ok(f) => (Some(f), None),
-        Err(e) => {
-            warn!("vision/assert: frame capture failed, continuing snapshot-only: {e}");
-            (None, Some(e))
-        }
-    };
-    // Frame B, after frame A (see the analyze handler).
-    let text_hidden = resolve_text_hidden(
+    // Frame A, then frame B (see the analyze handler).
+    let (frame, frame_error, text_hidden) = capture_frames(
         &state,
+        &req.target,
         req.text_hidden_frame.as_ref(),
         req.text_hidden_ids.clone(),
         req.capture_text_hidden,
-        frame.as_ref(),
-        frame_error.as_deref(),
     )
     .await;
 
@@ -3153,7 +3302,7 @@ async fn vision_assert_handler(
         ocr_blocks,
         target: _,
         // Consumed above, by `check_text_hidden_request` and
-        // `resolve_text_hidden`: frame B now travels in `text_hidden`.
+        // `capture_frames`: frame B now travels in `text_hidden`.
         text_hidden_frame: _,
         text_hidden_ids: _,
         capture_text_hidden: _,
@@ -3364,8 +3513,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/vision/raw", post(vision_raw_handler))
         .route("/ui-bridge/vision/extract", post(vision_extract_handler))
         .route("/ui-bridge/vision/describe", post(vision_describe_handler))
-        .route("/ui-bridge/vision/analyze", post(vision_analyze_handler))
-        .route("/ui-bridge/vision/assert", post(vision_assert_handler))
+        // A base64 frame B rides in these two bodies: past axum's 2 MiB default.
+        .route(
+            "/ui-bridge/vision/analyze",
+            post(vision_analyze_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+        )
+        .route(
+            "/ui-bridge/vision/assert",
+            post(vision_assert_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+        )
         .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
         .route(
             "/ui-bridge/vision/baselines",
@@ -4703,23 +4859,42 @@ mod text_hidden_tests {
             sha256: None,
         };
         let ids = vec!["heading".to_string()];
-        assert!(check_text_hidden_request(None, None, false, None).is_ok());
-        assert!(check_text_hidden_request(Some(&png), Some(&ids), false, Some("phone")).is_ok());
-        assert!(check_text_hidden_request(None, None, true, None).is_ok());
+        assert!(check_text_hidden_request(None, None, false, None, false).is_ok());
+        assert!(
+            check_text_hidden_request(Some(&png), Some(&ids), false, Some("phone"), true).is_ok()
+        );
+        assert!(check_text_hidden_request(None, None, true, None, true).is_ok());
         let cases = [
-            (Some(&png), None, true, None, "exclusive"),
-            (None, None, true, Some("phone"), "OWN webview only"),
+            (Some(&png), None, true, None, true, "exclusive"),
+            (None, None, true, Some("phone"), true, "OWN webview only"),
+            (
+                None,
+                None,
+                true,
+                None,
+                false,
+                "nothing in this request reads frame B",
+            ),
             (
                 None,
                 Some(ids.as_slice()),
                 false,
                 None,
+                true,
                 "no textHiddenFrame was supplied",
             ),
-            (None, Some(ids.as_slice()), true, None, "the runner reports"),
+            (
+                None,
+                Some(ids.as_slice()),
+                true,
+                None,
+                true,
+                "the runner reports",
+            ),
         ];
-        for (supplied, ids, capture, target, needle) in cases {
-            let err = check_text_hidden_request(supplied, ids, capture, target).expect_err(needle);
+        for (supplied, ids, capture, target, reads, needle) in cases {
+            let err =
+                check_text_hidden_request(supplied, ids, capture, target, reads).expect_err(needle);
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
         for (b64, sha, needle) in [
@@ -4731,7 +4906,7 @@ mod text_hidden_tests {
                 png_base64: b64.map(str::to_string),
                 sha256: sha.map(str::to_string),
             };
-            let err = check_text_hidden_request(Some(&f), None, false, None).unwrap_err();
+            let err = check_text_hidden_request(Some(&f), None, false, None, true).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
         // Unknown keys are refused at the shape, not ignored.
@@ -4760,7 +4935,7 @@ mod text_hidden_tests {
             png_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
             sha256: None,
         };
-        let f = decode_text_hidden_frame(&b64, 2.0, dir.path()).expect("decodes");
+        let f = decode_text_hidden_frame(&b64, 2.0, (8, 6), dir.path()).expect("decodes");
         assert_eq!((f.width, f.height), (8, 6));
         assert_eq!(f.source.scale_factor, 2.0);
         assert_eq!(
@@ -4770,11 +4945,12 @@ mod text_hidden_tests {
 
         let sha = "ab".repeat(32);
         std::fs::write(dir.path().join(format!("{sha}.png")), &bytes).unwrap();
+        // An uppercase digest finds the lowercase-named entry.
         let by_sha = TextHiddenFrameRequest {
             png_base64: None,
-            sha256: Some(sha.clone()),
+            sha256: Some(sha.to_ascii_uppercase()),
         };
-        let f = decode_text_hidden_frame(&by_sha, 1.5, dir.path()).expect("from the cache");
+        let f = decode_text_hidden_frame(&by_sha, 1.5, (8, 6), dir.path()).expect("from the cache");
         assert_eq!(f.buffer, img);
         assert_eq!(f.source.scale_factor, 1.5);
 
@@ -4782,16 +4958,112 @@ mod text_hidden_tests {
             png_base64: None,
             sha256: Some("cd".repeat(32)),
         };
-        assert!(decode_text_hidden_frame(&missing, 1.0, dir.path())
+        assert!(decode_text_hidden_frame(&missing, 1.0, (8, 6), dir.path())
             .unwrap_err()
             .contains("no vision cache entry"));
         let garbage = TextHiddenFrameRequest {
             png_base64: Some("not base64!".into()),
             sha256: None,
         };
-        assert!(decode_text_hidden_frame(&garbage, 1.0, dir.path())
+        assert!(decode_text_hidden_frame(&garbage, 1.0, (8, 6), dir.path())
             .unwrap_err()
             .contains("not base64"));
+    }
+
+    #[test]
+    fn a_supplied_frame_b_must_be_a_png_of_frame_as_size() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let b64 = |bytes: &[u8]| TextHiddenFrameRequest {
+            png_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            sha256: None,
+        };
+        let img = RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+
+        // Another size is refused from the header, before any pixel is decoded.
+        let err =
+            decode_text_hidden_frame(&b64(&png_bytes(&img)), 1.0, (9, 6), dir.path()).unwrap_err();
+        assert!(err.contains("8x6 px and the frame is 9x6 px"), "{err}");
+
+        // Another format is refused even at the right size.
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img.clone())
+            .to_rgb8()
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let err = decode_text_hidden_frame(&b64(&jpeg.into_inner()), 1.0, (8, 6), dir.path())
+            .unwrap_err();
+        assert!(err.contains("must be a PNG (got Jpeg)"), "{err}");
+
+        // A cache entry that is not a PNG is refused by its extension.
+        let sha = "ef".repeat(32);
+        std::fs::write(dir.path().join(format!("{sha}.jpeg")), b"x").unwrap();
+        let by_sha = TextHiddenFrameRequest {
+            png_base64: None,
+            sha256: Some(sha),
+        };
+        let err = decode_text_hidden_frame(&by_sha, 1.0, (8, 6), dir.path()).unwrap_err();
+        assert!(err.contains("not a PNG"), "{err}");
+
+        // A header that lies about its size cannot make the decoder allocate past
+        // frame A's: the limits are frame A's own dimensions.
+        let mut forged = png_bytes(&img);
+        // IHDR height (bytes 20..24) -> 60000. Refused from the header: by the
+        // size check, or by the PNG decoder's own checksum on the edited chunk.
+        forged[20..24].copy_from_slice(&60_000u32.to_be_bytes());
+        let err = decode_text_hidden_frame(&b64(&forged), 1.0, (8, 6), dir.path()).unwrap_err();
+        assert!(
+            err.contains("8x60000") || err.contains("PNG header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn frame_b_from_another_capture_backend_is_discarded() {
+        use qontinui_vision_core::CaptureBackend;
+        let frame = |backend| {
+            Frame::from_rgba(
+                RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255])),
+                FrameSource {
+                    kind: qontinui_vision_core::FrameSourceKind::Window,
+                    scale_factor: 1.0,
+                    captured_at: chrono::Utc::now(),
+                    capture_backend: Some(backend),
+                },
+            )
+        };
+        let preview = frame(CaptureBackend::Webview2CapturePreview);
+        let crop = frame(CaptureBackend::MonitorCrop);
+        assert!(
+            pair_backends_agree(&preview, &frame(CaptureBackend::Webview2CapturePreview)).is_ok()
+        );
+        let err = pair_backends_agree(&preview, &crop).unwrap_err();
+        assert!(err.contains("Webview2CapturePreview"), "{err}");
+        assert!(err.contains("MonitorCrop"), "{err}");
+    }
+
+    /// The vision capture cache keys on the mutation id: a capture cached on
+    /// one side of a hide must not answer for the other side of it.
+    #[tokio::test]
+    async fn a_hide_changes_the_capture_cache_key() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mutation_id = Arc::new(AtomicU64::new(7));
+        let req = CaptureRequest::default();
+        let before = capture_cache_key(mutation_id.load(Ordering::Relaxed), &req);
+        let m = Arc::clone(&mutation_id);
+        let _ = super::super::text_visibility::direct_set(
+            serde_json::json!({"hidden": true}),
+            |_kind, _body| std::future::ready(Ok(serde_json::json!({"success": true}))),
+            move || {
+                m.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+        let after = capture_cache_key(mutation_id.load(Ordering::Relaxed), &req);
+        assert_ne!(
+            before, after,
+            "a frame cached before the hide must miss after it"
+        );
     }
 
     /// A white heading painted over a dark hero image (frame A) and the same

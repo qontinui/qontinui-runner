@@ -19,20 +19,28 @@
 //!
 //! It is a DEV CONTROL. The SDK engine answers `capability_unavailable_in_build`
 //! unless the realm opted in (`@qontinui/ui-bridge` `core/dev-controls.ts`): the
-//! injected runtime always does; the runner's webview opts in only when
-//! `import.meta.env.DEV` is true, i.e. under a Vite dev server. Every runner —
-//! the published one and every dev or temp runner alike — runs in exe mode, so
-//! this route answers the typed refusal from the runner's own webview. It is
-//! mounted anyway because the SDK manifest-parity test requires every SDK route
-//! to be exposed. The gate is not a security boundary: hiding text adds no
-//! capability beyond the runner's existing `page_evaluate` / eval surface.
+//! injected runtime always does. The runner's webview opts in only where its
+//! `UIBridgeProvider` passes `features.devControls: import.meta.env.DEV` — a
+//! Vite dev runner, once qontinui-runner#2311 lands that line. Everywhere else,
+//! every exe-mode runner included, this route and the runner arm below answer
+//! `capability_unavailable_in_build`. The Phase 16 measurement on a web page
+//! goes through inject-cli (`/verify-web`); this arm covers only the runner's
+//! own window where its webview opted in. The route is mounted regardless,
+//! because the SDK manifest-parity test requires every SDK route to be exposed.
+//! The gate is not a security boundary: hiding text adds no capability beyond
+//! the runner's existing `page_evaluate` / eval surface.
 //!
 //! Validation mirrors the SDK's `validateTextVisibilityRequest` for an early
 //! 400; the SDK copy is the authority. Unlike the media override, there is no
 //! page-side wait to fit inside a transport budget: the SDK's hide and restore
 //! are synchronous, so one body serves every transport arm.
 //!
-//! [`capture_text_hidden`] is the runner arm of plan step 2: hide, capture
+//! Every hide or restore changes rendered pixels the vision capture cache keys
+//! on, so each one bumps `vision_mutation_id` (the `bump` callbacks below):
+//! otherwise a capture cached before a hide is served as "current" during it,
+//! and one cached during a hide is served after the restore.
+//!
+//! [`capture_text_hidden_pair`] is the runner arm of plan step 2: frame A, hide,
 //! frame B, restore — the orchestration `vision/analyze` and `vision/assert`
 //! run for `captureTextHidden: true`.
 
@@ -61,7 +69,7 @@ pub(crate) const SDK_ACTION: &str = "textVisibility";
 /// The SDK route, relative to the app's ui-bridge mount (the `/sdk/` HTTP arm).
 pub(crate) const SDK_PATH: &str = "/control/text-visibility";
 
-/// The TTL the runner arm ([`capture_text_hidden`]) hides with. Long enough for
+/// The TTL the runner arm ([`capture_text_hidden_pair`]) hides with. Long enough for
 /// one runner-window capture (a monitor-crop fallback included) between the
 /// hide and the restore; short enough that a runner dying between the two
 /// leaves the page altered for seconds, not the SDK's default half minute.
@@ -128,17 +136,22 @@ fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<Value>>) {
 /// (`ui_bridge_request_sync` in the axum handler, a recording closure in a
 /// test). Validation runs HERE, before `send`, so a test entering through this
 /// function observes it.
-pub(crate) async fn direct_set<S, F>(body: Value, send: S) -> HandlerResult
+pub(crate) async fn direct_set<S, F, B>(body: Value, send: S, bump: B) -> HandlerResult
 where
     S: FnOnce(&'static str, Value) -> F,
     F: Future<Output = Result<Value, String>>,
+    B: Fn(),
 {
     validate_text_visibility_body(&body).map_err(bad_request)?;
     info!(
         "UI Bridge API: text visibility hidden={}",
         body["hidden"].as_bool().unwrap_or_default()
     );
+    // Rendered pixels change between these two bumps; a capture keyed on the
+    // mutation id from either side of them is not reused across the change.
+    bump();
     let result = send(REQUEST_TYPE, body).await;
+    bump();
     // The SDK's own failure code (`capability_unavailable_in_build`,
     // `HIDE_FAILED`, …) is a verdict field the envelope does not forward when
     // the runner has no typed code by that name, so it is put back into
@@ -168,9 +181,12 @@ pub async fn ui_bridge_text_visibility_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<Value>,
 ) -> HandlerResult {
-    direct_set(body, |kind, body| async move {
-        ui_bridge_request_sync(&state, kind, body).await
-    })
+    let bump_state = Arc::clone(&state);
+    direct_set(
+        body,
+        |kind, body| async move { ui_bridge_request_sync(&state, kind, body).await },
+        move || super::vision_routes::bump_mutation_id(&bump_state),
+    )
     .await
 }
 
@@ -187,7 +203,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 }
 
 // ============================================================================
-// The runner arm (plan step 2): hide, capture frame B, restore
+// The runner arm (plan step 2): frame A, hide, frame B, restore
 // ============================================================================
 
 /// What the runner arm did to the page, reported beside frame B so a caller
@@ -197,16 +213,17 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[serde(rename_all = "camelCase")]
 pub struct TextVisibilityRun {
     /// What the webview answered to the hide: the SDK's own result
-    /// (`{success, hidden, changed, coverage, ttlMs, …}`) or its refusal
-    /// (`{success: false, code, reason, error}` — `capability_unavailable_in_build`
-    /// on every exe-mode runner), or `{success: false, error}` when the request
-    /// never reached the SDK.
+    /// (`{success, hidden, changed, coverage, ttlMs, paintFence, …}`) or its
+    /// refusal (`{success: false, code, reason, error}` —
+    /// `capability_unavailable_in_build` wherever the webview has not opted
+    /// into dev controls), or `{success: false, error}` when the request never
+    /// reached the SDK.
     pub hide: Value,
     /// What the webview answered to the restore, the SDK's `{hidden: false,
-    /// restore: {verified, …}}`. `None` when no restore was sent: the hide
-    /// failed, or the text was already hidden by another caller (`changed:
-    /// false`) — then that caller's hide is left to it, and the TTL this hide
-    /// re-armed ([`CAPTURE_TTL_MS`]) restores the page by itself.
+    /// changed, restore: {verified, …}}`. `None` when no restore was sent: the
+    /// hide failed, or the text was already hidden by another caller
+    /// (`changed: false`) — then that caller's hide is left to it, and the TTL
+    /// this hide re-armed ([`CAPTURE_TTL_MS`]) restores the page by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore: Option<Value>,
     /// True only when a restore was sent and the SDK verified it
@@ -214,14 +231,21 @@ pub struct TextVisibilityRun {
     /// failed; `None` when none was sent (see `restore`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_restored: Option<bool>,
+    /// Something the caller should know that does not by itself void frame B:
+    /// the hide answered after its paint fence TIMED OUT, so frame B may have
+    /// been composited before the glyphs went transparent (vision-core then
+    /// reads the glyphs as still painted and answers unknown, never a pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
-/// The outcome of [`capture_text_hidden`]: frame B when it was captured, else
-/// why not, and the hide/restore record either way.
+/// The outcome of [`capture_text_hidden_pair`]: frame A, frame B when it was
+/// taken (else why not), and the hide/restore record when a hide was sent.
 #[derive(Debug)]
-pub struct TextHiddenCapture<Fr> {
-    pub frame: Result<Fr, String>,
-    pub run: TextVisibilityRun,
+pub struct TextHiddenPair<Fr> {
+    pub frame_a: Result<Fr, String>,
+    pub frame_b: Result<Fr, String>,
+    pub run: Option<TextVisibilityRun>,
 }
 
 fn is_true(v: &Value, key: &str) -> bool {
@@ -241,26 +265,96 @@ fn hide_failure_message(hide: &Value) -> String {
     }
 }
 
-/// Hide every glyph in the runner's own webview, capture frame B, restore.
+/// Serializes the runner arm: one webview, one hide state. Two concurrent
+/// `captureTextHidden` calls would otherwise interleave — the second's frame A
+/// taken during the first's hide, or the first's restore landing before the
+/// second's frame B — and both would measure the wrong pixels.
+static PAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Sends the restore if dropped while armed: the runner arm's future cancelled
+/// (the HTTP client went away) or a panic unwinding through it after a
+/// confirmed hide. Without it the page stays hidden until the SDK's TTL.
+struct RestoreOnDrop<R: FnOnce()> {
+    restore: Option<R>,
+}
+
+impl<R: FnOnce()> RestoreOnDrop<R> {
+    fn disarm(mut self) {
+        self.restore = None;
+    }
+}
+
+impl<R: FnOnce()> Drop for RestoreOnDrop<R> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            warn!("vision: the runner arm ended before its restore; restoring the webview's text");
+            restore();
+        }
+    }
+}
+
+/// Frame A, then every glyph in the runner's own webview hidden, frame B, and
+/// the page restored — under one lock, with one capture permit held throughout.
 ///
-/// `send` is the request to the webview (`ui_bridge_request_sync`), called at
-/// most twice — the hide and the restore; `capture` takes one frame of the
-/// runner window. Frame B is taken only after the webview confirmed the hide
-/// (`success: true, hidden: true`): the hook answers after a paint, so the
-/// capture sees the hidden frame. The restore is sent whenever THIS call hid
-/// the text, whether or not the capture succeeded; a restore that fails or is
-/// not verified is reported in [`TextVisibilityRun::page_restored`], and frame
-/// B is still returned, because what it shows was fixed when it was taken.
-pub(crate) async fn capture_text_hidden<S, F, C, CF, Fr>(
+/// - `send` is the request to the webview (`ui_bridge_request_sync`): the hide
+///   and the restore.
+/// - `acquire` takes the capture permit BEFORE anything is hidden, so the page
+///   is never left hidden while this call queues for a capture slot.
+/// - `capture` takes one frame of the runner window, the permit already held;
+///   it is called for frame A and, only after the webview confirmed the hide
+///   (`success: true, hidden: true`; the hook answers after a paint), for
+///   frame B.
+/// - `bump` bumps the vision mutation id: before the hide and after the restore.
+/// - `abort_restore` restores the page from a drop guard if this future is
+///   cancelled or unwinds between the hide and the restore; it must not await
+///   (it spawns).
+///
+/// The restore is sent whenever THIS call hid the text, whether or not frame B
+/// was captured. A restore that fails or is not verified is reported in
+/// [`TextVisibilityRun::page_restored`] and frame B is kept: what it shows was
+/// fixed when it was taken. A restore answering `changed: false` means the
+/// SDK's TTL had already restored the page, at an unknown moment that may
+/// precede frame B, so frame B is discarded.
+pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, B, R>(
     send: S,
+    acquire: A,
     capture: C,
-) -> TextHiddenCapture<Fr>
+    bump: B,
+    abort_restore: R,
+) -> TextHiddenPair<Fr>
 where
     S: Fn(&'static str, Value) -> F,
     F: Future<Output = Result<Value, String>>,
-    C: FnOnce() -> CF,
+    A: FnOnce() -> AF,
+    AF: Future<Output = Result<P, String>>,
+    C: Fn() -> CF,
     CF: Future<Output = Result<Fr, String>>,
+    B: Fn(),
+    R: FnOnce(),
 {
+    let _serialized = PAIR_LOCK.lock().await;
+    let not_taken = |why: &str| Err(format!("frame B was not taken: {why}"));
+    let _permit = match acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            return TextHiddenPair {
+                frame_a: Err(format!("capture permit: {e}")),
+                frame_b: not_taken("no capture permit"),
+                run: None,
+            }
+        }
+    };
+    let frame_a = capture().await;
+    if frame_a.is_err() {
+        // Altering the page for a frame B nothing can be paired with buys nothing.
+        return TextHiddenPair {
+            frame_a,
+            frame_b: not_taken("frame A could not be captured"),
+            run: None,
+        };
+    }
+
+    bump();
     let hide = match send(
         REQUEST_TYPE,
         serde_json::json!({"hidden": true, "ttlMs": CAPTURE_TTL_MS}),
@@ -271,28 +365,43 @@ where
         Err(e) => serde_json::json!({"success": false, "error": e}),
     };
     if !(is_true(&hide, "success") && is_true(&hide, "hidden")) {
-        let error = hide_failure_message(&hide);
-        return TextHiddenCapture {
-            frame: Err(error),
-            run: TextVisibilityRun {
+        return TextHiddenPair {
+            frame_a,
+            frame_b: Err(hide_failure_message(&hide)),
+            run: Some(TextVisibilityRun {
                 hide,
                 restore: None,
                 page_restored: None,
-            },
+                warning: None,
+            }),
         };
     }
+    let warning = (hide.get("paintFence").and_then(Value::as_str) == Some("timeout")).then(|| {
+        "the hide's paint fence timed out (the webview painted no frame within it), so \
+         frame B may have been composited before the glyphs went transparent"
+            .to_string()
+    });
     // `changed: false` means the text was already hidden, by a caller this one
     // must not undo. Only an explicit `false` reads that way: a reply that
     // omits it is treated as this call's own hide, and restored.
     let hid_it = hide.get("changed").and_then(Value::as_bool) != Some(false);
+    let guard = hid_it.then(|| RestoreOnDrop {
+        restore: Some(abort_restore),
+    });
 
-    let frame = capture().await;
+    let mut frame_b = capture()
+        .await
+        .map_err(|e| format!("frame B (text hidden) capture failed: {e}"));
 
     let (restore, page_restored) = if hid_it {
         let restore = match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
             Ok(v) => v,
             Err(e) => serde_json::json!({"success": false, "error": e}),
         };
+        if let Some(guard) = guard {
+            guard.disarm();
+        }
+        bump();
         let verified = is_true(&restore, "success")
             && restore.get("hidden").and_then(Value::as_bool) == Some(false)
             && restore
@@ -301,19 +410,30 @@ where
         if !verified {
             warn!("vision: the runner webview's text restore was not verified: {restore}");
         }
+        if is_true(&restore, "success")
+            && restore.get("changed").and_then(Value::as_bool) == Some(false)
+            && frame_b.is_ok()
+        {
+            frame_b = Err(format!(
+                "frame B discarded: the restore found the text already visible, so the \
+                 {CAPTURE_TTL_MS} ms TTL had restored the page at a moment that may precede \
+                 frame B"
+            ));
+        }
         (Some(restore), Some(verified))
     } else {
         (None, None)
     };
 
-    let frame = frame.map_err(|e| format!("frame B (text hidden) capture failed: {e}"));
-    TextHiddenCapture {
-        frame,
-        run: TextVisibilityRun {
+    TextHiddenPair {
+        frame_a,
+        frame_b,
+        run: Some(TextVisibilityRun {
             hide,
             restore,
             page_restored,
-        },
+            warning,
+        }),
     }
 }
 
@@ -394,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn the_direct_route_refuses_an_invalid_body_before_the_webview_sees_it() {
         let (sent, send) = webview(vec![]);
-        let (status, Json(body)) = direct_set(json!({"hidden": "yes"}), send)
+        let (status, Json(body)) = direct_set(json!({"hidden": "yes"}), send, || {})
             .await
             .expect_err("must be refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -413,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn the_direct_route_sends_the_webview_the_body_as_given() {
         let (sent, send) = webview(vec![Ok(json!({"success": true, "hidden": true}))]);
-        let out = direct_set(json!({"hidden": true, "ttlMs": 5_000}), send)
+        let out = direct_set(json!({"hidden": true, "ttlMs": 5_000}), send, || {})
             .await
             .expect("forwarded");
         assert_eq!(out.0.data, Some(json!({"success": true, "hidden": true})));
@@ -432,7 +552,7 @@ mod tests {
             "error": "dev control",
         });
         let (_sent, send) = webview(vec![Ok(refusal)]);
-        let (status, Json(body)) = direct_set(json!({"hidden": true}), send)
+        let (status, Json(body)) = direct_set(json!({"hidden": true}), send, || {})
             .await
             .expect_err("a refusal is a failure, never a success");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -449,7 +569,25 @@ mod tests {
         );
     }
 
-    // ── the runner arm: hide, capture frame B, restore ────────────────────
+    #[tokio::test]
+    async fn the_direct_route_bumps_the_mutation_id_around_the_change() {
+        let log: Sent = Default::default();
+        let (l1, l2) = (log.clone(), log.clone());
+        let send = move |kind: &'static str, body: Value| {
+            l1.lock().unwrap().push((kind, body));
+            std::future::ready(Ok(json!({"success": true, "hidden": true})))
+        };
+        let bump = move || l2.lock().unwrap().push(("<bump>", Value::Null));
+        direct_set(json!({"hidden": true}), send, bump)
+            .await
+            .expect("forwarded");
+        let kinds: Vec<&str> = log.lock().unwrap().iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["<bump>", REQUEST_TYPE, "<bump>"]);
+    }
+
+    // ── the runner arm: frame A, hide, frame B, restore ───────────────────
+
+    type Events = Arc<Mutex<Vec<String>>>;
 
     fn hid() -> Value {
         json!({"success": true, "hidden": true, "changed": true, "ttlMs": CAPTURE_TTL_MS})
@@ -460,79 +598,161 @@ mod tests {
                "restore": {"trigger": "request", "verified": verified}})
     }
 
-    /// A capture that records that it ran, and when relative to the requests.
-    fn capture_after(
-        sent: &Sent,
-        result: Result<&'static str, String>,
-    ) -> impl FnOnce() -> std::future::Ready<Result<&'static str, String>> {
-        let sent = sent.clone();
-        move || {
-            sent.lock().unwrap().push(("<capture>", Value::Null));
-            std::future::ready(result)
+    type BoxFut<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
+
+    /// One scripted run of the arm: the webview answers `replies` in turn, the
+    /// captures answer `frames` in turn, and every step lands in `events`.
+    struct Script {
+        events: Events,
+        replies: Vec<Result<Value, String>>,
+        frames: Vec<Result<&'static str, String>>,
+    }
+
+    impl Script {
+        fn new(
+            replies: Vec<Result<Value, String>>,
+            frames: Vec<Result<&'static str, String>>,
+        ) -> Self {
+            Self {
+                events: Default::default(),
+                replies,
+                frames,
+            }
+        }
+
+        async fn run(self) -> (TextHiddenPair<&'static str>, Vec<String>) {
+            let ev = self.events.clone();
+            let out = run_scripted(self.events, self.replies, self.frames).await;
+            let events = ev.lock().unwrap().clone();
+            (out, events)
         }
     }
 
-    #[tokio::test]
-    async fn the_arm_hides_then_captures_then_restores() {
-        let (sent, send) = webview(vec![Ok(hid()), Ok(restored(true))]);
-        let cap = capture_after(&sent, Ok("frame-b"));
-        let out = capture_text_hidden(send, cap).await;
-        assert_eq!(out.frame, Ok("frame-b"));
-        assert_eq!(
-            *sent.lock().unwrap(),
-            vec![
-                (
-                    REQUEST_TYPE,
-                    json!({"hidden": true, "ttlMs": CAPTURE_TTL_MS})
-                ),
-                ("<capture>", Value::Null),
-                (REQUEST_TYPE, json!({"hidden": false})),
-            ]
+    fn run_scripted(
+        events: Events,
+        replies: Vec<Result<Value, String>>,
+        frames: Vec<Result<&'static str, String>>,
+    ) -> BoxFut<TextHiddenPair<&'static str>> {
+        let replies = Arc::new(Mutex::new(replies.into_iter()));
+        let frames = Arc::new(Mutex::new(frames.into_iter()));
+        let (e1, e2, e3, e4, e5) = (
+            events.clone(),
+            events.clone(),
+            events.clone(),
+            events.clone(),
+            events,
         );
-        assert_eq!(out.run.page_restored, Some(true));
-        assert_eq!(out.run.hide, hid());
+        let send = move |_kind: &'static str, body: Value| {
+            let hidden = body["hidden"].as_bool().unwrap_or_default();
+            e1.lock()
+                .unwrap()
+                .push(if hidden { "hide" } else { "show" }.into());
+            let reply = replies
+                .lock()
+                .unwrap()
+                .next()
+                .unwrap_or_else(|| Err("no more replies scripted".into()));
+            std::future::ready(reply)
+        };
+        let acquire = move || {
+            e2.lock().unwrap().push("permit".into());
+            std::future::ready(Ok::<(), String>(()))
+        };
+        let capture = move || {
+            e3.lock().unwrap().push("capture".into());
+            let next = frames.lock().unwrap().next();
+            let fut: BoxFut<Result<&'static str, String>> = match next {
+                Some(f) => Box::pin(std::future::ready(f)),
+                // Out of scripted frames: a capture that never finishes.
+                None => Box::pin(std::future::pending()),
+            };
+            fut
+        };
+        let bump = move || e4.lock().unwrap().push("bump".into());
+        let abort = move || e5.lock().unwrap().push("abort-restore".into());
+        Box::pin(capture_text_hidden_pair(
+            send, acquire, capture, bump, abort,
+        ))
     }
 
     #[tokio::test]
-    async fn a_refused_hide_captures_nothing_and_names_the_code() {
+    async fn the_arm_takes_the_permit_then_a_then_hides_then_b_then_restores() {
+        let (out, events) = Script::new(
+            vec![Ok(hid()), Ok(restored(true))],
+            vec![Ok("frame-a"), Ok("frame-b")],
+        )
+        .run()
+        .await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        assert_eq!(out.frame_b, Ok("frame-b"));
+        assert_eq!(
+            events,
+            ["permit", "capture", "bump", "hide", "capture", "show", "bump"],
+            "the permit before the hide; a bump before the hide and after the restore"
+        );
+        let run = out.run.expect("a hide was sent");
+        assert_eq!(run.page_restored, Some(true));
+        assert_eq!(run.hide, hid());
+        assert_eq!(run.warning, None);
+    }
+
+    #[tokio::test]
+    async fn no_frame_a_means_nothing_is_hidden() {
+        let (out, events) = Script::new(vec![], vec![Err("Runner window not found".into())])
+            .run()
+            .await;
+        assert!(out.frame_a.is_err());
+        assert!(out
+            .frame_b
+            .unwrap_err()
+            .contains("frame A could not be captured"));
+        assert!(out.run.is_none());
+        assert_eq!(events, ["permit", "capture"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_hide_captures_no_frame_b_and_names_the_code() {
         let refusal = json!({"success": false, "code": "capability_unavailable_in_build",
                              "error": "dev control"});
-        let (sent, send) = webview(vec![Ok(refusal.clone())]);
-        let cap = capture_after(&sent, Ok("frame-b"));
-        let out = capture_text_hidden(send, cap).await;
-        let err = out.frame.expect_err("no frame B without a hide");
+        let (out, events) = Script::new(vec![Ok(refusal.clone())], vec![Ok("frame-a")])
+            .run()
+            .await;
+        let err = out.frame_b.expect_err("no frame B without a hide");
         assert!(err.contains("capability_unavailable_in_build"), "{err}");
-        assert_eq!(sent.lock().unwrap().len(), 1, "no capture, no restore");
-        assert_eq!(out.run.hide, refusal);
-        assert_eq!(out.run.restore, None);
-        assert_eq!(out.run.page_restored, None);
+        assert_eq!(events, ["permit", "capture", "bump", "hide"]);
+        let run = out.run.expect("the hide was sent");
+        assert_eq!(run.hide, refusal);
+        assert_eq!(run.restore, None);
     }
 
     #[tokio::test]
     async fn an_unreachable_webview_is_a_failed_hide_not_a_frame() {
-        let (_sent, send) = webview(vec![Err("UI Bridge request timed out".into())]);
-        let out = capture_text_hidden(send, || std::future::ready(Ok("frame-b"))).await;
-        assert!(out.frame.unwrap_err().contains("timed out"));
-        assert_eq!(out.run.hide["success"], json!(false));
+        let (out, _) = Script::new(
+            vec![Err("UI Bridge request timed out".into())],
+            vec![Ok("frame-a")],
+        )
+        .run()
+        .await;
+        assert!(out.frame_b.unwrap_err().contains("timed out"));
+        assert_eq!(out.run.unwrap().hide["success"], json!(false));
     }
 
     #[tokio::test]
-    async fn a_failed_capture_still_restores_the_page() {
-        let (sent, send) = webview(vec![Ok(hid()), Ok(restored(true))]);
-        let cap = capture_after(&sent, Err("Runner window not found".into()));
-        let out = capture_text_hidden(send, cap).await;
-        let err = out.frame.expect_err("the capture failed");
+    async fn a_failed_frame_b_still_restores_the_page() {
+        let (out, events) = Script::new(
+            vec![Ok(hid()), Ok(restored(true))],
+            vec![Ok("frame-a"), Err("capture backend failed".into())],
+        )
+        .run()
+        .await;
+        let err = out.frame_b.expect_err("the capture failed");
         assert!(
             err.contains("frame B (text hidden) capture failed"),
             "{err}"
         );
-        assert!(err.contains("Runner window not found"), "{err}");
-        assert_eq!(
-            sent.lock().unwrap().last().cloned(),
-            Some((REQUEST_TYPE, json!({"hidden": false}))),
-            "the restore is sent even though the capture failed"
-        );
-        assert_eq!(out.run.page_restored, Some(true));
+        assert_eq!(events.last().map(String::as_str), Some("bump"));
+        assert!(events.contains(&"show".to_string()), "{events:?}");
+        assert_eq!(out.run.unwrap().page_restored, Some(true));
     }
 
     #[tokio::test]
@@ -542,27 +762,148 @@ mod tests {
             Ok(json!({"success": false, "error": "STATE_SCHEMA_MISMATCH"})),
             Err("transport".to_string()),
         ] {
-            let (_sent, send) = webview(vec![Ok(hid()), reply.clone()]);
-            let out = capture_text_hidden(send, || std::future::ready(Ok("frame-b"))).await;
-            assert_eq!(out.frame, Ok("frame-b"), "{reply:?}");
-            assert_eq!(out.run.page_restored, Some(false), "{reply:?}");
-            assert!(out.run.restore.is_some(), "{reply:?}");
+            let (out, _) = Script::new(
+                vec![Ok(hid()), reply.clone()],
+                vec![Ok("frame-a"), Ok("frame-b")],
+            )
+            .run()
+            .await;
+            assert_eq!(out.frame_b, Ok("frame-b"), "{reply:?}");
+            assert_eq!(out.run.unwrap().page_restored, Some(false), "{reply:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_restore_the_ttl_already_made_discards_frame_b() {
+        let late = json!({"success": true, "hidden": false, "changed": false,
+                          "restore": {"trigger": "ttl", "verified": true}});
+        let (out, _) = Script::new(
+            vec![Ok(hid()), Ok(late)],
+            vec![Ok("frame-a"), Ok("frame-b")],
+        )
+        .run()
+        .await;
+        let err = out
+            .frame_b
+            .expect_err("frame B may postdate the TTL restore");
+        assert!(err.contains("TTL had restored the page"), "{err}");
+        assert_eq!(out.frame_a, Ok("frame-a"));
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_paint_fence_is_a_warning() {
+        let mut fenced = hid();
+        fenced["paintFence"] = json!("timeout");
+        let (out, _) = Script::new(
+            vec![Ok(fenced), Ok(restored(true))],
+            vec![Ok("frame-a"), Ok("frame-b")],
+        )
+        .run()
+        .await;
+        assert_eq!(out.frame_b, Ok("frame-b"));
+        let warning = out.run.unwrap().warning.expect("a warning");
+        assert!(warning.contains("paint fence timed out"), "{warning}");
     }
 
     #[tokio::test]
     async fn text_another_caller_hid_is_left_to_it() {
         let already = json!({"success": true, "hidden": true, "changed": false});
-        let (sent, send) = webview(vec![Ok(already)]);
-        let out = capture_text_hidden(send, || std::future::ready(Ok("frame-b"))).await;
-        assert_eq!(out.frame, Ok("frame-b"));
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            1,
-            "no restore of a hide this call did not make"
+        let (out, events) = Script::new(vec![Ok(already)], vec![Ok("frame-a"), Ok("frame-b")])
+            .run()
+            .await;
+        assert_eq!(out.frame_b, Ok("frame-b"));
+        assert!(!events.contains(&"show".to_string()), "{events:?}");
+        assert_eq!(out.run.unwrap().restore, None);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_arm_restores_the_page_from_its_guard() {
+        let events: Events = Default::default();
+        // Frame B never finishes; the caller gives up while text is hidden.
+        let fut = run_scripted(
+            events.clone(),
+            vec![Ok(hid()), Ok(restored(true))],
+            vec![Ok("frame-a")],
         );
-        assert_eq!(out.run.restore, None);
-        assert_eq!(out.run.page_restored, None);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), fut)
+                .await
+                .is_err(),
+            "frame B was scripted never to finish"
+        );
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            [
+                "permit",
+                "capture",
+                "bump",
+                "hide",
+                "capture",
+                "abort-restore"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_arm_does_not_also_restore_from_its_guard() {
+        let (_, events) = Script::new(
+            vec![Ok(hid()), Ok(restored(true))],
+            vec![Ok("frame-a"), Ok("frame-b")],
+        )
+        .run()
+        .await;
+        assert!(!events.contains(&"abort-restore".to_string()), "{events:?}");
+    }
+
+    /// Two arms at once against one webview whose frames show whether its text
+    /// is hidden: each must see its own frame A with text and frame B without.
+    #[tokio::test]
+    async fn concurrent_arms_do_not_interleave() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let hidden = Arc::new(AtomicBool::new(false));
+        let arm = |hidden: Arc<AtomicBool>| async move {
+            let h1 = hidden.clone();
+            let send = move |_kind: &'static str, body: Value| {
+                let h = h1.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    let want = body["hidden"].as_bool().unwrap_or_default();
+                    let was = h.swap(want, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(if want {
+                        json!({"success": true, "hidden": true, "changed": !was})
+                    } else {
+                        json!({"success": true, "hidden": false, "changed": was,
+                               "restore": {"verified": true}})
+                    })
+                }
+            };
+            let h2 = hidden.clone();
+            let capture = move || {
+                let h = h2.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    let text_hidden = h.load(Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok::<bool, String>(text_hidden)
+                }
+            };
+            capture_text_hidden_pair(
+                send,
+                || std::future::ready(Ok::<(), String>(())),
+                capture,
+                || {},
+                || {},
+            )
+            .await
+        };
+        let (one, two) = tokio::join!(arm(hidden.clone()), arm(hidden.clone()));
+        for out in [one, two] {
+            assert_eq!(out.frame_a, Ok(false), "frame A must show the text");
+            assert_eq!(out.frame_b, Ok(true), "frame B must be the hidden page");
+        }
+        assert!(!hidden.load(Ordering::SeqCst), "the page ends restored");
     }
 
     #[test]
@@ -571,6 +912,7 @@ mod tests {
             hide: json!({"success": false}),
             restore: None,
             page_restored: None,
+            warning: None,
         };
         assert_eq!(
             serde_json::to_value(&run).unwrap(),
@@ -580,9 +922,11 @@ mod tests {
             hide: hid(),
             restore: Some(restored(true)),
             page_restored: Some(true),
+            warning: Some("w".into()),
         };
         let v = serde_json::to_value(&run).unwrap();
         assert_eq!(v["pageRestored"], json!(true));
+        assert_eq!(v["warning"], json!("w"));
         assert_eq!(v["restore"]["restore"]["verified"], json!(true));
     }
 }
