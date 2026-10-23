@@ -617,12 +617,12 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
 /// to make a divergence go green.
 #[test]
 fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
-    // One admitted modal whose registry id and DOM id are both `modal-1`, so
-    // the bare form matches through `bridgeId` and `div#modal-1` through
-    // `domId` (each kind only in its own form, SDK `a24b971`).
+    // One admitted `<div>` modal whose registry id and DOM id are both
+    // `modal-1`, so the bare form matches through `bridgeId` and `div#modal-1`
+    // through its DOM-form name (SDK `964a5b0`).
     let modal_ids: ModalIdentities = modal_ids_from_context(&serde_json::json!({
         "modals": [{
-            "id": "modal-1", "bridgeId": "modal-1", "domId": "modal-1",
+            "id": "modal-1", "tagName": "div", "bridgeId": "modal-1", "domId": "modal-1",
             "blocking": true, "blockingSource": "element",
         }]
     }))
@@ -914,18 +914,18 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
 fn expected_overlay_admission_is_blocking_source_element_exactly() {
     let ctx = serde_json::json!({
         "modals": [
-            { "id": "dialog", "bridgeId": "bridge-dialog", "domId": "dialog", "blocking": true, "blockingSource": "element" },
-            { "id": "backdrop", "bridgeId": "bridge-backdrop", "domId": "backdrop", "blocking": true, "blockingSource": "backdrop" },
-            { "id": "legacy", "bridgeId": "bridge-legacy", "domId": "legacy", "blocking": true },
-            { "id": "drawer", "bridgeId": "bridge-drawer", "domId": "drawer", "blocking": false },
-            { "id": "menu", "bridgeId": "bridge-menu", "domId": "menu" },
+            { "id": "dialog", "tagName": "div", "bridgeId": "bridge-dialog", "domId": "dialog", "blocking": true, "blockingSource": "element" },
+            { "id": "backdrop", "tagName": "div", "bridgeId": "bridge-backdrop", "domId": "backdrop", "blocking": true, "blockingSource": "backdrop" },
+            { "id": "legacy", "tagName": "div", "bridgeId": "bridge-legacy", "domId": "legacy", "blocking": true },
+            { "id": "drawer", "tagName": "div", "bridgeId": "bridge-drawer", "domId": "drawer", "blocking": false },
+            { "id": "menu", "tagName": "div", "bridgeId": "bridge-menu", "domId": "menu" },
         ]
     });
     let ids = modal_ids_from_context(&ctx).expect("modals array present");
     assert_eq!(
-        ids.dom_ids,
-        std::collections::HashSet::from(["dialog".to_string()]),
-        "only the element-declared modal's DOM id is admitted"
+        ids.dom_names,
+        std::collections::HashSet::from(["div#dialog".to_string()]),
+        "only the element-declared modal's DOM-form name is admitted"
     );
     assert_eq!(
         ids.bridge_ids,
@@ -954,32 +954,41 @@ fn expected_overlay_admission_is_blocking_source_element_exactly() {
     }
 }
 
-/// The expected-overlay MATCHER, against the SDK's `isTrackedOverlay`
-/// (`visibility-report.ts`, ui-bridge `a24b971`). `ModalInfo.id` is not read
-/// at all; each identity kind matches only its own `occludedBy` form:
-/// `bridgeId` by exact equality, `domId` as `<tag>#X`, `testId` as
-/// `<tag>[data-testid="X"]`. An absent field never matches, and neither does
-/// a generated `modal-N`. P8 is the case that forced it: an `aside#sidebar`
+/// The expected-overlay MATCHER, against the SDK's `isTrackedOverlay` and
+/// `modalIdentities` (`visibility-report.ts`, ui-bridge `964a5b0`).
+/// `ModalInfo.id` is not read. Two identity sets: `bridgeIds` (exact) and
+/// `domNames` (`<tagName>#<domId>`, `<tagName>[data-testid="<testId>"]`,
+/// built with the dialog's OWN tag; an absent `tagName` contributes none). An
+/// occluder that is itself a REGISTERED element id matches only a `bridgeId`,
+/// never a DOM-form name. P8 is the case that forced it: an `aside#sidebar`
 /// beside an admitted dialog whose testid is `sidebar` is NOT expected.
 #[test]
 fn expected_overlay_matcher_keys_each_identity_kind_to_its_own_form() {
     let ctx = serde_json::json!({
         "modals": [
             {
-                "id": "sidebar", "testId": "sidebar", "type": "dialog",
+                "id": "sidebar", "tagName": "div", "testId": "sidebar", "type": "dialog",
                 "blocking": true, "blockingSource": "element",
             },
-            { "id": "modal-2", "blocking": true, "blockingSource": "element" },
+            { "id": "modal-2", "tagName": "div", "blocking": true, "blockingSource": "element" },
             {
-                "id": "dlg", "domId": "dlg", "bridgeId": "bridge-dlg",
+                "id": "dlg", "tagName": "dialog", "domId": "dlg", "bridgeId": "bridge-dlg",
+                "blocking": true, "blockingSource": "element",
+            },
+            {
+                "id": "untagged", "domId": "untagged", "bridgeId": "bridge-untagged",
                 "blocking": true, "blockingSource": "element",
             },
         ]
     });
     let ids = modal_ids_from_context(&ctx).expect("modals array present");
-    let expected = |occluder: &str| {
+    let expected_with = |occluder: &str, registered: Option<&str>| {
+        let mut elements = vec![occluded_element("btn-save", occluder, 40.0, "Save")];
+        if let Some(reg) = registered {
+            elements.push(serde_json::json!({ "id": reg, "label": reg }));
+        }
         let r = build_visibility_report(
-            &[occluded_element("btn-save", occluder, 40.0, "Save")],
+            &elements,
             0.02,
             true,
             Some(&ids),
@@ -987,24 +996,40 @@ fn expected_overlay_matcher_keys_each_identity_kind_to_its_own_form() {
         );
         r["occlusions"][0]["isExpectedOverlay"] == true
     };
+    let expected = |occluder: &str| expected_with(occluder, None);
 
     for (occluder, want) in [
         // P8.
         ("aside#sidebar", false),
+        ("aside[data-testid=\"sidebar\"]", false),
         ("sidebar", false),
         ("div[data-testid=\"sidebar\"]", true),
         // A generated id is no identity.
         ("modal-2", false),
         ("div#modal-2", false),
-        // DOM id and registry id, each in its own form only.
-        ("div#dlg", true),
+        // Duplicate DOM id on a different tag.
+        ("dialog#dlg", true),
+        ("div#dlg", false),
         ("dlg", false),
         ("bridge-dlg", true),
-        ("div#bridge-dlg", false),
-        ("div[data-testid=\"dlg\"]", false),
+        ("dialog#bridge-dlg", false),
+        ("dialog[data-testid=\"dlg\"]", false),
+        // Absent tagName: no DOM-form name, bridgeId still matches.
+        ("bridge-untagged", true),
+        ("div#untagged", false),
+        ("undefined#untagged", false),
     ] {
         assert_eq!(expected(occluder), want, "occludedBy `{occluder}`");
     }
+
+    // A registered id shaped like a DOM-form name never matches one...
+    assert!(
+        !expected_with("dialog#dlg", Some("dialog#dlg")),
+        "`dialog#dlg` is a registered element id here, so it may only match a bridgeId"
+    );
+    // ...while a registry id that IS a bridgeId still matches, exactly.
+    assert!(expected_with("bridge-dlg", Some("bridge-dlg")));
+    assert!(!expected_with("bridge-dlg-2", Some("bridge-dlg-2")));
 }
 
 /// The TS responder for the census IPC. Same boundary as
