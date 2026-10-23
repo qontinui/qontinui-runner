@@ -99,9 +99,8 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
       // Process AI output for findings detection
       // Only process AI responses (not user prompts or hints)
       //
-      // FindingsTracker handles:
-      // - [FINDING:category:severity] markers
-      // - [VERIFICATION:PENDING/COMPLETED/FAILED] markers
+      // FindingsTracker handles [FINDING:category:severity] markers only —
+      // display data, never a trigger for IPC or an AI task.
       //
       // Rust backend also parses findings and sends via TauriFindingsListener events.
       if (source === "claude" || source === "ai") {

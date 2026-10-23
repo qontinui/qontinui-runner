@@ -33,8 +33,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use super::manager::WrapperManager;
-use super::primary_proxy::{self, into_http as proxy_error_to_http};
+use super::manager::{SpawnError, WrapperManager};
+use super::primary_proxy::{self, into_http_for_dispatch as proxy_error_to_http};
 use super::registry::WrapperRegistry;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -46,6 +46,195 @@ pub const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// HTTP header used to override the default dispatch timeout.
 pub const TIMEOUT_HEADER: &str = "X-Wrapper-Dispatch-Timeout";
+/// The longest a dispatch WAITS before it starts — for an exclusive action's
+/// turn and for the wrapper's spawn lock together, one deadline for both. The
+/// whole pre-dispatch time, waits and the spawn itself, is bounded by
+/// [`super::manager::PRE_DISPATCH_CEILING`].
+pub const PRE_DISPATCH_WAIT: Duration = Duration::from_secs(30);
+/// The typed code a busy refusal carries (HTTP 429): nothing was started, and
+/// the caller should come back soon — the action or the spawn is in use, the
+/// wrapper is not broken.
+pub const BUSY_CODE: &str = "wrapper_busy";
+/// The typed code a failed spawn carries (HTTP 503): the RUNNER could not
+/// start the wrapper, so nothing reached it.
+pub const SPAWN_FAILED_CODE: &str = "wrapper_spawn_failed";
+/// The typed code of the 503 a dispatch gets while the runner is still
+/// booting (its wrappers subsystem is not initialized): nothing reached any
+/// wrapper.
+pub const NOT_INITIALIZED_CODE: &str = "wrappers_not_initialized";
+/// The typed codes of the RUNNER's "nothing reached the wrapper" 503: a
+/// failed spawn, a booting runner, or (through a secondary) a primary the
+/// request never reached (`primary_proxy::PRIMARY_UNREACHABLE_CODE`). Every
+/// 503 the DISPATCH route answers carries one (other `/wrappers/*` routes
+/// still answer untyped 503s); a wrapper's own 5xx is 502
+/// (`wrapper_failure`), and on the dispatch route a secondary passes a
+/// primary's 503 on only when it carries one of these. A caller may park on these codes — and only on
+/// them — without risking a prompt the wrapper already sent. A 503 WITHOUT
+/// one (e.g. something else answering on the port) is not that verdict.
+pub const NOTHING_STARTED_CODES: &[&str] = &[
+    SPAWN_FAILED_CODE,
+    NOT_INITIALIZED_CODE,
+    primary_proxy::PRIMARY_UNREACHABLE_CODE,
+];
+
+/// Take `mtx`, or `None` once `wait` has passed.
+async fn acquire_bounded(
+    mtx: Arc<Mutex<()>>,
+    wait: Duration,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::time::timeout(wait, mtx.lock_owned()).await.ok()
+}
+
+/// Why a dispatch did not reach the wrapper.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreDispatchRefusal {
+    /// The exclusive turn or the spawn lock was not free inside the wait.
+    Busy(String),
+    /// The spawn ran and failed.
+    SpawnFailed(String),
+}
+
+/// The error envelope for a wrapper's non-2xx answer. Its body is NEVER
+/// quoted. Only typed fields pass through, all IN THE MESSAGE: the wrapper's
+/// `code` and `status` as `wrapper_code=` / `wrapper_status=` when each is a
+/// value of the closed diagnostic vocabulary (`manager::DIAG_CODES`), `retry_after_s` when a finite number in 0..=3600,
+/// `typed` when a bool, and the allowlisted codes extracted from its `error`
+/// text. The envelope's own `code` is NEVER set from a wrapper's body: that
+/// field is the runner's (`wrapper_busy` means "nothing was started"), and a
+/// wrapper that could forge it would make a caller retry a prompt it already
+/// sent.
+pub(crate) fn wrapper_error_body(
+    wrapper_id: &str,
+    status: u16,
+    parsed: &serde_json::Value,
+) -> ApiResponse<()> {
+    // Only a value from the closed diagnostic vocabulary passes: a short
+    // lowercase word is not trusted to be a code just by its shape.
+    let word = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| super::manager::DIAG_CODES.contains(s))
+            .map(str::to_string)
+    };
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(c) = word("code") {
+        fields.push(format!("wrapper_code={c}"));
+    }
+    if let Some(st) = word("status") {
+        fields.push(format!("wrapper_status={st}"));
+    }
+    if let Some(r) = parsed
+        .get("retry_after_s")
+        .and_then(|v| v.as_f64())
+        .filter(|r| r.is_finite() && (0.0..=3600.0).contains(r))
+    {
+        // `-0.0` passes the range check and would print as `-0`.
+        let r = if r == 0.0 { 0.0 } else { r };
+        fields.push(format!("retry_after_s={r}"));
+    }
+    if let Some(t) = parsed.get("typed").and_then(|v| v.as_bool()) {
+        fields.push(format!("typed={t}"));
+    }
+    if let Some(e) = parsed.get("error").and_then(|v| v.as_str()) {
+        let codes = super::manager::extract_codes(e);
+        if !codes.is_empty() {
+            fields.push(format!("codes={}", codes.join(",")));
+        }
+    }
+    api_error(format!(
+        "wrapper '{}' returned {}{}{}; body {}",
+        wrapper_id,
+        status,
+        if fields.is_empty() { "" } else { " " },
+        fields.join(" "),
+        super::manager::omitted(&parsed.to_string())
+    ))
+}
+
+/// The HTTP answer for a dispatch that never reached the wrapper. Busy is a
+/// 429 carrying the typed `code` `wrapper_busy` (nothing started, come back
+/// soon); a failed spawn is a 503 carrying `wrapper_spawn_failed` (the
+/// wrapper could not be started).
+pub(crate) fn refusal_response(refusal: PreDispatchRefusal) -> (StatusCode, Json<ApiResponse<()>>) {
+    match refusal {
+        PreDispatchRefusal::Busy(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::error_with_code(msg, BUSY_CODE)),
+        ),
+        PreDispatchRefusal::SpawnFailed(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error_with_code(msg, SPAWN_FAILED_CODE)),
+        ),
+    }
+}
+
+/// The answer while the wrappers subsystem is not initialized (the runner is
+/// booting): a 503 typed `wrappers_not_initialized` — nothing was started.
+pub(crate) fn not_initialized() -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiResponse::error_with_code(
+            "wrappers subsystem is not initialized",
+            NOT_INITIALIZED_CODE,
+        )),
+    )
+}
+
+/// The HTTP answer for a wrapper's own non-2xx. A 4xx passes through (the
+/// wrapper refused the call); every other status — a 5xx above all — is 502.
+/// A wrapper's 503 must NOT reach the caller as a 503: that status, with its
+/// typed code, is the runner's "nothing was started" verdict, and a wrapper
+/// that could answer it would get a prompt it already sent retried.
+pub(crate) fn wrapper_failure(
+    wrapper_id: &str,
+    status: u16,
+    parsed: &serde_json::Value,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mapped = StatusCode::from_u16(status)
+        .ok()
+        .filter(|s| s.is_client_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    (mapped, Json(wrapper_error_body(wrapper_id, status, parsed)))
+}
+
+/// Everything before the wrapper receives the call, under ONE deadline: the
+/// exclusive turn (when the action is exclusive), then the spawn lock and the
+/// spawn. Returns the held turn guard and the wrapper's port.
+pub(crate) async fn turn_and_spawn(
+    ctx: &DispatchContext,
+    wrapper_id: &str,
+    action: &str,
+    exclusive: bool,
+    wait: Duration,
+) -> Result<(Option<tokio::sync::OwnedMutexGuard<()>>, u16), PreDispatchRefusal> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let guard = if exclusive {
+        let mtx = ctx.exclusivity.lock_for(wrapper_id, action).await;
+        match acquire_bounded(mtx, left()).await {
+            Some(g) => Some(g),
+            None => {
+                return Err(PreDispatchRefusal::Busy(format!(
+                    "{BUSY_CODE}: wrapper '{wrapper_id}' action '{action}' is in use by another \
+                     call; nothing was started"
+                )))
+            }
+        }
+    } else {
+        None
+    };
+    match ctx.manager.spawn_within(wrapper_id, Some(left())).await {
+        Ok(port) => Ok((guard, port)),
+        Err(SpawnError::Busy) => Err(PreDispatchRefusal::Busy(format!(
+            "{BUSY_CODE}: wrapper '{wrapper_id}' is being started by another call; nothing \
+             was started"
+        ))),
+        Err(SpawnError::Failed(e)) => Err(PreDispatchRefusal::SpawnFailed(format!(
+            "failed to spawn wrapper '{wrapper_id}': {e}"
+        ))),
+    }
+}
 
 /// Body for `POST /wrappers/:id/dispatch`.
 #[derive(Debug, Deserialize)]
@@ -105,7 +294,10 @@ impl DispatchContext {
     pub fn new(registry: Arc<WrapperRegistry>, manager: Arc<WrapperManager>) -> Arc<Self> {
         // No global timeout on the client — we apply per-call timeouts
         // via tokio::time::timeout so the header override is exact.
+        // Loopback only (the wrapper's own port): never through a configured
+        // HTTP proxy.
         let http = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(4)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -179,14 +371,22 @@ pub async fn dispatch_handler(
         .map(|ws| ws.dispatch.clone())
     {
         Some(c) => c,
-        None => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(api_error("wrappers subsystem is not initialized")),
-            ));
-        }
+        None => return Err(not_initialized()),
     };
 
+    dispatch_local(ctx, wrapper_id, headers, req, PRE_DISPATCH_WAIT).await
+}
+
+/// The dispatch on THIS runner, given its wrapper context: everything the
+/// handler does once it is known not to be a secondary. `wait` is the
+/// pre-dispatch wait (`PRE_DISPATCH_WAIT` in production).
+pub(crate) async fn dispatch_local(
+    ctx: Arc<DispatchContext>,
+    wrapper_id: String,
+    headers: HeaderMap,
+    req: DispatchRequest,
+    wait: Duration,
+) -> Result<Json<ApiResponse<DispatchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Verify the wrapper exists in the registry — surface a 404 instead
     // of a confusing readiness timeout.
     if ctx.registry.get(&wrapper_id).await.is_none() {
@@ -202,27 +402,15 @@ pub async fn dispatch_handler(
     let timeout = resolve_timeout(&headers);
     let exclusive = action_is_exclusive(&ctx.registry, &wrapper_id, &req.action).await;
 
-    // Acquire the exclusivity guard *before* spawning so a slow spawn
-    // can't starve other parallel dispatches — well, parallel ones don't
-    // hit this branch, so the order is moot for them; for exclusive
-    // ones we want serialization across the spawn too, so this is fine.
-    let _exclusive_guard = if exclusive {
-        let mtx = ctx.exclusivity.lock_for(&wrapper_id, &req.action).await;
-        Some(mtx.lock_owned().await)
-    } else {
-        None
-    };
-
-    // Lazy-spawn (no-op if already running).
-    let port = ctx.manager.spawn(&wrapper_id).await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error(format!(
-                "failed to spawn wrapper '{}': {}",
-                wrapper_id, e
-            ))),
-        )
-    })?;
+    // The exclusive turn, the spawn lock and the spawn all run under one
+    // bounded deadline (`turn_and_spawn`). A busy refusal is HTTP 429 with the
+    // typed `wrapper_busy` code — nothing was started, so the caller retries
+    // soon — never the 503 a broken wrapper gets.
+    let (_exclusive_guard, port) =
+        match turn_and_spawn(&ctx, &wrapper_id, &req.action, exclusive, wait).await {
+            Ok(ok) => ok,
+            Err(refusal) => return Err(refusal_response(refusal)),
+        };
 
     let url = format!("http://127.0.0.1:{}/dispatch", port);
     let body = serde_json::json!({
@@ -273,16 +461,7 @@ pub async fn dispatch_handler(
     ctx.manager.note_dispatch(&wrapper_id).await;
 
     if !status.is_success() {
-        return Err((
-            // Translate the wrapper's HTTP status straightforwardly so
-            // upstream callers can distinguish "wrapper said 4xx" from
-            // "infra failure".
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(api_error(format!(
-                "wrapper '{}' returned {}: {}",
-                wrapper_id, status, parsed
-            ))),
-        ));
+        return Err(wrapper_failure(&wrapper_id, status.as_u16(), &parsed));
     }
 
     // Two acceptable response shapes from the wrapper:
@@ -297,6 +476,290 @@ pub async fn dispatch_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn context() -> (Arc<DispatchContext>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry.clone());
+        (DispatchContext::new(registry, manager), tmp)
+    }
+
+    /// A wrapper's non-2xx body is never quoted: a free-text message (here
+    /// carrying a cookie) is omitted, typed fields pass through.
+    #[test]
+    fn a_wrapper_error_body_is_not_quoted() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": "fetch failed: Cookie: SID=s3cr3t at https://x.example/?t=1 (net::ERR_CONNECTION_RESET, ECONNREFUSED)",
+            "code": "rate_limited",
+            "retry_after_s": 12,
+            "typed": true,
+        });
+        let env = wrapper_error_body("w", 429, &body);
+        let msg = env.error.clone().unwrap();
+        assert!(
+            !msg.contains("s3cr3t") && !msg.contains("Cookie") && !msg.contains("https"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("wrapper_code=rate_limited")
+                && msg.contains("retry_after_s=12")
+                && msg.contains("typed=true"),
+            "{msg}"
+        );
+        // The operator still gets the codes from the wrapper's error text.
+        assert!(
+            msg.contains("codes=net::ERR_CONNECTION_RESET,ECONNREFUSED"),
+            "{msg}"
+        );
+        assert!(msg.contains("omitted(len="), "{msg}");
+        // A wrapper's code never becomes the envelope's.
+        assert_eq!(env.code, None);
+        // An out-of-range or non-finite retry_after_s is dropped.
+        let env = wrapper_error_body("w", 500, &serde_json::json!({ "retry_after_s": 1e12 }));
+        assert!(!env.error.unwrap().contains("retry_after_s"));
+    }
+
+    /// A wrapper cannot forge the runner's `wrapper_busy`: a wrapper 429 whose
+    /// body says `{"code":"wrapper_busy"}` leaves the envelope's `code` unset,
+    /// so a caller cannot read it as "nothing was started" and retry a prompt
+    /// the wrapper may already have sent.
+    #[test]
+    fn a_wrapper_cannot_forge_the_runner_busy_code() {
+        let env = wrapper_error_body(
+            "w",
+            429,
+            &serde_json::json!({ "success": false, "code": "wrapper_busy" }),
+        );
+        assert_eq!(env.code, None);
+        // Not even in the message: `wrapper_busy` is not a diagnostic code.
+        assert!(!env.error.unwrap().contains("wrapper_busy"));
+    }
+
+    /// `wrapper_code` / `wrapper_status` pass only from the closed
+    /// vocabulary: a short lowercase word is not a code by its shape.
+    #[test]
+    fn wrapper_code_and_status_are_closed() {
+        let env = wrapper_error_body(
+            "w",
+            500,
+            &serde_json::json!({ "code": "sidabcdef", "status": "login_wall" }),
+        );
+        let msg = env.error.unwrap();
+        assert!(
+            !msg.contains("sidabcdef") && !msg.contains("wrapper_code="),
+            "{msg}"
+        );
+        assert!(msg.contains("wrapper_status=login_wall"), "{msg}");
+    }
+
+    /// A booting runner (no wrappers subsystem yet) answers the typed 503:
+    /// nothing was started, so a caller may park on it.
+    #[test]
+    fn a_booting_runner_answers_a_typed_503() {
+        let (s, body) = not_initialized();
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code.as_deref(), Some(NOT_INITIALIZED_CODE));
+        assert!(NOTHING_STARTED_CODES.contains(&NOT_INITIALIZED_CODE));
+        assert!(NOTHING_STARTED_CODES.contains(&SPAWN_FAILED_CODE));
+    }
+
+    /// `dispatch_local` itself — not just the helper — answers a wrapper's
+    /// own 503 as 502 with no runner code: a real wrapper HTTP server answers
+    /// 503 with a body naming the runner's code, and the dispatch must not
+    /// pass for "nothing started".
+    #[tokio::test]
+    async fn dispatch_local_answers_a_wrapper_503_as_502() {
+        use axum::routing::post;
+        let wrapper = axum::Router::new().route(
+            "/dispatch",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "code": SPAWN_FAILED_CODE, "error": "x" })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, wrapper).await });
+
+        let (ctx, _tmp) = context().await;
+        ctx.registry
+            .insert_for_test(test_wrapper("w", "a", false))
+            .await;
+        ctx.manager.insert_running_for_test("w", port).await;
+        let req = DispatchRequest {
+            action: "a".to_string(),
+            params: serde_json::json!({}),
+        };
+        let got = dispatch_local(
+            ctx,
+            "w".to_string(),
+            HeaderMap::new(),
+            req,
+            Duration::from_secs(5),
+        )
+        .await;
+        match got {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(body.0.code, None);
+            }
+            Ok(_) => panic!("a wrapper 503 is not a success"),
+        }
+        server.abort();
+    }
+
+    /// The 429 through an axum route and its JSON serialisation, not just the
+    /// helper: a registered wrapper whose exclusive action is held answers
+    /// HTTP 429 with `"code":"wrapper_busy"` in the body.
+    #[tokio::test]
+    async fn the_route_answers_a_held_exclusive_action_with_a_typed_429() {
+        use axum::{body::Body, http::Request, routing::post, Router};
+        use tower::ServiceExt;
+        // Registered directly (no node, no manifest scan): the test runs on
+        // every CI image.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        registry.insert_for_test(test_wrapper("w", "a", true)).await;
+        let manager = WrapperManager::new(registry.clone());
+        let ctx = DispatchContext::new(registry, manager);
+        let held = ctx.exclusivity.lock_for("w", "a").await.lock_owned().await;
+
+        let app =
+            Router::new().route(
+                "/wrappers/{id}/dispatch",
+                post({
+                    let ctx = ctx.clone();
+                    move |AxumPath(id): AxumPath<String>,
+                          headers: HeaderMap,
+                          Json(req): Json<DispatchRequest>| {
+                        let ctx = ctx.clone();
+                        async move {
+                            dispatch_local(ctx, id, headers, req, Duration::from_millis(80)).await
+                        }
+                    }
+                }),
+            );
+        let resp = app
+            .oneshot(
+                Request::post("/wrappers/w/dispatch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"a","params":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], BUSY_CODE);
+        drop(held);
+    }
+
+    fn test_wrapper(id: &str, action: &str, exclusive: bool) -> super::super::registry::Wrapper {
+        super::super::registry::Wrapper {
+            id: id.to_string(),
+            package_name: String::new(),
+            version: String::new(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "id": id, "displayName": id, "transport": "api"
+            }))
+            .unwrap(),
+            actions: vec![serde_json::from_value(serde_json::json!({
+                "id": action, "paramSchema": {}, "exclusive": exclusive
+            }))
+            .unwrap()],
+            install_path: String::new(),
+            installed_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// The dispatch handler's answer for each refusal: busy is HTTP 429 with
+    /// the typed code (a 503 here would park a caller for an hour on a merely
+    /// busy action), a failed spawn is 503 with its own typed code.
+    #[test]
+    fn a_busy_refusal_is_a_typed_429_and_a_failed_spawn_a_typed_503() {
+        let (status, body) = refusal_response(PreDispatchRefusal::Busy("b".into()));
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.0.code.as_deref(), Some(BUSY_CODE));
+        let (status, body) = refusal_response(PreDispatchRefusal::SpawnFailed("f".into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code.as_deref(), Some(SPAWN_FAILED_CODE));
+    }
+
+    /// A wrapper cannot answer the runner's "nothing was started" verdicts:
+    /// its 503 (and every other 5xx) is 502 with no envelope code, its 429 is
+    /// a 429 with no busy code, and only a 4xx keeps its status.
+    #[test]
+    fn a_wrappers_own_5xx_is_502_and_never_carries_a_runner_code() {
+        let body = serde_json::json!({ "code": SPAWN_FAILED_CODE, "error": "x" });
+        for status in [500u16, 502, 503, 504, 599] {
+            let (s, b) = wrapper_failure("w", status, &body);
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{status}");
+            assert_eq!(b.0.code, None, "{status}");
+        }
+        let (s, b) = wrapper_failure("w", 429, &serde_json::json!({ "code": BUSY_CODE }));
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(b.0.code, None);
+        let (s, _) = wrapper_failure("w", 404, &body);
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = wrapper_failure("w", 302, &body);
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+    }
+
+    /// `-0` is a number in range; it is reported as `0`, never `-0`.
+    #[test]
+    fn a_negative_zero_retry_after_is_reported_as_zero() {
+        let b = wrapper_error_body("w", 429, &serde_json::json!({ "retry_after_s": -0.0 }));
+        let msg = b.error.unwrap();
+        assert!(
+            msg.contains("retry_after_s=0 ") || msg.contains("retry_after_s=0;"),
+            "{msg}"
+        );
+        assert!(!msg.contains("-0"), "{msg}");
+    }
+
+    /// An exclusive action held by another call: the dispatch path refuses
+    /// as BUSY within the wait, before any spawn — not a spawn failure.
+    #[tokio::test]
+    async fn a_held_exclusive_turn_is_a_busy_refusal() {
+        let (ctx, _tmp) = context().await;
+        let held = ctx.exclusivity.lock_for("w", "a").await.lock_owned().await;
+        let started = std::time::Instant::now();
+        let got = turn_and_spawn(&ctx, "w", "a", true, Duration::from_millis(80)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        match got {
+            Err(PreDispatchRefusal::Busy(msg)) => assert!(msg.starts_with(BUSY_CODE), "{msg}"),
+            other => panic!("expected busy, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    /// A spawn in progress (its lock held) is busy too, inside the SAME
+    /// deadline: the spawn-lock wait is no longer unbounded.
+    #[tokio::test]
+    async fn a_held_spawn_lock_is_a_busy_refusal() {
+        let (ctx, _tmp) = context().await;
+        let held = ctx.manager.spawn_lock_for("w").await.lock_owned().await;
+        let started = std::time::Instant::now();
+        let got = turn_and_spawn(&ctx, "w", "a", false, Duration::from_millis(80)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(got, Err(PreDispatchRefusal::Busy(_))), "{got:?}");
+        drop(held);
+        // Free: the spawn runs and fails (no such wrapper): a different refusal.
+        let got = turn_and_spawn(&ctx, "w", "a", false, Duration::from_millis(80)).await;
+        assert!(
+            matches!(got, Err(PreDispatchRefusal::SpawnFailed(_))),
+            "{got:?}"
+        );
+    }
 
     #[test]
     fn timeout_header_clamps_to_max() {

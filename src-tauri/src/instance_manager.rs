@@ -658,7 +658,7 @@ impl InstanceManager {
 
 /// Path to the session file that tracks which instances were running.
 fn session_file_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("active_instances.json"))
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("active_instances.json"))
 }
 
 /// Persist the set of running instance IDs.
