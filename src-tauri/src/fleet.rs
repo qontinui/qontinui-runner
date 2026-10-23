@@ -5352,6 +5352,20 @@ pub async fn publish_tree_state() -> Result<(), String> {
             continue;
         }
 
+        // The head-of-tick gate in `spawn_tree_publisher` admitted this cycle,
+        // but each repo below costs ~9 `git` spawns and free commit can
+        // collapse while the walk is underway (2026-10-22: 0.97 GiB to 0 in 12 s,
+        // mid-cycle, and the runner died on the failed spawns). Re-ask per repo
+        // and end the cycle — every row is recomputed next tick, so a cut-short
+        // cycle costs staleness and nothing else.
+        if crate::resource_guard::commit_is_critical() {
+            warn!(
+                "fleet::tree_publisher: free commit fell below the critical floor mid-cycle; \
+                 ending the cycle after {total} repo(s) without spawning more `git`"
+            );
+            break;
+        }
+
         // capture_tree shells out to ~7 synchronous git subprocesses per
         // repo — multi-second on big or index-locked worktrees, and this
         // machine has dozens of them. Run it on the blocking pool so the

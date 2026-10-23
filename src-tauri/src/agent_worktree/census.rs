@@ -2570,6 +2570,13 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
         // fresh for EVERY worktree of the repo below. Best-effort: on
         // failure the walk proceeds against the staler trunk, exactly as it
         // did before this call existed.
+        //
+        // PAUSE (never skip) while free commit is critical: the head-of-tick gate
+        // cannot see a collapse after the walk is admitted, and this walk is
+        // ~12–15 `git` per row for hours. A skipped row would be deleted from
+        // coord by the completion snapshot replace, so the pause is bounded and
+        // then carries on, exactly as before it existed.
+        crate::resource_guard::wait_out_critical("worktree_census");
         fetch_trunk(canonical);
 
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -2587,6 +2594,7 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
             if !seen.insert(key) {
                 continue;
             }
+            crate::resource_guard::wait_out_critical("worktree_census");
             on_row(capture_worktree(repo, &wt));
         }
     }

@@ -2817,6 +2817,92 @@ pub(crate) fn background_work_verdict() -> BackgroundWork {
     background_work_verdict_for(lane, free_commit_bytes, &floors)
 }
 
+/// How often a paused walk re-reads the verdict.
+pub(crate) const MIDCYCLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest a walk waits for commit to recover before it carries on anyway.
+///
+/// Carrying on is the behaviour from before this existed, and a census walk
+/// that dropped rows instead would let its walk-completion snapshot replace
+/// delete live worktrees from coord — so a bounded wait is the only safe pause.
+pub(crate) const MIDCYCLE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether free commit is below the CRITICAL floor right now.
+///
+/// For a loop that is ALREADY mid-cycle. The head-of-tick gate
+/// ([`background_work_verdict`] via [`BackgroundShed::admit`]) cannot see a
+/// collapse that happens after the cycle is admitted: on 2026-10-22 the guard
+/// skipped one loop at 0.97 GiB free, and 12 s later the tree publisher and
+/// worktree census — admitted a moment earlier — were still spawning `git` per
+/// repo and per worktree when free commit hit 0 and the runner died. A cycle
+/// that spawns in a loop re-asks between iterations.
+pub(crate) fn commit_is_critical() -> bool {
+    matches!(background_work_verdict(), BackgroundWork::Skip(_))
+}
+
+/// Block until the verdict is no longer `Skip`, polling every `poll`, for at
+/// most `max_wait`. Returns `true` when there is headroom (immediately, in the
+/// common case) and `false` when `max_wait` ran out with commit still critical.
+///
+/// `verdict` and `sleep` are injected so a test drives it without a clock or the
+/// operator's real settings. Logs once on entering the wait and once on leaving
+/// it, never per poll.
+pub(crate) fn wait_out_critical_with(
+    spender: &'static str,
+    mut verdict: impl FnMut() -> BackgroundWork,
+    mut sleep: impl FnMut(std::time::Duration),
+    poll: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> bool {
+    let mut waited = std::time::Duration::ZERO;
+    let mut paused = false;
+    loop {
+        let BackgroundWork::Skip(obs) = verdict() else {
+            if paused {
+                tracing::info!(
+                    spender,
+                    "resource_guard: {spender} resumed mid-walk after {}s — free commit is back above the critical floor",
+                    waited.as_secs()
+                );
+            }
+            return true;
+        };
+        if waited >= max_wait {
+            warn!(
+                spender,
+                "resource_guard: {spender} waited {}s for commit to recover and is carrying on — {}",
+                waited.as_secs(),
+                obs.clause("critical")
+            );
+            return false;
+        }
+        if !paused {
+            paused = true;
+            warn!(
+                spender,
+                "resource_guard: pausing {spender} mid-walk — {}. No further `git` is spawned until \
+                 commit recovers (up to {}s); logged once per pause, not per poll",
+                obs.clause("critical"),
+                max_wait.as_secs()
+            );
+        }
+        sleep(poll);
+        waited += poll;
+    }
+}
+
+/// [`wait_out_critical_with`] against the live verdict, sleeping the calling
+/// thread. Only for a loop already on the blocking pool.
+pub(crate) fn wait_out_critical(spender: &'static str) -> bool {
+    wait_out_critical_with(
+        spender,
+        background_work_verdict,
+        std::thread::sleep,
+        MIDCYCLE_POLL,
+        MIDCYCLE_MAX_WAIT,
+    )
+}
+
 /// What one spender actually did on its last decision — the state the
 /// edge-triggered log line reports a CHANGE of.
 ///
@@ -3169,6 +3255,71 @@ mod tests {
             observed,
             limit,
         }
+    }
+
+    #[test]
+    fn mid_walk_wait_returns_at_once_with_headroom() {
+        let mut slept = 0u32;
+        let ok = wait_out_critical_with(
+            "t",
+            || BackgroundWork::Run,
+            |_| slept += 1,
+            MIDCYCLE_POLL,
+            MIDCYCLE_MAX_WAIT,
+        );
+        assert!(ok);
+        assert_eq!(slept, 0, "a healthy reading must never sleep the walk");
+    }
+
+    #[test]
+    fn mid_walk_wait_treats_warn_as_headroom() {
+        // Throttle is the head-of-tick rung's business; mid-walk only critical pauses.
+        let mut slept = 0u32;
+        let ok = wait_out_critical_with(
+            "t",
+            test_throttle_verdict,
+            |_| slept += 1,
+            MIDCYCLE_POLL,
+            MIDCYCLE_MAX_WAIT,
+        );
+        assert!(ok);
+        assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn mid_walk_wait_resumes_when_commit_recovers() {
+        let mut readings = 3u32;
+        let mut slept = 0u32;
+        let ok = wait_out_critical_with(
+            "t",
+            || {
+                if readings > 0 {
+                    readings -= 1;
+                    test_skip_verdict()
+                } else {
+                    BackgroundWork::Run
+                }
+            },
+            |_| slept += 1,
+            MIDCYCLE_POLL,
+            MIDCYCLE_MAX_WAIT,
+        );
+        assert!(ok);
+        assert_eq!(slept, 3, "one sleep per critical reading, then it resumes");
+    }
+
+    #[test]
+    fn mid_walk_wait_gives_up_after_the_ceiling_instead_of_hanging() {
+        let mut slept = std::time::Duration::ZERO;
+        let ok = wait_out_critical_with(
+            "t",
+            test_skip_verdict,
+            |d| slept += d,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        );
+        assert!(!ok, "still critical at the ceiling must report no headroom");
+        assert_eq!(slept, std::time::Duration::from_secs(20));
     }
 
     #[test]
