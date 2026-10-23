@@ -82,6 +82,10 @@
 //! unattributed. The gap between the classes and `cpu_busy_permille / 10` is
 //! that unattributed load; `other` is always reported when any process falls
 //! into it, so load that IS observed but unexplained is never hidden.
+//! `sysinfo` also reads zero — not a measurement — for a process it could not
+//! open (its CPU times are left unset), so the census retries that open and
+//! reports such a process's CPU as UNKNOWN, making its class's `cpu_pct`
+//! `null` exactly as an unreadable macOS process does (below).
 //!
 //! On macOS a non-root runner may not read another user's task info (root
 //! daemons included): such a process is still identified and counted, but its
@@ -89,7 +93,9 @@
 //! process publishes `cpu_pct: null` and `rss_bytes: null` — never a figure
 //! that silently covers only the processes the runner happened to be allowed
 //! to read. An unreadable process also leaves no CPU baseline, so it is never
-//! later credited its whole lifetime as if it had just started.
+//! later credited its whole lifetime as if it had just started. An unreaped
+//! zombie is not unreadable: xnu refuses its task info only because it has no
+//! task left, so it counts as `0` CPU and `0` resident bytes.
 //!
 //! `rss_bytes` sums resident set sizes, so pages shared between processes of a
 //! class (or across classes) are counted once per process. It is a pressure
@@ -233,8 +239,9 @@ pub(crate) struct WorkloadEntry {
     pub(crate) rss_bytes: Option<u64>,
     /// Per-process VRAM summed over the class. `null` = not measured.
     pub(crate) gpu_mem_bytes: Option<u64>,
-    /// User-space processes in the class (kernel threads excluded). `null` =
-    /// not measured, on the same terms as `rss_bytes`.
+    /// User-space processes in the class (kernel threads excluded), readable
+    /// or not. `null` only on the `claude_session` placeholder a Windows or
+    /// macOS census publishes when it could not count sessions at all.
     pub(crate) proc_count: Option<u32>,
     /// The class's roots — one per Claude Code process with no Claude Code
     /// ancestor (`claude_session`), one per `Runner.Worker` (`gh_actions_job`)
@@ -672,6 +679,11 @@ struct ProcStat {
     /// `None` when unreadable.
     rss_pages: Option<u64>,
     kernel_thread: bool,
+    /// An unreaped zombie (macOS `SZOMB`): it has no task left, so its CPU
+    /// time can be neither read nor added to — over any interval it is `0`,
+    /// never UNKNOWN. Always `false` on Linux, where a zombie's `stat` still
+    /// carries its CPU time.
+    zombie: bool,
 }
 
 /// Parse one `/proc/<pid>/stat` line. `comm` may contain spaces and
@@ -691,7 +703,33 @@ fn parse_proc_stat(line: &str) -> Option<ProcStat> {
         start_time: Some(num(19)?),
         rss_pages: Some(num(21)?),
         kernel_thread: num(6).is_some_and(|flags| flags & PF_KTHREAD != 0),
+        zombie: false,
     })
+}
+
+/// xnu's `p_stat` for a zombie (`bsd/sys/proc.h`, `#define SZOMB 5`). Spelled
+/// here rather than taken from `libc` so [`macos_task_reading`] is testable
+/// off macOS; `macos_proc_stat` pins it to `libc::SZOMB` at compile time.
+const SZOMB: u32 = 5;
+
+/// What a macOS process's `PROC_PIDTASKINFO` reading makes of its CPU time
+/// and resident size, as `(cpu_ticks, rss_bytes, zombie)`. PURE.
+///
+/// `status` is the process's `p_stat` (both BSD flavors carry it); `task` is
+/// `(cumulative CPU microseconds, resident bytes)` when the task flavor
+/// answered. xnu answers the BSD flavors for an unreaped zombie but refuses
+/// its task flavor — it has no task left — so a zombie is NOT unreadable: it
+/// holds no memory and accrues no CPU. Treating it as unreadable would null
+/// its whole class's figures every tick until its parent reaps it.
+fn macos_task_reading(status: u32, task: Option<(u64, u64)>) -> (Option<u64>, Option<u64>, bool) {
+    if status == SZOMB {
+        return (None, Some(0), true);
+    }
+    match task {
+        Some((cpu_us, rss)) => (Some(cpu_us), Some(rss), false),
+        // Another user's process: UNKNOWN, never zero.
+        None => (None, None, false),
+    }
 }
 
 /// Total jiffies across all CPUs from `/proc/stat`'s aggregate `cpu` line
@@ -776,14 +814,31 @@ struct PrevTick {
 /// A process absent from the previous reading started inside the interval, so
 /// ALL of its CPU time belongs to it. `None` — UNKNOWN, never zero and never a
 /// lifetime — when its CPU time is unreadable now, it has no start time to key
-/// a baseline by, or it was alive last time without a readable baseline.
+/// a baseline by, or it was alive last time without a readable baseline. A
+/// zombie accrued nothing: `0`, whatever its baseline.
 fn interval_cpu_ticks(prev: &PrevTick, s: &ProcStat) -> Option<u64> {
+    if s.zombie {
+        return Some(0);
+    }
     let now = s.cpu_ticks?;
     let start = s.start_time?;
     match prev.ticks.get(&(s.pid, start)) {
         Some(before) => before.map(|b| now.saturating_sub(b)),
         None if prev.undated.contains(&s.pid) => None,
         None => Some(now),
+    }
+}
+
+/// The baseline a dated process leaves for the next tick: its cumulative CPU
+/// time, or `None` (alive, no baseline) when that is unreadable. A zombie's CPU
+/// time is unreadable but frozen, so it carries forward the baseline it had —
+/// and none when it had none, so a later reading of that key is UNKNOWN rather
+/// than a whole lifetime poured into one interval. PURE.
+fn next_baseline(prev: Option<&PrevTick>, key: (u32, u64), s: &ProcStat) -> Option<u64> {
+    if s.zombie {
+        prev.and_then(|p| p.ticks.get(&key).copied().flatten())
+    } else {
+        s.cpu_ticks
     }
 }
 
@@ -853,15 +908,19 @@ impl CpuTimeCensus {
             _ => UnitCpu::default(),
         };
         let busy_units = busy_runner_units(&records);
+        // An unreadable CPU time is kept as `None`, never as a baseline.
+        let ticks = tick
+            .stats
+            .iter()
+            .filter_map(|s| {
+                let key = (s.pid, s.start_time?);
+                Some((key, next_baseline(self.prev.as_ref(), key, s)))
+            })
+            .collect();
         self.prev = Some(PrevTick {
             boot_time: tick.boot_time,
             total_jiffies: tick.total_jiffies,
-            // An unreadable CPU time is kept as `None`, never as a baseline.
-            ticks: tick
-                .stats
-                .iter()
-                .filter_map(|s| Some(((s.pid, s.start_time?), s.cpu_ticks)))
-                .collect(),
+            ticks,
             undated: tick
                 .stats
                 .iter()
@@ -1171,12 +1230,15 @@ fn macos_all_pids() -> Option<Vec<libc::pid_t>> {
 /// when the process has exited or cannot even be identified.
 ///
 /// Both of those flavors are refused for another user's process unless the
-/// runner is root (xnu `proc_info.c` checks same-user for every flavor but a
-/// short list). `PROC_PIDT_SHORTBSDINFO` is on that list, so such a process is
-/// still identified — pid, parent and a 16-byte name — and counted, with no
-/// start time and its CPU time and memory UNKNOWN (`None`), never zero.
+/// runner is root; `PROC_PIDT_SHORTBSDINFO` is exempt from that check (xnu
+/// `bsd/kern/proc_info.c`, `proc_pidinfo`, `NO_CHECK_SAME_USER`), so such a
+/// process is still identified — pid, parent and a 16-byte name — and
+/// counted, with no start time and its CPU time and memory UNKNOWN (`None`),
+/// never zero. A zombie is the exception the other way: see
+/// [`macos_task_reading`].
 #[cfg(target_os = "macos")]
 fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat> {
+    const _: () = assert!(SZOMB == libc::SZOMB, "xnu's SZOMB as libc spells it");
     // SAFETY: `proc_bsdinfo` is a plain C struct; all-zero is a valid value.
     let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let bsd_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -1191,7 +1253,7 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
             bsd_size,
         )
     };
-    let (own_pid, ppid, comm, start_time) = if got == bsd_size {
+    let (own_pid, ppid, comm, start_time, status) = if got == bsd_size {
         // `pbi_name` is the executable's name up to 32 bytes, `pbi_comm` the
         // same cut at 16; neither is ever argv.
         let name = Some(c_chars_to_string(&bsd.pbi_name))
@@ -1201,7 +1263,7 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
             .pbi_start_tvsec
             .saturating_mul(1_000_000)
             .saturating_add(bsd.pbi_start_tvusec);
-        (bsd.pbi_pid, bsd.pbi_ppid, name, Some(start))
+        (bsd.pbi_pid, bsd.pbi_ppid, name, Some(start), bsd.pbi_status)
     } else {
         // SAFETY: `proc_bsdshortinfo` is a plain C struct; all-zero is valid.
         let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
@@ -1220,7 +1282,7 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
             return None;
         }
         // `pbsi_comm` is the executable's name cut at 16 bytes, never argv.
-        (short.pbsi_pid, short.pbsi_ppid, c_chars_to_string(&short.pbsi_comm), None)
+        (short.pbsi_pid, short.pbsi_ppid, c_chars_to_string(&short.pbsi_comm), None, short.pbsi_status)
     };
 
     // SAFETY: as above, for `proc_taskinfo`.
@@ -1236,14 +1298,12 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
             task_size,
         )
     };
-    // Another user's process, or one with no task left (a zombie): UNKNOWN.
-    let (cpu_ticks, rss_pages) = if task_got == task_size {
+    let reading = (task_got == task_size).then(|| {
         let mach = u128::from(task.pti_total_user.saturating_add(task.pti_total_system));
         let ns = mach * u128::from(numer) / u128::from(denom);
-        (Some(u64::try_from(ns / 1_000).unwrap_or(u64::MAX)), Some(task.pti_resident_size))
-    } else {
-        (None, None)
-    };
+        (u64::try_from(ns / 1_000).unwrap_or(u64::MAX), task.pti_resident_size)
+    });
+    let (cpu_ticks, rss_pages, zombie) = macos_task_reading(status, reading);
 
     Some(ProcStat {
         pid: own_pid,
@@ -1254,6 +1314,7 @@ fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat>
         // `rss_pages` carries bytes here.
         rss_pages,
         kernel_thread: false,
+        zombie,
     })
 }
 
@@ -1323,7 +1384,7 @@ impl HostCensus {
                 ppid: p.parent().map(|pp| pp.as_u32()),
                 name: normalize_exe_name(&p.name().to_string_lossy()),
                 unit: None,
-                cpu_pct: Some(f64::from(p.cpu_usage()) / cpu_count),
+                cpu_pct: windows_cpu_readable(p.pid().as_u32()).then(|| f64::from(p.cpu_usage()) / cpu_count),
                 rss_bytes: Some(p.memory()),
                 kernel_thread: false,
             })
@@ -1334,6 +1395,36 @@ impl HostCensus {
         self.timer.record(started.elapsed(), records.len());
         Some(entries)
     }
+}
+
+/// Whether `sysinfo` can have read `pid`'s CPU times this tick.
+///
+/// sysinfo 0.32 opens each process with `PROCESS_QUERY_INFORMATION |
+/// PROCESS_VM_READ`, falling back to `PROCESS_QUERY_LIMITED_INFORMATION`; when
+/// both are refused (a protected or another session's process), its
+/// `compute_cpu_usage` skips `GetProcessTimes`, leaves the times zero and
+/// reports 0 % — a default, not a reading. It exposes no "no handle" flag, so
+/// the weaker of its two opens is repeated here: refused means UNKNOWN.
+/// Resident size is unaffected: sysinfo takes it from the system snapshot.
+///
+/// Pid 0, the System Idle Process, is never opened by sysinfo either, but its
+/// "CPU" is the machine's idle time, which is no load: it stays a measured 0.
+#[cfg(windows)]
+fn windows_cpu_readable(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: `OpenProcess` reads no caller memory and returns null on failure.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: a non-null handle from `OpenProcess` is ours, closed exactly once.
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 /// A Windows or macOS census that saw no native `claude` root cannot count
@@ -2260,6 +2351,7 @@ mod tests {
             cpu_ticks: cpu,
             rss_pages: rss,
             kernel_thread: false,
+            zombie: false,
         }
     }
 
@@ -2366,6 +2458,57 @@ mod tests {
             .expect("third tick");
         let build = third.iter().find(|e| e.class == "cargo_build").expect("build");
         assert_eq!(build.cpu_pct, None, "possibly the undated process: no lifetime credit");
+    }
+
+    /// xnu refuses a zombie's task info only because it has no task left: it
+    /// is `0` CPU and `0` bytes, never UNKNOWN; a live process's refusal is
+    /// UNKNOWN; and zombie status wins over whatever the task flavor said.
+    #[test]
+    fn a_zombie_reads_as_zero_not_unknown() {
+        const SRUN: u32 = 2;
+        assert_eq!(macos_task_reading(SZOMB, None), (None, Some(0), true));
+        assert_eq!(macos_task_reading(SZOMB, Some((900, 4096))), (None, Some(0), true));
+        assert_eq!(macos_task_reading(SRUN, Some((900, 4096))), (Some(900), Some(4096), false));
+        assert_eq!(macos_task_reading(SRUN, None), (None, None, false));
+    }
+
+    fn zombie(pid: u32, comm: &str, start: Option<u64>) -> ProcStat {
+        let (cpu, rss, zombie) = macos_task_reading(SZOMB, None);
+        ProcStat {
+            zombie,
+            ..pstat(pid, comm, start, cpu, rss)
+        }
+    }
+
+    /// An unreaped zombie leaves its class measured: `0` over every interval,
+    /// with its baseline carried forward (so nothing it did before dying is
+    /// lost or re-counted) — and, with no baseline to carry, none invented, so
+    /// it can never be credited a lifetime.
+    #[test]
+    fn a_zombie_keeps_its_class_measured_and_never_spikes() {
+        let mut c = CpuTimeCensus::default();
+        let init = || pstat(1, "init", Some(1), Some(0), Some(1));
+        c.take(cpu_tick(1000, vec![init(), pstat(7, "rustc", Some(5), Some(500), Some(4))]), None)
+            .expect("first tick");
+        for total in [2000, 3000] {
+            let out = c.take(cpu_tick(total, vec![init(), zombie(7, "rustc", Some(5))]), None).expect("zombie tick");
+            let build = out.iter().find(|e| e.class == "cargo_build").expect("build");
+            assert_eq!((build.cpu_pct, build.rss_bytes, build.proc_count), (Some(0.0), Some(0), Some(1)));
+        }
+        let key = (7, 5);
+        assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&key).copied()), Some(Some(500)), "baseline carried");
+
+        // A zombie first seen with no baseline: 0 now, no baseline after.
+        let first = zombie(8, "rustc", Some(6));
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &first), Some(0));
+        c.take(cpu_tick(4000, vec![init(), first]), None).expect("tick");
+        assert_eq!(c.prev.as_ref().and_then(|p| p.ticks.get(&(8, 6)).copied()), Some(None), "alive, no baseline");
+        let reread = pstat(8, "rustc", Some(6), Some(900), Some(4));
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &reread), None, "never a lifetime");
+
+        // An undated zombie (another user's) is still 0, not UNKNOWN.
+        let undated = zombie(9, "rustc", None);
+        assert_eq!(interval_cpu_ticks(c.prev.as_ref().expect("prev"), &undated), Some(0));
     }
 
     #[test]
@@ -2738,11 +2881,15 @@ mod tests {
         let t1 = std::time::Instant::now();
         let second = h.take(None).expect("second tick");
         let d2 = t1.elapsed();
+        // Only Linux reads every process's CPU time; on macOS and Windows a
+        // process the runner may not open nulls its class's share.
+        #[cfg(target_os = "linux")]
         assert!(second.iter().all(|e| e.cpu_pct.is_some()));
         assert!(second.len() <= MAX_WORKLOAD_ENTRIES);
         let total: f64 = second.iter().filter_map(|e| e.cpu_pct).sum();
         assert!(total <= 100.0 + 0.1 * second.len() as f64, "{total}");
-        let procs: u32 = second.iter().map(|e| e.proc_count.expect("measured")).sum();
+        // `filter_map`: the macOS/Windows `claude_session` placeholder has none.
+        let procs: u32 = second.iter().filter_map(|e| e.proc_count).sum();
         println!("host census: {procs} processes, first tick {d1:?}, second tick {d2:?}; {second:?}");
     }
 }
