@@ -191,11 +191,11 @@ export function registerTerminalExitHandler(
  * Shares the demux's single `listen()`; it does not add a second one.
  */
 export function subscribeTerminalOutputStream(
-  handler: (payload: TerminalOutputEvent) => void,
+  handler: (payload: TerminalOutputPayload) => void,
 ): () => void {
-  return acquireSingletonListener<TerminalOutputEvent>(
+  return acquireSingletonListener<TerminalOutputPayload>(
     "terminal-output",
-    (event: Event<TerminalOutputEvent>) => {
+    (event: Event<TerminalOutputPayload>) => {
       countOutputEvent(event.payload);
       handler(event.payload);
     },

@@ -3,7 +3,7 @@
  *
  * The default zone layout is `single` (1 zone), and auto-grow (Phase 1) caps at
  * `full-grid` (9 zones). Any live tab beyond the current layout's zone capacity
- * renders as an offscreen `HiddenTerminal` (`<div className="hidden">`) with ZERO
+ * renders as a parked, `display: none` zone cell with ZERO
  * affordance — this is exactly how 4 live gate-continuation sessions went
  * invisible to the operator. This chip is the visible backstop: whenever ANY
  * tab is unassigned it surfaces a compact "N more" pill near the StatusStrip;
@@ -16,9 +16,18 @@
  *
  * Styling mirrors StatusStrip's `Pill` button idiom (10px, rounded, tokyo-night
  * palette) so the chip reads as part of the same status row.
+ *
+ * tmux work mode renders NOTHING. There every session but the shown one is off
+ * screen by design — the mode's normal state, not a session gone missing past
+ * a zone ceiling — and the session manager lists and swaps to each of them. A
+ * permanent "N more" warning would be the anomaly signal firing on the normal
+ * case, and its target (assigning a tab to a zone) is not how tmux mode
+ * reaches a session. Hiding it is the predictable reading: the chip appears
+ * only when something is actually unreachable.
  */
 
 import { EyeOff } from "lucide-react";
+import type { TerminalWorkMode } from "./terminalWorkMode";
 
 /**
  * Pure label/visibility helper — exported so the unit test can lock the
@@ -26,11 +35,15 @@ import { EyeOff } from "lucide-react";
  * `environment: "node"`, no jsdom; component JSX is verified by UI Bridge /
  * manual tests).
  *
- * Returns `null` when there is nothing hidden (chip must not render), otherwise
- * the chip's short label + its `title` tooltip.
+ * Returns `null` when there is nothing hidden or the page is in tmux work mode
+ * (chip must not render), otherwise the chip's short label + its `title`
+ * tooltip.
  */
-export function unzonedChipLabel(unassignedCount: number): { text: string; title: string } | null {
-  if (unassignedCount <= 0) return null;
+export function unzonedChipLabel(
+  unassignedCount: number,
+  workMode: TerminalWorkMode = "grid",
+): { text: string; title: string } | null {
+  if (workMode === "tmux" || unassignedCount <= 0) return null;
   return {
     text: `${unassignedCount} more`,
     title: `${unassignedCount} session${
@@ -44,10 +57,12 @@ interface UnzonedChipProps {
   unassignedCount: number;
   /** Opens the ZoneControlPanel (where the Unassigned (N) list lives). */
   onOpen: () => void;
+  /** The page's work mode; tmux mode renders no chip. */
+  workMode: TerminalWorkMode;
 }
 
-export function UnzonedChip({ unassignedCount, onOpen }: UnzonedChipProps) {
-  const label = unzonedChipLabel(unassignedCount);
+export function UnzonedChip({ unassignedCount, onOpen, workMode }: UnzonedChipProps) {
+  const label = unzonedChipLabel(unassignedCount, workMode);
   if (!label) return null;
 
   return (

@@ -459,6 +459,11 @@ async function build(): Promise<RealRegistryHarness> {
         toggleMaximize: rec("zone.toggleMaximize", undefined),
         setLayoutId: rec("zone.setLayoutId", undefined),
         assignTabToZone: rec("zone.assignTabToZone", undefined),
+        // Grid, the default work mode — so `/terminal.mode` with no argument
+        // enters tmux (and opens the sidebar, which the stub has closed).
+        workMode: "grid",
+        enterTmuxMode: rec("zone.enterTmuxMode", undefined),
+        exitTmuxMode: rec("zone.exitTmuxMode", undefined),
       },
       workflowGen: {
         generatedWorkflow: null,
