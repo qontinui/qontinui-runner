@@ -19,14 +19,24 @@
 //! field an argument could be put into, so "argv leaked into a class" is not a
 //! bug this module can have.
 //!
+//! The guarantee is about what is READ, so it is kept per platform by what
+//! each collector calls:
+//!
 //! * **Linux (host lane and the WSL guest)** reads `/proc/<pid>/stat` (whose
 //!   only string is the kernel's `comm`), `/proc/<pid>/cgroup`, `/proc/stat`
 //!   and the `cpu.stat` of GitHub Actions runner unit cgroups — never
 //!   `cmdline` or `environ`.
-//! * **Other hosts** use one `sysinfo` table refreshed with CPU, memory and the
-//!   executable PATH only (loaded once per process). The path is reduced to one
-//!   bit on the spot — "this `node` is Claude Code" — and never enters the
-//!   census input; `cmd`, `environ` and `cwd` are never loaded.
+//! * **macOS** asks `libproc` for each process's `PROC_PIDTBSDINFO` (pid,
+//!   parent, start time and the kernel's executable name) and
+//!   `PROC_PIDTASKINFO` (CPU times and resident size) — two fixed-size kernel
+//!   structs with no argument in them. It never refreshes a `sysinfo` process
+//!   table: `sysinfo` reads every process's `KERN_PROCARGS2` (argv AND
+//!   environment) on each refresh whatever refresh kind it is given.
+//! * **Windows** uses one `sysinfo` table refreshed with CPU and memory only;
+//!   there `sysinfo` takes names from the system process snapshot, and `cmd`,
+//!   `environ`, `cwd` and the image path are never loaded.
+//! * **Any other host** takes no census: there is no collector this module
+//!   trusts to leave argv unread.
 //!
 //! The only strings that leave the host are the class names below.
 //!
@@ -48,21 +58,30 @@
 //! the tick, 0–100 — the classes of one sample therefore sum to at most 100
 //! and compare directly with the sample's own `cpu_busy_permille / 10`.
 //!
-//! On Linux a share is a difference of CUMULATIVE CPU time, so nothing a
-//! process did inside the tick is lost to sampling: a process seen for the
-//! first time started inside the interval, and ALL of its CPU time is counted
-//! (a 2-second `rustc` between two 30-second ticks is attributed in full). The
-//! one blind spot of per-process accounting — a process that started AND
-//! exited between two ticks — is closed for GitHub Actions runner units by
-//! their cgroup's `cpu.stat` `usage_usec`, which keeps the time of exited
-//! children; the unit's class gets the larger of the two figures.
+//! On Linux and macOS a share is a difference of CUMULATIVE CPU time, so
+//! nothing a process did inside the tick is lost to sampling: a process seen
+//! for the first time started inside the interval, and ALL of its CPU time is
+//! counted (a 2-second `rustc` between two 30-second ticks is attributed in
+//! full). The one blind spot of per-process accounting — a process that
+//! started AND exited between two ticks — is closed for GitHub Actions runner
+//! units (Linux) by their cgroup's `cpu.stat` `usage_usec`, which keeps the
+//! time of exited children; the unit's class gets the larger of the two
+//! figures. A runner unit's surplus is a job's when the unit had a
+//! `Runner.Worker` on the previous tick (the job ended inside the interval) or
+//! when it exceeds what an idle listener could account for.
 //!
-//! Hosts without procfs (Windows, macOS) take `sysinfo`'s per-process rate,
-//! which reads zero for a process's first observation, so short-lived
-//! processes there go unattributed. The gap between the classes and
-//! `cpu_busy_permille / 10` is that unattributed load; `other` is always
-//! reported when any process falls into it, so load that IS observed but
-//! unexplained is never hidden.
+//! A machine whose clock of record restarts — the WSL VM rebooting under a
+//! running runner — is detected by `/proc/stat`'s `btime`; every baseline is
+//! dropped and the next tick is a first tick again, never a share computed
+//! across two boots.
+//!
+//! Windows takes `sysinfo`'s per-process rate, which reads zero for a
+//! process's first observation, so short-lived processes there go
+//! unattributed. On macOS a process of another user whose task info the
+//! runner may not read is counted, with no CPU or memory. The gap between the
+//! classes and `cpu_busy_permille / 10` is that unattributed load; `other` is
+//! always reported when any process falls into it, so load that IS observed
+//! but unexplained is never hidden.
 //!
 //! `rss_bytes` sums resident set sizes, so pages shared between processes of a
 //! class (or across classes) are counted once per process. It is a pressure
@@ -75,6 +94,16 @@
 //! what reconciles a class against a session or job ledger: one per Claude
 //! Code process with no Claude Code ancestor (`claude_session`), and one per
 //! `Runner.Worker` (`gh_actions_job`).
+//!
+//! A Claude Code process is recognised by its executable name, `claude`. On
+//! Linux the npm install renames itself (Node sets the kernel's `comm` from
+//! `process.title`), but on Windows and macOS it stays the system `node`, and
+//! nothing short of its argv says it is Claude Code — so those lanes
+//! recognise only the native `claude` binary. A Windows or macOS census that
+//! saw no native root therefore publishes `claude_session` with a `null`
+//! `root_count` and `cpu_pct` (never an absent class, which would read as no
+//! session); an npm session's load lands in its parent's class, and the
+//! session ledger is the authority on how many run there.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -246,28 +275,6 @@ pub(crate) fn normalize_exe_name(raw: &str) -> String {
     }
 }
 
-/// Whether an executable's image path is Claude Code's own: a component named
-/// `@anthropic-ai` or containing `claude-code` (an npm package dir, or a
-/// runtime vendored inside one). PURE; the path never leaves this function.
-pub(crate) fn image_identifies_claude_code(image: &std::path::Path) -> bool {
-    image.components().any(|c| {
-        let part = c.as_os_str().to_string_lossy().to_ascii_lowercase();
-        part == "@anthropic-ai" || part.contains("claude-code")
-    })
-}
-
-/// The name a process is classified under. A Node runtime whose image is
-/// Claude Code's (the Windows npm install runs as `node.exe`) is `claude`; an
-/// ordinary `node.exe` stays `node` — its image says nothing, and the argv
-/// that would is never read.
-pub(crate) fn identity_name(name: String, image: Option<&std::path::Path>) -> String {
-    if name == "node" && image.is_some_and(image_identifies_claude_code) {
-        CLAUDE.to_string()
-    } else {
-        name
-    }
-}
-
 /// A GitHub Actions runner's systemd unit: `actions.runner.<scope>.<name>.service`.
 fn is_actions_runner_unit(unit: &str) -> bool {
     unit.starts_with("actions.runner.") && unit.ends_with(".service")
@@ -378,7 +385,7 @@ fn is_root(class: WorkloadClass, p: &ProcView<'_>) -> bool {
 pub(crate) struct ProcRecord {
     pub(crate) pid: u32,
     pub(crate) ppid: Option<u32>,
-    /// Normalized executable name ([`normalize_exe_name`] / [`identity_name`]).
+    /// Normalized executable name ([`normalize_exe_name`]).
     pub(crate) name: String,
     pub(crate) unit: Option<String>,
     /// This process's share of the lane's CPU capacity over the tick, 0–100.
@@ -389,33 +396,54 @@ pub(crate) struct ProcRecord {
     pub(crate) kernel_thread: bool,
 }
 
+/// The most CPU, as a share of the lane, an idle runner unit's exited children
+/// are taken to explain. An idle `Runner.Listener` long-polls and spawns
+/// almost nothing; a unit surplus above this ran a job that exited inside the
+/// interval, even when no `Runner.Worker` was alive at either end of it.
+const LISTENER_OVERHEAD_PCT: f64 = 0.5;
+
+/// What runner unit cgroups add to one tick (Linux only; empty elsewhere).
+#[derive(Debug, Default)]
+pub(crate) struct UnitCpu {
+    /// Runner unit → its cgroup's own CPU share over the tick, 0–100.
+    pub(crate) share: HashMap<String, f64>,
+    /// Runner units that had a `Runner.Worker` on the PREVIOUS tick.
+    pub(crate) busy_before: HashSet<String>,
+}
+
+/// The runner units that have a `Runner.Worker` in this table.
+fn busy_runner_units(records: &[ProcRecord]) -> HashSet<String> {
+    records
+        .iter()
+        .filter(|r| r.name == ACTIONS_WORKER)
+        .filter_map(|r| r.unit.clone().filter(|u| is_actions_runner_unit(u)))
+        .collect()
+}
+
 /// Aggregate a process table into one entry per non-empty class. PURE.
 ///
 /// `cpu_known = false` publishes `cpu_pct: null` on every entry (first tick).
 /// `vram_by_pid` is a complete per-process VRAM measurement, or `None` when
 /// none was taken — then every entry's `gpu_mem_bytes` is `null`.
-/// `unit_cpu` is a unit cgroup's own share over the tick (it includes children
-/// that exited inside the tick). A unit whose live processes all fall in one
-/// class raises that class by whatever the unit's figure exceeds its
-/// processes' sum; a unit whose processes span classes is ignored, since its
-/// surplus cannot be placed.
+/// `unit_cpu` carries each runner unit cgroup's own share over the tick (it
+/// includes children that exited inside the tick) — see [`UnitCpu`].
+/// A unit whose live processes all fall in one class raises that class by
+/// whatever the unit's figure exceeds its processes' sum; a unit whose
+/// processes span classes is ignored, since its surplus cannot be placed.
 pub(crate) fn census(
     records: &[ProcRecord],
     cpu_known: bool,
     vram_by_pid: Option<&HashMap<u32, u64>>,
-    unit_cpu: &HashMap<String, f64>,
+    unit_cpu: &UnitCpu,
 ) -> Vec<WorkloadEntry> {
     let by_pid: HashMap<u32, &ProcRecord> = records.iter().map(|r| (r.pid, r)).collect();
 
     // Which runners have a job: by unit, and by listener (the worker is the
     // listener's child), so both the Linux cgroup path and the name-only path
     // (Windows, macOS, a runner started by hand) agree.
-    let mut busy_units: HashSet<&str> = HashSet::new();
+    let busy_units = busy_runner_units(records);
     let mut busy_listeners: HashSet<u32> = HashSet::new();
     for r in records.iter().filter(|r| r.name == ACTIONS_WORKER) {
-        if let Some(unit) = r.unit.as_deref().filter(|u| is_actions_runner_unit(u)) {
-            busy_units.insert(unit);
-        }
         if let Some(parent) = r.ppid.and_then(|pp| by_pid.get(&pp)) {
             if parent.name == ACTIONS_LISTENER {
                 busy_listeners.insert(parent.pid);
@@ -479,7 +507,7 @@ pub(crate) fn census(
         if let Some(v) = vram_by_pid.and_then(|m| m.get(&r.pid)) {
             a.vram = a.vram.saturating_add(*v);
         }
-        if let Some(u) = unit.filter(|u| unit_cpu.contains_key(*u)) {
+        if let Some(u) = unit.filter(|u| unit_cpu.share.contains_key(*u)) {
             let ua = units.entry(u).or_insert(UnitAcc {
                 cpu: 0.0,
                 class: Some(class),
@@ -492,12 +520,24 @@ pub(crate) fn census(
     }
 
     for (unit, ua) in &units {
-        let (Some(class), Some(share)) = (ua.class, unit_cpu.get(*unit)) else {
+        let (Some(class), Some(share)) = (ua.class, unit_cpu.share.get(*unit)) else {
             continue;
         };
-        if let Some(a) = acc.get_mut(&class) {
-            a.cpu += (share - ua.cpu).max(0.0);
+        let surplus = (share - ua.cpu).max(0.0);
+        if surplus <= 0.0 {
+            continue;
         }
+        // The live processes say "idle" at the END of the interval; a worker
+        // that ran on the previous tick, or more CPU than a listener spends,
+        // says a job ran inside it and exited before this reading.
+        let class = if class == WorkloadClass::GhActionsRunnerIdle
+            && (unit_cpu.busy_before.contains(*unit) || surplus > LISTENER_OVERHEAD_PCT)
+        {
+            WorkloadClass::GhActionsJob
+        } else {
+            class
+        };
+        acc.entry(class).or_default().cpu += surplus;
     }
 
     WorkloadClass::ALL
@@ -555,21 +595,25 @@ fn parse_usage_usec(text: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// procfs accounting — shared by the Linux host lane and the WSL guest
+// Cumulative CPU-time accounting — the Linux and macOS host lanes and the WSL guest
 // ---------------------------------------------------------------------------
 
 /// `PF_KTHREAD` in `/proc/<pid>/stat`'s `flags` field.
 const PF_KTHREAD: u64 = 0x0020_0000;
 
-/// One process as `/proc/<pid>/stat` describes it.
+/// One process as `/proc/<pid>/stat` describes it (macOS fills the same
+/// fields from `libproc`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcStat {
     pid: u32,
     ppid: u32,
+    /// The kernel's executable name — never argv.
     comm: String,
+    /// With `pid`, what tells a reused pid from the process before it.
     start_time: u64,
-    /// `utime + stime`, cumulative over the process's life (its own threads;
-    /// not its reaped children).
+    /// User + system CPU time, cumulative over the process's life (its own
+    /// threads; not its reaped children): jiffies on Linux, microseconds on
+    /// macOS.
     cpu_ticks: u64,
     rss_pages: u64,
     kernel_thread: bool,
@@ -607,13 +651,26 @@ fn parse_total_jiffies(line: &str) -> Option<u64> {
     (v.len() == 8).then(|| v.iter().sum())
 }
 
-/// One procfs reading of a lane.
+/// `btime` (boot time, seconds since the epoch) from a `/proc/stat` line.
+fn parse_btime(line: &str) -> Option<u64> {
+    line.trim().strip_prefix("btime ")?.trim().parse().ok()
+}
+
+/// One reading of a lane's process table in cumulative CPU time: procfs on
+/// Linux and in the WSL guest, `libproc` on macOS.
 #[derive(Debug, Clone, Default)]
-struct ProcfsTick {
+struct CpuTimeTick {
+    /// Bytes per unit of [`ProcStat::rss_pages`].
     page_size: u64,
     /// `USER_HZ`, which converts a cgroup's microseconds into jiffies. `None`
     /// (unreadable) forgoes the unit-cgroup figures, never the census.
     clk_tck: Option<u64>,
+    /// The machine's boot time. A change between two readings means the
+    /// counters restarted under us (the WSL VM rebooted), so no baseline
+    /// carries over.
+    boot_time: Option<u64>,
+    /// The lane's whole CPU capacity so far, in the unit of
+    /// [`ProcStat::cpu_ticks`] — jiffies across all CPUs on Linux.
     total_jiffies: u64,
     stats: Vec<ProcStat>,
     /// pid → systemd unit.
@@ -625,27 +682,36 @@ struct ProcfsTick {
 /// The previous reading a tick is diffed against.
 #[derive(Debug)]
 struct PrevTick {
+    boot_time: Option<u64>,
     total_jiffies: u64,
     ticks: HashMap<(u32, u64), u64>,
     unit_usage_usec: HashMap<String, u64>,
+    /// Runner units that had a `Runner.Worker` in that reading.
+    busy_units: HashSet<String>,
 }
 
-/// Cumulative-time accounting over successive [`ProcfsTick`]s.
+/// Cumulative-time accounting over successive [`CpuTimeTick`]s.
 #[derive(Debug, Default)]
-struct ProcfsCensus {
+struct CpuTimeCensus {
     prev: Option<PrevTick>,
 }
 
-impl ProcfsCensus {
+impl CpuTimeCensus {
     /// Aggregate one reading. `None` when it holds no process — the lane then
     /// publishes no census, never a fabricated one.
     fn take(
         &mut self,
-        tick: ProcfsTick,
+        tick: CpuTimeTick,
         vram_by_pid: Option<&HashMap<u32, u64>>,
     ) -> Option<Vec<WorkloadEntry>> {
         if tick.stats.is_empty() {
             return None;
+        }
+        // A different boot is a different machine as far as every counter is
+        // concerned: pids, start times, cgroup usage and the jiffy total all
+        // restarted, and a restarted total can exceed the old one.
+        if self.prev.as_ref().is_some_and(|prev| prev.boot_time != tick.boot_time) {
+            self.prev = None;
         }
         // The interval in jiffies of the whole lane, and the reading it starts at.
         let interval = self.prev.as_ref().and_then(|prev| {
@@ -673,19 +739,24 @@ impl ProcfsCensus {
             .collect();
         // A unit first seen this tick has no baseline: its counter spans its
         // whole life, so it is left out rather than poured into one interval.
-        let unit_cpu: HashMap<String, f64> = match (interval, tick.clk_tck) {
-            (Some((span, prev)), Some(hz)) => tick
-                .unit_usage_usec
-                .iter()
-                .filter_map(|(unit, usage)| {
-                    let delta = usage.checked_sub(*prev.unit_usage_usec.get(unit)?)?;
-                    let jiffies = delta as f64 * hz as f64 / 1_000_000.0;
-                    Some((unit.clone(), jiffies / span * 100.0))
-                })
-                .collect(),
-            _ => HashMap::new(),
+        let unit_cpu = match (interval, tick.clk_tck) {
+            (Some((span, prev)), Some(hz)) => UnitCpu {
+                share: tick
+                    .unit_usage_usec
+                    .iter()
+                    .filter_map(|(unit, usage)| {
+                        let delta = usage.checked_sub(*prev.unit_usage_usec.get(unit)?)?;
+                        let jiffies = delta as f64 * hz as f64 / 1_000_000.0;
+                        Some((unit.clone(), jiffies / span * 100.0))
+                    })
+                    .collect(),
+                busy_before: prev.busy_units.clone(),
+            },
+            _ => UnitCpu::default(),
         };
+        let busy_units = busy_runner_units(&records);
         self.prev = Some(PrevTick {
+            boot_time: tick.boot_time,
             total_jiffies: tick.total_jiffies,
             ticks: tick
                 .stats
@@ -693,6 +764,7 @@ impl ProcfsCensus {
                 .map(|s| ((s.pid, s.start_time), s.cpu_ticks))
                 .collect(),
             unit_usage_usec: tick.unit_usage_usec,
+            busy_units,
         });
         Some(census(&records, cpu_known, vram_by_pid, &unit_cpu))
     }
@@ -764,10 +836,11 @@ fn p95(window: &VecDeque<Duration>) -> Duration {
 /// accounted in cumulative time (see the module docs).
 #[cfg(target_os = "linux")]
 pub(crate) struct HostCensus {
-    procfs: ProcfsCensus,
+    cumulative: CpuTimeCensus,
     /// Each live process's unit placement, keyed by pid and start time so a
     /// reused pid is re-read. A placement does not change under a process
-    /// that is not moved, so each `/proc/<pid>/cgroup` is read once.
+    /// that is not moved, so each `/proc/<pid>/cgroup` is read once — once
+    /// it has been read successfully.
     placements: HashMap<u32, (u64, Option<(String, Option<String>)>)>,
     page_size: u64,
     clk_tck: Option<u64>,
@@ -783,7 +856,7 @@ impl HostCensus {
         // SAFETY: as above.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         Self {
-            procfs: ProcfsCensus::default(),
+            cumulative: CpuTimeCensus::default(),
             placements: HashMap::new(),
             // `_SC_PAGESIZE` never fails on Linux; the constant only keeps a
             // reading from turning into a zero.
@@ -800,14 +873,15 @@ impl HostCensus {
         let started = std::time::Instant::now();
         let tick = self.read_tick()?;
         let procs = tick.stats.len();
-        let entries = self.procfs.take(tick, vram_by_pid);
+        let entries = self.cumulative.take(tick, vram_by_pid);
         self.timer.record(started.elapsed(), procs);
         entries
     }
 
-    fn read_tick(&mut self) -> Option<ProcfsTick> {
+    fn read_tick(&mut self) -> Option<CpuTimeTick> {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let total_jiffies = parse_total_jiffies(stat.lines().next()?)?;
+        let boot_time = stat.lines().find_map(parse_btime);
         let stats: Vec<ProcStat> = std::fs::read_dir("/proc")
             .ok()?
             .flatten()
@@ -827,13 +901,19 @@ impl HostCensus {
                 .get(&s.pid)
                 .filter(|(start, _)| *start == s.start_time)
                 .map(|(_, p)| p.clone());
-            let placement = cached.unwrap_or_else(|| {
-                let p = std::fs::read_to_string(format!("/proc/{}/cgroup", s.pid))
-                    .ok()
-                    .and_then(|t| unit_placement(&t));
-                self.placements.insert(s.pid, (s.start_time, p.clone()));
-                p
-            });
+            // Only a read that succeeded is cached: a failed one (a racing
+            // exit, a transient error) is retried next tick, never pinned.
+            let placement = match cached {
+                Some(p) => p,
+                None => match std::fs::read_to_string(format!("/proc/{}/cgroup", s.pid)) {
+                    Ok(text) => {
+                        let p = unit_placement(&text);
+                        self.placements.insert(s.pid, (s.start_time, p.clone()));
+                        p
+                    }
+                    Err(_) => None,
+                },
+            };
             if let Some((unit, path)) = placement {
                 if let Some(path) = path.filter(|_| is_actions_runner_unit(&unit)) {
                     runner_unit_paths.insert(unit.clone(), path);
@@ -856,9 +936,10 @@ impl HostCensus {
             })
             .collect();
 
-        Some(ProcfsTick {
+        Some(CpuTimeTick {
             page_size: self.page_size,
             clk_tck: self.clk_tck,
+            boot_time,
             total_jiffies,
             stats,
             units,
@@ -867,9 +948,196 @@ impl HostCensus {
     }
 }
 
-/// The host lane's census state off Linux: ONE `sysinfo::System` kept across
+/// The host lane's census state on macOS: `libproc` read directly, so CPU is
+/// accounted in cumulative time as on Linux.
+///
+/// Never a `sysinfo` process refresh: on macOS that reads every process's
+/// `KERN_PROCARGS2` — argv and environment — into the runner on every call,
+/// whatever `ProcessRefreshKind` asks for. The two `proc_pidinfo` flavors used
+/// here return fixed-size kernel structs with no argument in them.
+#[cfg(target_os = "macos")]
+pub(crate) struct HostCensus {
+    cumulative: CpuTimeCensus,
+    /// The origin of the lane's capacity clock ([`CpuTimeTick::total_jiffies`]
+    /// is CPU-microseconds since this instant).
+    epoch: std::time::Instant,
+    cpu_count: u64,
+    /// Mach absolute-time units → nanoseconds, as `(numer, denom)`; `None`
+    /// when the kernel would not say, and then there is no census.
+    timebase: Option<(u64, u64)>,
+    timer: CensusTimer,
+}
+
+#[cfg(target_os = "macos")]
+impl HostCensus {
+    pub(crate) fn new() -> Self {
+        // SAFETY: `sysconf` takes an integer selector, touches no caller memory
+        // and has no preconditions; every return value is handled below.
+        let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        Self {
+            cumulative: CpuTimeCensus::default(),
+            epoch: std::time::Instant::now(),
+            cpu_count: u64::try_from(ncpu).ok().filter(|n| *n > 0).unwrap_or(1),
+            timebase: mach_timebase(),
+            timer: CensusTimer::new(),
+        }
+    }
+
+    /// Read the process table and aggregate it. `vram_by_pid` is the seam for
+    /// a per-process VRAM measurement; `None` publishes `gpu_mem_bytes: null`.
+    /// `None` when the table could not be read whole.
+    pub(crate) fn take(&mut self, vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+        let started = std::time::Instant::now();
+        let tick = self.read_tick()?;
+        let procs = tick.stats.len();
+        let mut entries = self.cumulative.take(tick, vram_by_pid);
+        if let Some(entries) = entries.as_mut() {
+            claude_sessions_unknown_without_native_root(entries);
+        }
+        self.timer.record(started.elapsed(), procs);
+        entries
+    }
+
+    fn read_tick(&self) -> Option<CpuTimeTick> {
+        let (numer, denom) = self.timebase?;
+        // The lane's capacity so far, in the unit of a process's CPU time.
+        let elapsed_us = u64::try_from(self.epoch.elapsed().as_micros()).ok()?;
+        let total = elapsed_us.checked_mul(self.cpu_count)?;
+        let stats: Vec<ProcStat> = macos_all_pids()?
+            .into_iter()
+            .filter_map(|pid| macos_proc_stat(pid, numer, denom))
+            .collect();
+        Some(CpuTimeTick {
+            // `rss_pages` carries bytes here.
+            page_size: 1,
+            clk_tck: None,
+            // The capacity clock is this process's own monotonic clock; it
+            // cannot restart under the census.
+            boot_time: None,
+            total_jiffies: total,
+            stats,
+            units: HashMap::new(),
+            unit_usage_usec: HashMap::new(),
+        })
+    }
+}
+
+/// The Mach timebase, `(numer, denom)`: `pti_total_user`/`pti_total_system`
+/// are in Mach absolute-time units, which are nanoseconds only on Intel.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc points at the `mach2` crate, which this crate does not use.
+fn mach_timebase() -> Option<(u64, u64)> {
+    // SAFETY: `mach_timebase_info` is two `u32`s; all-zero is a valid value.
+    let mut tb: libc::mach_timebase_info = unsafe { std::mem::zeroed() };
+    // SAFETY: writes one struct this frame owns, and nothing else.
+    let rc = unsafe { libc::mach_timebase_info(&mut tb) };
+    (rc == 0 && tb.numer > 0 && tb.denom > 0).then(|| (u64::from(tb.numer), u64::from(tb.denom)))
+}
+
+/// Every pid on the host. `None` when the list cannot be read whole — a
+/// truncated table would be a silent undercount.
+#[cfg(target_os = "macos")]
+fn macos_all_pids() -> Option<Vec<libc::pid_t>> {
+    // SAFETY: a null buffer of size 0 only asks for the current count.
+    let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let mut capacity = usize::try_from(estimate).ok().filter(|n| *n > 0)?;
+    // A list that fills its buffer may have been cut short by processes
+    // started since the estimate: grow and ask again.
+    for _ in 0..3 {
+        capacity = capacity.saturating_add(capacity / 4).saturating_add(64);
+        let mut pids: Vec<libc::pid_t> = vec![0; capacity];
+        let bytes = libc::c_int::try_from(capacity.checked_mul(std::mem::size_of::<libc::pid_t>())?).ok()?;
+        // SAFETY: `pids` is writable for `bytes` bytes and outlives the call;
+        // the return value is the number of pids written.
+        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        let got = usize::try_from(got).ok().filter(|n| *n > 0)?;
+        if got < capacity {
+            pids.truncate(got);
+            return Some(pids);
+        }
+    }
+    None
+}
+
+/// One process from `libproc`: `PROC_PIDTBSDINFO` for its identity and
+/// `PROC_PIDTASKINFO` for its CPU time and resident size. `None` when the
+/// process has exited or is invisible to the runner. A process whose task
+/// info the runner may not read (another user's) is kept with no CPU time
+/// and no memory: it still counts as a process.
+#[cfg(target_os = "macos")]
+fn macos_proc_stat(pid: libc::pid_t, numer: u64, denom: u64) -> Option<ProcStat> {
+    // SAFETY: `proc_bsdinfo` is a plain C struct; all-zero is a valid value.
+    let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let bsd_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the kernel writes at most `bsd_size` bytes into `bsd`, which
+    // this frame owns; the return value is the byte count written.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(bsd).cast(),
+            bsd_size,
+        )
+    };
+    if got != bsd_size {
+        return None;
+    }
+
+    // SAFETY: as above, for `proc_taskinfo`.
+    let mut task: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let task_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: as above.
+    let task_got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::addr_of_mut!(task).cast(),
+            task_size,
+        )
+    };
+    let (cpu_us, rss_bytes) = if task_got == task_size {
+        let mach = u128::from(task.pti_total_user.saturating_add(task.pti_total_system));
+        let ns = mach * u128::from(numer) / u128::from(denom);
+        (u64::try_from(ns / 1_000).unwrap_or(u64::MAX), task.pti_resident_size)
+    } else {
+        (0, 0)
+    };
+
+    // `pbi_name` is the executable's name up to 32 bytes, `pbi_comm` the same
+    // cut at 16; neither is ever argv.
+    let name = Some(c_chars_to_string(&bsd.pbi_name))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| c_chars_to_string(&bsd.pbi_comm));
+    Some(ProcStat {
+        pid: bsd.pbi_pid,
+        ppid: bsd.pbi_ppid,
+        comm: name,
+        start_time: bsd
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(bsd.pbi_start_tvusec),
+        cpu_ticks: cpu_us,
+        rss_pages: rss_bytes,
+        kernel_thread: false,
+    })
+}
+
+/// A NUL-terminated fixed-size C name → `String` (lossy).
+#[cfg(target_os = "macos")]
+fn c_chars_to_string(chars: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = chars
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| c.to_ne_bytes()[0])
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The host lane's census state on Windows: ONE `sysinfo::System` kept across
 /// ticks, so the sample interval itself is the CPU diff window.
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 pub(crate) struct HostCensus {
     sys: sysinfo::System,
     /// Whether `sys` has been refreshed before — the first refresh has no CPU
@@ -879,7 +1147,7 @@ pub(crate) struct HostCensus {
     timer: CensusTimer,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 impl HostCensus {
     pub(crate) fn new() -> Self {
         let mut sys = sysinfo::System::new();
@@ -896,19 +1164,15 @@ impl HostCensus {
     /// Refresh the table and aggregate it. `vram_by_pid` is the seam for a
     /// per-process VRAM measurement; `None` publishes `gpu_mem_bytes: null`.
     pub(crate) fn take(&mut self, vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
         let started = std::time::Instant::now();
-        // CPU, memory, and the image path once per process (it identifies a
-        // Claude Code `node.exe`); `cmd`, `environ` and `cwd` stay at
-        // `UpdateKind::Never`, so they are never even read into the table.
+        // CPU and memory only; `cmd`, `environ`, `cwd` and the image path stay
+        // at `UpdateKind::Never`, so they are never even read into the table.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::new()
-                .with_cpu()
-                .with_memory()
-                .with_exe(UpdateKind::OnlyIfNotSet),
+            ProcessRefreshKind::new().with_cpu().with_memory(),
         );
         let cpu_known = self.primed;
         self.primed = true;
@@ -921,7 +1185,7 @@ impl HostCensus {
             .map(|p| ProcRecord {
                 pid: p.pid().as_u32(),
                 ppid: p.parent().map(|pp| pp.as_u32()),
-                name: identity_name(normalize_exe_name(&p.name().to_string_lossy()), p.exe()),
+                name: normalize_exe_name(&p.name().to_string_lossy()),
                 unit: None,
                 cpu_pct: f64::from(p.cpu_usage()) / cpu_count,
                 rss_bytes: p.memory(),
@@ -929,9 +1193,57 @@ impl HostCensus {
             })
             .collect();
 
-        let entries = census(&records, cpu_known, vram_by_pid, &HashMap::new());
+        let mut entries = census(&records, cpu_known, vram_by_pid, &UnitCpu::default());
+        claude_sessions_unknown_without_native_root(&mut entries);
         self.timer.record(started.elapsed(), records.len());
         Some(entries)
+    }
+}
+
+/// A Windows or macOS census that saw no native `claude` root cannot count
+/// Claude Code sessions: the npm install runs as `node` there, and only its
+/// argv — never read — says what it is. So instead of an absent class, which reads
+/// as "measured, no session", it publishes a `claude_session` entry whose
+/// `root_count` and `cpu_pct` are `null`. With a native root seen, the class
+/// is measured as everywhere else. PURE.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn claude_sessions_unknown_without_native_root(entries: &mut Vec<WorkloadEntry>) {
+    let class = WorkloadClass::ClaudeSession.as_str();
+    if entries.iter().any(|e| e.class == class && e.root_count.is_some_and(|n| n > 0)) {
+        return;
+    }
+    let unknown = WorkloadEntry {
+        class,
+        cpu_pct: None,
+        rss_bytes: 0,
+        gpu_mem_bytes: None,
+        proc_count: 0,
+        root_count: None,
+    };
+    match entries.iter_mut().find(|e| e.class == class) {
+        Some(e) => {
+            e.cpu_pct = None;
+            e.root_count = None;
+        }
+        // `claude_session` is the first class of the vocabulary, so the
+        // entries stay in vocabulary order.
+        None => entries.insert(0, unknown),
+    }
+}
+
+/// Any other host takes no census: no collector here is trusted to leave
+/// argv unread on it, and no census is UNKNOWN, never an empty one.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) struct HostCensus;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+impl HostCensus {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn take(&mut self, _vram_by_pid: Option<&HashMap<u32, u64>>) -> Option<Vec<WorkloadEntry>> {
+        None
     }
 }
 
@@ -953,111 +1265,117 @@ pub(crate) fn host_workloads() -> Option<Vec<WorkloadEntry>> {
 // WSL guest — rides the lane's single `wsl.exe` probe
 // ---------------------------------------------------------------------------
 
+// The section's literals are macros so the one script below can be spelled
+// with `concat!`, and each still has one home.
+macro_rules! guest_marker {
+    () => {
+        "@@qontinui-workload-census@@"
+    };
+}
+macro_rules! guest_cgroup_marker {
+    () => {
+        "@@qontinui-workload-census-cgroup@@"
+    };
+}
+macro_rules! guest_unit_marker {
+    () => {
+        "@@qontinui-workload-census-units@@"
+    };
+}
+macro_rules! guest_rc_marker {
+    () => {
+        "@@qontinui-workload-census-rc@@"
+    };
+}
+macro_rules! guest_stat_secs {
+    () => {
+        "2"
+    };
+}
+macro_rules! guest_cgroup_secs {
+    () => {
+        "2"
+    };
+}
+macro_rules! guest_unit_secs {
+    () => {
+        "1"
+    };
+}
+
 /// Separates the probe's original procfs output from the census section.
-const GUEST_MARKER: &str = "@@qontinui-workload-census@@";
+const GUEST_MARKER: &str = guest_marker!();
 /// Separates the census's `stat` lines from its `cgroup` files.
-const GUEST_CGROUP_MARKER: &str = "@@qontinui-workload-census-cgroup@@";
+const GUEST_CGROUP_MARKER: &str = guest_cgroup_marker!();
 /// Separates the `cgroup` files from the runner units' `cpu.stat` files.
-const GUEST_UNIT_MARKER: &str = "@@qontinui-workload-census-units@@";
+const GUEST_UNIT_MARKER: &str = guest_unit_marker!();
 /// Prefixes the exit status of each bounded step.
-const GUEST_RC_MARKER: &str = "@@qontinui-workload-census-rc@@";
+const GUEST_RC_MARKER: &str = guest_rc_marker!();
 
 /// In-guest bound on reading every `/proc/<pid>/stat`, seconds.
-const GUEST_STAT_SECS: &str = "2";
+const GUEST_STAT_SECS: &str = guest_stat_secs!();
 /// In-guest bound on reading every `/proc/<pid>/cgroup`, seconds.
-const GUEST_CGROUP_SECS: &str = "2";
-/// In-guest bound on reading the runner units' `cpu.stat`, seconds.
-const GUEST_UNIT_SECS: &str = "1";
+const GUEST_CGROUP_SECS: &str = guest_cgroup_secs!();
+/// In-guest bound on finding and reading the runner units' `cpu.stat`, seconds.
+const GUEST_UNIT_SECS: &str = guest_unit_secs!();
+/// Allowance for the section's unbounded steps — starting `sh`, the two
+/// `getconf`s, `head`, `grep` and the `echo`s — which read a handful of small
+/// files and exit; seconds.
+const GUEST_UNBOUNDED_SLACK_SECS: u64 = 1;
 
 /// The most the census section can add to the probe: the sum of its bounded
-/// steps. The probe's own timeout grows by exactly this while the census is
-/// on, so the census can never cost the lane its memory and saturation
-/// readings — a slow census is killed in the guest and published as no census.
+/// steps plus [`GUEST_UNBOUNDED_SLACK_SECS`]. The probe's own timeout grows by
+/// exactly this while the census is on, so the census can never cost the lane
+/// its memory and saturation readings — a slow census is killed in the guest
+/// and published as no census.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const GUEST_CENSUS_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const GUEST_CENSUS_BUDGET: Duration = Duration::from_secs(2 + 2 + 1 + GUEST_UNBOUNDED_SLACK_SECS);
 
-/// Shell words appended to the `wsl` lane's one probe when the census is on.
+/// The census section, as ONE `sh -c` script.
 ///
-/// `wsl.exe -d <distro> -- …` runs its arguments through the distro's default
-/// shell, so `;`, `$?`, the globs and the redirections are interpreted in the
-/// guest. The section emits the page size, `USER_HZ`, the aggregate `cpu` line
-/// of `/proc/stat`, every `/proc/<pid>/stat` (each line starts with its own
-/// pid, and its only string is the kernel's `comm`), every `/proc/<pid>/cgroup`
-/// behind a `tail` header naming its pid, and the `cpu.stat` of every GitHub
-/// Actions runner unit cgroup (one to three slices deep) behind a header naming
-/// its path. Never `cmdline` and never `environ`.
+/// `wsl.exe -d <distro> -- …` hands the rest of its command line to the
+/// distro user's LOGIN shell, which may be fish or zsh, where `$?` and an
+/// unmatched glob do not mean what they mean in `sh`. So the outer shell sees
+/// only `; sh -c "<script>"`: Rust's Windows argument quoting wraps this
+/// space-carrying argument in double quotes, which every one of those shells
+/// reads the same way — no glob, `;` or `'` inside them is touched — and the
+/// one character they all expand there, `$`, is written `\$`, which all of
+/// them turn back into `$`. Inside, POSIX `sh` alone interprets the script.
+/// The script itself therefore contains no `"` and no other backslash.
+///
+/// It emits the page size, `USER_HZ`, the aggregate `cpu` line and the
+/// `btime` line of `/proc/stat`, every `/proc/<pid>/stat` (each line starts
+/// with its own pid, and its only string is the kernel's `comm`), every
+/// `/proc/<pid>/cgroup` behind a `tail` header naming its pid, and the
+/// `cpu.stat` of every GitHub Actions runner unit cgroup up to eight levels
+/// below `/sys/fs/cgroup` (however many slices it sits in), behind a header
+/// naming its path. Never `cmdline` and never
+/// `environ`.
 ///
 /// Each read is bounded in the guest by `timeout -s KILL`, and followed by its
 /// exit status; a killed read (124 / 137) makes the section unusable rather
 /// than a silent undercount. On a guest where this section does not run, its
 /// marker is missing and the lane publishes no census — UNKNOWN, never empty.
+const GUEST_CENSUS_SCRIPT: &str = concat!(
+    "echo ", guest_marker!(), "; ",
+    "getconf PAGESIZE; getconf CLK_TCK; head -n 1 /proc/stat; grep btime /proc/stat; ",
+    "timeout -s KILL ", guest_stat_secs!(), " cat /proc/[0-9]*/stat 2>/dev/null; ",
+    "echo ", guest_rc_marker!(), " \\$?; ",
+    "echo ", guest_cgroup_marker!(), "; ",
+    "timeout -s KILL ", guest_cgroup_secs!(), " tail -v -n +1 /proc/[0-9]*/cgroup 2>/dev/null; ",
+    "echo ", guest_rc_marker!(), " \\$?; ",
+    "echo ", guest_unit_marker!(), "; ",
+    "timeout -s KILL ", guest_unit_secs!(),
+    " find /sys/fs/cgroup -maxdepth 9 -name cpu.stat -path '*/actions.runner.*.service/cpu.stat'",
+    " -exec tail -v -n +1 {} + 2>/dev/null; ",
+    "echo ", guest_rc_marker!(), " \\$?"
+);
+
+/// Shell words appended to the `wsl` lane's one probe when the census is on:
+/// the census section ([`GUEST_CENSUS_SCRIPT`]) as one `sh -c`, after the
+/// probe's own `cat`.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const GUEST_PROBE_WORDS: &[&str] = &[
-    ";",
-    "echo",
-    GUEST_MARKER,
-    ";",
-    "getconf",
-    "PAGESIZE",
-    ";",
-    "getconf",
-    "CLK_TCK",
-    ";",
-    "head",
-    "-n",
-    "1",
-    "/proc/stat",
-    ";",
-    "timeout",
-    "-s",
-    "KILL",
-    GUEST_STAT_SECS,
-    "cat",
-    "/proc/[0-9]*/stat",
-    "2>/dev/null",
-    ";",
-    "echo",
-    GUEST_RC_MARKER,
-    "$?",
-    ";",
-    "echo",
-    GUEST_CGROUP_MARKER,
-    ";",
-    "timeout",
-    "-s",
-    "KILL",
-    GUEST_CGROUP_SECS,
-    "tail",
-    "-v",
-    "-n",
-    "+1",
-    "/proc/[0-9]*/cgroup",
-    "2>/dev/null",
-    ";",
-    "echo",
-    GUEST_RC_MARKER,
-    "$?",
-    ";",
-    "echo",
-    GUEST_UNIT_MARKER,
-    ";",
-    "timeout",
-    "-s",
-    "KILL",
-    GUEST_UNIT_SECS,
-    "tail",
-    "-v",
-    "-n",
-    "+1",
-    "/sys/fs/cgroup/*/actions.runner.*.service/cpu.stat",
-    "/sys/fs/cgroup/*/*/actions.runner.*.service/cpu.stat",
-    "/sys/fs/cgroup/*/*/*/actions.runner.*.service/cpu.stat",
-    "2>/dev/null",
-    ";",
-    "echo",
-    GUEST_RC_MARKER,
-    "$?",
-];
+pub(crate) const GUEST_PROBE_WORDS: &[&str] = &[";", "sh", "-c", GUEST_CENSUS_SCRIPT];
 
 /// Split the probe's stdout into the original procfs part (which the lane's
 /// memory and saturation parsers read exactly as before) and the census
@@ -1131,7 +1449,7 @@ fn parse_guest_unit_usage(text: &str) -> HashMap<String, u64> {
 /// Parse one census section into a reading. `None` when the section is
 /// unusable: no page size, no `cpu` line, or a process-table step that was
 /// killed. A killed unit step only forgoes the unit figures.
-fn parse_guest_section(section: &str) -> Option<ProcfsTick> {
+fn parse_guest_section(section: &str) -> Option<CpuTimeTick> {
     let (stats_part, rest) = section.split_once(GUEST_CGROUP_MARKER)?;
     let (cgroup_part, unit_part) = rest.split_once(GUEST_UNIT_MARKER).unwrap_or((rest, ""));
     if guest_step_killed(stats_part) || guest_step_killed(cgroup_part) {
@@ -1147,15 +1465,17 @@ fn parse_guest_section(section: &str) -> Option<ProcfsTick> {
         Err(_) => (None, next),
     };
     let total_jiffies = parse_total_jiffies(cpu_line)?;
+    let boot_time = stats_part.lines().find_map(parse_btime);
     let stats: Vec<ProcStat> = lines.filter_map(parse_proc_stat).collect();
     let unit_usage_usec = if guest_step_killed(unit_part) {
         HashMap::new()
     } else {
         parse_guest_unit_usage(unit_part)
     };
-    Some(ProcfsTick {
+    Some(CpuTimeTick {
         page_size,
         clk_tck,
+        boot_time,
         total_jiffies,
         stats,
         units: parse_guest_cgroups(cgroup_part),
@@ -1166,7 +1486,7 @@ fn parse_guest_section(section: &str) -> Option<ProcfsTick> {
 /// The `wsl` lane's census state.
 #[derive(Debug, Default)]
 pub(crate) struct GuestCensus {
-    procfs: ProcfsCensus,
+    cumulative: CpuTimeCensus,
 }
 
 impl GuestCensus {
@@ -1175,7 +1495,7 @@ impl GuestCensus {
     /// previous reading stays the baseline, so the next interval simply spans
     /// two ticks.
     pub(crate) fn take(&mut self, section: &str) -> Option<Vec<WorkloadEntry>> {
-        self.procfs.take(parse_guest_section(section)?, None)
+        self.cumulative.take(parse_guest_section(section)?, None)
     }
 }
 
@@ -1217,8 +1537,15 @@ mod tests {
         }
     }
 
-    fn no_units() -> HashMap<String, f64> {
-        HashMap::new()
+    fn no_units() -> UnitCpu {
+        UnitCpu::default()
+    }
+
+    fn unit_share(unit: &str, share: f64) -> UnitCpu {
+        UnitCpu {
+            share: HashMap::from([(unit.to_string(), share)]),
+            busy_before: HashSet::new(),
+        }
     }
 
     #[test]
@@ -1341,22 +1668,6 @@ mod tests {
         );
     }
 
-    /// The Windows npm install runs Claude Code as `node.exe`: only the image
-    /// path, never argv, makes it a session — and an ordinary `node` stays put.
-    #[test]
-    fn a_claude_code_node_is_known_by_its_image_alone() {
-        use std::path::Path;
-        let npm = Path::new("/usr/lib/node_modules/@anthropic-ai/claude-code/vendor/node");
-        assert!(image_identifies_claude_code(npm));
-        assert_eq!(identity_name("node".to_string(), Some(npm)), "claude");
-        let plain = Path::new("/usr/bin/node");
-        assert!(!image_identifies_claude_code(plain));
-        assert_eq!(identity_name("node".to_string(), Some(plain)), "node");
-        assert_eq!(identity_name("node".to_string(), None), "node");
-        // Only a Node runtime is renamed; a helper inside the package is not.
-        assert_eq!(identity_name("rg".to_string(), Some(npm)), "rg");
-    }
-
     #[test]
     fn census_derives_runner_busyness_from_the_table() {
         let busy_unit = "actions.runner.o-r.host-1.service";
@@ -1430,13 +1741,11 @@ mod tests {
             rec(11, 1, "Runner.Listener", Some(unit), 1.0, 1),
             rec(12, 11, "Runner.Worker", Some(unit), 9.0, 1),
         ];
-        let units = HashMap::from([(unit.to_string(), 60.0)]);
-        let out = census(&table, true, None, &units);
+        let out = census(&table, true, None, &unit_share(unit, 60.0));
         let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
         assert_eq!(job.cpu_pct, Some(60.0));
         // Never below what the processes themselves measured.
-        let low = HashMap::from([(unit.to_string(), 4.0)]);
-        let out = census(&table, true, None, &low);
+        let out = census(&table, true, None, &unit_share(unit, 4.0));
         assert_eq!(out.iter().find(|e| e.class == "gh_actions_job").and_then(|e| e.cpu_pct), Some(10.0));
         // A unit whose processes span classes cannot place its surplus.
         let mixed_unit = "qontinui-runner.service";
@@ -1444,10 +1753,149 @@ mod tests {
             rec(2, 1, "qontinui-runner", Some(mixed_unit), 1.0, 1),
             rec(3, 2, "claude", Some(mixed_unit), 1.0, 1),
         ];
-        let units = HashMap::from([(mixed_unit.to_string(), 50.0)]);
-        let out = census(&mixed, true, None, &units);
+        let out = census(&mixed, true, None, &unit_share(mixed_unit, 50.0));
         let total: f64 = out.iter().filter_map(|e| e.cpu_pct).sum();
         assert_eq!(total, 2.0);
+    }
+
+    /// A job that ended inside the interval leaves an idle listener behind;
+    /// its exited children's CPU is still the job's, never idle overhead.
+    #[test]
+    fn an_idle_units_surplus_is_a_jobs_when_a_job_ran_in_the_interval() {
+        let unit = "actions.runner.o-r.host-1.service";
+        let idle = vec![rec(11, 1, "Runner.Listener", Some(unit), 0.1, 1)];
+        let class_cpu = |out: &[WorkloadEntry], c: &str| {
+            out.iter().find(|e| e.class == c).and_then(|e| e.cpu_pct)
+        };
+
+        // The unit had a worker on the previous tick: even a small surplus is
+        // the job's tail.
+        let mut after_job = unit_share(unit, 0.4);
+        after_job.busy_before.insert(unit.to_string());
+        let out = census(&idle, true, None, &after_job);
+        assert_eq!(class_cpu(&out, "gh_actions_job"), Some(0.3));
+        assert_eq!(class_cpu(&out, "gh_actions_runner_idle"), Some(0.1));
+        let job = out.iter().find(|e| e.class == "gh_actions_job").expect("job");
+        assert_eq!(job.proc_count, 0, "no job process is alive at the reading");
+
+        // No worker seen at either end, but more than a listener spends: a
+        // job started and finished inside the interval.
+        let out = census(&idle, true, None, &unit_share(unit, 25.1));
+        assert_eq!(class_cpu(&out, "gh_actions_job"), Some(25.0));
+        assert_eq!(class_cpu(&out, "gh_actions_runner_idle"), Some(0.1));
+
+        // Listener overhead stays idle.
+        let out = census(&idle, true, None, &unit_share(unit, 0.3));
+        assert_eq!(class_cpu(&out, "gh_actions_job"), None);
+        assert_eq!(class_cpu(&out, "gh_actions_runner_idle"), Some(0.3));
+    }
+
+    /// The previous tick's busyness is carried by the accounting itself.
+    #[test]
+    fn the_guest_census_remembers_which_units_ran_a_job() {
+        let unit = "actions.runner.o-r.spaceship-1.service";
+        let cg = |pids: &[u32]| {
+            pids.iter()
+                .map(|p| format!("==> /proc/{p}/cgroup <==\n0::/system.slice/{unit}\n\n"))
+                .collect::<String>()
+        };
+        let usage = |usec: u64| {
+            format!("==> /sys/fs/cgroup/system.slice/{unit}/cpu.stat <==\nusage_usec {usec}\n")
+        };
+        let mut g = GuestCensus::default();
+        g.take(&guest_section(
+            [0, 0, 0, 1000, 0, 0, 0, 0],
+            &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2), (3, 2, "Runner.Worker", 0, 3)],
+            &cg(&[2, 3]),
+            &usage(1_000_000),
+        ))
+        .expect("first tick");
+        g.take(&guest_section(
+            [100, 0, 0, 1900, 0, 0, 0, 0],
+            &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2), (3, 2, "Runner.Worker", 100, 3)],
+            &cg(&[2, 3]),
+            &usage(2_000_000),
+        ))
+        .expect("busy tick");
+        // The worker exited inside this interval; the unit's cgroup kept the
+        // 3 jiffies it burned before going.
+        let third = g
+            .take(&guest_section(
+                [103, 0, 0, 2897, 0, 0, 0, 0],
+                &[(1, 0, "init", 0, 1), (2, 1, "Runner.Listener", 10, 2)],
+                &cg(&[2]),
+                &usage(2_030_000),
+            ))
+            .expect("third tick");
+        let job = third.iter().find(|e| e.class == "gh_actions_job").expect("job tail");
+        assert_eq!(job.cpu_pct, Some(0.3));
+        let idle = third.iter().find(|e| e.class == "gh_actions_runner_idle").expect("idle");
+        assert_eq!(idle.cpu_pct, Some(0.0));
+    }
+
+    /// A rebooted guest restarts every counter — its new jiffy total can even
+    /// exceed the old one — so a changed `btime` drops every baseline.
+    #[test]
+    fn a_rebooted_guest_starts_over_with_unknown_cpu() {
+        let procs: &[(u32, u32, &str, u64, u64)] = &[(1, 0, "init", 0, 1), (50, 1, "rustc", 10, 100)];
+        let mut g = GuestCensus::default();
+        g.take(&guest_section([0, 0, 0, 1000, 0, 0, 0, 0], procs, "", ""))
+            .expect("first tick");
+        let rebooted = guest_section(
+            [500, 0, 0, 5000, 0, 0, 0, 0],
+            &[(1, 0, "init", 0, 1), (50, 1, "rustc", 400, 100)],
+            "",
+            "",
+        )
+        .replacen("btime 1700000000", "btime 1700009999", 1);
+        let after = g.take(&rebooted).expect("tick after reboot");
+        assert!(after.iter().all(|e| e.cpu_pct.is_none()), "{after:?}");
+        // The reading after that diffs against the new boot only.
+        let next = g
+            .take(
+                &guest_section(
+                    [600, 0, 0, 5900, 0, 0, 0, 0],
+                    &[(1, 0, "init", 0, 1), (50, 1, "rustc", 500, 100)],
+                    "",
+                    "",
+                )
+                .replacen("btime 1700000000", "btime 1700009999", 1),
+            )
+            .expect("second tick of the new boot");
+        let build = next.iter().find(|e| e.class == "cargo_build").expect("build");
+        assert_eq!(build.cpu_pct, Some(10.0));
+    }
+
+    #[test]
+    fn btime_parses_from_its_own_line_only() {
+        assert_eq!(parse_btime("btime 1700000000"), Some(1_700_000_000));
+        assert_eq!(parse_btime("cpu  1 2 3"), None);
+        assert_eq!(parse_btime("btime x"), None);
+    }
+
+    /// Where an npm Claude Code runs as `node`, a census with no native root
+    /// says "unknown", never "no session"; a native root is counted as ever.
+    #[test]
+    fn sessions_are_unknown_without_a_native_claude_root() {
+        // An npm session: `node` with a shell under it. Nothing says Claude.
+        let npm = vec![rec(10, 1, "node.exe", None, 3.0, 100), rec(11, 10, "bash.exe", None, 1.0, 10)];
+        let mut out = census(&npm, true, None, &no_units());
+        claude_sessions_unknown_without_native_root(&mut out);
+        let claude = &out[0];
+        assert_eq!(claude.class, "claude_session", "kept in vocabulary order: {out:?}");
+        assert_eq!(claude.root_count, None, "never 0 while a session may be running");
+        assert_eq!(claude.cpu_pct, None);
+        assert_eq!(claude.proc_count, 0);
+        assert_eq!(out.iter().filter(|e| e.class == "claude_session").count(), 1);
+
+        // A native root is measured as everywhere else.
+        let native = vec![rec(20, 1, "claude.exe", None, 2.0, 50), rec(21, 20, "git.exe", None, 1.0, 5)];
+        let mut out = census(&native, true, None, &no_units());
+        let before = out.clone();
+        claude_sessions_unknown_without_native_root(&mut out);
+        assert_eq!(out, before);
+        assert_eq!(out[0].root_count, Some(1));
+        assert_eq!(out[0].cpu_pct, Some(3.0));
     }
 
     #[test]
@@ -1626,7 +2074,7 @@ mod tests {
         units: &str,
     ) -> String {
         let cpu = total.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
-        let mut s = format!("\n4096\n100\ncpu  {cpu} 0 0\n");
+        let mut s = format!("\n4096\n100\ncpu  {cpu} 0 0\nbtime 1700000000\n");
         for (pid, ppid, comm, ticks, start) in procs {
             s.push_str(&format!(
                 "{pid} ({comm}) S {ppid} 0 0 0 -1 0 0 0 0 0 {ticks} 0 0 0 20 0 1 0 {start} 0 10\n"
@@ -1759,41 +2207,140 @@ mod tests {
         }
     }
 
-    /// The probe's timeout grows by exactly the census's in-guest bounds, and
-    /// every bounded step is followed by its exit status.
+    /// The probe's timeout grows by the census's in-guest bounds plus the
+    /// slack for its unbounded steps, and every bounded step is followed by
+    /// its exit status.
     #[test]
-    fn the_guest_census_budget_is_the_sum_of_its_bounds() {
-        let secs: u64 = [GUEST_STAT_SECS, GUEST_CGROUP_SECS, GUEST_UNIT_SECS]
+    fn the_guest_census_budget_is_the_sum_of_its_bounds_and_slack() {
+        let bounds = [GUEST_STAT_SECS, GUEST_CGROUP_SECS, GUEST_UNIT_SECS];
+        let secs: u64 = bounds
             .iter()
             .map(|s| s.parse::<u64>().expect("whole seconds"))
             .sum();
-        assert_eq!(GUEST_CENSUS_BUDGET, Duration::from_secs(secs));
-        let timeouts = GUEST_PROBE_WORDS.iter().filter(|w| **w == "timeout").count();
-        let statuses = GUEST_PROBE_WORDS.iter().filter(|w| **w == GUEST_RC_MARKER).count();
-        assert_eq!(timeouts, 3);
-        assert_eq!(statuses, timeouts);
+        assert_eq!(GUEST_CENSUS_BUDGET, Duration::from_secs(secs + GUEST_UNBOUNDED_SLACK_SECS));
+        assert_eq!(GUEST_CENSUS_SCRIPT.matches("timeout -s KILL ").count(), bounds.len());
+        for b in bounds {
+            assert!(GUEST_CENSUS_SCRIPT.contains(&format!("timeout -s KILL {b} ")));
+        }
+        assert_eq!(
+            GUEST_CENSUS_SCRIPT.matches(&format!("{GUEST_RC_MARKER} \\$?")).count(),
+            bounds.len()
+        );
+    }
+
+    /// The outer (login) shell must hand the script to `sh` untouched: no
+    /// `"` (Rust would escape it), no backslash but the `\$` every outer
+    /// shell turns into `$`, and spaces in it so it is quoted at all.
+    #[test]
+    fn the_guest_script_survives_any_login_shell() {
+        assert_eq!(GUEST_PROBE_WORDS[..3], [";", "sh", "-c"]);
+        assert!(!GUEST_CENSUS_SCRIPT.contains('"'));
+        assert_eq!(
+            GUEST_CENSUS_SCRIPT.matches('\\').count(),
+            GUEST_CENSUS_SCRIPT.matches("\\$").count(),
+            "every backslash escapes a `$`"
+        );
+        assert!(!GUEST_CENSUS_SCRIPT.ends_with('\\'));
+        assert!(GUEST_CENSUS_SCRIPT.contains(' '), "Rust quotes only an argument with a space");
+        assert!(
+            !GUEST_CENSUS_SCRIPT.replace("\\$?", "").contains('$'),
+            "no unescaped `$` for the login shell to expand"
+        );
+    }
+
+    /// The command line `wsl.exe` forwards, as Rust's Windows quoting builds
+    /// it for these words: an argument with a space or tab is wrapped in
+    /// double quotes (the script holds no `"` and ends in no backslash, so
+    /// nothing inside needs escaping).
+    #[cfg(target_os = "linux")]
+    fn windows_command_line(words: &[&str]) -> String {
+        words
+            .iter()
+            .map(|w| {
+                assert!(!w.contains('"'));
+                if w.is_empty() || w.contains([' ', '\t']) {
+                    format!("\"{w}\"")
+                } else {
+                    (*w).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Live: the probe exactly as `wsl.exe` hands it to a login shell, run
+    /// through every login shell this machine has, yields the meminfo head
+    /// AND a census section that parses — page size, `cpu` and `btime`, and
+    /// the process table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_guest_probe_runs_the_same_under_every_login_shell() {
+        let mut words = vec!["cat", "/proc/meminfo"];
+        words.extend_from_slice(GUEST_PROBE_WORDS);
+        let line = windows_command_line(&words);
+        let mut ran = 0;
+        for shell in ["sh", "bash", "zsh", "fish"] {
+            let out = match std::process::Command::new(shell).arg("-c").arg(&line).output() {
+                Ok(out) => out,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => panic!("{shell}: {e}"),
+            };
+            ran += 1;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let (head, section) = split_guest_output(&text);
+            assert!(head.contains("MemTotal:"), "{shell}: {head}");
+            let section = section.unwrap_or_else(|| panic!("{shell}: no census section"));
+            let tick = parse_guest_section(section).unwrap_or_else(|| panic!("{shell}: {section}"));
+            assert!(tick.boot_time.is_some(), "{shell}: btime");
+            assert!(tick.stats.len() > 1, "{shell}: process table");
+            assert!(!guest_step_killed(section), "{shell}: a bounded step was killed");
+        }
+        assert!(ran >= 1, "no POSIX shell to run the probe under");
     }
 
     /// The module must never load argv, environment or cwd. Structural: the
-    /// production half of this file names none of the accessors, and no
-    /// refresh that would load them wholesale.
+    /// production half of this file names none of the accessors, no refresh
+    /// that would load them wholesale, and — on macOS, where any `sysinfo`
+    /// process refresh reads `KERN_PROCARGS2` — no `sysinfo` at all.
     #[test]
     fn production_code_never_touches_argv_env_or_cwd() {
         const SRC: &str = include_str!("workload_census.rs");
-        let prod = SRC.split_once("\n#[cfg(test)]").map_or(SRC, |(a, _)| a);
+        // Code only: the docs above name what is avoided, and why.
+        let prod: String = SRC
+            .split_once("\n#[cfg(test)]")
+            .map_or(SRC, |(a, _)| a)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for forbidden in [
             ".cmd()",
             ".environ()",
             ".cwd()",
+            ".exe()",
             "with_cmd",
             "with_environ",
             "with_cwd",
+            "with_exe",
             "ProcessRefreshKind::everything",
             "UpdateKind::Always",
+            "UpdateKind::OnlyIfNotSet",
             "/cmdline",
             "/environ",
+            "KERN_PROCARGS",
+            "proc_pidpath",
         ] {
             assert!(!prod.contains(forbidden), "production code must not use {forbidden}");
+        }
+        // Every macOS-only item, from its `cfg` to its closing brace.
+        let macos: Vec<&str> = prod
+            .split("#[cfg(target_os = \"macos\")]")
+            .skip(1)
+            .map(|item| item.split("\n}\n").next().unwrap_or(item))
+            .collect();
+        assert!(macos.len() >= 4, "the macOS host lane must exist");
+        for item in macos {
+            assert!(!item.contains("sysinfo::"), "the macOS lane must not use sysinfo: {item}");
         }
     }
 

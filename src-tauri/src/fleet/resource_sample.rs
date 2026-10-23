@@ -1342,9 +1342,12 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     // The workload census rides the same fork: its words are appended to the
     // one `cat` only while the census is on, and its output follows a marker
     // the memory and saturation parsers never see. Its reads are bounded in
-    // the guest, and the probe's own bound grows by exactly that budget, so a
-    // slow census is killed in the guest and published as no census — it can
-    // never time the probe out and cost the lane its memory and saturation.
+    // the guest, its few unbounded steps (`sh`, `getconf`, `head`, `grep`,
+    // `echo`) get a slack allowance, and the probe's own bound grows by
+    // exactly that budget (`GUEST_CENSUS_BUDGET`: the bounds plus the slack),
+    // so a slow census is killed in the guest and published as no census — it
+    // can never time the probe out and cost the lane its memory and
+    // saturation.
     let census_on = workload_census::census_enabled();
     let out = {
         let mut args = vec!["-d", distro.as_str(), "--", "cat"];
