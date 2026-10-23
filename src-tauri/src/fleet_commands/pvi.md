@@ -258,8 +258,20 @@ When the argument resolves to a prompt **file**, check both signals:
 ```bash
 stem=$(basename "<the resolved prompt path>" .md)
 grep -m1 -E '^> \*\*(RESOLVED|SHIPPED|SUPERSEDED|CLOSED)' "<prompt path>"
-ls "$PLANS/$stem.md" 2>/dev/null && grep -m1 -E 'Status:' "$PLANS/$stem.md"
+stamp_reader=<workspace-root>/qontinui-claude-config/scripts/lint-plan-status.py
+if ls "$PLANS/$stem.md" 2>/dev/null; then
+  if [ -r "$stamp_reader" ] && command -v python3 >/dev/null; then python3 "$stamp_reader" --stamp "$PLANS/$stem.md"
+  else grep -m1 -E 'Status:' "$PLANS/$stem.md"; fi   # no config checkout or no python3: the old read
+fi
 ```
+
+`--stamp` is the parse owner's single-plan read (`_status-writers.md`), so
+every stamp shape is read: blockquoted, plain `**Status:** X`, list-form, bare,
+and the bold no-colon `> **STATUS SHIPPED`. It prints `<TOKEN>\t<block>`. Exit
+3 means the window holds no stamp, which is UNKNOWN and not "unresolved". The
+`grep` arm is used only where the script or `python3` is absent. It misses the no-colon
+form, and it can match `Status:` in body prose about another plan, so treat what
+it prints as a hint and read the stamp yourself.
 
 A prompt that merely **cites** a plan in its prose is *not* resolved — prompts
 legitimately cite prior art. Only a stamp or a same-stem plan settles it.

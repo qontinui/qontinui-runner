@@ -348,7 +348,9 @@ describe("handlers — the no-ops that used to render as effects", () => {
     h.reset();
     const o = await run("/layout quad", (id) => h.byId(id));
     expect(o.verdict).toBe("ok");
-    expect(h.calls.map((c) => [c.name, c.args])).toEqual([["zone.setLayoutId", ["quad"]]]);
+    expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+      ["zone.setLayoutId", ["quad", { source: "operator" }]],
+    ]);
     expect(reportOf(o.value).affected).toBe(0);
   });
 

@@ -46,6 +46,16 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 /**
+ * The session's total output as of one chunk: the chunk's absolute byte offset
+ * plus its length. `undefined` when the event carries no offset (an older
+ * runner), so a caller renders no total rather than guessing one.
+ */
+export function chunkEndOffset(offset: number | undefined, length: number): number | undefined {
+  if (offset === undefined || !Number.isFinite(offset) || offset < 0) return undefined;
+  return offset + length;
+}
+
+/**
  * Per-terminal streaming decode + per-frame coalescing.
  *
  * Ordering is preserved per tab (chunks are appended in arrival order), and

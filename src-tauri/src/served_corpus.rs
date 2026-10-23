@@ -297,6 +297,16 @@ impl SourceIdentity {
                 self.canonical,
                 clean(&s.fetched_at)
             ),
+            // The tenant's `egress_skill_mirror` switch is the REASON nothing
+            // is loaded when it is off — named, so a session can tell "the
+            // tenant turned the mirror off" from "the first fetch has not
+            // landed yet" (plan 2026-10-10-spec-front-end-phase-9-generic-boundary).
+            None if !crate::egress::permit(crate::egress::Flow::SkillMirror).allowed => {
+                format!(
+                    "canonical@unloaded(egress_skill_mirror=off) {}",
+                    self.canonical
+                )
+            }
             None => format!("canonical@unloaded {}", self.canonical),
         };
         format!(
@@ -2163,5 +2173,25 @@ mod tests {
     #[test]
     fn no_rendered_value_can_close_a_token_early() {
         assert_eq!(clean("a]b[c\nd"), "a)b(c d");
+    }
+}
+
+#[cfg(test)]
+mod egress_header_tests {
+    use super::*;
+    use crate::egress::test_support::pin;
+    use crate::egress::{Flow, Level};
+
+    #[test]
+    fn the_served_line_names_the_skill_mirror_switch_as_the_reason() {
+        let ident = SourceIdentity::default();
+        assert!(ident.render().starts_with("served: canonical@unloaded 0,"));
+        let _pin = pin(Flow::SkillMirror, Level::Off);
+        let line = ident.render();
+        assert!(
+            line.starts_with("served: canonical@unloaded(egress_skill_mirror=off) 0,"),
+            "{line}"
+        );
+        assert!(!line.contains(']'));
     }
 }
