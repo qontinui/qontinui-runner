@@ -125,10 +125,16 @@
 #                            mint. (Never restart a running runner over this -
 #                            served policy production-and-cost runner-lifecycle.)
 #   6    TENANT_REFUSED    - only with --tenant: the runner refused the tenant
-#                            (COORD_MCP_PROVISION_INVALID_TENANT 400,
-#                            ..._TENANT_NOT_PAIRED 422, ..._TENANT_UNKNOWN 503,
-#                            ..._TENANT_REFUSED 422). Nothing was minted; stdout
-#                            carries `refusal=<code>` so the caller can type it.
+#                            (COORD_MCP_PROVISION_TENANT_NOT_PAIRED 403,
+#                            ..._TENANT_WORKDIR_DECLARES_OTHER 403 - the cwd's
+#                            own .mcp.json declares a coord-mcp for another
+#                            tenant, ..._CREDENTIAL_STORE_UNREADABLE 503 -
+#                            whether the tenant is paired is UNKNOWN). Nothing
+#                            was minted; stdout carries `refusal=<code>` so the
+#                            caller can type it. A non-UUID --tenant is NOT
+#                            exit 6: the runner rejects the whole body as
+#                            ..._INVALID_BODY 400, which is exit 3 (this
+#                            script does not validate --tenant before sending).
 #   127  LOCAL fault       - curl missing, or neither jq nor python available.
 #
 # EXIT CODES (frontend-state)
@@ -698,7 +704,13 @@ for origin in $ORIGINS; do
         # different fix - which is exactly why the runner emits three of them
         # instead of one 403. Never collapse them.
         case "$ERRCODE" in
-          *_INVALID_TENANT|*_TENANT_NOT_PAIRED|*_TENANT_UNKNOWN|*_TENANT_REFUSED)
+          *_TENANT_NOT_PAIRED|*_TENANT_WORKDIR_DECLARES_OTHER|*_CREDENTIAL_STORE_UNREADABLE)
+            # The codes the runner actually emits for a named tenant (the table
+            # above coord_provision_session_handler in qontinui-runner
+            # src-tauri/src/mcp_api.rs): 403 ..._TENANT_NOT_PAIRED, 403
+            # ..._TENANT_WORKDIR_DECLARES_OTHER, 503
+            # ..._CREDENTIAL_STORE_UNREADABLE. A non-UUID tenant is not among
+            # them - it is ..._INVALID_BODY 400 and stays exit 3.
             # P2's refusals of the TENANT, not of the caller: nothing was minted,
             # and the fix is about which tenant was named (or pairing), never the
             # opt-in marker or the handshake. Its own exit code so no caller can
@@ -708,7 +720,14 @@ for origin in $ORIGINS; do
             # tenant this call sent, so it stays an ordinary typed refusal (3)
             # rather than an exit the caller has no input to fix.
             if [ -n "$TENANT_ARG" ]; then
-              echo "coord-provision-nonce: REFUSED $ERRCODE - the runner will not mint a session credential for tenant $TENANT_ARG: ${ERRMSG:-no message} (HTTP $CODE from $origin)" >&2
+              case "$ERRCODE" in
+                *_CREDENTIAL_STORE_UNREADABLE)
+                  echo "coord-provision-nonce: REFUSED $ERRCODE - the runner could not read its credential store, so whether tenant $TENANT_ARG is paired is UNKNOWN (NOT 'not paired'); it refused rather than guessed and minted nothing: ${ERRMSG:-no message} (HTTP $CODE from $origin)" >&2 ;;
+                *_TENANT_WORKDIR_DECLARES_OTHER)
+                  echo "coord-provision-nonce: REFUSED $ERRCODE - the cwd's own .mcp.json ($CWD_ARG) declares a coord-mcp that does not resolve to tenant $TENANT_ARG; a workdir problem, not a pairing one, and nothing was minted: ${ERRMSG:-no message} (HTTP $CODE from $origin)" >&2 ;;
+                *)
+                  echo "coord-provision-nonce: REFUSED $ERRCODE - the runner will not mint a session credential for tenant $TENANT_ARG: ${ERRMSG:-no message} (HTTP $CODE from $origin)" >&2 ;;
+              esac
               echo "refusal=$ERRCODE"
               exit 6
             fi
