@@ -530,6 +530,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "lib/ui-bridge/guardedHandler.ts",
   "lib/ui-bridge/use-discovered-specs.ts",
   "lib/utils.ts",
+  "lib/vision-api.ts",
   "lib/workflow-builder/buildSpecWorkflow.ts",
   "pages/specs/ApiOverview.tsx",
   "pages/specs/ConnectionBar.tsx",
