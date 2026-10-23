@@ -1,6 +1,6 @@
 [package]
 name = "qontinui-runner"
-version = "1.0.11"
+version = "1.0.12"
 description = "Desktop app for AI-assisted development: orchestrated AI coding sessions with visual feedback, self-verification, and real-time UI inspection"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
@@ -92,15 +92,23 @@ mdns-sd = "0.11"
 # Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,
 # `mdns` for adb mDNS services. The crate is sync; call via tokio::spawn_blocking.
 adb_client = { version = "3", features = ["usb", "mdns"] }
-# `hickory-dns` swaps reqwest's default `GaiResolver` — which resolves through
-# blocking `getaddrinfo` dispatched onto tokio's blocking pool — for the async
-# hickory resolver. Without it, every request costs a blocking-pool slot; the
-# runner pinned that pool near its 512-thread ceiling and DNS resolution queued
-# until requests hit their own timeouts (coord answers in <0.5s but calls failed
-# as `operation timed out`). `coord_http::coord_client` fixes the coord paths by
-# sharing one pooled client; this feature protects the ~160 call sites that
-# still construct clients per request.
-reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
+# NO `hickory-dns` feature, deliberately — `outbound_net::os_dns` has the
+# measurement. Hickory does not ask the OS to resolve; it queries every
+# adapter's configured nameserver itself with a 5 s timeout. On a box whose
+# VPN blocks the physical adapter's DNS (2026-10-18, 2020Dell, ProtonVPN)
+# every FRESH resolver spent 5.5 s per lookup against 0.37 s via
+# `getaddrinfo`, so every per-request client — the device-register heartbeat
+# among them — hit its 5 s cap for 33 hours while coord answered in 0.4 s.
+# Clients therefore resolve through the OS. Only clients built with
+# `outbound_net::os_dns::client_builder()` / `os_resolver()` (the shared coord
+# client, the device-register heartbeat, the boot drain read and the tree
+# publisher) are also kept OFF tokio's
+# blocking pool, the reason hickory was enabled in #918; every other
+# `reqwest::Client::builder()` site uses reqwest's default GaiResolver, which
+# takes one blocking-pool slot per lookup. Migrating them is the follow-up
+# recorded as coord finding 1d5d6c2e-d0f4-4a70-9e67-efc5ed158268. `os_dns::tests::no_reqwest_in_the_lockfile_depends_on_hickory`
+# pins the feature off.
+reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
@@ -114,7 +122,13 @@ base64 = "0.22"
 bollard = "0.18"
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-client"] }
+# `reqwest-blocking-client`, not `reqwest-client`: since 0.28 the batch span
+# processor exports from its own OS thread, where the async client panics with
+# "there is no reactor running" — so with `reqwest-client` no span was ever
+# exported. otlp builds the blocking client on a throwaway thread, so it is
+# safe to construct from inside the Tokio runtime. Found by the telemetry flow
+# test of plan 2026-10-10-spec-front-end-phase-9-generic-boundary.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 axum = { version = "0.8", features = ["ws"] }
 async-graphql = { version = "8.0.0-rc.4", features = ["chrono", "uuid", "tracing"] }
@@ -125,7 +139,7 @@ async-stream = "0.3"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace", "catch-panic"] }
 urlencoding = "2.1"
-zip = "8"
+zip = "9"
 sha2 = "0.10"
 hmac = "0.12"
 rand = "0.9"
@@ -142,9 +156,10 @@ qontinui-db = { path = "./clorinde" }
 # configured/reachable (see src/embedded_pg.rs), instead of panicking on boot.
 # `bundled` embeds the PG archive at COMPILE time — no runtime download, offline
 # first run. Provisioning only; the tokio-postgres/clorinde query layer above is
-# unchanged. Version resolves via the POSTGRESQL_VERSION build env (defaults to
-# the crate's latest); keep it consistent across builds for on-disk cluster
-# compatibility.
+# unchanged. Version resolves via the POSTGRESQL_VERSION build env, which is
+# PINNED in src-tauri/.cargo/config.toml. Unset, it floats to upstream's newest
+# release (see that file for why it must not); keep it consistent across builds
+# for on-disk cluster compatibility.
 postgresql_embedded = { version = "0.20.2", features = ["bundled"] }
 qontinui-spec-check = { path = "../crates/spec-check" }
 # Carved out of this crate's own module tree (plan

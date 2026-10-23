@@ -39,8 +39,8 @@ mod types;
 
 // Re-export public API
 pub use account_usage::{
-    pick_best_account, pick_migration_target, resolve_requested_account, AccountSelectError,
-    ResolvedAccount,
+    pick_best_account, pick_migration_target, record_handoff, resolve_requested_account,
+    unrecord_handoff, AccountSelectError, ResolvedAccount,
 };
 pub use cache_aware_builder::StructuredPrompt;
 pub use config::{

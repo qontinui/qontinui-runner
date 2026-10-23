@@ -71,6 +71,9 @@ pub enum AttachRefusal {
     TerminalMismatch,
     Disabled,
     SessionNotLocal,
+    /// The tenant's `egress_terminal_stream` switch is off (plan
+    /// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7).
+    EgressOff,
 }
 
 impl AttachRefusal {
@@ -78,12 +81,13 @@ impl AttachRefusal {
     /// here too — `admit_terminal_attach`'s frame-shape invariant test walks
     /// this list, and the exhaustive match it drives each variant through
     /// will not compile until the new one is handled.
-    pub const ALL: [AttachRefusal; 5] = [
+    pub const ALL: [AttachRefusal; 6] = [
         AttachRefusal::GrantUnknown,
         AttachRefusal::GrantExpired,
         AttachRefusal::TerminalMismatch,
         AttachRefusal::Disabled,
         AttachRefusal::SessionNotLocal,
+        AttachRefusal::EgressOff,
     ];
 
     pub fn code(self) -> &'static str {
@@ -93,6 +97,7 @@ impl AttachRefusal {
             AttachRefusal::TerminalMismatch => "attach_terminal_mismatch",
             AttachRefusal::Disabled => "remote_attach_disabled",
             AttachRefusal::SessionNotLocal => "session_not_local",
+            AttachRefusal::EgressOff => "egress_off",
         }
     }
 
@@ -105,6 +110,7 @@ impl AttachRefusal {
             }
             AttachRefusal::Disabled => "this device does not accept remote attach",
             AttachRefusal::SessionNotLocal => "no local terminal hosts that coord session",
+            AttachRefusal::EgressOff => "Terminal streaming is off for this project",
         }
     }
 }
@@ -925,6 +931,21 @@ pub fn gate_remote_frame<P: FnOnce() -> AcceptRemoteAttach>(
 ) -> Result<Option<AttachGrant>, AttachRefusal> {
     match parse_remote_block(data) {
         None => Ok(None),
+        // A remote frame streams this terminal to another device: the
+        // `egress_terminal_stream` switch of the tenant whose session is on
+        // that terminal (the default scope when none is known) is checked
+        // before any grant work.
+        Some(_)
+            if !crate::egress::permit_or_count_session(
+                crate::egress::Flow::TerminalStream,
+                terminal_id.map_or(
+                    crate::egress::SessionScope::Unresolved,
+                    crate::egress::terminal_session_tenant,
+                ),
+            ) =>
+        {
+            Err(AttachRefusal::EgressOff)
+        }
         Some(Err(())) => {
             if preference() == AcceptRemoteAttach::Off {
                 Err(AttachRefusal::Disabled)
@@ -1055,6 +1076,15 @@ where
         return Err(refusal_frame(AttachRefusal::SessionNotLocal, data, None));
     };
 
+    // The attach streams that terminal out: asked in the tenant of the session
+    // on it (the default scope when none is known), before anything is bound.
+    if !crate::egress::permit_or_count_session(
+        crate::egress::Flow::TerminalStream,
+        crate::egress::terminal_session_tenant(&terminal_id),
+    ) {
+        return Err(refusal_frame(AttachRefusal::EgressOff, data, None));
+    }
+
     // Bind at first use; a re-attach must land on the same terminal.
     if !grants.bind(&block.grant_jti, &terminal_id) {
         return Err(refusal_frame(
@@ -1164,6 +1194,11 @@ pub enum CreateRefusal {
     NoTargetDirectory,
     WorkingDirNotAllowed,
     IntentRepoNotAllowed,
+    /// A declared edit sibling is not on this device's `allowed_intent_repos`,
+    /// the value is not an array of repo names, or a GRANTED create declared
+    /// one at all (no grant names an edit sibling). Plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`.
+    EditSiblingNotAllowed,
     /// The device's own `accept_remote_create` dial reads `same_user`, and the
     /// grant's source user is not this device's paired user — or is not
     /// knowable at all. The LOCAL half of a three-valued dial coord also
@@ -1183,6 +1218,7 @@ impl CreateRefusal {
             CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
             CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
             CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
+            CreateRefusal::EditSiblingNotAllowed => "remote_create_edit_sibling_not_allowed",
             CreateRefusal::SourceUserNotAllowed => "remote_create_source_user_not_allowed",
         }
     }
@@ -1218,6 +1254,11 @@ impl CreateRefusal {
             CreateRefusal::IntentRepoNotAllowed => {
                 "the requested intent_repo is not one this device offers for remote creation — \
                  list it in `remote_create.allowed_intent_repos`"
+            }
+            CreateRefusal::EditSiblingNotAllowed => {
+                "edit_siblings must be an array naming only repos this device offers for remote \
+                 creation (`remote_create.allowed_intent_repos`), and a create admitted under a \
+                 grant may declare none — no grant names an edit sibling"
             }
             CreateRefusal::SourceUserNotAllowed => {
                 "this device accepts remote terminal creation only from its OWN user \
@@ -1352,6 +1393,13 @@ pub struct RelayCreate {
     /// exactly the impersonation. The local Tauri command and the loopback HTTP
     /// route, whose callers ARE the initiator, still read it.
     pub agent_session_id: Option<Uuid>,
+    /// The repos the session will EDIT beside `intent_repo` (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// Each one is REQUESTED in the allocate too (another worktree, another
+    /// coord claim), so it resolves through the SAME device-owned
+    /// `allowed_intent_repos` an `intent_repo` does — empty by default, so a
+    /// relay frame declares none unless this device offers it.
+    pub edit_siblings: Vec<String>,
 }
 
 /// Gate one inbound `terminal_create` that carries **no `remote` block**.
@@ -1404,11 +1452,85 @@ pub fn resolve_relay_create(targets: &CreateTargets, data: &Value) -> Result<Rel
         create_refusal_frame(refusal, data, Some(targets))
     })?;
 
+    let edit_siblings = resolve_create_edit_siblings(targets, data).map_err(|refusal| {
+        warn!(
+            code = refusal.code(),
+            "relay create: refused the requested edit_siblings — a frame with no grant may only \
+             name repos this device offers"
+        );
+        create_refusal_frame(refusal, data, Some(targets))
+    })?;
+
     Ok(RelayCreate {
         working_dir,
         intent_repo,
         agent_session_id: None,
+        edit_siblings,
     })
+}
+
+/// The edit siblings a relay frame declares (`edit_siblings`, or
+/// `editSiblings`), each resolved against this device's `allowed_intent_repos`
+/// exactly as [`resolve_create_intent_repo`] resolves `intent_repo` — an edit
+/// sibling is requested in the allocate, so it allocates a worktree and takes a
+/// claim just as the intent repo does. Absent, `null` or `[]` declares none. A
+/// value that is not an array of strings is refused rather than ignored.
+pub fn resolve_create_edit_siblings(
+    targets: &CreateTargets,
+    data: &Value,
+) -> Result<Vec<String>, CreateRefusal> {
+    let declared: Vec<&Value> = EDIT_SIBLING_KEYS
+        .iter()
+        .filter_map(|k| data.get(*k))
+        .filter(|v| !v.is_null())
+        .collect();
+    let items: Vec<&Value> = match declared.as_slice() {
+        [] => return Ok(Vec::new()),
+        // Both spellings at once is ambiguous; refuse rather than pick one.
+        [raw] => raw
+            .as_array()
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?
+            .iter()
+            .collect(),
+        _ => return Err(CreateRefusal::EditSiblingNotAllowed),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let requested = item
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?;
+        let offered = targets
+            .repos
+            .iter()
+            .find(|r| r.trim() == requested)
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?;
+        out.push(offered.clone());
+    }
+    Ok(out)
+}
+
+/// The two wire spellings of a frame's edit siblings.
+const EDIT_SIBLING_KEYS: [&str; 2] = ["edit_siblings", "editSiblings"];
+
+/// Whether a frame declares any edit sibling at all, under either spelling. A
+/// REMOTE (granted) create is refused when it does: the grant answers every
+/// spawn parameter, and no grant names an edit sibling.
+pub fn frame_declares_edit_siblings(data: &Value) -> bool {
+    EDIT_SIBLING_KEYS
+        .iter()
+        .filter_map(|k| data.get(*k))
+        .any(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+}
+
+/// The refusal for a frame carrying a `remote` block (a GRANTED create) that
+/// also declares edit siblings — decided BEFORE the grant gate, so the refusal
+/// spends no create grant. `None` for every other frame.
+pub fn granted_create_edit_sibling_refusal(data: &Value) -> Option<Value> {
+    let granted = data.get("remote").is_some_and(|b| !b.is_null());
+    (granted && frame_declares_edit_siblings(data))
+        .then(|| create_refusal_frame(CreateRefusal::EditSiblingNotAllowed, data, None))
 }
 
 /// Resolve a remote create's `intent_repo` against this device's allowlist.
@@ -2398,6 +2520,26 @@ impl Default for RemoteAttachClient {
     }
 }
 
+/// The SOURCE role opens no attach while the tenant's `egress_terminal_stream`
+/// switch is off: an attached pane sends keystrokes and resizes out through
+/// the relay and pulls a terminal stream through it (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Refused
+/// before any frame is queued. The terminal being attached lives on another
+/// device, so no local session — and no session tenant — exists to ask in:
+/// the attach is judged by the strictest verdict across every bound tenant.
+fn source_role_egress_check() -> Result<(), AttachError> {
+    if crate::egress::permit_or_count_session(
+        crate::egress::Flow::TerminalStream,
+        crate::egress::SessionScope::Unresolved,
+    ) {
+        return Ok(());
+    }
+    Err(AttachError {
+        code: AttachRefusal::EgressOff.code().to_string(),
+        message: AttachRefusal::EgressOff.message().to_string(),
+    })
+}
+
 impl RemoteAttachClient {
     pub fn new() -> Self {
         let (out_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
@@ -2562,6 +2704,7 @@ impl RemoteAttachClient {
         rows: u16,
         timeout: Duration,
     ) -> Result<AttachedReply, AttachError> {
+        source_role_egress_check()?;
         // No relay connection holds the outbound pump: a frame queued now is
         // discarded by the next connection's `discard_backlog`, so waiting out
         // the timeout would only end in blaming the target for a request that
@@ -2648,6 +2791,7 @@ impl RemoteAttachClient {
         intent_repo: Option<&str>,
         timeout: Duration,
     ) -> Result<CreatedReply, AttachError> {
+        source_role_egress_check()?;
         // See `attach`: an unheld pump means the frame would never be sent.
         // Registered before the check, for the reason `attach` gives.
         let request_id = Uuid::new_v4().to_string();
@@ -4378,6 +4522,20 @@ mod tests {
                         none,
                     )
                 }
+                AttachRefusal::EgressOff => {
+                    table.insert(grant("j-egress", None, NOW + 600), NOW);
+                    let _pin = crate::egress::test_support::pin(
+                        crate::egress::Flow::TerminalStream,
+                        crate::egress::Level::Off,
+                    );
+                    admit_terminal_attach(
+                        &table,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-egress"}))),
+                        NOW,
+                        resolves_to("term-A"),
+                    )
+                }
             }
             .expect_err("the scenario must refuse")
         };
@@ -6018,6 +6176,7 @@ mod grant_gate_tests {
             CreateRefusal::NoTargetDirectory,
             CreateRefusal::WorkingDirNotAllowed,
             CreateRefusal::IntentRepoNotAllowed,
+            CreateRefusal::EditSiblingNotAllowed,
         ] {
             assert!(
                 !refusal_warrants_a_coord_reread(GrantFamily::Create, final_refusal.code()),
@@ -6622,6 +6781,98 @@ mod relay_create_tests {
         .is_err());
     }
 
+    /// Plan 2026-10-10: an edit sibling is requested in the allocate (a
+    /// worktree AND a claim), so a blockless frame may declare only repos this
+    /// device offers — the same allowlist as `intent_repo`.
+    #[test]
+    fn a_blockless_relay_frame_may_declare_only_offered_edit_siblings() {
+        let ok = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "edit_siblings": ["qontinui-runner"] }),
+        )
+        .expect("an offered repo");
+        assert_eq!(ok.edit_siblings, vec!["qontinui-runner".to_string()]);
+        let camel = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "editSiblings": ["qontinui-runner"] }),
+        )
+        .expect("camelCase spelling");
+        assert_eq!(camel.edit_siblings, vec!["qontinui-runner".to_string()]);
+
+        for bad in [
+            json!(["qontinui-schemas"]),
+            json!(["../x"]),
+            json!([""]),
+            json!([3]),
+            json!("qontinui-runner"),
+        ] {
+            let err = resolve_relay_create(
+                &targets(),
+                &json!({ "type": "terminal_create", "edit_siblings": bad }),
+            )
+            .expect_err("refused");
+            assert_eq!(
+                err["code"], "remote_create_edit_sibling_not_allowed",
+                "{bad}"
+            );
+        }
+
+        let none = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "edit_siblings": null }),
+        )
+        .expect("null declares none");
+        assert!(none.edit_siblings.is_empty());
+        assert!(!frame_declares_edit_siblings(
+            &json!({ "edit_siblings": [] })
+        ));
+        assert!(!frame_declares_edit_siblings(
+            &json!({ "edit_siblings": null })
+        ));
+        assert!(!frame_declares_edit_siblings(&json!({})));
+        assert!(frame_declares_edit_siblings(
+            &json!({ "editSiblings": ["x"] })
+        ));
+        assert!(frame_declares_edit_siblings(
+            &json!({ "edit_siblings": "x" })
+        ));
+
+        // A null snake_case key does not hide a camelCase declaration, and
+        // both spellings at once is refused as ambiguous.
+        let fallback = resolve_relay_create(
+            &targets(),
+            &json!({ "edit_siblings": null, "editSiblings": ["qontinui-runner"] }),
+        )
+        .expect("the non-null spelling is read");
+        assert_eq!(fallback.edit_siblings, vec!["qontinui-runner".to_string()]);
+        assert!(resolve_relay_create(
+            &targets(),
+            &json!({ "edit_siblings": [], "editSiblings": ["qontinui-runner"] }),
+        )
+        .is_err());
+        assert!(frame_declares_edit_siblings(
+            &json!({ "edit_siblings": null, "editSiblings": ["x"] })
+        ));
+
+        // A GRANTED frame (one carrying a `remote` block) that declares edit
+        // siblings is refused before the grant gate; anything else passes.
+        let granted = json!({
+            "remote": { "grant_jti": "j1", "kind": "create" },
+            "editSiblings": ["qontinui-runner"],
+        });
+        let refusal = granted_create_edit_sibling_refusal(&granted).expect("refused");
+        assert_eq!(refusal["code"], "remote_create_edit_sibling_not_allowed");
+        assert_eq!(refusal["grant_jti"], "j1");
+        assert!(granted_create_edit_sibling_refusal(
+            &json!({ "remote": { "grant_jti": "j1" }, "edit_siblings": [] })
+        )
+        .is_none());
+        assert!(granted_create_edit_sibling_refusal(
+            &json!({ "edit_siblings": ["qontinui-runner"] })
+        )
+        .is_none());
+    }
+
     /// …and above all it may not name whose claim it takes. This is the field
     /// that made the escalation an IMPERSONATION rather than merely an
     /// over-broad spawn.
@@ -6917,5 +7168,159 @@ mod same_user_dial_tests {
                 "{label}"
             );
         }
+    }
+}
+
+/// The remote-terminal half of the egress switches.
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::pin;
+    use crate::egress::{Flow, Level};
+
+    #[test]
+    fn a_remote_frame_is_refused_while_the_switch_is_off() {
+        let table = RemoteAttachGrants::new();
+        let data = json!({"remote": {"grant_jti": "j-1"}, "terminal_id": "t"});
+        let _pin = pin(Flow::TerminalStream, Level::Off);
+        assert_eq!(
+            gate_remote_frame(&table, || AcceptRemoteAttach::Tenant, &data, Some("t"), 0)
+                .unwrap_err(),
+            AttachRefusal::EgressOff
+        );
+        // The operator-web path (no `remote` block) is not this gate's: the
+        // relay refuses those frames itself.
+        assert!(gate_remote_frame(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &json!({"terminal_id": "t"}),
+            Some("t"),
+            0
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn with_the_switch_on_the_grant_decides() {
+        let table = RemoteAttachGrants::new();
+        let data = json!({"remote": {"grant_jti": "j-1"}, "terminal_id": "t"});
+        let _pin = pin(Flow::TerminalStream, Level::On);
+        assert_eq!(
+            gate_remote_frame(&table, || AcceptRemoteAttach::Tenant, &data, Some("t"), 0)
+                .unwrap_err(),
+            AttachRefusal::GrantUnknown
+        );
+    }
+
+    /// Item 9: the target-side gate asks in the tenant of the session on the
+    /// terminal the frame names (default scope pinned ON, that tenant OFF).
+    #[test]
+    fn a_remote_frame_asks_in_the_terminal_sessions_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = Uuid::from_u128(0x7e7a_0003);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", crate::egress::SessionScope::Tenant(tenant));
+        let table = RemoteAttachGrants::new();
+        let data = json!({"remote": {"grant_jti": "j-1"}, "terminal_id": "t-tenant"});
+        assert_eq!(
+            gate_remote_frame(
+                &table,
+                || AcceptRemoteAttach::Tenant,
+                &data,
+                Some("t-tenant"),
+                0
+            )
+            .unwrap_err(),
+            AttachRefusal::EgressOff
+        );
+        // Another terminal: the default scope (on) lets the grant decide.
+        assert_eq!(
+            gate_remote_frame(
+                &table,
+                || AcceptRemoteAttach::Tenant,
+                &data,
+                Some("t-other"),
+                0
+            )
+            .unwrap_err(),
+            AttachRefusal::GrantUnknown
+        );
+    }
+
+    /// Item 9: `terminal_attach` asks in the tenant of the session on the
+    /// terminal the grant resolves to.
+    #[test]
+    fn an_attach_asks_in_the_resolved_terminals_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = Uuid::from_u128(0x7e7a_0004);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", crate::egress::SessionScope::Tenant(tenant));
+        let table = RemoteAttachGrants::new();
+        let session = Uuid::from_u128(0x5e55);
+        table.insert(
+            AttachGrant {
+                grant_jti: "j-t".into(),
+                source_device_id: "src-device".into(),
+                session_id: session,
+                terminal_id: None,
+                expires_at: 10_000,
+            },
+            0,
+        );
+        let frame = json!({
+            "type": "terminal_attach",
+            "request_id": "rq",
+            "remote": {"grant_jti": "j-t"},
+        });
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &frame,
+            1,
+            |_| Some(("t-tenant".to_string(), ())),
+        )
+        .unwrap_err();
+        assert_eq!(err["code"], AttachRefusal::EgressOff.code(), "{err}");
+    }
+
+    /// M3: the source side of an attach (no local session) and a remote frame
+    /// naming no terminal are judged by the strictest bound tenant.
+    #[tokio::test]
+    async fn unattributable_remote_attach_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = Uuid::from_u128(0x7e7a_000a);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let err = RemoteAttachClient::new()
+            .attach("grant", 80, 24, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "egress_off");
+        let table = RemoteAttachGrants::new();
+        let data = json!({"remote": {"grant_jti": "j-1"}});
+        assert_eq!(
+            gate_remote_frame(&table, || AcceptRemoteAttach::Tenant, &data, None, 0).unwrap_err(),
+            AttachRefusal::EgressOff
+        );
+    }
+
+    #[tokio::test]
+    async fn the_source_role_opens_no_attach_while_the_switch_is_off() {
+        let client = RemoteAttachClient::new();
+        let _pin = pin(Flow::TerminalStream, Level::Off);
+        let err = client
+            .attach("grant", 80, 24, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "egress_off");
+        let err = client
+            .create("grant", 80, 24, None, None, None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "egress_off");
     }
 }

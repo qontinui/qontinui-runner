@@ -61,7 +61,11 @@ pub struct AiConnectionTestResult {
 
 /// Get the current AI settings.
 ///
-/// Returns the AI settings stored in the persistent settings file.
+/// Returns the AI settings stored in the persistent settings file, flattened
+/// together with three READ-ONLY derived keys — `effective_account_selection_mode`,
+/// `account_selection_source` (`fleet` | `local` | `pinned`) and
+/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion) —
+/// see [`settings::AiSettingsView`].
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with AI settings data
@@ -74,18 +78,44 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting AI settings");
 
-    let ai_settings = settings::get_ai_settings();
+    let view = settings::AiSettingsView::current();
 
     Ok(CommandResponse {
         success: true,
         message: Some("AI settings retrieved".to_string()),
-        data: Some(serde_json::to_value(&ai_settings)?),
+        data: Some(serde_json::to_value(&view)?),
     })
+}
+
+/// The account-selection mode a Tauri `save_ai_settings` call stores. PURE.
+///
+/// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
+/// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
+/// defaulting it would silently re-point every runner on the machine. A sent
+/// value is parsed with `AccountSelectionMode::from_wire`; an unknown spelling
+/// is `AccountSelectionMode::default()` (settings.rs). Plan
+/// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 1.
+fn resolve_saved_selection_mode(
+    sent: Option<&str>,
+    stored: AccountSelectionMode,
+) -> AccountSelectionMode {
+    // A named mode is taken as given; an unknown spelling resolves to the
+    // default (`AccountSelectionMode::default()` in settings.rs).
+    match sent {
+        None => stored,
+        Some(raw) => AccountSelectionMode::from_wire(raw).unwrap_or_default(),
+    }
 }
 
 /// Save AI settings.
 ///
 /// Updates the AI settings in the persistent settings file.
+///
+/// Absent-means-keep for `account_selection_mode`, `account_selection_pinned`
+/// and the migration toggles; `config_dir` stays EXPLICIT — over Tauri IPC an
+/// absent and a `null` value both arrive as `None`, and the Settings page
+/// always sends it, so `None` clears it.
 ///
 /// # Arguments
 /// * `provider` - AI provider ("claude_cli" or "claude_api")
@@ -115,10 +145,11 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    account_selection_pinned: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, account_selection_pinned={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, account_selection_pinned, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -141,62 +172,69 @@ pub fn save_ai_settings(
     };
 
     // Get existing settings to preserve Gemini configuration when saving Claude settings
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let selection_mode = resolve_saved_selection_mode(
+            account_selection_mode.as_deref(),
+            existing_settings.claude_cli.account_selection_mode,
+        );
 
-    // Default to highest-expected-usage; only an explicit "manual" pins to a
-    // single account, and only an explicit "least_usage" opts into the older
-    // headroom-only ranking. (None / unknown resolve to HighestExpectedUsage
-    // so a multi-account runner auto-balances by default — matching the
-    // AccountSelectionMode::HighestExpectedUsage default in settings.rs.)
-    let selection_mode = match account_selection_mode.as_deref() {
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        _ => AccountSelectionMode::HighestExpectedUsage,
-    };
+        let ai_settings = AiSettings {
+            provider: ai_provider,
+            claude_cli: ClaudeCliSettings {
+                execution_mode: cli_execution_mode,
+                custom_path,
+                timeout_seconds,
+                config_dir,
+                account_selection_mode: selection_mode,
+                // `None` (an older frontend that does not send the pin) PRESERVES
+                // the configured value — it must never silently unpin a machine
+                // and hand it to the fleet policy.
+                account_selection_pinned: account_selection_pinned
+                    .unwrap_or(existing_settings.claude_cli.account_selection_pinned),
+                // `None` (older frontends) preserves whatever is configured.
+                auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
+                    existing_settings
+                        .claude_cli
+                        .auto_migrate_on_token_exhaustion,
+                ),
+                auto_continue_after_migration: auto_continue_after_migration
+                    .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+            },
+            claude_api: ClaudeApiSettings { model, max_tokens },
+            // Preserve existing Gemini settings
+            gemini_cli: existing_settings.gemini_cli,
+            gemini_api: existing_settings.gemini_api,
+            // Preserve existing pi CLI settings
+            pi_cli: existing_settings.pi_cli,
+            // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
+            // Preserve compression, retry, and routing settings
+            compression: existing_settings.compression,
+            retry: existing_settings.retry,
+            routing: existing_settings.routing,
+            interactive_sessions_enabled: interactive_sessions_enabled
+                .unwrap_or(existing_settings.interactive_sessions_enabled),
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // PRESERVE — no frontend surface sends this yet, so a save that
+            // reconstructed it from the default would silently re-enable git-op
+            // federation for anyone who had opted out, every time they touched an
+            // unrelated AI setting. Plan:
+            // `2026-07-28-git-op-federation-lost-its-kill-switch`.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        provider: ai_provider,
-        claude_cli: ClaudeCliSettings {
-            execution_mode: cli_execution_mode,
-            custom_path,
-            timeout_seconds,
-            config_dir,
-            account_selection_mode: selection_mode,
-            // `None` (older frontends) preserves whatever is configured.
-            auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
-                existing_settings
-                    .claude_cli
-                    .auto_migrate_on_token_exhaustion,
-            ),
-            auto_continue_after_migration: auto_continue_after_migration
-                .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
-        },
-        claude_api: ClaudeApiSettings { model, max_tokens },
-        // Preserve existing Gemini settings
-        gemini_cli: existing_settings.gemini_cli,
-        gemini_api: existing_settings.gemini_api,
-        // Preserve existing pi CLI settings
-        pi_cli: existing_settings.pi_cli,
-        // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
-        // Preserve compression, retry, and routing settings
-        compression: existing_settings.compression,
-        retry: existing_settings.retry,
-        routing: existing_settings.routing,
-        interactive_sessions_enabled: interactive_sessions_enabled
-            .unwrap_or(existing_settings.interactive_sessions_enabled),
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // PRESERVE — no frontend surface sends this yet, so a save that
-        // reconstructed it from the default would silently re-enable git-op
-        // federation for anyone who had opted out, every time they touched an
-        // unrelated AI setting. Plan:
-        // `2026-07-28-git-op-federation-lost-its-kill-switch`.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save AI settings: {}",
             e
@@ -257,43 +295,52 @@ pub fn save_gemini_settings(
     };
 
     // Get existing settings to preserve Claude configuration AND provider selection
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let ai_settings = AiSettings {
+            // IMPORTANT: Preserve the existing provider - don't overwrite it!
+            provider: existing_settings.provider,
+            // Preserve existing Claude settings
+            claude_cli: existing_settings.claude_cli,
+            claude_api: existing_settings.claude_api,
+            gemini_cli: GeminiCliSettings {
+                execution_mode: cli_execution_mode,
+                custom_path,
+                timeout_seconds,
+                auth_method: gemini_auth_method,
+                model: model.clone(),
+            },
+            gemini_api: GeminiApiSettings {
+                model,
+                max_output_tokens,
+                temperature,
+            },
+            // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
+            pi_cli: existing_settings.pi_cli,
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: existing_settings
+                .auto_refine_video_after_iterations,
+            // Preserve compression, retry, routing, and interactive settings
+            compression: existing_settings.compression,
+            retry: existing_settings.retry,
+            routing: existing_settings.routing,
+            interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // Preserve — see the note in `save_ai_settings`; reconstructing this
+            // from the default would silently re-enable federation on every save.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        // IMPORTANT: Preserve the existing provider - don't overwrite it!
-        provider: existing_settings.provider,
-        // Preserve existing Claude settings
-        claude_cli: existing_settings.claude_cli,
-        claude_api: existing_settings.claude_api,
-        gemini_cli: GeminiCliSettings {
-            execution_mode: cli_execution_mode,
-            custom_path,
-            timeout_seconds,
-            auth_method: gemini_auth_method,
-            model: model.clone(),
-        },
-        gemini_api: GeminiApiSettings {
-            model,
-            max_output_tokens,
-            temperature,
-        },
-        // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
-        pi_cli: existing_settings.pi_cli,
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
-        // Preserve compression, retry, routing, and interactive settings
-        compression: existing_settings.compression,
-        retry: existing_settings.retry,
-        routing: existing_settings.routing,
-        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // Preserve — see the note in `save_ai_settings`; reconstructing this
-        // from the default would silently re-enable federation on every save.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save Gemini settings: {}",
             e
@@ -407,7 +454,10 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
 
     let ai_settings = settings::get_ai_settings();
 
+    let refusal = crate::model_gateway::provider_refusal(&ai_settings.provider);
     let result = match ai_settings.provider {
+        // Review M5: refused while a model gateway is declared.
+        _ if refusal.is_some() => Err(refusal.unwrap_or_default()),
         AiProvider::ClaudeCli => test_claude_cli_connection(&ai_settings.claude_cli).await,
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
@@ -513,28 +563,39 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
 
 /// Test Claude API connection
 async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<String, String> {
-    // Get API key from keychain
-    let api_key = get_ai_api_key("claude_api")
-        .map_err(|e| {
-            String::from(AppError::ConfigError(format!(
-                "Failed to retrieve API key: {}",
-                e
-            )))
-        })?
-        .ok_or_else(|| "No API key configured. Please enter your Claude API key.".to_string())?;
+    // Vendor host + keychain key, or the declared model gateway + its
+    // api-key-helper key (`crate::model_gateway`). Resolved on a blocking
+    // thread: the helper is a subprocess.
+    let call = spawn_blocking_tracked(|| {
+        crate::model_gateway::ModelCall::resolve(|| {
+            get_ai_api_key("claude_api")
+                .map_err(|e| {
+                    String::from(AppError::ConfigError(format!(
+                        "Failed to retrieve API key: {}",
+                        e
+                    )))
+                })?
+                .ok_or_else(|| {
+                    "No API key configured. Please enter your Claude API key.".to_string()
+                })
+        })
+    })
+    .await
+    .map_err(|e| format!("credential resolution task failed: {e}"))??;
 
     info!(
-        "Testing Claude API connection with model: {}",
-        settings.model
+        "Testing Claude API connection with model: {} (route: {})",
+        settings.model,
+        call.route_label()
     );
 
     // Make a minimal API request to test the connection
     let client = reqwest::Client::new();
-    // coord-auth-exempt(not-coord): Anthropic's API. A coord bearer here would be
-    // a credential leak to a third party.
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
+    // Not a coord write: Anthropic's API or the operator's declared model
+    // gateway, built by `ModelCall` (which never attaches a coord bearer — that
+    // would be a credential leak to a third party).
+    let response = call
+        .post_async(&client, crate::model_gateway::MESSAGES_PATH)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&serde_json::json!({
@@ -932,60 +993,69 @@ pub fn save_agentic_settings(
     );
 
     // Get existing settings to preserve other configurations
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let compression_config = CompressionConfig {
+            enabled: compression_enabled,
+            threshold_tokens: compression_threshold_tokens,
+            target_tokens: compression_target_tokens,
+            keep_recent_items: compression_keep_recent_items,
+            summarize_batch_size: compression_summarize_batch_size,
+            tokens_per_char: existing_settings.compression.tokens_per_char, // Preserve advanced setting
+        };
 
-    let compression_config = CompressionConfig {
-        enabled: compression_enabled,
-        threshold_tokens: compression_threshold_tokens,
-        target_tokens: compression_target_tokens,
-        keep_recent_items: compression_keep_recent_items,
-        summarize_batch_size: compression_summarize_batch_size,
-        tokens_per_char: existing_settings.compression.tokens_per_char, // Preserve advanced setting
-    };
+        let retry_config = RetryConfig {
+            enabled: retry_enabled,
+            max_retries: retry_max_retries,
+            base_delay_ms: retry_base_delay_ms,
+            max_delay_ms: retry_max_delay_ms,
+            exponential_base: retry_exponential_base,
+            jitter: retry_jitter,
+            feedback_injection: retry_feedback_injection,
+            retryable_errors: existing_settings.retry.retryable_errors, // Preserve custom patterns
+        };
 
-    let retry_config = RetryConfig {
-        enabled: retry_enabled,
-        max_retries: retry_max_retries,
-        base_delay_ms: retry_base_delay_ms,
-        max_delay_ms: retry_max_delay_ms,
-        exponential_base: retry_exponential_base,
-        jitter: retry_jitter,
-        feedback_injection: retry_feedback_injection,
-        retryable_errors: existing_settings.retry.retryable_errors, // Preserve custom patterns
-    };
+        let routing_config = RoutingConfig {
+            enabled: routing_enabled,
+            simple_model: routing_simple_model,
+            medium_model: routing_medium_model,
+            complex_model: routing_complex_model,
+            file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
+            prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
+            complex_keywords: existing_settings.routing.complex_keywords, // Preserve
+            simple_keywords: existing_settings.routing.simple_keywords,   // Preserve
+        };
 
-    let routing_config = RoutingConfig {
-        enabled: routing_enabled,
-        simple_model: routing_simple_model,
-        medium_model: routing_medium_model,
-        complex_model: routing_complex_model,
-        file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
-        prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
-        complex_keywords: existing_settings.routing.complex_keywords,                 // Preserve
-        simple_keywords: existing_settings.routing.simple_keywords,                   // Preserve
-    };
+        let ai_settings = AiSettings {
+            provider: existing_settings.provider,
+            claude_cli: existing_settings.claude_cli,
+            claude_api: existing_settings.claude_api,
+            gemini_cli: existing_settings.gemini_cli,
+            gemini_api: existing_settings.gemini_api,
+            pi_cli: existing_settings.pi_cli,
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: existing_settings
+                .auto_refine_video_after_iterations,
+            compression: compression_config,
+            retry: retry_config,
+            routing: routing_config,
+            interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // Preserve — see the note in `save_ai_settings`; reconstructing this
+            // from the default would silently re-enable federation on every save.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        provider: existing_settings.provider,
-        claude_cli: existing_settings.claude_cli,
-        claude_api: existing_settings.claude_api,
-        gemini_cli: existing_settings.gemini_cli,
-        gemini_api: existing_settings.gemini_api,
-        pi_cli: existing_settings.pi_cli,
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
-        compression: compression_config,
-        retry: retry_config,
-        routing: routing_config,
-        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // Preserve — see the note in `save_ai_settings`; reconstructing this
-        // from the default would silently re-enable federation on every save.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save agentic settings: {}",
             e
@@ -1159,6 +1229,22 @@ static USAGE_PROBE_CACHE: Lazy<
 ///
 /// See [`crate::commands::usage_probe_cache`] for the mechanism.
 pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+    // Subscription accounts are off while a model gateway is declared, and a
+    // subscription token must not be spent or sent on their behalf
+    // (`crate::model_gateway`). Answered before the cache so no stale sample
+    // outlives the switch.
+    if crate::model_gateway::gateway_declared() {
+        let label = std::path::Path::new(&config_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| config_dir.clone());
+        return AccountUsageInfo {
+            config_dir,
+            label,
+            error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
+            ..Default::default()
+        };
+    }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
         .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
@@ -1272,12 +1358,14 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
     let client = reqwest::Client::new();
-    let request = crate::ai_provider::anthropic_auth::apply_async(
-        // coord-auth-exempt(not-coord): Anthropic's API, authenticated by the
-        // operator's own OAuth/API credential via `anthropic_auth::apply_async`.
-        client.post("https://api.anthropic.com/v1/messages"),
-        &token,
-    )
+    // Not a coord write: Anthropic's API, authenticated by the operator's own
+    // OAuth/API credential via `anthropic_auth::apply_async`.
+    // Always the vendor route: this measures a subscription account's own quota,
+    // and `probe_account_usage` never reaches here while a gateway is declared.
+    let request = crate::model_gateway::ModelCall::Vendor {
+        token: token.to_string(),
+    }
+    .post_async(&client, crate::model_gateway::MESSAGES_PATH)
     .header("anthropic-version", "2023-06-01")
     .header("content-type", "application/json")
     .json(&serde_json::json!({
@@ -1584,7 +1672,8 @@ mod usage_twin_report {
         /// stored by coord in its own `coord.prepaid_balances` table.
         prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
-        /// (`"manual"` | `"least_usage"` — see
+        /// (`"manual"` | `"least_usage"` | `"highest_expected_usage"` |
+        /// `"weighted_random"` | `"alternating_handoff"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
         /// per-account: the roster file holds one mode for the whole box.
         ///
@@ -2418,6 +2507,54 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             reset_provider_circuit,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod save_selection_mode_tests {
+    use super::*;
+
+    #[test]
+    fn absent_mode_keeps_the_stored_mode() {
+        for stored in [
+            AccountSelectionMode::Manual,
+            AccountSelectionMode::LeastUsage,
+            AccountSelectionMode::HighestExpectedUsage,
+            AccountSelectionMode::WeightedRandom,
+            AccountSelectionMode::AlternatingHandoff,
+        ] {
+            assert_eq!(resolve_saved_selection_mode(None, stored), stored);
+        }
+    }
+
+    #[test]
+    fn sent_mode_replaces_the_stored_mode() {
+        let stored = AccountSelectionMode::Manual;
+        assert_eq!(
+            resolve_saved_selection_mode(Some("least_usage"), stored),
+            AccountSelectionMode::LeastUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("highest_expected_usage"), stored),
+            AccountSelectionMode::HighestExpectedUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
+            AccountSelectionMode::Manual
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("weighted_random"), stored),
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("alternating_handoff"), stored),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        // An unknown spelling falls back to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("bogus"), stored),
+            AccountSelectionMode::default()
+        );
+    }
 }
 
 #[cfg(test)]

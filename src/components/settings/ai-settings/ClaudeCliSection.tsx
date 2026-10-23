@@ -22,9 +22,14 @@ import type {
   ClaudeConfigDirsData,
   DiscoveredDir,
 } from "./types";
-import { EXECUTION_MODE_OPTIONS } from "./types";
+import { EXECUTION_MODE_OPTIONS, SELECTION_MODE_OPTIONS } from "./types";
 import type { CliExecutionMode } from "../types";
-import { compareForAccountSelectionMode } from "../types";
+import {
+  accountSelectionModeLabel,
+  compareForAccountSelectionMode,
+  displayedAccountSelection,
+  hasDeterministicPick,
+} from "../types";
 
 interface ClaudeCliSectionProps {
   settings: AiSettings;
@@ -60,6 +65,14 @@ export function ClaudeCliSection({
   accountUsages,
   setAccountUsages,
 }: ClaudeCliSectionProps) {
+  // DESCRIPTIVE reads (which account is "best", the explainer, whether the
+  // manual radio list is live) follow the EFFECTIVE mode — the one the runner
+  // actually applies, which a fleet policy overrides on an unpinned machine.
+  // The selector buttons and the custom-dir chooser keep editing the LOCAL
+  // mode (`settings.claude_cli.account_selection_mode`).
+  const { mode: effectiveSelectionMode, fleetManaged: selectionFleetManaged } =
+    displayedAccountSelection(settings);
+
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
   const [switchingDir, setSwitchingDir] = useState<string | null>(null);
@@ -257,7 +270,7 @@ export function ClaudeCliSection({
         setAccountUsages(result.data);
         const best = result.data
           .filter((a) => !a.error)
-          .sort(compareForAccountSelectionMode(settings.claude_cli.account_selection_mode))[0];
+          .sort(compareForAccountSelectionMode(effectiveSelectionMode))[0];
         if (best) {
           onLog(
             "success",
@@ -442,7 +455,7 @@ export function ClaudeCliSection({
               closest to its cap and reads as a bug. It is phrased against the
               two figures already on each row — the usage bar and the Expected
               marker — so the operator can verify the choice on screen. */}
-          {settings.claude_cli.account_selection_mode === "least_usage" && (
+          {effectiveSelectionMode === "least_usage" && (
             <p data-testid="auto-select-rule-caption" className="text-[10px] text-muted-foreground">
               <span className="font-medium">Auto-selected</span> is not the emptiest account. Unused
               weekly capacity expires at each account&apos;s reset, so it picks the account whose
@@ -461,17 +474,17 @@ export function ClaudeCliSection({
                 const usage = accountUsages.find((a) => a.config_dir === dir);
                 const live = liveAccounts.find((a) => a.config_dir === dir);
                 const label = dir.split(/[\\/]/).filter(Boolean).pop() || dir;
-                const isManualMode = settings.claude_cli.account_selection_mode === "manual";
+                const isManualMode = effectiveSelectionMode === "manual";
                 const isSelected = isManualMode && settings.claude_cli.config_dir === dir;
                 const isLiveActive = live?.is_active ?? false;
                 const isRateLimited = live?.is_rate_limited ?? false;
                 const isBest =
-                  !isManualMode &&
+                  hasDeterministicPick(effectiveSelectionMode) &&
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
-                    .sort(compareForAccountSelectionMode(settings.claude_cli.account_selection_mode))[0]
-                    ?.config_dir === dir;
+                    .sort(compareForAccountSelectionMode(effectiveSelectionMode))[0]?.config_dir ===
+                    dir;
 
                 return (
                   <div
@@ -719,74 +732,76 @@ export function ClaudeCliSection({
 
           {claudeConfigDirs.length > 1 && (
             <div className="space-y-2 pt-2">
-              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
-                Selection Mode
-              </span>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "manual",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "manual"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Manual</div>
-                  <div className="text-[10px] text-muted-foreground">Select account above</div>
-                </button>
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "highest_expected_usage",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "highest_expected_usage"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Highest Expected Usage</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    Auto-select the under-pace account closest to its reset
-                  </div>
-                </button>
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "least_usage",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "least_usage"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Least Usage</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    Auto-select &amp; failover on rate-limit
-                  </div>
-                </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                  Selection Mode
+                </span>
+                {selectionFleetManaged && (
+                  <span
+                    data-testid="account-selection-fleet-managed"
+                    className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("blue").bg} ${getAccentColors("blue").text} font-medium`}
+                  >
+                    Managed by fleet policy: {accountSelectionModeLabel(effectiveSelectionMode)}
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {SELECTION_MODE_OPTIONS.map((option) => (
+                  <button
+                    key={option.mode}
+                    onClick={() =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        claude_cli: {
+                          ...prev.claude_cli,
+                          account_selection_mode: option.mode,
+                        },
+                      }))
+                    }
+                    className={`p-2.5 rounded-lg text-left transition-colors ${
+                      settings.claude_cli.account_selection_mode === option.mode
+                        ? "bg-primary/10 ring-1 ring-primary/30"
+                        : "bg-muted/30 hover:bg-muted/50"
+                    }`}
+                  >
+                    <div className="text-xs font-medium">{option.label}</div>
+                    <div className="text-[10px] text-muted-foreground">{option.hint}</div>
+                  </button>
+                ))}
               </div>
             </div>
           )}
+
+          {/* The pin is rendered for EVERY machine, not only multi-account ones:
+              a fleet-wide mode (manual in particular) reaches a zero- or
+              one-account machine too, and pinning is how it opts out. */}
+          <div className="space-y-2 pt-2">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.account_selection_pinned ?? false}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      account_selection_pinned: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">
+                  Pin this machine&apos;s selection mode (ignore fleet policy)
+                </span>
+                <span className="text-[10px] text-muted-foreground block">
+                  When unpinned, a fleet-wide account selection mode set by the operator overrides
+                  the mode chosen here. Applies to every runner on this machine.
+                </span>
+              </span>
+            </label>
+          </div>
 
           {claudeConfigDirs.length > 1 && (
             <div className="space-y-2 pt-2">
@@ -809,9 +824,7 @@ export function ClaudeCliSection({
                   className="mt-0.5 accent-primary"
                 />
                 <span>
-                  <span className="text-xs font-medium block">
-                    Auto-migrate exhausted sessions
-                  </span>
+                  <span className="text-xs font-medium block">Auto-migrate exhausted sessions</span>
                   <span className="text-[10px] text-muted-foreground block">
                     When a session hits its usage limit, respawn it — same conversation and model —
                     on the account picked by the same use-it-or-lose-it rule.
@@ -846,6 +859,15 @@ export function ClaudeCliSection({
 
           {settings.claude_cli.account_selection_mode === "manual" && (
             <div className="space-y-1">
+              {selectionFleetManaged && (
+                <p
+                  data-testid="manual-chooser-fleet-managed"
+                  className="text-[10px] text-muted-foreground"
+                >
+                  Managed by fleet policy: {accountSelectionModeLabel(effectiveSelectionMode)} —
+                  this machine&apos;s manual choice applies only once it is pinned.
+                </p>
+              )}
               <label
                 htmlFor="claude-cli-custom-config-dir"
                 className="text-[10px] text-muted-foreground"

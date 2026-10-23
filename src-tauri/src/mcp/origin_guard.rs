@@ -39,15 +39,21 @@
 //!      browser request into a NonBrowser one), or spawns/drives a process.
 //!      The one transitional exception is [`TRUSTED_DOOR_GRACE`] — doors the
 //!      qontinui-web dev frontend calls today. Under the default
-//!      [`RoutePolicy::EnforceDoors`] it admits ONLY the built-in
-//!      [`DEFAULT_TRUSTED_ORIGINS`] (the dev frontends it was justified for),
-//!      metered as `graceAdmitted` on `/health`. Stated plainly: until
-//!      qontinui-web #1380 deploys and the grace is removed, those default dev
-//!      origins RETAIN local command execution (hooks and their `sh -c` test,
-//!      shell-command run, backup import), arbitrary file reads and
-//!      caller-directed server-side requests through the graced doors.
-//!      Operator-added Trusted origins (env / settings) get every door
-//!      refused.
+//!      [`RoutePolicy::EnforceDoors`] it admits ONLY the two
+//!      [`GRACE_ORIGINS`] (the qontinui-web dev frontend on `:3001`, the one
+//!      caller it was justified for), metered as `graceAdmitted` on `/health`
+//!      (a total, plus `byRoute` rows and the guard's `installedAt`). Stated
+//!      plainly: those two origins RETAIN local command execution (hooks and
+//!      their `sh -c` test, shell-command run, backup import), arbitrary file
+//!      reads and caller-directed server-side requests through the graced
+//!      doors. The grace's retirement path is plan
+//!      `2026-09-17-retire-the-runner-origin-guard-dev-grace`: qontinui-web
+//!      moves those calls behind a same-origin door proxy, then the default
+//!      goes grace-off, then the grace is deleted. (qontinui-web #1380 does
+//!      NOT retire it: it strips `Origin` inside the FastAPI proxy, which the
+//!      dev frontend's direct calls never pass through.) Operator-added
+//!      Trusted origins (env / settings) and the `:9875` supervisor origins
+//!      get every door refused.
 //!    - `Trusted` is local trust for NON-door routes: [`TRUSTED_ROUTES`] holds
 //!      app features that run workflows and checks, because that is what the
 //!      web dev frontend is for. List only origins trusted like the runner.
@@ -105,7 +111,7 @@
 //! read at spawn) and the settings field [`SETTINGS_FIELD`] (re-read without a
 //! restart). `/health` reports all of it as `originGuard`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -166,6 +172,13 @@ pub const DEFAULT_TRUSTED_ORIGINS: &[&str] = &[
     "http://localhost:9875",
     "http://127.0.0.1:9875",
 ];
+
+/// The only origins [`TRUSTED_DOOR_GRACE`] admits: the qontinui-web dev
+/// frontend. A subset of [`DEFAULT_TRUSTED_ORIGINS`]; the `:9875` dev
+/// supervisor origins stay Trusted for non-door routes but get no grace — the
+/// supervisor dashboard makes no browser call to a graced door (plan
+/// `2026-09-17-retire-the-runner-origin-guard-dev-grace`, F2).
+pub const GRACE_ORIGINS: &[&str] = &["http://localhost:3001", "http://127.0.0.1:3001"];
 
 /// Routes no browser origin other than the runner's own webview may reach,
 /// whatever the route policy.
@@ -307,6 +320,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /bridges/{id}/workflow",
     "POST /vcs/pull-requests",
     "POST /agent-worktrees/reclaim",
+    // Rewrites `<agent_root>/.cargo/config.toml` and writes the edit-siblings
+    // marker under a CALLER-NAMED path (plan
+    // 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits,
+    // vet V4).
+    "POST /agent-worktrees/edit-sibling",
     "POST /ui/recover",
     "DELETE /security/audit/cleanup",
     "POST /ui-bridge/relay/dispatch",
@@ -404,13 +422,17 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
 
 /// Doors the qontinui-web dev frontend (`http://localhost:3001`) calls today,
 /// per the Phase 0 caller census. Under [`RoutePolicy::EnforceDoors`] (the
-/// default) a request whose `Origin` is EXACTLY one of the four built-in
-/// [`DEFAULT_TRUSTED_ORIGINS`] (`http://localhost:3001`,
-/// `http://127.0.0.1:3001`, `http://localhost:9875`, `http://127.0.0.1:9875`)
-/// is admitted, logged once per origin+route and counted as `graceAdmitted`
-/// on `/health`, until qontinui-web #1380 deploys and this list is removed.
-/// Operator-added Trusted origins (env or settings), every other policy and
-/// every other class are refused like any door. Every entry must be a door (tripwire) and a registered route.
+/// default) a request whose `Origin` is EXACTLY one of the two
+/// [`GRACE_ORIGINS`] (`http://localhost:3001`, `http://127.0.0.1:3001`) is
+/// admitted, logged once per origin+route per guard (its own sighting set,
+/// never capped by the shadow WARNs') and counted on `/health` as
+/// `graceAdmitted` (total and `byRoute`). Retirement path: plan
+/// `2026-09-17-retire-the-runner-origin-guard-dev-grace` — qontinui-web's
+/// same-origin door proxy, a measured window, then a grace-off default and
+/// deletion of this list. Operator-added Trusted origins (env or settings),
+/// the `:9875` supervisor origins, every other policy and every other class
+/// are refused like any door. Every entry must be a door (tripwire) and a
+/// registered route.
 pub const TRUSTED_DOOR_GRACE: &[(&str, &str)] = &[
     ("POST", "/settings/ai/api-key"),
     ("DELETE", "/settings/ai/api-key/{provider}"),
@@ -507,7 +529,6 @@ pub const FOREIGN_ROUTES: &[(&str, &str)] = &[
 pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-api-request"),
     ("POST", "/ai/generate-context"),
-    ("POST", "/ai/generate-macro"),
     ("POST", "/ai/generate-prompt"),
     ("POST", "/ai/generate-shell-command"),
     ("POST", "/ai/generate-test"),
@@ -815,8 +836,8 @@ enum Verdict {
     Admit,
     /// Admitted only because the route policy shadows this class.
     ShadowWouldRefuse,
-    /// A [`TRUSTED_DOOR_GRACE`] door admitted for a built-in default Trusted
-    /// origin under `enforce-doors`. Distinct from a shadow: this is a DOOR.
+    /// A [`TRUSTED_DOOR_GRACE`] door admitted for a [`GRACE_ORIGINS`] origin
+    /// under `enforce-doors`. Distinct from a shadow: this is a DOOR.
     GraceAdmitted,
     RefuseHost,
     /// A [`CREDENTIAL_DOORS`] route from a non-first-party browser origin.
@@ -858,6 +879,31 @@ struct Stats {
     shadow_foreign: AtomicU64,
     shadow_extension: AtomicU64,
     recent: Mutex<VecDeque<Value>>,
+    /// `graceAdmitted.byRoute`. Only a [`Verdict::GraceAdmitted`] inserts, and
+    /// its key is the canonical origin, so the map is bounded by
+    /// `GRACE_ORIGINS.len() × TRUSTED_DOOR_GRACE.len()`. An `OPTIONS`
+    /// preflight is judged by its `Access-Control-Request-Method` and counts
+    /// as an admission, so `count` is admissions, not door executions.
+    grace_by_route: Mutex<BTreeMap<GraceKey, GraceTally>>,
+    /// The grace WARN's OWN sighting set — never the shadow WARNs' shared,
+    /// 512-capped one, which Foreign shadow sightings can fill and so silence
+    /// every later grace admission. Same natural bound as `grace_by_route`.
+    grace_sighted: Mutex<HashSet<GraceKey>>,
+}
+
+/// `(canonical origin, method, route pattern)` of a grace admission.
+type GraceKey = (String, String, String);
+
+/// One `graceAdmitted.byRoute` row's tally.
+struct GraceTally {
+    count: u64,
+    first_seen_at: String,
+    last_seen_at: String,
+}
+
+/// RFC 3339 UTC, millisecond precision — the `/health` timestamp spelling.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// The guard's configuration and counters. One per router.
@@ -869,6 +915,9 @@ pub struct OriginGuard {
     env_hosts: Vec<String>,
     settings_origins: OriginsSource,
     stats: Stats,
+    /// When this guard was constructed (RFC 3339) — the start of the window
+    /// its process-local counters cover, so a zero read can be dated.
+    installed_at: String,
 }
 
 /// The process's installed guard, for `/health`.
@@ -901,6 +950,10 @@ impl OriginGuard {
                 .collect(),
             settings_origins,
             stats: Stats::default(),
+            // Captured here, not in `install`: `INSTALLED` is a process-wide
+            // `OnceLock`, and a guard built with `new` (every unit test) is
+            // never installed.
+            installed_at: now_rfc3339(),
         }
     }
 
@@ -987,8 +1040,8 @@ impl OriginGuard {
     }
 
     /// The origin class, and whether the (already-parsed) `Origin` is exactly
-    /// one of the built-in [`DEFAULT_TRUSTED_ORIGINS`] — the gate for
-    /// [`TRUSTED_DOOR_GRACE`]. Parsed once here, not again by the grace check.
+    /// one of the [`GRACE_ORIGINS`] — the gate for [`TRUSTED_DOOR_GRACE`].
+    /// Parsed once here, not again by the grace check.
     fn classify_detail(&self, headers: &HeaderMap) -> (OriginClass, bool) {
         let Some(origin) = headers.get(header::ORIGIN) else {
             let sfs = headers
@@ -1014,7 +1067,7 @@ impl OriginGuard {
             return (OriginClass::Extension, false);
         }
         if default_trusted_origins().contains(&norm) {
-            return (OriginClass::Trusted, true);
+            return (OriginClass::Trusted, grace_origins().contains(&norm));
         }
         if self.env_origins.contains(&norm) || (self.settings_origins)().contains(&norm) {
             return (OriginClass::Trusted, false);
@@ -1034,7 +1087,7 @@ impl OriginGuard {
 
     /// The whole decision for one request's head.
     fn decide(&self, parts_method: &Method, headers: &HeaderMap, route: Option<&str>) -> Decision {
-        let (class, default_trusted) = self.classify_detail(headers);
+        let (class, grace_origin) = self.classify_detail(headers);
         let method = effective_method(parts_method, headers);
         let origin = headers
             .get(header::ORIGIN)
@@ -1076,7 +1129,7 @@ impl OriginGuard {
             if class == OriginClass::Trusted
                 && self.route_policy == RoutePolicy::EnforceDoors
                 && listed(TRUSTED_DOOR_GRACE, &method, route)
-                && default_trusted
+                && grace_origin
             {
                 return mk(Verdict::GraceAdmitted);
             }
@@ -1117,6 +1170,21 @@ impl OriginGuard {
             (_, OriginClass::Extension) => s.refused_extension.fetch_add(1, Ordering::Relaxed),
             (_, _) => s.refused_foreign.fetch_add(1, Ordering::Relaxed),
         };
+        if d.verdict == Verdict::GraceAdmitted {
+            if let Ok(mut rows) = s.grace_by_route.lock() {
+                let now = now_rfc3339();
+                rows.entry(grace_key(d))
+                    .and_modify(|t| {
+                        t.count += 1;
+                        t.last_seen_at = now.clone();
+                    })
+                    .or_insert_with(|| GraceTally {
+                        count: 1,
+                        first_seen_at: now.clone(),
+                        last_seen_at: now.clone(),
+                    });
+            }
+        }
         if let Ok(mut recent) = s.recent.lock() {
             if recent.len() == RECENT_CAP {
                 recent.pop_front();
@@ -1131,16 +1199,30 @@ impl OriginGuard {
         }
     }
 
-    /// The `/health` `originGuard` block. The recent tuples name other sites
-    /// the operator's browser pointed at this runner, so they are shown only
-    /// to the webview and non-browser callers (`None` = a direct in-process
-    /// read) and withheld from every browser class — `/health` is on
-    /// [`FOREIGN_ROUTES`].
+    /// True the first time this guard sees a grace admission for this
+    /// (origin, method, route): the grace WARN's own sighting set, so the
+    /// shadow WARNs' 512-key cap can never silence it.
+    fn first_grace_sighting(&self, d: &Decision) -> bool {
+        self.stats
+            .grace_sighted
+            .lock()
+            .map(|mut seen| seen.insert(grace_key(d)))
+            .unwrap_or(false)
+    }
+
+    /// The `/health` `originGuard` block. The recent tuples and the
+    /// `graceAdmitted.byRoute` rows name sites the operator's browser pointed
+    /// at this runner, so they are shown only to the webview and non-browser
+    /// callers (`None` = a direct in-process read) and withheld from every
+    /// browser class, which sees the totals alone — `/health` is on
+    /// [`FOREIGN_ROUTES`]. `installedAt` dates the window every counter here
+    /// covers: they are per-process and restart at zero.
     pub fn health_json(&self, requester: Option<OriginClass>) -> Value {
         let s = &self.stats;
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut out = json!({
             "installed": true,
+            "installedAt": self.installed_at,
             "enabled": self.enabled,
             "routePolicy": self.route_policy.as_str(),
             "refusals": {
@@ -1156,7 +1238,7 @@ impl OriginGuard {
                 "foreign": load(&s.shadow_foreign),
                 "extension": load(&s.shadow_extension),
             },
-            // Doors admitted under TRUSTED_DOOR_GRACE (default dev origins only).
+            // Doors admitted under TRUSTED_DOOR_GRACE (GRACE_ORIGINS only).
             "graceAdmitted": {
                 "trusted": load(&s.grace_trusted),
             },
@@ -1176,6 +1258,25 @@ impl OriginGuard {
                 .map(|r| r.iter().cloned().collect())
                 .unwrap_or_default();
             out["recent"] = Value::Array(recent);
+            let by_route: Vec<Value> = s
+                .grace_by_route
+                .lock()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|((origin, method, route), t)| {
+                            json!({
+                                "origin": origin,
+                                "method": method,
+                                "route": route,
+                                "count": t.count,
+                                "firstSeenAt": t.first_seen_at,
+                                "lastSeenAt": t.last_seen_at,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out["graceAdmitted"]["byRoute"] = Value::Array(by_route);
         }
         out
     }
@@ -1250,12 +1351,12 @@ async fn origin_guard_middleware(
     guard.record(&d);
     match d.verdict {
         Verdict::Admit | Verdict::ShadowWouldRefuse | Verdict::GraceAdmitted => {
-            if d.verdict == Verdict::GraceAdmitted && first_shadow_sighting(&d) {
+            if d.verdict == Verdict::GraceAdmitted && guard.first_grace_sighting(&d) {
                 tracing::warn!(
                     origin = ?d.origin,
                     method = %d.method,
                     route = ?d.route,
-                    "origin guard (grace): ADMITTED a credential door for a default dev origin under TRUSTED_DOOR_GRACE (removed when qontinui-web #1380 deploys; logged once per origin+route; counted on /health graceAdmitted)"
+                    "origin guard (grace): ADMITTED a credential door for a qontinui-web dev origin under TRUSTED_DOOR_GRACE (transitional; retired by plan 2026-09-17-retire-the-runner-origin-guard-dev-grace; logged once per origin+route; counted on /health graceAdmitted.byRoute)"
                 );
             }
             if d.verdict == Verdict::ShadowWouldRefuse && first_shadow_sighting(&d) {
@@ -1407,6 +1508,22 @@ pub(crate) fn door_matches(entry: &str, method: &str, route: &str) -> bool {
     e.iter()
         .zip(r.iter())
         .all(|(a, b)| (is_placeholder(a) && is_placeholder(b)) || a.eq_ignore_ascii_case(b))
+}
+
+/// The `byRoute` / grace-sighting key: the CANONICAL origin (so a trailing
+/// slash or a default port cannot mint a second row), method and route.
+fn grace_key(d: &Decision) -> GraceKey {
+    let origin = d
+        .origin
+        .as_deref()
+        .and_then(NormOrigin::parse)
+        .map(|o| o.as_origin_string())
+        .unwrap_or_default();
+    (
+        origin,
+        d.method.clone(),
+        d.route.clone().unwrap_or_default(),
+    )
 }
 
 fn listed(list: &[(&str, &str)], method: &str, route: &str) -> bool {
@@ -1662,6 +1779,16 @@ fn default_trusted_origins() -> &'static [NormOrigin] {
     static DEFAULTS: OnceLock<Vec<NormOrigin>> = OnceLock::new();
     DEFAULTS.get_or_init(|| {
         DEFAULT_TRUSTED_ORIGINS
+            .iter()
+            .filter_map(|o| NormOrigin::parse(o))
+            .collect()
+    })
+}
+
+fn grace_origins() -> &'static [NormOrigin] {
+    static GRACE: OnceLock<Vec<NormOrigin>> = OnceLock::new();
+    GRACE.get_or_init(|| {
+        GRACE_ORIGINS
             .iter()
             .filter_map(|o| NormOrigin::parse(o))
             .collect()

@@ -113,6 +113,12 @@ pub async fn terminal_create(
     // that omit the argument keep working — Tauri/serde pass a missing arg as
     // `None`, which resolves to "no override", the safe answer.
     resource_override: Option<bool>,
+    // Plan 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits
+    // Phase 2 — the repos this session will EDIT beside its intent repo
+    // (`editSiblings` from the frontend). Absent on every legacy caller, which
+    // declares none. A bad or unresolvable entry is refused with an `Err`
+    // before anything is allocated.
+    edit_siblings: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
     // Spawn-time resource gate, EARLY-OUT arm (§Part D). The authority is still
     // the gate inside `TerminalSession::spawn` — every unattended seam reaches
@@ -189,12 +195,23 @@ pub async fn terminal_create(
     // it identifies the coord row, not the spawning agent. None is correct.
     // The spawn tenant rides along because this allocate runs before the
     // session exists, so no registry tenant can answer for it (P5b).
+    //
+    // The declared edit siblings are validated against the EFFECTIVE intent
+    // repo (derived from `working_dir` when none was passed) before the
+    // allocate, so a typo is an `Err` rather than the helper's fail-open
+    // fallback into the shared checkout (vet V9).
+    let edit_siblings = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+        effective_intent_repo.as_deref(),
+        edit_siblings.as_deref().unwrap_or_default(),
+    )
+    .map_err(|refusal| refusal.to_string())?;
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
         effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
         None,
         spawn_tenant_id,
+        &edit_siblings,
     )
     .await;
 
@@ -653,22 +670,21 @@ pub fn terminal_list(
 /// Returns the parsed `GridSnapshot` rather than raw scrollback bytes, so the
 /// frontend can paint the final visible state in one synchronous write.
 /// See `plans/terminal-grid-snapshot.md`.
+///
+/// `reset_flow_control` (default false) also resets the session's flow-control
+/// counters, just before the snapshot. The reconnect path sets it once its
+/// `terminal-output` listener exists: see `TerminalSession::grid_snapshot`.
 #[tauri::command]
 pub fn terminal_get_grid(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
+    reset_flow_control: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let session = terminal_manager
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    let grid_handle = session.grid();
-    let snapshot = {
-        let g = grid_handle
-            .lock()
-            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
-        g.snapshot()
-    };
+    let snapshot = session.grid_snapshot(reset_flow_control.unwrap_or(false))?;
     let value = serde_json::to_value(&snapshot).map_err(|e| {
         String::from(AppError::EncodingError(format!(
             "Failed to serialize grid snapshot: {}",
@@ -1069,14 +1085,11 @@ pub fn terminal_save_scrollback(
         });
     }
 
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 
@@ -1153,14 +1166,11 @@ pub fn terminal_get_saved_scrollback(file_path: String) -> Result<CommandRespons
 pub fn terminal_cleanup_scrollback(
     app_handle: tauri::AppHandle,
 ) -> Result<CommandResponse, String> {
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 
@@ -1608,6 +1618,47 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
     }
 }
 
+/// The PTY-holder boot sweep's status as soon as its census is in (at most
+/// `holder_boot_sweep::CENSUS_WAIT`): `data.settled`, and `data.held` — the
+/// terminal ids of live panes still being adopted (`null` when the census did
+/// not come in within the wait). The webview's restore restores every record
+/// NOT held at once, and waits for the sweep only for the held ones (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3,
+/// review round 4, M1).
+#[tauri::command]
+pub async fn terminal_holder_sweep_status() -> Result<CommandResponse, String> {
+    use crate::terminal::holder_boot_sweep::{sweep_status, CENSUS_WAIT};
+    let status = spawn_blocking_tracked(|| sweep_status(CENSUS_WAIT))
+        .await
+        .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: serde_json::to_value(status).ok(),
+    })
+}
+
+/// Wait (at most `holder_boot_sweep::RESTORE_WAIT`) for the PTY-holder boot
+/// sweep to settle — every surviving holder pane adopted into a terminal (or,
+/// failing that, ended), and every dead holder's leftovers reaped — and
+/// say whether it did (`data.settled`). The webview's restore calls this
+/// BEFORE it reads `terminal_list`, so a session a holder kept alive is
+/// reconnected, never cold-resumed a second time (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
+/// Setup itself never waits on the sweep.
+#[tauri::command]
+pub async fn terminal_holder_sweep_settled() -> Result<CommandResponse, String> {
+    use crate::terminal::holder_boot_sweep::{wait_settled, RESTORE_WAIT};
+    let settled = spawn_blocking_tracked(|| wait_settled(RESTORE_WAIT))
+        .await
+        .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "settled": settled })),
+    })
+}
+
 /// The `purpose` value the boot restore passes to [`terminal_session_list_open`].
 pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 
@@ -1949,12 +2000,10 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
 ///
-/// `target_config_dir: None` auto-picks the configured account whose spare
-/// weekly capacity is closest to expiring — among accounts under their
-/// projected pace, the one furthest through its 7-day window, since unused
-/// capacity does not roll over past the reset
-/// (`ai_provider::config::cmp_rank`) — excluding the session's current
-/// account.
+/// `target_config_dir: None` auto-picks a target with the selection mode's
+/// handoff strategy (`ai_provider::pick_migration_target`), excluding the
+/// session's current account; an explicit target is recorded as a handoff
+/// too.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -1971,6 +2020,7 @@ pub async fn terminal_migrate_session_account(
         .or_else(crate::ai_provider::get_resolved_config_dir)
         .ok_or("the session's current account is unknown — cannot migrate")?;
 
+    let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
         Some(d) => {
             if !crate::settings::get_claude_config_dirs().contains(&d) {
@@ -1985,8 +2035,16 @@ pub async fn terminal_migrate_session_account(
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
+    // A picked target is already in the handoff ledger; an explicit one is not.
+    if explicit_target {
+        crate::ai_provider::record_handoff(&dst);
+    }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
+        .inspect_err(|_| {
+            // The session never reached `dst`: it must not count as a handoff.
+            crate::ai_provider::unrecord_handoff(&dst);
+        })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
