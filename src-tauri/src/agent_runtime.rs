@@ -10470,6 +10470,12 @@ async fn report_spawn_stalled(
         config_dir_source = %body.preconditions.config_dir_source,
         trust = body.preconditions.trust.label(),
         trust_detail = ?body.preconditions.trust,
+        explicit_trust = body
+            .preconditions
+            .explicit_trust
+            .as_ref()
+            .map_or("<not a linked worktree>", |e| e.verdict.label()),
+        explicit_trust_detail = ?body.preconditions.explicit_trust,
         credential = ?body.preconditions.credential,
         "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
          the child is untouched"
