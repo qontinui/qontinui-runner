@@ -173,6 +173,7 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
           zoneLabels={labelsAndTags.zoneLabels}
           onSetZoneLabel={labelsAndTags.setZoneLabel}
           zoneCount={zoneLayout.layout.zones.length}
+          cosmeticZoneFor={zoneLayout.cosmeticZoneFor}
           onCompareZones={(z1, z2) => {
             dispatch({ type: "SET_SHOW_COMMAND_PALETTE", payload: false });
             snapshots.setDiffZones([z1, z2]);

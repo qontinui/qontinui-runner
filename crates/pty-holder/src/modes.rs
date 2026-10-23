@@ -78,6 +78,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 /// DEC private modes the postamble restores, when — and only when — the pane
 /// set or reset them. Never `?2026` (see the module docs), never a screen
 /// buffer mode (that is the preamble's). `1` is DECCKM (application cursor
@@ -120,7 +122,7 @@ pub const MAX_SCREEN_LOG: usize = 65_536;
 pub const MAX_TITLE_LOG: usize = 1024;
 
 /// Which buffer the pane is drawing on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Screen {
     #[default]
     Primary,
@@ -158,7 +160,7 @@ impl PreambleState {
 /// Values of one preamble field over stream offsets: a base (the value before
 /// the first logged change) and the changes, oldest first, each with the
 /// offset it takes effect at.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChangeLog<T> {
     base: T,
     changes: VecDeque<(u64, T)>,
@@ -212,7 +214,7 @@ impl<T> ChangeLog<T> {
 
 /// A kitty keyboard flag stack (one per screen, per the protocol). The first
 /// entry is the base the stack never pops below; `=` modifies the top.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct KittyStack {
     entries: Vec<u32>,
     /// The pane used the protocol on this screen at least once.
@@ -282,7 +284,7 @@ impl KittyStack {
 }
 
 /// The newest mode state — what the POSTAMBLE says.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Modes {
     /// Postamble DEC modes the pane touched: (set?, change sequence number).
     dec: BTreeMap<u16, (bool, u64)>,
@@ -342,6 +344,9 @@ pub struct ModeTracker {
     unterminated: usize,
     /// How often the parser was replaced for a runaway OSC.
     parser_resets: u64,
+    /// Stream offset at which the CURRENT parser started from the ground
+    /// state (0, or the last runaway-OSC reset).
+    parser_born_at: u64,
     screens: ChangeLog<Screen>,
     titles: ChangeLog<Option<Vec<u8>>>,
 }
@@ -389,6 +394,7 @@ impl ModeTracker {
             seq: 0,
             unterminated: 0,
             parser_resets: 0,
+            parser_born_at: 0,
             screens: ChangeLog::new(Screen::Primary, MAX_SCREEN_LOG),
             titles: ChangeLog::new(None, MAX_TITLE_LOG),
         }
@@ -409,6 +415,7 @@ impl ModeTracker {
                 self.parser = vte::Parser::new();
                 self.unterminated = 0;
                 self.parser_resets += 1;
+                self.parser_born_at = self.fed;
             }
         }
     }
@@ -499,7 +506,105 @@ impl ModeTracker {
     pub fn cwd(&self) -> Option<&[u8]> {
         self.modes.cwd.as_deref()
     }
+
+    /// Everything this tracker knows, for a holder upgrade (plan Phase 8,
+    /// D12a): a successor holder must answer the next attach's envelope as
+    /// this one would. The `vte` parser itself is not serializable; see
+    /// [`ModeTracker::restore`] for how its state is rebuilt.
+    pub fn snapshot(&self) -> ModeSnapshot {
+        ModeSnapshot {
+            modes: self.modes.clone(),
+            fed: self.fed,
+            seq: self.seq,
+            unterminated: self.unterminated,
+            parser_resets: self.parser_resets,
+            parser_born_at: self.parser_born_at,
+            screens: self.screens.clone(),
+            titles: self.titles.clone(),
+        }
+    }
+
+    /// Rebuild a tracker from [`ModeTracker::snapshot`] in a successor holder.
+    ///
+    /// `recent` must be the stream's newest bytes, ENDING exactly at
+    /// `snap`'s position (the ring's tail at the handoff offset). The parser's
+    /// mid-sequence state — an escape sequence, OSC string or UTF-8 character
+    /// split across the handoff — is not serializable, so it is rebuilt by
+    /// feeding the last [`PARSER_RESYNC_BYTES`] of `recent` to a fresh parser
+    /// whose performer DISCARDS everything: the recorded modes are the
+    /// snapshot's, and only the parser's position in the grammar is
+    /// re-derived. When the live parser was last (re)born inside `recent`,
+    /// the replay starts exactly there and is EXACT, runaway-OSC resets
+    /// included. Otherwise any sequence opened within that window is
+    /// reproduced exactly; one opened earlier is either an OSC (which the
+    /// tracker abandons past [`MAX_UNTERMINATED_BYTES`], smaller than the
+    /// window) or a DCS/SOS string longer than the window, whose
+    /// continuation the successor parses from the ground state.
+    pub fn restore(snap: ModeSnapshot, recent: &[u8]) -> ModeTracker {
+        let mut parser = vte::Parser::new();
+        // `recent` ends at `snap.fed`, so it starts at `fed - len`. When the
+        // live parser was born (fresh, at the ground state) inside `recent`,
+        // replaying from exactly there reproduces it byte for byte — `vte`'s
+        // state depends only on the bytes, not on how they were sliced. That
+        // includes a runaway-OSC reset the replay would otherwise not repeat
+        // (review r1 nit: a replay from before the reset stays inside the
+        // OSC). Only when its birth is older than `recent` does the window
+        // heuristic apply.
+        let recent_start = snap.fed.saturating_sub(recent.len() as u64);
+        let window_start = recent.len().saturating_sub(PARSER_RESYNC_BYTES) as u64;
+        let from = match snap.parser_born_at.checked_sub(recent_start) {
+            Some(born) => born.max(window_start),
+            None => window_start,
+        };
+        if let Some(window) = usize::try_from(from).ok().and_then(|f| recent.get(f..)) {
+            parser.advance(&mut DiscardAll, window);
+        }
+        ModeTracker {
+            parser,
+            modes: snap.modes,
+            fed: snap.fed,
+            seq: snap.seq,
+            unterminated: snap.unterminated,
+            parser_resets: snap.parser_resets,
+            parser_born_at: snap.parser_born_at,
+            screens: snap.screens,
+            titles: snap.titles,
+        }
+    }
 }
+
+/// How many of the stream's newest bytes [`ModeTracker::restore`] replays to
+/// rebuild the parser's position: twice the longest OSC the tracker keeps.
+pub const PARSER_RESYNC_BYTES: usize = 2 * MAX_UNTERMINATED_BYTES;
+
+/// A [`ModeTracker`]'s recorded state, without its parser (plan Phase 8). Opaque
+/// outside this module: it is written into a holder-upgrade snapshot and read
+/// back by [`ModeTracker::restore`], nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeSnapshot {
+    modes: Modes,
+    fed: u64,
+    seq: u64,
+    unterminated: usize,
+    parser_resets: u64,
+    #[serde(default)]
+    parser_born_at: u64,
+    screens: ChangeLog<Screen>,
+    titles: ChangeLog<Option<Vec<u8>>>,
+}
+
+impl ModeSnapshot {
+    /// The stream position the snapshot describes (the next byte to be fed).
+    pub fn fed(&self) -> u64 {
+        self.fed
+    }
+}
+
+/// A `vte` performer that records nothing: [`ModeTracker::restore`]'s parser
+/// resync.
+struct DiscardAll;
+
+impl vte::Perform for DiscardAll {}
 
 /// The `vte` performer. Postamble state changes in place; a screen or title
 /// change is also queued for its offset and STOPS the parse right after the
@@ -996,5 +1101,62 @@ mod tests {
         let parts: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
         let t = fed(format!("\x1b]2;{}\x07", parts.join(";")).as_bytes());
         assert_eq!(t.title(), Some(parts[..15].join(";").as_bytes()));
+    }
+
+    /// Phase 8 (holder upgrade): a tracker rebuilt from a snapshot in a
+    /// successor answers exactly as the original, INCLUDING a sequence split
+    /// across the handoff offset — the parser's position is re-derived from
+    /// the stream's tail, the recorded modes come from the snapshot.
+    #[test]
+    fn pty_holder_handoff_mode_snapshot_round_trips_a_split_sequence() {
+        let before: &[u8] = b"\x1b[?2004h\x1b]2;title\x07\x1b[?1049h hello \x1b[?10";
+        let after: &[u8] = b"00h more \x1b]2;t2\x07";
+        let mut original = fed(before);
+        let snap = original.snapshot();
+        assert_eq!(snap.fed(), before.len() as u64);
+        let json = serde_json::to_vec(&snap).unwrap();
+        let back: ModeSnapshot = serde_json::from_slice(&json).unwrap();
+        let mut restored = ModeTracker::restore(back, before);
+        original.feed(after);
+        restored.feed(after);
+        assert_eq!(restored.fed(), original.fed());
+        assert_eq!(restored.postamble(), original.postamble());
+        assert!(
+            contains(&restored.postamble(), b"\x1b[?1000h"),
+            "the split ?1000h was parsed"
+        );
+        assert_eq!(restored.title(), original.title());
+        for at in [0, 10, before.len() as u64, original.fed()] {
+            assert_eq!(
+                restored.preamble_state_at(at),
+                original.preamble_state_at(at)
+            );
+        }
+    }
+
+    /// Review r1 nit: a runaway OSC that made the live tracker reset its
+    /// parser BEFORE the handoff must not leave the successor's parser inside
+    /// that OSC — the next ESC would dispatch it as a title the pane never
+    /// set.
+    #[test]
+    fn pty_holder_handoff_restore_repeats_a_runaway_osc_reset() {
+        let mut before = b"\x1b]0;".to_vec();
+        before.extend(std::iter::repeat_n(
+            b'a',
+            MAX_UNTERMINATED_BYTES + FEED_SLICE,
+        ));
+        before.extend_from_slice(b"plain");
+        let original = fed(&before);
+        assert_eq!(original.parser_resets(), 1);
+        let mut restored = ModeTracker::restore(original.snapshot(), &before);
+        restored.feed(b"\x1b[?2004h");
+        let mut original = original;
+        original.feed(b"\x1b[?2004h");
+        assert!(contains(&original.postamble(), b"\x1b[?2004h"));
+        assert_eq!(restored.postamble(), original.postamble());
+        // A replay from before the reset would still be inside the OSC, and
+        // the ESC above would dispatch it as a bogus title.
+        assert_eq!(original.title(), None);
+        assert_eq!(restored.title(), original.title());
     }
 }

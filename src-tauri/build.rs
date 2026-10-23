@@ -15,6 +15,11 @@ fn main() {
     // own), i.e. a binary that compiles and then panics on startup.
     guard_tokio_console_cfg();
 
+    // `cfg(coord_egress_sibling)`: a sibling qontinui-coord checkout declares
+    // `EGRESS_DOMAINS`, so the runner's egress drift test can run (and fail)
+    // instead of being reported as an UNKNOWN-ignored test.
+    probe_coord_egress_sibling();
+
     // Pin the main-thread stack reserve HERE, not only in
     // `src-tauri/.cargo/config.toml`. Cargo reads `.cargo/config.toml` from its
     // CWD upward, so any cargo run from the repo ROOT never sees that file's
@@ -1566,15 +1571,14 @@ mod stack_reserve_tests {
 
     /// Every `/STACK:<n>` value in `text`, in order.
     fn stack_values(text: &str) -> Vec<u64> {
-        text.match_indices("/STACK:")
-            .map(|(i, m)| {
-                let digits: String = text[i + m.len()..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
+        text.split("/STACK:")
+            .skip(1)
+            .enumerate()
+            .map(|(n, rest)| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 digits
                     .parse()
-                    .unwrap_or_else(|_| panic!("`/STACK:` with no number at byte {i}"))
+                    .unwrap_or_else(|_| panic!("`/STACK:` occurrence {n} has no number"))
             })
             .collect()
     }
@@ -1615,5 +1619,34 @@ mod stack_reserve_tests {
     fn stack_values_reads_every_occurrence() {
         assert_eq!(stack_values("a /STACK:1 b /STACK:22 /Brepro"), vec![1, 22]);
         assert!(stack_values("no reserve here").is_empty());
+    }
+}
+
+/// Set `cfg(coord_egress_sibling)` when a sibling `qontinui-coord` checkout —
+/// beside this repo in the workspace, or beside it in an agent worktree —
+/// declares `EGRESS_DOMAINS` in `crates/coord/src/fleet_policy.rs` (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Without it the
+/// runner's `egress::tests::vendored_domains_match_coord` is `#[ignore]`d with
+/// an UNKNOWN reason rather than passing vacuously.
+///
+/// Only files that exist are watched (`rerun-if-changed` on a missing path
+/// would rerun this script on every build), so a sibling that appears later is
+/// noticed on the next build-script rerun.
+fn probe_coord_egress_sibling() {
+    println!("cargo::rustc-check-cfg=cfg(coord_egress_sibling)");
+    let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let rel = std::path::Path::new("qontinui-coord/crates/coord/src/fleet_policy.rs");
+    for dir in std::path::Path::new(&manifest).ancestors().skip(2).take(3) {
+        let candidate = dir.join(rel);
+        let Ok(src) = std::fs::read_to_string(&candidate) else {
+            continue;
+        };
+        println!("cargo:rerun-if-changed={}", candidate.display());
+        if src.contains("const EGRESS_DOMAINS") {
+            println!("cargo:rustc-cfg=coord_egress_sibling");
+            return;
+        }
     }
 }

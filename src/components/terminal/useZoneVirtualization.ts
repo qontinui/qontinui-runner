@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 
 /**
  * Half a viewport of overscan in every direction: a cell up to half a screen
@@ -57,6 +57,14 @@ export interface ZoneVirtualization {
 export function useZoneVirtualization(
   rootRef: RefObject<HTMLElement | null>,
   isFlowMode: boolean,
+  /**
+   * Hold the near set as it is: no observer runs and an unregistering cell
+   * keeps its place in the set. The grid freezes it while a zone is
+   * maximized — every other cell is hidden then, which an observer would read
+   * as "far away" and unmount; on unfreeze the observer re-reads every
+   * registered cell from scratch.
+   */
+  frozen = false,
 ): ZoneVirtualization {
   const [nearViewport, setNearViewport] = useState<Set<string>>(() => new Set());
 
@@ -70,6 +78,13 @@ export function useZoneVirtualization(
   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirtyRef = useRef(false);
   const firstFlushDoneRef = useRef(false);
+  // Layout-timed: an observer notification queued by the commit that froze
+  // the set (the cells it just hid) is delivered before a passive effect
+  // would run, and must already see the freeze.
+  const frozenRef = useRef(frozen);
+  useLayoutEffect(() => {
+    frozenRef.current = frozen;
+  }, [frozen]);
 
   const scheduleFlush = useCallback(() => {
     if (flushTimer.current) return;
@@ -102,7 +117,7 @@ export function useZoneVirtualization(
       tabToEl.current.delete(tabId);
       elToTab.current.delete(el);
       observerRef.current?.unobserve(el);
-      if (nearRef.current.delete(tabId)) {
+      if (!frozenRef.current && nearRef.current.delete(tabId)) {
         dirtyRef.current = true;
         scheduleFlush();
       }
@@ -127,9 +142,11 @@ export function useZoneVirtualization(
       }
       return;
     }
+    if (frozen) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
+        if (frozenRef.current) return;
         for (const entry of entries) {
           const tabId = elToTab.current.get(entry.target);
           if (!tabId) continue;
@@ -157,7 +174,7 @@ export function useZoneVirtualization(
     };
     // rootRef is a stable ref object; re-run only on flow-mode change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isFlowMode, scheduleFlush]);
+  }, [isFlowMode, frozen, scheduleFlush]);
 
   useEffect(() => {
     return () => {
