@@ -97,7 +97,12 @@ export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | 
 export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_api";
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
 export type GeminiAuthMethod = "oauth" | "api_key";
-export type AccountSelectionMode = "manual" | "least_usage" | "highest_expected_usage";
+export type AccountSelectionMode =
+  | "manual"
+  | "least_usage"
+  | "highest_expected_usage"
+  | "weighted_random"
+  | "alternating_handoff";
 /** Which input decided the effective account-selection mode (runner
  * `claude_accounts::AccountSelectionSource`): `pinned` — the local mode, pinned
  * against the fleet; `fleet` — unpinned and the fleet policy has a value;
@@ -397,7 +402,22 @@ export function compareByHighestExpectedUsage(
 export function compareForAccountSelectionMode(
   mode: AccountSelectionMode | undefined,
 ): typeof compareByUsageHeadroom {
-  return mode === "highest_expected_usage" ? compareByHighestExpectedUsage : compareByUsageHeadroom;
+  // `alternating_handoff` picks the highest-expected under-pace account at
+  // spawn time (its "account 1"), so it shares that comparator. The ordering
+  // it gives `weighted_random` is only a display order: that mode draws, so
+  // it has no single best account (see `hasDeterministicPick`).
+  return mode === "highest_expected_usage" ||
+    mode === "alternating_handoff" ||
+    mode === "weighted_random"
+    ? compareByHighestExpectedUsage
+    : compareByUsageHeadroom;
+}
+
+/** Whether a mode picks one predictable account, so the UI may mark it as the
+ * auto-selected one. `manual` names its account explicitly; `weighted_random`
+ * draws a new account on each pick. */
+export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
+  return mode !== "manual" && mode !== "weighted_random";
 }
 
 export interface ClaudeApiSettings {
@@ -497,6 +517,10 @@ export function accountSelectionModeLabel(mode: AccountSelectionMode | undefined
       return "Least Usage";
     case "highest_expected_usage":
       return "Highest Expected Usage";
+    case "weighted_random":
+      return "Weighted Random";
+    case "alternating_handoff":
+      return "Alternating Handoff";
     default:
       return "Unknown";
   }
