@@ -757,8 +757,13 @@ mod tests {
             2,
             21,
         );
-        assert!(exit_prompt_ready(&s).is_err());
-        assert!(input_prompt_ready(&s).is_err());
+        // The turn-complete predicate reads this screen IDLE, so the refusal
+        // below is the draft check's alone.
+        assert!(snapshot_looks_idle(&s.lines, s.cursor_row));
+        for why in [exit_prompt_ready(&s), input_prompt_ready(&s)] {
+            let why = why.unwrap_err();
+            assert!(why.contains("unsent text"), "{why}");
+        }
     }
 
     #[test]
@@ -776,8 +781,31 @@ mod tests {
             4,
             3,
         );
+        // Dialog text between the completed-turn line and the `❯` row means
+        // that line is not directly above the input, so the predicate already
+        // reads this busy; the refusal holds either way.
+        assert!(!snapshot_looks_idle(&s.lines, s.cursor_row));
         assert!(exit_prompt_ready(&s).is_err());
         assert!(input_prompt_ready(&s).is_err());
+
+        // The shape the predicate DOES read idle: the options directly under
+        // the completed-turn line. Refused by the numbered-choice check alone.
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                String::new(),
+                " ❯ 1. Yes".to_string(),
+                "   2. Yes, and don't ask again for rm commands in this project".to_string(),
+                "   3. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            2,
+            3,
+        );
+        assert!(snapshot_looks_idle(&s.lines, s.cursor_row));
+        for why in [exit_prompt_ready(&s), input_prompt_ready(&s)] {
+            let why = why.unwrap_err();
+            assert!(why.contains("numbered choice"), "{why}");
+        }
     }
 
     fn draft_prompt() -> ScreenText {

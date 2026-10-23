@@ -584,11 +584,8 @@ async fn supervise_one(
         }
         Action::Nudge => {
             let Some((tid, session)) = &live else { return };
-            match session.submit_prompt(
-                &playbook::nudge_prompt(&rec.def.journal_path),
-                crate::terminal::session::PtyWriteCaller::LoopingAgentNudge,
-            ) {
-                Ok(_) => {
+            match submit_nudge(session, &playbook::nudge_prompt(&rec.def.journal_path)) {
+                Ok(()) => {
                     info!(
                         agent = %rec.def.id,
                         terminal = %tid,
@@ -600,7 +597,14 @@ async fn supervise_one(
                         rt.last_cycle_started_at_ms = Some(now_ms);
                     });
                 }
-                Err(e) => warn!(
+                Err(NudgeError::InputNotReady(why)) => info!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    reason = %why,
+                    "looping_agent_supervisor: nudge held — the input area is not an empty \
+                     prompt (will retry next tick)"
+                ),
+                Err(NudgeError::Submit(e)) => warn!(
                     agent = %rec.def.id,
                     terminal = %tid,
                     error = %e,
@@ -1253,6 +1257,93 @@ pub(crate) fn status_snapshot(
         record: rec.clone(),
         tab_alive: liveness != Liveness::Dead,
         idle,
+    }
+}
+
+/// Why a nudge was not typed.
+#[derive(Debug, PartialEq, Eq)]
+enum NudgeError {
+    /// The input area is not an empty prompt: a dialog, a draft, or no prompt.
+    InputNotReady(String),
+    /// The paste itself failed.
+    Submit(String),
+}
+
+/// Type the next-cycle nudge into `session` — but only after
+/// [`crate::terminal::graceful_exit::input_prompt_ready`] passes on the
+/// screen read IMMEDIATELY before the write, the gate the session message
+/// poller's typed injection uses. The tick's idle verdict is not enough on its
+/// own: `snapshot_looks_idle` has no draft or dialog check, so a permission
+/// dialog under a completed-turn line reads idle — and the nudge's Enter
+/// would select its first choice.
+fn submit_nudge(
+    session: &crate::terminal::session::TerminalSession,
+    prompt: &str,
+) -> Result<(), NudgeError> {
+    crate::terminal::graceful_exit::input_prompt_ready(&session.grid_screen())
+        .map_err(NudgeError::InputNotReady)?;
+    session
+        .submit_prompt(
+            prompt,
+            crate::terminal::session::PtyWriteCaller::LoopingAgentNudge,
+        )
+        .map(|_| ())
+        .map_err(NudgeError::Submit)
+}
+
+/// Review M-1 of plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`:
+/// once a completed-turn line stopped reading busy, a stopped looping agent at
+/// a permission dialog read idle, and the nudge's Enter would have answered
+/// it. Screens SYNTHESIZED (Claude Code 2.1.309 shapes).
+#[cfg(test)]
+mod nudge_gate_tests {
+    use super::*;
+
+    fn pane(
+        frame: &str,
+    ) -> (
+        crate::terminal::session::TerminalSession,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = crate::terminal::session::tests::make_live_test_session(buf.clone());
+        {
+            let grid = session.grid();
+            let mut g = grid.lock().unwrap();
+            g.feed(&mut vte::Parser::new(), frame.as_bytes());
+        }
+        (session, buf)
+    }
+
+    const TURN: &str = "\u{273b} Cooked for 5m 33s \u{b7} done 8:55 PM\r\n";
+
+    #[test]
+    fn a_nudge_is_never_typed_into_a_dialog_or_a_draft() {
+        // A dialog whose options sit directly under the completed-turn line:
+        // the one dialog shape the turn-complete predicate reads idle.
+        let dialog = format!("{TURN}\r\n \u{276f} 1. Yes\r\n   2. No\x1b[3;4H");
+        let draft = format!("{TURN}\u{276f} draft text not sent");
+        for frame in [dialog, draft] {
+            let (session, buf) = pane(&frame);
+            let (lines, cursor) = session.grid_text();
+            assert!(
+                snapshot_looks_idle(&lines, cursor),
+                "the fixture must read idle to the tick, or it pins nothing: {lines:?}"
+            );
+            assert!(matches!(
+                submit_nudge(&session, "next cycle"),
+                Err(NudgeError::InputNotReady(_))
+            ));
+            assert!(buf.lock().unwrap().is_empty(), "nothing may reach the pty");
+        }
+    }
+
+    #[test]
+    fn an_empty_prompt_under_a_completed_turn_is_nudged() {
+        let (session, buf) = pane(&format!("{TURN}\u{276f} "));
+        assert_eq!(submit_nudge(&session, "next cycle"), Ok(()));
+        assert!(!buf.lock().unwrap().is_empty());
     }
 }
 

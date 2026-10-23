@@ -68,17 +68,23 @@ const CLEAR_HINT: &str = "/clear to save";
 /// The completed-turn line Claude Code leaves above the prompt when a turn
 /// ends: `✻ Cooked for 5m 33s · done 8:55 PM`. The WHOLE line must match — a
 /// spinner glyph, ONE word, ` for `, a duration of hours/minutes/seconds in
-/// that order (`5m 33s`, `2s`, `1h 2m`), optionally `· done <h:mm AM/PM>` — or
-/// the glyph keeps counting as busy. Fail closed: a wording Claude Code
-/// changes reads busy, which is the behaviour before this exemption, never a
-/// new idle.
+/// that order (`5m 33s`, `2s`, `1h 2m`, `5m`), optionally `· done <h:mm
+/// AM/PM>` — or the glyph keeps counting as busy. Fail closed: a wording
+/// Claude Code changes reads busy, which is the behaviour before this
+/// exemption, never a new idle. Where on the screen the line must sit is the
+/// predicate's job, not this pattern's (see [`snapshot_idle_verdict`]).
 ///
-/// Ports `TURN_END` from qontinui-claude-config
-/// `scripts/close-finished-sessions.py` so the two recognizers agree. This one
-/// is the stricter: it anchors both ends of the line (the script scans a byte
-/// stream, so it cannot), and it admits an hours-and-minutes duration with no
-/// seconds part (`1h 2m`). The glyph class is [`SPINNER_GLYPHS`] minus `·`,
-/// the exact set the glyph clause vetoes on.
+/// Ported from `TURN_END` in qontinui-claude-config
+/// `scripts/close-finished-sessions.py`, and NOT identical to it. Narrower:
+/// it anchors both ends of the line (the script scans a byte stream, so it
+/// cannot), it needs whitespace on both sides of `for`, and `done <time>` is
+/// accepted only as this line's suffix (the script also matches a bare
+/// `done 8:55 PM` anywhere). Wider: the duration need not end in seconds
+/// (bare `5m`, `1h`, `1h 2m` match; the script requires an `Ns` part). And
+/// the glyph class differs: it is [`SPINNER_GLYPHS`] minus `·` — the exact set
+/// the glyph clause vetoes on — which includes `∗` (U+2217, outside the
+/// script's U+2700–U+27BF dingbat range) and excludes every other dingbat in
+/// that range.
 static COMPLETED_TURN_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(concat!(
         r"(?i)^\s*[✻✶✳✽✢∗]\s*\w+\s+for\s+",
@@ -129,8 +135,12 @@ impl IdleVerdict {
 ///    ([`PROCESSING_INDICATORS`]) — except `tokens ·` on a line carrying the
 ///    `/clear to save` context hint (`CLEAR_HINT`).
 /// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted) — except
-///    on a line that is exactly a completed-turn line
-///    ([`is_completed_turn_line`]).
+///    on ONE line: the LAST glyph-bearing line on screen, when it is exactly a
+///    completed-turn line ([`is_completed_turn_line`]) and sits directly above
+///    the input area — only blank or box-edge rows between it and the next
+///    `❯` row below it (an earlier `❯` row above it is an echoed user prompt). A completed-turn-shaped line anywhere else (higher up in the
+///    transcript, or with a live spinner below it) is not the turn that just
+///    ended, and stays busy.
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
@@ -138,8 +148,11 @@ impl IdleVerdict {
 /// The two exceptions exist because a FINISHED idle pane routinely shows both
 /// shapes, and without them it read busy forever (plan
 /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`).
-/// There is NO draft or dialog check here: `terminal::graceful_exit`'s
-/// `prompt_ready_with` refuses those before anything is typed.
+/// There is NO draft or dialog check here. A caller that TYPES must also pass
+/// `terminal::graceful_exit`'s `exit_prompt_ready` / `input_prompt_ready` on
+/// the screen it is about to type into — `graceful_exit::drive`, the session
+/// message poller's typed injection and the looping-agent nudge do. A pane
+/// stopped at a dialog under a completed-turn line reads idle here.
 pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
     // (1) any processing-indicator text ⇒ busy.
     for line in lines {
@@ -154,21 +167,43 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy, unless the whole line
-    // is a completed-turn line.
-    for line in lines {
-        let glyph = line
-            .chars()
-            .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch));
-        if let Some(glyph) = glyph {
-            if !is_completed_turn_line(line) {
-                return IdleVerdict::Glyph(glyph);
-            }
+    let prompt_row = lines.iter().position(|l| l.contains(PROMPT_MARKER));
+
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy, unless the glyph line is
+    // the turn that just ended: the LAST glyph line, a completed-turn line,
+    // directly above the input area.
+    let glyph_rows: Vec<(usize, char)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| {
+            line.chars()
+                .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch))
+                .map(|glyph| (row, glyph))
+        })
+        .collect();
+    if let Some(&(last_row, _)) = glyph_rows.last() {
+        // The input row is the first `❯` row BELOW the line — not the first
+        // on screen: Claude Code echoes each earlier user prompt with `❯`,
+        // so a `❯` row above the completed-turn line is transcript.
+        let exempt = |row: usize| {
+            row == last_row
+                && is_completed_turn_line(&lines[row])
+                && lines[row + 1..]
+                    .iter()
+                    .position(|l| l.contains(PROMPT_MARKER))
+                    .is_some_and(|gap| {
+                        lines[row + 1..row + 1 + gap]
+                            .iter()
+                            .all(|l| is_spacer_row(l))
+                    })
+        };
+        if let Some(&(_, glyph)) = glyph_rows.iter().find(|(row, _)| !exempt(*row)) {
+            return IdleVerdict::Glyph(glyph);
         }
     }
 
     // (3) prompt marker visible — remember its row for (4).
-    let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
+    let Some(prompt_row) = prompt_row else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
         return IdleVerdict::NoPrompt;
     };
@@ -179,6 +214,13 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
     } else {
         IdleVerdict::CursorAbovePrompt
     }
+}
+
+/// A row that separates the completed-turn line from the input area without
+/// saying anything: blank, or the input box's border.
+fn is_spacer_row(line: &str) -> bool {
+    line.chars()
+        .all(|c| c.is_whitespace() || matches!(c, '─' | '━' | '╭' | '╮' | '╰' | '╯' | '│'))
 }
 
 /// [`snapshot_idle_verdict`] as a `bool`, for the consumers that only need
@@ -458,6 +500,70 @@ mod tests {
         }
         assert!(!is_completed_turn_line("· Cooked for 2s"));
         assert!(!is_completed_turn_line("● Cooked for 2s"));
+    }
+
+    /// Review L-2: only the turn that just ended is exempt — the LAST glyph
+    /// line, directly above the input area. A live spinner BELOW a
+    /// completed-turn line, or a completed-turn-shaped line higher up with
+    /// output under it, stays busy.
+    #[test]
+    fn only_the_last_glyph_line_directly_above_the_input_is_exempt() {
+        let mut below = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        below.insert(3, "✶ Pondering".to_string());
+        // The first non-exempt glyph line is reported: the completed-turn
+        // line itself, which is no longer the last.
+        assert_eq!(snapshot_idle_verdict(&below, 5), IdleVerdict::Glyph('✻'));
+
+        let stray = lines(&[
+            "✶ Baked for 2s",
+            "  ⎿ a tool result still streaming",
+            "● Working on the next step",
+            "",
+            &edge(),
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(snapshot_idle_verdict(&stray, 5), IdleVerdict::Glyph('✶'));
+
+        // An echoed earlier user prompt (`❯ …`) ABOVE the completed-turn line
+        // is transcript, not the input; the input row below still counts.
+        let echoed = lines(&[
+            "❯ please fix the build",
+            "● Fixed and pushed.",
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "",
+            &edge(),
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(snapshot_idle_verdict(&echoed, 5), IdleVerdict::Idle);
+
+        // Below the prompt (or with no prompt at all) is never "above the input".
+        let after = lines(&["❯\u{a0}", "✻ Cooked for 5m 33s"]);
+        assert_eq!(snapshot_idle_verdict(&after, 0), IdleVerdict::Glyph('✻'));
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["✻ Cooked for 5m 33s"]), 0),
+            IdleVerdict::Glyph('✻')
+        );
+
+        // An earlier completed turn on screen is not the one that just ended.
+        let mut two = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        two[0] = "✻ Baked for 2s".to_string();
+        assert_eq!(snapshot_idle_verdict(&two, 4), IdleVerdict::Glyph('✻'));
+    }
+
+    /// Review L-4: the `/clear` exemption covers `tokens ·` ONLY — a working
+    /// indicator on the same line still reads busy.
+    #[test]
+    fn a_clear_hint_line_that_also_says_esc_to_interrupt_is_busy() {
+        let grid = finished_frame(
+            "● Pushed.",
+            "  new task? /clear to save 399.4k tokens · esc to interrupt",
+        );
+        assert_eq!(
+            snapshot_idle_verdict(&grid, 4),
+            IdleVerdict::Indicator("esc to interrupt")
+        );
     }
 
     /// (G) CLI 2.1.309 shape, unrecognised wording — fail closed: a glyph line

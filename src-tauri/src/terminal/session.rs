@@ -5647,6 +5647,13 @@ pub(crate) mod tests {
     /// is a `CapturingWriter` and whose other fields are inert. The
     /// reader/waiter threads are NOT spawned — `submit_prompt` only
     /// touches `self.writer`, so this is enough.
+    /// [`make_test_session`], marked alive so a paste reaches its writer.
+    pub(crate) fn make_live_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
+        let session = make_test_session(buf);
+        session.is_alive.store(true, Ordering::SeqCst);
+        session
+    }
+
     pub(crate) fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);

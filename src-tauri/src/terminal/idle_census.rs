@@ -53,16 +53,46 @@ fn idle_census_replay() {
             .map_or_else(|| "idle".to_string(), GridBusyEvidence::wire);
         *counts.entry(format!("{status} {clause}")).or_default() += 1;
         if let IdleVerdict::Glyph(glyph) = verdict {
-            let line = snap
-                .lines
-                .iter()
-                .find(|l| l.contains(glyph) && !is_completed_turn_line(l))
-                .map_or("", String::as_str);
-            *shapes.entry(shape_of(line)).or_default() += 1;
+            *shapes.entry(culprit_shape(&snap.lines, glyph)).or_default() += 1;
         }
     }
     println!("idle census over {} panes: {counts:#?}", entries.len());
     println!("shapes of the lines behind glyph:* verdicts: {shapes:#?}");
+}
+
+/// The shape of what made a `glyph:*` verdict: the first glyph line that is
+/// not a completed-turn line, or — when every glyph line IS one, so the
+/// exemption's POSITION rule refused it — the last such line, the rows
+/// between it and the next `❯` row (`⏎`-joined), and how many glyph lines
+/// the screen carries.
+fn culprit_shape(lines: &[String], glyph: char) -> String {
+    if let Some(line) = lines
+        .iter()
+        .find(|l| l.contains(glyph) && !is_completed_turn_line(l))
+    {
+        return shape_of(line);
+    }
+    let glyph_rows: Vec<usize> = (0..lines.len())
+        .filter(|&r| lines[r].contains(glyph))
+        .collect();
+    let Some(&last) = glyph_rows.last() else {
+        return "<none>".to_string();
+    };
+    let gap: Vec<String> = lines[last + 1..]
+        .iter()
+        .take_while(|l| !l.contains('❯'))
+        .map(|l| shape_of(l))
+        .collect();
+    let below = if lines[last + 1..].iter().any(|l| l.contains('❯')) {
+        "❯ below"
+    } else {
+        "no ❯ below"
+    };
+    format!(
+        "{} glyph line(s), all completed turns; gap [{}]; {below}",
+        glyph_rows.len(),
+        gap.join(" ⏎ ")
+    )
 }
 
 /// A line with its letter runs replaced by `w` and its digit runs by `9`.
