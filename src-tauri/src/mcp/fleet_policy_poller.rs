@@ -467,14 +467,20 @@ fn workload_census_cache() -> &'static RwLock<Option<bool>> {
 }
 
 /// Whether the tenant allows the workload class census
-/// ([`crate::fleet::workload_census`]). `false` only when coord explicitly
-/// answered `workload_census_enabled: false`; before the first poll, after an
-/// auth/absent reset, and behind a poisoned lock the census stays on.
+/// ([`crate::fleet::workload_census`]). `false` once coord has explicitly
+/// answered `workload_census_enabled: false`, and from then on until coord
+/// answers otherwise — an auth/absent reset does not lift it (see
+/// [`next_workload_census_switch`]). A tenant that never answered, and a
+/// poisoned lock, leave the census on.
 pub(crate) fn fleet_workload_census_enabled() -> bool {
     workload_census_cache()
         .read()
         .map(|g| *g != Some(false))
         .unwrap_or(true)
+}
+
+fn workload_census_switch() -> Option<bool> {
+    workload_census_cache().read().map(|g| *g).unwrap_or(None)
 }
 
 fn set_workload_census_enabled(v: Option<bool>) {
@@ -483,9 +489,20 @@ fn set_workload_census_enabled(v: Option<bool>) {
     }
 }
 
-fn set_fleet_resource_controls(controls: FleetResourceControls) {
-    set_floors(controls.floors);
-    set_workload_census_enabled(controls.workload_census_enabled);
+/// The cached workload-census switch after one controls poll. PURE.
+///
+/// Only an ANSWER changes an opinion. A 2xx replaces it with whatever coord
+/// stated (a cleared row is "no opinion", which is on). A 401 / 404 says
+/// nothing about the tenant's choice — the device lost its credential or the
+/// route moved — so it clears a `true` (on either way) but KEEPS an explicit
+/// `false`: resetting it would start collecting on a tenant that switched the
+/// census off. Skipped / Kept leave it as it was, like every other control.
+fn next_workload_census_switch(prev: Option<bool>, outcome: &ControlsOutcome) -> Option<bool> {
+    match outcome {
+        ControlsOutcome::Updated(controls) => controls.workload_census_enabled,
+        ControlsOutcome::Reset(_) => prev.filter(|on| !*on),
+        ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => prev,
+    }
 }
 
 // ===========================================================================
@@ -2437,8 +2454,8 @@ enum ControlsOutcome {
     Updated(FleetResourceControls),
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
-    /// Coord said 401 / 404 — cache RESET to no floors and no census opinion
-    /// (fail-safe).
+    /// Coord said 401 / 404 — floors RESET to none (fail-safe); the census
+    /// switch keeps an explicit `false` ([`next_workload_census_switch`]).
     Reset(u16),
     /// Network / decode / other non-2xx error — LAST-GOOD floors kept.
     Kept(String),
@@ -2656,13 +2673,15 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         let controls_outcome = poll_controls_once().await;
 
         match &controls_outcome {
-            ControlsOutcome::Updated(controls) => set_fleet_resource_controls(*controls),
-            ControlsOutcome::Reset(_) => {
-                set_fleet_resource_controls(FleetResourceControls::default())
-            }
+            ControlsOutcome::Updated(controls) => set_floors(controls.floors),
+            ControlsOutcome::Reset(_) => set_floors(SessionFloorsByLane::default()),
             // Skipped / Kept leave the cache as-is (last-good or "no floors").
             ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => {}
         }
+        set_workload_census_enabled(next_workload_census_switch(
+            workload_census_switch(),
+            &controls_outcome,
+        ));
 
         let controls_changed = is_new_outcome(last_logged_controls.as_ref(), &controls_outcome);
         if controls_changed {
@@ -2690,7 +2709,8 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                     warn!(
                         "fleet_policy_poller: coord returned {status} for {CONTROLS_DOMAIN} \
                          (auth/absent) — clearing the cached fleet session floors (fail-safe: \
-                         no fleet term, never a zero floor)"
+                         no fleet term, never a zero floor); an explicit tenant `off` for the \
+                         workload census is kept"
                     );
                 }
                 ControlsOutcome::Kept(err) => {
@@ -3593,6 +3613,33 @@ mod tests {
             "controls":{"workload_census_enabled":"no","min_free_bytes_sessions_host":4096}}"#;
         assert_eq!(census_switch_of(odd), None);
         assert_eq!(floors_of(odd).host.warn_free_bytes, Some(4096));
+    }
+
+    /// An explicit tenant `off` survives a 401 / 404 reset; only an answer
+    /// lifts it. A tenant that never answered stays on.
+    #[test]
+    fn an_explicit_census_off_survives_a_reset() {
+        let updated = |v: Option<bool>| {
+            ControlsOutcome::Updated(FleetResourceControls {
+                floors: SessionFloorsByLane::default(),
+                workload_census_enabled: v,
+            })
+        };
+        for status in [401, 404] {
+            let reset = ControlsOutcome::Reset(status);
+            assert_eq!(next_workload_census_switch(Some(false), &reset), Some(false));
+            assert_eq!(next_workload_census_switch(Some(true), &reset), None);
+            assert_eq!(next_workload_census_switch(None, &reset), None, "never answered: on");
+        }
+        let kept = ControlsOutcome::Kept("timeout".to_string());
+        assert_eq!(next_workload_census_switch(Some(false), &kept), Some(false));
+        assert_eq!(
+            next_workload_census_switch(Some(false), &ControlsOutcome::SkippedNoJwt),
+            Some(false)
+        );
+        assert_eq!(next_workload_census_switch(Some(false), &updated(Some(true))), Some(true));
+        assert_eq!(next_workload_census_switch(Some(false), &updated(None)), None);
+        assert_eq!(next_workload_census_switch(None, &updated(Some(false))), Some(false));
     }
 
     #[test]

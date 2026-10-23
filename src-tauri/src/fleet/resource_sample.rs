@@ -449,7 +449,7 @@ pub(crate) struct ResourceSample {
     pub(crate) sock_source: Option<String>,
     /// The lane's workload class census —
     /// [`crate::fleet::workload_census`], one `{class, cpu_pct, rss_bytes,
-    /// gpu_mem_bytes, proc_count}` per non-empty class, at most
+    /// gpu_mem_bytes, proc_count, root_count}` per non-empty class, at most
     /// [`crate::fleet::workload_census::MAX_WORKLOAD_ENTRIES`].
     ///
     /// **Both lanes, and they are not summable.** The host lane's `wsl_vm`
@@ -1197,8 +1197,8 @@ pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>, Option<u64>) {
     )
 }
 
-/// Run one bounded `wsl.exe` probe, reaping the child **and its tree** on
-/// expiry.
+/// Run one `wsl.exe` probe bounded by `limit`, reaping the child **and its
+/// tree** on expiry.
 ///
 /// `tokio::time::timeout` only drops the output-future, and tokio does *not*
 /// kill on drop by default — so a bare `timeout(Command::output())` orphans a
@@ -1214,7 +1214,7 @@ pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>, Option<u64>) {
 /// `wsl.exe` (98k handles, 23% of all system handles) over ~3h — jamming the
 /// very distro it was trying to read, and outliving the fault that started it.
 #[cfg(windows)]
-async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
+async fn wsl_probe(args: &[&str], limit: Duration) -> Option<std::process::Output> {
     let mut cmd = crate::process_helpers::tokio_no_window("wsl.exe");
     cmd.args(args)
         .kill_on_drop(true)
@@ -1235,7 +1235,7 @@ async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
         job
     };
 
-    tokio::time::timeout(WSL_PROBE_TIMEOUT, child.wait_with_output())
+    tokio::time::timeout(limit, child.wait_with_output())
         .await
         .ok()?
         .ok()
@@ -1263,7 +1263,7 @@ async fn resolve_wsl_distro() -> Option<String> {
             return Some(d);
         }
     }
-    let out = wsl_probe(&["--list", "--quiet"]).await?;
+    let out = wsl_probe(&["--list", "--quiet"], WSL_PROBE_TIMEOUT).await?;
     if !out.status.success() {
         return None;
     }
@@ -1341,15 +1341,20 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     // Scoped so the `&distro` borrow ends before the name is moved below.
     // The workload census rides the same fork: its words are appended to the
     // one `cat` only while the census is on, and its output follows a marker
-    // the memory and saturation parsers never see.
+    // the memory and saturation parsers never see. Its reads are bounded in
+    // the guest, and the probe's own bound grows by exactly that budget, so a
+    // slow census is killed in the guest and published as no census — it can
+    // never time the probe out and cost the lane its memory and saturation.
     let census_on = workload_census::census_enabled();
     let out = {
         let mut args = vec!["-d", distro.as_str(), "--", "cat"];
         args.extend_from_slice(WSL_PROC_FILES);
+        let mut limit = WSL_PROBE_TIMEOUT;
         if census_on {
             args.extend_from_slice(workload_census::GUEST_PROBE_WORDS);
+            limit += workload_census::GUEST_CENSUS_BUDGET;
         }
-        wsl_probe(&args).await?
+        wsl_probe(&args, limit).await?
     };
     // procfs is plain ASCII even though `wsl --list` is UTF-16.
     let text = String::from_utf8_lossy(&out.stdout);
@@ -3153,6 +3158,7 @@ MemAvailable:   15335424 kB
             rss_bytes: 1,
             gpu_mem_bytes: None,
             proc_count: 1,
+            root_count: None,
         }]);
         let v = serde_json::to_value(&s).expect("serializes");
         assert_eq!(v["workloads"][0]["class"], "cargo_build");
@@ -3189,6 +3195,11 @@ MemAvailable:   15335424 kB
         assert!(body.contains("GUEST_PROBE_WORDS"));
         assert!(body.contains("split_guest_output("));
         assert!(body.contains("guest_workloads("));
+        assert!(
+            body.contains("GUEST_CENSUS_BUDGET"),
+            "the probe's bound must grow by the census's in-guest budget, or a slow \
+             census times out the memory and saturation readings with it"
+        );
 
         // The procfs parsers read the same lines with the census appended.
         let probe = "MemTotal: 2048 kB\nMemAvailable: 1024 kB\n192146\n0.5 0.4 0.3 2/900 77\n\
