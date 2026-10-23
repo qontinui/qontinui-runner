@@ -138,7 +138,11 @@ impl IdleVerdict {
 ///    on ONE line: the LAST glyph-bearing line on screen, when it is exactly a
 ///    completed-turn line ([`is_completed_turn_line`]) and sits directly above
 ///    the input area — only blank or box-edge rows between it and the next
-///    `❯` row below it (an earlier `❯` row above it is an echoed user prompt). A completed-turn-shaped line anywhere else (higher up in the
+///    `❯` row below it (an earlier `❯` row above it is an echoed user prompt).
+///    Fail closed by construction: a screen still showing an EARLIER turn's
+///    completed-turn line as well reads busy until that line scrolls off, and
+///    so does any row between the line and the input that is not one of the
+///    shapes [`is_turn_to_input_gap`] admits. A completed-turn-shaped line anywhere else (higher up in the
 ///    transcript, or with a live spinner below it) is not the turn that just
 ///    ended, and stays busy.
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
@@ -214,30 +218,81 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
 
 /// Do `rows` — everything between a completed-turn line and the input row
 /// below it — hold only what Claude Code puts there after a turn ends?
+/// Fail closed: any other row, or a recap block that does not close, means
+/// the glyph stays busy.
 ///
 /// Measured over 40 finished panes' grids (Claude Code 2.1.309, plan
 /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`
 /// census): blank rows; the `/clear to save …` context hint (often with an
 /// update notice); the input box's top edge, which carries the session's
 /// name (`──── my-session ─`); and, on some panes, a `※ recap: …`
-/// paragraph between the turn line and the hint. Any other row means the
-/// turn line is not the one that just ended, and the glyph stays busy.
+/// paragraph between the turn line and the hint, usually closed by a
+/// `(… /config)` hint (one census pane's was not). Inside an open recap its
+/// prose rows are admitted, but never a row that starts a transcript item;
+/// after a closed recap, only blank, hint and edge rows. Any other row means
+/// the turn line is not the one that just ended, and the glyph stays busy.
 fn is_turn_to_input_gap(rows: &[String]) -> bool {
-    let mut in_recap = false;
+    #[derive(PartialEq)]
+    enum Recap {
+        None,
+        Open,
+        Closed,
+    }
+    let mut recap = Recap::None;
     rows.iter().all(|row| {
         let trimmed = row.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_box_edge_row(trimmed) || is_context_hint_row(trimmed) {
             return true;
         }
-        if is_box_edge_row(trimmed) || is_context_hint_row(trimmed) {
-            in_recap = false;
-            return true;
+        match recap {
+            // Before any recap only a recap may start; after a CLOSED one,
+            // nothing but blank, hint and edge rows.
+            Recap::None if trimmed.starts_with('※') => {
+                recap = if closes_recap(trimmed) {
+                    Recap::Closed
+                } else {
+                    Recap::Open
+                };
+                true
+            }
+            Recap::None | Recap::Closed => false,
+            // Inside an open recap its prose is admitted — but never a row
+            // that opens a transcript item, which is what text that is not
+            // recap prose looks like on this screen.
+            Recap::Open => {
+                if starts_transcript_item(trimmed) {
+                    return false;
+                }
+                if closes_recap(trimmed) {
+                    recap = Recap::Closed;
+                }
+                true
+            }
         }
-        if trimmed.starts_with('※') {
-            in_recap = true;
-        }
-        in_recap
     })
+}
+
+/// A row that begins a transcript item rather than continuing prose: an
+/// assistant bullet, a tool-result elbow, an echoed prompt, or a spinner.
+fn starts_transcript_item(trimmed: &str) -> bool {
+    trimmed.starts_with(['●', '⎿', PROMPT_MARKER])
+        || trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c != '·' && SPINNER_GLYPHS.contains(&c))
+}
+
+/// The last row of a `※ recap` block: it ends with the parenthesised
+/// `/command` hint the block closes with — `… (disable recaps in /config)` —
+/// which on a narrow pane can wrap so that only its tail, `… /config)`, sits
+/// on this row. Matched by that shape (a `/word` closing the parenthesis), as
+/// the census measured it, not by the words inside.
+fn closes_recap(trimmed: &str) -> bool {
+    let Some(body) = trimmed.strip_suffix(')') else {
+        return false;
+    };
+    body.rsplit_once('/')
+        .is_some_and(|(_, word)| !word.is_empty() && word.chars().all(char::is_alphanumeric))
 }
 
 /// The context hint row. Recognised by its START — `new task?` and a
@@ -253,6 +308,24 @@ fn is_context_hint_row(trimmed: &str) -> bool {
 /// corner or rule.
 fn is_box_edge_row(trimmed: &str) -> bool {
     trimmed.starts_with(['─', '━', '╭', '╰'])
+}
+
+/// A fingerprint of what the screen shows, for the wind-down grace clock's
+/// per-process floor (`wind_down::ScreenQuietTracker`): every row's text and
+/// the cursor position, EXCEPT the context-hint row, whose update notice
+/// (`Auto-updating…` → `✔ Update installed`) changes on a pane nobody is
+/// using. Content, not the grid generation, so a status line redrawn
+/// unchanged leaves it alone. Only ever compared within one process.
+pub fn screen_fingerprint(lines: &[String], cursor_row: u16, cursor_col: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (row, line) in lines.iter().enumerate() {
+        if !is_context_hint_row(line.trim()) {
+            (row, line).hash(&mut hasher);
+        }
+    }
+    (cursor_row, cursor_col).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// [`snapshot_idle_verdict`] as a `bool`, for the consumers that only need
@@ -576,6 +649,47 @@ mod tests {
         let mut narrow = measured.clone();
         narrow[5] = "new task? /clear to 399.…".to_string();
         assert_eq!(snapshot_idle_verdict(&narrow, 7), IdleVerdict::Idle);
+        // A recap whose closing hint wrapped onto its own row still closes.
+        let mut wrapped = measured.clone();
+        wrapped[4] = "  (disable recaps in".to_string();
+        wrapped.insert(5, "  /config)".to_string());
+        assert_eq!(snapshot_idle_verdict(&wrapped, 8), IdleVerdict::Idle);
+        // A recap with no closing hint (one census pane) is still admitted
+        // while its rows are prose...
+        let mut unclosed = measured.clone();
+        unclosed[4] = "  and more prose with no closing hint".to_string();
+        assert_eq!(snapshot_idle_verdict(&unclosed, 7), IdleVerdict::Idle);
+        // ...but a row inside it that starts a transcript item is not.
+        let mut item_in_recap = measured.clone();
+        item_in_recap[4] = "● Next I will run the migration.".to_string();
+        assert_eq!(
+            snapshot_idle_verdict(&item_in_recap, 7),
+            IdleVerdict::Glyph('✻')
+        );
+        let mut result_in_recap = measured.clone();
+        result_in_recap[4] = "  ⎿  Ran 3 tests".to_string();
+        assert_eq!(
+            snapshot_idle_verdict(&result_in_recap, 7),
+            IdleVerdict::Glyph('✻')
+        );
+        // Arbitrary text AFTER a closed recap is not admitted either.
+        let mut after_recap = measured.clone();
+        after_recap.insert(5, "● Next I will run the migration.".to_string());
+        assert_eq!(
+            snapshot_idle_verdict(&after_recap, 8),
+            IdleVerdict::Glyph('✻')
+        );
+        // Plain prose after a CLOSED recap is not admitted either.
+        let mut prose_after = measured.clone();
+        prose_after.insert(5, "  some more words".to_string());
+        assert_eq!(
+            snapshot_idle_verdict(&prose_after, 8),
+            IdleVerdict::Glyph('✻')
+        );
+        // A live spinner directly above the hint row is busy.
+        let mut live = measured.clone();
+        live[4] = "✶ Pondering".to_string();
+        assert_eq!(snapshot_idle_verdict(&live, 7), IdleVerdict::Glyph('✻'));
         // ...but prose that is not a recap block, in the same place, is not.
         let mut prose = measured.clone();
         prose[3] = "● Next I will run the migration.".to_string();
@@ -602,10 +716,36 @@ mod tests {
             IdleVerdict::Glyph('✻')
         );
 
-        // An earlier completed turn on screen is not the one that just ended.
+        // Two completed-turn lines on screen: an earlier turn's line still
+        // visible is not the one that just ended — fail closed (busy) until it
+        // scrolls off.
         let mut two = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
         two[0] = "✻ Baked for 2s".to_string();
         assert_eq!(snapshot_idle_verdict(&two, 4), IdleVerdict::Glyph('✻'));
+    }
+
+    /// The grace floor's fingerprint moves with what an operator does at the
+    /// prompt, and NOT with the context hint's update notice.
+    #[test]
+    fn screen_fingerprint_ignores_only_the_context_hint() {
+        let base = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        let fp = |grid: &[String], col: u16| screen_fingerprint(grid, 4, col);
+        let mut hint_a = base.clone();
+        hint_a.insert(
+            3,
+            "  new task? /clear to save 399.4k tokens · Auto-updating…".into(),
+        );
+        let mut hint_b = base.clone();
+        hint_b.insert(
+            3,
+            "  new task? /clear to save 399.4k tokens · ✔ Update installed".into(),
+        );
+        assert_eq!(fp(&hint_a, 2), fp(&hint_b, 2));
+        let mut draft = base.clone();
+        draft[4] = "❯\u{a0}d".to_string();
+        assert_ne!(fp(&base, 2), fp(&draft, 3));
+        assert_ne!(fp(&base, 2), fp(&base, 3));
+        assert_eq!(fp(&base, 2), fp(&base.clone(), 2));
     }
 
     /// Review L-4: the `/clear` exemption covers `tokens ·` ONLY — a working
