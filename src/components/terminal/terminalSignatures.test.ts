@@ -16,6 +16,7 @@ import {
   LAUNCH_CREATE_PLAIN_SIGNATURE,
   predictMoveTerminal,
   predictPopOutPage,
+  predictWorkMode,
   predictZoneView,
   PTY_SPAWN_SETTLE_MS,
   type ZoneLabelInputs,
@@ -140,6 +141,24 @@ describe("zone view (maximize / restore / toggle)", () => {
       elementsDisappear: [{ id: "terminal-zone-header-*" }],
     });
     expect(predictZoneView("maximize", p({ zoneIndex: 9 }), GRID, tiled)).toEqual({});
+  });
+});
+
+describe("set-terminal-work-mode", () => {
+  it("entering tmux from a grid with headers removes them", () => {
+    expect(predictWorkMode(p({ mode: "tmux" }), GRID, "grid")).toEqual({
+      elementsDisappear: [{ id: "terminal-zone-header-*" }],
+    });
+    expect(predictWorkMode(p({}), GRID, "grid")).toEqual({
+      elementsDisappear: [{ id: "terminal-zone-header-*" }],
+    });
+  });
+
+  it("predicts nothing it cannot see: leaving tmux, a no-op request, a malformed one", () => {
+    expect(predictWorkMode(p({}), snap("terminal-input-a"), "tmux")).toEqual({});
+    expect(predictWorkMode(p({ mode: "grid" }), GRID, "grid")).toEqual({});
+    expect(predictWorkMode(p({ mode: "tmux" }), snap("terminal-input-a"), "grid")).toEqual({});
+    expect(predictWorkMode(p({ mode: "tiles" }), GRID, "grid")).toEqual({});
   });
 });
 

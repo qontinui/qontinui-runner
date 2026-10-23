@@ -66,6 +66,8 @@ import type {
   SemanticSnapshot,
 } from "@qontinui/ui-bridge";
 
+import type { TerminalWorkMode } from "./terminalWorkMode";
+import { parseWorkModeRequest, resolveWorkModeRequest } from "./terminalWorkModeControl";
 import { FLOW_GRID_ID } from "./useZoneLayout";
 
 /** Every terminal tab's UI Bridge element (`TerminalBridgeProxies`). */
@@ -388,6 +390,52 @@ export function zoneViewSignature(
   return {
     id: `terminal-page.${actionId}`,
     predicts: (params, pre) => predictZoneView(kind, params, pre, facts),
+    scope: { elementIds: [ZONE_HEADER_GLOB] },
+    reversibility: "reversible",
+    provenance: "declared",
+  };
+}
+
+export const GET_TERMINAL_WORK_MODE_SIGNATURE = readSignature(
+  "terminal-page.get-terminal-work-mode",
+);
+
+/**
+ * Pure core of `set-terminal-work-mode`'s prediction, with the mode the page
+ * is in injected.
+ *
+ * tmux renders ONE cell filling the page — not multi-zone, so `ZoneGrid`
+ * renders no `ZoneLabel` header — and every terminal stays mounted in both
+ * modes, so the `terminal-input-*` elements do not change. Entering tmux from
+ * a grid that renders headers therefore removes them. Leaving tmux brings back
+ * the headers the tiled grid renders, which tmux does not render and so cannot
+ * be counted from here: nothing is predicted, and the returning headers report
+ * as `Surprise` — the honest report. A request naming the current mode, or a
+ * malformed one (the handler throws before any effect), changes nothing.
+ */
+export function predictWorkMode(
+  params: ActionParams,
+  pre: SemanticSnapshot,
+  current: TerminalWorkMode,
+): PredictedDelta {
+  const parsed = parseWorkModeRequest(params.params?.mode);
+  if (!parsed.ok) return {};
+  if (current === "tmux" || resolveWorkModeRequest(parsed.request, current) !== "tmux") return {};
+  return preHasPrefix(pre, ZONE_HEADER_PREFIX)
+    ? { elementsDisappear: [{ id: ZONE_HEADER_GLOB }] }
+    : {};
+}
+
+/**
+ * `set-terminal-work-mode` — grid ⇄ tmux. The mode is read when `predict`
+ * runs, not from a render, for the same reason the handler reads it from a
+ * ref. The Session Manager sidebar the request may open is outside the scope.
+ * The inverse request restores the grid the operator left.
+ */
+export function workModeSignature(currentMode: () => TerminalWorkMode): EffectSignature {
+  return {
+    id: "terminal-page.set-terminal-work-mode",
+    predicts: (params, pre) => predictWorkMode(params, pre, currentMode()),
     scope: { elementIds: [ZONE_HEADER_GLOB] },
     reversibility: "reversible",
     provenance: "declared",
