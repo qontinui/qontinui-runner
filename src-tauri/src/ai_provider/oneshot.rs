@@ -942,9 +942,15 @@ impl OneshotLlm for OneshotDisabled {
 /// per LLM round-trip.
 pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
     let provider = settings::get_ai_settings().provider;
+    // Review M5: a provider that cannot route through a declared model gateway
+    // is disabled rather than run around it.
+    if let Some(reason) = crate::model_gateway::provider_refusal(&provider) {
+        warn!("oneshot_for_settings: {reason}");
+        return Box::new(OneshotDisabled::new());
+    }
     match provider {
         AiProvider::ClaudeApi => {
-            if super::claude_api_warm::resolve_warm_credential().is_some() {
+            if super::claude_api_warm::warm_path_available() {
                 debug!("oneshot_for_settings: ClaudeApi → OneshotClaudeApiWarm (warm credential resolved)");
                 Box::new(OneshotClaudeApiWarm::new())
             } else {
@@ -955,7 +961,7 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
             }
         }
         AiProvider::ClaudeCli => {
-            if super::claude_api_warm::resolve_warm_credential().is_some() {
+            if super::claude_api_warm::warm_path_available() {
                 debug!("oneshot_for_settings: ClaudeCli → OneshotClaudeApiWarm");
                 Box::new(OneshotClaudeApiWarm::new())
             } else {

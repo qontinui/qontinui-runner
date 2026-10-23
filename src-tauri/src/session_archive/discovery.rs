@@ -178,7 +178,7 @@ pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome
 /// rather than abort a backfill.
 pub fn roster_config_dirs() -> Vec<String> {
     let Some(path) =
-        dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("claude-accounts.json"))
+        crate::instance_env::runner_config_base().map(|d| d.join("claude-accounts.json"))
     else {
         return Vec::new();
     };
