@@ -38,6 +38,34 @@ pub mod routes;
 
 use std::sync::Arc;
 
+/// Run `f` with every `tracing` event (TRACE and up) captured on this
+/// thread, and return what was logged (tests only): proves what a log line
+/// does — and does not — carry.
+#[cfg(test)]
+pub(crate) fn capture_logs<F: FnOnce()>(f: F) -> String {
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Capture(Arc::default());
+    let sink = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 pub use dispatch::DispatchContext;
 pub use manager::WrapperManager;
 pub use registry::WrapperRegistry;
