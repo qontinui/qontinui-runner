@@ -8276,7 +8276,11 @@ mod tests {",
     /// satisfy or trip it. Whitespace is squeezed out so a rustfmt rewrap does
     /// not hide a call. Besides `host_capabilities()` itself, the body must not
     /// call the two blocking probes it wraps, `slow_host_probes()` and the
-    /// image probe's `capability_tokens()`, inline either.
+    /// image probe's `capability_tokens()`, inline either. A name counts as a
+    /// call only where it is not the tail of a longer identifier
+    /// ([`calls_fn`]), so the heartbeat's own `skill_capability_tokens(...)`
+    /// is not mistaken for the image probe, while `imagegen_probe::capability_tokens(`
+    /// and a bare `capability_tokens(` after a `use` both are caught.
     #[test]
     fn heartbeat_runs_the_host_probes_on_the_blocking_pool() {
         let src = include_str!("fleet.rs");
@@ -8296,16 +8300,42 @@ mod tests {",
             body.contains("spawn_blocking_tracked(host_capabilities)"),
             "heartbeat_to_coord must run host_capabilities via spawn_blocking_tracked"
         );
-        for inline in [
-            "host_capabilities()",
-            "capability_tokens()",
-            "slow_host_probes()",
-        ] {
+        for inline in ["host_capabilities", "capability_tokens", "slow_host_probes"] {
             assert!(
-                !body.contains(inline),
-                "heartbeat_to_coord must not call {inline} inline on its async worker"
+                !calls_fn(&body, inline),
+                "heartbeat_to_coord must not call {inline}(..) inline on its async worker"
             );
         }
+        // The matcher itself: a path-qualified or bare call counts; a longer
+        // identifier ending in the name does not.
+        assert!(calls_fn(
+            "x=imagegen_probe::capability_tokens();",
+            "capability_tokens"
+        ));
+        assert!(calls_fn(
+            "x.extend(capability_tokens());",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "x.extend(skill_capability_tokens(a,b));",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "spawn_blocking_tracked(host_capabilities)",
+            "host_capabilities"
+        ));
+    }
+
+    /// True when `src` contains `name(` where `name` is a whole identifier, not
+    /// the tail of a longer one (`skill_capability_tokens(` does not call
+    /// `capability_tokens`). A `::` path prefix still counts as a call.
+    fn calls_fn(src: &str, name: &str) -> bool {
+        let needle = format!("{name}(");
+        src.match_indices(&needle).any(|(at, _)| {
+            src.get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
     }
 
     /// PATH resolution must not hallucinate. A name that cannot exist
