@@ -65,6 +65,8 @@ use crate::terminal::migration_identity::{
 };
 use crate::terminal::session_carry::{copy_transcript, CarriedSubagent};
 
+mod followup;
+
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
 /// chain means every account is exhausted and migrating is pure churn.
@@ -366,17 +368,13 @@ impl ReadyDebounce {
     }
 }
 
-/// Watch the freshly-respawned terminal until the resumed CLI paints its idle
-/// prompt, then submit [`CONTINUE_NUDGE`]. Detached and strictly best-effort:
-/// bounded (~3 min), one submission max, and it stands down when the session
-/// is already busy or the terminal goes away. Deliberately does NOT stand
-/// down on a visible usage-limit message: a `--resume` repaint can re-render
-/// the OLD account's historical banner (see the `usage_limit` module doc),
-/// and a genuinely-dry target is caught by the grid scanner firing a fresh
-/// migration hint on this terminal anyway.
-fn spawn_continue_nudge(terminal_id: String, subagents: &[CarriedSubagent]) {
-    spawn_prompt_when_idle(terminal_id, continue_nudge(subagents), "continue-nudge");
-}
+// The continue nudge ([`continue_nudge`]) is delivered by the migration's
+// detached follow-up ([`followup`]) through [`prompt_when_idle`]: bounded
+// (~3 min), one submission max, standing down when the session is already
+// busy or the terminal goes away. Deliberately NOT standing down on a visible
+// usage-limit message: a `--resume` repaint can re-render the OLD account's
+// historical banner (see the `usage_limit` module doc). When it gives up, the
+// follow-up decides between one `Esc` + retry and a reported stall (Phase 2b).
 
 /// How many carried subagents [`continue_nudge`] names before summarising the
 /// rest as a count — a fan-out measured at 45 on one session.
@@ -429,78 +427,154 @@ fn continue_nudge(subagents: &[CarriedSubagent]) -> String {
     )
 }
 
-/// The generalized idle-watcher behind [`spawn_continue_nudge`]: wait for the
-/// resumed CLI to paint its idle prompt, then submit `prompt` once.
+/// How one [`prompt_when_idle`] run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdlePromptOutcome {
+    /// The prompt was typed and submitted.
+    Submitted,
+    /// The session was already mid-turn ([`IdleWait::stand_down_on_busy`]):
+    /// it picked itself up, nothing was typed.
+    AlreadyBusy,
+    /// The terminal (or the app) went away.
+    TerminalGone,
+    /// The PTY write failed.
+    SubmitFailed(String),
+    /// The deadline passed with no submission; `last_refusal` is why the last
+    /// read was not ready.
+    GaveUp { last_refusal: String },
+}
+
+/// How long, and how patiently, [`prompt_when_idle`] waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleWait {
+    pub deadline: std::time::Duration,
+    /// `true`: a mid-turn read ends the wait (the session picked itself up,
+    /// so a nudge is moot). `false`: wait THROUGH the turn for the next idle
+    /// prompt — for a message that must arrive regardless (the Phase 2b
+    /// transcript-tail catch-up).
+    pub stand_down_on_busy: bool,
+}
+
+impl IdleWait {
+    /// The continue nudge and coord's respawn `initial_prompt`: ~3 min,
+    /// standing down on a busy session.
+    pub(crate) const NUDGE: Self = Self {
+        deadline: std::time::Duration::from_secs(180),
+        stand_down_on_busy: true,
+    };
+}
+
+/// What one grid read tells the watcher loop to do.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleStep {
+    Submit,
+    StandDown,
+    /// Read again; carries why this read was not ready.
+    Wait(String),
+}
+
+/// Pure: one rendered screen through [`probe_idle_prompt`] and the
+/// [`ReadyDebounce`], under `wait`'s busy policy.
+fn idle_step(
+    screen: crate::terminal::graceful_exit::ScreenText,
+    debounce: &mut ReadyDebounce,
+    wait: IdleWait,
+) -> IdleStep {
+    match probe_idle_prompt(&screen) {
+        IdlePromptProbe::Busy if wait.stand_down_on_busy => IdleStep::StandDown,
+        IdlePromptProbe::Busy => {
+            debounce.reset();
+            IdleStep::Wait("the session is mid-turn".to_string())
+        }
+        IdlePromptProbe::NotYet(why) => {
+            debounce.reset();
+            IdleStep::Wait(why)
+        }
+        IdlePromptProbe::Ready if !debounce.settled(screen) => IdleStep::Wait(
+            "idle prompt seen once; waiting for an identical second read".to_string(),
+        ),
+        IdlePromptProbe::Ready => IdleStep::Submit,
+    }
+}
+
+/// The generalized idle-watcher: wait for the resumed CLI to paint its idle
+/// prompt, then submit `prompt` once, and say how it ended.
 ///
-/// Extracted so the respawn receiver
-/// ([`crate::session::respawn`]) can deliver coord's optional
-/// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
-/// instead of growing a second one that would drift from it. `label` only
-/// names the caller in the log lines.
-pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+/// One watcher for every caller — the migration's continue nudge and
+/// transcript-tail catch-up ([`followup`]) and the respawn receiver's coord
+/// `initial_prompt` ([`spawn_prompt_when_idle`]) — so they never drift.
+/// `label` only names the caller in the log lines.
+pub(crate) async fn prompt_when_idle(
+    terminal_id: &str,
+    prompt: &str,
+    label: &'static str,
+    wait: IdleWait,
+) -> IdlePromptOutcome {
     use tauri::Manager;
-    tauri::async_runtime::spawn(async move {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-        let mut debounce = ReadyDebounce::default();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let Some(app) = crate::tauri_app_handle::current() else {
-                return;
-            };
-            let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
-            else {
-                return;
-            };
-            let Some(session) = tm.get(&terminal_id) else {
+    let deadline = std::time::Instant::now() + wait.deadline;
+    let mut debounce = ReadyDebounce::default();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let Some(app) = crate::tauri_app_handle::current() else {
+            return IdlePromptOutcome::TerminalGone;
+        };
+        let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>() else {
+            return IdlePromptOutcome::TerminalGone;
+        };
+        let Some(session) = tm.get(terminal_id) else {
+            info!(
+                terminal_id,
+                label, "prompt-when-idle: terminal gone — standing down"
+            );
+            return IdlePromptOutcome::TerminalGone;
+        };
+        let refusal = match idle_step(session.grid_screen(), &mut debounce, wait) {
+            IdleStep::StandDown => {
                 info!(
                     terminal_id,
-                    label, "prompt-when-idle: terminal gone — standing down"
+                    label, "prompt-when-idle: session already working — no prompt needed"
                 );
-                return;
-            };
-            let screen = session.grid_screen();
-            let refusal = match probe_idle_prompt(&screen) {
-                IdlePromptProbe::Busy => {
-                    info!(
-                        terminal_id,
-                        label, "prompt-when-idle: session already working — no prompt needed"
-                    );
-                    return;
-                }
-                IdlePromptProbe::NotYet(why) => {
-                    debounce.reset();
-                    why
-                }
-                IdlePromptProbe::Ready if !debounce.settled(screen) => {
-                    "idle prompt seen once; waiting for an identical second read".to_string()
-                }
-                IdlePromptProbe::Ready => {
-                    // Composes both sides of the 2026-08-29 rebase: OUR generalized
-                    // `prompt`/`label` seam (one impl for the migration nudge and the
-                    // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-                    // returning `()` in fee48d4c, which now reports the neutralized body.
-                    match session.submit_prompt(
-                        &prompt,
-                        crate::terminal::session::PtyWriteCaller::AccountMigration,
-                    ) {
-                        Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                        Err(e) => {
-                            warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
-                        }
-                    }
-                    return;
-                }
-            };
-            if std::time::Instant::now() >= deadline {
-                warn!(
-                    terminal_id,
-                    label,
-                    last_refusal = %refusal,
-                    "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
-                );
-                return;
+                return IdlePromptOutcome::AlreadyBusy;
             }
+            IdleStep::Wait(why) => why,
+            IdleStep::Submit => {
+                // `submit_prompt` reports the neutralized body (fee48d4c).
+                return match session.submit_prompt(
+                    prompt,
+                    crate::terminal::session::PtyWriteCaller::AccountMigration,
+                ) {
+                    Ok(_) => {
+                        info!(terminal_id, label, "prompt-when-idle submitted");
+                        IdlePromptOutcome::Submitted
+                    }
+                    Err(e) => {
+                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed");
+                        IdlePromptOutcome::SubmitFailed(e)
+                    }
+                };
+            }
+        };
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                terminal_id,
+                label,
+                wait_s = wait.deadline.as_secs(),
+                last_refusal = %refusal,
+                "prompt-when-idle: resumed CLI never painted its idle prompt within the wait — giving up"
+            );
+            return IdlePromptOutcome::GaveUp {
+                last_refusal: refusal,
+            };
         }
+    }
+}
+
+/// [`prompt_when_idle`] detached, with the [`IdleWait::NUDGE`] policy — the
+/// respawn receiver ([`crate::session::respawn`]) delivers coord's optional
+/// `initial_prompt` through it.
+pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        prompt_when_idle(&terminal_id, &prompt, label, IdleWait::NUDGE).await;
     });
 }
 
@@ -1134,30 +1208,37 @@ pub fn migrate_session(
         );
     }
 
-    // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
-    // and its exit — detached, because `close` does not wait for the `claude`
-    // and this fn is synchronous. It waits (bounded) until `old_writer` is
-    // gone from the whole process table and never touches `<sid>.jsonl` or a
-    // file the resumed process has written. Runs after a failed close too:
-    // the pane was already gone, and the wait still decides.
-    crate::terminal::session_carry::spawn_delta_sync_after_exit(
-        old_writer,
-        src_config_dir.to_string(),
-        dst_config_dir.to_string(),
-        working_dir.clone(),
-        record.claude_session_id.clone(),
-        carried.clone(),
+    // The usage-limit watcher must not read the new pane's replayed banner as
+    // news until the pane has produced a turn (Phase 2b).
+    crate::terminal::migration_handoff::note_respawned_pane(
+        &new_terminal_id,
+        std::time::Instant::now(),
     );
 
-    // 5. Optionally nudge the resumed session to pick the task back up once
-    // the CLI paints its idle prompt — a bare `--resume` restores context but
-    // then sits at the input box with nobody typing.
-    if crate::settings::get_ai_settings()
+    // 4b + 5. The detached follow-up ([`followup`]): once `old_writer` is gone
+    // from the whole process table (bounded), top `<sid>/` up with whatever
+    // the old pane wrote between the carry and its exit and rescue the main
+    // transcript's tail beside it — never touching either `<sid>.jsonl` or a
+    // file the resumed process has written. Meanwhile nudge the resumed
+    // session to pick the task back up once the CLI paints its idle prompt (a
+    // bare `--resume` restores context but then sits at the input box with
+    // nobody typing), recovering or reporting a nudge that gives up. Last,
+    // deliver the tail's catch-up. Runs after a failed close too: the pane was
+    // already gone, and the wait still decides.
+    let nudge = crate::settings::get_ai_settings()
         .claude_cli
         .auto_continue_after_migration
-    {
-        spawn_continue_nudge(new_terminal_id.clone(), &carried.subagents);
-    }
+        .then(|| continue_nudge(&carried.subagents));
+    followup::spawn_post_migration(followup::PostMigration {
+        old_writer,
+        src_config_dir: src_config_dir.to_string(),
+        dst_config_dir: dst_config_dir.to_string(),
+        working_dir: working_dir.clone(),
+        claude_session_id: record.claude_session_id.clone(),
+        new_terminal_id: new_terminal_id.clone(),
+        carried: carried.clone(),
+        nudge,
+    });
 
     let outcome = MigrationOutcome {
         new_terminal_id: new_terminal_id.clone(),
@@ -1569,5 +1650,74 @@ mod tests {
         assert!(!text.contains(&format!("a{:02}", NUDGE_MAX_LISTED_SUBAGENTS)));
         assert!(text.ends_with(", and 3 more under this session's subagents/ folder."));
         assert!(text.contains(&format!("\"{}…\"", "x".repeat(NUDGE_MAX_DESCRIPTION_CHARS))));
+    }
+
+    // ---- Phase 2b: the watcher's busy policy -------------------------------
+
+    fn busy_screen() -> crate::terminal::graceful_exit::ScreenText {
+        let rule = "─".repeat(75);
+        v2_screen(
+            &["✻ Compiling… (esc to interrupt)", &rule, "❯\u{a0}", &rule],
+            2,
+            2,
+        )
+    }
+
+    /// Mutation check: dropping the `stand_down_on_busy` guard makes the
+    /// catch-up stand down on a busy pane (the second assert fails).
+    #[test]
+    fn the_nudge_stands_down_on_a_busy_pane_but_the_catch_up_waits_through_it() {
+        let mut debounce = ReadyDebounce::default();
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, IdleWait::NUDGE),
+            IdleStep::StandDown
+        );
+        let through = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, through),
+            IdleStep::Wait("the session is mid-turn".to_string())
+        );
+    }
+
+    /// The debounce still governs submission: a busy read between two ready
+    /// reads restarts it.
+    #[test]
+    fn a_busy_read_restarts_the_ready_debounce() {
+        let rule = "─".repeat(75);
+        let ready = v2_screen(
+            &[
+                "● Done.",
+                &rule,
+                "❯\u{a0}",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            2,
+            2,
+        );
+        let wait = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        let mut debounce = ReadyDebounce::default();
+        assert!(matches!(
+            idle_step(ready.clone(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(matches!(
+            idle_step(busy_screen(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(
+            matches!(
+                idle_step(ready.clone(), &mut debounce, wait),
+                IdleStep::Wait(_)
+            ),
+            "the busy read reset the debounce"
+        );
+        assert_eq!(idle_step(ready, &mut debounce, wait), IdleStep::Submit);
     }
 }

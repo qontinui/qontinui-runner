@@ -17,10 +17,11 @@
 //!   exited, for files the old pane wrote between the carry and its close. It
 //!   never touches `<sid>.jsonl` and never overwrites a file the resumed
 //!   process has written since the carry.
-//! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
+//! - [`sync_after_writer_exit`] is the post-close driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
-//!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
-//!   writer may be live.
+//!   runs [`delta_sync`] and the tail rescue ([`tail::rescue_tail`], Phase 2b).
+//!   On timeout it skips; it never reads or copies while the old writer may be
+//!   live.
 //!
 //! Plans `2026-10-12-account-migration-leaves-subagent-transcripts-behind`
 //! (the carry) and
@@ -36,6 +37,8 @@ use tracing::{info, warn};
 
 use crate::terminal::graceful_exit::ProcIdentity;
 
+pub(crate) mod tail;
+
 #[cfg(test)]
 mod tests;
 
@@ -44,6 +47,12 @@ mod tests;
 pub(crate) struct TranscriptCopy {
     /// The session transcript (`<sid>.jsonl`) under the destination account.
     pub path: PathBuf,
+    /// How far into the SOURCE `<sid>.jsonl` the destination is known to
+    /// reach: the bytes this carry wrote, or the source's size when the
+    /// destination already held at least that much. Everything the old writer
+    /// appends past it after the carry is the tail
+    /// [`tail::rescue_tail`] rescues (Phase 2b).
+    pub transcript_offset: u64,
     /// The session's sibling directory (`<sid>/`), carried best-effort.
     pub session_dir: SessionDirCarry,
     /// Every regular file under `<sid>/` the carry looked at, with the source's
@@ -140,7 +149,7 @@ const SESSION_DIR_MAX_DEPTH: usize = 8;
 /// Suffix of the temporary file a copy writes before renaming it into place.
 const PARTIAL_SUFFIX: &str = ".partial";
 
-/// How long the detached [`spawn_delta_sync_after_exit`] waits for the old
+/// How long [`sync_after_writer_exit`] waits for the old
 /// pane's `claude` to leave the process table before it gives up.
 pub(crate) const DELTA_SYNC_EXIT_WAIT: Duration = Duration::from_secs(30);
 
@@ -211,6 +220,7 @@ pub(crate) fn copy_transcript(
     let source_is_newer = dst_len.is_none_or(|len| src_meta.len() >= len);
     // Already migrated (retry / repeated hint).
     let already_present = dst_len.is_some_and(|len| len >= src_meta.len());
+    let mut transcript_offset = src_meta.len();
     if !already_present {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
@@ -218,6 +228,12 @@ pub(crate) fn copy_transcript(
         }
         copy_via_partial(&src, &dst)
             .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+        // The old writer may have appended between the stat above and the
+        // copy: the copied length, not the stat, is where the tail starts.
+        // Nothing else writes `dst` yet — the respawn comes after the carry.
+        if let Ok(meta) = std::fs::metadata(&dst) {
+            transcript_offset = meta.len();
+        }
     }
     let (session_dir, files) = carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
     let subagents = carried_subagents(
@@ -258,6 +274,7 @@ pub(crate) fn copy_transcript(
     }
     Ok(TranscriptCopy {
         path: dst,
+        transcript_offset,
         session_dir,
         files,
         subagents,
@@ -738,28 +755,29 @@ where
     }
 }
 
-/// What the detached delta sync ended with.
+/// What the detached post-exit step ended with. `T` is what the step returns
+/// once the writer is gone ([`DeltaSync`] alone, or with the tail rescue).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DeltaSyncOutcome {
+pub(crate) enum DeltaSyncOutcome<T = DeltaSync> {
     /// The old writer was not proven gone within the deadline; nothing copied.
     WriterNotGone,
-    Synced(DeltaSync),
+    Synced(T),
     Failed(String),
 }
 
 /// Wait for the old writer to exit, then run `sync`. Never runs `sync` while
 /// the writer may be live.
-pub(crate) async fn run_delta_sync_after_exit<P, F, S, SF>(
+pub(crate) async fn run_delta_sync_after_exit<P, F, S, SF, T>(
     probe: P,
     deadline: Duration,
     poll: Duration,
     sync: S,
-) -> DeltaSyncOutcome
+) -> DeltaSyncOutcome<T>
 where
     P: FnMut() -> F,
     F: Future<Output = WriterProbe>,
     S: FnOnce() -> SF,
-    SF: Future<Output = Result<DeltaSync, String>>,
+    SF: Future<Output = Result<T, String>>,
 {
     if !wait_for_writer_exit(probe, deadline, poll).await {
         return DeltaSyncOutcome::WriterNotGone;
@@ -770,72 +788,109 @@ where
     }
 }
 
-/// Detached, best-effort: once the old pane's `claude` (`writer`, captured
-/// BEFORE the pane was closed — `TerminalManager::close` does not wait for it)
-/// is gone from the whole process table, re-copy the `<sid>/` files it wrote
-/// between the carry and its exit. Bounded by [`DELTA_SYNC_EXIT_WAIT`]; on
-/// timeout, or with no writer identity to watch, it logs and skips. A failure
-/// is logged and never reaches the migration.
-pub(crate) fn spawn_delta_sync_after_exit(
+/// Best-effort, awaited by the account migration's detached follow-up task
+/// (`account_migration::followup`): once the old pane's `claude` (`writer`,
+/// captured BEFORE the pane was closed — `TerminalManager::close` does not
+/// wait for it) is gone from the whole process table, re-copy the `<sid>/`
+/// files it wrote between the carry and its exit, then rescue the main
+/// transcript's tail ([`tail::rescue_tail`]). Bounded by
+/// [`DELTA_SYNC_EXIT_WAIT`]; on timeout, or with no writer identity to watch,
+/// it logs and skips both — neither ever reads while the writer may be live.
+/// A failure is logged and never reaches the migration.
+///
+/// Returns the tail rescue's verdict, `None` when it did not run (or failed).
+pub(crate) async fn sync_after_writer_exit(
     writer: Option<ProcIdentity>,
     src_config_dir: String,
     dst_config_dir: String,
     working_dir: String,
     claude_session_id: String,
     since: TranscriptCopy,
-) {
+) -> Option<tail::TailRescue> {
     let Some(writer) = writer else {
         info!(
             session = %claude_session_id,
-            "session delta sync: skipped — the old pane's claude was not resolved before the close, so its exit cannot be proven"
+            "session delta sync + tail rescue: skipped — the old pane's claude was not resolved before the close, so its exit cannot be proven"
         );
-        return;
+        return None;
     };
-    tauri::async_runtime::spawn(async move {
-        let sid = claude_session_id.clone();
-        let outcome = run_delta_sync_after_exit(
-            || probe_writer(writer),
-            DELTA_SYNC_EXIT_WAIT,
-            crate::terminal::graceful_exit::POLL_INTERVAL,
-            // Small (side-car files written in a ~seconds window) but still
-            // disk I/O: keep it off the async workers.
-            move || async move {
-                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                    delta_sync(
-                        &src_config_dir,
-                        &dst_config_dir,
-                        &working_dir,
-                        &claude_session_id,
-                        &since,
-                    )
-                })
-                .await
-                .map_err(|e| format!("delta sync task did not complete: {e}"))?
-            },
-        )
-        .await;
-        match outcome {
-            DeltaSyncOutcome::Synced(done) if done == DeltaSync::default() => {}
-            DeltaSyncOutcome::Synced(done) => info!(
-                session = %sid,
-                copied = done.copied,
-                unchanged = done.unchanged,
-                refused_destination_changed = done.refused_destination_changed,
-                skipped_other = done.skipped_other,
-                failed = done.failed,
-                "session delta sync: topped up the destination's <sid>/ after the old writer exited"
-            ),
-            DeltaSyncOutcome::WriterNotGone => warn!(
+    let sid = claude_session_id.clone();
+    let outcome = run_delta_sync_after_exit(
+        || probe_writer(writer),
+        DELTA_SYNC_EXIT_WAIT,
+        crate::terminal::graceful_exit::POLL_INTERVAL,
+        // Small (side-car files written in a ~seconds window) but still
+        // disk I/O: keep it off the async workers.
+        move || async move {
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                let delta = delta_sync(
+                    &src_config_dir,
+                    &dst_config_dir,
+                    &working_dir,
+                    &claude_session_id,
+                    &since,
+                );
+                let tail = tail::rescue_tail(
+                    &src_config_dir,
+                    &dst_config_dir,
+                    &working_dir,
+                    &claude_session_id,
+                    &since,
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                Ok::<_, String>((delta, tail))
+            })
+            .await
+            .map_err(|e| format!("delta sync task did not complete: {e}"))?
+        },
+    )
+    .await;
+    let (delta, tail) = match outcome {
+        DeltaSyncOutcome::Synced(both) => both,
+        DeltaSyncOutcome::WriterNotGone => {
+            warn!(
                 session = %sid,
                 pid = writer.pid,
                 wait_s = DELTA_SYNC_EXIT_WAIT.as_secs(),
-                "session delta sync: skipped — the old pane's claude was still in the process table at the deadline"
-            ),
-            DeltaSyncOutcome::Failed(e) => warn!(
+                "session delta sync + tail rescue: skipped — the old pane's claude was still in the process table at the deadline"
+            );
+            return None;
+        }
+        DeltaSyncOutcome::Failed(e) => {
+            warn!(
                 session = %sid,
                 error = %e,
-                "session delta sync: failed (the migration itself is unaffected)"
-            ),
+                "session delta sync + tail rescue: failed (the migration itself is unaffected)"
+            );
+            return None;
         }
-    });
+    };
+    match delta {
+        Ok(done) if done == DeltaSync::default() => {}
+        Ok(done) => info!(
+            session = %sid,
+            copied = done.copied,
+            unchanged = done.unchanged,
+            refused_destination_changed = done.refused_destination_changed,
+            skipped_other = done.skipped_other,
+            failed = done.failed,
+            "session delta sync: topped up the destination's <sid>/ after the old writer exited"
+        ),
+        Err(e) => warn!(
+            session = %sid,
+            error = %e,
+            "session delta sync: failed (the migration itself is unaffected)"
+        ),
+    }
+    match tail {
+        Ok(rescue) => Some(rescue),
+        Err(e) => {
+            warn!(
+                session = %sid,
+                error = %e,
+                "session tail rescue: failed (the migration itself is unaffected)"
+            );
+            None
+        }
+    }
 }

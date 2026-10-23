@@ -256,7 +256,21 @@ pub fn run_duplicate_hosts_pass(
 /// `mcp_api::post_coord_mcp_drift_finding` / `coord_outside_observer::post_finding`.
 /// One attempt, 10 s, warn-and-continue.
 async fn post_duplicate_finding(d: DuplicateHost, holders: String) {
-    let body = finding_body(&d, &holders);
+    post_session_finding(finding_body(&d, &holders), &d.session_id, "duplicate hosts").await;
+}
+
+/// The ONE door this module and the account migration's stall report
+/// (`terminal::account_migration::followup`, plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+/// Phase 2b) post a session-keyed coord finding through: `POST
+/// <coord>/coord/agent-findings` under the device credential the coord-mcp
+/// door resolves. One attempt, 10 s, warn-and-continue — never retried, never
+/// surfaced to the caller. `who` prefixes the log lines.
+pub(crate) async fn post_session_finding(
+    body: serde_json::Value,
+    claude_session_id: &str,
+    who: &'static str,
+) {
     let door = qontinui_runner_lib::coord_doctor::resolve_coord_mcp_door();
     let scope = {
         use crate::auth::TenantScope;
@@ -273,7 +287,7 @@ async fn post_duplicate_finding(d: DuplicateHost, holders: String) {
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "duplicate hosts: reqwest client build failed; finding not posted");
+            tracing::warn!(error = %e, "{who}: reqwest client build failed; finding not posted");
             return;
         }
     };
@@ -283,18 +297,18 @@ async fn post_duplicate_finding(d: DuplicateHost, holders: String) {
         .await
     {
         Ok(resp) if resp.status().is_success() => tracing::info!(
-            claude_session = %d.session_id,
-            "duplicate hosts: finding posted to coord"
+            claude_session = %claude_session_id,
+            "{who}: finding posted to coord"
         ),
         Ok(resp) => tracing::warn!(
             status = %resp.status(),
-            claude_session = %d.session_id,
-            "duplicate hosts: coord refused the finding; not retried"
+            claude_session = %claude_session_id,
+            "{who}: coord refused the finding; not retried"
         ),
         Err(e) => tracing::warn!(
             error = %e,
-            claude_session = %d.session_id,
-            "duplicate hosts: posting the finding failed; not retried"
+            claude_session = %claude_session_id,
+            "{who}: posting the finding failed; not retried"
         ),
     }
 }
