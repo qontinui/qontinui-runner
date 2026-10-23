@@ -486,6 +486,12 @@ export function useTerminalPages() {
   useEffect(() => {
     allPagesRef.current = allPages;
   }, [allPages]);
+  // Page ids the operator closed this session. `reconcile` skips them: the
+  // backend can still report a just-closed page (a PTY not yet dead, or its
+  // restore record not yet marked closed), and without this guard the
+  // reconcile that `terminal-exit` triggers re-mints the tab as "Page N".
+  // Cleared for an id when it is explicitly reopened (`addPage`/`openPage`).
+  const closedPageIdsRef = useRef<Set<string>>(new Set());
   const [activePageId, setActivePageIdState] = useState<string>(() =>
     isPinned ? pinnedPageId! : instanceStorage.getItem(ACTIVE_PAGE_KEY) || "default",
   );
@@ -553,6 +559,7 @@ export function useTerminalPages() {
   const addPage = useCallback(
     (name: string) => {
       const id = crypto.randomUUID();
+      closedPageIdsRef.current.delete(id);
       const newPage: TerminalPageConfig = { id, name, createdAt: Date.now() };
       setPages((prev) => {
         const updated = [...prev, newPage];
@@ -566,6 +573,13 @@ export function useTerminalPages() {
   );
 
   const removePage = useCallback(async (id: string) => {
+    // Mark closed BEFORE any await so a reconcile fired by the first
+    // `terminal-exit` cannot resurrect the page.
+    // Never for "default" (the internal API-terminal home, not a closable tab)
+    // or the last remaining page (which `setPages` below refuses to remove).
+    if (id !== "default" && allPagesRef.current.length > 1) {
+      closedPageIdsRef.current.add(id);
+    }
     // Close all PTYs belonging to this page
     try {
       const result = await invoke<{
@@ -724,6 +738,7 @@ export function useTerminalPages() {
   const openPage = useCallback(
     (id: string, name: string) => {
       if (!id) return;
+      closedPageIdsRef.current.delete(id);
       setPages((prev) => {
         if (prev.some((p) => p.id === id)) return prev; // already present — just activate below
         const updated = [...prev, { id, name, createdAt: Date.now() }];
@@ -765,8 +780,17 @@ export function useTerminalPages() {
     // memo sees a new reference and recomputes.
     setOccupiedPageIds(new Set(ids));
 
+    // Drop pages the operator closed from the TAB reconcile only (occupancy
+    // above stays unfiltered). A closed id the backend no longer lists has
+    // finished dying: forget it, so a later terminal on that id gets a tab.
+    const reconcileIds = new Set(ids);
+    for (const closed of [...closedPageIdsRef.current]) {
+      if (!ids.has(closed)) closedPageIdsRef.current.delete(closed);
+      else reconcileIds.delete(closed);
+    }
+
     setPages((prev) => {
-      const next = reconcilePages(prev, ids);
+      const next = reconcilePages(prev, reconcileIds);
       if (next === prev) return prev; // nothing missing — no persist / no re-render
       savePages(next);
       return next;
