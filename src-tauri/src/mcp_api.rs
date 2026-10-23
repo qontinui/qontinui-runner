@@ -17658,6 +17658,46 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen`
+    /// Phase 3: the one-screen project-state read forwards, and so does the
+    /// overview its Phase 1 acceptance (d) checks `row_count` against. Neither
+    /// is covered by the `coord_query_` prefix, so each must be an EXACT entry
+    /// in sorted position (membership is a `binary_search`), must not also be a
+    /// deliberate exclusion, must pass the proxy's body gate, and must be read
+    /// back exactly once by the source-text parser the drift verdict runs —
+    /// the comments above both entries must not hide one or add a phantom.
+    #[test]
+    fn one_screen_reads_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in ["coord_project_state", "coord_work_unit_overview"] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position in COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also be a deliberate exclusion"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
