@@ -3139,10 +3139,15 @@ pub(crate) async fn sdk_text_visibility(
     sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
     body: serde_json::Value,
     bump: impl Fn(),
+    bump_after_ttl: impl FnOnce(u64),
 ) -> serde_json::Value {
     use crate::mcp::ui_bridge::text_visibility;
     if let Err(e) = text_visibility::validate_text_visibility_body(&body) {
         return serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e });
+    }
+    // The app's TTL restores its page with no request this runner sees.
+    if let Some(delay_ms) = text_visibility::ttl_bump_delay_ms(&body) {
+        bump_after_ttl(delay_ms);
     }
     // The app's rendered pixels change between these two bumps, so a vision
     // capture cached on either side of the change is not reused across it.
@@ -3170,7 +3175,18 @@ async fn handle_text_visibility(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let bump = || crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
-    Json(sdk_text_visibility(&state.app_dispatcher, &state.sdk_connection, body, bump).await)
+    let bump_after_ttl =
+        |delay_ms| crate::mcp::ui_bridge::text_visibility::schedule_mutation_bump(&state, delay_ms);
+    Json(
+        sdk_text_visibility(
+            &state.app_dispatcher,
+            &state.sdk_connection,
+            body,
+            bump,
+            bump_after_ttl,
+        )
+        .await,
+    )
 }
 
 /// GET /ui-bridge/sdk/debug/metrics — Debug metrics
@@ -8724,7 +8740,7 @@ mod text_visibility_dispatch_tests {
                 "ttlMs must be an integer",
             ),
         ] {
-            let out = sdk_text_visibility(&d, &c, body, || {}).await;
+            let out = sdk_text_visibility(&d, &c, body, || {}, |_| {}).await;
             assert_eq!(out["code"], json!("INVALID_REQUEST"), "{out}");
             assert!(
                 out["error"].as_str().unwrap_or("").contains(needle),
@@ -8742,10 +8758,22 @@ mod text_visibility_dispatch_tests {
         let (d, c) = http_target().await;
         let body = json!({"hidden": true, "ttlMs": 5_000});
         let bumps = std::sync::atomic::AtomicU32::new(0);
-        let out = sdk_text_visibility(&d, &c, body.clone(), || {
-            bumps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
+        let ttl = std::sync::Mutex::new(Vec::new());
+        let out = sdk_text_visibility(
+            &d,
+            &c,
+            body.clone(),
+            || {
+                bumps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            |ms| ttl.lock().unwrap().push(ms),
+        )
         .await;
+        assert_eq!(
+            *ttl.lock().unwrap(),
+            [5_000 + crate::mcp::ui_bridge::text_visibility::TTL_BUMP_MARGIN_MS],
+            "the app's TTL restore gets its own scheduled bump"
+        );
         assert_eq!(out["path"], json!("/control/text-visibility"), "{out}");
         assert_eq!(out["got"], body, "{out}");
         assert_eq!(
@@ -8775,7 +8803,7 @@ mod text_visibility_dispatch_tests {
             active("wapp", "ws-app://wapp"),
         );
         let pending = tokio::spawn(async move {
-            sdk_text_visibility(&d, &c, json!({"hidden": false}), || {}).await
+            sdk_text_visibility(&d, &c, json!({"hidden": false}), || {}, |_| {}).await
         });
         let frame = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
             .await

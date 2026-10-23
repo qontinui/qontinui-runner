@@ -59,6 +59,39 @@ use super::request::{ui_bridge_request_sync, wrap_ipc_result_keeping_failure_dat
 /// SDK bounds, mirrored (`control/text-visibility.ts`).
 pub(crate) const MIN_TTL_MS: u64 = 1_000;
 pub(crate) const MAX_TTL_MS: u64 = 600_000;
+/// The SDK's TTL when a hide names none (`DEFAULT_TEXT_VISIBILITY_TTL_MS`).
+pub(crate) const DEFAULT_TTL_MS: u64 = 30_000;
+
+/// How long past a hide's TTL the scheduled mutation bump fires: the SDK's
+/// own timer restores the page at the TTL, with no request this runner sees,
+/// so a bump a little later keeps the capture cache from serving a frame
+/// cached while the text was hidden. Unconditional — a bump after a restore
+/// that already happened costs one cache miss and nothing else.
+pub(crate) const TTL_BUMP_MARGIN_MS: u64 = 1_000;
+
+/// When a body that HIDES text should have its TTL-restore bump scheduled:
+/// the TTL it names (or the SDK default) plus [`TTL_BUMP_MARGIN_MS`]. `None`
+/// for a restore, which has no TTL.
+pub(crate) fn ttl_bump_delay_ms(body: &Value) -> Option<u64> {
+    if body.get("hidden").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let ttl = body
+        .get("ttlMs")
+        .and_then(whole_u64)
+        .unwrap_or(DEFAULT_TTL_MS);
+    Some(ttl + TTL_BUMP_MARGIN_MS)
+}
+
+/// Bump `state`'s vision mutation id after `delay_ms`: the TTL-restore bump
+/// [`ttl_bump_delay_ms`] times.
+pub(crate) fn schedule_mutation_bump(state: &Arc<ApiState>, delay_ms: u64) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        super::vision_routes::bump_mutation_id(&state);
+    });
+}
 
 /// The IPC request type the frontend hook answers.
 pub(crate) const REQUEST_TYPE: &str = "text_visibility";
@@ -136,17 +169,27 @@ fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<Value>>) {
 /// (`ui_bridge_request_sync` in the axum handler, a recording closure in a
 /// test). Validation runs HERE, before `send`, so a test entering through this
 /// function observes it.
-pub(crate) async fn direct_set<S, F, B>(body: Value, send: S, bump: B) -> HandlerResult
+pub(crate) async fn direct_set<S, F, B, T>(
+    body: Value,
+    send: S,
+    bump: B,
+    bump_after_ttl: T,
+) -> HandlerResult
 where
     S: FnOnce(&'static str, Value) -> F,
     F: Future<Output = Result<Value, String>>,
     B: Fn(),
+    T: FnOnce(u64),
 {
     validate_text_visibility_body(&body).map_err(bad_request)?;
     info!(
         "UI Bridge API: text visibility hidden={}",
         body["hidden"].as_bool().unwrap_or_default()
     );
+    // A hide's TTL restores the page with no request this runner sees.
+    if let Some(delay_ms) = ttl_bump_delay_ms(&body) {
+        bump_after_ttl(delay_ms);
+    }
     // Rendered pixels change between these two bumps; a capture keyed on the
     // mutation id from either side of them is not reused across the change.
     bump();
@@ -182,10 +225,12 @@ pub async fn ui_bridge_text_visibility_handler(
     Json(body): Json<Value>,
 ) -> HandlerResult {
     let bump_state = Arc::clone(&state);
+    let ttl_state = Arc::clone(&state);
     direct_set(
         body,
         |kind, body| async move { ui_bridge_request_sync(&state, kind, body).await },
         move || super::vision_routes::bump_mutation_id(&bump_state),
+        move |delay_ms| schedule_mutation_bump(&ttl_state, delay_ms),
     )
     .await
 }
@@ -221,9 +266,10 @@ pub struct TextVisibilityRun {
     pub hide: Value,
     /// What the webview answered to the restore, the SDK's `{hidden: false,
     /// changed, restore: {verified, …}}`. `None` when no restore was sent: the
-    /// hide failed, or the text was already hidden by another caller
-    /// (`changed: false`) — then that caller's hide is left to it, and the TTL
-    /// this hide re-armed ([`CAPTURE_TTL_MS`]) restores the page by itself.
+    /// hide failed, or the text was already hidden by another caller (its
+    /// `hiddenAt` predates this call's hide) — then that caller's hide is left
+    /// to it, and the TTL this hide re-armed ([`CAPTURE_TTL_MS`]) restores the
+    /// page by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore: Option<Value>,
     /// True only when a restore was sent and the SDK verified it
@@ -268,58 +314,104 @@ fn hide_failure_message(hide: &Value) -> String {
 /// Serializes the runner arm: one webview, one hide state. Two concurrent
 /// `captureTextHidden` calls would otherwise interleave — the second's frame A
 /// taken during the first's hide, or the first's restore landing before the
-/// second's frame B — and both would measure the wrong pixels.
-static PAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Sends the restore if dropped while armed: the runner arm's future cancelled
-/// (the HTTP client went away) or a panic unwinding through it after a
-/// confirmed hide. Without it the page stays hidden until the SDK's TTL.
-struct RestoreOnDrop<R: FnOnce()> {
-    restore: Option<R>,
+/// second's frame B — and both would measure the wrong pixels. An `Arc`'d
+/// mutex so the drop guard's spawned restore can carry the lock with it: the
+/// next arm then cannot take its frame A until that restore has landed.
+fn pair_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
-impl<R: FnOnce()> RestoreOnDrop<R> {
-    fn disarm(mut self) {
+/// The lock the arm holds, as handed to its restore-on-drop callback.
+pub(crate) type PairLockGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// Holds the arm's lock for the whole call and, while ARMED, restores the page
+/// if dropped: the arm's future cancelled (the HTTP client went away) or a
+/// panic unwinding through it. The restore callback is handed the lock, so the
+/// restore it spawns releases the lock only once it has landed.
+struct ArmGuard<R: FnOnce(PairLockGuard)> {
+    restore: Option<R>,
+    lock: Option<PairLockGuard>,
+}
+
+impl<R: FnOnce(PairLockGuard)> ArmGuard<R> {
+    fn new(lock: PairLockGuard) -> Self {
+        Self {
+            restore: None,
+            lock: Some(lock),
+        }
+    }
+
+    fn arm(&mut self, restore: R) {
+        self.restore = Some(restore);
+    }
+
+    fn disarm(&mut self) {
         self.restore = None;
     }
 }
 
-impl<R: FnOnce()> Drop for RestoreOnDrop<R> {
+impl<R: FnOnce(PairLockGuard)> Drop for ArmGuard<R> {
     fn drop(&mut self) {
-        if let Some(restore) = self.restore.take() {
+        if let (Some(restore), Some(lock)) = (self.restore.take(), self.lock.take()) {
             warn!("vision: the runner arm ended before its restore; restoring the webview's text");
-            restore();
+            restore(lock);
         }
     }
 }
 
+/// Whether the hide reply shows THIS call's hide, by the SDK's `hiddenAt`
+/// (epoch ms; the hide state's creation time, which a re-hide keeps). The
+/// webview and the runner share the machine's clock. `Some(true)`: created at
+/// or after `sent_at_ms`, so this call created it. `Some(false)`: an earlier
+/// caller's hide, which this call only re-armed. `None`: no `hiddenAt`.
+///
+/// Not `changed`: a re-hide of another caller's state answers `changed: true`
+/// whenever the app added elements meanwhile, and `changed: false` says
+/// nothing about who created the state.
+fn hide_is_ours(hide: &Value, sent_at_ms: i64) -> Option<bool> {
+    let hidden_at = hide.get("hiddenAt").and_then(Value::as_f64)?;
+    Some(hidden_at >= sent_at_ms as f64)
+}
+
 /// Frame A, then every glyph in the runner's own webview hidden, frame B, and
-/// the page restored — under one lock, with one capture permit held throughout.
+/// the page restored — under one lock, with the capture permits held
+/// throughout.
 ///
 /// - `send` is the request to the webview (`ui_bridge_request_sync`): the hide
 ///   and the restore.
-/// - `acquire` takes the capture permit BEFORE anything is hidden, so the page
-///   is never left hidden while this call queues for a capture slot.
-/// - `capture` takes one frame of the runner window, the permit already held;
-///   it is called for frame A and, only after the webview confirmed the hide
-///   (`success: true, hidden: true`; the hook answers after a paint), for
-///   frame B.
+/// - `acquire` takes the capture permits BEFORE frame A — ALL of them in
+///   production, so no other runner-window capture can see the page while its
+///   text is hidden. (A DOM read — a snapshot, a discover — during the hide is
+///   not covered: it reads the DOM, not pixels, and the hide changes only paint
+///   properties, but its computed colours would read transparent.)
+/// - `capture` takes one frame of the runner window, the permits already held:
+///   frame A, and — only after the webview confirmed THIS call's hide — frame B.
+/// - `now_ms` reads the clock the webview's `hiddenAt` is on (epoch ms).
 /// - `bump` bumps the vision mutation id: before the hide and after the restore.
-/// - `abort_restore` restores the page from a drop guard if this future is
-///   cancelled or unwinds between the hide and the restore; it must not await
-///   (it spawns).
+/// - `bump_after_ttl` schedules the bump for the SDK's own TTL restore.
+/// - `abort_restore` restores the page if this future is cancelled or unwinds
+///   while armed — from just BEFORE the hide is sent (the restore is
+///   idempotent) until the restore returns. It is handed the arm's lock and
+///   must spawn the restore holding it; it must not block.
 ///
+/// When the page was already text-hidden by another caller, this call neither
+/// restores it nor returns frame B ("frame B not taken: …"), and when that
+/// hide predates frame A, frame A is refused too: it was taken text-hidden.
 /// The restore is sent whenever THIS call hid the text, whether or not frame B
 /// was captured. A restore that fails or is not verified is reported in
 /// [`TextVisibilityRun::page_restored`] and frame B is kept: what it shows was
 /// fixed when it was taken. A restore answering `changed: false` means the
 /// SDK's TTL had already restored the page, at an unknown moment that may
 /// precede frame B, so frame B is discarded.
-pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, B, R>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, N, B, T, R>(
     send: S,
     acquire: A,
     capture: C,
+    now_ms: N,
     bump: B,
+    bump_after_ttl: T,
     abort_restore: R,
 ) -> TextHiddenPair<Fr>
 where
@@ -329,12 +421,14 @@ where
     AF: Future<Output = Result<P, String>>,
     C: Fn() -> CF,
     CF: Future<Output = Result<Fr, String>>,
+    N: Fn() -> i64,
     B: Fn(),
-    R: FnOnce(),
+    T: FnOnce(u64),
+    R: FnOnce(PairLockGuard),
 {
-    let _serialized = PAIR_LOCK.lock().await;
+    let mut guard = ArmGuard::new(pair_lock().lock_owned().await);
     let not_taken = |why: &str| Err(format!("frame B was not taken: {why}"));
-    let _permit = match acquire().await {
+    let _permits = match acquire().await {
         Ok(p) => p,
         Err(e) => {
             return TextHiddenPair {
@@ -344,7 +438,8 @@ where
             }
         }
     };
-    let frame_a = capture().await;
+    let frame_a_at_ms = now_ms();
+    let mut frame_a = capture().await;
     if frame_a.is_err() {
         // Altering the page for a frame B nothing can be paired with buys nothing.
         return TextHiddenPair {
@@ -354,17 +449,21 @@ where
         };
     }
 
+    let hide_body = serde_json::json!({"hidden": true, "ttlMs": CAPTURE_TTL_MS});
+    if let Some(delay_ms) = ttl_bump_delay_ms(&hide_body) {
+        bump_after_ttl(delay_ms);
+    }
+    // Armed BEFORE the send: a cancel while the hide is in flight still
+    // restores (a restore of a page this call did not hide is a no-op).
+    guard.arm(abort_restore);
     bump();
-    let hide = match send(
-        REQUEST_TYPE,
-        serde_json::json!({"hidden": true, "ttlMs": CAPTURE_TTL_MS}),
-    )
-    .await
-    {
+    let hide_sent_at_ms = now_ms();
+    let hide = match send(REQUEST_TYPE, hide_body).await {
         Ok(v) => v,
         Err(e) => serde_json::json!({"success": false, "error": e}),
     };
     if !(is_true(&hide, "success") && is_true(&hide, "hidden")) {
+        guard.disarm();
         return TextHiddenPair {
             frame_a,
             frame_b: Err(hide_failure_message(&hide)),
@@ -376,62 +475,79 @@ where
             }),
         };
     }
+    match hide_is_ours(&hide, hide_sent_at_ms) {
+        Some(true) => {}
+        ours => {
+            // Another caller's hide (or one this call cannot attribute): left to
+            // that caller, whose TTL this re-hide re-armed to CAPTURE_TTL_MS.
+            guard.disarm();
+            let hidden_at = hide.get("hiddenAt").and_then(Value::as_f64);
+            if let Some(at) = hidden_at {
+                if at < frame_a_at_ms as f64 {
+                    frame_a = Err(format!(
+                        "frame A was taken while the page was already text-hidden by another \
+                         caller (hidden since {at} ms, frame A at {frame_a_at_ms} ms)"
+                    ));
+                }
+            }
+            let why = match ours {
+                Some(_) => "the page was already text-hidden by another caller",
+                None => "the hide reply carries no hiddenAt, so whose hide it is is unknown",
+            };
+            return TextHiddenPair {
+                frame_a,
+                frame_b: not_taken(why),
+                run: Some(TextVisibilityRun {
+                    hide,
+                    restore: None,
+                    page_restored: None,
+                    warning: None,
+                }),
+            };
+        }
+    }
     let warning = (hide.get("paintFence").and_then(Value::as_str) == Some("timeout")).then(|| {
         "the hide's paint fence timed out (the webview painted no frame within it), so \
          frame B may have been composited before the glyphs went transparent"
             .to_string()
-    });
-    // `changed: false` means the text was already hidden, by a caller this one
-    // must not undo. Only an explicit `false` reads that way: a reply that
-    // omits it is treated as this call's own hide, and restored.
-    let hid_it = hide.get("changed").and_then(Value::as_bool) != Some(false);
-    let guard = hid_it.then(|| RestoreOnDrop {
-        restore: Some(abort_restore),
     });
 
     let mut frame_b = capture()
         .await
         .map_err(|e| format!("frame B (text hidden) capture failed: {e}"));
 
-    let (restore, page_restored) = if hid_it {
-        let restore = match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
-            Ok(v) => v,
-            Err(e) => serde_json::json!({"success": false, "error": e}),
-        };
-        if let Some(guard) = guard {
-            guard.disarm();
-        }
-        bump();
-        let verified = is_true(&restore, "success")
-            && restore.get("hidden").and_then(Value::as_bool) == Some(false)
-            && restore
-                .get("restore")
-                .is_some_and(|r| is_true(r, "verified"));
-        if !verified {
-            warn!("vision: the runner webview's text restore was not verified: {restore}");
-        }
-        if is_true(&restore, "success")
-            && restore.get("changed").and_then(Value::as_bool) == Some(false)
-            && frame_b.is_ok()
-        {
-            frame_b = Err(format!(
-                "frame B discarded: the restore found the text already visible, so the \
-                 {CAPTURE_TTL_MS} ms TTL had restored the page at a moment that may precede \
-                 frame B"
-            ));
-        }
-        (Some(restore), Some(verified))
-    } else {
-        (None, None)
+    let restore = match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"success": false, "error": e}),
     };
+    guard.disarm();
+    bump();
+    let verified = is_true(&restore, "success")
+        && restore.get("hidden").and_then(Value::as_bool) == Some(false)
+        && restore
+            .get("restore")
+            .is_some_and(|r| is_true(r, "verified"));
+    if !verified {
+        warn!("vision: the runner webview's text restore was not verified: {restore}");
+    }
+    if is_true(&restore, "success")
+        && restore.get("changed").and_then(Value::as_bool) == Some(false)
+        && frame_b.is_ok()
+    {
+        frame_b = Err(format!(
+            "frame B discarded: the restore found the text already visible, so the \
+             {CAPTURE_TTL_MS} ms TTL had restored the page at a moment that may precede \
+             frame B"
+        ));
+    }
 
     TextHiddenPair {
         frame_a,
         frame_b,
         run: Some(TextVisibilityRun {
             hide,
-            restore,
-            page_restored,
+            restore: Some(restore),
+            page_restored: Some(verified),
             warning,
         }),
     }
@@ -514,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn the_direct_route_refuses_an_invalid_body_before_the_webview_sees_it() {
         let (sent, send) = webview(vec![]);
-        let (status, Json(body)) = direct_set(json!({"hidden": "yes"}), send, || {})
+        let (status, Json(body)) = direct_set(json!({"hidden": "yes"}), send, || {}, |_| {})
             .await
             .expect_err("must be refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -533,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn the_direct_route_sends_the_webview_the_body_as_given() {
         let (sent, send) = webview(vec![Ok(json!({"success": true, "hidden": true}))]);
-        let out = direct_set(json!({"hidden": true, "ttlMs": 5_000}), send, || {})
+        let out = direct_set(json!({"hidden": true, "ttlMs": 5_000}), send, || {}, |_| {})
             .await
             .expect("forwarded");
         assert_eq!(out.0.data, Some(json!({"success": true, "hidden": true})));
@@ -552,7 +668,7 @@ mod tests {
             "error": "dev control",
         });
         let (_sent, send) = webview(vec![Ok(refusal)]);
-        let (status, Json(body)) = direct_set(json!({"hidden": true}), send, || {})
+        let (status, Json(body)) = direct_set(json!({"hidden": true}), send, || {}, |_| {})
             .await
             .expect_err("a refusal is a failure, never a success");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -578,19 +694,51 @@ mod tests {
             std::future::ready(Ok(json!({"success": true, "hidden": true})))
         };
         let bump = move || l2.lock().unwrap().push(("<bump>", Value::Null));
-        direct_set(json!({"hidden": true}), send, bump)
+        direct_set(json!({"hidden": true}), send, bump, |_| {})
             .await
             .expect("forwarded");
         let kinds: Vec<&str> = log.lock().unwrap().iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, ["<bump>", REQUEST_TYPE, "<bump>"]);
     }
 
+    /// The SDK's TTL restores the page with no request the runner sees: a hide
+    /// schedules a bump past its TTL; a restore schedules none.
+    #[tokio::test]
+    async fn a_hide_schedules_a_bump_past_its_ttl() {
+        let scheduled = |body: Value| {
+            let at = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let a = at.clone();
+            let (_sent, send) = webview(vec![Ok(json!({"success": true}))]);
+            let run = direct_set(body, send, || {}, move |ms| a.lock().unwrap().push(ms));
+            async move {
+                let _ = run.await;
+                let v = at.lock().unwrap().clone();
+                v
+            }
+        };
+        assert_eq!(
+            scheduled(json!({"hidden": true, "ttlMs": 5_000})).await,
+            [5_000 + TTL_BUMP_MARGIN_MS]
+        );
+        assert_eq!(
+            scheduled(json!({"hidden": true})).await,
+            [DEFAULT_TTL_MS + TTL_BUMP_MARGIN_MS]
+        );
+        assert!(scheduled(json!({"hidden": false})).await.is_empty());
+    }
+
     // ── the runner arm: frame A, hide, frame B, restore ───────────────────
 
     type Events = Arc<Mutex<Vec<String>>>;
 
+    /// The fake clock's readings: frame A at 1000, the hide sent at 1010.
+    const FRAME_A_AT: i64 = 1_000;
+    const HIDE_SENT_AT: i64 = 1_010;
+
+    /// A hide THIS call made: created after it was sent.
     fn hid() -> Value {
-        json!({"success": true, "hidden": true, "changed": true, "ttlMs": CAPTURE_TTL_MS})
+        json!({"success": true, "hidden": true, "changed": true, "ttlMs": CAPTURE_TTL_MS,
+               "hiddenAt": HIDE_SENT_AT + 1})
     }
 
     fn restored(verified: bool) -> Value {
@@ -600,95 +748,137 @@ mod tests {
 
     type BoxFut<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
 
-    /// One scripted run of the arm: the webview answers `replies` in turn, the
-    /// captures answer `frames` in turn, and every step lands in `events`.
-    struct Script {
-        events: Events,
-        replies: Vec<Result<Value, String>>,
-        frames: Vec<Result<&'static str, String>>,
+    /// A scripted answer: `Some` answers, `None` never answers (and notifies
+    /// the test that the arm reached it).
+    type Step<T> = Option<Result<T, String>>;
+
+    fn ok<T>(v: T) -> Step<T> {
+        Some(Ok(v))
     }
 
-    impl Script {
-        fn new(
-            replies: Vec<Result<Value, String>>,
-            frames: Vec<Result<&'static str, String>>,
-        ) -> Self {
-            Self {
-                events: Default::default(),
-                replies,
-                frames,
-            }
-        }
-
-        async fn run(self) -> (TextHiddenPair<&'static str>, Vec<String>) {
-            let ev = self.events.clone();
-            let out = run_scripted(self.events, self.replies, self.frames).await;
-            let events = ev.lock().unwrap().clone();
-            (out, events)
-        }
+    fn fails<T>(e: &str) -> Step<T> {
+        Some(Err(e.into()))
     }
 
+    /// One scripted run of the arm against a fake webview, captures and clock;
+    /// every step lands in `events`. `stalled` is notified when a `None` step
+    /// is reached.
     fn run_scripted(
         events: Events,
-        replies: Vec<Result<Value, String>>,
-        frames: Vec<Result<&'static str, String>>,
+        stalled: Arc<tokio::sync::Notify>,
+        replies: Vec<Step<Value>>,
+        frames: Vec<Step<&'static str>>,
     ) -> BoxFut<TextHiddenPair<&'static str>> {
         let replies = Arc::new(Mutex::new(replies.into_iter()));
         let frames = Arc::new(Mutex::new(frames.into_iter()));
-        let (e1, e2, e3, e4, e5) = (
+        let clock = Arc::new(Mutex::new(vec![FRAME_A_AT, HIDE_SENT_AT].into_iter()));
+        let (e1, e2, e3, e4, e5, e6) = (
+            events.clone(),
             events.clone(),
             events.clone(),
             events.clone(),
             events.clone(),
             events,
         );
+        let stall2 = stalled.clone();
         let send = move |_kind: &'static str, body: Value| {
             let hidden = body["hidden"].as_bool().unwrap_or_default();
             e1.lock()
                 .unwrap()
                 .push(if hidden { "hide" } else { "show" }.into());
-            let reply = replies
+            let step = replies
                 .lock()
                 .unwrap()
                 .next()
-                .unwrap_or_else(|| Err("no more replies scripted".into()));
-            std::future::ready(reply)
+                .unwrap_or_else(|| fails("no more replies scripted"));
+            let fut: BoxFut<Result<Value, String>> = match step {
+                Some(r) => Box::pin(std::future::ready(r)),
+                None => {
+                    stalled.notify_one();
+                    Box::pin(std::future::pending())
+                }
+            };
+            fut
         };
         let acquire = move || {
-            e2.lock().unwrap().push("permit".into());
+            e2.lock().unwrap().push("permits".into());
             std::future::ready(Ok::<(), String>(()))
         };
         let capture = move || {
             e3.lock().unwrap().push("capture".into());
-            let next = frames.lock().unwrap().next();
-            let fut: BoxFut<Result<&'static str, String>> = match next {
+            let step = frames.lock().unwrap().next().unwrap_or(None);
+            let fut: BoxFut<Result<&'static str, String>> = match step {
                 Some(f) => Box::pin(std::future::ready(f)),
-                // Out of scripted frames: a capture that never finishes.
-                None => Box::pin(std::future::pending()),
+                None => {
+                    stall2.notify_one();
+                    Box::pin(std::future::pending())
+                }
             };
             fut
         };
+        let now_ms = move || clock.lock().unwrap().next().unwrap_or(i64::MAX);
         let bump = move || e4.lock().unwrap().push("bump".into());
-        let abort = move || e5.lock().unwrap().push("abort-restore".into());
+        let ttl = move |ms: u64| e5.lock().unwrap().push(format!("ttl-bump {ms}"));
+        let abort = move |_lock: PairLockGuard| e6.lock().unwrap().push("abort-restore".into());
         Box::pin(capture_text_hidden_pair(
-            send, acquire, capture, bump, abort,
+            send, acquire, capture, now_ms, bump, ttl, abort,
         ))
     }
 
+    async fn run(
+        replies: Vec<Step<Value>>,
+        frames: Vec<Step<&'static str>>,
+    ) -> (TextHiddenPair<&'static str>, Vec<String>) {
+        let events: Events = Default::default();
+        let out = run_scripted(events.clone(), Default::default(), replies, frames).await;
+        let events = events.lock().unwrap().clone();
+        (out, events)
+    }
+
+    /// Run until the arm reaches a `None` step, then drop it (the caller went
+    /// away): deterministic, no timing.
+    async fn run_until_stalled_then_cancel(
+        replies: Vec<Step<Value>>,
+        frames: Vec<Step<&'static str>>,
+    ) -> Vec<String> {
+        let events: Events = Default::default();
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let fut = run_scripted(events.clone(), stalled.clone(), replies, frames);
+        tokio::select! {
+            _ = fut => panic!("the arm was scripted to stall"),
+            _ = stalled.notified() => {}
+        }
+        let events = events.lock().unwrap().clone();
+        events
+    }
+
+    fn ttl_bump() -> String {
+        format!("ttl-bump {}", CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS)
+    }
+
     #[tokio::test]
-    async fn the_arm_takes_the_permit_then_a_then_hides_then_b_then_restores() {
-        let (out, events) = Script::new(
-            vec![Ok(hid()), Ok(restored(true))],
-            vec![Ok("frame-a"), Ok("frame-b")],
+    async fn the_arm_takes_the_permits_then_a_then_hides_then_b_then_restores() {
+        let (out, events) = run(
+            vec![ok(hid()), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
         )
-        .run()
         .await;
         assert_eq!(out.frame_a, Ok("frame-a"));
         assert_eq!(out.frame_b, Ok("frame-b"));
         assert_eq!(
             events,
-            ["permit", "capture", "bump", "hide", "capture", "show", "bump"],
-            "the permit before the hide; a bump before the hide and after the restore"
+            [
+                "permits".to_string(),
+                "capture".into(),
+                ttl_bump(),
+                "bump".into(),
+                "hide".into(),
+                "capture".into(),
+                "show".into(),
+                "bump".into(),
+            ],
+            "the permits before frame A; a TTL bump scheduled with the hide; a bump before \
+             the hide and after the restore; no guard restore once restored"
         );
         let run = out.run.expect("a hide was sent");
         assert_eq!(run.page_restored, Some(true));
@@ -698,28 +888,25 @@ mod tests {
 
     #[tokio::test]
     async fn no_frame_a_means_nothing_is_hidden() {
-        let (out, events) = Script::new(vec![], vec![Err("Runner window not found".into())])
-            .run()
-            .await;
+        let (out, events) = run(vec![], vec![fails("Runner window not found")]).await;
         assert!(out.frame_a.is_err());
         assert!(out
             .frame_b
             .unwrap_err()
             .contains("frame A could not be captured"));
         assert!(out.run.is_none());
-        assert_eq!(events, ["permit", "capture"]);
+        assert_eq!(events, ["permits", "capture"]);
     }
 
     #[tokio::test]
     async fn a_refused_hide_captures_no_frame_b_and_names_the_code() {
         let refusal = json!({"success": false, "code": "capability_unavailable_in_build",
                              "error": "dev control"});
-        let (out, events) = Script::new(vec![Ok(refusal.clone())], vec![Ok("frame-a")])
-            .run()
-            .await;
+        let (out, events) = run(vec![ok(refusal.clone())], vec![ok("frame-a")]).await;
         let err = out.frame_b.expect_err("no frame B without a hide");
         assert!(err.contains("capability_unavailable_in_build"), "{err}");
-        assert_eq!(events, ["permit", "capture", "bump", "hide"]);
+        assert!(!events.contains(&"abort-restore".to_string()), "{events:?}");
+        assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
         let run = out.run.expect("the hide was sent");
         assert_eq!(run.hide, refusal);
         assert_eq!(run.restore, None);
@@ -727,11 +914,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_webview_is_a_failed_hide_not_a_frame() {
-        let (out, _) = Script::new(
-            vec![Err("UI Bridge request timed out".into())],
-            vec![Ok("frame-a")],
+        let (out, _) = run(
+            vec![fails("UI Bridge request timed out")],
+            vec![ok("frame-a")],
         )
-        .run()
         .await;
         assert!(out.frame_b.unwrap_err().contains("timed out"));
         assert_eq!(out.run.unwrap().hide["success"], json!(false));
@@ -739,11 +925,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_frame_b_still_restores_the_page() {
-        let (out, events) = Script::new(
-            vec![Ok(hid()), Ok(restored(true))],
-            vec![Ok("frame-a"), Err("capture backend failed".into())],
+        let (out, events) = run(
+            vec![ok(hid()), ok(restored(true))],
+            vec![ok("frame-a"), fails("capture backend failed")],
         )
-        .run()
         .await;
         let err = out.frame_b.expect_err("the capture failed");
         assert!(
@@ -758,15 +943,14 @@ mod tests {
     #[tokio::test]
     async fn an_unverified_or_failed_restore_is_reported_and_frame_b_kept() {
         for reply in [
-            Ok(restored(false)),
-            Ok(json!({"success": false, "error": "STATE_SCHEMA_MISMATCH"})),
-            Err("transport".to_string()),
+            ok(restored(false)),
+            ok(json!({"success": false, "error": "STATE_SCHEMA_MISMATCH"})),
+            fails("transport"),
         ] {
-            let (out, _) = Script::new(
-                vec![Ok(hid()), reply.clone()],
-                vec![Ok("frame-a"), Ok("frame-b")],
+            let (out, _) = run(
+                vec![ok(hid()), reply.clone()],
+                vec![ok("frame-a"), ok("frame-b")],
             )
-            .run()
             .await;
             assert_eq!(out.frame_b, Ok("frame-b"), "{reply:?}");
             assert_eq!(out.run.unwrap().page_restored, Some(false), "{reply:?}");
@@ -777,11 +961,10 @@ mod tests {
     async fn a_restore_the_ttl_already_made_discards_frame_b() {
         let late = json!({"success": true, "hidden": false, "changed": false,
                           "restore": {"trigger": "ttl", "verified": true}});
-        let (out, _) = Script::new(
-            vec![Ok(hid()), Ok(late)],
-            vec![Ok("frame-a"), Ok("frame-b")],
+        let (out, _) = run(
+            vec![ok(hid()), ok(late)],
+            vec![ok("frame-a"), ok("frame-b")],
         )
-        .run()
         .await;
         let err = out
             .frame_b
@@ -794,116 +977,192 @@ mod tests {
     async fn a_timed_out_paint_fence_is_a_warning() {
         let mut fenced = hid();
         fenced["paintFence"] = json!("timeout");
-        let (out, _) = Script::new(
-            vec![Ok(fenced), Ok(restored(true))],
-            vec![Ok("frame-a"), Ok("frame-b")],
+        let (out, _) = run(
+            vec![ok(fenced), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
         )
-        .run()
         .await;
         assert_eq!(out.frame_b, Ok("frame-b"));
         let warning = out.run.unwrap().warning.expect("a warning");
         assert!(warning.contains("paint fence timed out"), "{warning}");
     }
 
+    /// Another caller hid the text after frame A: frame A stands, but this
+    /// call takes no frame B and does not restore the other caller's hide —
+    /// even when the SDK reports `changed: true` (coverage grew).
     #[tokio::test]
-    async fn text_another_caller_hid_is_left_to_it() {
-        let already = json!({"success": true, "hidden": true, "changed": false});
-        let (out, events) = Script::new(vec![Ok(already)], vec![Ok("frame-a"), Ok("frame-b")])
-            .run()
-            .await;
-        assert_eq!(out.frame_b, Ok("frame-b"));
+    async fn text_another_caller_hid_after_frame_a_is_left_to_it() {
+        let theirs = json!({"success": true, "hidden": true, "changed": true,
+                            "hiddenAt": FRAME_A_AT + 5});
+        let (out, events) = run(vec![ok(theirs)], vec![ok("frame-a"), ok("frame-b")]).await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        let err = out.frame_b.expect_err("not this call's hide");
+        assert!(
+            err.contains("already text-hidden by another caller"),
+            "{err}"
+        );
         assert!(!events.contains(&"show".to_string()), "{events:?}");
+        assert!(!events.contains(&"abort-restore".to_string()), "{events:?}");
+        assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
         assert_eq!(out.run.unwrap().restore, None);
+    }
+
+    /// Hidden before frame A was taken: frame A shows the hidden page too.
+    #[tokio::test]
+    async fn a_frame_a_taken_while_hidden_is_refused() {
+        let theirs = json!({"success": true, "hidden": true, "changed": false,
+                            "hiddenAt": FRAME_A_AT - 500});
+        let (out, events) = run(vec![ok(theirs)], vec![ok("frame-a"), ok("frame-b")]).await;
+        let err = out.frame_a.expect_err("frame A was taken text-hidden");
+        assert!(
+            err.contains("frame A was taken while the page was already"),
+            "{err}"
+        );
+        assert!(out.frame_b.is_err());
+        assert!(!events.contains(&"show".to_string()), "{events:?}");
+    }
+
+    /// No `hiddenAt`: whose hide it is is unknown, so nothing is restored and
+    /// no frame B is returned.
+    #[tokio::test]
+    async fn an_unattributable_hide_is_neither_restored_nor_measured() {
+        let anon = json!({"success": true, "hidden": true, "changed": true});
+        let (out, events) = run(vec![ok(anon)], vec![ok("frame-a"), ok("frame-b")]).await;
+        assert!(out.frame_b.unwrap_err().contains("no hiddenAt"));
+        assert!(!events.contains(&"show".to_string()), "{events:?}");
     }
 
     #[tokio::test]
     async fn a_cancelled_arm_restores_the_page_from_its_guard() {
-        let events: Events = Default::default();
-        // Frame B never finishes; the caller gives up while text is hidden.
-        let fut = run_scripted(
-            events.clone(),
-            vec![Ok(hid()), Ok(restored(true))],
-            vec![Ok("frame-a")],
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), fut)
-                .await
-                .is_err(),
-            "frame B was scripted never to finish"
-        );
-        let events = events.lock().unwrap().clone();
-        assert_eq!(
-            events,
-            [
-                "permit",
-                "capture",
-                "bump",
-                "hide",
-                "capture",
-                "abort-restore"
-            ]
-        );
+        // Frame B never finishes; the caller goes away while text is hidden.
+        let events = run_until_stalled_then_cancel(
+            vec![ok(hid()), ok(restored(true))],
+            vec![ok("frame-a"), None],
+        )
+        .await;
+        assert_eq!(events.last().map(String::as_str), Some("abort-restore"));
+        assert!(!events.contains(&"show".to_string()), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_the_hide_is_in_flight_still_restores() {
+        let events = run_until_stalled_then_cancel(vec![None], vec![ok("frame-a")]).await;
+        assert_eq!(events.last().map(String::as_str), Some("abort-restore"));
+        assert!(events.contains(&"hide".to_string()), "{events:?}");
     }
 
     #[tokio::test]
     async fn a_completed_arm_does_not_also_restore_from_its_guard() {
-        let (_, events) = Script::new(
-            vec![Ok(hid()), Ok(restored(true))],
-            vec![Ok("frame-a"), Ok("frame-b")],
+        let (_, events) = run(
+            vec![ok(hid()), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
         )
-        .run()
         .await;
         assert!(!events.contains(&"abort-restore".to_string()), "{events:?}");
+    }
+
+    /// The guard hands its restore the lock, so the next arm cannot start until
+    /// that restore has finished with it.
+    #[tokio::test]
+    async fn the_guard_restore_carries_the_lock() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let kept: Arc<Mutex<Option<PairLockGuard>>> = Default::default();
+        let k = kept.clone();
+        {
+            let mut guard = ArmGuard::new(Arc::clone(&lock).lock_owned().await);
+            guard.arm(move |held| *k.lock().unwrap() = Some(held));
+        }
+        assert!(
+            lock.try_lock().is_err(),
+            "the lock stays held by the restore the guard handed it to"
+        );
+        kept.lock().unwrap().take();
+        assert!(
+            lock.try_lock().is_ok(),
+            "released once the restore drops it"
+        );
+
+        // Disarmed: the lock is released with the guard, no restore runs.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ran.clone();
+        {
+            let mut guard = ArmGuard::new(Arc::clone(&lock).lock_owned().await);
+            guard.arm(move |_| r.store(true, std::sync::atomic::Ordering::SeqCst));
+            guard.disarm();
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock.try_lock().is_ok());
     }
 
     /// Two arms at once against one webview whose frames show whether its text
     /// is hidden: each must see its own frame A with text and frame B without.
     #[tokio::test]
     async fn concurrent_arms_do_not_interleave() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let hidden = Arc::new(AtomicBool::new(false));
-        let arm = |hidden: Arc<AtomicBool>| async move {
-            let h1 = hidden.clone();
+        use std::sync::atomic::{AtomicI64, Ordering};
+        // `hiddenAt` of the live hide, 0 when the text is visible.
+        let hidden_at = Arc::new(AtomicI64::new(0));
+        let clock = Arc::new(AtomicI64::new(1));
+        let arm = |hidden_at: Arc<AtomicI64>, clock: Arc<AtomicI64>| async move {
+            let (h1, c1) = (hidden_at.clone(), clock.clone());
             let send = move |_kind: &'static str, body: Value| {
-                let h = h1.clone();
+                let (h, c) = (h1.clone(), c1.clone());
                 async move {
                     tokio::task::yield_now().await;
                     let want = body["hidden"].as_bool().unwrap_or_default();
-                    let was = h.swap(want, Ordering::SeqCst);
-                    tokio::task::yield_now().await;
-                    Ok(if want {
-                        json!({"success": true, "hidden": true, "changed": !was})
+                    let was = h.load(Ordering::SeqCst);
+                    let reply = if want {
+                        let at = if was == 0 {
+                            c.fetch_add(1, Ordering::SeqCst)
+                        } else {
+                            was
+                        };
+                        h.store(at, Ordering::SeqCst);
+                        json!({"success": true, "hidden": true, "changed": was == 0,
+                               "hiddenAt": at})
                     } else {
-                        json!({"success": true, "hidden": false, "changed": was,
+                        h.store(0, Ordering::SeqCst);
+                        json!({"success": true, "hidden": false, "changed": was != 0,
                                "restore": {"verified": true}})
-                    })
+                    };
+                    tokio::task::yield_now().await;
+                    Ok(reply)
                 }
             };
-            let h2 = hidden.clone();
+            let h2 = hidden_at.clone();
             let capture = move || {
                 let h = h2.clone();
                 async move {
                     tokio::task::yield_now().await;
-                    let text_hidden = h.load(Ordering::SeqCst);
+                    let text_hidden = h.load(Ordering::SeqCst) != 0;
                     tokio::task::yield_now().await;
                     Ok::<bool, String>(text_hidden)
                 }
             };
+            let c2 = clock.clone();
             capture_text_hidden_pair(
                 send,
                 || std::future::ready(Ok::<(), String>(())),
                 capture,
+                move || c2.fetch_add(1, Ordering::SeqCst),
                 || {},
-                || {},
+                |_| {},
+                |_| {},
             )
             .await
         };
-        let (one, two) = tokio::join!(arm(hidden.clone()), arm(hidden.clone()));
+        let (one, two) = tokio::join!(
+            arm(hidden_at.clone(), clock.clone()),
+            arm(hidden_at.clone(), clock.clone())
+        );
         for out in [one, two] {
             assert_eq!(out.frame_a, Ok(false), "frame A must show the text");
             assert_eq!(out.frame_b, Ok(true), "frame B must be the hidden page");
         }
-        assert!(!hidden.load(Ordering::SeqCst), "the page ends restored");
+        assert_eq!(
+            hidden_at.load(Ordering::SeqCst),
+            0,
+            "the page ends restored"
+        );
     }
 
     #[test]

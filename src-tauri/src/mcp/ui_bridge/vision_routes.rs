@@ -489,18 +489,20 @@ pub struct MutationOccurredResponse {
 /// — the bounded permit pool (size 2) prevents thrash under multi-agent load;
 /// it is harmless overhead for CapturePreview.
 pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
-    let _permit = state
-        .vision_capture_semaphore
-        .acquire()
-        .await
-        .map_err(|e| format!("capture semaphore acquire: {}", e))?;
-    capture_runner_window_frame_permitted(state).await
+    capture_runner_window(state, true).await
 }
 
-/// [`capture_runner_window_frame`] for a caller already holding a permit from
-/// `state.vision_capture_semaphore` — the `captureTextHidden` arm, which takes
-/// one permit before frame A and holds it through frame B.
+/// [`capture_runner_window_frame`] for a caller already holding the capture
+/// permits — the `captureTextHidden` arm, which takes them before frame A and
+/// holds them through frame B.
 async fn capture_runner_window_frame_permitted(state: &Arc<ApiState>) -> Result<Frame, String> {
+    capture_runner_window(state, false).await
+}
+
+/// The runner-window capture: the window probe first, then (when
+/// `take_permit`) a permit from `state.vision_capture_semaphore`, then the
+/// backend ladder.
+async fn capture_runner_window(state: &Arc<ApiState>, take_permit: bool) -> Result<Frame, String> {
     use tauri::Manager;
 
     let window = state
@@ -515,6 +517,18 @@ async fn capture_runner_window_frame_permitted(state: &Arc<ApiState>) -> Result<
     let geometry = super::window_probe::geometry(&window)
         .await
         .map_err(|e| e.to_string())?;
+
+    let _permit = if take_permit {
+        Some(
+            state
+                .vision_capture_semaphore
+                .acquire()
+                .await
+                .map_err(|e| format!("capture semaphore acquire: {}", e))?,
+        )
+    } else {
+        None
+    };
 
     let scale = geometry.scale;
     let x = geometry.x;
@@ -2172,6 +2186,13 @@ fn check_text_hidden_request(
             );
         }
     }
+    if supplied.is_some() && !reads_frame_b {
+        return Err(
+            "textHiddenFrame is frame B, and nothing in this request reads frame B: use the \
+             `image` analyzer or a `text_over_image_contrast` assertion"
+                .into(),
+        );
+    }
     if let Some(f) = supplied {
         match (&f.png_base64, &f.sha256) {
             (Some(_), Some(_)) | (None, None) => {
@@ -2184,6 +2205,38 @@ fn check_text_hidden_request(
         }
     }
     Ok(())
+}
+
+/// Refuse frame B to a caller that may not drive it: `captureTextHidden` alters
+/// the runner's own page (the direct `control/text-visibility` route is a
+/// credential door, and `captureTextHidden` must not be a way around it), and a
+/// supplied `textHiddenFrame` makes the runner read a vision-cache file or
+/// decode a caller's image. Only a NonBrowser or FirstParty requester may ask
+/// for either — the origin guard's own classification
+/// ([`RequesterPrincipal`]); an absent principal is UNKNOWN and refused.
+/// Answered with 403, before anything is captured, hidden or decoded.
+fn refuse_untrusted_frame_b(
+    principal: Option<&crate::mcp::origin_guard::RequesterPrincipal>,
+    supplied: bool,
+    capture: bool,
+) -> Result<(), String> {
+    use crate::mcp::origin_guard::OriginClass;
+    if !supplied && !capture {
+        return Ok(());
+    }
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "{} is reachable only from a non-browser caller or the runner's own UI \
+             (requester class: {})",
+            if capture {
+                "captureTextHidden hides the runner's text and"
+            } else {
+                "textHiddenFrame reads the vision cache or decodes a caller image and"
+            },
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
 }
 
 /// Decode a caller-supplied frame B: a PNG of exactly `expected` (frame A's
@@ -2245,16 +2298,10 @@ fn decode_text_hidden_frame(
             dims.0, dims.1, expected.0, expected.1
         ));
     }
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(expected.0);
-    limits.max_image_height = Some(expected.1);
-    limits.max_alloc = Some(TEXT_HIDDEN_FRAME_MAX_ALLOC);
-    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Png);
-    reader.limits(limits);
-    let rgba = reader
-        .decode()
-        .map_err(|e| format!("textHiddenFrame is not a decodable PNG: {e}"))?
-        .to_rgba8();
+    let rgba = decode_png_limited(
+        &bytes,
+        text_hidden_frame_limits(expected, TEXT_HIDDEN_FRAME_MAX_ALLOC),
+    )?;
     Ok(Frame::from_rgba(
         rgba,
         FrameSource {
@@ -2265,6 +2312,40 @@ fn decode_text_hidden_frame(
             capture_backend: None,
         },
     ))
+}
+
+/// The decode limits for a supplied frame B: frame A's own dimensions, and an
+/// allocation ceiling.
+fn text_hidden_frame_limits(expected: (u32, u32), max_alloc: u64) -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(expected.0);
+    limits.max_image_height = Some(expected.1);
+    limits.max_alloc = Some(max_alloc);
+    limits
+}
+
+/// Decode PNG `bytes` under `limits`: the decoder refuses, rather than
+/// allocates, past them.
+fn decode_png_limited(bytes: &[u8], limits: image::Limits) -> Result<RgbaImage, String> {
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    reader.limits(limits);
+    Ok(reader
+        .decode()
+        .map_err(|e| format!("textHiddenFrame is not a decodable PNG: {e}"))?
+        .to_rgba8())
+}
+
+/// Run blocking `work` — a file read, an image decode — on the blocking pool,
+/// off the tokio worker.
+async fn off_worker<T, W>(work: W) -> Result<T, String>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    spawn_blocking_tracked(work)
+        .await
+        .unwrap_or_else(|e| Err(format!("blocking task: {e}")))
 }
 
 /// Frame B for one `vision/analyze` or `vision/assert` call, and what the
@@ -2329,11 +2410,8 @@ async fn capture_frames(
     let expected = (frame_a.width, frame_a.height);
     let cache_root = state.vision_cache.root().to_path_buf();
     // The file read and the decode are blocking work: off the tokio worker.
-    let decoded = spawn_blocking_tracked(move || {
-        decode_text_hidden_frame(&supplied, scale, expected, &cache_root)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("textHiddenFrame decode task: {e}")));
+    let decoded =
+        off_worker(move || decode_text_hidden_frame(&supplied, scale, expected, &cache_root)).await;
     let text_hidden = match decoded {
         Ok(f) => TextHidden {
             frame: Some(f),
@@ -2363,13 +2441,21 @@ fn pair_backends_agree(a: &Frame, b: &Frame) -> Result<(), String> {
     ))
 }
 
+/// The size of `state.vision_capture_semaphore`: concurrent runner-window
+/// captures. The `captureTextHidden` arm takes ALL of them.
+pub(crate) const VISION_CAPTURE_PERMITS: u32 = 2;
+
 /// The runner arm (`captureTextHidden`): frame A and frame B of the runner's
-/// own window around a hide of its webview's text, under one lock and one
-/// capture permit ([`super::text_visibility::capture_text_hidden_pair`]).
+/// own window around a hide of its webview's text, under one lock and EVERY
+/// capture permit ([`super::text_visibility::capture_text_hidden_pair`]), so no
+/// other runner-window capture lands while the text is hidden. A DOM read
+/// (snapshot, discover) during the hide is not covered by the permits.
 async fn capture_text_hidden_arm(
     state: &Arc<ApiState>,
 ) -> (Option<Frame>, Option<String>, TextHidden) {
-    use super::text_visibility::{capture_text_hidden_pair, REQUEST_TYPE};
+    use super::text_visibility::{
+        capture_text_hidden_pair, schedule_mutation_bump, PairLockGuard, REQUEST_TYPE,
+    };
     let send = |kind: &'static str, body: serde_json::Value| {
         let state = Arc::clone(state);
         async move { super::request::ui_bridge_request_sync(&state, kind, body).await }
@@ -2377,12 +2463,13 @@ async fn capture_text_hidden_arm(
     let acquire = || async {
         state
             .vision_capture_semaphore
-            .acquire()
+            .acquire_many(VISION_CAPTURE_PERMITS)
             .await
             .map_err(|e| format!("capture semaphore acquire: {e}"))
     };
     let abort_state = Arc::clone(state);
-    let abort_restore = move || {
+    // Spawned holding the arm's lock: the next arm waits for this restore.
+    let abort_restore = move |lock: PairLockGuard| {
         tokio::spawn(async move {
             let _ = super::request::ui_bridge_request_sync(
                 &abort_state,
@@ -2391,16 +2478,28 @@ async fn capture_text_hidden_arm(
             )
             .await;
             bump_mutation_id(&abort_state);
+            drop(lock);
         });
     };
     let out = capture_text_hidden_pair(
         send,
         acquire,
         || capture_runner_window_frame_permitted(state),
+        || chrono::Utc::now().timestamp_millis(),
         || bump_mutation_id(state),
+        |delay_ms| schedule_mutation_bump(state, delay_ms),
         abort_restore,
     )
     .await;
+    text_hidden_from_pair(out)
+}
+
+/// The runner arm's outcome as the handlers consume it: frame A (or why not),
+/// and frame B with its record — frame B dropped, with the reason, when it
+/// does not pair with frame A ([`pair_backends_agree`]).
+fn text_hidden_from_pair(
+    out: super::text_visibility::TextHiddenPair<Frame>,
+) -> (Option<Frame>, Option<String>, TextHidden) {
     let (frame, frame_error) = match out.frame_a {
         Ok(f) => (Some(f), None),
         Err(e) => (None, Some(e)),
@@ -3144,6 +3243,7 @@ pub struct BaselineListResponse {
 /// structured findings; never pixels.
 async fn vision_analyze_handler(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
     UiBridgeJson(req): UiBridgeJson<AnalyzeRequest>,
 ) -> Result<Json<ApiResponse<AnalyzeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
@@ -3161,6 +3261,12 @@ async fn vision_analyze_handler(
     // (`frontendState: "window_missing"`, a headless or crashed UI) the
     // occlusion and overlap checks 500'd with "Runner window not found"
     // rather than answering from the snapshot in hand.
+    refuse_untrusted_frame_b(
+        principal.as_deref(),
+        req.text_hidden_frame.is_some(),
+        req.capture_text_hidden,
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
     check_text_hidden_request(
         req.text_hidden_frame.as_ref(),
         req.text_hidden_ids.as_deref(),
@@ -3242,6 +3348,7 @@ async fn vision_analyze_handler(
 /// Returns per-assertion pass/fail + reason.
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
     UiBridgeJson(req): UiBridgeJson<AssertRequest>,
 ) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
@@ -3253,6 +3360,12 @@ async fn vision_assert_handler(
     // snapshot, the OCR blocks or the baseline registry. Capturing a frame
     // as a hard precondition made `no_overlap` and `no_clipping` unavailable
     // on a headless runner for a value they never consult.
+    refuse_untrusted_frame_b(
+        principal.as_deref(),
+        req.text_hidden_frame.is_some(),
+        req.capture_text_hidden,
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
     check_text_hidden_request(
         req.text_hidden_frame.as_ref(),
         req.text_hidden_ids.as_deref(),
@@ -4873,7 +4986,15 @@ mod text_hidden_tests {
                 true,
                 None,
                 false,
-                "nothing in this request reads frame B",
+                "captureTextHidden hides the page's text for frame B, and nothing",
+            ),
+            (
+                Some(&png),
+                None,
+                false,
+                None,
+                false,
+                "textHiddenFrame is frame B, and nothing",
             ),
             (
                 None,
@@ -5020,6 +5141,7 @@ mod text_hidden_tests {
 
     #[test]
     fn frame_b_from_another_capture_backend_is_discarded() {
+        use super::super::text_visibility::TextHiddenPair;
         use qontinui_vision_core::CaptureBackend;
         let frame = |backend| {
             Frame::from_rgba(
@@ -5032,14 +5154,93 @@ mod text_hidden_tests {
                 },
             )
         };
-        let preview = frame(CaptureBackend::Webview2CapturePreview);
-        let crop = frame(CaptureBackend::MonitorCrop);
+        // Through the arm's own outcome mapping, so dropping the backend check
+        // from it turns this red.
+        let pair = |b| TextHiddenPair {
+            frame_a: Ok(frame(CaptureBackend::Webview2CapturePreview)),
+            frame_b: Ok(frame(b)),
+            run: None,
+        };
+        let (a, a_err, same) = text_hidden_from_pair(pair(CaptureBackend::Webview2CapturePreview));
+        assert!(a.is_some() && a_err.is_none());
+        assert!(same.frame.is_some(), "{:?}", same.error);
+        let (a, _, mixed) = text_hidden_from_pair(pair(CaptureBackend::MonitorCrop));
+        assert!(a.is_some(), "frame A stands");
         assert!(
-            pair_backends_agree(&preview, &frame(CaptureBackend::Webview2CapturePreview)).is_ok()
+            mixed.frame.is_none(),
+            "frame B from another backend is dropped"
         );
-        let err = pair_backends_agree(&preview, &crop).unwrap_err();
+        let err = mixed.error.expect("and says why");
         assert!(err.contains("Webview2CapturePreview"), "{err}");
         assert!(err.contains("MonitorCrop"), "{err}");
+    }
+
+    /// The decode runs under frame A's limits: a correctly sized PNG whose
+    /// decode would allocate past a deliberately tiny ceiling is refused, not
+    /// decoded; the same PNG under the production ceiling decodes.
+    #[test]
+    fn a_supplied_frame_b_decodes_under_limits() {
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255]));
+        let bytes = png_bytes(&img);
+        let limits = text_hidden_frame_limits((64, 64), TEXT_HIDDEN_FRAME_MAX_ALLOC);
+        assert_eq!(limits.max_image_width, Some(64));
+        assert_eq!(limits.max_image_height, Some(64));
+        assert_eq!(decode_png_limited(&bytes, limits).expect("fits"), img);
+        let err = decode_png_limited(&bytes, text_hidden_frame_limits((64, 64), 1_024))
+            .expect_err("64x64 RGBA is 16 KiB, past a 1 KiB ceiling");
+        assert!(err.contains("not a decodable PNG"), "{err}");
+        let err = decode_png_limited(&bytes, text_hidden_frame_limits((32, 32), u64::MAX))
+            .expect_err("wider than frame A");
+        assert!(err.contains("not a decodable PNG"), "{err}");
+    }
+
+    /// The supplied frame's file read and decode run on the blocking pool, not
+    /// the calling tokio worker. Pinned on the helper `capture_frames` routes
+    /// them through: a current-thread runtime runs async code on the test's own
+    /// thread, so a different thread id is the blocking pool.
+    #[test]
+    fn blocking_work_runs_off_the_worker() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let here = std::thread::current().id();
+        let there = rt
+            .block_on(off_worker(|| Ok::<_, String>(std::thread::current().id())))
+            .unwrap();
+        assert_ne!(here, there, "the work ran on the calling thread");
+    }
+
+    /// `captureTextHidden` and a supplied `textHiddenFrame` are refused to a
+    /// browser origin the guard does not class as FirstParty, before anything
+    /// is captured, hidden or decoded.
+    #[test]
+    fn frame_b_is_refused_to_an_untrusted_origin() {
+        use crate::mcp::origin_guard::{OriginClass, RequesterPrincipal};
+        let p = |class| RequesterPrincipal {
+            class,
+            origin: None,
+        };
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_untrusted_frame_b(Some(&p(class)), false, true).is_ok());
+            assert!(refuse_untrusted_frame_b(Some(&p(class)), true, false).is_ok());
+        }
+        for class in [
+            OriginClass::Foreign,
+            OriginClass::Extension,
+            OriginClass::Trusted,
+        ] {
+            let err = refuse_untrusted_frame_b(Some(&p(class)), false, true).unwrap_err();
+            assert!(err.contains(class.as_str()), "{err}");
+            assert!(err.contains("captureTextHidden"), "{err}");
+            let err = refuse_untrusted_frame_b(Some(&p(class)), true, false).unwrap_err();
+            assert!(err.contains("textHiddenFrame"), "{err}");
+        }
+        // No principal is UNKNOWN, refused; no frame B asked for, nothing to gate.
+        assert!(refuse_untrusted_frame_b(None, false, true)
+            .unwrap_err()
+            .contains("unknown"));
+        assert!(refuse_untrusted_frame_b(Some(&p(OriginClass::Foreign)), false, false).is_ok());
     }
 
     /// The vision capture cache keys on the mutation id: a capture cached on
@@ -5057,6 +5258,7 @@ mod text_hidden_tests {
             move || {
                 m.fetch_add(1, Ordering::Relaxed);
             },
+            |_| {},
         )
         .await;
         let after = capture_cache_key(mutation_id.load(Ordering::Relaxed), &req);
@@ -5220,6 +5422,7 @@ mod text_hidden_tests {
             hide: serde_json::json!({"success": true, "hidden": true}),
             restore: Some(serde_json::json!({"success": true, "hidden": false})),
             page_restored: Some(true),
+            warning: None,
         };
         let analyze = serde_json::to_value(
             AnalyzeResponse::of(
