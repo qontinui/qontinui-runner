@@ -1,12 +1,21 @@
 /**
  * FindingsTracker Service
  *
- * Comprehensive service for tracking categorized findings from AI analysis.
- * Parses structured output markers like [FINDING:category:severity] from AI output.
- * Manages execution reports and user input requests.
+ * Tracks categorized findings parsed from AI and terminal output, and manages
+ * execution reports and user input requests.
  *
- * This file has been refactored to use modules from src/findings/.
- * It maintains backward compatibility while delegating to focused modules.
+ * The line parser handles `[FINDING:category:severity]` ... `[/FINDING]`
+ * blocks ONLY. `processLine` has no side effect beyond this tracker's
+ * in-memory findings store and the events it emits to subscribers: output
+ * text is display data, never a trigger for IPC, a request, or an AI task
+ * (plan `2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task`;
+ * the import boundary is enforced in `eslint.config.js`).
+ *
+ * Separately from parsing, report completion persists findings through
+ * `../findings/FindingsPersistence` (a Tauri `save_findings_data` command) and
+ * syncs reports to the backend — a caller-invoked path, not a parser one.
+ *
+ * Delegates to the focused modules in src/findings/.
  */
 
 import { createLogger } from "@/lib/logger";
@@ -23,12 +32,6 @@ import type {
 import { getCategoryById } from "./FindingCategories";
 
 const logger = createLogger("FindingsTracker");
-import {
-  verificationService,
-  VerificationPendingMarker,
-  VerificationCompletedMarker,
-  VerificationFailedMarker,
-} from "./VerificationService";
 
 // Import from refactored modules
 import {
@@ -82,14 +85,6 @@ const LINE_PATTERN = /^Line:\s*(\d+)$/m;
 const QUESTION_PATTERN = /^Question:\s*(.+)$/m;
 const OPTIONS_PATTERN = /^Options:\s*(.+)$/m;
 const RESOLUTION_PATTERN = /^Resolution:\s*(.+)$/m;
-
-/**
- * Verification marker patterns
- * (These are not findings, but control flow markers)
- */
-const VERIFICATION_PENDING_PATTERN = /\[VERIFICATION:PENDING\]\s*(\{[\s\S]*?\})/;
-const VERIFICATION_COMPLETED_PATTERN = /\[VERIFICATION:COMPLETED\]\s*(\{[\s\S]*?\})/;
-const VERIFICATION_FAILED_PATTERN = /\[VERIFICATION:FAILED\]\s*(\{[\s\S]*?\})/;
 
 /**
  * Parse severity string to typed severity
@@ -279,45 +274,6 @@ export class FindingsTracker {
       }
 
       this.parsingBuffer = restOfLine + "\n";
-      return null;
-    }
-
-    // Check for [VERIFICATION:PENDING] - AI wants to save verification state
-    const verificationPendingMatch = line.match(VERIFICATION_PENDING_PATTERN);
-    if (verificationPendingMatch) {
-      try {
-        const payload = JSON.parse(verificationPendingMatch[1]) as VerificationPendingMarker;
-        logger.info("Verification pending detected:", payload.reason);
-        verificationService.savePendingVerification(payload);
-      } catch (error) {
-        console.error("[FindingsTracker] Failed to parse VERIFICATION:PENDING:", error);
-      }
-      return null;
-    }
-
-    // Check for [VERIFICATION:COMPLETED] - AI confirms fix worked
-    const verificationCompletedMatch = line.match(VERIFICATION_COMPLETED_PATTERN);
-    if (verificationCompletedMatch) {
-      try {
-        const payload = JSON.parse(verificationCompletedMatch[1]) as VerificationCompletedMarker;
-        logger.info("Verification completed:", payload.message);
-        verificationService.handleVerificationCompleted(payload);
-      } catch (error) {
-        console.error("[FindingsTracker] Failed to parse VERIFICATION:COMPLETED:", error);
-      }
-      return null;
-    }
-
-    // Check for [VERIFICATION:FAILED] - AI reports fix didn't work
-    const verificationFailedMatch = line.match(VERIFICATION_FAILED_PATTERN);
-    if (verificationFailedMatch) {
-      try {
-        const payload = JSON.parse(verificationFailedMatch[1]) as VerificationFailedMarker;
-        logger.info("Verification failed:", payload.message);
-        verificationService.handleVerificationFailed(payload);
-      } catch (error) {
-        console.error("[FindingsTracker] Failed to parse VERIFICATION:FAILED:", error);
-      }
       return null;
     }
 

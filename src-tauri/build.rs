@@ -1571,15 +1571,14 @@ mod stack_reserve_tests {
 
     /// Every `/STACK:<n>` value in `text`, in order.
     fn stack_values(text: &str) -> Vec<u64> {
-        text.match_indices("/STACK:")
-            .map(|(i, m)| {
-                let digits: String = text[i + m.len()..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
+        text.split("/STACK:")
+            .skip(1)
+            .enumerate()
+            .map(|(n, rest)| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 digits
                     .parse()
-                    .unwrap_or_else(|_| panic!("`/STACK:` with no number at byte {i}"))
+                    .unwrap_or_else(|_| panic!("`/STACK:` occurrence {n} has no number"))
             })
             .collect()
     }
