@@ -83,8 +83,10 @@ use qontinui_runner_lib::wind_down::{
 pub const ACTIVE_WINDOW_MS: i64 = 30 * 60 * 1000;
 
 /// How much of a transcript's tail is read to find its last message line.
-/// Only `busy`/`shell` records the pane could not decide pay it (single digits
-/// to low tens on a 250-session box), so it is bounded per request.
+/// Only records whose status the caller names pay it — `busy`/`shell` for
+/// the activity report ([`ACTIVITY_TRANSCRIPT_STATUSES`]), `idle` as well for
+/// the wind-down verdict's top-level terminal sessions
+/// ([`WIND_DOWN_TRANSCRIPT_STATUSES`]) — so it is bounded per request.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 /// The window `startedAt - process_start` must fall in for a record to
@@ -158,8 +160,9 @@ pub struct RecordEvidence {
     pub status: String,
     pub status_updated_at_ms: Option<i64>,
     /// Timestamp of the last real `user`/`assistant` transcript line, read
-    /// only for `busy`/`shell` records. `None` when not read, not located, or
-    /// no such line was in the tail.
+    /// only for the statuses the caller asked tails for (see
+    /// [`read_records_with`]). `None` when not read, not located, or no such
+    /// line was in the tail.
     pub last_message_ms: Option<i64>,
 }
 
@@ -416,10 +419,61 @@ impl Drop for InFlightRead {
     }
 }
 
+/// Why a bounded record read produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordReadMiss {
+    /// An earlier read holding the same flag is still running.
+    InFlight,
+    /// The blocking task failed (panicked or was cancelled).
+    Failed(String),
+    /// The read outlived its deadline; it is abandoned, not cancelled.
+    TimedOut,
+}
+
+impl std::fmt::Display for RecordReadMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InFlight => write!(f, "an earlier session-record read is still in flight"),
+            Self::Failed(e) => write!(f, "the session-record read failed ({e})"),
+            Self::TimedOut => write!(f, "the session-record read exceeded its deadline"),
+        }
+    }
+}
+
+/// Run one blocking record read off the async executor: one at a time per
+/// `flag` ([`InFlightRead`]), bounded by `timeout`. Everything blocking —
+/// config-dir discovery included — belongs inside `read`, so a slow home
+/// directory costs the records, never the caller's deadline. A miss is the
+/// caller's to report as unknown, never as idle.
+pub async fn read_records_bounded<F>(
+    flag: &'static std::sync::atomic::AtomicBool,
+    timeout: std::time::Duration,
+    read: F,
+) -> Result<HashMap<u32, RecordReading>, RecordReadMiss>
+where
+    F: FnOnce() -> HashMap<u32, RecordReading> + Send + 'static,
+{
+    let Some(guard) = InFlightRead::try_acquire(flag) else {
+        return Err(RecordReadMiss::InFlight);
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        // Released when the read ENDS (or unwinds), not when the caller stops
+        // waiting for it.
+        let _guard = guard;
+        read()
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(records)) => Ok(records),
+        Ok(Err(e)) => Err(RecordReadMiss::Failed(e.to_string())),
+        Err(_) => Err(RecordReadMiss::TimedOut),
+    }
+}
+
 /// Read Claude Code's record for each of `pids` across `config_dirs`.
 ///
 /// Each `sessions/` dir is listed ONCE and only the wanted `<pid>.json` files
-/// are opened; the transcript tail is read only for `busy`/`shell` records.
+/// are opened; the transcript tail is read only for `busy`/`shell` records
+/// ([`ACTIVITY_TRANSCRIPT_STATUSES`] — see [`read_records_with`] for others).
 /// `proc_start` is [`proc_start_ticks`] in production and injectable in tests.
 /// Blocking file I/O — call it off the async executor.
 pub fn read_records(
@@ -438,6 +492,10 @@ pub const ACTIVITY_TRANSCRIPT_STATUSES: &[&str] = &["busy", "shell"];
 /// record must also show a transcript quiet for the grace period. Every other
 /// status already rules a close out, so it pays no tail read.
 pub const WIND_DOWN_TRANSCRIPT_STATUSES: &[&str] = &["idle"];
+
+/// Both consumers' tails in one read — what `GET /restart-readiness` asks
+/// for, so its one pass serves the wind-down verdict and the activity report.
+pub const ALL_TRANSCRIPT_STATUSES: &[&str] = &["busy", "shell", "idle"];
 
 /// [`read_records`], reading the transcript tail for exactly the records whose
 /// status is in `transcript_statuses`.
@@ -559,6 +617,7 @@ mod tests {
             sideband,
             grid,
             prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+            screen_quiet_since_ms: Some(1_000),
         }
     }
 
@@ -1048,6 +1107,64 @@ mod tests {
             panic!("{:?}", activity[&30]);
         };
         assert_eq!(ev.last_message_ms, None);
+    }
+
+    /// A pid-reused or ambiguous record is never an idle one to the
+    /// wind-down verdict.
+    #[test]
+    fn wind_down_record_of_a_reused_or_ambiguous_pid_is_unknown() {
+        for reading in [
+            RecordReading::PidReused,
+            RecordReading::Ambiguous,
+            RecordReading::Missing,
+            RecordReading::Unparseable,
+        ] {
+            assert_eq!(
+                wind_down_record(&reading, NOW),
+                SessionRecord::UNKNOWN,
+                "{reading:?}"
+            );
+        }
+    }
+
+    /// The bounded reader's three misses — contended, failed, timed out —
+    /// each come back as a miss, never as an empty-but-successful read.
+    #[tokio::test]
+    async fn bounded_record_read_reports_every_miss() {
+        use std::sync::atomic::AtomicBool;
+        static OK: AtomicBool = AtomicBool::new(false);
+        let got = read_records_bounded(&OK, std::time::Duration::from_secs(5), || {
+            [(7, RecordReading::Missing)].into()
+        })
+        .await;
+        assert_eq!(got, Ok([(7, RecordReading::Missing)].into()));
+        assert!(!OK.load(std::sync::atomic::Ordering::SeqCst), "released");
+
+        static HELD: AtomicBool = AtomicBool::new(true);
+        let got =
+            read_records_bounded(&HELD, std::time::Duration::from_secs(5), HashMap::new).await;
+        assert_eq!(got, Err(RecordReadMiss::InFlight));
+
+        static PANICS: AtomicBool = AtomicBool::new(false);
+        let got = read_records_bounded(&PANICS, std::time::Duration::from_secs(5), || {
+            panic!("a record read that unwinds")
+        })
+        .await;
+        assert!(matches!(got, Err(RecordReadMiss::Failed(_))), "{got:?}");
+        assert!(
+            !PANICS.load(std::sync::atomic::Ordering::SeqCst),
+            "released on unwind"
+        );
+
+        static SLOW: AtomicBool = AtomicBool::new(false);
+        let got = read_records_bounded(&SLOW, std::time::Duration::from_millis(20), || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            HashMap::new()
+        })
+        .await;
+        assert_eq!(got, Err(RecordReadMiss::TimedOut));
+        // The abandoned read still holds the flag until it ends.
+        assert!(SLOW.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

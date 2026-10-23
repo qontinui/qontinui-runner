@@ -789,67 +789,50 @@ fn pids_needing_a_record(
 
 /// Assemble the activity evidence for one pass: the pane observations the
 /// wind-down observer already took, plus Claude Code's records for every
-/// process the pane could not decide, read from `config_dirs` off the
-/// executor and bounded by `read_timeout`. A read that fails or times out
-/// costs the records — those processes read `unknown`, never `idle`.
+/// process the pane could not decide. `prior` is the read the same pass
+/// already made for the wind-down verdict (`FreshPass::records`); only the
+/// processes it does not cover are read again, from `config_dirs()` — called
+/// inside the blocking section — off the executor and bounded by
+/// `read_timeout`. A read that fails or times out costs those records — the
+/// processes read `unknown`, never `idle`.
 /// `proc_start` is [`claude_activity::proc_start_ticks`] in production.
 ///
 /// `in_flight` admits ONE read at a time: while a read (even an abandoned,
 /// timed-out one) is still running, a new call skips the read and reports its
 /// undecided processes `unknown`. Production passes
 /// [`RECORD_READ_IN_FLIGHT`].
-pub async fn gather_activity_evidence(
+pub async fn gather_activity_evidence<D>(
     report: &TrackingHealthReport,
     observed: &ObservedInputs,
-    config_dirs: Vec<PathBuf>,
+    prior: HashMap<u32, claude_activity::RecordReading>,
+    config_dirs: D,
     proc_start: fn(u32) -> Option<String>,
     read_timeout: std::time::Duration,
     in_flight: &'static AtomicBool,
-) -> ActivityEvidence {
+) -> ActivityEvidence
+where
+    D: FnOnce() -> Vec<PathBuf> + Send + 'static,
+{
     let now_ms = chrono::Utc::now().timestamp_millis();
     let pane_by_pid = pane_observations_by_pid(report, observed);
-    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
-    let guard = if pids.is_empty() {
-        None
-    } else {
-        claude_activity::InFlightRead::try_acquire(in_flight)
-    };
-    let records = if pids.is_empty() {
-        HashMap::new()
-    } else if guard.is_none() {
-        // An earlier read is still running — it timed out and was abandoned,
-        // but a blocking thread cannot be cancelled. Starting another would
-        // leak one more thread per poll on a hung filesystem.
-        tracing::warn!(
-            "restart-readiness: a previous Claude Code session-record read is still in \
-             flight — skipped; every undecided process reads activity `unknown`"
-        );
-        HashMap::new()
-    } else {
-        let read = tokio::task::spawn_blocking(move || {
-            // Released when the read ENDS (or unwinds), not when the caller
-            // stops waiting for it.
-            let _guard = guard;
-            claude_activity::read_records(&config_dirs, &pids, &proc_start)
-        });
-        match tokio::time::timeout(read_timeout, read).await {
-            Ok(Ok(records)) => records,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "restart-readiness: Claude Code session-record read failed ({e}) — \
-                     every undecided process reads activity `unknown`"
-                );
-                HashMap::new()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "restart-readiness: Claude Code session-record read exceeded {read_timeout:?} — \
-                     every undecided process reads activity `unknown`"
-                );
-                HashMap::new()
-            }
+    let pids: Vec<LivePid> = pids_needing_a_record(report, &pane_by_pid, now_ms)
+        .into_iter()
+        .filter(|p| !prior.contains_key(&p.pid))
+        .collect();
+    let mut records = prior;
+    if !pids.is_empty() {
+        let read = claude_activity::read_records_bounded(in_flight, read_timeout, move || {
+            claude_activity::read_records(&config_dirs(), &pids, &proc_start)
+        })
+        .await;
+        match read {
+            Ok(read) => records.extend(read),
+            Err(miss) => tracing::warn!(
+                "restart-readiness: {miss} — every undecided process it would have \
+                 covered reads activity `unknown`"
+            ),
         }
-    };
+    }
     ActivityEvidence {
         pane_by_pid,
         records,
@@ -1349,11 +1332,17 @@ pub async fn restart_readiness_handler(
     // Phase 4 the wind-down executor reads the same one and does act on it,
     // while drained. Do not restore the old "DRY RUN" wording: it described the
     // verdict, and stopped being true of it.
-    let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
+    let fresh = wind_down_observer::fresh_pass(
+        app,
+        wind_down::grace_from_env(),
+        claude_activity::ALL_TRANSCRIPT_STATUSES,
+    )
+    .await;
     let wind_down_observer::FreshPass {
         pass,
         status_fetch,
         observed,
+        records: wind_down_records,
         unknowns: pass_unknowns,
     } = fresh;
     unknowns.extend(pass_unknowns);
@@ -1362,15 +1351,17 @@ pub async fn restart_readiness_handler(
     // ── The ACTIVITY axis (report-only; the verdict never reads it) ───────
     //
     // The pane half is the observation `fresh_pass` already took for the
-    // wind-down verdicts — no second look at any pane. The record half reads
-    // Claude Code's `sessions/<pid>.json` only for processes the pane did not
-    // decide, off the executor and under `RECORD_READ_TIMEOUT`.
+    // wind-down verdicts — no second look at any pane. The record half reuses
+    // the records that pass read (with `busy`/`shell` tails too) and reads
+    // Claude Code's `sessions/<pid>.json` only for the undecided processes it
+    // did not cover, off the executor and under `RECORD_READ_TIMEOUT`.
     let activity_evidence = match pass.as_ref() {
         Some(p) => {
             gather_activity_evidence(
                 &p.report,
                 &observed,
-                crate::terminal::transcript::find_claude_config_dirs(),
+                wind_down_records,
+                crate::terminal::transcript::find_claude_config_dirs,
                 claude_activity::proc_start_ticks,
                 RECORD_READ_TIMEOUT,
                 &RECORD_READ_IN_FLIGHT,
@@ -3130,6 +3121,7 @@ mod tests {
         sideband: Sideband::NeverReported,
         grid: GridIdle::Idle { since_ms: 1_000 },
         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+        screen_quiet_since_ms: Some(1_000),
     };
 
     #[test]
@@ -3273,6 +3265,7 @@ mod tests {
                         evidence: *evidence,
                     },
                     prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                    screen_quiet_since_ms: Some(1_000),
                 },
             );
         }
@@ -3447,6 +3440,7 @@ mod tests {
                             evidence: qontinui_runner_lib::wind_down::GridBusyEvidence::NoPrompt,
                         },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
                     },
                 ),
                 (
@@ -3458,6 +3452,7 @@ mod tests {
                         },
                         grid: GridIdle::Idle { since_ms: 1 },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
                     },
                 ),
                 (
@@ -3469,6 +3464,7 @@ mod tests {
                         },
                         grid: GridIdle::Idle { since_ms: 1 },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
                     },
                 ),
             ]
@@ -3643,6 +3639,29 @@ mod tests {
         Some("77".to_string())
     }
 
+    /// Review finding 3: one record read per pass. Readings the wind-down
+    /// pass already made are reused as-is — the config dirs are not even
+    /// consulted when they cover every undecided process.
+    #[tokio::test]
+    async fn gather_activity_evidence_reuses_the_passs_records() {
+        let report = activity_report();
+        let prior: HashMap<u32, claude_activity::RecordReading> = (1..=9)
+            .map(|pid| (pid, claude_activity::RecordReading::Missing))
+            .collect();
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            prior.clone(),
+            || -> Vec<PathBuf> { panic!("no second read when the pass's read covers it") },
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
+        )
+        .await;
+        assert_eq!(evidence.records, prior);
+    }
+
     /// L1: the handler's evidence assembly, end to end against a temp config
     /// dir — pane-decided processes, record-decided ones, and a missing
     /// record, summing to `total`.
@@ -3671,6 +3690,7 @@ mod tests {
                             evidence: qontinui_runner_lib::wind_down::GridBusyEvidence::NoPrompt,
                         },
                         prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
                     },
                 ),
                 ("t2".to_string(), IDLE_LONG_AGO),
@@ -3682,7 +3702,8 @@ mod tests {
         let evidence = gather_activity_evidence(
             &report,
             &observed,
-            vec![dir],
+            HashMap::new(),
+            move || vec![dir],
             kernel_agrees,
             RECORD_READ_TIMEOUT,
             &IN_FLIGHT,
@@ -3730,7 +3751,8 @@ mod tests {
         let evidence = gather_activity_evidence(
             &report,
             &ObservedInputs::default(),
-            vec![dir],
+            HashMap::new(),
+            move || vec![dir],
             slow_once,
             std::time::Duration::from_millis(20),
             &IN_FLIGHT,
@@ -3778,7 +3800,11 @@ mod tests {
             gather_activity_evidence(
                 report,
                 observed,
-                vec![dir.to_path_buf()],
+                HashMap::new(),
+                {
+                    let dir = dir.to_path_buf();
+                    move || vec![dir]
+                },
                 kernel,
                 std::time::Duration::from_millis(timeout_ms),
                 &IN_FLIGHT,

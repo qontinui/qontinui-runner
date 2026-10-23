@@ -56,13 +56,25 @@
 //!    (`transcript_age_unknown`).** The grace needs a clock to run from.
 //! 8. **Grace.** Eligible once `now >= since + grace`, where `since` is the
 //!    latest of the transcript's last `user`/`assistant` message, the sideband
-//!    set-time and — for a terminal session whose coord row carried it — the
-//!    time the `finished` declaration was made; before that,
-//!    [`Eligibility::NotYet`] with the instant it would become eligible. When
-//!    coord serves no transition time the declaration does not bound the
-//!    window. The grid's idle window is NOT one of the clocks any more: it is
-//!    reset by every repaint (an auto-updating footer churns it), and the
-//!    transcript records an operator's return directly.
+//!    set-time, the SCREEN-QUIET FLOOR, and — for a terminal session whose
+//!    coord row carried it — the time the `finished` declaration was made;
+//!    before that, [`Eligibility::NotYet`] with the instant it would become
+//!    eligible. When coord serves no transition time the declaration does not
+//!    bound the window.
+//!
+//!    The screen-quiet floor ([`ScreenQuietTracker`]) is the latest time THIS
+//!    PROCESS observed the pane's screen change, or its first observation of
+//!    the pane. It keeps two properties the transcript clock alone loses:
+//!    the window can never predate the process (after a runner start or a
+//!    handoff-adopted pane, a full grace must pass under this process's eyes,
+//!    however old the transcript is), and operator activity that writes no
+//!    transcript message — a local slash command, a menu, a draft typed and
+//!    deleted — restarts the window when an observation sees it. It hashes
+//!    screen CONTENT rather than reading the grid generation, so a status
+//!    line that is redrawn unchanged does not reset it, and it skips the
+//!    context-hint row whose update notice churns on an idle pane
+//!    (`looping_agent::idle::screen_fingerprint`). A change that comes and
+//!    goes entirely between two observations is not seen.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -297,8 +309,12 @@ pub struct EligibilityInputs {
     pub work_status: WorkStatus,
     pub sideband: Sideband,
     pub grid: GridIdle,
-    /// The pane's input area — the grid's veto (rule 7).
+    /// The pane's input area — the grid's veto (rule 4).
     pub prompt: PromptScreen,
+    /// Since when THIS PROCESS has seen the pane's screen unchanged
+    /// ([`ScreenQuietTracker`]) — the per-process floor of the grace clock.
+    /// `None` when the pane could not be observed.
+    pub screen_quiet_since_ms: Option<i64>,
     /// Claude Code's own record and the transcript's last-message time.
     pub record: SessionRecord,
     /// `None` when the process snapshot could not answer.
@@ -419,7 +435,10 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
             reason: UnknownReason::SidebandUnreadable,
         };
     }
-    if inputs.grid == GridIdle::Unknown || inputs.prompt == PromptScreen::Unknown {
+    if inputs.grid == GridIdle::Unknown
+        || inputs.prompt == PromptScreen::Unknown
+        || inputs.screen_quiet_since_ms.is_none()
+    {
         return Eligibility::Unknown {
             reason: UnknownReason::GridUnknown,
         };
@@ -485,9 +504,12 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
     };
 
     // (8) Grace, from the latest of the clocks: the transcript's last
-    // message, the sideband report, and (terminal sessions only) the
-    // `finished` declaration.
+    // message, the sideband report, the screen-quiet floor, and (terminal
+    // sessions only) the `finished` declaration.
     let mut since_ms = sideband_set_at.map_or(last_message_ms, |s| s.max(last_message_ms));
+    if let Some(quiet_since) = inputs.screen_quiet_since_ms {
+        since_ms = since_ms.max(quiet_since);
+    }
     if finished_required {
         if let Some(finished_at) = inputs.finished_at_ms {
             since_ms = since_ms.max(finished_at);
@@ -550,6 +572,50 @@ impl WindDownView {
 
     pub fn is_eligible(&self) -> bool {
         self.eligibility == "eligible"
+    }
+}
+
+/// The per-process floor of the grace clock: since when this process has seen
+/// one pane's screen unchanged. One per terminal; see rule 8 in the module
+/// docs.
+///
+/// The first observation starts the window at its own instant — a pane this
+/// process has just started watching has been quiet for no time at all, as
+/// far as it can prove. A fingerprint that differs from the previous
+/// observation's restarts it. An observation older than the last one recorded
+/// (a concurrent observer arriving late) returns the recorded floor unchanged,
+/// so the floor never moves backwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScreenQuietTracker {
+    last: Option<QuietObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuietObservation {
+    fingerprint: u64,
+    observed_at_ms: i64,
+    quiet_since_ms: i64,
+}
+
+impl ScreenQuietTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one observation of the screen's `fingerprint` at
+    /// `observed_at_ms`, and return since when it has been unchanged.
+    pub fn observe(&mut self, fingerprint: u64, observed_at_ms: i64) -> i64 {
+        let quiet_since_ms = match self.last {
+            Some(last) if observed_at_ms < last.observed_at_ms => return last.quiet_since_ms,
+            Some(last) if last.fingerprint == fingerprint => last.quiet_since_ms,
+            _ => observed_at_ms,
+        };
+        self.last = Some(QuietObservation {
+            fingerprint,
+            observed_at_ms,
+            quiet_since_ms,
+        });
+        quiet_since_ms
     }
 }
 
@@ -675,6 +741,7 @@ mod tests {
             sideband: Sideband::NeverReported,
             grid: GridIdle::Idle { since_ms: 1_000 },
             prompt: PromptScreen::Ready,
+            screen_quiet_since_ms: Some(1_000),
             record: IDLE_RECORD,
             has_live_children: Some(false),
             finished_at_ms: None,
@@ -990,6 +1057,79 @@ mod tests {
         let i = eligible_terminal();
         assert_eq!(i.sideband, Sideband::NeverReported);
         assert!(eligibility(&i, i64::MAX).is_eligible());
+    }
+
+    // ---- the screen-quiet floor (review of plan
+    //      2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-
+    //      for-a-spinner, finding 2) ------------------------------------------
+
+    /// After a runner start (or a handoff-adopted pane) the tracker's first
+    /// observation is the floor: an hours-old transcript does not make the
+    /// session eligible on the first tick — a full grace must pass first.
+    #[test]
+    fn the_first_observation_by_this_process_floors_the_grace_clock() {
+        let start = 50_000_000;
+        let mut t = ScreenQuietTracker::new();
+        let mut i = eligible_terminal(); // transcript quiet since t=1000
+        i.screen_quiet_since_ms = Some(t.observe(7, start));
+        assert_eq!(
+            eligibility(&i, start),
+            Eligibility::NotYet {
+                since_ms: start,
+                until_ms: start + GRACE_MS
+            }
+        );
+        i.screen_quiet_since_ms = Some(t.observe(7, start + GRACE_MS - 1));
+        assert!(!eligibility(&i, start + GRACE_MS - 1).is_eligible());
+        i.screen_quiet_since_ms = Some(t.observe(7, start + GRACE_MS));
+        assert_eq!(
+            eligibility(&i, start + GRACE_MS),
+            Eligibility::Eligible { since_ms: start }
+        );
+    }
+
+    /// Operator activity that writes no transcript message still changes the
+    /// screen, and a changed screen restarts the window.
+    #[test]
+    fn a_screen_change_restarts_the_window() {
+        let mut t = ScreenQuietTracker::new();
+        let mut i = eligible_terminal();
+        assert_eq!(t.observe(1, 1_000), 1_000);
+        i.screen_quiet_since_ms = Some(t.observe(1, 1_000 + GRACE_MS));
+        assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible());
+        // A draft typed (and later deleted) between ticks.
+        let changed = 1_000 + GRACE_MS + 30_000;
+        i.screen_quiet_since_ms = Some(t.observe(2, changed));
+        assert_eq!(
+            eligibility(&i, changed),
+            Eligibility::NotYet {
+                since_ms: changed,
+                until_ms: changed + GRACE_MS
+            }
+        );
+        i.screen_quiet_since_ms = Some(t.observe(1, changed + 30_000));
+        assert_eq!(i.screen_quiet_since_ms, Some(changed + 30_000));
+        // A late, older observation never moves the floor backwards.
+        assert_eq!(t.observe(9, changed), changed + 30_000);
+        assert_eq!(t.observe(1, changed + 60_000), changed + 30_000);
+    }
+
+    /// An old transcript ALONE never makes a session eligible early, and an
+    /// unobserved floor is unknown, never "quiet forever".
+    #[test]
+    fn an_old_transcript_alone_is_not_enough() {
+        let mut i = eligible_terminal();
+        i.record.last_message_ms = Some(0);
+        i.screen_quiet_since_ms = Some(900_000);
+        assert!(!eligibility(&i, 900_000 + GRACE_MS - 1).is_eligible());
+        assert!(eligibility(&i, 900_000 + GRACE_MS).is_eligible());
+        i.screen_quiet_since_ms = None;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Unknown {
+                reason: UnknownReason::GridUnknown
+            }
+        );
     }
 
     // ---- rules 3 and 4: the record decides, the screen vetoes ---------------

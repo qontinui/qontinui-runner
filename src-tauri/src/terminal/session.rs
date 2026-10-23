@@ -1544,6 +1544,11 @@ pub struct TerminalSession {
     /// grid generation has not moved between observations
     /// ([`qontinui_runner_lib::wind_down::GridIdleTracker`]).
     grid_idle_tracker: Mutex<qontinui_runner_lib::wind_down::GridIdleTracker>,
+    /// Since when THIS process has seen the screen unchanged — the per-process
+    /// floor of the wind-down grace clock
+    /// ([`qontinui_runner_lib::wind_down::ScreenQuietTracker`]). A pane adopted
+    /// after a runner start gets a fresh one, so its window starts here.
+    screen_quiet_tracker: Mutex<qontinui_runner_lib::wind_down::ScreenQuietTracker>,
     /// Unix timestamp in milliseconds when the session was created.
     created_at: u64,
     /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
@@ -2532,6 +2537,9 @@ impl TerminalSession {
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
+            screen_quiet_tracker: Mutex::new(
+                qontinui_runner_lib::wind_down::ScreenQuietTracker::new(),
+            ),
             on_exit,
             exit_snapshot,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
@@ -4624,6 +4632,28 @@ impl TerminalSession {
         }
     }
 
+    /// One screen read for the wind-down verdict: the input-area screen the
+    /// grid's veto judges, and since when this process has seen the screen
+    /// unchanged (`None` on a poisoned tracker — never a fresh window, which
+    /// would be a confident "quiet since now" on a failure).
+    pub fn observe_screen_quiet(
+        &self,
+    ) -> (crate::terminal::graceful_exit::ScreenText, Option<i64>) {
+        let screen = self.grid_screen();
+        let fingerprint = qontinui_runner_lib::looping_agent::idle::screen_fingerprint(
+            &screen.lines,
+            screen.cursor_row,
+            screen.cursor_col,
+        );
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        let since = self
+            .screen_quiet_tracker
+            .lock()
+            .ok()
+            .map(|mut tracker| tracker.observe(fingerprint, observed_at_ms));
+        (screen, since)
+    }
+
     /// Debounced idle gate: the grid looks idle
     /// ([`qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle`]), and
     /// after `debounce` it still looks idle AND renders identical text — nothing
@@ -5643,10 +5673,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Construct a minimum-viable `TerminalSession` whose `writer` field
-    /// is a `CapturingWriter` and whose other fields are inert. The
-    /// reader/waiter threads are NOT spawned — `submit_prompt` only
-    /// touches `self.writer`, so this is enough.
     /// [`make_test_session`], marked alive so a paste reaches its writer.
     pub(crate) fn make_live_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let session = make_test_session(buf);
@@ -5654,6 +5680,10 @@ pub(crate) mod tests {
         session
     }
 
+    /// Construct a minimum-viable `TerminalSession` whose `writer` field
+    /// is a `CapturingWriter` and whose other fields are inert. The
+    /// reader/waiter threads are NOT spawned — `submit_prompt` only
+    /// touches `self.writer`, so this is enough.
     pub(crate) fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
@@ -5695,6 +5725,9 @@ pub(crate) mod tests {
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
+            screen_quiet_tracker: Mutex::new(
+                qontinui_runner_lib::wind_down::ScreenQuietTracker::new(),
+            ),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             // No real Tauri app in unit fixtures — the input-line warn
@@ -6165,6 +6198,27 @@ pub(crate) mod tests {
             panic!("still idle");
         };
         assert!(restarted > first, "{restarted} > {first}");
+    }
+
+    /// The grace floor: the first observation by this process starts it, an
+    /// unchanged screen keeps it, a typed character restarts it.
+    #[test]
+    fn observe_screen_quiet_floors_at_first_sight_and_restarts_on_change() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let feed = |bytes: &str| {
+            let grid = session.grid();
+            let mut g = grid.lock().unwrap();
+            g.feed(&mut vte::Parser::new(), bytes.as_bytes());
+        };
+        feed(EMPTY_PROMPT);
+        let (_, first) = session.observe_screen_quiet();
+        let first = first.expect("a healthy tracker answers");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(session.observe_screen_quiet().1, Some(first));
+        feed("x");
+        std::thread::sleep(Duration::from_millis(5));
+        let (_, after) = session.observe_screen_quiet();
+        assert!(after.unwrap() > first);
     }
 
     /// A busy observation carries the clause that vetoed idle, and a

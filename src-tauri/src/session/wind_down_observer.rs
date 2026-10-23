@@ -172,13 +172,26 @@ pub struct FreshPass {
     pub pass: Option<TrackingHealthPass>,
     pub status_fetch: StatusFetch,
     pub observed: ObservedInputs,
+    /// Claude Code's records for the pass's top-level terminal-hosted
+    /// processes, as read for the verdict — handed on so `GET
+    /// /restart-readiness`'s activity report does not read them a second
+    /// time. Empty when the read missed.
+    pub records: HashMap<u32, claude_activity::RecordReading>,
     /// Human-readable reasons the pass is incomplete, in the order they were
     /// discovered. `/restart-readiness` renders these verbatim.
     pub unknowns: Vec<String>,
 }
 
-/// Compute + observe one fresh pass. See [`FreshPass`].
-pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
+/// Compute + observe one fresh pass. See [`FreshPass`]. `tails` names the
+/// record statuses whose transcript tail is read:
+/// [`claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES`] for a caller that only
+/// needs the verdict, [`claude_activity::ALL_TRANSCRIPT_STATUSES`] for one
+/// that will also report activity from the same read.
+pub async fn fresh_pass(
+    app: &tauri::AppHandle,
+    grace: Duration,
+    tails: &'static [&'static str],
+) -> FreshPass {
     use tauri::Manager;
 
     let mut unknowns: Vec<String> = Vec::new();
@@ -257,14 +270,16 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
         }
     };
 
+    let mut records = HashMap::new();
     let observed = match pass.as_mut() {
         Some(p) => {
-            let records = read_wind_down_records(&p.report).await;
+            records = read_wind_down_records(wind_down_pids(&p.report), tails).await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
             observe_and_apply(
                 app,
                 p,
                 &status_fetch.finished_at_by_session_id,
-                &records,
+                &wind_down_records(&records, now_ms),
                 grace,
             )
         }
@@ -275,6 +290,7 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
         pass,
         status_fetch,
         observed,
+        records,
         unknowns,
     }
 }
@@ -311,7 +327,7 @@ pub async fn recheck(
     claude_session_id: &str,
     terminal_id: &str,
 ) -> Option<WindDownView> {
-    let fresh = fresh_pass(app, grace).await;
+    let fresh = fresh_pass(app, grace, claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES).await;
     // The pane must still host this session: a terminal id that has been
     // rebound to another session since the tick's first pass is not the pane
     // whose verdict we are re-checking.
@@ -339,13 +355,11 @@ pub const RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 static RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Claude Code's record for every top-level terminal-hosted process in the
-/// report, reduced to the wind-down input. The transcript tail is read for
-/// `idle` records too (the grace runs from the last message). Empty — every
-/// process `record_unknown` — when the read fails, times out, or an earlier
-/// read is still running.
-async fn read_wind_down_records(report: &TrackingHealthReport) -> HashMap<u32, SessionRecord> {
-    let pids: Vec<claude_activity::LivePid> = report
+/// The top-level terminal-hosted processes of `report` — the ones a verdict
+/// is computed for — with the census's process start for the record's
+/// identity check.
+fn wind_down_pids(report: &TrackingHealthReport) -> Vec<claude_activity::LivePid> {
+    report
         .terminal_hosted
         .iter()
         .filter(|p| !p.nested_under_claude)
@@ -353,44 +367,68 @@ async fn read_wind_down_records(report: &TrackingHealthReport) -> HashMap<u32, S
             pid: p.pid,
             process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
         })
-        .collect();
+        .collect()
+}
+
+/// Claude Code's record for every top-level terminal-hosted process, read
+/// ONCE per pass through [`claude_activity::read_records_bounded`] with
+/// transcript tails for `tails`. Config-dir discovery runs inside the
+/// blocking, timed section. Empty — every process `record_unknown`, which is
+/// never closable — on any miss.
+async fn read_wind_down_records(
+    pids: Vec<claude_activity::LivePid>,
+    tails: &'static [&'static str],
+) -> HashMap<u32, claude_activity::RecordReading> {
+    read_wind_down_records_with(
+        &RECORD_READ_IN_FLIGHT,
+        RECORD_READ_TIMEOUT,
+        pids,
+        move |pids| {
+            claude_activity::read_records_with(
+                &crate::terminal::transcript::find_claude_config_dirs(),
+                &pids,
+                &claude_activity::proc_start_ticks,
+                tails,
+            )
+        },
+    )
+    .await
+}
+
+/// [`read_wind_down_records`] with its flag, deadline and reader injected —
+/// the seam its miss handling is tested through.
+async fn read_wind_down_records_with<F>(
+    flag: &'static std::sync::atomic::AtomicBool,
+    timeout: Duration,
+    pids: Vec<claude_activity::LivePid>,
+    read: F,
+) -> HashMap<u32, claude_activity::RecordReading>
+where
+    F: FnOnce(Vec<claude_activity::LivePid>) -> HashMap<u32, claude_activity::RecordReading>
+        + Send
+        + 'static,
+{
     if pids.is_empty() {
         return HashMap::new();
     }
-    let Some(guard) = claude_activity::InFlightRead::try_acquire(&RECORD_READ_IN_FLIGHT) else {
-        tracing::warn!(
-            "wind-down: a previous Claude Code session-record read is still in flight — \
-             skipped; every session reads record_unknown"
-        );
-        return HashMap::new();
-    };
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let read = tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        claude_activity::read_records_with(
-            &config_dirs,
-            &pids,
-            &claude_activity::proc_start_ticks,
-            claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES,
-        )
-    });
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    match tokio::time::timeout(RECORD_READ_TIMEOUT, read).await {
-        Ok(Ok(readings)) => readings
-            .iter()
-            .map(|(pid, reading)| (*pid, claude_activity::wind_down_record(reading, now_ms)))
-            .collect(),
-        Ok(Err(e)) => {
-            tracing::warn!("wind-down: Claude Code session-record read failed ({e})");
-            HashMap::new()
-        }
-        Err(_) => {
-            tracing::warn!(
-                "wind-down: Claude Code session-record read exceeded {RECORD_READ_TIMEOUT:?}"
-            );
+    match claude_activity::read_records_bounded(flag, timeout, move || read(pids)).await {
+        Ok(readings) => readings,
+        Err(miss) => {
+            tracing::warn!("wind-down: {miss} — every session reads record_unknown");
             HashMap::new()
         }
     }
+}
+
+/// The wind-down record input for each reading.
+pub fn wind_down_records(
+    readings: &HashMap<u32, claude_activity::RecordReading>,
+    now_ms: i64,
+) -> HashMap<u32, SessionRecord> {
+    readings
+        .iter()
+        .map(|(pid, reading)| (*pid, claude_activity::wind_down_record(reading, now_ms)))
+        .collect()
 }
 
 /// What one terminal pane showed wind-down.
@@ -401,6 +439,9 @@ pub struct TerminalObservation {
     /// The input area, judged by `graceful_exit::exit_input_area_clear` — the
     /// grid's veto on a close (unsent draft, dialog, no prompt).
     pub prompt: PromptScreen,
+    /// Since when this process has seen the pane's screen unchanged — the
+    /// grace clock's per-process floor. `None` when it could not be read.
+    pub screen_quiet_since_ms: Option<i64>,
 }
 
 impl TerminalObservation {
@@ -409,6 +450,7 @@ impl TerminalObservation {
         sideband: Sideband::Unreadable,
         grid: GridIdle::Unknown,
         prompt: PromptScreen::Unknown,
+        screen_quiet_since_ms: None,
     };
 }
 
@@ -512,6 +554,7 @@ pub fn wind_down_for_process(
         sideband: observation.sideband,
         grid: observation.grid,
         prompt: observation.prompt,
+        screen_quiet_since_ms: observation.screen_quiet_since_ms,
         // No record read for this pid (none found, a failed or timed-out
         // read) is UNKNOWN, which is never closable.
         record: records
@@ -573,11 +616,15 @@ pub fn observe_terminals(
         .into_iter()
         .map(|terminal_id| {
             let observation = match manager.and_then(|m| m.get(&terminal_id)) {
-                Some(session) => TerminalObservation {
-                    sideband: sideband_from(session.last_agent_status()),
-                    grid: session.observe_grid_idle(),
-                    prompt: prompt_screen_from(&session.grid_screen()),
-                },
+                Some(session) => {
+                    let (screen, screen_quiet_since_ms) = session.observe_screen_quiet();
+                    TerminalObservation {
+                        sideband: sideband_from(session.last_agent_status()),
+                        grid: session.observe_grid_idle(),
+                        prompt: prompt_screen_from(&screen),
+                        screen_quiet_since_ms,
+                    }
+                }
                 None => TerminalObservation::UNOBSERVABLE,
             };
             (terminal_id, observation)
@@ -697,6 +744,7 @@ mod tests {
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 1_000 },
                 prompt: PromptScreen::Ready,
+                screen_quiet_since_ms: Some(1_000),
             },
         )]
         .into();
@@ -777,6 +825,94 @@ mod tests {
             prompt_screen_from(&clean_but_odd_wording),
             PromptScreen::Ready
         );
+    }
+
+    /// A record read that is contended, unwinds, or times out leaves every
+    /// session `record_unknown` — never closable.
+    #[tokio::test]
+    async fn a_missed_record_read_makes_every_session_record_unknown() {
+        use std::sync::atomic::AtomicBool;
+        let pids = vec![claude_activity::LivePid {
+            pid: 1,
+            process_started_ms: None,
+        }];
+        let idle_reading = || -> HashMap<u32, claude_activity::RecordReading> {
+            [(
+                1,
+                claude_activity::RecordReading::Parsed(claude_activity::RecordEvidence {
+                    status: "idle".to_string(),
+                    status_updated_at_ms: Some(1),
+                    last_message_ms: Some(1),
+                }),
+            )]
+            .into()
+        };
+        static HELD: AtomicBool = AtomicBool::new(true);
+        static PANICS: AtomicBool = AtomicBool::new(false);
+        static SLOW: AtomicBool = AtomicBool::new(false);
+        static OK: AtomicBool = AtomicBool::new(false);
+        let contended =
+            read_wind_down_records_with(&HELD, Duration::from_secs(5), pids.clone(), move |_| {
+                idle_reading()
+            })
+            .await;
+        let unwound = read_wind_down_records_with(
+            &PANICS,
+            Duration::from_secs(5),
+            pids.clone(),
+            |_| -> HashMap<u32, claude_activity::RecordReading> { panic!("unwinds") },
+        )
+        .await;
+        let timed_out = read_wind_down_records_with(
+            &SLOW,
+            Duration::from_millis(20),
+            pids.clone(),
+            move |_| {
+                std::thread::sleep(Duration::from_millis(300));
+                idle_reading()
+            },
+        )
+        .await;
+        let ok =
+            read_wind_down_records_with(&OK, Duration::from_secs(5), pids, move |_| idle_reading())
+                .await;
+
+        let reason = |readings: &HashMap<u32, claude_activity::RecordReading>| {
+            let terminal_by_session: HashMap<String, String> =
+                [("s".to_string(), "t".to_string())].into();
+            let observations: HashMap<String, TerminalObservation> = [(
+                "t".to_string(),
+                TerminalObservation {
+                    sideband: Sideband::NeverReported,
+                    grid: GridIdle::Idle { since_ms: 1 },
+                    prompt: PromptScreen::Ready,
+                    screen_quiet_since_ms: Some(1),
+                },
+            )]
+            .into();
+            wind_down_for_process(
+                &process(Some("s"), Some("finished")),
+                &terminal_by_session,
+                &observations,
+                &HashMap::new(),
+                &wind_down_records(readings, 10),
+                &HashSet::new(),
+                &HashSet::new(),
+                Duration::from_secs(600),
+                i64::MAX,
+            )
+            .unwrap()
+            .reason
+        };
+        for (what, readings) in [
+            ("contended", &contended),
+            ("unwound", &unwound),
+            ("timed out", &timed_out),
+        ] {
+            assert!(readings.is_empty(), "{what}");
+            assert_eq!(reason(readings), Some("record_unknown"), "{what}");
+        }
+        assert_eq!(reason(&ok), None, "the control: an idle record is eligible");
     }
 
     #[test]
