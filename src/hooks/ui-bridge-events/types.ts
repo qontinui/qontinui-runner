@@ -231,6 +231,10 @@ export type UIBridgeRequestType =
   | "clear_network_stubs"
   // Non-consuming stub verification (N3)
   | "verify_network_stub"
+  // Text visibility — dev control (plan
+  // 2026-10-13-image-generation-and-visual-judgment, Phase 16); backs
+  // POST /ui-bridge/control/text-visibility and vision captureTextHidden.
+  | "text_visibility"
   // Toast ring buffer (GET /control/toasts)
   | "get_toast_buffer"
   // Spec execution (POST /control/spec/{id}/run)
@@ -332,7 +336,8 @@ export type PageEventTypes =
   | "list_network_stubs"
   | "delete_network_stub"
   | "clear_network_stubs"
-  | "verify_network_stub";
+  | "verify_network_stub"
+  | "text_visibility";
 
 export type DesignEventTypes =
   | "design_get_snapshot"

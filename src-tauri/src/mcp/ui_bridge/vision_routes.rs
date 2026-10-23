@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -489,6 +489,20 @@ pub struct MutationOccurredResponse {
 /// — the bounded permit pool (size 2) prevents thrash under multi-agent load;
 /// it is harmless overhead for CapturePreview.
 pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
+    capture_runner_window(state, true).await
+}
+
+/// [`capture_runner_window_frame`] for a caller already holding the capture
+/// permits — the `captureTextHidden` arm, which takes them before frame A and
+/// holds them through frame B.
+async fn capture_runner_window_frame_permitted(state: &Arc<ApiState>) -> Result<Frame, String> {
+    capture_runner_window(state, false).await
+}
+
+/// The runner-window capture: the window probe first, then (when
+/// `take_permit`) a permit from `state.vision_capture_semaphore`, then the
+/// backend ladder.
+async fn capture_runner_window(state: &Arc<ApiState>, take_permit: bool) -> Result<Frame, String> {
     use tauri::Manager;
 
     let window = state
@@ -504,17 +518,28 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
         .await
         .map_err(|e| e.to_string())?;
 
+    // The probe above runs BEFORE the permit is taken, so a caller queued for a
+    // permit does not hold one across a blocking event-loop round-trip. The
+    // trade-off: if the window moves or resizes while this waits, the
+    // monitor-crop fallback crops at the probed (stale) geometry. CapturePreview
+    // reads the webview itself and is unaffected.
+    let _permit = if take_permit {
+        Some(
+            state
+                .vision_capture_semaphore
+                .acquire()
+                .await
+                .map_err(|e| format!("capture semaphore acquire: {}", e))?,
+        )
+    } else {
+        None
+    };
+
     let scale = geometry.scale;
     let x = geometry.x;
     let y = geometry.y;
     let w = geometry.width;
     let h = geometry.height;
-
-    let _permit = state
-        .vision_capture_semaphore
-        .acquire()
-        .await
-        .map_err(|e| format!("capture semaphore acquire: {}", e))?;
 
     // Prefer occlusion-immune WebView2 CapturePreview on Windows.
     #[cfg(windows)]
@@ -641,9 +666,16 @@ fn record_capture_fallback_inner(
 /// (contract, region, element, annotations, redact) all participate via
 /// Debug-format hashing so any parameter change flips the key.
 fn compose_capture_cache_key(state: &Arc<ApiState>, req: &CaptureRequest) -> [u8; 32] {
-    let mut_id = state
-        .vision_mutation_id
-        .load(std::sync::atomic::Ordering::Relaxed);
+    capture_cache_key(
+        state
+            .vision_mutation_id
+            .load(std::sync::atomic::Ordering::Relaxed),
+        req,
+    )
+}
+
+/// [`compose_capture_cache_key`] over an already-read mutation id.
+fn capture_cache_key(mut_id: u64, req: &CaptureRequest) -> [u8; 32] {
     let s = format!("v=1|mut={mut_id}|req={req:?}");
     qontinui_vision_core::sha256_of(s.as_bytes())
 }
@@ -2075,6 +2107,496 @@ impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
     }
 }
 
+// ============================================================================
+// Frame B — the text-hidden twin (plan 2026-10-13-image-generation-and-visual-
+// judgment, Phase 16)
+// ============================================================================
+
+/// A caller-supplied frame B: the same page as the frame this call captures,
+/// taken with every glyph transparent (the SDK's dev-only
+/// `control/text-visibility`). vision-core's `text_over_image_contrast` and the
+/// `image` analyzer's per-image `text_contrast` read it; without it they answer
+/// `unknown{needs_multi_frame_input}`.
+///
+/// Exactly one of the two fields: a base64 PNG, or the sha256 of a
+/// `vision/cache` PNG entry (what `vision/capture` returns — take it with
+/// `contract: "png_strict"`, which neither resizes nor re-encodes lossily).
+/// Only a PNG with frame A's exact pixel size is accepted, and it is decoded
+/// under limits sized to that frame. A PNG carries no device pixel ratio, so
+/// frame B is read at the scale factor of the frame this call captured, as
+/// `vision-audit --frame-text-hidden` reads it at `--frame`'s. A base64 frame
+/// rides in the request body, which these two routes accept up to
+/// [`VISION_FRAME_BODY_LIMIT`] (32 MiB); pass a larger one by `sha256`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TextHiddenFrameRequest {
+    #[serde(default)]
+    pub png_base64: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// The request-body ceiling of `vision/analyze` and `vision/assert`, raised
+/// from axum's 2 MiB `Json` default so a base64 frame B fits.
+pub(crate) const VISION_FRAME_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// The decode ceiling for a supplied frame B: its pixels as RGBA, with room
+/// for the decoder's own buffers. Frame A's size bounds it first.
+const TEXT_HIDDEN_FRAME_MAX_ALLOC: u64 = 512 * 1024 * 1024;
+
+/// Refuse a frame-B request that cannot be honoured, before anything is
+/// captured or hidden. `reads_frame_b` says whether the analysis asked for
+/// reads frame B at all (the `image` analyzer, or a `text_over_image_contrast`
+/// assertion): hiding the runner's text for a frame nothing reads alters the
+/// page for nothing, so `captureTextHidden` is refused without one.
+fn check_text_hidden_request(
+    supplied: Option<&TextHiddenFrameRequest>,
+    ids: Option<&[String]>,
+    capture: bool,
+    target: Option<&str>,
+    reads_frame_b: bool,
+) -> Result<(), String> {
+    if ids.is_some() && supplied.is_none() {
+        return Err(if capture {
+            "textHiddenIds goes with a supplied textHiddenFrame; under captureTextHidden the \
+             runner reports which elements its own hide covered"
+                .into()
+        } else {
+            "textHiddenIds names the elements hidden in textHiddenFrame, and no \
+             textHiddenFrame was supplied"
+                .into()
+        });
+    }
+    if capture && supplied.is_some() {
+        return Err(
+            "textHiddenFrame and captureTextHidden are exclusive: frame B is either \
+             supplied or captured here, not both"
+                .into(),
+        );
+    }
+    if capture {
+        if let Some(target) = target {
+            return Err(format!(
+                "captureTextHidden hides text in the runner's OWN webview only, and this call \
+                 targets '{target}'; capture frame B there (inject-cli for a web page) and \
+                 pass it as textHiddenFrame"
+            ));
+        }
+        if !reads_frame_b {
+            return Err(
+                "captureTextHidden hides the page's text for frame B, and nothing in this \
+                 request reads frame B: use the `image` analyzer or a \
+                 `text_over_image_contrast` assertion"
+                    .into(),
+            );
+        }
+    }
+    if supplied.is_some() && !reads_frame_b {
+        return Err(
+            "textHiddenFrame is frame B, and nothing in this request reads frame B: use the \
+             `image` analyzer or a `text_over_image_contrast` assertion"
+                .into(),
+        );
+    }
+    if let Some(f) = supplied {
+        match (&f.png_base64, &f.sha256) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err("textHiddenFrame takes exactly one of pngBase64 or sha256".into())
+            }
+            (None, Some(sha)) if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) => {
+                return Err("textHiddenFrame.sha256 must be 64 hex chars".into())
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse frame B to a caller that may not drive it: `captureTextHidden` alters
+/// the runner's own page (the direct `control/text-visibility` route is a
+/// credential door, and `captureTextHidden` must not be a way around it), and a
+/// supplied `textHiddenFrame` makes the runner read a vision-cache file or
+/// decode a caller's image. Only a NonBrowser or FirstParty requester may ask
+/// for either — the origin guard's own classification
+/// ([`RequesterPrincipal`]); an absent principal is UNKNOWN and refused.
+/// Answered with 403, before anything is captured, hidden or decoded.
+fn refuse_untrusted_frame_b(
+    principal: Option<&crate::mcp::origin_guard::RequesterPrincipal>,
+    supplied: bool,
+    capture: bool,
+) -> Result<(), String> {
+    use crate::mcp::origin_guard::OriginClass;
+    if !supplied && !capture {
+        return Ok(());
+    }
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "{} is reachable only from a non-browser caller or the runner's own UI \
+             (requester class: {})",
+            if capture {
+                "captureTextHidden hides the runner's text and"
+            } else {
+                "textHiddenFrame reads the vision cache or decodes a caller image and"
+            },
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
+}
+
+/// Decode a caller-supplied frame B: a PNG of exactly `expected` (frame A's
+/// width and height) pixels, read at `scale_factor` (frame A's). The header is
+/// read first and anything else refused before a pixel is decoded; the decode
+/// runs under [`image::Limits`] sized to frame A. `cache_root` is the
+/// `vision/cache` root a `sha256` is looked up under. Blocking: call it from
+/// the blocking pool.
+fn decode_text_hidden_frame(
+    supplied: &TextHiddenFrameRequest,
+    scale_factor: f64,
+    expected: (u32, u32),
+    cache_root: &StdPath,
+) -> Result<Frame, String> {
+    use base64::Engine as _;
+    use std::io::Cursor;
+    let bytes = match (&supplied.png_base64, &supplied.sha256) {
+        (Some(b64), None) => base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|e| format!("textHiddenFrame.pngBase64 is not base64: {e}"))?,
+        (None, Some(sha)) => {
+            // Cache entries are named by the lowercase hex digest.
+            let sha = sha.to_ascii_lowercase();
+            let (path, ext) = find_cache_file(cache_root, &sha)
+                .map_err(|e| format!("textHiddenFrame.sha256: vision cache unreadable: {e}"))?
+                .ok_or_else(|| {
+                    format!("textHiddenFrame.sha256: no vision cache entry for {sha}")
+                })?;
+            if !ext.eq_ignore_ascii_case("png") {
+                return Err(format!(
+                    "textHiddenFrame.sha256: the vision cache entry for {sha} is .{ext}, not a \
+                     PNG; capture frame B with contract \"png_strict\""
+                ));
+            }
+            std::fs::read(&path)
+                .map_err(|e| format!("textHiddenFrame.sha256: read {}: {e}", path.display()))?
+        }
+        _ => return Err("textHiddenFrame takes exactly one of pngBase64 or sha256".into()),
+    };
+    let header = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("textHiddenFrame: unreadable header: {e}"))?;
+    if header.format() != Some(image::ImageFormat::Png) {
+        return Err(format!(
+            "textHiddenFrame must be a PNG (got {})",
+            header.format().map_or_else(
+                || "an unrecognised format".to_string(),
+                |f| format!("{f:?}")
+            )
+        ));
+    }
+    let dims = header
+        .into_dimensions()
+        .map_err(|e| format!("textHiddenFrame: unreadable PNG header: {e}"))?;
+    if dims != expected {
+        return Err(format!(
+            "textHiddenFrame is {}x{} px and the frame is {}x{} px: frame B must be the same \
+             page captured at the same size",
+            dims.0, dims.1, expected.0, expected.1
+        ));
+    }
+    let rgba = decode_png_limited(
+        &bytes,
+        text_hidden_frame_limits(expected, TEXT_HIDDEN_FRAME_MAX_ALLOC),
+    )?;
+    Ok(Frame::from_rgba(
+        rgba,
+        FrameSource {
+            // Not captured by this runner: the caller made it.
+            kind: qontinui_vision_core::FrameSourceKind::Synthetic,
+            scale_factor,
+            captured_at: chrono::Utc::now(),
+            capture_backend: None,
+        },
+    ))
+}
+
+/// The decode limits for a supplied frame B: frame A's own dimensions, and an
+/// allocation ceiling.
+fn text_hidden_frame_limits(expected: (u32, u32), max_alloc: u64) -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(expected.0);
+    limits.max_image_height = Some(expected.1);
+    limits.max_alloc = Some(max_alloc);
+    limits
+}
+
+/// Decode PNG `bytes` under `limits`: the decoder refuses, rather than
+/// allocates, past them.
+fn decode_png_limited(bytes: &[u8], limits: image::Limits) -> Result<RgbaImage, String> {
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    reader.limits(limits);
+    Ok(reader
+        .decode()
+        .map_err(|e| format!("textHiddenFrame is not a decodable PNG: {e}"))?
+        .to_rgba8())
+}
+
+/// Run blocking `work` — a file read, an image decode — on the blocking pool,
+/// off the tokio worker.
+async fn off_worker<T, W>(work: W) -> Result<T, String>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    spawn_blocking_tracked(work)
+        .await
+        .unwrap_or_else(|e| Err(format!("blocking task: {e}")))
+}
+
+/// Frame B for one `vision/analyze` or `vision/assert` call, and what the
+/// response reports about it.
+#[derive(Debug, Default)]
+struct TextHidden {
+    frame: Option<Frame>,
+    /// The ids of the text elements reported hidden in `frame`: the caller's
+    /// `textHiddenIds` with a supplied frame. `None` on the runner arm: the
+    /// SDK's hide reports coverage counts, not ids (ui-bridge#265), so
+    /// vision-core infers the hide from the pixels there.
+    ids: Option<Vec<String>>,
+    /// Why there is no frame B although one was asked for.
+    error: Option<String>,
+    /// The runner arm's hide/restore record (`captureTextHidden` only).
+    run: Option<super::text_visibility::TextVisibilityRun>,
+}
+
+/// Frame A and, when the request asked for one, frame B: the runner arm under
+/// `captureTextHidden`, else frame A from `target` and a supplied frame B.
+/// Frame A is best-effort (see the handlers); its error is returned beside it.
+async fn capture_frames(
+    state: &Arc<ApiState>,
+    target: &Option<String>,
+    supplied: Option<&TextHiddenFrameRequest>,
+    ids: Option<Vec<String>>,
+    capture: bool,
+) -> (Option<Frame>, Option<String>, TextHidden) {
+    if capture {
+        return capture_text_hidden_arm(state).await;
+    }
+    let frame_result = match resolve_frame_provider(state, target).await {
+        Ok(provider) => provider.frame(state).await,
+        Err(e) => Err(e),
+    };
+    let (frame, frame_error) = match frame_result {
+        Ok(f) => (Some(f), None),
+        Err(e) => {
+            warn!("vision: frame capture failed, continuing snapshot-only: {e}");
+            (None, Some(e))
+        }
+    };
+    let Some(supplied) = supplied else {
+        return (frame, frame_error, TextHidden::default());
+    };
+    let Some(frame_a) = frame.as_ref() else {
+        let error = format!(
+            "frame B is the text-hidden twin of the frame, and no frame was captured ({})",
+            frame_error.as_deref().unwrap_or("no reason given")
+        );
+        return (
+            frame,
+            frame_error,
+            TextHidden {
+                error: Some(error),
+                ..Default::default()
+            },
+        );
+    };
+    let supplied = supplied.clone();
+    let scale = frame_a.source.scale_factor;
+    let expected = (frame_a.width, frame_a.height);
+    let cache_root = state.vision_cache.root().to_path_buf();
+    // The file read and the decode are blocking work: off the tokio worker.
+    let decoded =
+        off_worker(move || decode_text_hidden_frame(&supplied, scale, expected, &cache_root)).await;
+    let text_hidden = match decoded {
+        Ok(f) => TextHidden {
+            frame: Some(f),
+            ids,
+            ..Default::default()
+        },
+        Err(e) => TextHidden {
+            error: Some(e),
+            ..Default::default()
+        },
+    };
+    (frame, frame_error, text_hidden)
+}
+
+/// Frame B must come from the backend that took frame A: the WebView2
+/// `CapturePreview` path and the monitor crop composite differently, so their
+/// pixels differ where no glyph is, and the difference would read as glyphs.
+fn pair_backends_agree(a: &Frame, b: &Frame) -> Result<(), String> {
+    if a.source.capture_backend == b.source.capture_backend {
+        return Ok(());
+    }
+    Err(format!(
+        "frame B discarded: frame A was captured by {} and frame B by {}; two backends \
+         composite differently, so their difference is not the glyphs",
+        capture_backend_label(a).unwrap_or_else(|| "no runner-window backend".into()),
+        capture_backend_label(b).unwrap_or_else(|| "no runner-window backend".into()),
+    ))
+}
+
+/// The size of `state.vision_capture_semaphore`: concurrent runner-window
+/// captures. The `captureTextHidden` arm takes ALL of them.
+pub(crate) const VISION_CAPTURE_PERMITS: u32 = 2;
+
+/// The runner arm (`captureTextHidden`): frame A and frame B of the runner's
+/// own window around a hide of its webview's text, under one lock and EVERY
+/// capture permit ([`super::text_visibility::capture_text_hidden_pair`]), so no
+/// other runner-window capture lands while the text is hidden. A DOM read
+/// (snapshot, discover) during the hide is not covered by the permits.
+///
+/// The lock and the permits are held until the restore attempt has returned —
+/// on a cancel, until the guard's spawned restore has landed and bumped. If
+/// that restore FAILS (the webview unreachable, say), the page may stay
+/// text-hidden until the arm's TTL ([`super::text_visibility::CAPTURE_TTL_MS`])
+/// restores it; the scheduled TTL bump then retires any capture cached in
+/// between.
+async fn capture_text_hidden_arm(
+    state: &Arc<ApiState>,
+) -> (Option<Frame>, Option<String>, TextHidden) {
+    use super::text_visibility::{
+        capture_text_hidden_pair, schedule_mutation_bump, PairLockGuard, REQUEST_TYPE,
+    };
+    let send = |kind: &'static str, body: serde_json::Value| {
+        let state = Arc::clone(state);
+        async move { super::request::ui_bridge_request_sync(&state, kind, body).await }
+    };
+    let acquire = || async {
+        Arc::clone(&state.vision_capture_semaphore)
+            .acquire_many_owned(VISION_CAPTURE_PERMITS)
+            .await
+            .map_err(|e| format!("capture semaphore acquire: {e}"))
+    };
+    let abort_state = Arc::clone(state);
+    // Spawned holding the arm's lock AND its permits, released only after the
+    // restore and the bump: no other arm starts, and no other capture sees the
+    // text-hidden page, until the restore has landed.
+    let abort_restore = move |lock: PairLockGuard, permits: tokio::sync::OwnedSemaphorePermit| {
+        let restore = async move {
+            let _ = super::request::ui_bridge_request_sync(
+                &abort_state,
+                REQUEST_TYPE,
+                serde_json::json!({"hidden": false}),
+            )
+            .await;
+            bump_mutation_id(&abort_state);
+            drop(permits);
+            drop(lock);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(restore);
+            }
+            // No runtime to restore on (a shutdown): the arm's TTL restores the
+            // page instead.
+            Err(e) => warn!(
+                "vision: no tokio runtime to restore the webview's text on ({e}); the \
+                 {} ms TTL will restore it",
+                super::text_visibility::CAPTURE_TTL_MS
+            ),
+        }
+    };
+    let out = capture_text_hidden_pair(
+        send,
+        acquire,
+        || capture_runner_window_frame_permitted(state),
+        || bump_mutation_id(state),
+        |delay_ms| schedule_mutation_bump(state, delay_ms),
+        abort_restore,
+    )
+    .await;
+    text_hidden_from_pair(out)
+}
+
+/// The runner arm's outcome as the handlers consume it: frame A (or why not),
+/// and frame B with its record — frame B dropped, with the reason, when it
+/// does not pair with frame A ([`pair_backends_agree`]).
+fn text_hidden_from_pair(
+    out: super::text_visibility::TextHiddenPair<Frame>,
+) -> (Option<Frame>, Option<String>, TextHidden) {
+    let (frame, frame_error) = match out.frame_a {
+        Ok(f) => (Some(f), None),
+        Err(e) => (None, Some(e)),
+    };
+    let (frame_b, error) = match (out.frame_b, frame.as_ref()) {
+        (Ok(b), Some(a)) => match pair_backends_agree(a, &b) {
+            Ok(()) => (Some(b), None),
+            Err(e) => (None, Some(e)),
+        },
+        (Ok(_), None) => (None, Some("frame B without a frame A".into())),
+        (Err(e), _) => (None, Some(e)),
+    };
+    (
+        frame,
+        frame_error,
+        TextHidden {
+            frame: frame_b,
+            // Follow-up: fill from the hide's report once the SDK reports the
+            // ids it hid; ui-bridge#265's hide reports counts only.
+            ids: None,
+            error,
+            run: out.run,
+        },
+    )
+}
+
+/// Run `analyzer` over frame A, its text-hidden twin and the snapshot. The one
+/// place the handler builds `AnalyzeInput`, so a test entering here observes
+/// what reaches vision-core.
+fn run_analyzer(
+    analyzer: qontinui_vision_core::Analyzer,
+    frame: Option<&Frame>,
+    text_hidden_frame: Option<&Frame>,
+    text_hidden_ids: Option<&[String]>,
+    snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
+) -> qontinui_vision_core::AnalyzerResult {
+    let input = qontinui_vision_core::AnalyzeInput {
+        frame,
+        snapshot,
+        prior_frame: None, // future: look up by sha256 in cache
+        text_hidden_frame,
+        text_hidden_ids,
+    };
+    qontinui_vision_core::analyzers::run(analyzer, &input)
+}
+
+/// Evaluate `assertions` over frame A, its text-hidden twin, the snapshot, the
+/// OCR blocks and the baselines. The one place the handler builds
+/// `EvalContext`, so a test entering here observes what reaches vision-core.
+fn evaluate_assertions(
+    assertions: &[qontinui_vision_core::Assertion],
+    snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
+    frame: Option<&Frame>,
+    text_hidden_frame: Option<&Frame>,
+    text_hidden_ids: Option<&[String]>,
+    ocr_blocks: Option<&[qontinui_vision_core::OcrBlockRef<'_>]>,
+    baselines: Option<&std::collections::HashMap<String, qontinui_vision_core::BaselineEntry>>,
+) -> Vec<qontinui_vision_core::AssertionResult> {
+    let ctx = qontinui_vision_core::EvalContext {
+        snapshot,
+        frame,
+        text_hidden_frame,
+        text_hidden_ids,
+        ocr_blocks,
+        baselines,
+    };
+    assertions
+        .iter()
+        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeRequest {
@@ -2099,14 +2621,41 @@ pub struct AnalyzeRequest {
     /// see [`super::vision_frame_source`].
     #[serde(default)]
     pub target: Option<String>,
+    /// Optional: frame B, the text-hidden twin of the frame this call
+    /// captures, supplied by the caller. See [`TextHiddenFrameRequest`].
+    #[serde(default)]
+    pub text_hidden_frame: Option<TextHiddenFrameRequest>,
+    /// Optional, only with `textHiddenFrame`: the ids of the text elements
+    /// the producer reports it hid in that frame. Supplied, a text element
+    /// not in it is unmeasured ("not reported hidden"); absent, the hide is
+    /// inferred from the pixels. Passed to vision-core as `text_hidden_ids`.
+    #[serde(default)]
+    pub text_hidden_ids: Option<Vec<String>>,
+    /// Optional: take frame B HERE — the runner arm of plan Phase 16 step 2.
+    /// The runner captures the frame as usual, hides every glyph in its OWN
+    /// webview (`control/text-visibility`), captures frame B, and restores the
+    /// page, all inside this request; the response's `textVisibility` says
+    /// what the page answered and whether it ended restored. Only for the
+    /// runner's own window (`target` absent), exclusive with
+    /// `textHiddenFrame`, and only when something in the request reads frame
+    /// B. The hide is a dev control: it works only where the webview opted
+    /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
+    /// everywhere else — every exe-mode runner — answers
+    /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
+    #[serde(default)]
+    pub capture_text_hidden: bool,
 }
 
 impl RequestHints for AnalyzeRequest {
     fn shape_error_suggestions() -> Option<Vec<String>> {
         Some(vec![
             "Required field: `analyzer` (one of: \"layout\", \"typography\", \"color\", \
-             \"dynamic\", \"elements\"). \
-             Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`."
+             \"dynamic\", \"elements\", \"image\"). \
+             Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`, \
+             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
+             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
+             only with the `image` analyzer)."
                 .to_string(),
             "Use `vision/assert` for targeted pass/fail checks; \
              use `vision/analyze` for broad findings across a frame."
@@ -2115,7 +2664,7 @@ impl RequestHints for AnalyzeRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
+            "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements", "image"]
         }))
     }
 }
@@ -2191,6 +2740,31 @@ pub struct AnalyzeResponse {
     /// confused with the REQUEST's `snapshot` field, which is an
     /// `ElementSnapshot` and a completely different shape.
     pub snapshot_attribution: SnapshotAttribution,
+    /// The per-image and page-level VALUES the `image` analyzer measured,
+    /// each an `Observation` with its own provenance — forwarded verbatim
+    /// from [`qontinui_vision_core::AnalyzerResult::image_values`].
+    ///
+    /// The image analyzer's output IS these values: its findings are `Info`
+    /// only, so a projection that dropped this field would return a
+    /// verdict and an empty-looking finding list while the measurements
+    /// were computed and thrown away. Omitted (never `null`) for every
+    /// other analyzer and for an `image` run that was `Blocked` (no frame,
+    /// so nothing was read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_values: Option<qontinui_vision_core::analyzers::image::ImageValues>,
+    /// Provenance of frame B (`textHiddenFrame` supplied, or taken under
+    /// `captureTextHidden`), when there is one. Only the `image` analyzer
+    /// reads it, for each image's `textContrast`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_hidden_frame: Option<AnalyzedFrameInfo>,
+    /// Why there is no frame B although the request asked for one. Without
+    /// it `textContrast` is `unknown{needs_multi_frame_input}`; this says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_hidden_frame_error: Option<String>,
+    /// `captureTextHidden` only: what the runner's webview answered to the
+    /// hide and the restore, and whether the page ended restored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_visibility: Option<super::text_visibility::TextVisibilityRun>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2286,16 +2860,42 @@ impl AnalyzeResponse {
         snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
         evaluated_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
+        // Destructured exhaustively, with no `..`, so a field vision-core
+        // adds to `AnalyzerResult` fails THIS build until it is either
+        // forwarded or deliberately dropped here. `image_values` is the
+        // field a field-by-field projection was most likely to lose.
+        // `conclusive` is derived from `verdict` by construction, so the
+        // wire carries the verdict and not the redundant bit.
+        let qontinui_vision_core::AnalyzerResult {
+            verdict,
+            conclusive: _,
+            coverage,
+            findings,
+            image_values,
+        } = result;
         Self {
             analyzer,
-            findings: result.findings,
-            verdict: result.verdict,
-            coverage: result.coverage,
+            findings,
+            verdict,
+            coverage,
             frame: frame.map(AnalyzedFrameInfo::of),
             frame_error,
             evaluated_at,
             snapshot_attribution: SnapshotAttribution::of(snapshot),
+            image_values,
+            text_hidden_frame: None,
+            text_hidden_frame_error: None,
+            text_visibility: None,
         }
+    }
+
+    /// Report frame B: its provenance, why it is missing, and the runner
+    /// arm's hide/restore record.
+    fn with_text_hidden(mut self, text_hidden: TextHidden) -> Self {
+        self.text_hidden_frame = text_hidden.frame.as_ref().map(AnalyzedFrameInfo::of);
+        self.text_hidden_frame_error = text_hidden.error;
+        self.text_visibility = text_hidden.run;
+        self
     }
 }
 
@@ -2386,6 +2986,29 @@ pub struct AssertRequest {
     /// instead — see [`super::vision_frame_source`].
     #[serde(default)]
     pub target: Option<String>,
+    /// Optional: frame B, the text-hidden twin of the frame this call
+    /// captures, supplied by the caller. See [`TextHiddenFrameRequest`].
+    #[serde(default)]
+    pub text_hidden_frame: Option<TextHiddenFrameRequest>,
+    /// Optional, only with `textHiddenFrame`: the ids of the text elements
+    /// the producer reports it hid in that frame. Supplied, a text element
+    /// not in it is unmeasured ("not reported hidden"); absent, the hide is
+    /// inferred from the pixels. Passed to vision-core as `text_hidden_ids`.
+    #[serde(default)]
+    pub text_hidden_ids: Option<Vec<String>>,
+    /// Optional: take frame B HERE — the runner arm of plan Phase 16 step 2.
+    /// The runner captures the frame as usual, hides every glyph in its OWN
+    /// webview (`control/text-visibility`), captures frame B, and restores the
+    /// page, all inside this request; the response's `textVisibility` says
+    /// what the page answered and whether it ended restored. Only for the
+    /// runner's own window (`target` absent), exclusive with
+    /// `textHiddenFrame`, and only when something in the request reads frame
+    /// B. The hide is a dev control: it works only where the webview opted
+    /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
+    /// everywhere else — every exe-mode runner — answers
+    /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
+    #[serde(default)]
+    pub capture_text_hidden: bool,
 }
 
 impl RequestHints for AssertRequest {
@@ -2397,10 +3020,17 @@ impl RequestHints for AssertRequest {
             "Assertion `type` values: no_overlap, element_above, contains_text, \
              text_fits_container, aligned_horizontally, aligned_vertically, color_within, \
              typography_consistent, no_layout_shift_since, no_clipping, animation_settled, \
-             contrast_meets_wcag."
+             contrast_meets_wcag, image_palette_within, no_near_duplicate_images, \
+             no_placeholder_images, image_focal_visible, transparent_image_legible, \
+             salience_order, image_sharpness_at_least, image_blockiness_within, \
+             text_over_image_contrast."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
-             `ocr_blocks` (from /vision/extract), `target` (device/app id)."
+             `ocr_blocks` (from /vision/extract), `target` (device/app id), \
+             `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
+             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
+             only with a text_over_image_contrast assertion, which reads it)."
                 .to_string(),
         ])
     }
@@ -2418,7 +3048,16 @@ impl RequestHints for AssertRequest {
                 "no_layout_shift_since",
                 "no_clipping",
                 "animation_settled",
-                "contrast_meets_wcag"
+                "contrast_meets_wcag",
+                "image_palette_within",
+                "no_near_duplicate_images",
+                "no_placeholder_images",
+                "image_focal_visible",
+                "transparent_image_legible",
+                "salience_order",
+                "image_sharpness_at_least",
+                "image_blockiness_within",
+                "text_over_image_contrast"
             ],
             "exampleAssertion": {
                 "type": "no_overlap",
@@ -2433,20 +3072,27 @@ impl RequestHints for AssertRequest {
 pub struct AssertResponse {
     pub results: Vec<qontinui_vision_core::AssertionResult>,
     pub all_passed: bool,
-    /// Why frame capture failed, when it did. Every assertion in the DSL is
-    /// evaluated from the snapshot, so this is informational — but it must
-    /// be visible, not inferred from a missing field.
+    /// Why frame capture failed, when it did. Most assertions evaluate from
+    /// the snapshot and are untouched by it, but the pixel-reading image
+    /// assertions answer `unknown` without one (a slot placeholder marker can
+    /// still fail `no_placeholder_images`) — so it must be visible, not
+    /// inferred from a missing field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
     /// Provenance of the frame this call captured, when it captured one.
     ///
-    /// No assertion in the DSL reads the frame — every one evaluates from
-    /// the snapshot, the OCR blocks or the baseline registry — so this
-    /// describes a resource that did not feed any verdict here. It is
-    /// reported anyway, because the handler pays the full capture cost on
-    /// every call and reporting neither the result nor the provenance is
-    /// strictly worse than either alternative: a caller cannot otherwise
-    /// tell what the runner was looking at when it answered.
+    /// Only the L1 image assertions read the frame (`image_palette_within`,
+    /// `no_near_duplicate_images`, `no_placeholder_images`,
+    /// `transparent_image_legible`, `salience_order`,
+    /// `image_sharpness_at_least`, `image_blockiness_within`, and
+    /// `text_over_image_contrast`, which also reads frame B). A verdict one
+    /// of those rests on pixels states a `confidence`, because a pixel read
+    /// from a composited frame is an estimate. Every other assertion
+    /// (`image_focal_visible` included: it reads media facts) evaluates from
+    /// the snapshot, the OCR blocks or the baseline registry, and for those
+    /// this describes a resource that did not feed the verdict. It is
+    /// reported either way, because a caller cannot otherwise tell what the
+    /// runner was looking at when it answered.
     ///
     /// `None` states that no frame was captured, and `frameError` says why.
     /// Same build-marker caveat as `coverage` below: the key is omitted
@@ -2467,9 +3113,10 @@ pub struct AssertResponse {
     ///
     /// An assert-only consumer previously got no answer at all to "what did
     /// this cover", while the analyze path had carried one since
-    /// `SnapshotCoverage` landed. Every assertion in the DSL evaluates from
-    /// the snapshot, so a `passed: true` over an impoverished snapshot is
-    /// exactly as vacuous here as an empty finding list is there.
+    /// `SnapshotCoverage` landed. Every assertion in the DSL reads the
+    /// snapshot (the image assertions too, to find the image's box), so a
+    /// `passed: true` over an impoverished snapshot is exactly as vacuous
+    /// here as an empty finding list is there.
     ///
     /// **`None` is a STATEMENT, not a gap**: no snapshot was supplied, so
     /// there was nothing to count — `snapshotAttribution.state == "absent"`
@@ -2492,11 +3139,10 @@ pub struct AssertResponse {
     pub coverage: Option<qontinui_vision_core::SnapshotCoverage>,
     /// When these assertions finished evaluating, on the runner's clock.
     ///
-    /// No assertion in the DSL reads the frame — every one evaluates from
-    /// the snapshot, the OCR blocks or the baseline registry — so while
-    /// `frame.capturedAt` is usually present beside this, it dates a
-    /// resource no verdict here consulted. This is the only time that dates
-    /// the ANSWER, and it is never absent. A failing gate line that cannot
+    /// `frame.capturedAt` dates the frame, which only the L1 image
+    /// assertions consult — for every other assertion it dates a resource
+    /// the verdict did not read. This is the only time that dates the
+    /// ANSWER, and it is never absent. A failing gate line that cannot
     /// be aged is a failing gate line a reviewer cannot separate from a
     /// stale one.
     pub evaluated_at: chrono::DateTime<chrono::Utc>,
@@ -2508,6 +3154,20 @@ pub struct AssertResponse {
     /// confused with the REQUEST's `snapshot` field, which is an
     /// `ElementSnapshot` and a completely different shape.
     pub snapshot_attribution: SnapshotAttribution,
+    /// Provenance of frame B (`textHiddenFrame` supplied, or taken under
+    /// `captureTextHidden`), when there is one. Only
+    /// `text_over_image_contrast` reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_hidden_frame: Option<AnalyzedFrameInfo>,
+    /// Why there is no frame B although the request asked for one. Without
+    /// it `text_over_image_contrast` is `unknown{needs_multi_frame_input}`;
+    /// this says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_hidden_frame_error: Option<String>,
+    /// `captureTextHidden` only: what the runner's webview answered to the
+    /// hide and the restore, and whether the page ended restored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_visibility: Option<super::text_visibility::TextVisibilityRun>,
 }
 
 impl AssertResponse {
@@ -2539,7 +3199,19 @@ impl AssertResponse {
             coverage: snapshot.map(qontinui_vision_core::SnapshotCoverage::of),
             evaluated_at,
             snapshot_attribution: SnapshotAttribution::of(snapshot),
+            text_hidden_frame: None,
+            text_hidden_frame_error: None,
+            text_visibility: None,
         }
+    }
+
+    /// Report frame B: its provenance, why it is missing, and the runner
+    /// arm's hide/restore record.
+    fn with_text_hidden(mut self, text_hidden: TextHidden) -> Self {
+        self.text_hidden_frame = text_hidden.frame.as_ref().map(AnalyzedFrameInfo::of);
+        self.text_hidden_frame_error = text_hidden.error;
+        self.text_visibility = text_hidden.run;
+        self
     }
 }
 
@@ -2596,6 +3268,7 @@ pub struct BaselineListResponse {
 /// structured findings; never pixels.
 async fn vision_analyze_handler(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
     UiBridgeJson(req): UiBridgeJson<AnalyzeRequest>,
 ) -> Result<Json<ApiResponse<AnalyzeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
@@ -2604,44 +3277,76 @@ async fn vision_analyze_handler(
     //
     // Frame capture is BEST-EFFORT and must not gate the analysis.
     //
-    // Three of the five analyzers — layout, typography, elements — are pure
+    // Three of the six analyzers — layout, typography, elements — are pure
     // geometry over the caller's snapshot and never read a pixel, and
-    // `analyzers::run` already degrades the other two to an explicit
-    // "skipped" finding when `frame` is `None`. Capturing first and `?`-ing
+    // `analyzers::run` already answers the other three (color, dynamic,
+    // image) with an explicit Blocked verdict when `frame` is `None`. Capturing first and `?`-ing
     // on failure therefore threw away every frameless analysis for a
     // resource none of them needed: with the Tauri window absent
     // (`frontendState: "window_missing"`, a headless or crashed UI) the
     // occlusion and overlap checks 500'd with "Runner window not found"
     // rather than answering from the snapshot in hand.
-    let frame_result = match resolve_frame_provider(&state, &req.target).await {
-        Ok(provider) => provider.frame(&state).await,
-        Err(e) => Err(e),
-    };
-    let (frame, frame_error) = match frame_result {
-        Ok(f) => (Some(f), None),
-        Err(e) => {
-            warn!("vision/analyze: frame capture failed, continuing snapshot-only: {e}");
-            (None, Some(e))
-        }
-    };
+    refuse_untrusted_frame_b(
+        principal.as_deref(),
+        req.text_hidden_frame.is_some(),
+        req.capture_text_hidden,
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    check_text_hidden_request(
+        req.text_hidden_frame.as_ref(),
+        req.text_hidden_ids.as_deref(),
+        req.capture_text_hidden,
+        req.target.as_deref(),
+        // Only the `image` analyzer reads frame B (each image's `textContrast`).
+        req.analyzer == qontinui_vision_core::Analyzer::Image,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    // Frame A, then frame B: the runner arm hides text only once frame A,
+    // which must show it, is taken.
+    let (frame, frame_error, text_hidden) = capture_frames(
+        &state,
+        &req.target,
+        req.text_hidden_frame.as_ref(),
+        req.text_hidden_ids.clone(),
+        req.capture_text_hidden,
+    )
+    .await;
 
-    let snapshot = req.snapshot.as_ref();
-    let prior = None; // future: look up by sha256 in cache
-
-    let input = qontinui_vision_core::AnalyzeInput {
-        frame: frame.as_ref(),
-        snapshot,
-        prior_frame: prior,
-    };
-    let result = qontinui_vision_core::analyzers::run(req.analyzer, &input);
-    // Stamped the instant the analyzer returns, not at response assembly —
-    // `evaluatedAt` says when the observation was made, and for a heavy
-    // analyzer over a large frame those are measurably different moments.
-    let evaluated_at = chrono::Utc::now();
+    // The analyzers are CPU-bound pure functions — the `image` analyzer
+    // hashes, clusters and filters every image crop of a full frame — so
+    // they run on the blocking pool, not inline on a tokio worker. The
+    // owned frames, ids and snapshot move in and come back out for the
+    // response.
+    let analyzer = req.analyzer;
+    let snapshot = req.snapshot;
+    let (result, evaluated_at, frame, snapshot, text_hidden) = spawn_blocking_tracked(move || {
+        let result = run_analyzer(
+            analyzer,
+            frame.as_ref(),
+            text_hidden.frame.as_ref(),
+            text_hidden.ids.as_deref(),
+            snapshot.as_ref(),
+        );
+        // Stamped the instant the analyzer returns, not at response
+        // assembly — `evaluatedAt` says when the observation was made, and
+        // for a heavy analyzer over a large frame those are measurably
+        // different moments.
+        let evaluated_at = chrono::Utc::now();
+        (result, evaluated_at, frame, snapshot, text_hidden)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/analyze: analyzer task join error: {e}"
+            ))),
+        )
+    })?;
 
     info!(
         "vision/analyze: analyzer={:?} findings={} verdict={:?} frame={}",
-        req.analyzer,
+        analyzer,
         result.findings.len(),
         result.verdict,
         if frame.is_some() {
@@ -2650,14 +3355,17 @@ async fn vision_analyze_handler(
             "absent"
         }
     );
-    Ok(Json(ApiResponse::success(AnalyzeResponse::of(
-        req.analyzer,
-        result,
-        frame.as_ref(),
-        frame_error,
-        snapshot,
-        evaluated_at,
-    ))))
+    Ok(Json(ApiResponse::success(
+        AnalyzeResponse::of(
+            analyzer,
+            result,
+            frame.as_ref(),
+            frame_error,
+            snapshot.as_ref(),
+            evaluated_at,
+        )
+        .with_text_hidden(text_hidden),
+    )))
 }
 
 /// `POST /ui-bridge/vision/assert` — evaluate a list of declarative
@@ -2665,28 +3373,47 @@ async fn vision_analyze_handler(
 /// Returns per-assertion pass/fail + reason.
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
     UiBridgeJson(req): UiBridgeJson<AssertRequest>,
 ) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
     // on this to assert against a paired device rather than the runner window.
-    // Best-effort, for the same reason as `vision/analyze` above — and more
-    // strongly here: NO assertion in the DSL reads `ctx.frame`. Every one of
-    // them evaluates from the snapshot, the OCR blocks or the baseline
-    // registry. Capturing a frame was a hard precondition for a value the
-    // evaluator never consulted, which made `no_overlap` and `no_clipping`
-    // unavailable on a headless runner for no reason at all.
-    let frame_result = match resolve_frame_provider(&state, &req.target).await {
-        Ok(provider) => provider.frame(&state).await,
-        Err(e) => Err(e),
-    };
-    let (frame, frame_error) = match frame_result {
-        Ok(f) => (Some(f), None),
-        Err(e) => {
-            warn!("vision/assert: frame capture failed, continuing snapshot-only: {e}");
-            (None, Some(e))
-        }
-    };
+    // Best-effort, for the same reason as `vision/analyze` above. Only the
+    // L1 image assertions read `ctx.frame`, and without one their pixel
+    // checks answer `unknown`; every other assertion evaluates from the
+    // snapshot, the OCR blocks or the baseline registry. Capturing a frame
+    // as a hard precondition made `no_overlap` and `no_clipping` unavailable
+    // on a headless runner for a value they never consult.
+    refuse_untrusted_frame_b(
+        principal.as_deref(),
+        req.text_hidden_frame.is_some(),
+        req.capture_text_hidden,
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    check_text_hidden_request(
+        req.text_hidden_frame.as_ref(),
+        req.text_hidden_ids.as_deref(),
+        req.capture_text_hidden,
+        req.target.as_deref(),
+        // Only `text_over_image_contrast` reads frame B.
+        req.assertions.iter().any(|a| {
+            matches!(
+                a,
+                qontinui_vision_core::Assertion::TextOverImageContrast { .. }
+            )
+        }),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    // Frame A, then frame B (see the analyze handler).
+    let (frame, frame_error, text_hidden) = capture_frames(
+        &state,
+        &req.target,
+        req.text_hidden_frame.as_ref(),
+        req.text_hidden_ids.clone(),
+        req.capture_text_hidden,
+    )
+    .await;
 
     // Project the registry into the vision-core BaselineEntry map
     // (matches the assertion DSL's expected shape).
@@ -2703,41 +3430,65 @@ async fn vision_assert_handler(
             .collect()
     };
 
-    let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
-        req.ocr_blocks.as_ref().map(|blocks| {
-            blocks
-                .iter()
-                .map(|b| qontinui_vision_core::OcrBlockRef {
-                    bbox: qontinui_vision_core::Region {
-                        // OCR blocks are detected INSIDE a frame, so their
-                        // origin is a buffer index and can never be negative —
-                        // `OcrBbox` stays u32 and the widening cast is lossless.
-                        x: b.bbox.x as i32,
-                        y: b.bbox.y as i32,
-                        w: b.bbox.w,
-                        h: b.bbox.h,
-                    },
-                    text: b.text.as_str(),
-                    confidence: b.confidence,
-                })
-                .collect()
-        });
+    // Evaluated on the blocking pool for the same reason as the analyze
+    // handler: the L1 image assertions read the frame and hash, cluster and
+    // filter image crops. Everything the evaluation borrows moves in owned;
+    // the frame and snapshot come back out for the response.
+    let AssertRequest {
+        assertions,
+        snapshot,
+        ocr_blocks,
+        target: _,
+        // Consumed above, by `check_text_hidden_request` and
+        // `capture_frames`: frame B now travels in `text_hidden`.
+        text_hidden_frame: _,
+        text_hidden_ids: _,
+        capture_text_hidden: _,
+    } = req;
+    let (results, evaluated_at, frame, snapshot, text_hidden) = spawn_blocking_tracked(move || {
+        let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
+            ocr_blocks.as_ref().map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|b| qontinui_vision_core::OcrBlockRef {
+                        bbox: qontinui_vision_core::Region {
+                            // OCR blocks are detected INSIDE a frame, so their
+                            // origin is a buffer index and can never be negative —
+                            // `OcrBbox` stays u32 and the widening cast is lossless.
+                            x: b.bbox.x as i32,
+                            y: b.bbox.y as i32,
+                            w: b.bbox.w,
+                            h: b.bbox.h,
+                        },
+                        text: b.text.as_str(),
+                        confidence: b.confidence,
+                    })
+                    .collect()
+            });
 
-    let ctx = qontinui_vision_core::EvalContext {
-        snapshot: req.snapshot.as_ref(),
-        frame: frame.as_ref(),
-        ocr_blocks: ocr_borrowed.as_deref(),
-        baselines: Some(&baselines_owned),
-    };
-
-    let results: Vec<_> = req
-        .assertions
-        .iter()
-        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
-        .collect();
-    // See the analyze handler: stamped when evaluation finishes, not at
-    // response assembly.
-    let evaluated_at = chrono::Utc::now();
+        let results = evaluate_assertions(
+            &assertions,
+            snapshot.as_ref(),
+            frame.as_ref(),
+            text_hidden.frame.as_ref(),
+            text_hidden.ids.as_deref(),
+            ocr_borrowed.as_deref(),
+            Some(&baselines_owned),
+        );
+        // See the analyze handler: stamped when evaluation finishes, not at
+        // response assembly.
+        let evaluated_at = chrono::Utc::now();
+        (results, evaluated_at, frame, snapshot, text_hidden)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/assert: evaluation task join error: {e}"
+            ))),
+        )
+    })?;
     info!(
         "vision/assert: {} assertions, {} passed, {} failed",
         results.len(),
@@ -2745,13 +3496,16 @@ async fn vision_assert_handler(
         results.iter().filter(|r| !r.passed).count()
     );
 
-    Ok(Json(ApiResponse::success(AssertResponse::of(
-        results,
-        req.snapshot.as_ref(),
-        frame.as_ref(),
-        frame_error,
-        evaluated_at,
-    ))))
+    Ok(Json(ApiResponse::success(
+        AssertResponse::of(
+            results,
+            snapshot.as_ref(),
+            frame.as_ref(),
+            frame_error,
+            evaluated_at,
+        )
+        .with_text_hidden(text_hidden),
+    )))
 }
 
 /// `POST /ui-bridge/vision/baseline` — capture a baseline image + record
@@ -2897,8 +3651,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/vision/raw", post(vision_raw_handler))
         .route("/ui-bridge/vision/extract", post(vision_extract_handler))
         .route("/ui-bridge/vision/describe", post(vision_describe_handler))
-        .route("/ui-bridge/vision/analyze", post(vision_analyze_handler))
-        .route("/ui-bridge/vision/assert", post(vision_assert_handler))
+        // A base64 frame B rides in these two bodies: past axum's 2 MiB default.
+        .route(
+            "/ui-bridge/vision/analyze",
+            post(vision_analyze_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+        )
+        .route(
+            "/ui-bridge/vision/assert",
+            post(vision_assert_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+        )
         .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
         .route(
             "/ui-bridge/vision/baselines",
@@ -2937,19 +3698,271 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
+    /// The wire name of every `Assertion` variant. No `_` arm, on purpose: a
+    /// new variant fails the build here, beside [`ASSERTION_WIRE_NAMES`].
+    fn assertion_wire_name(a: &qontinui_vision_core::Assertion) -> &'static str {
+        use qontinui_vision_core::Assertion as A;
+        match a {
+            A::NoOverlap { .. } => "no_overlap",
+            A::ElementAbove { .. } => "element_above",
+            A::ContainsText { .. } => "contains_text",
+            A::TextFitsContainer { .. } => "text_fits_container",
+            A::AlignedHorizontally { .. } => "aligned_horizontally",
+            A::AlignedVertically { .. } => "aligned_vertically",
+            A::ColorWithin { .. } => "color_within",
+            A::TypographyConsistent { .. } => "typography_consistent",
+            A::NoLayoutShiftSince { .. } => "no_layout_shift_since",
+            A::NoClipping { .. } => "no_clipping",
+            A::AnimationSettled { .. } => "animation_settled",
+            A::ContrastMeetsWcag { .. } => "contrast_meets_wcag",
+            A::ImagePaletteWithin { .. } => "image_palette_within",
+            A::NoNearDuplicateImages { .. } => "no_near_duplicate_images",
+            A::NoPlaceholderImages { .. } => "no_placeholder_images",
+            A::ImageFocalVisible { .. } => "image_focal_visible",
+            A::TransparentImageLegible { .. } => "transparent_image_legible",
+            A::SalienceOrder { .. } => "salience_order",
+            A::ImageSharpnessAtLeast { .. } => "image_sharpness_at_least",
+            A::ImageBlockinessWithin { .. } => "image_blockiness_within",
+            A::TextOverImageContrast { .. } => "text_over_image_contrast",
+        }
+    }
+
+    /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ASSERTION_WIRE_NAMES: [&str; 21] = [
+        "no_overlap",
+        "element_above",
+        "contains_text",
+        "text_fits_container",
+        "aligned_horizontally",
+        "aligned_vertically",
+        "color_within",
+        "typography_consistent",
+        "no_layout_shift_since",
+        "no_clipping",
+        "animation_settled",
+        "contrast_meets_wcag",
+        "image_palette_within",
+        "no_near_duplicate_images",
+        "no_placeholder_images",
+        "image_focal_visible",
+        "transparent_image_legible",
+        "salience_order",
+        "image_sharpness_at_least",
+        "image_blockiness_within",
+        "text_over_image_contrast",
+    ];
+
+    /// One parsed instance of every assertion type, from the wire form a
+    /// caller writes — so a linked vision-core that lacks a type fails here
+    /// rather than 422-ing a caller the hint invited to send it.
+    fn assertion_samples() -> Vec<qontinui_vision_core::Assertion> {
+        serde_json::from_str(
+            r#"[
+                {"type":"no_overlap","elements":["a","b"]},
+                {"type":"element_above","elements":["a","b"]},
+                {"type":"contains_text","target":{"element":"a"},"text":"Save"},
+                {"type":"text_fits_container","element":"a"},
+                {"type":"aligned_horizontally","elements":["a","b"]},
+                {"type":"aligned_vertically","elements":["a","b"]},
+                {"type":"color_within","element":"a","expected":{"r":1,"g":2,"b":3},"delta_e_max":2.0},
+                {"type":"typography_consistent","elements":["a","b"],"dimensions":["font_size"]},
+                {"type":"no_layout_shift_since","baseline":"b0"},
+                {"type":"no_clipping"},
+                {"type":"animation_settled","settle_frames":3},
+                {"type":"contrast_meets_wcag","element":"a"},
+                {"type":"image_palette_within","element":"hero","palette":[{"r":10,"g":20,"b":30}],
+                 "max_delta_e":10.0,"min_coverage":0.6},
+                {"type":"no_near_duplicate_images","max_hamming":6},
+                {"type":"no_placeholder_images"},
+                {"type":"image_focal_visible","element":"hero",
+                 "focal":{"x":0.25,"y":0.25,"width":0.5,"height":0.5}},
+                {"type":"transparent_image_legible","element":"logo","min_ratio":3.0},
+                {"type":"salience_order","cta_id":"cta"},
+                {"type":"image_sharpness_at_least","element":"hero","min_sharpness":50.0},
+                {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5},
+                {"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5.0}
+            ]"#,
+        )
+        .expect("every advertised assertion type must parse against the linked vision-core")
+    }
+
+    /// No `_` arm: a new `Analyzer` variant fails this test build until it
+    /// is given an arm here, beside [`ANALYZER_WIRE_NAMES`].
+    fn analyzer_wire_name(a: qontinui_vision_core::Analyzer) -> &'static str {
+        use qontinui_vision_core::Analyzer as A;
+        match a {
+            A::Layout => "layout",
+            A::Typography => "typography",
+            A::Color => "color",
+            A::Dynamic => "dynamic",
+            A::Elements => "elements",
+            A::Image => "image",
+        }
+    }
+
+    /// Every name [`analyzer_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ANALYZER_WIRE_NAMES: [&str; 6] = [
+        "layout",
+        "typography",
+        "color",
+        "dynamic",
+        "elements",
+        "image",
+    ];
+
+    /// The `/vision/analyze` 422 hint advertises the analyzer vocabulary the
+    /// same way the assert hint does, and drifts the same way: `image` (image
+    /// plan Phase 15) was added to vision-core while this list stayed at
+    /// five. [`analyzer_wire_name`]'s missing `_` arm forces a new variant
+    /// to be named beside [`ANALYZER_WIRE_NAMES`], which must equal the
+    /// advertised list; every name must parse as an `Analyzer` of the crate
+    /// this runner links and map back to itself through the match and
+    /// through vision-core's own `name()`. An arm added without its name in
+    /// the array is not detectable at runtime (nothing enumerates the enum).
+    #[test]
+    fn analyze_request_hint_advertises_every_analyzer() {
+        const EXPECTED: [&str; 6] = [
+            "layout",
+            "typography",
+            "color",
+            "dynamic",
+            "elements",
+            "image",
+        ];
+
+        let data = <AnalyzeRequest as RequestHints>::shape_error_data()
+            .expect("AnalyzeRequest must advertise shape_error_data");
+        let advertised: Vec<&str> = data["allowedAnalyzers"]
+            .as_array()
+            .expect("allowedAnalyzers must be an array")
+            .iter()
+            .map(|t| t.as_str().expect("each analyzer is a string"))
+            .collect();
+        assert_eq!(
+            advertised,
+            EXPECTED.as_slice(),
+            "allowedAnalyzers drifted from vision-core's Analyzer enum"
+        );
+        assert_eq!(
+            ANALYZER_WIRE_NAMES, EXPECTED,
+            "ANALYZER_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
+
+        for name in ANALYZER_WIRE_NAMES {
+            let parsed: qontinui_vision_core::Analyzer =
+                serde_json::from_value(serde_json::json!(name))
+                    .unwrap_or_else(|e| panic!("`{name}` must parse as an Analyzer: {e}"));
+            assert_eq!(parsed.name(), name);
+            assert_eq!(analyzer_wire_name(parsed), name);
+        }
+
+        let prose = <AnalyzeRequest as RequestHints>::shape_error_suggestions()
+            .expect("AnalyzeRequest must advertise shape_error_suggestions")
+            .join(" ");
+        for name in EXPECTED {
+            assert!(
+                prose.contains(&format!("\"{name}\"")),
+                "the prose hint omits `{name}`: {prose}"
+            );
+        }
+    }
+
+    /// `AnalyzeResponse::of` must forward the image analyzer's values. They
+    /// are its whole output — its findings are Info only — so a projection
+    /// that dropped them would answer `degraded`/`checked` with the
+    /// measurements computed and silently discarded. Through the REAL
+    /// analyzer, so the record is the one vision-core actually builds.
+    #[test]
+    fn analyze_response_forwards_image_values() {
+        let frame = Frame::from_rgba(
+            RgbaImage::from_pixel(16, 12, image::Rgba([200, 40, 40, 255])),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Window,
+                scale_factor: 1.0,
+                captured_at: chrono::Utc::now(),
+                capture_backend: Some(qontinui_vision_core::CaptureBackend::MonitorCrop),
+            },
+        );
+        let result = qontinui_vision_core::analyzers::run(
+            qontinui_vision_core::Analyzer::Image,
+            &qontinui_vision_core::AnalyzeInput {
+                frame: Some(&frame),
+                snapshot: None,
+                prior_frame: None,
+                text_hidden_frame: None,
+                text_hidden_ids: None,
+            },
+        );
+        let expected = serde_json::to_value(
+            result
+                .image_values
+                .as_ref()
+                .expect("an image run with a frame carries image_values"),
+        )
+        .expect("serialize image values");
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Image,
+            result,
+            Some(&frame),
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["analyzer"], "image");
+        assert_eq!(
+            v["imageValues"], expected,
+            "imageValues must reach the analyze wire verbatim"
+        );
+        assert!(
+            v["imageValues"]["page"].is_object(),
+            "the page-level values must be on the wire: {v}"
+        );
+
+        // And it is absent, not null, for an analyzer that measures none.
+        let layout = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Layout,
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+        assert!(
+            layout.get("imageValues").is_none(),
+            "imageValues must be omitted when the analyzer measured none: {layout}"
+        );
+    }
+
     /// The `/vision/assert` 422 hint is the only place the assertion DSL's
     /// vocabulary is advertised to a caller, and it is a hand-maintained
     /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
-    /// a derivation of it — the enum has no `strum`-style variant iterator, so
-    /// nothing links the two. Adding `element_above` (U3) took the list from
-    /// 11 to 12; without a pin, a variant added upstream stays undiscoverable
-    /// while `evaluate_assertion` (which is variant-agnostic) handles it fine.
+    /// a derivation of it — the enum has no `strum`-style variant iterator.
+    /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
+    /// image assertions (image plan Phase 15) from 12 to 20, and `text_over_image_contrast` (Phase 16)
+    /// to 21; without a pin, a
+    /// variant added upstream stays undiscoverable while `evaluate_assertion`
+    /// (which is variant-agnostic) handles it fine.
+    ///
+    /// What ties the list to the enum, and how far: [`assertion_wire_name`]
+    /// has no `_` arm, so a variant vision-core adds fails this test build
+    /// until it is given an arm there — beside [`ASSERTION_WIRE_NAMES`], which
+    /// this test holds equal to `EXPECTED` and to the names the parsed
+    /// samples map to. Nothing can enumerate the enum's variants at runtime,
+    /// so an arm added WITHOUT its name in that array is caught only if a
+    /// sample of it is added too; the compile error is what puts the author
+    /// next to both.
     ///
     /// The prose hint and the structured array are ALSO two separate copies of
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 12] = [
+        const EXPECTED: [&str; 21] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -2962,7 +3975,38 @@ mod tests {
             "no_clipping",
             "animation_settled",
             "contrast_meets_wcag",
+            "image_palette_within",
+            "no_near_duplicate_images",
+            "no_placeholder_images",
+            "image_focal_visible",
+            "transparent_image_legible",
+            "salience_order",
+            "image_sharpness_at_least",
+            "image_blockiness_within",
+            "text_over_image_contrast",
         ];
+
+        // The names the exhaustive match knows are the advertised ones.
+        assert_eq!(
+            ASSERTION_WIRE_NAMES, EXPECTED,
+            "ASSERTION_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
+        // One sample per name, each mapping through the match to that name and
+        // round-tripping through the linked crate's serde as that variant.
+        let sampled: Vec<&str> = assertion_samples()
+            .iter()
+            .map(|sample| {
+                let name = assertion_wire_name(sample);
+                let wire = serde_json::to_value(sample).expect("serialize assertion");
+                assert_eq!(wire["type"], name, "wire tag of {sample:?}");
+                name
+            })
+            .collect();
+        assert_eq!(
+            sampled,
+            ASSERTION_WIRE_NAMES.as_slice(),
+            "one sample per wire name, in order"
+        );
 
         let data = <AssertRequest as RequestHints>::shape_error_data()
             .expect("AssertRequest must advertise shape_error_data");
@@ -3934,5 +4978,680 @@ mod capture_fallback_tests {
             2,
             "monitor_crop_count must bump to 2 after the second fallback frame"
         );
+    }
+}
+
+/// Frame B (plan 2026-10-13-image-generation-and-visual-judgment, Phase 16):
+/// the request checks, the supplied-frame decoding, the pass-through to
+/// vision-core, and what the responses report.
+#[cfg(test)]
+mod text_hidden_tests {
+    use super::*;
+
+    // ── the fixes, pinned at their production call sites (by source) ──────
+
+    /// The body of the first `fn` whose signature starts with `sig`, up to the
+    /// first line that closes a top-level item.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let (_, rest) = src
+            .split_once(sig)
+            .unwrap_or_else(|| panic!("{sig} not found"));
+        rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+    }
+
+    /// The code in front of a statement starting at the end of `head`: the
+    /// trailing text of `head` back to the previous statement's end (a line
+    /// ending in `;`, `{` or `}`), skipping blank and `//` comment lines.
+    fn gate_lead(head: &str) -> String {
+        let mut lines = head.split('\n').rev();
+        let mut lead = vec![lines.next().unwrap_or_default().trim().to_string()];
+        for line in lines {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") {
+                continue;
+            }
+            if t.ends_with(';') || t.ends_with('{') || t.ends_with('}') {
+                break;
+            }
+            lead.push(t.to_string());
+        }
+        lead.reverse();
+        lead.join(" ").trim().to_string()
+    }
+
+    #[test]
+    fn the_gate_lead_sees_a_binding_on_the_line_above() {
+        assert_eq!(gate_lead("    x();\n    // note\n    "), "");
+        assert_eq!(gate_lead("    x();\n    let _ =\n    "), "let _ =");
+        assert_eq!(gate_lead("    x();\n    let _ = "), "let _ =");
+    }
+
+    fn pos(body: &str, needle: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` not found in:\n{body}"))
+    }
+
+    /// Both handlers refuse an untrusted origin BEFORE any frame is captured,
+    /// any text hidden or any frame B decoded — all of which happen in
+    /// `capture_frames`.
+    ///
+    /// A source scan, so it has an inherent limit: it reads the gate statement,
+    /// not control flow, and a gate wrapped in a block that never runs (`if
+    /// false { … }`) still passes it. What the refusal decides is pinned
+    /// behaviourally by `frame_b_is_refused_to_an_untrusted_origin` on
+    /// [`refuse_untrusted_frame_b`] itself; no handler-level 403 test exists,
+    /// because these handlers take a full `ApiState` that this crate's tests
+    /// have no constructor for.
+    #[test]
+    fn both_handlers_gate_the_origin_before_any_capture_or_decode() {
+        let src = include_str!("vision_routes.rs");
+        for handler in [
+            "async fn vision_analyze_handler(",
+            "async fn vision_assert_handler(",
+        ] {
+            let body = fn_body(src, handler);
+            assert!(
+                body.contains(
+                    "Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>"
+                ),
+                "{handler} must take the requester principal"
+            );
+            let gate = pos(body, "refuse_untrusted_frame_b(");
+            assert!(
+                body.get(gate..)
+                    .is_some_and(|rest| rest.contains("principal.as_deref()")),
+                "{handler} must gate on the requester it was given"
+            );
+            assert!(
+                gate < pos(body, "capture_frames("),
+                "{handler} must refuse before capturing, hiding or decoding"
+            );
+            // And its result must be acted on: a call whose refusal is ignored
+            // gates nothing. The gate STATEMENT — from the call to its first
+            // `;` — must map the refusal to the 403 and `?` it, with nothing
+            // that discards or replaces the error on the way.
+            let statement = body
+                .get(gate..)
+                .and_then(|rest| rest.split_once(';'))
+                .map(|(stmt, _)| format!("{stmt};"))
+                .expect("the gate statement ends");
+            assert!(
+                statement.contains("StatusCode::FORBIDDEN") && statement.ends_with(")?;"),
+                "{handler} must return the 403: {statement}"
+            );
+            for evasion in [".ok()", ".or(", ".or_else(", ".unwrap_or", "let _"] {
+                assert!(
+                    !statement.contains(evasion),
+                    "{handler}: `{evasion}` discards the refusal: {statement}"
+                );
+            }
+            // And nothing in front of the call: the code between the previous
+            // statement's end and the call (comments aside) must be empty, so
+            // no `let _ =` or other binding — on this line or the one above —
+            // swallows it.
+            let lead = gate_lead(body.get(..gate).unwrap_or_default());
+            assert!(
+                lead.is_empty(),
+                "{handler}: the gate must not be bound away: `{lead}`"
+            );
+            assert!(gate < pos(body, "check_text_hidden_request("), "{handler}");
+        }
+    }
+
+    /// The arm takes EVERY capture permit, owned so the guard can hand them on,
+    /// and its abort restore carries the lock and the permits, releasing them
+    /// only after the restore request and the bump; the TTL bump is the real
+    /// scheduler.
+    #[test]
+    fn the_arm_wiring_is_the_real_one() {
+        let src = include_str!("vision_routes.rs");
+        let body = fn_body(src, "async fn capture_text_hidden_arm(");
+        assert!(
+            body.contains(".acquire_many_owned(VISION_CAPTURE_PERMITS)"),
+            "{body}"
+        );
+
+        let (_, abort) = body
+            .split_once("let abort_restore = move |lock: PairLockGuard, permits")
+            .expect("the abort restore takes the lock and the permits");
+        let (abort, call) = abort
+            .split_once("let out = capture_text_hidden_pair(")
+            .expect("abort restore precedes the call");
+        let request = pos(abort, "ui_bridge_request_sync(");
+        let bump = pos(abort, "bump_mutation_id(&abort_state);");
+        assert!(request < bump, "restore, then bump");
+        assert!(
+            bump < pos(abort, "drop(permits);"),
+            "permits released after the bump"
+        );
+        assert!(
+            bump < pos(abort, "drop(lock);"),
+            "lock released after the bump"
+        );
+        assert!(abort.contains("runtime.spawn(restore)"), "{abort}");
+
+        assert!(
+            call.contains("capture_runner_window_frame_permitted(state)"),
+            "{call}"
+        );
+        assert!(
+            call.contains("schedule_mutation_bump(state, delay_ms)"),
+            "{call}"
+        );
+        assert!(call.contains("abort_restore,"), "{call}");
+    }
+
+    // ── frame B (text hidden): request checks, decoding, pass-through ─────
+
+    #[test]
+    fn a_frame_b_request_that_cannot_be_honoured_is_refused() {
+        let png = TextHiddenFrameRequest {
+            png_base64: Some("x".into()),
+            sha256: None,
+        };
+        let ids = vec!["heading".to_string()];
+        assert!(check_text_hidden_request(None, None, false, None, false).is_ok());
+        assert!(
+            check_text_hidden_request(Some(&png), Some(&ids), false, Some("phone"), true).is_ok()
+        );
+        assert!(check_text_hidden_request(None, None, true, None, true).is_ok());
+        let cases = [
+            (Some(&png), None, true, None, true, "exclusive"),
+            (None, None, true, Some("phone"), true, "OWN webview only"),
+            (
+                None,
+                None,
+                true,
+                None,
+                false,
+                "captureTextHidden hides the page's text for frame B, and nothing",
+            ),
+            (
+                Some(&png),
+                None,
+                false,
+                None,
+                false,
+                "textHiddenFrame is frame B, and nothing",
+            ),
+            (
+                None,
+                Some(ids.as_slice()),
+                false,
+                None,
+                true,
+                "no textHiddenFrame was supplied",
+            ),
+            (
+                None,
+                Some(ids.as_slice()),
+                true,
+                None,
+                true,
+                "the runner reports",
+            ),
+        ];
+        for (supplied, ids, capture, target, reads, needle) in cases {
+            let err =
+                check_text_hidden_request(supplied, ids, capture, target, reads).expect_err(needle);
+            assert!(err.contains(needle), "{err} lacks {needle}");
+        }
+        for (b64, sha, needle) in [
+            (Some("x"), Some("y"), "exactly one"),
+            (None, None, "exactly one"),
+            (None, Some("abc"), "64 hex"),
+        ] {
+            let f = TextHiddenFrameRequest {
+                png_base64: b64.map(str::to_string),
+                sha256: sha.map(str::to_string),
+            };
+            let err = check_text_hidden_request(Some(&f), None, false, None, true).unwrap_err();
+            assert!(err.contains(needle), "{err} lacks {needle}");
+        }
+        // Unknown keys are refused at the shape, not ignored.
+        assert!(
+            serde_json::from_value::<TextHiddenFrameRequest>(serde_json::json!({"png": "x"}))
+                .is_err()
+        );
+    }
+
+    fn png_bytes(img: &RgbaImage) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode png");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn a_supplied_frame_b_decodes_at_frame_as_scale_factor() {
+        use base64::Engine as _;
+        let img = RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let bytes = png_bytes(&img);
+        let dir = tempfile::tempdir().unwrap();
+
+        let b64 = TextHiddenFrameRequest {
+            png_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            sha256: None,
+        };
+        let f = decode_text_hidden_frame(&b64, 2.0, (8, 6), dir.path()).expect("decodes");
+        assert_eq!((f.width, f.height), (8, 6));
+        assert_eq!(f.source.scale_factor, 2.0);
+        assert_eq!(
+            f.source.kind,
+            qontinui_vision_core::FrameSourceKind::Synthetic
+        );
+
+        let sha = "ab".repeat(32);
+        std::fs::write(dir.path().join(format!("{sha}.png")), &bytes).unwrap();
+        // An uppercase digest finds the lowercase-named entry.
+        let by_sha = TextHiddenFrameRequest {
+            png_base64: None,
+            sha256: Some(sha.to_ascii_uppercase()),
+        };
+        let f = decode_text_hidden_frame(&by_sha, 1.5, (8, 6), dir.path()).expect("from the cache");
+        assert_eq!(f.buffer, img);
+        assert_eq!(f.source.scale_factor, 1.5);
+
+        let missing = TextHiddenFrameRequest {
+            png_base64: None,
+            sha256: Some("cd".repeat(32)),
+        };
+        assert!(decode_text_hidden_frame(&missing, 1.0, (8, 6), dir.path())
+            .unwrap_err()
+            .contains("no vision cache entry"));
+        let garbage = TextHiddenFrameRequest {
+            png_base64: Some("not base64!".into()),
+            sha256: None,
+        };
+        assert!(decode_text_hidden_frame(&garbage, 1.0, (8, 6), dir.path())
+            .unwrap_err()
+            .contains("not base64"));
+    }
+
+    #[test]
+    fn a_supplied_frame_b_must_be_a_png_of_frame_as_size() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let b64 = |bytes: &[u8]| TextHiddenFrameRequest {
+            png_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            sha256: None,
+        };
+        let img = RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+
+        // Another size is refused from the header, before any pixel is decoded.
+        let err =
+            decode_text_hidden_frame(&b64(&png_bytes(&img)), 1.0, (9, 6), dir.path()).unwrap_err();
+        assert!(err.contains("8x6 px and the frame is 9x6 px"), "{err}");
+
+        // Another format is refused even at the right size.
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img.clone())
+            .to_rgb8()
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let err = decode_text_hidden_frame(&b64(&jpeg.into_inner()), 1.0, (8, 6), dir.path())
+            .unwrap_err();
+        assert!(err.contains("must be a PNG (got Jpeg)"), "{err}");
+
+        // A cache entry that is not a PNG is refused by its extension.
+        let sha = "ef".repeat(32);
+        std::fs::write(dir.path().join(format!("{sha}.jpeg")), b"x").unwrap();
+        let by_sha = TextHiddenFrameRequest {
+            png_base64: None,
+            sha256: Some(sha),
+        };
+        let err = decode_text_hidden_frame(&by_sha, 1.0, (8, 6), dir.path()).unwrap_err();
+        assert!(err.contains("not a PNG"), "{err}");
+
+        // A header that lies about its size cannot make the decoder allocate past
+        // frame A's: the limits are frame A's own dimensions.
+        let mut forged = png_bytes(&img);
+        // IHDR height (bytes 20..24) -> 60000. Refused from the header: by the
+        // size check, or by the PNG decoder's own checksum on the edited chunk.
+        forged[20..24].copy_from_slice(&60_000u32.to_be_bytes());
+        let err = decode_text_hidden_frame(&b64(&forged), 1.0, (8, 6), dir.path()).unwrap_err();
+        assert!(
+            err.contains("8x60000") || err.contains("PNG header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn frame_b_from_another_capture_backend_is_discarded() {
+        use super::super::text_visibility::TextHiddenPair;
+        use qontinui_vision_core::CaptureBackend;
+        let frame = |backend| {
+            Frame::from_rgba(
+                RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255])),
+                FrameSource {
+                    kind: qontinui_vision_core::FrameSourceKind::Window,
+                    scale_factor: 1.0,
+                    captured_at: chrono::Utc::now(),
+                    capture_backend: Some(backend),
+                },
+            )
+        };
+        // Through the arm's own outcome mapping, so dropping the backend check
+        // from it turns this red.
+        let pair = |b| TextHiddenPair {
+            frame_a: Ok(frame(CaptureBackend::Webview2CapturePreview)),
+            frame_b: Ok(frame(b)),
+            run: None,
+        };
+        let (a, a_err, same) = text_hidden_from_pair(pair(CaptureBackend::Webview2CapturePreview));
+        assert!(a.is_some() && a_err.is_none());
+        assert!(same.frame.is_some(), "{:?}", same.error);
+        let (a, _, mixed) = text_hidden_from_pair(pair(CaptureBackend::MonitorCrop));
+        assert!(a.is_some(), "frame A stands");
+        assert!(
+            mixed.frame.is_none(),
+            "frame B from another backend is dropped"
+        );
+        let err = mixed.error.expect("and says why");
+        assert!(err.contains("Webview2CapturePreview"), "{err}");
+        assert!(err.contains("MonitorCrop"), "{err}");
+    }
+
+    /// The decode runs under frame A's limits: a correctly sized PNG whose
+    /// decode would allocate past a deliberately tiny ceiling is refused, not
+    /// decoded; the same PNG under the production ceiling decodes.
+    #[test]
+    fn a_supplied_frame_b_decodes_under_limits() {
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255]));
+        let bytes = png_bytes(&img);
+        let limits = text_hidden_frame_limits((64, 64), TEXT_HIDDEN_FRAME_MAX_ALLOC);
+        assert_eq!(limits.max_image_width, Some(64));
+        assert_eq!(limits.max_image_height, Some(64));
+        assert_eq!(decode_png_limited(&bytes, limits).expect("fits"), img);
+        let err = decode_png_limited(&bytes, text_hidden_frame_limits((64, 64), 1_024))
+            .expect_err("64x64 RGBA is 16 KiB, past a 1 KiB ceiling");
+        assert!(err.contains("not a decodable PNG"), "{err}");
+        let err = decode_png_limited(&bytes, text_hidden_frame_limits((32, 32), u64::MAX))
+            .expect_err("wider than frame A");
+        assert!(err.contains("not a decodable PNG"), "{err}");
+    }
+
+    /// The supplied frame's file read and decode run on the blocking pool, not
+    /// the calling tokio worker. Pinned on the helper `capture_frames` routes
+    /// them through: a current-thread runtime runs async code on the test's own
+    /// thread, so a different thread id is the blocking pool.
+    #[test]
+    fn blocking_work_runs_off_the_worker() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let here = std::thread::current().id();
+        let there = rt
+            .block_on(off_worker(|| Ok::<_, String>(std::thread::current().id())))
+            .unwrap();
+        assert_ne!(here, there, "the work ran on the calling thread");
+    }
+
+    /// `captureTextHidden` and a supplied `textHiddenFrame` are refused to a
+    /// browser origin the guard does not class as FirstParty, before anything
+    /// is captured, hidden or decoded.
+    #[test]
+    fn frame_b_is_refused_to_an_untrusted_origin() {
+        use crate::mcp::origin_guard::{OriginClass, RequesterPrincipal};
+        let p = |class| RequesterPrincipal {
+            class,
+            origin: None,
+        };
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_untrusted_frame_b(Some(&p(class)), false, true).is_ok());
+            assert!(refuse_untrusted_frame_b(Some(&p(class)), true, false).is_ok());
+        }
+        for class in [
+            OriginClass::Foreign,
+            OriginClass::Extension,
+            OriginClass::Trusted,
+        ] {
+            let err = refuse_untrusted_frame_b(Some(&p(class)), false, true).unwrap_err();
+            assert!(err.contains(class.as_str()), "{err}");
+            assert!(err.contains("captureTextHidden"), "{err}");
+            let err = refuse_untrusted_frame_b(Some(&p(class)), true, false).unwrap_err();
+            assert!(err.contains("textHiddenFrame"), "{err}");
+        }
+        // No principal is UNKNOWN, refused; no frame B asked for, nothing to gate.
+        assert!(refuse_untrusted_frame_b(None, false, true)
+            .unwrap_err()
+            .contains("unknown"));
+        assert!(refuse_untrusted_frame_b(Some(&p(OriginClass::Foreign)), false, false).is_ok());
+    }
+
+    /// The vision capture cache keys on the mutation id: a capture cached on
+    /// one side of a hide must not answer for the other side of it.
+    #[tokio::test]
+    async fn a_hide_changes_the_capture_cache_key() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mutation_id = Arc::new(AtomicU64::new(7));
+        let req = CaptureRequest::default();
+        let before = capture_cache_key(mutation_id.load(Ordering::Relaxed), &req);
+        let m = Arc::clone(&mutation_id);
+        let _ = super::super::text_visibility::direct_set(
+            serde_json::json!({"hidden": true}),
+            |_kind, _body| std::future::ready(Ok(serde_json::json!({"success": true}))),
+            move || {
+                m.fetch_add(1, Ordering::Relaxed);
+            },
+            |_| {},
+        )
+        .await;
+        let after = capture_cache_key(mutation_id.load(Ordering::Relaxed), &req);
+        assert_ne!(
+            before, after,
+            "a frame cached before the hide must miss after it"
+        );
+    }
+
+    /// A white heading painted over a dark hero image (frame A) and the same
+    /// page with the heading's glyphs transparent (frame B), with its snapshot.
+    fn text_over_image_pair() -> (Frame, Frame, qontinui_vision_core::ElementSnapshot) {
+        use qontinui_vision_core::{Element, ElementMedia, MediaKind, ObjectFit, Rgb};
+        let dark = image::Rgba([30, 30, 60, 255]);
+        let b = RgbaImage::from_pixel(200, 100, dark);
+        let mut a = b.clone();
+        // Glyph-like strokes inside the heading's box: 2 px bars, 4 px apart.
+        for x in (24..176).step_by(6) {
+            for y in 34..66 {
+                for dx in 0..2 {
+                    a.put_pixel(x + dx, y, image::Rgba([255, 255, 255, 255]));
+                }
+            }
+        }
+        let frame = |img: RgbaImage| {
+            Frame::from_rgba(img, qontinui_vision_core::FrameSource::synthetic_now())
+        };
+        let region = |x, y, w, h| qontinui_vision_core::Region { x, y, w, h };
+        let snapshot = qontinui_vision_core::ElementSnapshot {
+            elements: vec![
+                Element {
+                    id: "hero".into(),
+                    bbox: Some(region(0, 0, 200, 100)),
+                    media: Some(ElementMedia {
+                        object_fit: Some(ObjectFit::Fill),
+                        ..ElementMedia::new(MediaKind::Img)
+                    }),
+                    ..Default::default()
+                },
+                Element {
+                    id: "heading".into(),
+                    bbox: Some(region(20, 30, 160, 40)),
+                    text: Some("Measured on real pixels".into()),
+                    fg_color: Some(Rgb::new(255, 255, 255)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        (frame(a), frame(b), snapshot)
+    }
+
+    fn contrast_assertion() -> Vec<qontinui_vision_core::Assertion> {
+        vec![qontinui_vision_core::Assertion::TextOverImageContrast {
+            min_ratio: Some(4.5),
+            percentile: None,
+        }]
+    }
+
+    #[test]
+    fn evaluate_assertions_passes_frame_b_and_its_ids_to_vision_core() {
+        use qontinui_vision_core::{AssertionOutcome, UnknownCode};
+        let (a, b, snap) = text_over_image_pair();
+        let with_b = evaluate_assertions(
+            &contrast_assertion(),
+            Some(&snap),
+            Some(&a),
+            Some(&b),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            with_b[0].outcome,
+            AssertionOutcome::Passed,
+            "white on a dark image, measured with frame B: {:?}",
+            with_b[0]
+        );
+
+        let without_b = evaluate_assertions(
+            &contrast_assertion(),
+            Some(&snap),
+            Some(&a),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(without_b[0].outcome, AssertionOutcome::Unknown);
+        assert_eq!(without_b[0].code, Some(UnknownCode::NeedsMultiFrameInput));
+
+        // Ids reported hidden that leave the heading out: it is unmeasured.
+        let others = vec!["hero".to_string()];
+        let not_reported = evaluate_assertions(
+            &contrast_assertion(),
+            Some(&snap),
+            Some(&a),
+            Some(&b),
+            Some(&others),
+            None,
+            None,
+        );
+        assert_eq!(
+            not_reported[0].outcome,
+            AssertionOutcome::Unknown,
+            "a heading not reported hidden must not be measured: {:?}",
+            not_reported[0]
+        );
+    }
+
+    #[test]
+    fn run_analyzer_passes_frame_b_and_its_ids_to_vision_core() {
+        let (a, b, snap) = text_over_image_pair();
+        let status = |b: Option<&Frame>, ids: Option<&[String]>| {
+            let result = run_analyzer(
+                qontinui_vision_core::Analyzer::Image,
+                Some(&a),
+                b,
+                ids,
+                Some(&snap),
+            );
+            let v = serde_json::to_value(result.image_values.expect("image values"))
+                .expect("serialize");
+            v["images"]
+                .as_array()
+                .and_then(|els| els.iter().find(|e| e["element"] == "hero"))
+                .map(|e| e["textContrast"].clone())
+                .unwrap_or_else(|| panic!("no hero values: {v}"))
+        };
+        // Whether a contrast record for the heading was measured. Searched
+        // structurally rather than compared whole: provenance carries times.
+        fn heading_measured(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Object(o) => {
+                    (o.get("element") == Some(&serde_json::json!("heading"))
+                        && o.get("minRatio").is_some_and(serde_json::Value::is_number))
+                        || o.values().any(heading_measured)
+                }
+                serde_json::Value::Array(a) => a.iter().any(heading_measured),
+                _ => false,
+            }
+        }
+        let measured = status(Some(&b), None);
+        assert_eq!(measured["status"], "measured", "{measured}");
+        assert!(heading_measured(&measured), "{measured}");
+        let absent = status(None, None);
+        assert_eq!(absent["status"], "unknown", "{absent}");
+        assert!(!heading_measured(&absent), "{absent}");
+        let others = vec!["hero".to_string()];
+        let not_reported = status(Some(&b), Some(&others));
+        assert!(
+            !heading_measured(&not_reported),
+            "ids that leave the heading out must leave it unmeasured: {not_reported}"
+        );
+    }
+
+    #[test]
+    fn the_responses_report_frame_b_its_error_and_the_runner_arm() {
+        let (_a, b, _snap) = text_over_image_pair();
+        let run = super::super::text_visibility::TextVisibilityRun {
+            hide: serde_json::json!({"success": true, "hidden": true}),
+            restore: Some(serde_json::json!({"success": true, "hidden": false})),
+            page_restored: Some(true),
+            warning: None,
+        };
+        let analyze = serde_json::to_value(
+            AnalyzeResponse::of(
+                qontinui_vision_core::Analyzer::Layout,
+                qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+                None,
+                None,
+                None,
+                chrono::Utc::now(),
+            )
+            .with_text_hidden(TextHidden {
+                frame: Some(b),
+                ids: None,
+                error: None,
+                run: Some(run.clone()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(analyze["textHiddenFrame"]["width"], 200, "{analyze}");
+        assert_eq!(analyze["textHiddenFrame"]["kind"], "synthetic", "{analyze}");
+        assert_eq!(analyze["textVisibility"]["pageRestored"], true, "{analyze}");
+        assert!(analyze.get("textHiddenFrameError").is_none(), "{analyze}");
+
+        let assert = serde_json::to_value(
+            AssertResponse::of(vec![], None, None, None, chrono::Utc::now()).with_text_hidden(
+                TextHidden {
+                    error: Some("refused (capability_unavailable_in_build)".into()),
+                    run: Some(run),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+        assert!(assert.get("textHiddenFrame").is_none(), "{assert}");
+        assert_eq!(
+            assert["textHiddenFrameError"],
+            "refused (capability_unavailable_in_build)"
+        );
+        assert_eq!(assert["textVisibility"]["hide"]["hidden"], true, "{assert}");
+
+        // Nothing asked for: none of the three keys is on the wire.
+        let plain = serde_json::to_value(AssertResponse::of(
+            vec![],
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .unwrap();
+        for key in ["textHiddenFrame", "textHiddenFrameError", "textVisibility"] {
+            assert!(plain.get(key).is_none(), "{key}: {plain}");
+        }
     }
 }
