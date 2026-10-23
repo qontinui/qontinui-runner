@@ -203,10 +203,15 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
     assert_eq!(cen.holder_pid, h.pid());
     assert_eq!(cen.versions, PROTOCOL_VERSIONS.to_vec());
 
-    // prepare_upgrade is in the envelope and answered typed, connection kept.
-    match c.request(&Request::PrepareUpgrade, soon()).unwrap() {
-        Reply::Unsupported { verb, .. } => assert_eq!(verb, "prepare_upgrade"),
-        other => panic!("{other:?}"),
+    // prepare_upgrade is in the envelope and answered typed. Windows: always
+    // `unsupported` (plan D12), connection kept. Unix: it really upgrades
+    // the holder (plan Phase 8) — that is `pty_holder_handoff`'s suite.
+    #[cfg(not(unix))]
+    {
+        match c.request(&Request::PrepareUpgrade, soon()).unwrap() {
+            Reply::Unsupported { verb, .. } => assert_eq!(verb, "prepare_upgrade"),
+            other => panic!("{other:?}"),
+        }
     }
     c.ping(soon()).unwrap();
 
@@ -575,10 +580,24 @@ fn pty_holder_census_healthy_and_dead() {
         )),
         Probe::Dead { .. }
     ));
-    let rows = census(&dir, Duration::from_secs(3), &[]).unwrap();
+    // Polled, not taken once: a census probe acquires and drops each free
+    // lock, and a child another test in this binary forks meanwhile shares
+    // that open file description — and the lock — until its exec. Within that
+    // window the dead pane reads Unknown (held, no answer), never Healthy.
+    let end = Instant::now() + Duration::from_secs(5);
+    let rows = loop {
+        let rows = census(&dir, Duration::from_secs(3), &[]).unwrap();
+        let settled = rows
+            .first()
+            .is_some_and(|r| matches!(r.probe, Probe::Dead { .. }));
+        if settled || Instant::now() >= end {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(rows.len(), 2, "{rows:#?}");
     assert_eq!(rows[0].pane_id, "gone");
-    assert!(matches!(rows[0].probe, Probe::Dead { .. }));
+    assert!(matches!(rows[0].probe, Probe::Dead { .. }), "{rows:#?}");
     assert_eq!(rows[1].pane_id, "live");
     assert!(matches!(rows[1].probe, Probe::Healthy { .. }));
     drop(healthy);

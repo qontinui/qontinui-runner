@@ -955,8 +955,6 @@ fn pty_holder_attach_envelope_brackets_the_tail_at_its_anchors() {
             title: Some("T".into()),
         })
     );
-    // Output produced AFTER the attach, which must follow the postamble.
-    input_of(&h).input(b"after\n", soon()).unwrap();
     let start = s.info.start_offset;
     // Every event in wire order: output as (offset, len), synthetic as
     // (part, anchor, bytes).
@@ -966,12 +964,22 @@ fn pty_holder_attach_envelope_brackets_the_tail_at_its_anchors() {
     }
     let mut seen = Vec::new();
     let mut bytes = Vec::new();
+    let mut after_sent = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !contains(&bytes, b"after") {
         match s.reader.next_event(Some(deadline)).unwrap().expect("event") {
             Event::Output { offset, bytes: b } => {
                 seen.push(Seen::Out(offset, b.len() as u64));
                 bytes.extend_from_slice(&b);
+                // Output produced AFTER the attach, which must follow the
+                // postamble. Sent once the tail reached `end`, not before:
+                // the ring is exactly full, so an echo produced while the
+                // tail is still in it evicts the tail's head, and the holder
+                // honestly reports that as Lost (6/100 runs on main).
+                if !after_sent && offset + b.len() as u64 >= end {
+                    input_of(&h).input(b"after\n", soon()).unwrap();
+                    after_sent = true;
+                }
             }
             Event::Synthetic {
                 part,

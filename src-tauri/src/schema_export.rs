@@ -36,11 +36,11 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, agent_commands as qac, agent_text_units as qatu, ai_workflows as qaw,
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
-        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
-        priorities_profile as qpp, process_management as qpm, projects as qprj, rag as qr,
-        runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
-        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht,
+        image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
+        orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
+        projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
+        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
         ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
         worker_output as qwo, workflow as qw, workflow_step as qws,
     };
@@ -896,6 +896,15 @@ pub fn export_all_schemas() -> Value {
     add!("BoundKind", qontinui_types::page::BoundKind);
     add!("BoundedReadMeta", qontinui_types::page::BoundedReadMeta);
     add!("FilterNarrowing", qontinui_types::page::FilterNarrowing);
+    // ── qontinui-types: image_slot (plan
+    // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+    // qontinui-schemas#230). The ROOT only: every `ImageSlot*` sub-type is a
+    // `$defs` entry of this schema, so the generated `ImageSlotSpec.d.ts` and
+    // `image_slot_spec.py` declare each one beside it. Read the
+    // `qontinui_types::image_slot` module doc before registering a sub-type on
+    // its own: the TypeScript generator's fork guard is why each one has a
+    // single reference site. (1) ──
+    add!("ImageSlotSpec", qis::ImageSlotSpec);
 
     Value::Object(m)
 }
@@ -977,8 +986,11 @@ mod tests {
         // FilterNarrowing — plan
         // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
         // qontinui-schemas#186) = 569.
-        // The codegen's "Processing N top-level types" line should read 569 here.
-        assert_eq!(obj.len(), 569, "Expected 569 schema entries");
+        // + the 1 image-slot spec (ImageSlotSpec — plan
+        // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+        // qontinui-schemas#230; its sub-types are `$defs`) = 570.
+        // The codegen's "Processing N top-level types" line should read 570 here.
+        assert_eq!(obj.len(), 570, "Expected 570 schema entries");
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
@@ -991,6 +1003,10 @@ mod tests {
         for page in ["BoundKind", "BoundedReadMeta", "FilterNarrowing"] {
             assert!(obj.contains_key(page), "Missing {page} schema");
         }
+        assert!(
+            obj.contains_key("ImageSlotSpec"),
+            "Missing ImageSlotSpec schema from qontinui_types::image_slot"
+        );
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
