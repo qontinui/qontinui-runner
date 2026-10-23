@@ -7,11 +7,14 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { enableDevControls } from "@qontinui/ui-bridge/core";
+import { textHidden } from "@qontinui/ui-bridge/control";
 import { runTextVisibilityRequest } from "./textVisibilityRequest";
 
 const KEY = Symbol.for("@qontinui/ui-bridge/dev-controls");
 
 afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   // Never leave the shared hide state behind for another test.
   await runTextVisibilityRequest({ hidden: false }, async () => "timeout");
   delete (globalThis as unknown as Record<symbol, unknown>)[KEY];
@@ -54,5 +57,47 @@ describe("text visibility in the runner webview (DOM)", () => {
     });
     expect(heading.getAttribute("style")).toBe(before);
     expect(waitForPaint).toHaveBeenCalledTimes(2);
+  });
+
+  it("an explicit re-hide keeps the first hide's hiddenAt and reports wasHidden", async () => {
+    enableDevControls("provider-feature");
+    document.body.innerHTML = "<p>Body copy</p>";
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const first = await runTextVisibilityRequest({ hidden: true }, async () => "timeout");
+    expect(first).toMatchObject({ data: { changed: true, wasHidden: false, hiddenAt: 1_000 } });
+
+    // A later millisecond: the re-hide (the direct route's, no onlyIfVisible)
+    // reaches the engine, which keeps the original hiddenAt.
+    now.mockReturnValue(5_000);
+    const again = await runTextVisibilityRequest({ hidden: true }, async () => "timeout");
+    expect(again).toMatchObject({
+      success: true,
+      data: { hidden: true, changed: false, wasHidden: true, hiddenAt: 1_000 },
+    });
+    expect((again.data as { hiddenAt: number }).hiddenAt).toBeLessThan(Date.now());
+  });
+
+  it("the arm's onlyIfVisible on a hidden page leaves that hide's TTL alone", async () => {
+    vi.useFakeTimers();
+    enableDevControls("provider-feature");
+    document.body.innerHTML = "<p>Body copy</p>";
+    // Another caller's hide, 1 s TTL.
+    await runTextVisibilityRequest({ hidden: true, ttlMs: 1_000 }, async () => "timeout");
+    vi.advanceTimersByTime(600);
+
+    const probe = await runTextVisibilityRequest({ query: true });
+    expect(probe).toEqual({ success: true, data: { success: true, query: true, hidden: true } });
+    const arm = await runTextVisibilityRequest(
+      { hidden: true, ttlMs: 15_000, onlyIfVisible: true },
+      async () => "timeout",
+    );
+    expect(arm).toEqual({
+      success: true,
+      data: { success: true, hidden: true, changed: false, wasHidden: true },
+    });
+
+    // The other caller's TTL fires when it always would have: not re-armed.
+    vi.advanceTimersByTime(500);
+    expect(textHidden()).toBe(false);
   });
 });

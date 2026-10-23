@@ -21,7 +21,7 @@
  * state rather than the one composited before the styles were written.
  */
 
-import { setTextVisibility } from "@qontinui/ui-bridge/control";
+import { setTextVisibility, textHidden } from "@qontinui/ui-bridge/control";
 import { devControlsEnabled } from "@qontinui/ui-bridge/core";
 
 /** The reply fields the hook sends back (it adds `requestId`, `type`, `timestamp`). */
@@ -92,28 +92,52 @@ export function textVisibilityBody(payload: object): Record<string, unknown> {
 /**
  * Run one text-visibility message against the webview's own DOM.
  *
- * The reply carries two stamps from this webview's own `Date.now()`:
- * `receivedAt`, taken immediately BEFORE the SDK call, and `answeredAt`, taken
- * after the paint wait. A hide's `hiddenAt` (the SDK's, from the same clock) at
- * or after `receivedAt` was created by THIS request; one before it is another
- * caller's that this request only re-armed. The runner decides ownership from
- * that one comparison, on one clock.
+ * Two fields only the runner's own arm (`capture_text_hidden_pair` in
+ * `text_visibility.rs`) sends, never forwarded to the SDK:
+ *
+ * - `query: true` — read-only: answer `{hidden}` from the SDK's
+ *   `textHidden()` and change nothing. Answered without the dev-controls gate:
+ *   reading changes nothing, and where the gate is closed nothing can be
+ *   hidden. The arm asks this before frame A. (The direct HTTP route cannot
+ *   send it: its validation requires `hidden`.)
+ * - `onlyIfVisible: true` — hide only when text is not already hidden. When it
+ *   is, answer `{hidden: true, changed: false, wasHidden: true}` WITHOUT
+ *   calling the SDK, so another caller's hide is neither re-armed nor touched.
+ *   The direct route never sends it: an explicit re-hide re-arms the TTL, as
+ *   the SDK documents.
+ *
+ * Every reply that reached the SDK carries `wasHidden`: `textHidden()` read
+ * immediately before `setTextVisibility`, in the same synchronous run, so no
+ * other hide can land between the two. `wasHidden: false` on a hide means THIS
+ * request created it — no clock is involved. `null` means the SDK could not
+ * tell (another copy of it owns the state), and the runner reads that as
+ * unknown.
  */
 export async function runTextVisibilityRequest(
   payload: object,
   waitForPaint: () => Promise<PaintFence> = nextPaint,
 ): Promise<TextVisibilityReply> {
+  const { query, onlyIfVisible, ...body } = textVisibilityBody(payload);
+  if (query === true) {
+    return { success: true, data: { success: true, query: true, hidden: textHidden() } };
+  }
   if (!devControlsEnabled()) {
     return { success: false, error: DEV_CONTROLS_REFUSAL.error, data: { ...DEV_CONTROLS_REFUSAL } };
   }
-  const receivedAt = Date.now();
-  const result = setTextVisibility(textVisibilityBody(payload));
+  const wasHidden = textHidden();
+  if (onlyIfVisible === true && body.hidden === true && wasHidden === true) {
+    return {
+      success: true,
+      data: { success: true, hidden: true, changed: false, wasHidden: true },
+    };
+  }
+  const result = setTextVisibility(body);
   if (!result.success) {
-    return { success: false, error: result.error, data: { ...result, receivedAt } };
+    return { success: false, error: result.error, data: { ...result, wasHidden } };
   }
   if (!result.changed) {
-    return { success: true, data: { ...result, receivedAt, answeredAt: Date.now() } };
+    return { success: true, data: { ...result, wasHidden } };
   }
   const paintFence = await waitForPaint();
-  return { success: true, data: { ...result, paintFence, receivedAt, answeredAt: Date.now() } };
+  return { success: true, data: { ...result, paintFence, wasHidden } };
 }

@@ -2507,14 +2507,10 @@ async fn capture_text_hidden_arm(
             ),
         }
     };
-    let clock_origin = std::time::Instant::now();
     let out = capture_text_hidden_pair(
         send,
         acquire,
         || capture_runner_window_frame_permitted(state),
-        // Monotonic: the arm only measures a duration with it (frame A's end to
-        // the hide's send).
-        move || i64::try_from(clock_origin.elapsed().as_millis()).unwrap_or(i64::MAX),
         || bump_mutation_id(state),
         |delay_ms| schedule_mutation_bump(state, delay_ms),
         abort_restore,
@@ -5003,6 +4999,33 @@ mod text_hidden_tests {
         rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
     }
 
+    /// The code in front of a statement starting at the end of `head`: the
+    /// trailing text of `head` back to the previous statement's end (a line
+    /// ending in `;`, `{` or `}`), skipping blank and `//` comment lines.
+    fn gate_lead(head: &str) -> String {
+        let mut lines = head.split('\n').rev();
+        let mut lead = vec![lines.next().unwrap_or_default().trim().to_string()];
+        for line in lines {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") {
+                continue;
+            }
+            if t.ends_with(';') || t.ends_with('{') || t.ends_with('}') {
+                break;
+            }
+            lead.push(t.to_string());
+        }
+        lead.reverse();
+        lead.join(" ").trim().to_string()
+    }
+
+    #[test]
+    fn the_gate_lead_sees_a_binding_on_the_line_above() {
+        assert_eq!(gate_lead("    x();\n    // note\n    "), "");
+        assert_eq!(gate_lead("    x();\n    let _ =\n    "), "let _ =");
+        assert_eq!(gate_lead("    x();\n    let _ = "), "let _ =");
+    }
+
     fn pos(body: &str, needle: &str) -> usize {
         body.find(needle)
             .unwrap_or_else(|| panic!("`{needle}` not found in:\n{body}"))
@@ -5037,8 +5060,8 @@ mod text_hidden_tests {
             );
             // And its result must be acted on: a call whose refusal is ignored
             // gates nothing. The gate STATEMENT — from the call to its first
-            // `;` — must map the refusal to the 403 and `?` it, and must start
-            // the statement (no `let _ =` or other binding swallowing it).
+            // `;` — must map the refusal to the 403 and `?` it, with nothing
+            // that discards or replaces the error on the way.
             let statement = body
                 .get(gate..)
                 .and_then(|rest| rest.split_once(';'))
@@ -5048,12 +5071,20 @@ mod text_hidden_tests {
                 statement.contains("StatusCode::FORBIDDEN") && statement.ends_with(")?;"),
                 "{handler} must return the 403: {statement}"
             );
-            let line_start = body.get(..gate).map_or("", |head| {
-                head.rsplit_once('\n').map_or(head, |(_, line)| line)
-            });
+            for evasion in [".ok()", ".or(", ".or_else(", ".unwrap_or", "let _"] {
+                assert!(
+                    !statement.contains(evasion),
+                    "{handler}: `{evasion}` discards the refusal: {statement}"
+                );
+            }
+            // And nothing in front of the call: the code between the previous
+            // statement's end and the call (comments aside) must be empty, so
+            // no `let _ =` or other binding — on this line or the one above —
+            // swallows it.
+            let lead = gate_lead(body.get(..gate).unwrap_or_default());
             assert!(
-                line_start.trim().is_empty() && !line_start.contains("let _"),
-                "{handler}: the gate must not be bound away: `{line_start}`"
+                lead.is_empty(),
+                "{handler}: the gate must not be bound away: `{lead}`"
             );
             assert!(gate < pos(body, "check_text_hidden_request("), "{handler}");
         }
@@ -5094,13 +5125,6 @@ mod text_hidden_tests {
         assert!(
             call.contains("capture_runner_window_frame_permitted(state)"),
             "{call}"
-        );
-        // A duration on a monotonic clock; ownership itself reads the
-        // webview's clock alone.
-        assert!(call.contains("clock_origin.elapsed()"), "{call}");
-        assert!(
-            !body.contains("Utc::now"),
-            "the arm must not time anything on the wall clock"
         );
         assert!(
             call.contains("schedule_mutation_bump(state, delay_ms)"),
