@@ -447,15 +447,29 @@ fn set_floors(floors: SessionFloorsByLane) {
 /// Everything this poller caches from one [`CONTROLS_DOMAIN`] answer: the
 /// session floors and the workload-census switch. One value so a poll applies
 /// both from the same response.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FleetResourceControls {
     floors: SessionFloorsByLane,
     /// The tenant's `workload_census_enabled` control (plan
     /// `2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware`,
-    /// Decision 6). Tri-state on the wire; only an explicit `false` turns the
-    /// census off — absent / NULL / an unreadable value is "no opinion", and
-    /// the census ships enabled.
-    workload_census_enabled: Option<bool>,
+    /// Decision 6), as this answer stated it — or that it could not.
+    workload_census: CensusSwitchAnswer,
+}
+
+/// What one 2xx [`CONTROLS_DOMAIN`] answer said about the workload-census
+/// switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CensusSwitchAnswer {
+    /// Coord read its control columns and stated the switch. Tri-state on the
+    /// wire; only an explicit `false` turns the census off — absent / NULL / a
+    /// non-boolean value is "no opinion", and the census ships enabled.
+    Stated(Option<bool>),
+    /// Coord answered 2xx but could not read its control columns
+    /// (`controls_available: false`, or no `controls` object at all). That is
+    /// UNKNOWN, not "no opinion": coord's refuse-on-miss obligation exists so
+    /// an unreadable switch is never reported as an unset one, and folding it
+    /// into `Stated(None)` would lift a tenant's explicit `off`.
+    Unreadable,
 }
 
 /// The cached `workload_census_enabled` control. Resting value `None` — no
@@ -491,15 +505,20 @@ fn set_workload_census_enabled(v: Option<bool>) {
 
 /// The cached workload-census switch after one controls poll. PURE.
 ///
-/// Only an ANSWER changes an opinion. A 2xx replaces it with whatever coord
-/// stated (a cleared row is "no opinion", which is on). A 401 / 404 says
-/// nothing about the tenant's choice — the device lost its credential or the
-/// route moved — so it clears a `true` (on either way) but KEEPS an explicit
-/// `false`: resetting it would start collecting on a tenant that switched the
-/// census off. Skipped / Kept leave it as it was, like every other control.
+/// Only an ANSWER changes an opinion. A 2xx that READ the controls replaces it
+/// with whatever coord stated (a cleared row is "no opinion", which is on). A
+/// 2xx whose controls were unreadable ([`CensusSwitchAnswer::Unreadable`]) and
+/// a 401 / 404 say nothing about the tenant's choice — coord's columns are
+/// unreadable, the device lost its credential, or the route moved — so they
+/// clear a `true` (on either way) but KEEP an explicit `false`: resetting it
+/// would start collecting on a tenant that switched the census off. Skipped /
+/// Kept leave it as it was, like every other control.
 fn next_workload_census_switch(prev: Option<bool>, outcome: &ControlsOutcome) -> Option<bool> {
     match outcome {
-        ControlsOutcome::Updated(controls) => controls.workload_census_enabled,
+        ControlsOutcome::Updated(controls) => match controls.workload_census {
+            CensusSwitchAnswer::Stated(v) => v,
+            CensusSwitchAnswer::Unreadable => prev.filter(|on| !*on),
+        },
         ControlsOutcome::Reset(_) => prev.filter(|on| !*on),
         ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => prev,
     }
@@ -2156,9 +2175,10 @@ struct FleetPolicyResponse {
     default_source: Option<String>,
     /// Coord's own "I could not read the control columns" flag. `Some(false)`
     /// means the §D1 columns are not provisioned on that deployment yet, which
-    /// is NOT the same statement as "the tenant set no floors" — but both
-    /// produce the same, correct behaviour here (no fleet term), so the flag is
-    /// read for the explicitness rather than for a different outcome.
+    /// is NOT the same statement as "the tenant set no floors". For the floors
+    /// both produce the same, correct behaviour (no fleet term); for the
+    /// workload-census switch they do not — an unreadable answer keeps an
+    /// explicit tenant `off` ([`CensusSwitchAnswer::Unreadable`]).
     #[serde(default)]
     controls_available: Option<bool>,
     /// The §D1 controls object, `null` when coord cannot read the columns.
@@ -2222,14 +2242,17 @@ where
     Ok(v.as_bool())
 }
 
-/// The workload-census switch from a decoded response. PURE. `None` (no fleet
-/// opinion) on every path where coord did not hand us a controls object that
-/// states it.
-fn workload_census_enabled_from(body: &FleetPolicyResponse) -> Option<bool> {
+/// The workload-census switch from a decoded response. PURE.
+/// [`CensusSwitchAnswer::Unreadable`] when coord says it could not read its
+/// controls or sent no controls object; otherwise what the object states.
+fn workload_census_answer_from(body: &FleetPolicyResponse) -> CensusSwitchAnswer {
     if body.controls_available == Some(false) {
-        return None;
+        return CensusSwitchAnswer::Unreadable;
     }
-    body.controls.as_ref()?.workload_census_enabled
+    match body.controls.as_ref() {
+        Some(controls) => CensusSwitchAnswer::Stated(controls.workload_census_enabled),
+        None => CensusSwitchAnswer::Unreadable,
+    }
 }
 
 /// One control column → a floor this runner will honour. PURE.
@@ -2691,10 +2714,13 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                         "fleet_policy_poller: fleet session floors ({}) = {}; workload census = {}",
                         CONTROLS_DOMAIN,
                         describe_floors(&controls.floors),
-                        match controls.workload_census_enabled {
-                            Some(false) => "off (tenant)",
-                            Some(true) => "on (tenant)",
-                            None => "on (no fleet opinion)",
+                        match controls.workload_census {
+                            CensusSwitchAnswer::Stated(Some(false)) => "off (tenant)",
+                            CensusSwitchAnswer::Stated(Some(true)) => "on (tenant)",
+                            CensusSwitchAnswer::Stated(None) => "on (no fleet opinion)",
+                            CensusSwitchAnswer::Unreadable => {
+                                "unknown (controls unreadable; an explicit tenant `off` is kept)"
+                            }
                         }
                     );
                 }
@@ -3420,7 +3446,7 @@ async fn poll_controls_once() -> ControlsOutcome {
     match fetch_fleet_policy(CONTROLS_DOMAIN).await {
         Ok(body) => ControlsOutcome::Updated(FleetResourceControls {
             floors: session_floors_from(&body),
-            workload_census_enabled: workload_census_enabled_from(&body),
+            workload_census: workload_census_answer_from(&body),
         }),
         Err(FetchError::NoJwt) => ControlsOutcome::SkippedNoJwt,
         Err(FetchError::AuthOrAbsent(status)) => ControlsOutcome::Reset(status),
@@ -3583,35 +3609,42 @@ mod tests {
         session_floors_from(&body)
     }
 
-    fn census_switch_of(json: &str) -> Option<bool> {
+    fn census_switch_of(json: &str) -> CensusSwitchAnswer {
         let body: FleetPolicyResponse = serde_json::from_str(json).expect("decode");
-        workload_census_enabled_from(&body)
+        workload_census_answer_from(&body)
     }
 
     /// Tri-state, absent = on: only an explicit `false` is an opinion that
-    /// turns the census off, and an odd value must not cost the floors.
+    /// turns the census off, and an odd value must not cost the floors. An
+    /// unreadable controls block is UNKNOWN, never "no opinion".
     #[test]
     fn the_workload_census_switch_decodes_tolerantly() {
+        use CensusSwitchAnswer::{Stated, Unreadable};
         assert_eq!(
             census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":false}}"#),
-            Some(false)
+            Stated(Some(false))
         );
         assert_eq!(
             census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":true}}"#),
-            Some(true)
+            Stated(Some(true))
         );
         assert_eq!(
             census_switch_of(r#"{"controls_available":true,"controls":{"workload_census_enabled":null}}"#),
-            None
+            Stated(None)
         );
-        assert_eq!(census_switch_of(r#"{"controls_available":true,"controls":{}}"#), None);
+        assert_eq!(census_switch_of(r#"{"controls_available":true,"controls":{}}"#), Stated(None));
         assert_eq!(
             census_switch_of(r#"{"controls_available":false,"controls":{"workload_census_enabled":false}}"#),
-            None
+            Unreadable
         );
+        assert_eq!(
+            census_switch_of(r#"{"controls_available":false,"controls":null}"#),
+            Unreadable
+        );
+        assert_eq!(census_switch_of(r#"{"controls_available":true}"#), Unreadable);
         let odd = r#"{"controls_available":true,
             "controls":{"workload_census_enabled":"no","min_free_bytes_sessions_host":4096}}"#;
-        assert_eq!(census_switch_of(odd), None);
+        assert_eq!(census_switch_of(odd), Stated(None));
         assert_eq!(floors_of(odd).host.warn_free_bytes, Some(4096));
     }
 
@@ -3622,7 +3655,7 @@ mod tests {
         let updated = |v: Option<bool>| {
             ControlsOutcome::Updated(FleetResourceControls {
                 floors: SessionFloorsByLane::default(),
-                workload_census_enabled: v,
+                workload_census: CensusSwitchAnswer::Stated(v),
             })
         };
         for status in [401, 404] {
@@ -3640,6 +3673,22 @@ mod tests {
         assert_eq!(next_workload_census_switch(Some(false), &updated(Some(true))), Some(true));
         assert_eq!(next_workload_census_switch(Some(false), &updated(None)), None);
         assert_eq!(next_workload_census_switch(None, &updated(Some(false))), Some(false));
+    }
+
+    /// A 2xx whose controls coord could not read (`controls_available: false`)
+    /// is UNKNOWN, not "no opinion": it must not lift an explicit tenant `off`
+    /// (the off-switch would fail open), and it behaves like a reset otherwise.
+    #[test]
+    fn an_explicit_census_off_survives_an_unreadable_controls_answer() {
+        let unreadable = ControlsOutcome::Updated(FleetResourceControls {
+            floors: SessionFloorsByLane::default(),
+            workload_census: census_switch_of(
+                r#"{"domain":"fleet_resources","controls_available":false,"controls":null}"#,
+            ),
+        });
+        assert_eq!(next_workload_census_switch(Some(false), &unreadable), Some(false));
+        assert_eq!(next_workload_census_switch(Some(true), &unreadable), None);
+        assert_eq!(next_workload_census_switch(None, &unreadable), None, "never answered: on");
     }
 
     #[test]
