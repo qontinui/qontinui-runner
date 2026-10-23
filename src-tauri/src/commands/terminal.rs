@@ -670,22 +670,21 @@ pub fn terminal_list(
 /// Returns the parsed `GridSnapshot` rather than raw scrollback bytes, so the
 /// frontend can paint the final visible state in one synchronous write.
 /// See `plans/terminal-grid-snapshot.md`.
+///
+/// `reset_flow_control` (default false) also resets the session's flow-control
+/// counters, just before the snapshot. The reconnect path sets it once its
+/// `terminal-output` listener exists: see `TerminalSession::grid_snapshot`.
 #[tauri::command]
 pub fn terminal_get_grid(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
+    reset_flow_control: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let session = terminal_manager
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    let grid_handle = session.grid();
-    let snapshot = {
-        let g = grid_handle
-            .lock()
-            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
-        g.snapshot()
-    };
+    let snapshot = session.grid_snapshot(reset_flow_control.unwrap_or(false))?;
     let value = serde_json::to_value(&snapshot).map_err(|e| {
         String::from(AppError::EncodingError(format!(
             "Failed to serialize grid snapshot: {}",
@@ -1086,14 +1085,11 @@ pub fn terminal_save_scrollback(
         });
     }
 
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 
@@ -1170,14 +1166,11 @@ pub fn terminal_get_saved_scrollback(file_path: String) -> Result<CommandRespons
 pub fn terminal_cleanup_scrollback(
     app_handle: tauri::AppHandle,
 ) -> Result<CommandResponse, String> {
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 
@@ -2007,12 +2000,10 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
 ///
-/// `target_config_dir: None` auto-picks the configured account whose spare
-/// weekly capacity is closest to expiring — among accounts under their
-/// projected pace, the one furthest through its 7-day window, since unused
-/// capacity does not roll over past the reset
-/// (`ai_provider::config::cmp_rank`) — excluding the session's current
-/// account.
+/// `target_config_dir: None` auto-picks a target with the selection mode's
+/// handoff strategy (`ai_provider::pick_migration_target`), excluding the
+/// session's current account; an explicit target is recorded as a handoff
+/// too.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -2029,6 +2020,7 @@ pub async fn terminal_migrate_session_account(
         .or_else(crate::ai_provider::get_resolved_config_dir)
         .ok_or("the session's current account is unknown — cannot migrate")?;
 
+    let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
         Some(d) => {
             if !crate::settings::get_claude_config_dirs().contains(&d) {
@@ -2043,8 +2035,16 @@ pub async fn terminal_migrate_session_account(
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
+    // A picked target is already in the handoff ledger; an explicit one is not.
+    if explicit_target {
+        crate::ai_provider::record_handoff(&dst);
+    }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
+        .inspect_err(|_| {
+            // The session never reached `dst`: it must not count as a handoff.
+            crate::ai_provider::unrecord_handoff(&dst);
+        })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(

@@ -663,6 +663,18 @@ impl TerminalManager {
         })
     }
 
+    /// Ids being built right now — a holder being spawned for one of them may
+    /// not hold its lock yet, so a probe could steal it (the holder census
+    /// skips these and counts them as unknown).
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Ids open now AND ids being built: what the boot sweep must not probe.
     pub fn open_or_in_flight_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.list().into_iter().map(|t| t.id).collect();
@@ -728,6 +740,16 @@ impl TerminalManager {
     /// Get a terminal session by ID.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalSession>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// Test seam: mark `id` as being built, as `create` does for the length
+    /// of a spawn.
+    #[cfg(test)]
+    pub(crate) fn mark_in_flight_for_test(&self, id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
     }
 
     /// Test seam: hold `session` under `id` without spawning a PTY.

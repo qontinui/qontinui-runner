@@ -5,7 +5,9 @@
 //! Phase 2. D2: the holder is the THIRD `PaneIo` impl, not a new subsystem —
 //! the reader thread, grid, scrollback ring, emission gate and waiter thread
 //! above it are the code a `LocalPty` drives. D13: one holder per pane. Shipped
-//! behind `terminal.pty_holder` (default OFF, `settings::TerminalSettings`);
+//! behind `terminal.pty_holder` (default ON on Linux since Phase 5, which made
+//! `/restart-readiness` count holder panes; OFF on Windows and macOS —
+//! `settings::TerminalSettings`);
 //! [`pane_backend_for`] is the one place that switch is read.
 //!
 //! # What is reused, and what is new
@@ -90,7 +92,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -966,7 +968,11 @@ impl ControlQueue {
 /// A [`PaneIo`] over one pane's PTY holder. See the module docs.
 pub struct DaemonPaneIo {
     pane_id: PaneId,
-    holder_pid: u32,
+    /// Shared with the pump, which refreshes it from every reattach's
+    /// `hello_ack`: after an in-place holder upgrade (plan Phase 8) the
+    /// SUCCESSOR serves the pane, and a verified terminate or a notice must
+    /// name it, not the predecessor (review r1, finding 5).
+    holder_pid: Arc<AtomicU32>,
     child_pid: u32,
     out: Arc<PaneOutput>,
     link: Arc<dyn HolderLink>,
@@ -1006,7 +1012,7 @@ struct PumpCtx {
     pane_dir: PathBuf,
     pane_id: PaneId,
     key: String,
-    holder_pid: u32,
+    holder_pid: Arc<AtomicU32>,
     child_pid: u32,
     out: Arc<PaneOutput>,
     conn: Arc<HolderConn>,
@@ -1124,7 +1130,7 @@ impl DaemonPaneIo {
             Ok(pane) => {
                 info!(
                     pane = %pane_id,
-                    holder_pid = pane.holder_pid,
+                    holder_pid = pane.holder_pid(),
                     child_pid = pane.child_pid,
                     route = spawned.route_name(),
                     ready_after_ms = spawned.ready_after.as_millis() as u64,
@@ -1245,7 +1251,7 @@ impl DaemonPaneIo {
             );
             out.push_local(&unprotected_notice(why));
         }
-        let holder_pid = stream.hello_ack.holder_pid;
+        let holder_pid = Arc::new(AtomicU32::new(stream.hello_ack.holder_pid));
         let child_pid = info.child_pid;
         let conn = Arc::new(HolderConn::new(pane_dir, pane_id));
         conn.install(stream.writer);
@@ -1274,7 +1280,7 @@ impl DaemonPaneIo {
             pane_dir: pane_dir.to_path_buf(),
             pane_id: pane_id.clone(),
             key,
-            holder_pid,
+            holder_pid: holder_pid.clone(),
             child_pid,
             out: out.clone(),
             conn: conn.clone(),
@@ -1322,8 +1328,10 @@ impl DaemonPaneIo {
         &self.pane_id
     }
 
+    /// The pid of the holder serving this pane NOW — refreshed on every
+    /// reattach, so it follows an in-place holder upgrade (plan Phase 8).
     pub fn holder_pid(&self) -> u32 {
-        self.holder_pid
+        self.holder_pid.load(Ordering::Acquire)
     }
 
     pub fn child_pid(&self) -> u32 {
@@ -1593,7 +1601,7 @@ impl PumpCtx {
                 }
             }
             Event::Exit(exit) => {
-                info!(pane = %self.key, holder_pid = self.holder_pid, child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
+                info!(pane = %self.key, holder_pid = self.holder_pid(), child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
                 self.out.settle(exit_result(exit));
                 self.control.close();
                 self.conn.close();
@@ -1605,6 +1613,11 @@ impl PumpCtx {
             Event::Reply(_) => {}
         }
         false
+    }
+
+    /// The holder serving the pane now (see [`DaemonPaneIo::holder_pid`]).
+    fn holder_pid(&self) -> u32 {
+        self.holder_pid.load(Ordering::Acquire)
     }
 
     fn done(&self) -> bool {
@@ -1640,7 +1653,7 @@ impl PumpCtx {
                     let from = self.out.offset();
                     let restoring = reattach_restoring(*restore);
                     if restoring {
-                        info!(pane = %self.key, holder_pid = self.holder_pid, from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
+                        info!(pane = %self.key, holder_pid = self.holder_pid(), from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
                     }
                     match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
                         if restoring {
@@ -1651,8 +1664,13 @@ impl PumpCtx {
                     }) {
                         Ok(stream) => {
                             if restoring && stream.info.restore.is_none() {
-                                warn!(pane = %self.key, holder_pid = self.holder_pid, "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
+                                warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
                                 *restore = None;
+                            }
+                            let now_pid = stream.hello_ack.holder_pid;
+                            let was_pid = self.holder_pid.swap(now_pid, Ordering::AcqRel);
+                            if was_pid != now_pid {
+                                info!(pane = %self.key, was_pid, now_pid, "pty holder: another holder serves this pane now (an in-place holder upgrade)");
                             }
                             self.conn.install(stream.writer);
                             // N4: a detach that raced this reattach must not
@@ -1663,7 +1681,7 @@ impl PumpCtx {
                                 self.conn.abort_connection();
                                 return Reconnect::Done;
                             }
-                            info!(pane = %self.key, holder_pid = self.holder_pid, from, reason = %ended, attempt = outage.attempts, "pty holder: connection ended with the holder alive — reattached");
+                            info!(pane = %self.key, holder_pid = self.holder_pid(), from, reason = %ended, attempt = outage.attempts, "pty holder: connection ended with the holder alive — reattached");
                             // A new connection starts unpaused at the holder's
                             // size: re-send what this pane last asked for.
                             self.control.resize(
@@ -1689,11 +1707,13 @@ impl PumpCtx {
                         "PTY holder pid {} for pane {} answers but speaks protocol versions \
                          {holder_versions:?}, none of which this runner drives; it was LEFT \
                          RUNNING with pane process {}",
-                        self.holder_pid, self.key, self.child_pid
+                        self.holder_pid(),
+                        self.key,
+                        self.child_pid
                     );
-                    warn!(pane = %self.key, holder_pid = self.holder_pid, "pty holder: {why}");
+                    warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: {why}");
                     self.out.push_local(&holder_incompatible_notice(
-                        self.holder_pid,
+                        self.holder_pid(),
                         &holder_versions,
                     ));
                     self.out.settle(Err(why));
@@ -1717,17 +1737,20 @@ impl PumpCtx {
         let how = match self.conn.kill(GIVE_UP_KILL_BUDGET) {
             Ok(()) => "its child was killed through the holder's `kill`".to_string(),
             Err(asked) => {
-                let t = self.conn.terminate(self.holder_pid);
+                let t = self.conn.terminate(self.holder_pid());
                 format!("`kill` not answered ({asked}); {}", t.detail)
             }
         };
-        warn!(pane = %self.key, holder_pid = self.holder_pid, last = %last, how = %how, "pty holder: unreachable for the reconnect window — ending it");
+        warn!(pane = %self.key, holder_pid = self.holder_pid(), last = %last, how = %how, "pty holder: unreachable for the reconnect window — ending it");
         self.out
-            .push_local(&holder_terminated_notice(self.holder_pid, &how));
+            .push_local(&holder_terminated_notice(self.holder_pid(), &how));
         self.out.settle(Err(format!(
             "PTY holder pid {} for pane {} could not be reached for {:?} ({last}); ending it: \
              {how} — exit code of pane process {} unknown",
-            self.holder_pid, self.key, RECONNECT_WINDOW, self.child_pid
+            self.holder_pid(),
+            self.key,
+            RECONNECT_WINDOW,
+            self.child_pid
         )));
         self.conn.close();
     }
@@ -1735,17 +1758,19 @@ impl PumpCtx {
     fn settle_gone(&self, ended: &str, why: &str) {
         warn!(
             pane = %self.key,
-            holder_pid = self.holder_pid,
+            holder_pid = self.holder_pid(),
             child_pid = self.child_pid,
             reason = %ended,
             "pty holder: connection ended without an exit report and {why}; exit code unknown"
         );
         self.out
-            .push_local(&holder_gone_notice(self.holder_pid, self.child_pid));
+            .push_local(&holder_gone_notice(self.holder_pid(), self.child_pid));
         self.out.settle(Err(format!(
             "PTY holder pid {} for pane {} ended ({ended}; {why}) without reporting how \
              pane process {} exited — exit code unknown",
-            self.holder_pid, self.key, self.child_pid
+            self.holder_pid(),
+            self.key,
+            self.child_pid
         )));
         self.conn.close();
     }
@@ -1829,10 +1854,10 @@ impl PaneIo for DaemonPaneIo {
             // end the holder itself — only once it is verified to be the
             // holder this pane attached to — which hangs up the child's PTY
             // (Unix) or closes the job holding its tree (Windows).
-            let how = self.link.terminate(self.holder_pid);
+            let how = self.link.terminate(self.holder_pid());
             warn!(
                 pane = %self.pane_id,
-                holder_pid = self.holder_pid,
+                holder_pid = self.holder_pid(),
                 error = %asked,
                 how = %how.detail,
                 "pty holder: kill not answered — terminating the holder out of band"
@@ -1904,7 +1929,7 @@ impl PaneIo for DaemonPaneIo {
             self.out.close_output();
             let (out, detacher) = (self.out.clone(), self.detacher());
             let left = self.kill_settle.saturating_sub(waited);
-            let (holder_pid, child_pid) = (self.holder_pid, self.child_pid);
+            let (holder_pid, child_pid) = (self.holder_pid(), self.child_pid);
             let spawned = std::thread::Builder::new()
                 .name(format!("pty-holder-settle-{}", self.pane_id))
                 .spawn(move || settle_after_kill(&out, &detacher, left, holder_pid, child_pid));
@@ -1913,7 +1938,7 @@ impl PaneIo for DaemonPaneIo {
                     &self.out,
                     &self.detacher(),
                     Duration::ZERO,
-                    self.holder_pid,
+                    self.holder_pid(),
                     self.child_pid,
                 );
             }
@@ -1927,11 +1952,12 @@ impl PaneIo for DaemonPaneIo {
             // purpose".
             let why = format!(
                 "kill failed; PTY holder pid {} and pane process {} were left running",
-                self.holder_pid, self.child_pid
+                self.holder_pid(),
+                self.child_pid
             );
-            warn!(pane = %self.pane_id, holder_pid = self.holder_pid, "pty holder: {why}");
+            warn!(pane = %self.pane_id, holder_pid = self.holder_pid(), "pty holder: {why}");
             self.out
-                .push_local(&kill_failed_notice(self.holder_pid, self.child_pid));
+                .push_local(&kill_failed_notice(self.holder_pid(), self.child_pid));
             self.detacher().detach_once(budget);
             self.out.settle(Err(why));
             return Err(format!(
@@ -1954,7 +1980,7 @@ impl Drop for DaemonPaneIo {
         if !self.released.load(Ordering::Acquire) && !self.out.is_finished() {
             warn!(
                 pane = %self.pane_id,
-                holder_pid = self.holder_pid,
+                holder_pid = self.holder_pid(),
                 "pty holder: pane dropped without release — killing its holder's child rather \
                  than orphaning it"
             );
@@ -2066,7 +2092,7 @@ mod tests {
         }
         DaemonPaneIo {
             pane_id: PaneId::new("t-1").unwrap(),
-            holder_pid: 100,
+            holder_pid: Arc::new(AtomicU32::new(100)),
             child_pid: 101,
             out,
             link,
@@ -2141,7 +2167,7 @@ mod tests {
             )),
             pane_id,
             key: "t-pump".into(),
-            holder_pid: 100,
+            holder_pid: Arc::new(AtomicU32::new(100)),
             child_pid: 101,
             out,
             control: Arc::new(ControlQueue::new()),
@@ -2295,16 +2321,25 @@ mod tests {
         );
     }
 
-    /// The setting OFF (the default) yields `LocalPty`; ON yields the holder.
+    /// ON yields the holder, OFF yields `LocalPty`; the DEFAULT is ON on
+    /// Linux only (plan Phase 5 as amended 2026-10-15).
     #[test]
-    fn pty_holder_backend_off_by_default_yields_local_pty() {
+    fn pty_holder_backend_default_is_the_holder_on_linux_only() {
         assert_eq!(
             pane_backend_for(&TerminalSettings::default()),
-            PaneBackend::LocalPty
+            if cfg!(target_os = "linux") {
+                PaneBackend::Holder
+            } else {
+                PaneBackend::LocalPty
+            }
         );
         assert_eq!(
             pane_backend_for(&TerminalSettings { pty_holder: true }),
             PaneBackend::Holder
+        );
+        assert_eq!(
+            pane_backend_for(&TerminalSettings { pty_holder: false }),
+            PaneBackend::LocalPty
         );
     }
 
@@ -2597,6 +2632,12 @@ mod tests {
                 began.store(true, Ordering::SeqCst);
                 let mut cmd = portable_pty::CommandBuilder::new("sh");
                 cmd.args(["-c", "true"]);
+                // An explicit cwd: without one portable-pty runs the child in
+                // the builder's captured `$HOME`, which a concurrently running
+                // `IsolatedAmbient` test points at a temp dir it then deletes
+                // — the fallback spawn then fails ENOENT and this test reads
+                // that as "never fell back".
+                cmd.cwd(std::env::temp_dir());
                 let pane = spawn_holder_pane_or_fallback_in(
                     Ok(fake2.as_path()),
                     Ok(panes2),
@@ -2742,6 +2783,9 @@ mod tests {
         } else {
             cmd.args(["-c", "echo FALLBACK_MARK"]);
         }
+        // See `pty_holder_spawn_door_does_not_park_a_tokio_worker`: never the
+        // captured `$HOME`, which a concurrent test may have deleted.
+        cmd.cwd(std::env::temp_dir());
         let pane = spawn_holder_pane_or_fallback_in(
             Err("no holder in this test".into()),
             Err("unused".into()),
@@ -2982,6 +3026,63 @@ mod tests {
             pane.release(Duration::from_secs(1)).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&files);
+        }
+
+        /// Review r1, finding 5: after an in-place holder upgrade (plan Phase
+        /// 8) the pane's pump reattaches to the SUCCESSOR, and the pane's
+        /// holder pid follows it — so a verified terminate and every notice
+        /// name the holder actually serving the pane. Input and the child's
+        /// exit still flow through the same `DaemonPaneIo`.
+        #[test]
+        fn pty_holder_daemon_pane_follows_an_upgraded_holder() {
+            let dir = pane_dir("upg");
+            let pane_id = PaneId::new("upg").unwrap();
+            let pane = Arc::new(
+                DaemonPaneIo::spawn(
+                    &holder(),
+                    &dir,
+                    &pane_id,
+                    &sh("stty -echo; printf UP; read x; echo \"got:$x\"; exit 3"),
+                    80,
+                    24,
+                )
+                .expect("spawn + attach"),
+            );
+            let (collected, t) = drain(&pane);
+            until(&collected, Duration::from_secs(10), |c| contains(c, b"UP"));
+            let before = pane.holder_pid();
+            let outcome = qontinui_pty_holder::client::connect(
+                &dir,
+                &pane_id,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .expect("handshake")
+            .prepare_upgrade(Instant::now() + Duration::from_secs(60))
+            .expect("prepare_upgrade answered");
+            let qontinui_pty_holder::client::UpgradeOutcome::Upgraded { successor_pid, .. } =
+                outcome
+            else {
+                panic!("expected upgraded, got {outcome:?}");
+            };
+            assert_ne!(successor_pid, before);
+            let end = Instant::now() + Duration::from_secs(20);
+            while pane.holder_pid() != successor_pid {
+                assert!(
+                    Instant::now() < end,
+                    "the pane still names holder {} after the upgrade to {successor_pid}",
+                    pane.holder_pid()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            pane.writer().unwrap().write_all(b"after\n").unwrap();
+            until(&collected, Duration::from_secs(10), |c| {
+                contains(c, b"got:after")
+            });
+            // An adopted pane's exit code is UNKNOWN (plan D12a rule 3).
+            assert!(wait_within(&pane, Duration::from_secs(10)).is_err());
+            t.join().unwrap();
+            pane.release(Duration::from_secs(1)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SIGKILL the holder under a live pane: `wait` settles within a bound,

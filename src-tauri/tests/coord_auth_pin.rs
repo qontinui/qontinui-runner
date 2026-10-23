@@ -171,7 +171,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
-    ("commands/ai_settings.rs", "not-coord", 3),
+    // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
+    // Phase 9): the Claude connection test and the usage probe now build their
+    // requests through `model_gateway::ModelCall`, which has no `.post(` here and
+    // never attaches a coord credential. The remaining site is the Gemini call.
+    ("commands/ai_settings.rs", "not-coord", 1),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
     ("credential_helper.rs", "device-jwt-required", 1),
@@ -826,7 +830,11 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 6),
+    // 7th: `report_session_launched` (plan 2026-09-30-session-attribution-is-too-
+    // sparse-to-derive-a-terminal-state Phase 4) — POST /agents/{agent_id}/session;
+    // coord resolves the tenant from the allocation's own rows (like post_log); route
+    // and its reporter_owns_allocation check land in qontinui-coord#2746.
+    ("agent_runtime.rs", "session-noop", 7),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
     ("claude_session/trust_gate.rs", "device", 1),
@@ -953,7 +961,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
-    ("session-noop", 10),
+    ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 8),
     ("escalated", 2),
@@ -1114,8 +1122,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 42,
-        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 43,
+        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1164,8 +1172,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant \
          Phase 4 then added repo_tenant.rs's fetch_repo_tenants, the cwd resolver's \
          `GET /coord/repos/tenants` read (device: coord answers it over the caller DEVICE's own \
-         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. \
-         Found {sites}. A change here \
+         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
+         2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
+         added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
+         session-noop): 42 to 43. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
