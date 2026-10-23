@@ -22566,7 +22566,9 @@ mod not_found_message_tests {
     #[test]
     fn removed_ui_bridge_route_names_its_replacement() {
         use crate::mcp::ui_bridge::removed_routes::REMOVED_UI_BRIDGE_ROUTES;
-        assert!(REMOVED_UI_BRIDGE_ROUTES.len() >= 10);
+        // Guards an emptied table, which would make the loop below vacuous. A
+        // count floor went stale the first time an entry was dropped.
+        assert!(!REMOVED_UI_BRIDGE_ROUTES.is_empty());
         for (removed, _) in REMOVED_UI_BRIDGE_ROUTES {
             let path = match removed.strip_suffix('*') {
                 Some(prefix) => format!("{prefix}audit/accessibility"),
