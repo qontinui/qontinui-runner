@@ -383,7 +383,9 @@ impl UnknownRow {
             UnknownRow::MalformedProcStart => "registry row procStart is malformed",
             UnknownRow::UnsupportedPidDomain => "registry row pidDomain is not comparable",
             UnknownRow::CreationTimeUnavailable => "process creation time unavailable",
-            UnknownRow::UnreadableFile => "a live claude's registry file could not be read or parsed",
+            UnknownRow::UnreadableFile => {
+                "a live claude's registry file could not be read or parsed"
+            }
             UnknownRow::RegistryDirUnreadable => "a sessions/ directory could not be listed",
         }
     }
@@ -553,8 +555,7 @@ const REGISTRY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_mill
 
 fn read_registry_file_once(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map_err(|e| format!("not JSON: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("not JSON: {e}"))?;
     Ok(text)
 }
 

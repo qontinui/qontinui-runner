@@ -187,14 +187,15 @@ pub fn decide_migration_identity(
     // (or unreadable) id ⇒ a fork cannot be ruled out ⇒ refuse; stale ⇒ not
     // evidence.
     let mut maybe: Option<(u32, &'static str)> = None;
-    for other in rows.iter().filter(|r| !in_pane(r.pid) && r.is_interactive()) {
+    for other in rows
+        .iter()
+        .filter(|r| !in_pane(r.pid) && r.is_interactive())
+    {
         match other.validity {
             RowValidity::Valid if other.session_id == sid => {
                 return MigrationIdentity::HeldElsewhere { pid: other.pid }
             }
-            RowValidity::Unknown(why)
-                if other.session_id == sid || other.session_id.is_empty() =>
-            {
+            RowValidity::Unknown(why) if other.session_id == sid || other.session_id.is_empty() => {
                 maybe.get_or_insert((other.pid, why.as_str()));
             }
             _ => {}
@@ -747,7 +748,9 @@ mod tests {
             },
         ];
         match decide_migration_identity(REC, &[P2_PID], &dir_down) {
-            MigrationIdentity::Unknown(why) => assert!(why.contains("could not be listed"), "{why}"),
+            MigrationIdentity::Unknown(why) => {
+                assert!(why.contains("could not be listed"), "{why}")
+            }
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -795,7 +798,10 @@ mod tests {
         ));
         match migration_verdict(id, REC, MigrationTrigger::UsageLimitHint) {
             MigrationVerdict::ProceedOnRecord { why } => {
-                assert!(why.starts_with("identity not checked on this platform"), "{why}")
+                assert!(
+                    why.starts_with("identity not checked on this platform"),
+                    "{why}"
+                )
             }
             other => panic!("expected ProceedOnRecord, got {other:?}"),
         }
@@ -823,13 +829,17 @@ mod tests {
         assert_eq!(
             migration_verdict(id.clone(), REC, MigrationTrigger::OperatorCommand),
             MigrationVerdict::Refuse {
-                reason: "identity-mismatch(the pane runs session 506a0190, not the requested 0c4e3025)"
-                    .into()
+                reason:
+                    "identity-mismatch(the pane runs session 506a0190, not the requested 0c4e3025)"
+                        .into()
             }
         );
         assert!(matches!(
             migration_verdict(id, REC, MigrationTrigger::UsageLimitHint),
-            MigrationVerdict::Proceed { rebound_from: Some(_), .. }
+            MigrationVerdict::Proceed {
+                rebound_from: Some(_),
+                ..
+            }
         ));
     }
 
