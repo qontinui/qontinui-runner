@@ -112,6 +112,13 @@ struct RegisterOverrides {
     adopt: Option<Uuid>,
     /// Stamp this tenant instead of the resolver's answer.
     tenant: Option<Uuid>,
+    /// A tenant the CALLER already decided: stamped verbatim, with no
+    /// fallback to the resolver. Outranks `tenant`. Set by
+    /// [`AiCoordRegistrar::register_session_in`], where a
+    /// [`NewSessionTenant::Refused`] ("no tenant can be stated for this
+    /// workdir") must not be papered over with the resolver's machine default,
+    /// and is recorded so the session's federation is not either.
+    decided_tenant: Option<NewSessionTenant>,
     /// Resume parameters stamped on a FRESH `Started` row.
     resume: ResumeParams,
 }
@@ -182,10 +189,19 @@ struct Inner {
     /// The thin rows' wire bodies are rebuilt from named fields, so the
     /// stamp only picks the credential slot; it never reaches coord.
     tenants: Mutex<HashMap<Uuid, Uuid>>,
+    /// The coord `session_id`s registered since boot through
+    /// [`AiCoordRegistrar::register_session_in`] whose decision stated NO
+    /// tenant ([`NewSessionTenant::Unstated`] or [`NewSessionTenant::Refused`];
+    /// a stated one is in `tenants`). Kept beside `tenants` and evicted with
+    /// it, so the session's federation ([`federation_session_tenant`]) reuses
+    /// the decision — a refusal stays a refusal — instead of resolving again.
+    undecided: Mutex<HashMap<Uuid, NewSessionTenant>>,
     /// Resolves a new session's tenant. [`crate::session::resolve_new_session_tenant`]
     /// in production (the same source `SessionRegistry` stamps from); tests
     /// that assert on tenants inject a fixed answer
-    /// ([`AiCoordRegistrar::with_tenant_resolver`]).
+    /// ([`AiCoordRegistrar::with_tenant_resolver`]). NOT consulted by
+    /// [`AiCoordRegistrar::register_session_in`] with a workdir, which decides
+    /// through [`crate::session::resolve_new_session_tenant_in`] instead.
     tenant_resolver: fn() -> Option<Uuid>,
     /// Session-identity fabric Phase 1 — lifecycle store the registrar
     /// persists the coord-minted `fsh_` session handle into (next to the
@@ -289,6 +305,7 @@ impl AiCoordRegistrar {
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
                 tenants: Mutex::new(HashMap::new()),
+                undecided: Mutex::new(HashMap::new()),
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
@@ -494,6 +511,51 @@ impl AiCoordRegistrar {
         .ok()
     }
 
+    /// [`Self::register_session`] for a session whose spawn directory is
+    /// known: its tenant follows the workspace and the repo in `workdir`
+    /// ([`crate::session::resolve_new_session_tenant_in`]) rather than the
+    /// machine's default, so the coord record names the tenant that owns the
+    /// work and, on a multi-bound device, its writes present that tenant's
+    /// device-JWT slot. A REFUSED (or undetermined) decision stamps no tenant: the writes go
+    /// `TenantScope::Unresolved` (unauthenticated on a multi-bound device, the
+    /// default slot on a single-bound one, where the default is the only
+    /// credential there is). `workdir: None` is [`Self::register_session`]
+    /// exactly.
+    ///
+    /// A key ALREADY registered in this process (by [`Self::register_session`]
+    /// or the sniffed-resume path, R6) keeps its first registration: this
+    /// call's decision is discarded, as every R6 hit discards its inputs.
+    ///
+    /// The tenant is decided BEFORE the R6 dedupe, so a session that is
+    /// already registered pays one resolution for a no-op; registration is
+    /// once per session, and the resolution is bounded.
+    pub async fn register_session_in(
+        &self,
+        task_run_id: &str,
+        purpose: &str,
+        repo: Option<String>,
+        workdir: Option<&std::path::Path>,
+    ) -> Option<Uuid> {
+        let Some(workdir) = workdir else {
+            return self.register_session(task_run_id, purpose, repo);
+        };
+        if !registration_enabled() {
+            return None;
+        }
+        let decided = crate::session::resolve_new_session_tenant_in(Some(workdir)).await;
+        self.register_inner(
+            task_run_id,
+            Some(task_run_id),
+            purpose,
+            repo,
+            RegisterOverrides {
+                decided_tenant: Some(decided),
+                ..RegisterOverrides::default()
+            },
+        )
+        .ok()
+    }
+
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
     /// session (a `claude --resume <id>` / `--session-id <id>` line the
     /// operator typed into a plain terminal, lifted by
@@ -586,6 +648,7 @@ impl AiCoordRegistrar {
                 adopt,
                 tenant,
                 resume,
+                decided_tenant: None,
             },
         )
     }
@@ -614,7 +677,15 @@ impl AiCoordRegistrar {
         // An adopted id names a coord row that already exists (see
         // `bind_transcript_session`); otherwise mint one.
         let session_id = adopt_coord_session.unwrap_or_else(crate::session::uuid_v7);
-        let tenant = overrides.tenant.or_else(|| (self.inner.tenant_resolver)());
+        // Only a STANDING tenant-less decision is recorded; an Undetermined one
+        // is left for a later reader to ask again.
+        let decided_without_tenant = overrides
+            .decided_tenant
+            .filter(|d| d.tenant().is_none() && d.is_standing());
+        let tenant = match overrides.decided_tenant {
+            Some(decided) => decided.tenant(),
+            None => overrides.tenant.or_else(|| (self.inner.tenant_resolver)()),
+        };
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -654,6 +725,11 @@ impl AiCoordRegistrar {
                     // already find its tenant.
                     if let (Some(t), Ok(mut tenants)) = (tenant, self.inner.tenants.lock()) {
                         tenants.insert(session_id, t);
+                    }
+                    if let (Some(d), Ok(mut undecided)) =
+                        (decided_without_tenant, self.inner.undecided.lock())
+                    {
+                        undecided.insert(session_id, d);
                     }
                     None
                 }
@@ -812,9 +888,7 @@ impl AiCoordRegistrar {
                     rev.remove(claude_session_id);
                 }
             }
-            if let Ok(mut tenants) = self.inner.tenants.lock() {
-                tenants.remove(&session_id);
-            }
+            self.evict_tenant(session_id);
             return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
 
@@ -1054,6 +1128,41 @@ impl AiCoordRegistrar {
             payload["tenant_id"] = json!(t);
         }
         payload
+    }
+
+    /// The tenant decision `session_key`'s registration recorded, if it
+    /// recorded one: the stamped tenant (see [`Inner::tenants`]), else a
+    /// tenant-less decision from [`Self::register_session_in`] (see
+    /// [`Inner::undecided`]). `None` when this process has not registered it,
+    /// or registered it without deciding (plain [`Self::register_session`]
+    /// with no tenant resolved).
+    pub(crate) fn recorded_decision(&self, session_key: &str) -> Option<NewSessionTenant> {
+        let session_id = self.session_id_for(session_key)?;
+        let stated = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied());
+        match stated {
+            Some(t) => Some(NewSessionTenant::Stated(t)),
+            None => self
+                .inner
+                .undecided
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&session_id).copied()),
+        }
+    }
+
+    /// Drop `session_id`'s recorded tenant decision (both halves).
+    fn evict_tenant(&self, session_id: Uuid) {
+        if let Ok(mut tenants) = self.inner.tenants.lock() {
+            tenants.remove(&session_id);
+        }
+        if let Ok(mut undecided) = self.inner.undecided.lock() {
+            undecided.remove(&session_id);
+        }
     }
 
     /// The tenant `session_key`'s coord session was recorded under at
@@ -1404,9 +1513,7 @@ impl AiCoordRegistrar {
         // Read the tenant for the `Closed` row, then evict it with the rest of
         // the R4 index.
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
-        if let Ok(mut tenants) = self.inner.tenants.lock() {
-            tenants.remove(&session_id);
-        }
+        self.evict_tenant(session_id);
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
@@ -1446,20 +1553,29 @@ impl AiCoordRegistrar {
 /// (`{task_run_id}-agentic-N`, …), so the spawn site passes the owning
 /// `task_run_id` after its own id.
 ///
-/// Falls back to the registrar's own resolver
-/// ([`crate::session::resolve_new_session_tenant`]) when no key is registered
-/// yet (the orchestration worker registers after it spawns) or registration
-/// resolved no tenant — nothing is recorded then, so an unpaired device that
-/// pairs between the two can still disagree.
+/// A session whose registration decided without a tenant answers that same
+/// decision; a [`NewSessionTenant::Refused`] then runs the session
+/// unfederated: `build_federation_ctx` would otherwise fill the gap with the
+/// paired default — the cross-tenant filing the refusal exists to prevent.
+///
+/// Falls back to `resolve` — the spawn site's blocking call into
+/// [`crate::session::resolve_new_session_tenant_in`] for the spawn's working
+/// directory, so an unregistered session's federation follows its workspace
+/// and repo exactly as its registration would have — when no key is
+/// registered yet (the orchestration worker registers after it spawns) or was
+/// registered without a standing decision. A session registered AFTER it
+/// spawns can therefore still disagree with its federation — notably when the
+/// repo had not settled at spawn (machine rows) but has by registration.
 pub(crate) fn federation_session_tenant(
     registrar: Option<&AiCoordRegistrar>,
     session_keys: &[&str],
-) -> Option<Uuid> {
-    federation_session_tenant_with(
-        registrar,
-        session_keys,
-        crate::session::resolve_new_session_tenant,
-    )
+    resolve: impl FnOnce() -> NewSessionTenant,
+) -> NewSessionTenant {
+    // The FIRST key with any recorded decision answers, in key order: the
+    // spawn's own registration outranks its owning run's.
+    registrar
+        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_decision(k)))
+        .unwrap_or_else(resolve)
 }
 
 /// The registrar keys a spawn's federation looks its tenant up by, in order
@@ -1482,18 +1598,7 @@ pub(crate) fn federation_session_keys<'a>(
     .collect()
 }
 
-/// [`federation_session_tenant`] with the fallback resolver injected.
-fn federation_session_tenant_with(
-    registrar: Option<&AiCoordRegistrar>,
-    session_keys: &[&str],
-    fallback: fn() -> Option<Uuid>,
-) -> Option<Uuid> {
-    registrar
-        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k)))
-        .or_else(fallback)
-}
-
-use crate::session::SessionKind;
+use crate::session::{NewSessionTenant, SessionKind};
 
 // ============================================================================
 // Interactive-agent log emitter (Phase 1b/1c)
@@ -2233,29 +2338,171 @@ mod tests {
 
         assert_eq!(reg.recorded_tenant(&trid), Some(OWNING_TENANT));
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant(Some(&reg), &[&trid], || NewSessionTenant::Stated(REPINNED)),
+            NewSessionTenant::Stated(OWNING_TENANT)
         );
         // A unified-workflow phase session spawns under a suffixed id the
         // registrar never saw; the owning task_run_id, tried next, still hits.
         let phase_id = format!("{trid}-agentic-1");
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant(
+                Some(&reg),
+                &[&phase_id, &trid],
+                || NewSessionTenant::Stated(REPINNED)
+            ),
+            NewSessionTenant::Stated(OWNING_TENANT)
         );
         // No key registered (or no registrar): the fallback answers.
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant(Some(&reg), &[&phase_id], || NewSessionTenant::Stated(
+                REPINNED
+            )),
+            NewSessionTenant::Stated(REPINNED)
         );
         assert_eq!(
-            federation_session_tenant_with(None, &[&trid], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant(None, &[&trid], || NewSessionTenant::Stated(REPINNED)),
+            NewSessionTenant::Stated(REPINNED)
         );
 
         // Closing evicts it along with the rest of the R4 index.
         reg.close_session(&trid);
         assert_eq!(reg.recorded_tenant(&trid), None);
+    }
+
+    #[test]
+    fn a_decided_tenant_is_stamped_verbatim_and_a_decided_none_never_falls_back() {
+        // `register_session_in` hands the registrar the tenant its workspace
+        // and repo decided. That answer must win over the resolver's machine
+        // default — and a decided NONE (a refusal: the repo's tenant is not
+        // paired here) must stay none, not be papered over with the default.
+        const REPO_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_0000000000d1);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+
+        let decided = Uuid::new_v4().to_string();
+        let id = reg
+            .register_inner(
+                &decided,
+                Some(&decided),
+                "repo-owned",
+                None,
+                RegisterOverrides {
+                    decided_tenant: Some(NewSessionTenant::Stated(REPO_TENANT)),
+                    ..RegisterOverrides::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reg.recorded_tenant(&decided), Some(REPO_TENANT));
+
+        let refused = Uuid::new_v4().to_string();
+        let refused_id = reg
+            .register_inner(
+                &refused,
+                Some(&refused),
+                "refused",
+                None,
+                RegisterOverrides {
+                    decided_tenant: Some(NewSessionTenant::Refused),
+                    // Even a caller-named tenant does not outrank a decision.
+                    tenant: Some(OWNING_TENANT),
+                    ..RegisterOverrides::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reg.recorded_tenant(&refused), None);
+        assert_eq!(
+            reg.recorded_decision(&refused),
+            Some(NewSessionTenant::Refused)
+        );
+        assert_eq!(
+            reg.recorded_decision(&decided),
+            Some(NewSessionTenant::Stated(REPO_TENANT))
+        );
+        // Federation reads the refusal rather than resolving a default of its
+        // own; the stated session federates under its decided tenant.
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&refused], || {
+                NewSessionTenant::Stated(OWNING_TENANT)
+            }),
+            NewSessionTenant::Refused
+        );
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&decided], || NewSessionTenant::Refused),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+        // Key order decides: the spawn's own registration outranks its run's,
+        // whichever kind of decision each recorded.
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&refused, &decided], || {
+                NewSessionTenant::Stated(OWNING_TENANT)
+            }),
+            NewSessionTenant::Refused
+        );
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&decided, &refused], || {
+                NewSessionTenant::Refused
+            }),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+        // A decided Unstated is reused too — federation does not resolve again.
+        let unstated = Uuid::new_v4().to_string();
+        reg.register_inner(
+            &unstated,
+            Some(&unstated),
+            "unstated",
+            None,
+            RegisterOverrides {
+                decided_tenant: Some(NewSessionTenant::Unstated),
+                ..RegisterOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&unstated], || {
+                panic!("a recorded decision must not be resolved again")
+            }),
+            NewSessionTenant::Unstated
+        );
+        // An Undetermined decision is NOT recorded: federation asks again.
+        let undetermined = Uuid::new_v4().to_string();
+        reg.register_inner(
+            &undetermined,
+            Some(&undetermined),
+            "undetermined",
+            None,
+            RegisterOverrides {
+                decided_tenant: Some(NewSessionTenant::Undetermined),
+                ..RegisterOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reg.recorded_decision(&undetermined), None);
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&undetermined], || {
+                NewSessionTenant::Stated(REPO_TENANT)
+            }),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        let started = |sid: Uuid| {
+            pending
+                .iter()
+                .find(|r| r.session_id == sid && r.event_kind == SessionEventKind::Started.as_str())
+                .expect("a Started row")
+                .payload
+                .get("tenant_id")
+                .cloned()
+        };
+        assert_eq!(started(id), Some(json!(REPO_TENANT)));
+        assert!(
+            started(refused_id).map_or(true, |t| t.is_null()),
+            "a refused decision must not be stamped with the machine default"
+        );
+        // Closing evicts the refusal with the rest of the R4 index.
+        reg.close_session(&refused);
+        assert_eq!(reg.recorded_decision(&refused), None);
     }
 
     #[test]

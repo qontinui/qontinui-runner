@@ -3231,6 +3231,7 @@ mod tests {
             ..Default::default()
         };
         let result = qontinui_vision_core::AnalyzerResult::blocked(
+            qontinui_vision_core::UnknownCode::InputMissing,
             "no element carries a bbox (0/7)".to_string(),
             None,
             vec![],
@@ -3280,7 +3281,12 @@ mod tests {
 
         let v = serde_json::to_value(AnalyzeResponse::of(
             qontinui_vision_core::Analyzer::Color,
-            qontinui_vision_core::AnalyzerResult::blocked("n/a".to_string(), None, vec![]),
+            qontinui_vision_core::AnalyzerResult::blocked(
+                qontinui_vision_core::UnknownCode::InputMissing,
+                "n/a".to_string(),
+                None,
+                vec![],
+            ),
             Some(&frame),
             None,
             None,
@@ -3569,6 +3575,7 @@ mod tests {
         let result = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: Some("read 'Save' from 2 OCR blocks".to_string()),
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["save-btn".to_string(), "cancel-btn".to_string()],
@@ -3582,6 +3589,7 @@ mod tests {
         let qontinui_vision_core::AssertionResult {
             passed: _,
             outcome: _,
+            code: _,
             detail: _,
             assertion: _,
             confidence: _,
@@ -3788,6 +3796,7 @@ mod tests {
         let deduced = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: None,
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["a".to_string(), "b".to_string()],
@@ -3799,6 +3808,7 @@ mod tests {
         let estimated = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: Some("lowest contributing OCR block".to_string()),
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["c".to_string(), "d".to_string()],
