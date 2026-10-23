@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
@@ -99,14 +99,41 @@ pub enum CliExecutionMode {
     Native,        // Native *nix execution
 }
 
-/// Account selection strategy for multi-account Claude CLI setups
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+/// Account selection strategy for multi-account Claude CLI setups.
+///
+/// Deserialization is tolerant: a spelling this build does not know (a mode
+/// added by a newer runner, written into the machine-wide
+/// `claude-accounts.json` every runner on the box reads) decodes to the
+/// default with a warning instead of failing the whole document.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
-    Manual,     // Use the explicitly configured config_dir
+    Manual,               // Use the explicitly configured config_dir
     LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
+    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage.
+    /// Among accounts under their expected pace, pick at random, weighted by
+    /// `expected * (expected - actual)`.
+    WeightedRandom,
+    /// Among accounts under their expected pace, ranked by expected usage
+    /// (highest first), alternate handoffs between the first account and each
+    /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
+    /// last 3 hours. Spawn-time selection takes the first account. No-op when
+    /// fewer than two config dirs are configured, so safe as the default.
     #[default]
-    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage. No-op when fewer than two config dirs are configured, so safe as the default.
+    AlternatingHandoff,
+}
+
+impl<'de> Deserialize<'de> for AccountSelectionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(AccountSelectionMode::from_wire(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                mode = %raw,
+                "unknown account_selection_mode — using the default; a newer runner may have written it"
+            );
+            AccountSelectionMode::default()
+        }))
+    }
 }
 
 impl AccountSelectionMode {
@@ -123,7 +150,26 @@ impl AccountSelectionMode {
             AccountSelectionMode::Manual => "manual",
             AccountSelectionMode::LeastUsage => "least_usage",
             AccountSelectionMode::HighestExpectedUsage => "highest_expected_usage",
+            AccountSelectionMode::WeightedRandom => "weighted_random",
+            AccountSelectionMode::AlternatingHandoff => "alternating_handoff",
         }
+    }
+
+    /// Every mode, in declaration order — the one list wire-spelling parsers
+    /// walk, so a new variant cannot be missed by one of them.
+    pub const ALL: [AccountSelectionMode; 5] = [
+        AccountSelectionMode::Manual,
+        AccountSelectionMode::LeastUsage,
+        AccountSelectionMode::HighestExpectedUsage,
+        AccountSelectionMode::WeightedRandom,
+        AccountSelectionMode::AlternatingHandoff,
+    ];
+
+    /// Parse a wire spelling (trimmed, case-insensitive); `None` when it names
+    /// no mode.
+    pub fn from_wire(raw: &str) -> Option<AccountSelectionMode> {
+        let level = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|mode| mode.as_str() == level)
     }
 }
 
@@ -152,9 +198,9 @@ pub struct ClaudeCliSettings {
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
-    /// transcript copy + `claude --resume` respawn under the account whose
-    /// spare weekly capacity is closest to expiring — unused capacity does not
-    /// roll over past the reset (see `terminal::account_migration`).
+    /// transcript copy + `claude --resume` respawn under the account the
+    /// selection mode's handoff strategy picks (see
+    /// `terminal::account_migration` and `ai_provider::account_usage`).
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,
@@ -181,7 +227,7 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
-            account_selection_mode: AccountSelectionMode::HighestExpectedUsage,
+            account_selection_mode: AccountSelectionMode::default(),
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
@@ -534,6 +580,60 @@ pub struct AiSettings {
     /// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
     #[serde(default = "default_git_op_federation_enabled")]
     pub git_op_federation_enabled: bool,
+}
+
+/// The READ shape of the AI settings: the stored [`AiSettings`] plus the
+/// account-selection mode that actually governs this machine and the input
+/// that decided it ([`crate::claude_accounts::effective_selection`]).
+///
+/// Read-only by construction — it is `Serialize` only, and the three derived
+/// keys (`effective_account_selection_mode`, `account_selection_source`,
+/// `fleet_account_selection_mode`) are never fields of [`AiSettings`]: a
+/// derived value persisted into `settings.json` would be written back by every
+/// save. A client that echoes the view back on `PUT /settings/ai` is harmless,
+/// because `AiSettings` has no `deny_unknown_fields` and the three keys are
+/// dropped on deserialize (pinned by `mcp::settings` tests).
+///
+/// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 2.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSettingsView {
+    #[serde(flatten)]
+    pub settings: AiSettings,
+    pub effective_account_selection_mode: AccountSelectionMode,
+    pub account_selection_source: crate::claude_accounts::AccountSelectionSource,
+    /// The RAW fleet-policy `account_selection_mode` (`null` = the fleet has
+    /// no opinion), so a client can re-apply
+    /// [`crate::claude_accounts::resolve_selection`] to UNSAVED form state.
+    pub fleet_account_selection_mode: Option<AccountSelectionMode>,
+}
+
+impl AiSettingsView {
+    /// PURE constructor from a settings document and an already-resolved
+    /// `(mode, source, fleet)` triple.
+    pub fn from_parts(
+        settings: AiSettings,
+        (mode, source, fleet): (
+            AccountSelectionMode,
+            crate::claude_accounts::AccountSelectionSource,
+            Option<AccountSelectionMode>,
+        ),
+    ) -> Self {
+        Self {
+            settings,
+            effective_account_selection_mode: mode,
+            account_selection_source: source,
+            fleet_account_selection_mode: fleet,
+        }
+    }
+
+    /// The current stored settings plus this machine's effective selection.
+    pub fn current() -> Self {
+        Self::from_parts(
+            get_ai_settings(),
+            crate::claude_accounts::effective_selection_with_fleet(),
+        )
+    }
 }
 
 fn default_interactive_sessions_enabled() -> bool {
@@ -2600,27 +2700,61 @@ mod session_guard_tests {
 mod pty_holder_setting_tests {
     use super::*;
 
-    /// Plan 2026-09-12 Phase 2: `terminal.pty_holder` defaults OFF for a
-    /// fresh install, an empty settings.json, and a `terminal` object that
-    /// names no field — every settings file that exists today.
+    /// Plan 2026-09-12 Phase 5 (as amended 2026-10-15): `terminal.pty_holder`
+    /// defaults ON on Linux and OFF on Windows and macOS, for a fresh install,
+    /// an empty settings.json, and a `terminal` object that names no field.
     #[test]
-    fn pty_holder_setting_defaults_off() {
+    fn pty_holder_setting_defaults_on_linux_only() {
+        let expected = cfg!(target_os = "linux");
+        assert_eq!(PTY_HOLDER_DEFAULT, expected);
         for s in [
             Settings::default(),
             serde_json::from_str::<Settings>("{}").expect("empty object"),
             serde_json::from_str::<Settings>(r#"{"terminal": {}}"#).expect("empty terminal"),
         ] {
-            assert!(!s.terminal.pty_holder);
+            assert_eq!(s.terminal.pty_holder, expected);
             assert_eq!(s.terminal, TerminalSettings::default());
         }
     }
 
-    /// The hand-edit the doc names turns it on and round-trips.
+    /// An explicit opt-IN round-trips too — what a Windows or macOS operator
+    /// writes to try the holder.
     #[test]
     fn pty_holder_setting_round_trips_when_on() {
         let parsed: Settings =
             serde_json::from_str(r#"{"terminal": {"pty_holder": true}}"#).expect("parse");
         assert!(parsed.terminal.pty_holder);
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.terminal, parsed.terminal);
+    }
+
+    /// Review F4: an unreadable settings file never turns the holder on —
+    /// its default placeholder must not override an explicit opt-out — while
+    /// a loaded or fresh-install read is honoured as written.
+    #[test]
+    fn pty_holder_setting_unreadable_file_means_local_pty() {
+        let load = |provenance, pty_holder| LoadedSettings {
+            settings: Settings {
+                terminal: TerminalSettings { pty_holder },
+                ..Settings::default()
+            },
+            provenance,
+            error: None,
+        };
+        assert!(!terminal_settings_from(load(SettingsProvenance::Unreadable, true)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::Loaded, true)).pty_holder);
+        assert!(!terminal_settings_from(load(SettingsProvenance::Loaded, false)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::FreshInstall, true)).pty_holder);
+    }
+
+    /// The hand-edit the doc names turns it OFF and round-trips — the
+    /// operator's opt-out survives a load/save.
+    #[test]
+    fn pty_holder_setting_round_trips_when_off() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"terminal": {"pty_holder": false}}"#).expect("parse");
+        assert!(!parsed.terminal.pty_holder);
         let back: Settings =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(back.terminal, parsed.terminal);
@@ -3719,36 +3853,83 @@ pub struct Settings {
     #[serde(default)]
     pub api: ApiSettings,
     /// Terminal pane backend knobs. See [`TerminalSettings`]; the one field,
-    /// `terminal.pty_holder`, defaults OFF.
+    /// `terminal.pty_holder`, defaults to [`PTY_HOLDER_DEFAULT`] (ON on Linux only,
+    /// since plan 2026-09-12 Phase 5).
     #[serde(default)]
     pub terminal: TerminalSettings,
+    /// Model gateway declaration (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D12). An
+    /// empty `base_url` (the default) means no gateway: every behavior is
+    /// unchanged. See [`crate::model_gateway`].
+    #[serde(default)]
+    pub model_gateway: crate::model_gateway::ModelGatewaySettings,
+    /// Permission posture for runner-spawned `claude` sessions (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
+    /// default keeps each spawn site's bypass flag. `allow_list` replaces it
+    /// with a pre-approved tool list, for machines whose IT-managed Claude Code
+    /// settings disable bypass mode. Read per spawn: into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// `LaunchSpec` spawn site, the typed resume renderer
+    /// `commands::config::build_ai_resume_command`, and the provider-adapter
+    /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
+    /// task's tools), and by the orchestration fix agent. Settings layers the
+    /// runner does not own (a repository's `.claude/settings.json`, managed
+    /// settings) can still pre-approve more tools.
+    #[serde(default)]
+    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
 }
 
 /// `terminal.*` — how a LOCAL terminal pane is backed.
 ///
 /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"). Struct-level
-/// `#[serde(default)]`, so a `settings.json` written before this key — every
-/// one today — loads with the switch OFF, and a hand-edit naming one field
-/// keeps the default for the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"), flipped ON
+/// for Linux by Phase 5. Struct-level `#[serde(default)]` over the
+/// hand-written [`Default`] below, so a `settings.json` written before this
+/// key — or an empty `terminal` object — loads with the platform default
+/// ([`PTY_HOLDER_DEFAULT`]), and a hand-edit naming one field keeps the
+/// default for the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
     /// Run each new local pane's PTY in its own out-of-process holder
     /// (`qontinui-pty-holder`, driven by `terminal::daemon_pane_io`) instead
-    /// of in this process (`LocalPty`). Default **false**, and it must stay
-    /// false until Phase 5 of that plan: a holder pane's processes leave the
-    /// runner's process subtree, and `/restart-readiness` does not count them
-    /// until the holder census lands — flipping this early makes a restart
-    /// read "safe" by making the sessions invisible (the plan's Risk 2). Phase
-    /// 5 flips the default in the same change that makes the census count
-    /// holder panes.
+    /// of in this process (`LocalPty`). Default [`PTY_HOLDER_DEFAULT`]: **true
+    /// on Linux** since Phase 5 of that plan, which flipped it in the same
+    /// change that makes
+    /// `/restart-readiness` count holder panes (`terminal::holder_census`,
+    /// the fifth class of `session::tracking_health`'s partition) — the
+    /// ordering the plan's Risk 2 requires: a holder pane's processes can
+    /// leave the runner's process subtree, and before that census a restart
+    /// would have read "safe" by making those sessions invisible. **false on
+    /// Windows and macOS** (coordinator decision recorded on the plan as a
+    /// Phase 5 amendment, 2026-10-15): the Windows holder paths — job
+    /// breakaway, the WMI fallback, the named-pipe census, Toolhelp reaping —
+    /// have only ever been type-checked, and macOS has never been built. The
+    /// setting is honoured everywhere: `{"terminal": {"pty_holder": true}}`
+    /// opts a Windows or macOS box in.
+    ///
+    /// A holder that cannot be started falls back, visibly, to an in-process
+    /// PTY (`daemon_pane_io::spawn_holder_pane_or_fallback`), so ON never
+    /// costs a working terminal. `{"terminal": {"pty_holder": false}}` turns
+    /// it off for new panes, on any platform.
     ///
     /// Read once per spawn, from the non-mutating cached settings read
     /// ([`get_terminal_settings`]), so a change applies to the next terminal;
     /// an open pane keeps the backend it was born with. No settings UI: a
-    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": true}}`).
+    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": false}}`).
     pub pty_holder: bool,
+}
+
+/// `terminal.pty_holder`'s default on this platform: ON on Linux only (see
+/// [`TerminalSettings::pty_holder`]).
+pub const PTY_HOLDER_DEFAULT: bool = cfg!(target_os = "linux");
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            pty_holder: PTY_HOLDER_DEFAULT,
+        }
+    }
 }
 
 /// The `terminal.*` settings for a spawn happening now.
@@ -3756,11 +3937,29 @@ pub struct TerminalSettings {
 /// Reads through [`read_settings_from_disk`] — the NON-MUTATING, cached read —
 /// rather than [`load_settings`], whose loader can write the operator's
 /// settings file, mint ids and touch the keyring: nothing a terminal spawn
-/// should do. An unreadable settings file yields the defaults, i.e. the switch
-/// OFF, which is the safe reading of UNKNOWN here (the census-invisibility
-/// failure stays unreachable).
+/// should do.
+///
+/// **An UNREADABLE settings file turns the holder OFF for the spawn**, whatever
+/// the platform default: its `Settings` is a default placeholder, and reading
+/// the default ON from it would override an operator's explicit
+/// `"pty_holder": false` the moment the file stops parsing. `LocalPty` is
+/// today's terminal, so OFF costs nothing but survival — the opt-out is never
+/// silently overridden. Logged at `warn`.
 pub fn get_terminal_settings() -> TerminalSettings {
-    read_settings_from_disk().settings.terminal
+    terminal_settings_from(read_settings_from_disk())
+}
+
+/// [`get_terminal_settings`]'s decision over one load — the testable seam.
+fn terminal_settings_from(loaded: LoadedSettings) -> TerminalSettings {
+    if loaded.provenance == SettingsProvenance::Unreadable {
+        warn!(
+            error = ?loaded.error,
+            "terminal.pty_holder: settings.json is unreadable — new panes use an in-process PTY \
+             so an operator's opt-out is never overridden by a default"
+        );
+        return TerminalSettings { pty_holder: false };
+    }
+    loaded.settings.terminal
 }
 
 /// Settings → Runner → "Allowed browser origins".
@@ -3772,12 +3971,12 @@ pub struct ApiSettings {
     /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
     /// checks) and never the credential doors (secrets, caller-named paths,
     /// caller-directed requests, process execution). Origins listed HERE never
-    /// get a door. Only the four built-in default dev origins
-    /// (`http://localhost:3001`, `http://127.0.0.1:3001`,
-    /// `http://localhost:9875`, `http://127.0.0.1:9875`) currently retain the
-    /// graced doors — including local
-    /// command execution and file reads — until qontinui-web #1380 deploys
-    /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
+    /// get a door. Only the two built-in qontinui-web dev origins
+    /// (`GRACE_ORIGINS`: `http://localhost:3001`, `http://127.0.0.1:3001`)
+    /// currently retain the graced doors — including local command execution
+    /// and file reads — while `TRUSTED_DOOR_GRACE` exists; plan
+    /// `2026-09-17-retire-the-runner-origin-guard-dev-grace` is its
+    /// retirement path. List only origins served by
     /// software trusted like the runner. Agents and scripts send no
     /// `Origin` and need no entry.
     #[serde(default)]
@@ -4258,7 +4457,9 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     resolve_config_dir_from(
         std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
+        qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Config,
+        ),
     )
 }
 
@@ -4271,16 +4472,14 @@ pub(crate) fn resolve_config_dir_from(
     env_config_dir: Option<String>,
     platform_config_dir: Option<PathBuf>,
 ) -> Result<(PathBuf, ConfigDirSource), String> {
-    env_config_dir
-        .filter(|s| !s.is_empty())
-        .map(|s| (PathBuf::from(s), ConfigDirSource::EnvConfigDir))
-        .or_else(|| {
-            platform_config_dir.map(|d| {
-                (
-                    d.join("com.qontinui.runner"),
-                    ConfigDirSource::PlatformConfigDir,
-                )
-            })
+    qontinui_runner_lib::instance_env::runner_config_dir_from(env_config_dir, platform_config_dir)
+        .map(|(dir, from_env)| {
+            let source = if from_env {
+                ConfigDirSource::EnvConfigDir
+            } else {
+                ConfigDirSource::PlatformConfigDir
+            };
+            (dir, source)
         })
         .ok_or_else(|| "Failed to get config directory".to_string())
 }
@@ -4980,8 +5179,9 @@ pub fn load_settings_full() -> LoadedSettings {
     // Tier env-var overlay. In-memory only; never persisted. Lets a parent
     // process (notably the supervisor spawning a temp runner) force the
     // booted runner onto a specific tier without writing to the shared
-    // settings.json — which is keyed off `dirs::config_dir()` and is the
-    // same file for primary + temp + named runners. Persisting tier=Local
+    // settings.json — which is keyed off the platform config dir and is the
+    // same file for primary + temp + named runners that carry no
+    // `QONTINUI_CONFIG_DIR`. Persisting tier=Local
     // for a temp runner would silently strip the primary runner's Tier 2
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
@@ -5776,7 +5976,10 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
     update_settings(|settings| settings.ci_node = ci_node)
 }
 
-/// Save AI settings.
+/// Persist AI settings WITHOUT the write lock — private on purpose: every
+/// writer goes through [`update_ai_settings`], which holds
+/// `AI_SETTINGS_WRITE_LOCK` across the read and this write. A second public
+/// door here is how a lock-free read-modify-write loses a concurrent change.
 ///
 /// The whole-`AiSettings` per-instance save stays as-is (its embedded
 /// `claude_cli.config_dir` / `account_selection_mode` / `account_selection_pinned`
@@ -5784,7 +5987,7 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
 /// in `load_settings` wins unconditionally). ADDITIONALLY mirrors those three
 /// roster fields into the machine-global `claude-accounts.json` so mode/pin
 /// changes made on any instance reach every instance.
-pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
+fn save_ai_settings_unlocked(ai_settings: AiSettings) -> Result<(), String> {
     let config_dir = ai_settings.claude_cli.config_dir.clone();
     let selection_mode = ai_settings.claude_cli.account_selection_mode;
     let selection_pinned = ai_settings.claude_cli.account_selection_pinned;
@@ -5794,6 +5997,45 @@ pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
         roster.account_selection_mode = selection_mode;
         roster.account_selection_pinned = selection_pinned;
     })
+}
+
+/// Serializes every read-modify-write of the AI settings in this process
+/// (`PUT /settings/ai`, the path-prediction toggle, the Tauri save), so two
+/// concurrent partial writes cannot each read the same base and have the later
+/// save drop the earlier one's change.
+///
+/// A process mutex rather than [`update_settings`]: that primitive hands its
+/// closure the RAW on-disk document, whose roster fields are stale shadows of
+/// `claude-accounts.json` — merging over it would write a stale
+/// `config_dir` / mode / pin back machine-wide. The base here is
+/// [`get_ai_settings`] (roster overlaid), and the write is
+/// [`save_ai_settings_unlocked`] (per-instance save + roster mirror).
+/// That writer is private to this module, so this function is the ONLY door
+/// through which `settings.ai` is written.
+static AI_SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Why [`update_ai_settings`] did not save.
+#[derive(Debug)]
+pub enum AiSettingsUpdateError<E> {
+    /// The caller's transform refused the stored document (e.g. a bad body).
+    Rejected(E),
+    /// The transform succeeded but persisting failed.
+    SaveFailed(String),
+}
+
+/// Read the current AI settings, transform them with `f`, and save the result
+/// — atomically with respect to every other caller of this function.
+pub fn update_ai_settings<E>(
+    f: impl FnOnce(AiSettings) -> Result<AiSettings, E>,
+) -> Result<AiSettings, AiSettingsUpdateError<E>> {
+    // Poison-tolerant: a panic in another writer leaves no partial state
+    // behind this lock (the save itself is atomic on disk).
+    let _guard = AI_SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let next = f(get_ai_settings()).map_err(AiSettingsUpdateError::Rejected)?;
+    save_ai_settings_unlocked(next.clone()).map_err(AiSettingsUpdateError::SaveFailed)?;
+    Ok(next)
 }
 
 /// Get the World State Verifier settings.
@@ -5964,11 +6206,6 @@ fn store_performance_cache(entry: CachedPerformance) {
 /// Get the interactive sessions enabled setting
 pub fn get_interactive_sessions_enabled() -> bool {
     crate::config_facade::get_interactive_sessions_enabled()
-}
-
-/// Save the interactive sessions enabled setting
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    crate::config_facade::save_interactive_sessions_enabled(enabled)
 }
 
 /// Get the auto-continue AI workflow setting
@@ -6392,6 +6629,46 @@ pub fn get_remote_create_settings() -> RemoteCreateSettings {
 /// Persist the remote-create preference.
 pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
+}
+
+/// Get the model gateway declaration. See [`crate::model_gateway`].
+pub fn get_model_gateway() -> crate::model_gateway::ModelGatewaySettings {
+    crate::model_gateway::current_settings()
+}
+
+/// Validate, normalize and persist the model gateway declaration. An invalid
+/// declaration is refused and nothing is written. Returns what was stored.
+pub fn save_model_gateway(
+    value: crate::model_gateway::ModelGatewaySettings,
+) -> Result<crate::model_gateway::ModelGatewaySettings, String> {
+    let normalized = value.normalized();
+    normalized.validate()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.model_gateway = normalized)?;
+    // The sticky marker (written for a gateway, deleted for an explicit clear)
+    // is what lets a later settings reset read as UNKNOWN rather than "no
+    // gateway" — see `model_gateway` "Fail closed".
+    crate::model_gateway::record_saved_declaration(&stored)?;
+    Ok(stored)
+}
+
+/// Get the session permission posture. See [`Settings::claude_session_permission`].
+///
+/// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
+pub fn get_claude_session_permission(
+) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+    read_settings_from_disk().settings.claude_session_permission
+}
+
+/// Validate, normalize and persist the session permission posture. Returns what
+/// was stored.
+pub fn save_claude_session_permission(
+    value: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    let normalized = value.normalized()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.claude_session_permission = normalized)?;
+    Ok(stored)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see
@@ -6961,14 +7238,30 @@ mod account_selection_mode_tests {
     /// silently seeing an unknown mode.
     #[test]
     fn selection_mode_str_matches_serde() {
-        for mode in [
-            AccountSelectionMode::Manual,
-            AccountSelectionMode::LeastUsage,
-            AccountSelectionMode::HighestExpectedUsage,
-        ] {
+        for mode in AccountSelectionMode::ALL {
             let serde_spelling = serde_json::to_value(mode).expect("serializes");
             assert_eq!(serde_spelling, serde_json::json!(mode.as_str()));
+            let back: AccountSelectionMode =
+                serde_json::from_value(serde_spelling).expect("round-trips");
+            assert_eq!(back, mode);
         }
+        // A spelling this build does not know decodes to the default rather
+        // than failing the document it sits in.
+        let unknown: AccountSelectionMode =
+            serde_json::from_value(serde_json::json!("from_a_newer_runner")).unwrap();
+        assert_eq!(unknown, AccountSelectionMode::default());
+        assert_eq!(
+            AccountSelectionMode::default(),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        assert_eq!(
+            AccountSelectionMode::WeightedRandom.as_str(),
+            "weighted_random"
+        );
+        assert_eq!(
+            AccountSelectionMode::AlternatingHandoff.as_str(),
+            "alternating_handoff"
+        );
         // Pin the literals too: the coord half codes against these strings.
         assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
         assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");

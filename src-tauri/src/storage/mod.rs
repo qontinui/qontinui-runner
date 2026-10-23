@@ -16,7 +16,10 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Home,
+        )
+        .unwrap_or_else(|| PathBuf::from("."));
         let base_path = home.join("qontinui");
 
         Self {

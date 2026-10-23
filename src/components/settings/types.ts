@@ -87,6 +87,8 @@ export interface UpdateInfo {
   current_version?: string;
   notes?: string;
   development?: boolean;
+  /** `"egress_off"` when the project turned update checks off. */
+  status?: string;
 }
 
 export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | "error";
@@ -95,7 +97,17 @@ export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | 
 export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_api";
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
 export type GeminiAuthMethod = "oauth" | "api_key";
-export type AccountSelectionMode = "manual" | "least_usage" | "highest_expected_usage";
+export type AccountSelectionMode =
+  | "manual"
+  | "least_usage"
+  | "highest_expected_usage"
+  | "weighted_random"
+  | "alternating_handoff";
+/** Which input decided the effective account-selection mode (runner
+ * `claude_accounts::AccountSelectionSource`): `pinned` — the local mode, pinned
+ * against the fleet; `fleet` — unpinned and the fleet policy has a value;
+ * `local` — unpinned and the fleet has no opinion. */
+export type AccountSelectionSource = "fleet" | "local" | "pinned";
 
 export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
@@ -390,7 +402,22 @@ export function compareByHighestExpectedUsage(
 export function compareForAccountSelectionMode(
   mode: AccountSelectionMode | undefined,
 ): typeof compareByUsageHeadroom {
-  return mode === "highest_expected_usage" ? compareByHighestExpectedUsage : compareByUsageHeadroom;
+  // `alternating_handoff` picks the highest-expected under-pace account at
+  // spawn time (its "account 1"), so it shares that comparator. The ordering
+  // it gives `weighted_random` is only a display order: that mode draws, so
+  // it has no single best account (see `hasDeterministicPick`).
+  return mode === "highest_expected_usage" ||
+    mode === "alternating_handoff" ||
+    mode === "weighted_random"
+    ? compareByHighestExpectedUsage
+    : compareByUsageHeadroom;
+}
+
+/** Whether a mode picks one predictable account, so the UI may mark it as the
+ * auto-selected one. `manual` names its account explicitly; `weighted_random`
+ * draws a new account on each pick. */
+export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
+  return mode !== "manual" && mode !== "weighted_random";
 }
 
 export interface ClaudeApiSettings {
@@ -424,6 +451,79 @@ export interface AiSettings {
    * When true, sessions use multi-turn interactive mode with message queuing.
    * When false, sessions use one-shot inline mode. */
   interactive_sessions_enabled: boolean;
+  /** READ-ONLY (runner `AiSettingsView`): the account-selection mode that
+   * actually governs this machine — the fleet policy's value when unpinned
+   * and the fleet has one, else `claude_cli.account_selection_mode`. Never
+   * saved; absent from an older runner. */
+  effective_account_selection_mode?: AccountSelectionMode;
+  /** READ-ONLY: which input decided `effective_account_selection_mode`. */
+  account_selection_source?: AccountSelectionSource;
+  /** READ-ONLY: the raw fleet-policy mode (`null` = the fleet has no
+   * opinion; absent = an older runner). Lets the page re-apply the runner's
+   * rule to unsaved form state — see {@link displayedAccountSelection}. */
+  fleet_account_selection_mode?: AccountSelectionMode | null;
+}
+
+/** The account-selection mode the Settings page DESCRIBES, which input
+ * decided it, and whether that input is the fleet policy.
+ *
+ * Re-applies the runner's ONE rule (`claude_accounts::resolve_selection`) to
+ * the CURRENT form state — the local mode and the pin checkbox, saved or not —
+ * against the raw fleet value the runner reported:
+ *   pinned → local mode, source `pinned`;
+ *   unpinned and the fleet has a value → the fleet's mode, source `fleet`;
+ *   otherwise → local mode, source `local`.
+ * So un-ticking the pin while the fleet has a value immediately shows the
+ * fleet's mode, and a different local mode shows at once when it governs.
+ *
+ * Against a runner that predates `fleet_account_selection_mode`, falls back to
+ * the runner-computed `effective_account_selection_mode` /
+ * `account_selection_source` (and to the local mode when those are absent). */
+export function displayedAccountSelection(settings: AiSettings): {
+  mode: AccountSelectionMode | undefined;
+  source: AccountSelectionSource | undefined;
+  fleetManaged: boolean;
+} {
+  const local = settings.claude_cli.account_selection_mode;
+  const pinned = settings.claude_cli.account_selection_pinned ?? false;
+  const fleet = settings.fleet_account_selection_mode;
+
+  if (fleet !== undefined) {
+    if (pinned) return { mode: local, source: "pinned", fleetManaged: false };
+    if (fleet !== null) return { mode: fleet, source: "fleet", fleetManaged: true };
+    return { mode: local, source: "local", fleetManaged: false };
+  }
+
+  // Older runner: no raw fleet value, only its own resolution at load time.
+  const fleetManaged =
+    settings.account_selection_source === "fleet" &&
+    !pinned &&
+    settings.effective_account_selection_mode !== undefined;
+  return {
+    mode: fleetManaged ? settings.effective_account_selection_mode : local,
+    // A ticked (even unsaved) pin is what governs, whatever the runner said
+    // at load time.
+    source: pinned ? "pinned" : settings.account_selection_source,
+    fleetManaged,
+  };
+}
+
+/** Human label for an account-selection mode (the selector's button text). */
+export function accountSelectionModeLabel(mode: AccountSelectionMode | undefined): string {
+  switch (mode) {
+    case "manual":
+      return "Manual";
+    case "least_usage":
+      return "Least Usage";
+    case "highest_expected_usage":
+      return "Highest Expected Usage";
+    case "weighted_random":
+      return "Weighted Random";
+    case "alternating_handoff":
+      return "Alternating Handoff";
+    default:
+      return "Unknown";
+  }
 }
 
 export interface AiConnectionTestResult {
