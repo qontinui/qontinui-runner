@@ -1332,7 +1332,8 @@ pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<Moda
             ids.dom_names.insert(format!("{tag}#{dom_id}"));
         }
         if let Some(test_id) = text(modal, "testId") {
-            ids.dom_names.insert(format!("{tag}[data-testid=\"{test_id}\"]"));
+            ids.dom_names
+                .insert(format!("{tag}[data-testid=\"{test_id}\"]"));
         }
     }
     Some(ids)
@@ -2166,7 +2167,11 @@ mod visibility_tests {
         assert!(is_tracked_overlay("bridge-1", &ids, &reg));
         assert!(!is_tracked_overlay("div#bridge-1", &ids, &reg));
         assert!(is_tracked_overlay("div#dom-1", &ids, &reg));
-        assert!(is_tracked_overlay("div[data-testid=\"test-1\"]", &ids, &reg));
+        assert!(is_tracked_overlay(
+            "div[data-testid=\"test-1\"]",
+            &ids,
+            &reg
+        ));
         for miss in [
             "dom-1",
             "#dom-1",
@@ -2288,8 +2293,9 @@ mod visibility_tests {
     fn a_registry_id_matches_only_exactly() {
         use super::is_tracked_overlay;
         let ids = identities(&["bridge-settings"], &[]);
-        let reg: std::collections::HashSet<&str> =
-            ["bridge-settings", "bridge-settings-2"].into_iter().collect();
+        let reg: std::collections::HashSet<&str> = ["bridge-settings", "bridge-settings-2"]
+            .into_iter()
+            .collect();
         assert!(is_tracked_overlay("bridge-settings", &ids, &reg));
         for miss in [
             "bridge-settings-2",
@@ -2317,9 +2323,17 @@ mod visibility_tests {
         .expect("modals array present");
         let reg = no_registry();
         assert!(!is_tracked_overlay("aside#sidebar", &modals, &reg));
-        assert!(!is_tracked_overlay("aside[data-testid=\"sidebar\"]", &modals, &reg));
+        assert!(!is_tracked_overlay(
+            "aside[data-testid=\"sidebar\"]",
+            &modals,
+            &reg
+        ));
         assert!(!is_tracked_overlay("sidebar", &modals, &reg));
-        assert!(is_tracked_overlay("div[data-testid=\"sidebar\"]", &modals, &reg));
+        assert!(is_tracked_overlay(
+            "div[data-testid=\"sidebar\"]",
+            &modals,
+            &reg
+        ));
 
         let elements = vec![el(
             "btn-save",
