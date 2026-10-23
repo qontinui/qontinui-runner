@@ -90,6 +90,32 @@ export function textVisibilityBody(payload: object): Record<string, unknown> {
 }
 
 /**
+ * How recent the SDK's last restore must be for the probe to wait for its
+ * paint: one paint fence. An unthrottled webview paints a restore within a
+ * frame; past this window, a restore is taken as painted.
+ */
+export const RECENT_RESTORE_MS = PAINT_FENCE_TIMEOUT_MS;
+
+/**
+ * Whether the SDK's last restore may not have been painted yet: it happened
+ * within {@link RECENT_RESTORE_MS}, or it cannot be read. Read through the
+ * SDK's own public answer — `setTextVisibility({hidden: false})` with nothing
+ * hidden writes nothing and returns the last restore (`changed: false`). Call
+ * it only right after `textHidden()` answered `false`, in the same synchronous
+ * run, so there is nothing for it to restore. Wall-clock: a clock stepped
+ * forward past the window reads a recent restore as old (a backward step only
+ * makes the probe wait).
+ */
+function restoreMayBeUnpainted(): boolean {
+  const read = setTextVisibility({ hidden: false });
+  if (!read.success || read.hidden !== false || read.changed !== false) return true;
+  if (read.restore === null) return false;
+  const restoredAt = read.restore?.restoredAt;
+  if (typeof restoredAt !== "number") return true;
+  return Date.now() - restoredAt < RECENT_RESTORE_MS;
+}
+
+/**
  * Run one text-visibility message against the webview's own DOM.
  *
  * Two fields only the runner's own arm (`capture_text_hidden_pair` in
@@ -97,22 +123,29 @@ export function textVisibilityBody(payload: object): Record<string, unknown> {
  *
  * - `query: true` — the probe: answer `{hidden, paintFence}` from the SDK's
  *   `textHidden()`, with no page-state change (`textHidden()` may lazily
- *   create the SDK's shared state slot, nothing more). The state is read on
- *   both sides of a paint fence, because a restore — the SDK's TTL, or a
- *   restore whose reply the runner never saw — writes synchronously and
- *   paints later: `hidden: false` is answered only once a frame has painted
- *   it, and `hidden: null` when the state moved during the wait. Where dev
- *   controls are off nothing can ever have been hidden in this realm, so the
- *   answer is `hidden: false` with `paintFence: "not_needed"` and no wait (a
- *   throttled webview would otherwise time the fence out for nothing). The
- *   arm asks this before frame A.
+ *   create the SDK's shared state slot, nothing more). The arm asks this
+ *   before frame A. A restore — the SDK's TTL, or a restore whose reply the
+ *   runner never saw — writes synchronously and paints later, so when the
+ *   text reads visible but the SDK's last restore is recent (within
+ *   {@link RECENT_RESTORE_MS}), the state is read on both sides of a paint
+ *   fence: `hidden: false` then answers only once a frame has painted, and
+ *   `hidden: null` when the state differs before and after the fence. With no
+ *   recent restore there is nothing unpainted to wait for, and the answer is
+ *   `paintFence: "not_needed"` at once — so a minimized or occluded dev
+ *   runner, whose paused frames would time every fence out, still gets its
+ *   frame A. Where dev controls are off nothing can ever have been hidden in
+ *   this realm (the gate is one-way), so the answer is likewise
+ *   `"not_needed"`. Not seen: another caller's hide AND its restore, both
+ *   made inside the fence's own wait.
  * - `onlyIfVisible: true` — hide only when text is not already hidden. When it
  *   is, answer `{hidden: true, changed: false, wasHidden: true}` WITHOUT
  *   calling the SDK, so another caller's hide is neither re-armed nor touched.
  *
- * The direct HTTP route (`POST /ui-bridge/control/text-visibility`) refuses a
- * body carrying either field with a 400, so only the arm sends them; an
- * explicit re-hide there re-arms the TTL, as the SDK documents.
+ * The runner's text-visibility routes refuse a body carrying either field —
+ * the direct route (`POST /ui-bridge/control/text-visibility`) with a 400,
+ * the `/sdk/` route with `{success: false, code: "INVALID_REQUEST"}` — so only
+ * the arm sends them; an explicit re-hide on the direct route re-arms the
+ * TTL, as the SDK documents.
  *
  * Every reply that reached the SDK carries `wasHidden`: `textHidden()` read
  * immediately before `setTextVisibility`, in the same synchronous run, so no
@@ -130,10 +163,16 @@ export async function runTextVisibilityRequest(
     if (!devControlsEnabled()) {
       return {
         success: true,
-        data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
+        data: { success: true, query: true, hidden: textHidden(), paintFence: "not_needed" },
       };
     }
     const before = textHidden();
+    if (before === false && !restoreMayBeUnpainted()) {
+      return {
+        success: true,
+        data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
+      };
+    }
     const paintFence = await waitForPaint();
     const after = textHidden();
     return {

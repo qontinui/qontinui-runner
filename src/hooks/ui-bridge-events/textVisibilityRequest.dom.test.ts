@@ -8,7 +8,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { enableDevControls } from "@qontinui/ui-bridge/core";
 import { textHidden } from "@qontinui/ui-bridge/control";
-import { runTextVisibilityRequest } from "./textVisibilityRequest";
+import { PAINT_FENCE_TIMEOUT_MS, runTextVisibilityRequest } from "./textVisibilityRequest";
 
 const KEY = Symbol.for("@qontinui/ui-bridge/dev-controls");
 
@@ -101,6 +101,27 @@ describe("text visibility in the runner webview (DOM)", () => {
 
     // The other caller's TTL fires when it always would have: not re-armed.
     vi.advanceTimersByTime(500);
+    expect(textHidden()).toBe(false);
+  });
+
+  it("the probe reads the real engine's last restore: recent waits, old does not", async () => {
+    enableDevControls("provider-feature");
+    document.body.innerHTML = "<p>Body copy</p>";
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    await runTextVisibilityRequest({ hidden: true }, async () => "timeout");
+    await runTextVisibilityRequest({ hidden: false }, async () => "timeout");
+
+    now.mockReturnValue(10_100);
+    const recent = vi.fn(async () => "animation_frame" as const);
+    const waited = await runTextVisibilityRequest({ query: true }, recent);
+    expect(recent).toHaveBeenCalledTimes(1);
+    expect(waited).toMatchObject({ data: { hidden: false, paintFence: "animation_frame" } });
+
+    now.mockReturnValue(10_000 + PAINT_FENCE_TIMEOUT_MS + 1);
+    const old = vi.fn(async () => "animation_frame" as const);
+    const atOnce = await runTextVisibilityRequest({ query: true }, old);
+    expect(old).not.toHaveBeenCalled();
+    expect(atOnce).toMatchObject({ data: { hidden: false, paintFence: "not_needed" } });
     expect(textHidden()).toBe(false);
   });
 });

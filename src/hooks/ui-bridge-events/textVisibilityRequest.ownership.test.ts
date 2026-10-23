@@ -3,13 +3,14 @@
  * reach through the SDK's own two calls: `wasHidden` is read BEFORE
  * `setTextVisibility`; `onlyIfVisible` leaves an already-hidden page untouched
  * (no SDK call, so no TTL re-arm); `query` reads, with no page-state change,
- * and answers only after a paint fence.
+ * and waits for a paint fence only when a restore may still be unpainted.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 let hidden = false;
 let devControls = true;
+let lastRestore: { restoredAt: number } | null = null;
 const calls: string[] = [];
 const bodies: unknown[] = [];
 
@@ -24,17 +25,23 @@ vi.mock("@qontinui/ui-bridge/control", () => ({
     bodies.push(body);
     const changed = hidden !== body.hidden;
     hidden = body.hidden;
-    return { success: true, hidden: body.hidden, changed, hiddenAt: 1_000, timestamp: 1_000 };
+    if (!body.hidden) {
+      // The SDK's show: a real restore when text was hidden, else the last one.
+      if (changed) lastRestore = { restoredAt: Date.now() };
+      return { success: true, hidden: false, changed, restore: lastRestore, timestamp: 1_000 };
+    }
+    return { success: true, hidden: true, changed, hiddenAt: 1_000, timestamp: 1_000 };
   },
 }));
 
-import { runTextVisibilityRequest } from "./textVisibilityRequest";
+import { RECENT_RESTORE_MS, runTextVisibilityRequest } from "./textVisibilityRequest";
 
 const paint = async () => "animation_frame" as const;
 
 beforeEach(() => {
   hidden = false;
   devControls = true;
+  lastRestore = null;
   calls.length = 0;
   bodies.length = 0;
 });
@@ -71,21 +78,36 @@ describe("text visibility ownership (clock-free)", () => {
     expect(bodies).toEqual([{ hidden: true, ttlMs: 15000 }]);
   });
 
-  it.each([true, false])(
-    "query reads textHidden (%s) around the fence, changing no state",
-    async (h) => {
-      hidden = h;
-      const reply = await runTextVisibilityRequest({ query: true }, paint);
-      expect(calls).toEqual(["textHidden", "textHidden"]);
-      expect(bodies).toEqual([]);
-      expect(reply).toEqual({
-        success: true,
-        data: { success: true, query: true, hidden: h, paintFence: "animation_frame" },
-      });
-    },
-  );
+  it("query on a hidden page reads textHidden around the fence, changing no state", async () => {
+    hidden = true;
+    const reply = await runTextVisibilityRequest({ query: true }, paint);
+    expect(calls).toEqual(["textHidden", "textHidden"]);
+    expect(bodies).toEqual([]);
+    expect(reply).toEqual({
+      success: true,
+      data: { success: true, query: true, hidden: true, paintFence: "animation_frame" },
+    });
+  });
 
-  it("query answers only after the paint fence, and passes a timed-out fence on", async () => {
+  it.each([
+    ["no restore ever", null],
+    ["a restore older than the window", -(RECENT_RESTORE_MS + 1)],
+  ])("query with %s answers at once, with no fence to wait for", async (_, age) => {
+    if (age !== null) lastRestore = { restoredAt: Date.now() + age };
+    const waitForPaint = vi.fn(paint);
+    const reply = await runTextVisibilityRequest({ query: true }, waitForPaint);
+    expect(waitForPaint).not.toHaveBeenCalled();
+    // The last restore is read through the SDK's no-op show: nothing written.
+    expect(calls).toEqual(["textHidden", "set:false"]);
+    expect(hidden).toBe(false);
+    expect(reply).toEqual({
+      success: true,
+      data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
+    });
+  });
+
+  it("query after a recent restore waits for the fence, and passes a timed-out one on", async () => {
+    lastRestore = { restoredAt: Date.now() - 100 };
     let release: (fence: "animation_frame" | "timeout") => void = () => {};
     const fence = new Promise<"animation_frame" | "timeout">((r) => (release = r));
     let settled = false;
@@ -102,7 +124,7 @@ describe("text visibility ownership (clock-free)", () => {
     });
   });
 
-  it("query answers hidden: null when the state moved during the fence", async () => {
+  it("query answers hidden: null when the state differs before and after the fence", async () => {
     hidden = true;
     const reply = await runTextVisibilityRequest({ query: true }, async () => {
       hidden = false; // a restore written while the probe waited
@@ -111,14 +133,19 @@ describe("text visibility ownership (clock-free)", () => {
     expect(reply).toMatchObject({ data: { hidden: null } });
   });
 
-  it("query with dev controls off: nothing can be hidden, no fence is needed", async () => {
-    devControls = false;
-    const waitForPaint = vi.fn(paint);
-    const reply = await runTextVisibilityRequest({ query: true }, waitForPaint);
-    expect(waitForPaint).not.toHaveBeenCalled();
-    expect(reply).toEqual({
-      success: true,
-      data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
-    });
-  });
+  it.each([false, true])(
+    "query with dev controls off answers textHidden() (%s) with no fence",
+    async (h) => {
+      devControls = false;
+      hidden = h;
+      const waitForPaint = vi.fn(paint);
+      const reply = await runTextVisibilityRequest({ query: true }, waitForPaint);
+      expect(waitForPaint).not.toHaveBeenCalled();
+      expect(bodies).toEqual([]);
+      expect(reply).toEqual({
+        success: true,
+        data: { success: true, query: true, hidden: h, paintFence: "not_needed" },
+      });
+    },
+  );
 });

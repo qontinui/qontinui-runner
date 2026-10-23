@@ -120,7 +120,9 @@ fn whole_u64(v: &Value) -> Option<u64> {
 }
 
 /// Fields only [`capture_text_hidden_pair`] sends to the hook
-/// ([`probe_body`], [`arm_hide_body`]); refused on the direct route.
+/// ([`probe_body`], [`arm_hide_body`]). [`validate_text_visibility_body`]
+/// refuses them, so neither caller-facing route accepts them: the direct route
+/// answers 400, the `/sdk/` route `{success: false, code: "INVALID_REQUEST"}`.
 pub(crate) const ARM_ONLY_FIELDS: [&str; 2] = ["query", "onlyIfVisible"];
 
 /// Validate a `POST /control/text-visibility` body. Mirrors the SDK rules:
@@ -129,14 +131,14 @@ pub(crate) const ARM_ONLY_FIELDS: [&str; 2] = ["query", "onlyIfVisible"];
 /// refused).
 pub(crate) fn validate_text_visibility_body(body: &Value) -> Result<(), String> {
     let obj = body.as_object().ok_or("body must be a JSON object")?;
-    // The runner arm's own fields: on this route `query` would turn a restore
-    // into a probe answering 200, and `onlyIfVisible` would change what an
-    // explicit hide does. The webview hook honours them from the arm alone.
+    // The runner arm's own fields, refused from any caller: forwarded, `query`
+    // would turn a restore into a probe that answers success, and
+    // `onlyIfVisible` would change what an explicit hide does.
     for arm_only in ARM_ONLY_FIELDS {
         if obj.contains_key(arm_only) {
             return Err(format!(
-                "{arm_only} is not a field of this route (it is reserved for the runner's \
-                 own captureTextHidden arm)"
+                "`{arm_only}` is not accepted: `query` and `onlyIfVisible` are reserved for \
+                 the runner's internal capture arm"
             ));
         }
     }
@@ -312,6 +314,20 @@ fn is_true(v: &Value, key: &str) -> bool {
     v.get(key).and_then(Value::as_bool) == Some(true)
 }
 
+/// Whether a REFUSED hide still leaves frame A proven: the hook read
+/// `wasHidden: false` before the SDK refused, or the refusal is the hook's own
+/// dev-controls one (`capability_unavailable_in_build`, which carries no
+/// `wasHidden`: nothing can be hidden in that realm). `wasHidden: true`, a
+/// null, or a missing one on any other refusal leaves the same unknown as a
+/// lost `wasHidden`.
+fn refusal_keeps_frame_a(hide: &Value) -> bool {
+    match hide.get("wasHidden") {
+        Some(Value::Bool(was)) => !was,
+        None => hide.get("code").and_then(Value::as_str) == Some("capability_unavailable_in_build"),
+        Some(_) => false,
+    }
+}
+
 /// A hide request that never left the runner, as one line.
 fn never_sent_message(hide: &Value) -> String {
     let error = hide
@@ -409,8 +425,10 @@ fn hide_is_ours(hide: &Value) -> Option<bool> {
 /// Why a probe answering `hidden: false` still does not prove frame A would
 /// show the text: a restore writes its state at once and paints later, so the
 /// answer counts only once the hook's paint fence released on a painted frame
-/// (`animation_frame`), or the hook said no fence was needed (dev controls
-/// off: nothing can have been hidden in that realm). `None` when it is proven.
+/// (`animation_frame`), or the hook said no fence was needed (`not_needed`:
+/// the SDK's last restore is older than the hook's window, or none happened,
+/// or dev controls are off and nothing can have been hidden in that realm).
+/// `None` when it is proven.
 fn probe_fence_unproven(probe: Option<&Value>) -> Option<String> {
     match probe
         .and_then(|v| v.get("paintFence"))
@@ -514,21 +532,33 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   no `wasHidden`: the page is RESTORED (holding the lock and permits), then
 ///   the id bumped, and no frame B is returned. Frame A is refused too: the
 ///   lost `wasHidden` is the only thing that could have shown another caller's
-///   hide landing after the probe, during frame A. The arm's TTL is short, and a page left text-hidden poisons every capture
-///   until it fires; the one hide this can wrongly undo is a concurrent
-///   dev-only direct-route (`control/text-visibility`) hide.
+///   hide landing after the probe, during frame A. The arm's TTL is short, and
+///   a page left text-hidden poisons every capture until it fires; the one hide
+///   this can wrongly undo is a concurrent dev-only direct-route
+///   (`control/text-visibility`) hide.
 /// - A refused hide (`success: false`), or a request that provably never left
 ///   the runner ([`hide_never_sent`]): nothing was hidden, nothing restored, and
-///   the permits are released at once. A never-sent hide refuses frame A as
-///   well: with no hook answer, nothing checked whether another caller hid the
-///   page after the probe (the UNKNOWN case's reason).
+///   the permits are released at once. Frame A is refused here too unless the
+///   hook's answer proves it ([`refusal_keeps_frame_a`]): a never-sent hide has
+///   no answer at all, and a refusal must carry `wasHidden: false` or be the
+///   dev-controls refusal — otherwise nothing checked whether another caller
+///   hid the page after the probe (the UNKNOWN case's reason).
 ///
-/// Accepted remainder: a hide by another caller that appears after the probe
-/// AND is gone again before the hook reads `wasHidden` — made and restored (or
-/// expired) entirely while frame A was being captured — is invisible to both
-/// checks, and frame A may show its text-hidden page. Only the dev-only direct
-/// route can hide this webview's text besides this arm, and the arm's lock
-/// keeps two arms apart.
+/// Accepted remainder — frame A may show a text-hidden page, unseen, when:
+/// - a hide by another caller appears after the probe AND is gone again before
+///   the hook reads `wasHidden` (made and restored, or expired, entirely while
+///   frame A was being captured);
+/// - another caller's hide AND its restore both land inside the probe's own
+///   paint-fence wait, so the state reads the same on both sides of it;
+/// - the probe skipped its fence because the last restore was older than the
+///   hook's window (`RECENT_RESTORE_MS`), yet a webview with paused frames had
+///   still not painted it — or the webview's wall clock stepped forward past
+///   the window.
+///
+/// Only the dev-only direct route can hide this webview's text besides this
+/// arm, and the arm's lock keeps two arms apart. `captureTextHidden` therefore
+/// works on a minimized or occluded dev runner too: the probe waits on a paint
+/// only right after a restore, where a timed-out fence still refuses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, B, T, R>(
     send: S,
@@ -572,6 +602,11 @@ where
             "the page's text was already hidden by another caller, so frame A would not show \
              it"
             .to_string(),
+        ),
+        Ok(Some(Value::Null)) => Some(
+            "whether the page's text was already hidden is unknown (its state differed \
+             before and after the probe's paint fence, or the SDK could not tell)"
+                .to_string(),
         ),
         Ok(_) => Some(
             "whether the page's text was already hidden is unknown (the webview's answer \
@@ -643,6 +678,14 @@ where
                  another caller's hide covered frame A is unknown"
                     .into(),
             );
+        } else if !refusal_keeps_frame_a(&hide) {
+            frame_a = Err(format!(
+                "frame A was not kept: the hide was refused, and its reply does not show the \
+                 text was visible when it was asked (wasHidden: {}), so another caller's hide \
+                 may have covered frame A",
+                hide.get("wasHidden")
+                    .map_or("absent".into(), Value::to_string)
+            ));
         }
         return TextHiddenPair {
             frame_a,
@@ -860,7 +903,7 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             let error = reply.error.unwrap_or_default();
             assert!(
-                error.contains("reserved for the runner's own"),
+                error.contains("reserved for the runner's internal capture arm"),
                 "{body}: {error}"
             );
             assert!(
@@ -1178,9 +1221,39 @@ mod tests {
         assert!(!has(&events, "show"), "the webview hid nothing: {events:?}");
         assert!(!has(&events, "abort-restore"), "{events:?}");
         assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
+        assert_eq!(
+            out.frame_a,
+            Ok("frame-a"),
+            "nothing can be hidden where dev controls are off"
+        );
         let run = out.run.expect("the hide was sent");
         assert_eq!(run.hide, refusal);
         assert_eq!(run.restore, None);
+    }
+
+    /// Any other refusal keeps frame A only when the hook read `wasHidden:
+    /// false` before the SDK refused; `true`, null, or none leaves it unknown
+    /// whether another caller's hide covered frame A.
+    #[tokio::test]
+    async fn a_refused_hide_keeps_frame_a_only_when_was_hidden_proves_it() {
+        let refused = |was: Option<Value>| {
+            let mut v = json!({"success": false, "code": "HIDE_FAILED", "error": "threw"});
+            if let Some(was) = was {
+                v["wasHidden"] = was;
+            }
+            v
+        };
+        let (out, events) = run(vec![ok(refused(Some(json!(false))))], vec![ok("frame-a")]).await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        assert!(!has(&events, "show"), "{events:?}");
+        for was in [Some(json!(true)), Some(Value::Null), None] {
+            let (out, events) = run(vec![ok(refused(was.clone()))], vec![ok("frame-a")]).await;
+            let err = out.frame_a.expect_err("frame A is not proven");
+            assert!(err.contains("the hide was refused"), "{was:?}: {err}");
+            assert!(out.frame_b.is_err(), "{was:?}");
+            assert!(!has(&events, "show"), "{was:?}: {events:?}");
+            assert!(!has(&events, "abort-restore"), "{was:?}: {events:?}");
+        }
     }
 
     /// The hide request erred (a transport error or a timeout): whether it

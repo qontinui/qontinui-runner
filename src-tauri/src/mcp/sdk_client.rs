@@ -8753,6 +8753,32 @@ mod text_visibility_dispatch_tests {
         }
     }
 
+    /// The runner arm's own fields are refused here too — answered, like every
+    /// `/sdk/` validation failure, as `{success: false, code: INVALID_REQUEST}`.
+    #[tokio::test]
+    async fn the_arm_only_fields_are_refused_before_anything_is_dispatched() {
+        let (d, c) = http_target().await;
+        for body in [
+            json!({"hidden": false, "query": true}),
+            json!({"hidden": true, "onlyIfVisible": true}),
+        ] {
+            let out = sdk_text_visibility(&d, &c, body.clone(), || {}, |_| {}).await;
+            assert_eq!(out["success"], json!(false), "{body}: {out}");
+            assert_eq!(out["code"], json!("INVALID_REQUEST"), "{body}: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("reserved for the runner's internal capture arm"),
+                "{body}: {out}"
+            );
+            assert!(
+                out.get("got").is_none(),
+                "{body}: the app must not have been sent it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_http_app_is_sent_the_body_at_its_text_visibility_route() {
         let (d, c) = http_target().await;
