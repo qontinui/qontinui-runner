@@ -3588,6 +3588,8 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /health`, `/status` | none — device status |
 /// | `GET /apps/{app_id}/spec/list`, `/spec/graph` | none — app specs, not session content |
 /// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
+/// | `GET /ui-bridge/control/components` | none — component and action metadata (names, descriptions, declared effects), no element text |
+/// | `POST /ui-bridge/control/page-health` | terminal stream, strictest, refuse — its text findings quote the same webview as the snapshot |
 /// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
 /// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
 /// | `GET /task-runs/{id}/events`, `/output`, `/session-state`, `/workflow-state`, `/screenshots` | terminal stream, that run's tenant, refuse |
@@ -3646,9 +3648,16 @@ fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Val
         [route, leaf] if route == "memory" && leaf == "search" => {
             (Flow::TranscriptSync, SessionScope::Unresolved)
         }
-        // Matched as one route string: it is the runner's own HTTP route, not
-        // the `ui-bridge` sibling repo the workspace-assumption scan looks for.
-        _ if segments.join("/") == "ui-bridge/control/snapshot" => {
+        // Matched as whole route strings: they are the runner's own HTTP
+        // routes, not the `ui-bridge` sibling repo the workspace-assumption
+        // scan looks for. Both read the runner's own webview, which shows
+        // session panes: the snapshot carries every element's text, and page
+        // health quotes the text of each element its findings flag.
+        _ if matches!(
+            segments.join("/").as_str(),
+            "ui-bridge/control/snapshot" | "ui-bridge/control/page-health"
+        ) =>
+        {
             (Flow::TerminalStream, SessionScope::Unresolved)
         }
         _ => return None,
@@ -7397,6 +7406,11 @@ mod tests {
             ("GET", "/files"),
             ("POST", "/files/read"),
             ("DELETE", "/task-runs/abc"),
+            // Beside the UI Bridge dashboard's two reads: the other method on
+            // each, and the action invocation the component read advertises.
+            ("POST", "/ui-bridge/control/components"),
+            ("GET", "/ui-bridge/control/page-health"),
+            ("POST", "/ui-bridge/control/component/x1/action/delete"),
         ] {
             let env = json!({
                 "type": "http_request",
@@ -7435,6 +7449,9 @@ mod tests {
             ("GET", "/ui-bridge/control/snapshot"),
             // qontinui-web: the co-pilot planner.
             ("POST", "/prompt-home/plan"),
+            // qontinui-web: the console's UI Bridge dashboard (`relayReads.ts`).
+            ("GET", "/ui-bridge/control/components"),
+            ("POST", "/ui-bridge/control/page-health"),
             // qontinui-mobile in remote mode: its whole API surface rides
             // this arm, so a sample from across its domain clients.
             ("GET", "/status"),
@@ -9957,6 +9974,58 @@ mod egress_tests {
         // No session content: untouched even with every tenant refusing.
         let before = counter.count();
         let reply = relay_http_to_base(&counter.http_base(), &get("/configs")).await;
+        assert_ne!(reply["status"], 409, "{reply}");
+        assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
+    }
+
+    /// Plan 2026-10-23-console-presentation-spaces Phase 6: the UI Bridge
+    /// dashboard's two relay reads take the snapshot's egress verdicts. Page
+    /// health quotes the text of the elements it flags in the runner's own
+    /// webview, session panes included, so while a bound tenant refuses it is
+    /// refused exactly as the snapshot is, before the loopback API is called,
+    /// and once every bound tenant permits it flows. The component registry is
+    /// action metadata with no element text, so it flows even while a bound
+    /// tenant refuses.
+    #[tokio::test]
+    async fn the_ui_bridge_dashboard_reads_take_the_snapshots_egress_verdicts() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        fn relay_frame(method: &str, path: &str) -> serde_json::Value {
+            serde_json::json!({"request_id": "rq", "method": method, "path": path})
+        }
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0016);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let page_health = relay_frame("POST", "/ui-bridge/control/page-health");
+
+        {
+            let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+            for request in [
+                relay_frame("GET", "/ui-bridge/control/snapshot"),
+                page_health.clone(),
+            ] {
+                let reply = relay_http_to_base(&counter.http_base(), &request).await;
+                assert_eq!(
+                    status_and_flow(&reply),
+                    (409, Some("terminal_stream".into())),
+                    "{request}"
+                );
+            }
+            assert_eq!(
+                counter.count(),
+                0,
+                "a refused read never reaches the loopback API"
+            );
+
+            let components = relay_frame("GET", "/ui-bridge/control/components");
+            let reply = relay_http_to_base(&counter.http_base(), &components).await;
+            assert_ne!(reply["status"], 409, "{reply}");
+            assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+        }
+
+        let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
+        let before = counter.count();
+        let reply = relay_http_to_base(&counter.http_base(), &page_health).await;
         assert_ne!(reply["status"], 409, "{reply}");
         assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
     }
