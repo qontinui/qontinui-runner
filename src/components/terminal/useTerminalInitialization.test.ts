@@ -7,7 +7,7 @@
  * `useTabSessionIdCapture.test.ts`).
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -17,6 +17,22 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchOpenRecords,
   fetchRestoreSet,
+  waitForHolderSweep,
+  recheckRefusedAfterSweep,
+  HOLDER_SWEEP_RECHECK_ATTEMPTS,
+  fetchHolderSweepStatus,
+  splitRestoreByHold,
+  onHolderSessionReleased,
+  ownsReleasedPage,
+  RestoreRerunQueue,
+  ABORT_RETRY_BASE_MS,
+  ABORT_RETRY_LIMIT,
+  RerunTimers,
+  beginRestoreRun,
+  scheduleRestoreRerun,
+  settleRestoreRun,
+  type RestoreRerunWiring,
+  ColdResumeGuard,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -363,11 +379,19 @@ describe("runVerifiedResume", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     // The pane probe reads a plain shell (no claude), so the typing paths run.
-    mockInvoke.mockImplementation(async (cmd: string) =>
-      cmd === "terminal_probe_claude"
-        ? { success: true, message: null, data: { state: "absent", sessionIds: [] } }
-        : { success: true, message: null, data: null },
-    );
+    mockInvoke.mockImplementation(async (cmd: string, args?: { sessionId?: string }) => {
+      if (cmd === "terminal_probe_claude")
+        return { success: true, message: null, data: { state: "absent", sessionIds: [] } };
+      if (cmd === "build_ai_resume_command")
+        return {
+          success: true,
+          message: null,
+          data: {
+            command: `claude --permission-mode bypassPermissions --resume ${args?.sessionId}`,
+          },
+        };
+      return { success: true, message: null, data: null };
+    });
   });
 
   it("a claude that is NOT provably this session → types nothing, parks resumeFailed, no re-assert, marker kept", async () => {
@@ -599,54 +623,107 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
   });
 });
 
-// #548 item 3 — the typed resume must suppress the CLI's "Resume from
-// summary?" picker under the default full-resume policy (env thresholds; no
-// CLI flag / settings key short of the global "Don't ask again" exists), and
-// must leave it answerable under the opt-in summary policy.
-describe("buildResumeCmd (resume-size picker policy)", () => {
-  it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "full");
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
-    expect(cmd).toContain("--resume sess-1\r");
+// The Claude resume is RENDERED BY THE BACKEND (review H1): the config dir and
+// permission posture are its decisions. The CLI-shape assertions (#548 item 3
+// thresholds, the bypass/allow-list flag, the gateway dir) live with the Rust
+// renderer `commands::config::render_ai_resume_command`; these pin the
+// frontend half — what is asked for, and that nothing is typed on a refusal.
+describe("buildResumeCmd (backend-rendered resume)", () => {
+  // `isWindows` comes from `navigator.platform`, and Node has a real global
+  // `navigator` that reports the HOST — so without a pin these expectations
+  // passed on Linux CI and failed on every Windows dev box.
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("tells the backend the host is Windows when the platform says so", async () => {
+    vi.stubGlobal("navigator", { platform: "Win32" });
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "W" } });
+    await buildResumeCmd("sess-1", undefined, "summary");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: true,
+      fullResume: false,
+    });
   });
 
-  it("'summary' policy leaves the thresholds alone (picker shows; the loop answers it)", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "summary");
-    expect(cmd).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(cmd).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  it("asks the backend with the recorded dir and the full-resume policy, then appends Enter", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { command: "RENDERED" },
+    });
+    const cmd = await buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
+    expect(cmd).toBe("RENDERED\r");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: "C:/claude/.claude-hotmail",
+      isWindows: false,
+      fullResume: true,
+    });
   });
 
-  it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
-    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
-    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
-    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(cmd).toContain("--resume sess-1\r");
+  it("'summary' policy asks for no threshold env; an unbound dir is sent as null", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "X" } });
+    await buildResumeCmd("sess-1", undefined, "summary");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
   });
 
-  it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt (#547 union)", () => {
-    for (const policy of ["full", "summary"] as const) {
-      expect(buildResumeCmd("abc-123", undefined, policy)).toContain(
-        "claude --permission-mode bypassPermissions --resume abc-123",
-      );
-    }
+  // Review N7: a non-Claude provider's resume is rendered by the backend too
+  // (so a provider refusal under a gateway applies), never assembled here.
+  it("routes a non-Claude provider through the backend as well", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "G" } });
+    expect(await buildResumeCmd("sess-1", undefined, "summary", "gemini")).toBe("G\r");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "gemini",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
   });
 
-  // G2 (Phase 1 configDir capture): now that every capture path persists a
-  // non-null configDir, the resume must emit the CLAUDE_CONFIG_DIR prefix
-  // whenever an account is bound, and NONE when it isn't — isolated here from
-  // the threshold vars via the 'summary' policy so the config-dir branch alone
-  // is asserted.
-  it("emits the CLAUDE_CONFIG_DIR prefix iff an account dir is bound (config-dir branch, no thresholds)", () => {
-    const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary");
-    expect(bound).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-qontinui"');
-    expect(bound).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(bound).toContain("--resume sess-1\r");
+  it("a backend refusal rejects — the caller types nothing", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: false,
+      message: "model gateway unresolved",
+      data: null,
+    });
+    await expect(buildResumeCmd("sess-1", undefined, "full")).rejects.toThrow(
+      "model gateway unresolved",
+    );
+  });
 
-    // No account bound ⇒ no prefix at all (bare command).
-    const unbound = buildResumeCmd("sess-1", undefined, "summary");
-    expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  it("runVerifiedResume types nothing and parks the tab when the backend refuses to render", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "build_ai_resume_command"
+        ? { success: false, message: "refused", data: null }
+        : { success: true, message: null, data: null },
+    );
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: new Map([
+        ["tab-1", { current: { writeToTerminal: (t: string) => void writes.push(t) } }],
+      ]) as never,
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
   });
 });
 
@@ -839,5 +916,479 @@ describe("reportTreeReset — drain deferral", () => {
       "terminal_report_tree_reset",
       expect.objectContaining({ mountNumber: 2, openRecordCount: undefined }),
     );
+  });
+});
+
+describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("asks the runner to wait for the sweep to settle", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: true } });
+    await expect(waitForHolderSweep()).resolves.toBe(true);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_settled");
+  });
+
+  it("reports a sweep that did not settle in time", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: false } });
+    await expect(waitForHolderSweep()).resolves.toBe(false);
+  });
+
+  it("counts a runner with no such command as settled (no sweep there)", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("command terminal_holder_sweep_settled not found"));
+    await expect(waitForHolderSweep()).resolves.toBe(true);
+  });
+});
+
+describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const unsettled = { success: true, message: null, data: { settled: false } };
+  const settled = { success: true, message: null, data: { settled: true } };
+
+  it("once the sweep settles, returns exactly the refused ids no longer hosted live", async () => {
+    mockInvoke.mockResolvedValueOnce(unsettled).mockResolvedValueOnce(settled);
+    const live = vi.fn().mockResolvedValue(new Set(["still-alive", "never-refused"]));
+    await expect(
+      recheckRefusedAfterSweep(["reaped-by-sweep", "still-alive"], live),
+    ).resolves.toEqual(["reaped-by-sweep"]);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+    expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes nothing when the sweep never settles", async () => {
+    mockInvoke.mockResolvedValue(unsettled);
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(HOLDER_SWEEP_RECHECK_ATTEMPTS);
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the live registry cannot be read", async () => {
+    mockInvoke.mockResolvedValue(settled);
+    const live = vi.fn().mockResolvedValue(null);
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+  });
+
+  it("does nothing for nothing refused", async () => {
+    await expect(recheckRefusedAfterSweep([])).resolves.toEqual([]);
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("the holder sweep's census — restore what is not held, now", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const rec = (terminalId: string) => ({ terminalId, claudeSessionId: `s-${terminalId}` });
+
+  it("restores a non-held record without waiting while a held one is still adopting", async () => {
+    // The census is in: t2's pane is still being adopted, the sweep is unsettled.
+    mockInvoke.mockImplementation(
+      (cmd: unknown) =>
+        cmd === "terminal_holder_sweep_status"
+          ? Promise.resolve({
+              success: true,
+              message: null,
+              data: { settled: false, held: ["t2"] },
+            })
+          : new Promise(() => {}), // a settle-wait would never resolve
+    );
+    const status = await fetchHolderSweepStatus();
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_status");
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_holder_sweep_settled");
+    const { now, heldBack } = splitRestoreByHold([rec("t1"), rec("t2")], status);
+    expect(now.map((r) => r.terminalId)).toEqual(["t1"]);
+    expect(heldBack.map((r) => r.terminalId)).toEqual(["t2"]);
+  });
+
+  it("holds nothing back once the sweep settled, or with no census", () => {
+    const records = [rec("t1"), rec("t2")];
+    expect(splitRestoreByHold(records, { settled: true, held: new Set(["t2"]) }).heldBack).toEqual(
+      [],
+    );
+    expect(splitRestoreByHold(records, { settled: false, held: null }).now).toHaveLength(2);
+  });
+
+  it("reads a runner without the command as settled with nothing held", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("unknown command"));
+    const status = await fetchHolderSweepStatus();
+    expect(status.settled).toBe(true);
+    expect(status.held?.size).toBe(0);
+  });
+
+  it("reads a census that did not come in as held: null", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { settled: false, held: null },
+    });
+    await expect(fetchHolderSweepStatus()).resolves.toEqual({ settled: false, held: null });
+  });
+
+  it("re-runs the held-back sessions after the sweep, settled or not", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: false } });
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep([], live, ["s-t2"])).resolves.toEqual(["s-t2"]);
+    expect(live).not.toHaveBeenCalled();
+  });
+});
+
+describe("onHolderSessionReleased — a deferred holder died before adoption", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  const payload = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+
+  it("re-runs the restore of its page for that session when no live process hosts it", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(true);
+    expect(schedule).toHaveBeenCalledWith("page-2", ["sess-1"]);
+  });
+
+  it("leaves a session a live process still hosts alone", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set(["sess-1"]));
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it("re-runs the default page when the record named none", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
+    expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+});
+
+describe("restore re-runs — one run per page, one cold resume per session (review round 7, U1)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  /**
+   * The hook's wiring, minus React: `schedule` is `scheduleRecheckRerun`,
+   * `run` is the init effect — `begin` at its start, a guarded cold resume per
+   * record, `finish` (and a trigger) in its `finally`.
+   */
+  function harness() {
+    const queue = new RestoreRerunQueue();
+    const guard = new ColdResumeGuard();
+    const createTerminal = vi.fn();
+    const triggered: string[] = [];
+    const schedule = (pageId: string, ids: string[]) => {
+      if (queue.schedule(pageId, ids)) triggered.push(pageId);
+    };
+    const runBody = (pageId: string, records: readonly string[]) => {
+      const only = queue.begin(pageId);
+      const claims: string[] = [];
+      for (const id of only ? [...only] : records) {
+        if (!guard.tryClaim(id)) continue;
+        claims.push(id);
+        createTerminal(id);
+      }
+      return () => {
+        for (const id of claims) guard.release(id);
+        if (queue.finish(pageId, "restored") === 0) triggered.push(pageId);
+      };
+    };
+    return { queue, guard, createTerminal, triggered, schedule, runBody };
+  }
+
+  it("two schedules for one session while a run is in flight produce exactly one cold resume", async () => {
+    const h = harness();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    // The page's first restore is in flight; it refused sess-1 as live.
+    const endFirst = h.runBody("page-2", []);
+    // A late sweep settle and a released holder both ask for sess-1.
+    const released = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+    await onHolderSessionReleased(released, h.schedule, live);
+    await onHolderSessionReleased(released, h.schedule, live);
+    expect(h.triggered).toEqual([]);
+    endFirst();
+    // ONE re-run, for the merged ids.
+    expect(h.triggered).toEqual(["page-2"]);
+    h.runBody("page-2", ["sess-1", "sess-other"])();
+    expect(h.createTerminal).toHaveBeenCalledTimes(1);
+    expect(h.createTerminal).toHaveBeenCalledWith("sess-1");
+    expect(h.triggered).toEqual(["page-2"]);
+  });
+
+  it("a schedule with no run in flight triggers at once", () => {
+    const h = harness();
+    h.runBody("page-2", [])();
+    h.schedule("page-2", ["sess-1"]);
+    expect(h.triggered).toEqual(["page-2"]);
+    expect(h.queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+  });
+
+  it("a page this window never began restoring is not re-run: its full restore covers it", () => {
+    const h = harness();
+    h.schedule("page-9", ["sess-1"]);
+    expect(h.triggered).toEqual([]);
+    expect(h.queue.begin("page-9")).toBeUndefined();
+  });
+
+  it("a drain-deferred run drops what was scheduled meanwhile: the drain lift re-runs in full", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
+    expect(queue.finish("page-2", "deferred")).toBeNull();
+    expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
+  });
+
+  it("the session guard keeps two concurrent runs from both creating a tab", () => {
+    const guard = new ColdResumeGuard();
+    expect(guard.tryClaim("sess-1")).toBe(true);
+    expect(guard.tryClaim("sess-1")).toBe(false);
+    guard.release("sess-1");
+    expect(guard.tryClaim("sess-1")).toBe(true);
+  });
+});
+
+describe("RestoreRerunQueue — an aborted restore keeps what it owes (review V1)", () => {
+  it("(a) an abort with pending ids still re-runs them, after a backoff", () => {
+    const queue = new RestoreRerunQueue();
+    // The page's first restore is in flight; a released session arrives.
+    queue.begin("page-2");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
+    // The run aborts (indeterminate reconnect): the id is kept, and the
+    // queue asks for a re-run after the first backoff.
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+    // That re-run is the page's FULL restore (none ever completed), which
+    // covers sess-1.
+    expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
+  });
+
+  it("(a) an aborted targeted re-run gives its ids back, and the retry restores exactly them", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    queue.finish("page-2", "restored");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(true);
+    expect(queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+    expect(queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    expect(queue.begin("page-2")).toBeUndefined();
+  });
+
+  it("(b) a schedule after an abort is kept, and triggers a re-run", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    // Aborted with nothing owed: no re-run of its own.
+    expect(queue.finish("page-2", "aborted")).toBeNull();
+    // The page stays known: a later released session is kept, not ignored.
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(true);
+    expect(queue.restoredOnce("page-2")).toBe(false);
+    expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    expect(queue.restoredOnce("page-2")).toBe(true);
+  });
+
+  it("(c) consecutive aborts retry at most ABORT_RETRY_LIMIT times, with a doubling backoff", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    queue.schedule("page-2", ["sess-1"]);
+    const delays: Array<number | null> = [queue.finish("page-2", "aborted")];
+    // Drive every retry the queue asks for; each one aborts too.
+    while (delays[delays.length - 1] !== null && delays.length < 50) {
+      queue.begin("page-2");
+      delays.push(queue.finish("page-2", "aborted"));
+    }
+    expect(delays).toEqual([
+      ...Array.from({ length: ABORT_RETRY_LIMIT }, (_, i) => ABORT_RETRY_BASE_MS * 2 ** i),
+      null,
+    ]);
+    // The id is still owed: the next schedule (or activation) re-runs the
+    // page, and a completed restore resets the streak.
+    expect(queue.schedule("page-2", ["sess-2"])).toBe(true);
+    queue.begin("page-2");
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    queue.schedule("page-2", ["sess-3"]);
+    queue.begin("page-2");
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+  });
+});
+
+describe("restore re-run wiring — the hook's timer, trigger and unmount (review V1, r1)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The hook's wiring with its effect replaced by a recorder: `trigger` is
+   * `triggerRerun`, and a "run" is `beginRestoreRun` … `settleRestoreRun`,
+   * exactly as the init effect calls them. `drainDeferred` is the hook's
+   * `drainDeferredPages`, and a page in it re-runs merging.
+   */
+  function wiring() {
+    const drainDeferred = new Set<string>();
+    const runs: Array<{ pageId: string; merge: boolean }> = [];
+    const w: RestoreRerunWiring = {
+      queue: new RestoreRerunQueue(),
+      timers: new RerunTimers(),
+      markMerging: (pageId) => drainDeferred.add(pageId),
+      trigger: (pageId, merge) => {
+        if (merge) drainDeferred.add(pageId);
+        runs.push({ pageId, merge: merge || drainDeferred.has(pageId) });
+      },
+    };
+    // The init effect's own start: it consumes the page's merge mark.
+    const begin = (pageId: string) => {
+      const merging = drainDeferred.delete(pageId);
+      return { only: beginRestoreRun(w, pageId), merging };
+    };
+    return { w, runs, drainDeferred, begin };
+  }
+
+  it("a backoff retry that a schedule beat to it starts no second restore (finding 1)", () => {
+    const { w, runs, begin } = wiring();
+    // The page's first restore is in flight and owes sess-1; it aborts.
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(runs).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    // Before the backoff fires, another released session wins the race: it
+    // re-runs the page at once, and that run restores.
+    scheduleRestoreRerun(w, "page-2", ["sess-2"]);
+    expect(runs).toEqual([{ pageId: "page-2", merge: false }]);
+    const { only } = begin("page-2");
+    expect(only).toBeUndefined();
+    // The run beginning cancelled the page's backoff retry.
+    expect(vi.getTimerCount()).toBe(0);
+    settleRestoreRun(w, "page-2", "restored", false);
+    // The pending retry is moot: no further run, however long we wait.
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a retry that fires owing nothing does nothing, and decides merging when it fires (finding 1)", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "restored", false);
+    // A targeted re-run aborts while owing sess-1: retried after the backoff,
+    // merging — the page has a completed restore.
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    runs.length = 0;
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    vi.advanceTimersByTime(ABORT_RETRY_BASE_MS);
+    expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    // Defence in depth: a retry still armed when its ids were taken by a run
+    // that did not cancel it (the queue driven directly) fires into nothing.
+    runs.length = 0;
+    scheduleRestoreRerun(w, "page-2", ["sess-3"]);
+    runs.length = 0;
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(vi.getTimerCount()).toBe(1);
+    w.queue.begin("page-2");
+    w.queue.finish("page-2", "restored");
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toEqual([]);
+  });
+
+  it("a run that ends after unmount schedules nothing (finding 2)", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    w.timers.setActive(false);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toEqual([]);
+  });
+
+  it("unmount clears a pending retry; a re-mount re-arms scheduling", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    w.timers.setActive(false);
+    expect(vi.getTimerCount()).toBe(0);
+    w.timers.setActive(true);
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    vi.advanceTimersByTime(ABORT_RETRY_BASE_MS * 2);
+    expect(runs).toEqual([{ pageId: "page-2", merge: false }]);
+  });
+
+  it("an aborted merging re-run re-runs merging on every path (finding 3)", () => {
+    // Via the backoff timer.
+    {
+      const { w, runs, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2"); // the drain lifted: a merging re-run
+      const { merging } = begin("page-2");
+      expect(merging).toBe(true);
+      scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(drainDeferred.has("page-2")).toBe(true);
+      vi.advanceTimersByTime(ABORT_RETRY_BASE_MS);
+      expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    }
+    // Via a later schedule (the page never completed a restore).
+    {
+      const { w, runs, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2");
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+      expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    }
+    // Via re-activation: the effect's own start finds the merge mark.
+    {
+      const { w, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2");
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(begin("page-2").merging).toBe(true);
+    }
+    // An aborted FIRST restore stays a first restore.
+    {
+      const { w, drainDeferred, begin } = wiring();
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(drainDeferred.has("page-2")).toBe(false);
+    }
+  });
+});
+
+describe("ownsReleasedPage — one window handles a released session (review round 7, N4)", () => {
+  const bindings = { "page-pop": "term-1" };
+
+  it("the main window owns every page not detached into a pop-out", () => {
+    expect(ownsReleasedPage("page-2", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("default", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("page-pop", null, bindings)).toBe(false);
+  });
+
+  it("a pinned pop-out owns its one page only", () => {
+    expect(ownsReleasedPage("page-pop", "page-pop", bindings)).toBe(true);
+    expect(ownsReleasedPage("page-2", "page-pop", bindings)).toBe(false);
+  });
+
+  it("exactly one window owns each page", () => {
+    for (const page of ["page-2", "page-pop", "default"]) {
+      const owners = [null, "page-pop"].filter((pinned) =>
+        ownsReleasedPage(page, pinned, bindings),
+      );
+      expect(owners).toHaveLength(1);
+    }
   });
 });

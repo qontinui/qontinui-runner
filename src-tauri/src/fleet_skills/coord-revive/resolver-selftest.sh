@@ -99,12 +99,19 @@ done
 WS="$TMPROOT/ws"
 CFG="$WS/qontinui-claude-config"
 mkdir -p "$CFG/scripts/lib" "$CFG/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
-# The roster `coord-revive.sh` actually resolves. SIX, not the four this list
-# carried until the `_scripts/` render landed: `lib/native-path.sh` is sourced
-# by envelope.sh from beside itself, and `drain-closeout-spool.sh` is resolved
-# at the closeout-spool call site. A roster short of the real one lets case 2
-# report every helper reachable while one is not.
-HELPERS="lib/envelope.sh lib/native-path.sh lib/guard-decision-log.sh coord-acting-bearer.sh coord-provision-nonce.sh drain-closeout-spool.sh"
+# The roster `coord-revive.sh` actually resolves, read from this skill's own
+# `_scripts/` render rather than written out here. Check #64
+# holds that render equal to its roster
+# with no extras, so the directory IS the roster. The hand-written list this
+# replaced said SIX and fell two behind it (lib/mcp-env-ref.sh, then
+# lib/capability-evidence.sh), and a roster short of the real one lets case 2
+# report every helper reachable while one is not. An unreadable or empty render
+# is a refusal, never an empty roster that passes vacuously.
+HELPERS="$(cd "$HERE_SELF/_scripts" 2>/dev/null && find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')"
+case "$HELPERS" in
+  *lib/envelope.sh*) : ;;
+  *) echo "FATAL: cannot read the roster from $HERE_SELF/_scripts (got: '${HELPERS}')" >&2; exit 2 ;;
+esac
 for f in $HELPERS; do
   mkdir -p "$(dirname "$CFG/scripts/$f")"; : > "$CFG/scripts/$f"
 done
@@ -120,7 +127,7 @@ mkdir -p "$ORPHAN"
 # before the render rung this layout resolved NOTHING and `coord-revive.sh`
 # exited 127 at its `lib/envelope.sh` lookup, before probing a single door.
 # $BUNDLE_SIB is the sibling skill (`pr-status`) that ships no render of its
-# own and reaches this one -- which is why the bundle carries six files and not
+# own and reaches this one -- which is why the bundle carries each helper once and not
 # twelve.
 BUNDLE="$TMPROOT/bundle/.claude/skills/coord-revive"      # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 BUNDLE_SIB="$TMPROOT/bundle/.claude/skills/pr-status"     # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
@@ -207,9 +214,9 @@ else
 fi
 
 # ---------------------------------------------------------------- case 2
-# All four helpers resolve from the layout that used to refuse. This is the
+# All the rostered helpers resolve from the layout that used to refuse. This is the
 # defect itself: fixing envelope.sh alone left the other three refusing.
-echo "case 2 -- all six helpers from a sibling checkout, ROOT unset"
+echo "case 2 -- every rostered helper from a sibling checkout, ROOT unset"
 for rel in $HELPERS; do
   got="$(resolve "$SIB/.claude/skills/coord-revive" - "$rel")"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
   if same_file "$got" "$CFG/scripts/$rel"; then ok "$rel"; else bad "$rel -- got [${got:-<nothing>}]"; fi
@@ -221,7 +228,7 @@ done
 # -- the residual plan
 # 2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without
 # names, and the reason the end-to-end fixture is run as well as this one.
-echo "case 2b -- all six helpers from the bundled render, no checkout anywhere"
+echo "case 2b -- every rostered helper from the bundled render, no checkout anywhere"
 for rel in $HELPERS; do
   got="$(resolve "$BUNDLE" - "$rel")"
   if same_file "$got" "$BUNDLE/_scripts/$rel"; then ok "$rel"; else bad "$rel -- got [${got:-<nothing>}]"; fi
@@ -428,7 +435,7 @@ else
       -- bash "$0"
     # The sibling candidate ALONE. `pr-status` ships no render of its own, so
     # only this candidate serves it -- deleting it is how the bundle would
-    # silently grow a second copy of the same six files.
+    # silently grow a second copy of the same rostered files.
     mc_expect_red "drop the sibling-skill render candidate, so pr-status resolves nothing" \
       "$SUBJECT" '\|__rfs_try "\$HERE/../coord-revive/_scripts/\$__rfs_rel"|d' \
       -- bash "$0"

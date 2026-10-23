@@ -682,12 +682,6 @@ pub fn get_interactive_sessions_enabled() -> bool {
     load_settings().ai.interactive_sessions_enabled
 }
 
-/// Save the interactive sessions enabled setting.
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    info!("Saving interactive sessions enabled setting: {}", enabled);
-    update_settings(|settings| settings.ai.interactive_sessions_enabled = enabled)
-}
-
 /// Get the user-configured custom UI Bridge discovery ports.
 /// These are merged with the hardcoded `DESKTOP_APP_PORTS` at scan time.
 pub fn get_discovery_ports() -> Vec<u16> {

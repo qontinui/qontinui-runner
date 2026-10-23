@@ -80,6 +80,7 @@ mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_wor
 mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow
 meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal
 orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask
+orchestration_loop/fix_agent.rs | build_fix_agent_command_with | helper | build_fix_agent_command_with(
 orchestration_loop/fix_agent.rs | build_fix_agent_command | helper | build_fix_agent_command(
 orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an orchestration loop ALREADY running — carries DrainAdmission::Exempt; the loop's own fan-out is the new work the drain defers
 reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
