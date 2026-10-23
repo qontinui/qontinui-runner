@@ -266,7 +266,7 @@ pub fn is_server_mode() -> bool {
 #[derive(Debug, Clone)]
 pub struct MainWindowSpec {
     /// Isolated WebView2 profile directory (temp/secondary runners). `None`
-    /// on non-Windows and for the default profile.
+    /// for the default profile, and off Windows except under an instance root.
     pub data_dir: Option<std::path::PathBuf>,
     /// Logical inner size the builder is seeded with.
     pub initial_size: (f64, f64),
@@ -444,9 +444,10 @@ pub(crate) struct WebviewEnvOptions {
 pub(crate) fn webview_env_options(spec: Option<&MainWindowSpec>) -> WebviewEnvOptions {
     match spec {
         Some(spec) => WebviewEnvOptions {
-            // `None` off-Windows and for the default profile
-            // (`instance::webview2_data_dir` returns `None` on non-Windows),
-            // which makes the whole propagation a no-op there.
+            // `None` for the default profile, and off Windows for every
+            // runner but a subject under an instance root
+            // (`instance::webview2_data_dir`) — `None` makes the whole
+            // propagation a no-op.
             data_dir: spec.data_dir.clone(),
             browser_args: Some(MAIN_WINDOW_BROWSER_ARGS),
         },

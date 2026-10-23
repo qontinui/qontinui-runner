@@ -139,6 +139,13 @@ export interface HeldDrainResult {
   /** `writtenThrough` advanced past the writable chunks. */
   writtenThrough: number;
   /**
+   * Full byte length of every chunk the drain CONSUMED (not `reheld`) — the
+   * trimmed-away prefix included. The runner counted all of these bytes as
+   * sent, so all of them must be acked once `writable` renders, not just the
+   * bytes actually written (see `AckedWriteQueue`).
+   */
+  receivedBytes: number;
+  /**
    * Chunks that must stay held: the first of them starts beyond
    * `writtenThrough`, i.e. a hole still precedes it — writing it (or
    * anything after it) would splice the hole out permanently. The caller
@@ -165,14 +172,16 @@ export function drainHeldChunks(
 ): HeldDrainResult {
   const writable: Uint8Array[] = [];
   let through = writtenThrough;
+  let receivedBytes = 0;
   for (let i = 0; i < held.length; i++) {
     const c = held[i];
     if (c.offset !== undefined && c.offset > through) {
-      return { writable, writtenThrough: through, reheld: held.slice(i) };
+      return { writable, writtenThrough: through, receivedBytes, reheld: held.slice(i) };
     }
     const slice = trimReplayedChunk(c, replayedThrough);
     if (slice && slice.length > 0) writable.push(slice);
+    receivedBytes += c.bytes.length;
     if (c.offset !== undefined) through = Math.max(through, c.offset + c.bytes.length);
   }
-  return { writable, writtenThrough: through, reheld: [] };
+  return { writable, writtenThrough: through, receivedBytes, reheld: [] };
 }
