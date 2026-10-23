@@ -98,6 +98,15 @@ pub struct Grid {
     /// see [`Grid::sync_output`].
     sync_output_opened_at: Option<Instant>,
     alt_screen: bool,
+    /// Exclusive end, in the session's absolute output stream, of the bytes this
+    /// grid has absorbed (`ring` / `terminal-output` offsets), taken at the
+    /// last point where no escape sequence or UTF-8 character was open.
+    /// Surfaced in the snapshot so a frontend that paints it knows which stream
+    /// bytes the paint already contains, and can feed the rest to a fresh
+    /// parser from a clean boundary. Set via [`Grid::absorb_stream`].
+    stream_end: u64,
+    /// Tracks whether the absorbed stream is at a sequence boundary.
+    stream_boundary: SequenceBoundary,
     /// DEC private mode 2004 — bracketed paste. Tracked here because it is the
     /// only place in the runner that sees EVERY output byte of a session and
     /// already parses DEC private modes; the frontend's copy lives inside a
@@ -181,6 +190,8 @@ impl Grid {
             sync_output: false,
             sync_output_opened_at: None,
             alt_screen: false,
+            stream_end: 0,
+            stream_boundary: SequenceBoundary::default(),
             bracketed_paste: false,
             dirty: false,
             agent_status_sideband: None,
@@ -360,8 +371,27 @@ impl Grid {
             cursor: self.cursor,
             title: self.title.clone(),
             alt_screen: self.alt_screen,
+            stream_offset: self.stream_boundary.resumable().then_some(self.stream_end),
             cells: self.cells.clone(),
         }
+    }
+
+    /// Record that the grid has absorbed `data`, which starts at absolute stream
+    /// offset `start`. The stream end advances to the last byte boundary in
+    /// `data` where no escape sequence or UTF-8 character is open, so the
+    /// snapshot's `stream_offset` never falls inside one: a read boundary can
+    /// split `ESC [ 3 8 ; 5 ;` from `1 9 6 m`, and a fresh xterm fed from the
+    /// middle would print `196m` as text.
+    pub fn absorb_stream(&mut self, start: u64, data: &[u8]) {
+        if let Some(boundary) = self.stream_boundary.scan(data) {
+            self.set_stream_end(start + boundary as u64);
+        }
+    }
+
+    /// Advance the stream end to `end` (exclusive). Monotonic: an older offset
+    /// never moves it back.
+    fn set_stream_end(&mut self, end: u64) {
+        self.stream_end = self.stream_end.max(end);
     }
 
     /// Convenience: feed bytes through a parser into this grid.
@@ -585,6 +615,152 @@ impl Grid {
     }
 }
 
+// ---- Sequence boundary ---------------------------------------------------
+
+/// Where an escape sequence or UTF-8 character open across a read would leave
+/// a parser. A coarse model of the VT500 state machine `vte` 0.15 implements
+/// (whose own state is private): enough to tell "between sequences" from
+/// "inside one", which is all [`Grid::absorb_stream`] needs. It follows vte
+/// where vte and the frontend's parser could disagree on where a sequence
+/// ends: a raw 0x9C (8-bit ST) ends a DCS, as in vte's passthrough, but not
+/// SOS / PM / APC, which vte ends only on ESC, CAN or SUB.
+///
+/// Known divergence, between the parsers rather than in this tracker: vte
+/// decodes UTF-8 in ground, so a UTF-8-encoded C1 (`C2 9C`, U+009C) is a
+/// character to it, while a parser that honours C1 controls in UTF-8 may act
+/// on it. This tracker sides with vte, which drew the grid being painted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SeqState {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    /// OSC: ends at BEL, or at ST (`ESC \`, via `Escape`).
+    Osc,
+    /// DCS: ends at ST (via `Escape`) or a raw 0x9C.
+    Dcs,
+    /// SOS, PM, APC: end at ST (via `Escape`).
+    SosPmApc,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SequenceBoundary {
+    state: SeqState,
+    /// UTF-8 continuation bytes still owed by the character in progress.
+    utf8_left: u8,
+    /// The open sequence has had a C0 control EXECUTED inside it (vte, like
+    /// xterm, executes C0 in ESC and CSI states). The grid already shows its
+    /// effect, so resuming a fresh parser from before the sequence would apply
+    /// it twice: while this holds, no clean resume point exists.
+    executed_c0: bool,
+}
+
+impl SequenceBoundary {
+    fn at_boundary(&self) -> bool {
+        self.state == SeqState::Ground && self.utf8_left == 0
+    }
+
+    /// Whether the last boundary is still a faithful resume point: nothing past
+    /// it has already changed the grid.
+    fn resumable(&self) -> bool {
+        !self.executed_c0
+    }
+
+    /// Feed `data`; return the index just past the last byte after which the
+    /// stream was at a boundary (`Some(0)` when only the start was), or `None`
+    /// when no point in `data` was.
+    fn scan(&mut self, data: &[u8]) -> Option<usize> {
+        let mut last = self.at_boundary().then_some(0);
+        for (i, &b) in data.iter().enumerate() {
+            self.step(b);
+            if self.at_boundary() {
+                last = Some(i + 1);
+            }
+        }
+        last
+    }
+
+    fn step(&mut self, b: u8) {
+        if self.state != SeqState::Ground {
+            // "Anywhere" transitions: CAN and SUB abort a sequence, ESC starts
+            // one. BEL ends an OSC; a raw 0x9C ends a DCS.
+            let next = match (b, self.state) {
+                (0x18 | 0x1A, _) => Some(SeqState::Ground),
+                (0x1B, _) => Some(SeqState::Escape),
+                (0x07, SeqState::Osc) | (0x9C, SeqState::Dcs) => Some(SeqState::Ground),
+                _ => None,
+            };
+            if let Some(next) = next {
+                self.state = next;
+                self.executed_c0 &= next != SeqState::Ground;
+                return;
+            }
+            if matches!(b, 0x00..=0x17 | 0x19 | 0x1C..=0x1F)
+                && matches!(
+                    self.state,
+                    SeqState::Escape | SeqState::EscapeIntermediate | SeqState::Csi
+                )
+            {
+                self.executed_c0 = true;
+                return;
+            }
+        }
+        self.state = match self.state {
+            SeqState::Ground => {
+                if self.utf8_left > 0 {
+                    if (0x80..=0xBF).contains(&b) {
+                        self.utf8_left -= 1;
+                        return;
+                    }
+                    // Invalid continuation: the character is abandoned, and
+                    // this byte starts afresh.
+                    self.utf8_left = 0;
+                }
+                match b {
+                    0x1B => SeqState::Escape,
+                    0xC2..=0xDF => {
+                        self.utf8_left = 1;
+                        SeqState::Ground
+                    }
+                    0xE0..=0xEF => {
+                        self.utf8_left = 2;
+                        SeqState::Ground
+                    }
+                    0xF0..=0xF4 => {
+                        self.utf8_left = 3;
+                        SeqState::Ground
+                    }
+                    // ASCII, C0, and bytes that cannot start UTF-8 (0x80..=0xC1,
+                    // 0xF5..=0xFF), which a decoder replaces on the spot.
+                    _ => SeqState::Ground,
+                }
+            }
+            SeqState::Escape => match b {
+                0x20..=0x2F => SeqState::EscapeIntermediate,
+                b'[' => SeqState::Csi,
+                b']' => SeqState::Osc,
+                b'P' => SeqState::Dcs,
+                b'X' | b'^' | b'_' => SeqState::SosPmApc,
+                0x30..=0x7E => SeqState::Ground,
+                _ => SeqState::Escape,
+            },
+            SeqState::EscapeIntermediate => match b {
+                0x30..=0x7E => SeqState::Ground,
+                _ => SeqState::EscapeIntermediate,
+            },
+            SeqState::Csi => match b {
+                0x40..=0x7E => SeqState::Ground,
+                _ => SeqState::Csi,
+            },
+            state @ (SeqState::Osc | SeqState::Dcs | SeqState::SosPmApc) => state,
+        };
+        if self.state == SeqState::Ground {
+            self.executed_c0 = false;
+        }
+    }
+}
+
 // ---- Wire format ---------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize)]
@@ -600,6 +776,17 @@ pub struct GridSnapshot {
     /// hard-skips in that case rather than overlay alt content onto a fresh
     /// xterm. See `paintGrid.ts` / `TerminalInstance.tsx`.
     pub alt_screen: bool,
+    /// Exclusive end, in the absolute output stream, of the bytes this
+    /// snapshot reflects. A pane that paints the snapshot already shows every
+    /// stream byte before this offset, so it must not replay them on top of the
+    /// paint (`TerminalInstance.tsx`, the reconnect path).
+    ///
+    /// `None` while the stream is inside an escape sequence that has already
+    /// changed the grid (a C0 control executed inside a CSI): resuming from
+    /// before it would apply that control twice, so there is no faithful
+    /// resume point, and the reconnect path replays from the ring instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_offset: Option<u64>,
     pub cells: Vec<Cell>,
 }
 
@@ -1050,6 +1237,125 @@ impl<'a> Perform for GridPerformer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `reads` as the session reader would, from stream offset 0, and
+    /// return the snapshot's `stream_offset` after each.
+    fn offsets_after(reads: &[&[u8]]) -> Vec<u64> {
+        let mut grid = Grid::new(80, 24);
+        let mut parser = vte::Parser::new();
+        let mut start = 0u64;
+        reads
+            .iter()
+            .map(|r| {
+                grid.feed(&mut parser, r);
+                grid.absorb_stream(start, r);
+                start += r.len() as u64;
+                grid.snapshot().stream_offset.expect("a resumable boundary")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_offset_tracks_absorbed_bytes() {
+        assert_eq!(Grid::new(80, 24).snapshot().stream_offset, Some(0));
+        assert_eq!(offsets_after(&[&b"hello"[..], &b" world"[..]]), vec![5, 11]);
+    }
+
+    #[test]
+    fn stream_offset_stops_before_an_sgr_split_across_reads() {
+        // `hello` then ESC [ 38;5; | 196m world: the offset after the first
+        // read must be before the ESC, so a fresh parser fed from it gets the
+        // whole sequence, not `196m` as text.
+        let first: &[u8] = b"hello\x1b[38;5;";
+        let second: &[u8] = b"196mworld";
+        assert_eq!(offsets_after(&[first, second]), vec![5, 21]);
+    }
+
+    #[test]
+    fn stream_offset_stops_before_a_split_utf8_character() {
+        // "é" is C3 A9.
+        assert_eq!(offsets_after(&[&b"ab\xC3"[..], &b"\xA9c"[..]]), vec![2, 5]);
+    }
+
+    #[test]
+    fn stream_offset_spans_osc_dcs_and_aborted_sequences() {
+        // An OSC title ended by BEL, then one ended by ST, split mid-string.
+        assert_eq!(
+            offsets_after(&[
+                &b"x\x1b]0;ti"[..],
+                &b"tle\x07y\x1b]2;a\x1b"[..],
+                &b"\\z"[..]
+            ]),
+            vec![1, 12, 20]
+        );
+        // A CSI aborted by CAN, and a DCS ended by ST.
+        assert_eq!(
+            offsets_after(&[&b"\x1b[3\x18q\x1bPq#0"[..], &b"\x1b\\r"[..]]),
+            vec![5, 13]
+        );
+        // A whole read inside a sequence leaves the offset where it was.
+        assert_eq!(
+            offsets_after(&[&b"ok\x1b]0;"[..], &b"long title"[..], &b"\x07"[..]]),
+            vec![2, 2, 17]
+        );
+    }
+
+    #[test]
+    fn stream_offset_handles_charset_sos_pm_apc_and_esc_esc() {
+        // ESC ( B (designate G0) split after the intermediate.
+        assert_eq!(offsets_after(&[&b"a\x1b("[..], &b"Bc"[..]]), vec![1, 5]);
+        // SOS, PM and APC each end only at ST, not at a raw 0x9C.
+        assert_eq!(
+            offsets_after(&[
+                &b"\x1bXs\x9c"[..],
+                &b"\x1b\\"[..],
+                &b"\x1b^p\x1b\\\x1b_a"[..],
+                &b"\x1b\\!"[..]
+            ]),
+            vec![0, 6, 11, 17]
+        );
+        // ESC ESC restarts the escape: the sequence is still open after it.
+        assert_eq!(offsets_after(&[&b"x\x1b\x1b"[..], &b"7y"[..]]), vec![1, 5]);
+    }
+
+    #[test]
+    fn stream_offset_ends_a_dcs_on_a_raw_st_byte() {
+        assert_eq!(
+            offsets_after(&[&b"\x1bPq#0"[..], &b"\x9cz"[..]]),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn stream_offset_treats_invalid_utf8_as_complete() {
+        // Bytes that cannot start UTF-8, and a lead abandoned by a non-continuation.
+        assert_eq!(
+            offsets_after(&[&b"a\xff\x80\xc0"[..], &b"\xc3A"[..]]),
+            vec![4, 6]
+        );
+    }
+
+    #[test]
+    fn stream_offset_withheld_while_a_csi_has_executed_a_c0() {
+        // ESC [ 3 LF ... : vte executes the LF inside the CSI, so the grid has
+        // moved. Resuming before the ESC would apply it twice: no offset.
+        let mut grid = Grid::new(80, 24);
+        let mut parser = vte::Parser::new();
+        let first: &[u8] = b"hi\x1b[3\n";
+        grid.feed(&mut parser, first);
+        grid.absorb_stream(0, first);
+        assert_eq!(grid.snapshot().stream_offset, None);
+        // Once the sequence ends, the boundary after it is clean again.
+        let second: &[u8] = b"8mok";
+        grid.feed(&mut parser, second);
+        grid.absorb_stream(first.len() as u64, second);
+        assert_eq!(grid.snapshot().stream_offset, Some(10));
+        // A C0 inside an OSC is ignored, not executed: the offset stands.
+        let third: &[u8] = b"\x1b]0;a\nb";
+        grid.feed(&mut parser, third);
+        grid.absorb_stream(10, third);
+        assert_eq!(grid.snapshot().stream_offset, Some(10));
+    }
 
     fn feed(grid: &mut Grid, bytes: &[u8]) {
         let mut parser = vte::Parser::new();

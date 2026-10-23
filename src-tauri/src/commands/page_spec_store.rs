@@ -1,14 +1,14 @@
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 use tracing::{info, warn};
 
 const SPEC_DIR: &str = "user-specs";
 
-fn spec_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+/// `<app-data>/user-specs`, through the instance-root-aware seam (Tauri's own
+/// `app_data_dir()` knows nothing of `QONTINUI_INSTANCE_ROOT`).
+fn spec_dir() -> Result<PathBuf, String> {
+    let base = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| "Failed to get app data dir".to_string())?;
     let dir = crate::instance::scope_path(&base).join(SPEC_DIR);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create spec store directory: {e}"))?;
@@ -22,7 +22,7 @@ fn spec_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
 /// replaced with dashes so they're safe as file names.
 #[tauri::command]
 pub async fn save_page_spec<R: Runtime>(
-    app: AppHandle<R>,
+    _app: AppHandle<R>,
     spec_id: String,
     spec_json: String,
 ) -> Result<(), String> {
@@ -30,7 +30,7 @@ pub async fn save_page_spec<R: Runtime>(
     serde_json::from_str::<serde_json::Value>(&spec_json)
         .map_err(|e| format!("Invalid spec JSON: {e}"))?;
 
-    let dir = spec_dir(&app)?;
+    let dir = spec_dir()?;
     let safe_name = spec_id
         .replace(':', "_")
         .replace(['/', '\\', '<', '>', '"', '|', '?', '*'], "_");
@@ -52,9 +52,9 @@ pub async fn save_page_spec<R: Runtime>(
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 pub async fn load_user_specs<R: Runtime>(
-    app: AppHandle<R>,
+    _app: AppHandle<R>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let dir = spec_dir(&app)?;
+    let dir = spec_dir()?;
     let mut specs = Vec::new();
 
     let entries = match std::fs::read_dir(&dir) {
@@ -113,10 +113,10 @@ pub async fn load_user_specs<R: Runtime>(
 /// Delete a user-saved page spec from the store.
 #[tauri::command]
 pub async fn delete_page_spec<R: Runtime>(
-    app: AppHandle<R>,
+    _app: AppHandle<R>,
     spec_id: String,
 ) -> Result<(), String> {
-    let dir = spec_dir(&app)?;
+    let dir = spec_dir()?;
     let safe_name = spec_id
         .replace(':', "_")
         .replace(['/', '\\', '<', '>', '"', '|', '?', '*'], "_");

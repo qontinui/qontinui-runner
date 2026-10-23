@@ -14,6 +14,11 @@ interface UseFindingsActionsParams {
   setRightPanelMode: React.Dispatch<
     React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
   >;
+  /**
+   * A terminal the operator just created (`useZoneLayout().showSpawnedTab`):
+   * shown in tmux mode, a no-op in grid mode where the reconcile zones it.
+   */
+  showSpawnedTab?: (tabId: string) => void;
 }
 
 export function useFindingsActions({
@@ -24,6 +29,7 @@ export function useFindingsActions({
   pendingResumeRef,
   runGeneration,
   setRightPanelMode,
+  showSpawnedTab,
 }: UseFindingsActionsParams): {
   handleFindingRespond: (findingId: string, text: string) => void;
   handleFixFinding: (finding: Finding) => Promise<void>;
@@ -47,6 +53,7 @@ export function useFindingsActions({
       const tabTitle = `fix: ${finding.title.slice(0, 20)}`;
       const tabId = await createTerminal(tabTitle, workingDir);
       if (!tabId) return;
+      showSpawnedTab?.(tabId);
 
       setRightPanelMode(null); // close findings panel to show terminal
 
@@ -70,7 +77,15 @@ export function useFindingsActions({
         );
       }, 1500);
     },
-    [activeId, tabs, createTerminal, terminalRefs, pendingResumeRef, setRightPanelMode],
+    [
+      activeId,
+      tabs,
+      createTerminal,
+      terminalRefs,
+      pendingResumeRef,
+      setRightPanelMode,
+      showSpawnedTab,
+    ],
   );
 
   const handleGenerateFromFindings = useCallback(
