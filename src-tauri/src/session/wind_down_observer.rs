@@ -433,6 +433,7 @@ pub fn wind_down_for_process(
     Some(WindDownView::from_verdict(
         &wind_down::eligibility(&inputs, now_ms),
         kind,
+        observation.grid,
     ))
 }
 

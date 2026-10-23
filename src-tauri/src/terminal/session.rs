@@ -4679,7 +4679,8 @@ impl TerminalSession {
     /// bracketed by two reads of the grid generation, timestamped when it was
     /// read, folded through this pane's
     /// [`qontinui_runner_lib::wind_down::GridIdleTracker`]. A generation that
-    /// moved during the read counts as busy; the tracker extends an idle window
+    /// moved during the read counts as busy (evidence `generation_moved`; any
+    /// other busy read carries the clause of the predicate that vetoed idle); the tracker extends an idle window
     /// only across observations with an unchanged generation, which is what
     /// stands in for a quiescence debounce. A poisoned tracker is
     /// `GridIdle::Unknown`, never a fresh window.
@@ -4703,21 +4704,22 @@ impl TerminalSession {
     /// they disagree — so a stepped window is refused rather than acted on. See
     /// that module's "Hazard 1" section.
     pub fn observe_grid_idle(&self) -> qontinui_runner_lib::wind_down::GridIdle {
-        use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+        use qontinui_runner_lib::looping_agent::idle::snapshot_idle_verdict;
+        use qontinui_runner_lib::wind_down::GridBusyEvidence;
 
         let generation_before = self.grid_generation();
         let (lines, cursor_row) = self.grid_text();
         let observed_at_ms = chrono::Utc::now().timestamp_millis();
         let generation_after = self.grid_generation();
-        let looks_idle =
-            generation_before == generation_after && snapshot_looks_idle(&lines, cursor_row);
+        let busy = GridBusyEvidence::of_observation(
+            generation_before,
+            generation_after,
+            snapshot_idle_verdict(&lines, cursor_row),
+        );
         match self.grid_idle_tracker.lock() {
-            Ok(mut tracker) => tracker.observe(
-                looks_idle,
-                generation_before,
-                generation_after,
-                observed_at_ms,
-            ),
+            Ok(mut tracker) => {
+                tracker.observe(busy, generation_before, generation_after, observed_at_ms)
+            }
             Err(_) => qontinui_runner_lib::wind_down::GridIdle::Unknown,
         }
     }
@@ -6156,6 +6158,48 @@ pub(crate) mod tests {
             panic!("still idle");
         };
         assert!(restarted > first, "{restarted} > {first}");
+    }
+
+    /// A busy observation carries the clause that vetoed idle, and a
+    /// completed-turn line above the prompt no longer does (plan
+    /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`).
+    #[test]
+    fn observe_grid_idle_reports_the_busy_clause() {
+        use qontinui_runner_lib::wind_down::{GridBusyEvidence, GridIdle};
+
+        fn observe(frame: &str) -> GridIdle {
+            let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            {
+                let grid = session.grid();
+                let mut g = grid.lock().unwrap();
+                let mut parser = vte::Parser::new();
+                g.feed(&mut parser, frame.as_bytes());
+            }
+            session.observe_grid_idle()
+        }
+
+        assert_eq!(
+            observe("\u{273b} Cooking\u{2026} (12s \u{b7} esc to interrupt)\r\n\u{276f} "),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::Indicator("esc to interrupt")
+            }
+        );
+        assert_eq!(
+            observe("\u{2736} Pondering\r\n\u{276f} "),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::Glyph('\u{2736}')
+            }
+        );
+        assert_eq!(
+            observe("just output"),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::NoPrompt
+            }
+        );
+        assert!(matches!(
+            observe("\u{273b} Cooked for 5m 33s \u{b7} done 8:55 PM\r\n\u{276f} "),
+            GridIdle::Idle { .. }
+        ));
     }
 
     /// `idle_quiescence_probe` is the ONE debounce, and it hands back the

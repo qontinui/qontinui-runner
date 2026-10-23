@@ -1454,6 +1454,7 @@ mod tests {
                 since: None,
                 until: None,
                 reason: None,
+                idle_evidence: None,
                 kind: SessionKind::Terminal,
             }),
         }
@@ -1502,6 +1503,7 @@ mod tests {
             since: Some(1),
             until: None,
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
         };
         let not_yet = wind_down::WindDownView {
@@ -1509,6 +1511,7 @@ mod tests {
             since: Some(1),
             until: Some(2),
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
         };
 
@@ -1629,6 +1632,7 @@ mod tests {
             since: Some(1),
             until: None,
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
         }
     }

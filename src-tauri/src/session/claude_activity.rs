@@ -214,7 +214,7 @@ pub fn classify_from_pane(
             set_at_ms,
         } if now_ms - set_at_ms <= ACTIVE_WINDOW_MS
     );
-    if recent_sideband_working || observation.grid == GridIdle::Busy {
+    if recent_sideband_working || matches!(observation.grid, GridIdle::Busy { .. }) {
         return Some(Activity::Working);
     }
     let sideband_idle = matches!(
@@ -491,6 +491,9 @@ mod tests {
         set_at_ms: 1,
     };
     const IDLE_GRID: GridIdle = GridIdle::Idle { since_ms: 1 };
+    const BUSY_GRID: GridIdle = GridIdle::Busy {
+        evidence: qontinui_runner_lib::wind_down::GridBusyEvidence::NoPrompt,
+    };
 
     /// No `/proc` in tests: every identity check falls to `startedAt`.
     fn no_proc(_: u32) -> Option<String> {
@@ -599,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             classify(
-                Some(&obs(NOT_WORKING, GridIdle::Busy)),
+                Some(&obs(NOT_WORKING, BUSY_GRID)),
                 Some(false),
                 &unknown,
                 NOW
@@ -609,7 +612,7 @@ mod tests {
         // A decisive pane beats an idle record.
         assert_eq!(
             classify(
-                Some(&obs(Sideband::NeverReported, GridIdle::Busy)),
+                Some(&obs(Sideband::NeverReported, BUSY_GRID)),
                 None,
                 &parsed("idle", None, None),
                 NOW

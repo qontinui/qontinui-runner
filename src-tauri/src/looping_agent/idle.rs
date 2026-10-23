@@ -93,9 +93,37 @@ pub fn is_completed_turn_line(line: &str) -> bool {
     COMPLETED_TURN_LINE.is_match(line)
 }
 
+/// Which clause of the turn-complete recognizer decided a snapshot — the
+/// typed form of [`snapshot_looks_idle`]'s answer.
+///
+/// A busy variant names the FIRST clause that vetoed idle, in the order the
+/// predicate checks them. [`IdleVerdict::Indicator`] carries the matched
+/// [`PROCESSING_INDICATORS`] constant, never screen text: panes carry session
+/// content, and this verdict reaches `GET /restart-readiness` as
+/// `windDown.idleEvidence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleVerdict {
+    /// Every clause holds: the screen looks ready for input.
+    Idle,
+    /// (1) A processing indicator is on screen.
+    Indicator(&'static str),
+    /// (2) A spinner glyph is on screen, outside a completed-turn line.
+    Glyph(char),
+    /// (3) No `❯` prompt row is visible.
+    NoPrompt,
+    /// (4) The cursor sits above the prompt row, up in streaming output.
+    CursorAbovePrompt,
+}
+
+impl IdleVerdict {
+    pub fn is_idle(self) -> bool {
+        self == Self::Idle
+    }
+}
+
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for
-/// input. Pure over the snapshot. CONSERVATIVE: returns `false` (NOT idle)
-/// on any ambiguity. Idle requires ALL of:
+/// input, and if not, which clause said so. Pure over the snapshot.
+/// CONSERVATIVE: anything not positively idle is busy. Idle requires ALL of:
 ///
 /// 1. NO processing-indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]) — except `tokens ·` on a line carrying the
@@ -112,7 +140,7 @@ pub fn is_completed_turn_line(line: &str) -> bool {
 /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`).
 /// There is NO draft or dialog check here: `terminal::graceful_exit`'s
 /// `prompt_ready_with` refuses those before anything is typed.
-pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
     // (1) any processing-indicator text ⇒ busy.
     for line in lines {
         let lower = line.to_ascii_lowercase();
@@ -121,7 +149,7 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
                 continue;
             }
             if lower.contains(ind) {
-                return false;
+                return IdleVerdict::Indicator(ind);
             }
         }
     }
@@ -129,22 +157,34 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
     // (2) spinner glyphs (excluding bare `·`) ⇒ busy, unless the whole line
     // is a completed-turn line.
     for line in lines {
-        let has_glyph = line
+        let glyph = line
             .chars()
-            .any(|ch| ch != '·' && SPINNER_GLYPHS.contains(&ch));
-        if has_glyph && !is_completed_turn_line(line) {
-            return false;
+            .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch));
+        if let Some(glyph) = glyph {
+            if !is_completed_turn_line(line) {
+                return IdleVerdict::Glyph(glyph);
+            }
         }
     }
 
     // (3) prompt marker visible — remember its row for (4).
     let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
-        return false;
+        return IdleVerdict::NoPrompt;
     };
 
     // (4) cursor in the input area (at/below the prompt row).
-    (cursor_row as usize) >= prompt_row
+    if (cursor_row as usize) >= prompt_row {
+        IdleVerdict::Idle
+    } else {
+        IdleVerdict::CursorAbovePrompt
+    }
+}
+
+/// [`snapshot_idle_verdict`] as a `bool`, for the consumers that only need
+/// the bit. `true` only for [`IdleVerdict::Idle`].
+pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    snapshot_idle_verdict(lines, cursor_row).is_idle()
 }
 
 /// Context-low grid markers. The percentage form
@@ -439,6 +479,53 @@ mod tests {
             assert!(
                 !snapshot_looks_idle(&grid, 4),
                 "must be busy with line: {odd}"
+            );
+        }
+    }
+
+    // ── snapshot_idle_verdict: every value ──────────────────────────────
+
+    #[test]
+    fn verdict_names_the_first_clause_that_vetoed_idle() {
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["cycle done.", "❯ "]), 1),
+            IdleVerdict::Idle
+        );
+        // The indicator is the matched CONSTANT, not the screen text.
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["  12.3K TOKENS · ESC TO INTERRUPT", "❯ "]), 1),
+            IdleVerdict::Indicator("esc to interrupt")
+        );
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["↑ 1.2k tokens · working", "❯ "]), 1),
+            IdleVerdict::Indicator("tokens ·")
+        );
+        // Indicators outrank glyphs (clause order).
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["✻ Thinking…", "❯ "]), 1),
+            IdleVerdict::Indicator("thinking…")
+        );
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["✶ Pondering", "❯ "]), 1),
+            IdleVerdict::Glyph('✶')
+        );
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["some output", "more output"]), 1),
+            IdleVerdict::NoPrompt
+        );
+        assert_eq!(
+            snapshot_idle_verdict(&lines(&["streaming output", "more", "❯ "]), 0),
+            IdleVerdict::CursorAbovePrompt
+        );
+        // The bool view agrees with the verdict.
+        for (grid, row) in [
+            (lines(&["cycle done.", "❯ "]), 1),
+            (lines(&["✶ Pondering", "❯ "]), 1),
+            (lines(&["streaming output", "❯ "]), 0),
+        ] {
+            assert_eq!(
+                snapshot_looks_idle(&grid, row),
+                snapshot_idle_verdict(&grid, row).is_idle()
             );
         }
     }

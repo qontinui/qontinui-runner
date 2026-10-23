@@ -20,6 +20,8 @@ pub mod daemon_pane_io;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;
+#[cfg(test)]
+mod idle_census; // #[ignore]d replay census for the turn-complete recognizer
 pub mod holder_boot_sweep;
 pub mod holder_census;
 pub mod interceptor;

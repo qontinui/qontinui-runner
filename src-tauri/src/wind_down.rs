@@ -60,6 +60,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::looping_agent::idle::IdleVerdict;
+
 /// Default grace period: how long every condition must hold, continuously,
 /// before a session becomes eligible. Plan open question resolved at vet.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(10 * 60);
@@ -139,10 +141,77 @@ pub enum GridIdle {
     /// Looks idle, and has looked idle continuously since `since_ms` as far
     /// as the observer can prove ([`GridIdleTracker`]).
     Idle { since_ms: i64 },
-    /// Does not look idle right now.
-    Busy,
+    /// Does not look idle right now, and the clause that said so.
+    Busy { evidence: GridBusyEvidence },
     /// The grid could not be observed (no live terminal, poisoned lock).
     Unknown,
+}
+
+/// Why a grid observation read busy — reported as `windDown.idleEvidence` on
+/// `GET /restart-readiness` (plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+/// D2). The first four are the clauses of the turn-complete recognizer
+/// ([`IdleVerdict`]); [`GridBusyEvidence::GenerationMoved`] is the observer's
+/// own: the grid changed while it was being read.
+///
+/// There is deliberately no `Idle` value: evidence exists only beside a busy
+/// grid, and "idle" next to `reason: grid_busy` would be a contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridBusyEvidence {
+    /// A processing indicator — the matched `PROCESSING_INDICATORS`
+    /// CONSTANT, never screen text (panes carry session content).
+    Indicator(&'static str),
+    /// A spinner glyph outside a completed-turn line.
+    Glyph(char),
+    /// No `❯` prompt row on screen.
+    NoPrompt,
+    /// The cursor above the prompt row.
+    CursorAbovePrompt,
+    /// The grid generation moved during the read, so the snapshot cannot be
+    /// trusted to show one settled frame.
+    GenerationMoved,
+}
+
+impl GridBusyEvidence {
+    /// The evidence behind a busy screen verdict; `None` for
+    /// [`IdleVerdict::Idle`].
+    pub fn from_screen(verdict: IdleVerdict) -> Option<Self> {
+        match verdict {
+            IdleVerdict::Idle => None,
+            IdleVerdict::Indicator(ind) => Some(Self::Indicator(ind)),
+            IdleVerdict::Glyph(ch) => Some(Self::Glyph(ch)),
+            IdleVerdict::NoPrompt => Some(Self::NoPrompt),
+            IdleVerdict::CursorAbovePrompt => Some(Self::CursorAbovePrompt),
+        }
+    }
+
+    /// The evidence of one grid observation: `generation_moved` when the
+    /// generation moved during the read — it outranks whatever the torn
+    /// snapshot showed, since that is not one settled frame — else the screen
+    /// verdict's clause. `None` means the observation looked idle.
+    pub fn of_observation(
+        generation_before: u64,
+        generation_after: u64,
+        screen: IdleVerdict,
+    ) -> Option<Self> {
+        if generation_before != generation_after {
+            Some(Self::GenerationMoved)
+        } else {
+            Self::from_screen(screen)
+        }
+    }
+
+    /// The wire value: `indicator:<constant>`, `glyph:<char>`, `no_prompt`,
+    /// `cursor_above_prompt` or `generation_moved`.
+    pub fn wire(self) -> String {
+        match self {
+            Self::Indicator(ind) => format!("indicator:{ind}"),
+            Self::Glyph(ch) => format!("glyph:{ch}"),
+            Self::NoPrompt => "no_prompt".to_string(),
+            Self::CursorAbovePrompt => "cursor_above_prompt".to_string(),
+            Self::GenerationMoved => "generation_moved".to_string(),
+        }
+    }
 }
 
 /// Everything [`eligibility`] reads.
@@ -331,22 +400,38 @@ pub struct WindDownView {
     pub until: Option<i64>,
     /// Why, for `ineligible` and `unknown`.
     pub reason: Option<&'static str>,
+    /// Which clause made the grid read busy ([`GridBusyEvidence::wire`]),
+    /// exactly when `reason` is `grid_busy`; `null` otherwise. Additive: no
+    /// other field changed when it was added.
+    pub idle_evidence: Option<String>,
     pub kind: SessionKind,
 }
 
 impl WindDownView {
-    pub fn from_verdict(verdict: &Eligibility, kind: SessionKind) -> Self {
+    /// `grid` is the observation the verdict was computed from; it supplies
+    /// `idleEvidence` when the verdict is `grid_busy`.
+    pub fn from_verdict(verdict: &Eligibility, kind: SessionKind, grid: GridIdle) -> Self {
         let (since, until, reason) = match *verdict {
             Eligibility::Eligible { since_ms } => (Some(since_ms), None, None),
             Eligibility::NotYet { since_ms, until_ms } => (Some(since_ms), Some(until_ms), None),
             Eligibility::Ineligible { reason } => (None, None, Some(reason.as_str())),
             Eligibility::Unknown { reason } => (None, None, Some(reason.as_str())),
         };
+        let idle_evidence = match (*verdict, grid) {
+            (
+                Eligibility::Ineligible {
+                    reason: IneligibleReason::GridBusy,
+                },
+                GridIdle::Busy { evidence },
+            ) => Some(evidence.wire()),
+            _ => None,
+        };
         Self {
             eligibility: verdict.as_str(),
             since,
             until,
             reason,
+            idle_evidence,
             kind,
         }
     }
@@ -388,16 +473,9 @@ pub struct GridIdleTracker {
 struct TrackedObservation {
     generation: u64,
     observed_at_ms: i64,
-    idle_since_ms: Option<i64>,
-}
-
-impl TrackedObservation {
-    fn verdict(&self) -> GridIdle {
-        match self.idle_since_ms {
-            Some(since_ms) => GridIdle::Idle { since_ms },
-            None => GridIdle::Busy,
-        }
-    }
+    /// [`GridIdle::Idle`] or [`GridIdle::Busy`] — never `Unknown`. Replayed
+    /// as-is to a late arrival, so a busy observation keeps its evidence.
+    verdict: GridIdle,
 }
 
 impl GridIdleTracker {
@@ -408,9 +486,10 @@ impl GridIdleTracker {
     /// Record one observation and return what it shows.
     ///
     /// `generation_before` is the grid generation read immediately before the
-    /// grid snapshot, `generation_after` immediately after it; `looks_idle` is
-    /// the idle verdict over that snapshot; `observed_at_ms` is when the
-    /// snapshot was read.
+    /// grid snapshot, `generation_after` immediately after it; `busy` is the
+    /// observation's verdict — `None` when the snapshot looked idle, else the
+    /// evidence that it did not; `observed_at_ms` is when the snapshot was
+    /// read.
     ///
     /// An observation that is OLDER than the last one recorded — a lower
     /// starting generation, or an earlier timestamp — is a late arrival from a
@@ -418,30 +497,31 @@ impl GridIdleTracker {
     /// unchanged, so `since` can never move backwards.
     pub fn observe(
         &mut self,
-        looks_idle: bool,
+        busy: Option<GridBusyEvidence>,
         generation_before: u64,
         generation_after: u64,
         observed_at_ms: i64,
     ) -> GridIdle {
         if let Some(last) = self.last {
             if generation_before < last.generation || observed_at_ms < last.observed_at_ms {
-                return last.verdict();
+                return last.verdict;
             }
         }
-        if !looks_idle {
+        if let Some(evidence) = busy {
+            let verdict = GridIdle::Busy { evidence };
             self.last = Some(TrackedObservation {
                 generation: generation_after,
                 observed_at_ms,
-                idle_since_ms: None,
+                verdict,
             });
-            return GridIdle::Busy;
+            return verdict;
         }
         let continuous = generation_before == generation_after
             && matches!(
                 self.last,
                 Some(TrackedObservation {
                     generation,
-                    idle_since_ms: Some(_),
+                    verdict: GridIdle::Idle { .. },
                     ..
                 }) if generation == generation_before
             );
@@ -449,24 +529,28 @@ impl GridIdleTracker {
             (
                 true,
                 Some(TrackedObservation {
-                    idle_since_ms: Some(since),
+                    verdict: GridIdle::Idle { since_ms: since },
                     ..
                 }),
             ) => since,
             _ => observed_at_ms,
         };
+        let verdict = GridIdle::Idle { since_ms };
         self.last = Some(TrackedObservation {
             generation: generation_after,
             observed_at_ms,
-            idle_since_ms: Some(since_ms),
+            verdict,
         });
-        GridIdle::Idle { since_ms }
+        verdict
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BUSY: GridBusyEvidence = GridBusyEvidence::NoPrompt;
+    const BUSY_GRID: GridIdle = GridIdle::Busy { evidence: BUSY };
 
     const GRACE: Duration = Duration::from_secs(600);
     const GRACE_MS: i64 = 600_000;
@@ -658,7 +742,7 @@ mod tests {
     #[test]
     fn busy_grid_is_ineligible() {
         let mut i = eligible_terminal();
-        i.grid = GridIdle::Busy;
+        i.grid = BUSY_GRID;
         assert_eq!(
             eligibility(&i, i64::MAX),
             Eligibility::Ineligible {
@@ -728,7 +812,7 @@ mod tests {
             };
 
             let mut busy = base;
-            busy.grid = GridIdle::Busy;
+            busy.grid = BUSY_GRID;
             assert!(matches!(
                 eligibility(&busy, i64::MAX),
                 Eligibility::Ineligible {
@@ -794,6 +878,7 @@ mod tests {
         let e = WindDownView::from_verdict(
             &Eligibility::Eligible { since_ms: 7 },
             SessionKind::Terminal,
+            GridIdle::Idle { since_ms: 7 },
         );
         assert_eq!(
             (e.eligibility, e.since, e.until, e.reason),
@@ -807,6 +892,7 @@ mod tests {
                 until_ms: 9,
             },
             SessionKind::Looping,
+            GridIdle::Idle { since_ms: 7 },
         );
         assert_eq!(
             (n.eligibility, n.since, n.until, n.reason),
@@ -819,6 +905,7 @@ mod tests {
                 reason: IneligibleReason::NotFinished,
             },
             SessionKind::Terminal,
+            GridIdle::Idle { since_ms: 7 },
         );
         assert_eq!(
             (i.eligibility, i.reason),
@@ -830,6 +917,7 @@ mod tests {
                 reason: UnknownReason::GridUnknown,
             },
             SessionKind::Steward,
+            GridIdle::Unknown,
         );
         assert_eq!((u.eligibility, u.reason), ("unknown", Some("grid_unknown")));
 
@@ -838,7 +926,7 @@ mod tests {
             json,
             serde_json::json!({
                 "eligibility": "not_yet", "since": 7, "until": 9,
-                "reason": null, "kind": "looping"
+                "reason": null, "idleEvidence": null, "kind": "looping"
             })
         );
     }
@@ -848,16 +936,16 @@ mod tests {
     #[test]
     fn tracker_first_idle_observation_starts_the_window() {
         let mut t = GridIdleTracker::new();
-        assert_eq!(t.observe(true, 5, 5, 100), GridIdle::Idle { since_ms: 100 });
+        assert_eq!(t.observe(None, 5, 5, 100), GridIdle::Idle { since_ms: 100 });
     }
 
     #[test]
     fn tracker_extends_the_window_while_the_grid_does_not_move() {
         let mut t = GridIdleTracker::new();
-        t.observe(true, 5, 5, 100);
-        assert_eq!(t.observe(true, 5, 5, 900), GridIdle::Idle { since_ms: 100 });
+        t.observe(None, 5, 5, 100);
+        assert_eq!(t.observe(None, 5, 5, 900), GridIdle::Idle { since_ms: 100 });
         assert_eq!(
-            t.observe(true, 5, 5, 5_000),
+            t.observe(None, 5, 5, 5_000),
             GridIdle::Idle { since_ms: 100 }
         );
     }
@@ -867,11 +955,11 @@ mod tests {
         // Idle at t=100 and idle again at t=900, but the generation advanced
         // in between: the session may have worked in the gap.
         let mut t = GridIdleTracker::new();
-        t.observe(true, 5, 5, 100);
-        assert_eq!(t.observe(true, 8, 8, 900), GridIdle::Idle { since_ms: 900 });
+        t.observe(None, 5, 5, 100);
+        assert_eq!(t.observe(None, 8, 8, 900), GridIdle::Idle { since_ms: 900 });
         // ...and then extends from the new window.
         assert_eq!(
-            t.observe(true, 8, 8, 1_500),
+            t.observe(None, 8, 8, 1_500),
             GridIdle::Idle { since_ms: 900 }
         );
     }
@@ -879,34 +967,34 @@ mod tests {
     #[test]
     fn tracker_restarts_when_the_grid_moved_during_the_debounce() {
         let mut t = GridIdleTracker::new();
-        t.observe(true, 5, 5, 100);
-        assert_eq!(t.observe(true, 5, 6, 900), GridIdle::Idle { since_ms: 900 });
+        t.observe(None, 5, 5, 100);
+        assert_eq!(t.observe(None, 5, 6, 900), GridIdle::Idle { since_ms: 900 });
     }
 
     #[test]
     fn tracker_busy_observation_breaks_the_window() {
         let mut t = GridIdleTracker::new();
-        t.observe(true, 5, 5, 100);
-        assert_eq!(t.observe(false, 5, 5, 200), GridIdle::Busy);
-        assert_eq!(t.observe(true, 5, 5, 300), GridIdle::Idle { since_ms: 300 });
+        t.observe(None, 5, 5, 100);
+        assert_eq!(t.observe(Some(BUSY), 5, 5, 200), BUSY_GRID);
+        assert_eq!(t.observe(None, 5, 5, 300), GridIdle::Idle { since_ms: 300 });
     }
 
     #[test]
     fn tracker_ignores_an_observation_from_an_older_generation() {
         let mut t = GridIdleTracker::new();
-        t.observe(true, 9, 9, 1_000);
+        t.observe(None, 9, 9, 1_000);
         // A concurrent observer's late snapshot of generation 7 must neither
         // restart nor backdate the window.
         assert_eq!(
-            t.observe(true, 7, 7, 2_000),
+            t.observe(None, 7, 7, 2_000),
             GridIdle::Idle { since_ms: 1_000 }
         );
         assert_eq!(
-            t.observe(false, 7, 8, 2_000),
+            t.observe(Some(BUSY), 7, 8, 2_000),
             GridIdle::Idle { since_ms: 1_000 }
         );
         assert_eq!(
-            t.observe(true, 9, 9, 3_000),
+            t.observe(None, 9, 9, 3_000),
             GridIdle::Idle { since_ms: 1_000 }
         );
     }
@@ -914,18 +1002,18 @@ mod tests {
     #[test]
     fn tracker_ignores_an_observation_older_in_time_so_since_never_moves_back() {
         let mut t = GridIdleTracker::new();
-        t.observe(false, 4, 4, 5_000);
+        t.observe(Some(BUSY), 4, 4, 5_000);
         assert_eq!(
-            t.observe(true, 4, 4, 6_000),
+            t.observe(None, 4, 4, 6_000),
             GridIdle::Idle { since_ms: 6_000 }
         );
         // Same generation, earlier timestamp: a late arrival, ignored.
         assert_eq!(
-            t.observe(true, 4, 4, 5_500),
+            t.observe(None, 4, 4, 5_500),
             GridIdle::Idle { since_ms: 6_000 }
         );
         assert_eq!(
-            t.observe(true, 4, 4, 9_000),
+            t.observe(None, 4, 4, 9_000),
             GridIdle::Idle { since_ms: 6_000 }
         );
     }
@@ -965,5 +1053,126 @@ mod tests {
             i.finished_at_ms = Some(900_000);
             assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible(), "{kind:?}");
         }
+    }
+
+    // ---- idleEvidence --------------------------------------------------------
+
+    #[test]
+    fn every_busy_evidence_has_its_wire_value() {
+        for (evidence, wire) in [
+            (
+                GridBusyEvidence::Indicator("tokens ·"),
+                "indicator:tokens ·",
+            ),
+            (
+                GridBusyEvidence::Indicator("esc to interrupt"),
+                "indicator:esc to interrupt",
+            ),
+            (GridBusyEvidence::Glyph('✻'), "glyph:✻"),
+            (GridBusyEvidence::NoPrompt, "no_prompt"),
+            (GridBusyEvidence::CursorAbovePrompt, "cursor_above_prompt"),
+            (GridBusyEvidence::GenerationMoved, "generation_moved"),
+        ] {
+            assert_eq!(evidence.wire(), wire);
+        }
+    }
+
+    #[test]
+    fn screen_verdicts_map_onto_evidence_and_idle_has_none() {
+        assert_eq!(GridBusyEvidence::from_screen(IdleVerdict::Idle), None);
+        assert_eq!(
+            GridBusyEvidence::from_screen(IdleVerdict::Indicator("compacting")),
+            Some(GridBusyEvidence::Indicator("compacting"))
+        );
+        assert_eq!(
+            GridBusyEvidence::from_screen(IdleVerdict::Glyph('✶')),
+            Some(GridBusyEvidence::Glyph('✶'))
+        );
+        assert_eq!(
+            GridBusyEvidence::from_screen(IdleVerdict::NoPrompt),
+            Some(GridBusyEvidence::NoPrompt)
+        );
+        assert_eq!(
+            GridBusyEvidence::from_screen(IdleVerdict::CursorAbovePrompt),
+            Some(GridBusyEvidence::CursorAbovePrompt)
+        );
+    }
+
+    #[test]
+    fn a_moved_generation_outranks_the_screen() {
+        assert_eq!(
+            GridBusyEvidence::of_observation(3, 4, IdleVerdict::Idle),
+            Some(GridBusyEvidence::GenerationMoved)
+        );
+        assert_eq!(
+            GridBusyEvidence::of_observation(3, 4, IdleVerdict::Glyph('✻')),
+            Some(GridBusyEvidence::GenerationMoved)
+        );
+        assert_eq!(
+            GridBusyEvidence::of_observation(4, 4, IdleVerdict::Glyph('✻')),
+            Some(GridBusyEvidence::Glyph('✻'))
+        );
+        assert_eq!(
+            GridBusyEvidence::of_observation(4, 4, IdleVerdict::Idle),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_evidence_is_reported_exactly_beside_grid_busy() {
+        let grid = GridIdle::Busy {
+            evidence: GridBusyEvidence::Glyph('✻'),
+        };
+        let mut i = eligible_terminal();
+        i.grid = grid;
+        let verdict = eligibility(&i, i64::MAX);
+        let view = WindDownView::from_verdict(&verdict, SessionKind::Terminal, grid);
+        assert_eq!(view.reason, Some("grid_busy"));
+        assert_eq!(view.idle_evidence.as_deref(), Some("glyph:✻"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["idleEvidence"], "glyph:✻");
+        assert_eq!(json["reason"], "grid_busy");
+
+        // A busy grid behind a reason that decided FIRST is not reported: the
+        // field explains `grid_busy` and nothing else.
+        let mut unknown = i;
+        unknown.work_status = WorkStatus::Unknown;
+        let v = WindDownView::from_verdict(
+            &eligibility(&unknown, i64::MAX),
+            SessionKind::Terminal,
+            grid,
+        );
+        assert_eq!(v.reason, Some("work_status_unknown"));
+        assert_eq!(v.idle_evidence, None);
+
+        // An idle grid never carries evidence.
+        let idle = eligible_terminal();
+        let v = WindDownView::from_verdict(
+            &eligibility(&idle, i64::MAX),
+            SessionKind::Terminal,
+            idle.grid,
+        );
+        assert_eq!(v.idle_evidence, None);
+        assert!(serde_json::to_value(&v).unwrap()["idleEvidence"].is_null());
+    }
+
+    #[test]
+    fn tracker_reports_and_replays_the_busy_evidence() {
+        let mut t = GridIdleTracker::new();
+        let gen = GridBusyEvidence::GenerationMoved;
+        assert_eq!(
+            t.observe(Some(gen), 5, 6, 1_000),
+            GridIdle::Busy { evidence: gen }
+        );
+        // A late arrival gets the recorded verdict back, evidence included.
+        assert_eq!(
+            t.observe(None, 4, 4, 2_000),
+            GridIdle::Busy { evidence: gen }
+        );
+        let glyph = GridBusyEvidence::Glyph('✻');
+        assert_eq!(
+            t.observe(Some(glyph), 6, 6, 3_000),
+            GridIdle::Busy { evidence: glyph }
+        );
     }
 }
