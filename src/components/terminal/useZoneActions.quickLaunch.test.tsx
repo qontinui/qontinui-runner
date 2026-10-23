@@ -62,6 +62,7 @@ async function spawnOne(
   }
   const layout = resolveLayout(layoutId, existing);
   const setLayoutId = vi.fn();
+  const showSpawnedTab = vi.fn();
   let actions: ReturnType<typeof useZoneActions> | null = null;
   function Harness() {
     actions = useZoneActions({
@@ -75,6 +76,8 @@ async function spawnOne(
         setFocusedZone: () => {},
         assignTabToZone: () => {},
         setLayoutId,
+        showSpawnedTab,
+        workMode: "grid",
         isMultiZone: layout.zones.length > 1,
         toggleMaximize: () => {},
       },
@@ -91,6 +94,10 @@ async function spawnOne(
   renderToStaticMarkup(<Harness />);
   expect(actions).not.toBeNull();
   await actions!.createAndAssignTerminal();
+  // Every layout request this path makes is a `spawn` (a no-op in tmux mode),
+  // and the spawned tab is always handed to `showSpawnedTab` (tmux: show it).
+  for (const call of setLayoutId.mock.calls) expect(call[1]).toStrictEqual({ source: "spawn" });
+  expect(showSpawnedTab.mock.calls).toStrictEqual([["t-new"]]);
   return setLayoutId.mock.calls.map((c) => c[0] as string);
 }
 
