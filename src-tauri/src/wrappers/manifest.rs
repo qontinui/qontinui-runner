@@ -61,7 +61,9 @@ pub struct WrapperManifest {
     /// Short description.
     #[serde(default)]
     pub description: String,
-    /// Transport this wrapper uses. Phase 1 only enables `"api"`.
+    /// Transport this wrapper uses: one of [`KNOWN_TRANSPORTS`] (checked at
+    /// scan time); which of them the runner spawns is
+    /// `manager::SPAWNABLE_TRANSPORTS`.
     #[serde(default = "default_transport")]
     pub transport: String,
     /// Free-form category tags (used for filtering in the marketplace).
@@ -105,38 +107,81 @@ pub struct ActionDescriptor {
     pub exclusive: bool,
 }
 
+/// The longest wrapper id accepted.
+pub const MAX_WRAPPER_ID_LEN: usize = 64;
+
+/// Every transport kind `@qontinui/ui-bridge-wrapper` defines. A manifest
+/// declaring anything else is refused at scan time.
+pub const KNOWN_TRANSPORTS: &[&str] = &["api", "headless", "headed", "injected", "live"];
+
 /// Validate a freshly-parsed `WrapperManifest`.
 ///
-/// Currently only enforces the `id` charset constraint. Returns the manifest
-/// unchanged on success; an error string ready to embed in an HTTP response
-/// on failure.
+/// Enforces the shapes of the wrapper-supplied strings the runner later puts
+/// in errors and logs:
+/// - `id`: 1..=`MAX_WRAPPER_ID_LEN` of `[a-z0-9-]`, starting with a letter or
+///   digit;
+/// - `transport`: one of [`KNOWN_TRANSPORTS`];
+/// - every `envVars[].name`: `^[A-Z_][A-Z0-9_]{0,63}$`.
+///
+/// A rejected value is NEVER echoed into the error (which reaches an HTTP
+/// body): only its length, and for an env var its index, are. Returns an
+/// error string ready to embed in an HTTP response on failure.
 pub fn validate_manifest(m: &WrapperManifest) -> Result<(), String> {
-    if m.id.is_empty() {
-        return Err("wrapper manifest: id must not be empty".to_string());
-    }
-    if !m
-        .id
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if !id_shape_ok(&m.id) {
         return Err(format!(
-            "wrapper manifest: id '{}' must match [a-z0-9-]+ (lowercase letters, digits, hyphens)",
-            m.id
+            "wrapper manifest: id (len={}) must be 1..={MAX_WRAPPER_ID_LEN} of [a-z0-9-] \
+             (lowercase letters, digits, hyphens), starting with a letter or digit",
+            m.id.len()
         ));
     }
-    if !m
-        .id
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        .unwrap_or(false)
+    if !KNOWN_TRANSPORTS.contains(&m.transport.as_str()) {
+        return Err(format!(
+            "wrapper manifest: transport (len={}) must be one of {KNOWN_TRANSPORTS:?}",
+            m.transport.len()
+        ));
+    }
+    if let Some((i, spec)) = m
+        .env_vars
+        .iter()
+        .enumerate()
+        .find(|(_, spec)| !env_var_name_ok(&spec.name))
     {
         return Err(format!(
-            "wrapper manifest: id '{}' must start with a lowercase letter or digit",
-            m.id
+            "wrapper manifest: envVars[{i}].name (len={}) must match ^[A-Z_][A-Z0-9_]{{0,63}}$",
+            spec.name.len()
         ));
     }
     Ok(())
+}
+
+/// `^[A-Z_][A-Z0-9_]{0,63}$`: an env var name safe to put in a log line.
+pub fn env_var_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A wrapper-supplied string for a log line or an error: itself when `ok`
+/// says its shape is safe, else only its length. For a record that may
+/// predate scan-time validation (the persisted index).
+pub fn label_if(value: &str, ok: bool) -> String {
+    if ok {
+        value.to_string()
+    } else {
+        format!("<rejected, len={}>", value.len())
+    }
+}
+
+fn id_shape_ok(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= MAX_WRAPPER_ID_LEN
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[cfg(test)]
@@ -176,5 +221,83 @@ mod tests {
             env_vars: vec![],
         };
         assert!(validate_manifest(&m).is_err());
+    }
+
+    /// A rejected id is wrapper-supplied text: the error names its length,
+    /// never the id itself.
+    #[test]
+    fn a_rejected_id_is_never_echoed() {
+        let mut m = WrapperManifest {
+            id: String::new(),
+            display_name: "x".to_string(),
+            description: String::new(),
+            transport: "api".to_string(),
+            categories: vec![],
+            env_vars: vec![],
+        };
+        let secret = concat!("Bearer ", "abcDEF123");
+        for id in [
+            secret.to_string(),
+            "-leading-hyphen".to_string(),
+            String::new(),
+            "a".repeat(MAX_WRAPPER_ID_LEN + 1),
+        ] {
+            m.id = id.clone();
+            let err = validate_manifest(&m).unwrap_err();
+            assert!(id.is_empty() || !err.contains(&id), "{err}");
+            assert!(err.contains(&format!("len={}", id.len())), "{err}");
+        }
+        for ok in ["gemini-web", "v0", "a".repeat(MAX_WRAPPER_ID_LEN).as_str()] {
+            m.id = ok.to_string();
+            assert!(validate_manifest(&m).is_ok(), "{ok}");
+        }
+    }
+
+    /// The transport and every env var name are checked at scan time, and a
+    /// rejected one is reported by length (and index), never echoed.
+    #[test]
+    fn a_rejected_transport_or_env_var_name_is_never_echoed() {
+        let base = || WrapperManifest {
+            id: "w".to_string(),
+            display_name: "x".to_string(),
+            description: String::new(),
+            transport: "api".to_string(),
+            categories: vec![],
+            env_vars: vec![],
+        };
+        let spec = |name: &str| EnvVarSpec {
+            name: name.to_string(),
+            required: false,
+            secret: false,
+            description: String::new(),
+        };
+        let secret = concat!("sk-", "live-0123456789");
+        let mut m = base();
+        m.transport = secret.to_string();
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(
+            !err.contains(secret) && err.contains(&format!("len={}", secret.len())),
+            "{err}"
+        );
+        for t in KNOWN_TRANSPORTS {
+            m.transport = t.to_string();
+            assert!(validate_manifest(&m).is_ok(), "{t}");
+        }
+        let mut m = base();
+        m.env_vars = vec![spec("GEMINI_WEB_KEY"), spec(secret)];
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(err.contains("envVars[1]"), "{err}");
+        for bad in ["lower", "1LEAD", "", &"A".repeat(65), "A-B"] {
+            assert!(!env_var_name_ok(bad), "{bad}");
+        }
+        for good in ["_X", "A", "GEMINI_WEB_STORAGE_STATE_PATH", &"A".repeat(64)] {
+            assert!(env_var_name_ok(good), "{good}");
+        }
+        assert_eq!(
+            label_if(secret, false),
+            format!("<rejected, len={}>", secret.len())
+        );
+        assert_eq!(label_if("API_KEY", true), "API_KEY");
     }
 }

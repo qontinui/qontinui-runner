@@ -33,6 +33,8 @@
 //! - [`ring`] — the bounded output ring with absolute offsets.
 //! - [`modes`] — the terminal-mode tracker behind an attach's restore
 //!   envelope (Phase 2b, D14); [`metadata`] — its cwd/title as reply strings.
+//! - [`scrollback`] — the ring's durable, offset-anchored tail on disk (Phase
+//!   4, D7): capped, 0600, atomically replaced on a timer with a change mark.
 //! - [`pty`] — the PTY, the child, and when the holder may exit.
 //! - [`startup`] — fd closing, `SIGCHLD`, `setsid`, stdio: the holder's first
 //!   acts.
@@ -40,21 +42,37 @@
 //!   per-connection output pump.
 //! - [`client`] — connect + handshake, `probe`, `census`, `attach`.
 //! - [`spawn`] — the RUNNER side of a holder's birth: cgroup escape, Windows
-//!   job breakaway, the ready line, verified-pid teardown, reaping.
+//!   job breakaway and its WMI fallback, the ready line, verified-pid
+//!   teardown, reaping.
+//! - [`proc_identity`] — a process's start token, so a recorded pid can be
+//!   told from a recycled one (Phase 3).
+//! - [`reap`] — a pane's process tree is reaped by its own holder at pane end,
+//!   and a dead holder's proven remainder by the boot sweep (Phase 3, D8).
+//! - [`sweep`] — the boot sweep: the per-pane lock directory IS the orphan
+//!   ledger; live panes are handed to the caller to adopt (Phase 3).
+//! - `handoff` (Unix only) — the in-place holder upgrade: `prepare_upgrade`
+//!   hands a live pane to a successor holder by an inherited master fd, ack
+//!   before dispose (Phase 8, D12a). Windows has none (D12).
 
 pub mod client;
 pub mod frame;
+#[cfg(unix)]
+pub mod handoff;
 pub mod lock;
 pub mod metadata;
 pub mod modes;
 pub mod pane;
+pub mod proc_identity;
 pub mod protocol;
 pub mod pty;
+pub mod reap;
 pub mod ring;
+pub mod scrollback;
 pub mod server;
 pub mod spawn;
 pub mod spec;
 pub mod startup;
+pub mod sweep;
 pub mod terminate;
 pub mod transport;
 

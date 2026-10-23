@@ -23,7 +23,13 @@ these skills, byte for byte:
 | Helper | Used by | Needs |
 |---|---|---|
 | `_scripts/qontinui-http.py` | `/analyze-automation` | Python 3 and the `qontinui-mcp` package (`qontinui_mcp.client`, which brings `httpx`), installed from a source checkout: it is not on PyPI |
-| `_scripts/lib/envelope.py` | `/workflow-runs` | Python 3.9+, stdlib only |
+| `_scripts/lib/envelope.py` | `/workflow-runs`, `_scripts/close-finished-sessions.py`, `_scripts/runner-layout.py` | Python 3.9+, stdlib only |
+| `_scripts/close-finished-sessions.py` | `/close-finished-sessions`, `_scripts/nudge-stopped-sessions.py`, `_scripts/runner-sessions.py`, `_scripts/triage-sessions.py`, `_scripts/name-session.py` | Python 3.9+, stdlib only, and `_scripts/lib/envelope.py` beside it. Closing needs a `/proc` process table (Linux) |
+| `_scripts/nudge-stopped-sessions.py` | `/nudge-stopped-sessions`, `_scripts/triage-sessions.py` | Python 3.9+, stdlib only, and `_scripts/close-finished-sessions.py` beside it. Sending needs a `/proc` process table (Linux) |
+| `_scripts/name-session.py` | `/name` | Python 3.9+, stdlib only, and `_scripts/close-finished-sessions.py` beside it. Setting a name needs a runner tab (`$QONTINUI_TERMINAL_ID`) |
+| `_scripts/runner-layout.py` | `/layout`, `_scripts/triage-sessions.py` | Python 3.9+, stdlib only, and `_scripts/lib/envelope.py` beside it. Setting a page needs a runner build whose `/layout` takes a window count and a page |
+| `_scripts/runner-sessions.py` | `/runner-sessions` | Python 3.9+, stdlib only, and `_scripts/close-finished-sessions.py` beside it. Reads only |
+| `_scripts/triage-sessions.py` | `/triage-sessions` | Python 3.9+, stdlib only, and `_scripts/nudge-stopped-sessions.py`, `_scripts/close-finished-sessions.py` and `_scripts/runner-layout.py` beside it. Acting needs a `/proc` process table (Linux) |
 | `_scripts/mobile-feedback.py` | `/mobile-dev`, `/mobile-verify` | Python 3 and Android `adb` |
 
 ## How a command finds a helper

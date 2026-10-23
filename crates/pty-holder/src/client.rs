@@ -43,8 +43,8 @@ use crate::frame::{
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
-    parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, Reply, Request,
-    DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
+    parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, RejectReason, Reply,
+    Request, DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
 };
 use crate::transport::{self, remaining, Conn, DeadlineIo};
 
@@ -53,10 +53,20 @@ use crate::transport::{self, remaining, Conn, DeadlineIo};
 pub enum ConnectError {
     /// The holder answered, and speaks none of our versions. It is alive.
     Incompatible { holder_versions: Vec<u32> },
+    /// The handshake succeeded, but at a version below the data path
+    /// ([`DATA_PATH_VERSION`]): the holder is live and cannot be attached to.
+    NoDataPath { version: u32 },
     /// The holder answered something that is not a handshake reply.
     Protocol(String),
     /// Connect, write, read or deadline failure.
     Io(io::Error),
+    /// The holder refused the request (`rejected`, which also closes the
+    /// connection). Whether that is final is the reason's to say
+    /// ([`ConnectError::is_definitive`]).
+    Rejected {
+        reason: RejectReason,
+        detail: String,
+    },
     /// An earlier call on this [`Client`] failed, so the stream's position is
     /// unknown (a reply may be half-read, a request half-written). Nothing
     /// more is sent or read on it; the string is the failure that poisoned it.
@@ -72,7 +82,14 @@ impl std::fmt::Display for ConnectError {
                     "no common protocol version; holder speaks {holder_versions:?}"
                 )
             }
+            ConnectError::NoDataPath { version } => write!(
+                f,
+                "holder negotiated version {version}; the data path needs {DATA_PATH_VERSION}"
+            ),
             ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
+            ConnectError::Rejected { reason, detail } => {
+                write!(f, "holder rejected the request ({reason:?}: {detail})")
+            }
             ConnectError::Io(e) => write!(f, "{e}"),
             ConnectError::Poisoned(why) => write!(
                 f,
@@ -83,6 +100,69 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+/// What a caller that wants to ADOPT a live holder should do after an attach
+/// failed ([`ConnectError::disposition`]; review round 4, H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// The holder can never be driven by this runner, and that is FINAL: it
+    /// answered `no_common_version`, refused our peer identity
+    /// (`peer_not_authorized`), or refused a verb its own negotiated version
+    /// lacks (`verb_not_in_version`, which can only follow a successful
+    /// handshake). The only failures that may end a live session.
+    End,
+    /// A live holder this runner cannot drive the data path of — it
+    /// negotiated a version below [`DATA_PATH_VERSION`]. Exactly like a
+    /// census `Incompatible` (plan D15): not adopted, NOT touched.
+    LeaveAlone,
+    /// Anything a retry may clear, or that says nothing final about the
+    /// holder: IO errors and timeouts, a busy holder, a garbled reply, a
+    /// reason this build does not know (a newer holder's), and a rejection of
+    /// a MALFORMED request — the last a bug in this runner, never a reason to
+    /// end the user's session ([`ConnectError::is_runner_bug`]).
+    Retry,
+}
+
+impl ConnectError {
+    /// See [`FailureDisposition`].
+    pub fn disposition(&self) -> FailureDisposition {
+        match self {
+            // Corner, kept on purpose: the census filters `no_common_version`
+            // holders out (left alone, D15), so this only meets one whose
+            // answer CHANGED between the census and the attach.
+            ConnectError::Incompatible { .. } => FailureDisposition::End,
+            ConnectError::NoDataPath { .. } => FailureDisposition::LeaveAlone,
+            ConnectError::Rejected { reason, .. } => match reason {
+                RejectReason::PeerNotAuthorized | RejectReason::VerbNotInVersion => {
+                    FailureDisposition::End
+                }
+                _ => FailureDisposition::Retry,
+            },
+            ConnectError::Protocol(_) | ConnectError::Io(_) | ConnectError::Poisoned(_) => {
+                FailureDisposition::Retry
+            }
+        }
+    }
+
+    /// The holder rejected a request THIS runner malformed or sent out of
+    /// order: a runner bug, to be logged loudly — and still only retried.
+    pub fn is_runner_bug(&self) -> bool {
+        matches!(
+            self,
+            ConnectError::Rejected {
+                reason: RejectReason::Malformed
+                    | RejectReason::HandshakeRequired
+                    | RejectReason::DuplicateHello
+                    | RejectReason::UnexpectedDataFrame
+                    | RejectReason::NotAttached
+                    | RejectReason::AlreadyAttached
+                    | RejectReason::UnknownVerb
+                    | RejectReason::UnknownFrameKind,
+                ..
+            }
+        )
+    }
+}
 
 impl From<io::Error> for ConnectError {
     fn from(e: io::Error) -> Self {
@@ -265,6 +345,37 @@ impl Client {
         }
     }
 
+    /// `prepare_upgrade` (plan Phase 8, a FROZEN envelope verb, so it works
+    /// on a holder that speaks none of this runner's data-path versions):
+    /// hand the pane to a successor holder started from the holder's own
+    /// executable path. Waits for the whole exchange. Its worst case is the
+    /// sum of the holder's bounds — input freeze 2 s, quiesce 2 s, ack 15 s,
+    /// input drain 2 s, commit write 15 s, `serving` 5 s: about 41 s — so give
+    /// `deadline` at least 45 s. A client that gives up first gets an error
+    /// for an upgrade whose outcome is UNKNOWN: it may have committed or been
+    /// rolled back; probe the pane (`hello_ack.holder_pid`) to learn which.
+    ///
+    /// After [`UpgradeOutcome::Upgraded`] this connection is dead (the old
+    /// holder exits) and every other connection to the pane drops; a client
+    /// reattaches at its own last offset and finds the successor. After
+    /// `Failed`/`Unsupported` the old holder still serves, untouched.
+    pub fn prepare_upgrade(&mut self, deadline: Instant) -> Result<UpgradeOutcome, ConnectError> {
+        match self.request(&Request::PrepareUpgrade, deadline)? {
+            Reply::Upgraded {
+                successor_pid,
+                handoff_offset,
+            } => Ok(UpgradeOutcome::Upgraded {
+                successor_pid,
+                handoff_offset,
+            }),
+            Reply::UpgradeFailed { reason } => Ok(UpgradeOutcome::Failed(reason)),
+            Reply::Unsupported { reason, .. } => Ok(UpgradeOutcome::Unsupported(reason)),
+            other => self.poison_on_err(Err(ConnectError::Protocol(format!(
+                "expected upgraded / upgrade_failed / unsupported, got {other:?}"
+            )))),
+        }
+    }
+
     /// Send a raw frame. For tests of the holder's refusal paths; a runner
     /// sends typed requests. Poisons on failure, like [`Client::request`].
     pub fn send_raw_frame(
@@ -337,10 +448,11 @@ impl Client {
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
         if self.ack.version < DATA_PATH_VERSION {
-            return Err(ConnectError::Protocol(format!(
-                "holder negotiated version {}; the data path needs {DATA_PATH_VERSION}",
-                self.ack.version
-            )));
+            // The holder answered, and cannot serve the data path this runner
+            // drives: leave it alone, as a census Incompatible.
+            return Err(ConnectError::NoDataPath {
+                version: self.ack.version,
+            });
         }
         let request = Request::Attach {
             from_offset,
@@ -348,6 +460,9 @@ impl Client {
         };
         let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,
+            Reply::Rejected { reason, detail } => {
+                return Err(ConnectError::Rejected { reason, detail })
+            }
             other => {
                 return Err(ConnectError::Protocol(format!(
                     "expected attached, got {other:?}"
@@ -365,6 +480,22 @@ impl Client {
             writer: StreamWriter { conn: writer },
         })
     }
+}
+
+/// How a `prepare_upgrade` ended ([`Client::prepare_upgrade`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeOutcome {
+    /// `successor_pid` serves the pane now, from stream offset
+    /// `handoff_offset`; same child, same offsets.
+    Upgraded {
+        successor_pid: u32,
+        handoff_offset: u64,
+    },
+    /// Rolled back: the old holder keeps serving; nothing was lost.
+    Failed(String),
+    /// This holder cannot be upgraded in place — a Windows holder (plan D12:
+    /// leave it running, or end and resume it) or one built before Phase 8.
+    Unsupported(String),
 }
 
 /// An attached connection, split. Drop both halves to close it (the child
@@ -752,6 +883,24 @@ pub fn census_with_versions(
     skip: &[PaneId],
     versions: &[u32],
 ) -> io::Result<Vec<CensusEntry>> {
+    census_with_skip(pane_dir, timeout, || skip.to_vec(), versions)
+}
+
+/// [`census_with_versions`] with the skip list read LATE: `skip` is called
+/// once, AFTER the pane directory has been enumerated and before any pane is
+/// probed. A caller whose set of panes-being-spawned changes concurrently
+/// (the runner's in-flight terminal ids) reads it here, so a pane that began
+/// spawning before the walk saw its lock file is in the list the walk is
+/// filtered by — never probed, so never robbed of its lock. A pane that
+/// begins spawning after this read had no lock file when the directory was
+/// enumerated, so the walk cannot see it; the caller must account for it
+/// separately (the runner adds a row for every in-flight id afterwards).
+pub fn census_with_skip(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: impl FnOnce() -> Vec<PaneId>,
+    versions: &[u32],
+) -> io::Result<Vec<CensusEntry>> {
     let deadline = Instant::now() + timeout;
     match check_private_dir(pane_dir) {
         Ok(()) => {}
@@ -776,6 +925,7 @@ pub fn census_with_versions(
         };
         stems.push(stem);
     }
+    let skip = skip();
 
     let (tx, rx) = mpsc::channel::<CensusEntry>();
     let mut rows: Vec<CensusEntry> = Vec::new();
@@ -867,6 +1017,52 @@ mod tests {
             },
             theirs,
         )
+    }
+
+    /// Review round 4, H1: only a final answer ends a session. A v1-only
+    /// holder is left alone; an unknown (newer) reason and a malformed-request
+    /// rejection (a runner bug) are retried.
+    #[test]
+    fn pty_holder_boot_sweep_attach_failure_disposition() {
+        use FailureDisposition::*;
+        let rejected = |reason| ConnectError::Rejected {
+            reason,
+            detail: String::new(),
+        };
+        assert_eq!(
+            ConnectError::Incompatible {
+                holder_versions: vec![9]
+            }
+            .disposition(),
+            End
+        );
+        assert_eq!(rejected(RejectReason::PeerNotAuthorized).disposition(), End);
+        assert_eq!(rejected(RejectReason::VerbNotInVersion).disposition(), End);
+        assert_eq!(
+            ConnectError::NoDataPath { version: 1 }.disposition(),
+            LeaveAlone
+        );
+        assert_eq!(rejected(RejectReason::Unknown).disposition(), Retry);
+        assert_eq!(rejected(RejectReason::Busy).disposition(), Retry);
+        for bug in [
+            RejectReason::Malformed,
+            RejectReason::HandshakeRequired,
+            RejectReason::DuplicateHello,
+            RejectReason::UnexpectedDataFrame,
+            RejectReason::NotAttached,
+            RejectReason::AlreadyAttached,
+        ] {
+            let e = rejected(bug);
+            assert_eq!(e.disposition(), Retry, "{bug:?}");
+            assert!(e.is_runner_bug(), "{bug:?}");
+        }
+        assert!(!rejected(RejectReason::Busy).is_runner_bug());
+        assert_eq!(
+            ConnectError::Io(io::Error::from(io::ErrorKind::TimedOut)).disposition(),
+            Retry
+        );
+        assert_eq!(ConnectError::Protocol("x".into()).disposition(), Retry);
+        assert_eq!(ConnectError::Poisoned("x".into()).disposition(), Retry);
     }
 
     /// Nit from review: a synthetic frame is accepted only on a connection
