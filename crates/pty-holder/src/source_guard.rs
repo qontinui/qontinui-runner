@@ -45,6 +45,8 @@ const GUARDED: &[(&str, &str)] = &[
     ("proc_identity.rs", include_str!("proc_identity.rs")),
     ("reap.rs", include_str!("reap.rs")),
     ("sweep.rs", include_str!("sweep.rs")),
+    // Phase 8: the holder upgrade carries the ring and the held input.
+    ("handoff.rs", include_str!("handoff.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned
