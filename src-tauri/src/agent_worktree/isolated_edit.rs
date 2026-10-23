@@ -42,6 +42,10 @@ pub struct IsolatedEditContext {
     /// mode off path never reaches here). Drop releases EVERY entry.
     /// Phase 1 of plan 2026-06-06-session-scoped-multi-repo-workspace.
     pub active_claims: Vec<ActiveClaim>,
+    /// coord's one-line notes about build siblings it could not expand for this
+    /// allocation (see [`super::AllocateResult::sibling_notes`]). Empty on
+    /// every path that did not run the runner-side allocate.
+    pub sibling_notes: Vec<String>,
 
     // One heartbeat handle per claim in `active_claims` — each task lives
     // as long as the context; the handle's own Drop notifies its cancel
@@ -466,6 +470,7 @@ pub async fn acquire(
         agent_id: result.agent_id,
         worktrees: result.worktrees,
         active_claims: result.active_claims,
+        sibling_notes: result.sibling_notes,
         _heartbeats: heartbeats,
         coord_http_base,
         device_id,
@@ -627,6 +632,7 @@ async fn materialize_repos(
             token_jti: sb.token_jti,
             token_exp: sb.token_exp,
             active_claims: sb.active_claims,
+            sibling_notes: Vec::new(),
         }),
         MaterializeOutcome::Wait(w) => Err(AllocateError::Wait(w)),
     }
@@ -1407,6 +1413,7 @@ impl IsolatedEditContext {
             agent_id,
             worktrees,
             active_claims,
+            sibling_notes: Vec::new(),
             _heartbeats: Vec::new(),
             // 127.0.0.1:1 refuses instantly — release POSTs fail fast, the
             // bookkeeping under test runs regardless.

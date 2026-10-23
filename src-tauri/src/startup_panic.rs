@@ -39,7 +39,8 @@
 //!
 //! 1. `QONTINUI_RUNNER_LOG_DIR` env var (supervisor sets this when spawning).
 //! 2. `<LOCALAPPDATA>/qontinui-runner/dev-logs` (Windows) or the platform
-//!    equivalent via `dirs::data_local_dir()`.
+//!    equivalent via `instance_env::platform_dir(DataLocal)` (inside the
+//!    instance root for a subject runner).
 //!
 //! We deliberately do *not* consult `crate::paths::get_dev_logs_dir()`
 //! here because that helper reads settings — which may itself panic
@@ -66,10 +67,12 @@ pub fn resolve_log_dir() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("dev-logs")
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("dev-logs")
 }
 
 /// Full path to the panic log file.
