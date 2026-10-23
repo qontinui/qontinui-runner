@@ -231,6 +231,10 @@ fn main() {
     // no longer matches the frontend sources it was built from. Never fatal.
     stamp_provenance();
 
+    // Stamp the build profile (profile dir + opt-level) for `/health`
+    // `buildProfile` — the measured knobs, never the profile's name alone.
+    stamp_build_profile();
+
     tauri_build::build()
 }
 
@@ -591,12 +595,9 @@ fn remove_zero_length_sidecar_copies_from_profile_dir() {
     let Ok(target) = std::env::var("TARGET") else {
         return;
     };
-    let Some(profile_dir) = std::env::var_os("OUT_DIR").and_then(|out| {
-        std::path::PathBuf::from(out)
-            .ancestors()
-            .nth(3)
-            .map(std::path::Path::to_path_buf)
-    }) else {
+    let Some(profile_dir) = std::env::var_os("OUT_DIR")
+        .and_then(|out| profile_dir_from_out_dir(std::path::Path::new(&out)))
+    else {
         return;
     };
     let exe_ext = if target.contains("windows") {
@@ -610,6 +611,67 @@ fn remove_zero_length_sidecar_copies_from_profile_dir() {
              a build placeholder, never a binary (the real one comes from building its bin)"
         );
     }
+}
+
+/// The cargo PROFILE directory a build script's `OUT_DIR` sits under — the one
+/// derivation of it in this file, shared by the sidecar repair above and the
+/// build-profile stamp below. Cargo lays a build script's output out as
+/// `<target>/<profile-dir>/build/<pkg>-<hash>/out`, or, under
+/// `--target <triple>`, `<target>/<triple>/<profile-dir>/build/<pkg>-<hash>/out`;
+/// either way the profile dir is the fourth path component up. The `out` and
+/// `build` components are CHECKED rather than assumed, so a path of any other
+/// shape answers `None` (UNKNOWN) instead of naming some unrelated ancestor.
+/// Pure.
+fn profile_dir_from_out_dir(out_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut up = out_dir.ancestors();
+    let out = up.next()?;
+    if out.file_name()? != "out" {
+        return None;
+    }
+    up.next()?.file_name()?; // <pkg>-<hash>
+    let build = up.next()?;
+    if build.file_name()? != "build" {
+        return None;
+    }
+    let profile = up.next()?;
+    profile.file_name()?;
+    Some(profile.to_path_buf())
+}
+
+/// The profile-dir NAME to stamp as `QONTINUI_BUILD_PROFILE_DIR`: `debug` for
+/// cargo's `dev` profile, otherwise the profile's own name (`release`,
+/// `release-checked`, …). The literal `unknown` when `OUT_DIR` is absent or not
+/// cargo's layout — never a guessed `debug`. Pure.
+fn build_profile_dir_stamp(out_dir: Option<&std::ffi::OsStr>) -> String {
+    out_dir
+        .and_then(|out| profile_dir_from_out_dir(std::path::Path::new(out)))
+        .and_then(|dir| dir.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| PROVENANCE_UNKNOWN.to_string())
+}
+
+/// The opt-level to stamp as `QONTINUI_BUILD_OPT_LEVEL`, from the `OPT_LEVEL`
+/// cargo sets for a build script to the profile being built (`0`..`3`, `s`,
+/// `z`). The literal `unknown` when it is absent or blank. Pure.
+fn build_opt_level_stamp(opt_level: Option<&str>) -> String {
+    opt_level
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| PROVENANCE_UNKNOWN.to_string())
+}
+
+/// Stamp the build's MEASURED profile knobs for `/health` `buildProfile` and
+/// `provenance.build` (plan
+/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 2):
+/// the profile directory cargo is building into and the opt-level it passes
+/// rustc. A build script re-runs per profile (each has its own `OUT_DIR`), so
+/// the stamps cannot carry one profile's values into another's binary.
+fn stamp_build_profile() {
+    let profile_dir = build_profile_dir_stamp(std::env::var_os("OUT_DIR").as_deref());
+    let opt_level = build_opt_level_stamp(std::env::var("OPT_LEVEL").ok().as_deref());
+    println!("cargo:rustc-env=QONTINUI_BUILD_PROFILE_DIR={profile_dir}");
+    println!("cargo:rustc-env=QONTINUI_BUILD_OPT_LEVEL={opt_level}");
 }
 
 /// Remove each `<dir>/<sidecar><exe_ext>` that is a ZERO-LENGTH regular file;
@@ -1555,6 +1617,82 @@ mod sidecar_scope_tests {
         std::fs::create_dir(tmp.path().join("qontinui-pr")).unwrap();
         assert!(remove_zero_length_sidecar_copies(tmp.path(), "").is_empty());
         assert!(tmp.path().join("qontinui-pr").is_dir());
+    }
+}
+
+/// The build-profile stamps behind `/health` `buildProfile` (plan
+/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 2).
+/// Every expected value is a literal: the profile dir cargo would lay out, never
+/// a constant re-exported from the code under test.
+#[cfg(test)]
+mod build_profile_stamp_tests {
+    use super::{build_opt_level_stamp, build_profile_dir_stamp, profile_dir_from_out_dir};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    fn stamp(out_dir: &str) -> String {
+        build_profile_dir_stamp(Some(OsStr::new(out_dir)))
+    }
+
+    /// cargo's `dev` profile builds into `debug/` — the dir, not the name.
+    #[test]
+    fn the_dev_profile_stamps_debug() {
+        assert_eq!(
+            stamp("D:/r/target-agent/debug/build/qontinui-runner-0a1b2c3d/out"),
+            "debug"
+        );
+    }
+
+    #[test]
+    fn release_and_release_checked_stamp_their_own_dir() {
+        assert_eq!(
+            stamp("/r/target/release/build/qontinui-runner-ff00/out"),
+            "release"
+        );
+        assert_eq!(
+            stamp("/r/target/release-checked/build/qontinui-runner-ff00/out"),
+            "release-checked"
+        );
+    }
+
+    /// A custom profile name passes through as cargo lays it out.
+    #[test]
+    fn a_custom_profile_stamps_its_name() {
+        assert_eq!(stamp("/r/target/perf-probe/build/pkg-1/out"), "perf-probe");
+    }
+
+    /// `--target <triple>` inserts a component ABOVE the profile dir; the
+    /// profile dir is still four components up from `out`.
+    #[test]
+    fn a_target_triple_layout_still_finds_the_profile_dir() {
+        let out = "D:/r/target/x86_64-pc-windows-msvc/release-checked/build/qontinui-runner-9/out";
+        assert_eq!(stamp(out), "release-checked");
+        assert_eq!(
+            profile_dir_from_out_dir(Path::new(out)),
+            Some(PathBuf::from(
+                "D:/r/target/x86_64-pc-windows-msvc/release-checked"
+            ))
+        );
+    }
+
+    /// Anything that is not cargo's layout is UNKNOWN — never a guessed
+    /// `debug`, and never some unrelated ancestor's name.
+    #[test]
+    fn a_malformed_out_dir_stamps_unknown() {
+        assert_eq!(stamp("/r/target/debug/build/pkg-1/not-out"), "unknown");
+        assert_eq!(stamp("/r/target/debug/elsewhere/pkg-1/out"), "unknown");
+        assert_eq!(stamp("pkg-1/out"), "unknown");
+        assert_eq!(stamp(""), "unknown");
+        assert_eq!(build_profile_dir_stamp(None), "unknown");
+    }
+
+    #[test]
+    fn the_opt_level_passes_through_or_is_unknown() {
+        assert_eq!(build_opt_level_stamp(Some("0")), "0");
+        assert_eq!(build_opt_level_stamp(Some("2")), "2");
+        assert_eq!(build_opt_level_stamp(Some("s")), "s");
+        assert_eq!(build_opt_level_stamp(Some("  ")), "unknown");
+        assert_eq!(build_opt_level_stamp(None), "unknown");
     }
 }
 

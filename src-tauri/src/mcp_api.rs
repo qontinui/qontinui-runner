@@ -2654,6 +2654,13 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Which cargo profile DIRECTORY this binary was built into (`debug`,
+        // `release-checked`, …), read from the build's own `OUT_DIR`; `null`
+        // when unmeasured, never a defaulted `"debug"`. The opt-level and the
+        // derived `optimized` verdict are in `provenance.build` (plan
+        // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it,
+        // Phase 2). Compile-time, like `buildId`.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // WHAT TREE STATE the two build halves came from, as content hashes
         // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
         // compile-time constants, like `gitSha`/`buildId` above. Compare them
@@ -2836,6 +2843,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.buildProfile`, for the same consumers.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // Top-level mirror of `data.provenance`, for the same consumers.
         "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
@@ -6033,6 +6042,7 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // producer, so the two can never disagree about this binary.
         "gitSha": env!("QONTINUI_GIT_SHA"),
         "buildId": env!("RUNNER_BUILD_ID"),
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         "mainSha": main_sha,
         "buildDrift": build_drift,
         // The drift WARN's reader (plan
@@ -19092,7 +19102,9 @@ mod coord_mcp_tool_policy_tests {
             "deliberateExclusionPrefixes",
             "gitSha",
             "buildId",
+            "buildProfile",
         ] {
+            assert!(served.get(key).is_some(), "{key} missing over the wire");
             assert_eq!(served[key], direct[key], "{key} differs over the wire");
         }
     }
@@ -20600,6 +20612,34 @@ mod coord_provision_session_gate_tests {
         for flow in crate::egress::Flow::ALL {
             assert_eq!(block[flow.key()]["domain"], flow.domain());
         }
+    }
+
+    /// Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`
+    /// Phase 2: `/health` carries `buildProfile` TWICE — under `data` beside
+    /// `buildId`, and at the root beside the root-level `buildId` mirror —
+    /// both rendered by the one `build_provenance::build_profile_json`, and
+    /// `provenance` (both copies) carries the `build` object it mirrors.
+    #[test]
+    fn the_health_handler_emits_build_profile_in_data_and_at_the_root() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let emit = "\"buildProfile\": qontinui_runner_lib::build_provenance::build_profile_json()";
+        assert_eq!(region.matches(emit).count(), 2, "{region}");
+        assert_eq!(
+            region
+                .matches("\"provenance\": qontinui_runner_lib::build_provenance::health_json()")
+                .count(),
+            2,
+            "{region}"
+        );
+        let provenance = qontinui_runner_lib::build_provenance::health_json();
+        assert_eq!(
+            provenance["build"]["profile"],
+            qontinui_runner_lib::build_provenance::build_profile_json()
+        );
     }
 
     /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-
