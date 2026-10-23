@@ -152,6 +152,57 @@ pub(crate) fn refuse_untrusted_probe(
     }
 }
 
+/// The command-bearing fields of a `Script` task, or `None` for any other
+/// task type. `ScheduledTaskType` is not `PartialEq`, so the echo test in
+/// [`refuse_untrusted_script`] compares these.
+fn script_parts(
+    task: &crate::scheduler::ScheduledTaskType,
+) -> Option<(&str, Option<&str>, Option<u64>)> {
+    match task {
+        crate::scheduler::ScheduledTaskType::Script {
+            command,
+            working_directory,
+            timeout_seconds,
+        } => Some((
+            command.as_str(),
+            working_directory.as_deref(),
+            *timeout_seconds,
+        )),
+        _ => None,
+    }
+}
+
+/// Refuse a `Script` task the requester may not set — the same gate, for the
+/// same reason, as [`refuse_untrusted_probe`]: a `Script` task's `command` is
+/// run by `sh -c` as this device's user, so writing one is command execution,
+/// and the two task-write routes admit a Foreign browser origin under the
+/// default route policy. Only a NonBrowser or FirstParty caller may create a
+/// `Script` task or change one; an absent principal is UNKNOWN and refused.
+///
+/// `existing` is the stored task on an update: re-sending a stored `Script`
+/// unchanged (the scheduler form round-trips one read-only) passes. A request
+/// that is not a `Script` is not gated here.
+pub(crate) fn refuse_untrusted_script(
+    principal: Option<&RequesterPrincipal>,
+    requested: Option<&crate::scheduler::ScheduledTaskType>,
+    existing: Option<&crate::scheduler::ScheduledTaskType>,
+) -> Result<(), String> {
+    let Some(requested) = requested.and_then(script_parts) else {
+        return Ok(());
+    };
+    if existing.and_then(script_parts) == Some(requested) {
+        return Ok(());
+    }
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "a Script task runs a command as this device's user; only a non-browser caller \
+             or the runner's own UI may create or change one (requester class: {})",
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -204,6 +255,9 @@ pub async fn create_scheduled_task(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let pg = &state.app_state.pg_db;
+
+    refuse_untrusted_script(principal.as_ref().map(|p| &p.0), Some(&request.task), None)
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
 
     if let Some(conditions) = &request.conditions {
         refuse_untrusted_probe(
@@ -336,6 +390,12 @@ pub async fn update_scheduled_task(
         scheduled_task.schedule = schedule;
     }
     if let Some(task) = request.task {
+        refuse_untrusted_script(
+            principal.as_ref().map(|p| &p.0),
+            Some(&task),
+            Some(&scheduled_task.task),
+        )
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
         scheduled_task.task = task;
     }
     if let Some(skip_if_completed) = request.skip_if_completed {
@@ -773,6 +833,83 @@ mod tests {
             refuse_untrusted_probe(Some(&foreign), Some(&stored), Some(&enabled)).is_err(),
             "enabling a stored probe is a change"
         );
+    }
+
+    fn script(cmd: &str) -> crate::scheduler::ScheduledTaskType {
+        crate::scheduler::ScheduledTaskType::Script {
+            command: cmd.into(),
+            working_directory: None,
+            timeout_seconds: Some(60),
+        }
+    }
+
+    #[test]
+    fn only_non_browser_and_first_party_may_set_a_script_task() {
+        let s = script("exit 0");
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_untrusted_script(Some(&principal(class)), Some(&s), None).is_ok());
+        }
+        for class in [
+            OriginClass::Trusted,
+            OriginClass::Extension,
+            OriginClass::Foreign,
+        ] {
+            let refusal =
+                refuse_untrusted_script(Some(&principal(class)), Some(&s), None).unwrap_err();
+            assert!(refusal.contains(class.as_str()), "{refusal}");
+        }
+        assert!(refuse_untrusted_script(None, Some(&s), None)
+            .unwrap_err()
+            .contains("unknown"));
+        // Not a Script (or no task in the request): nothing to gate here.
+        let other = crate::scheduler::ScheduledTaskType::Watcher {
+            watcher_id: "w".into(),
+        };
+        let foreign = principal(OriginClass::Foreign);
+        assert!(refuse_untrusted_script(Some(&foreign), Some(&other), None).is_ok());
+        assert!(refuse_untrusted_script(Some(&foreign), None, None).is_ok());
+    }
+
+    #[test]
+    fn echoing_the_stored_script_back_unchanged_is_not_a_new_grant() {
+        let stored = script("exit 0");
+        let trusted = principal(OriginClass::Trusted);
+        assert!(refuse_untrusted_script(Some(&trusted), Some(&stored), Some(&stored)).is_ok());
+        let changed = script("id > /tmp/pwned");
+        assert!(refuse_untrusted_script(Some(&trusted), Some(&changed), Some(&stored)).is_err());
+        let other = crate::scheduler::ScheduledTaskType::Watcher {
+            watcher_id: "w".into(),
+        };
+        assert!(
+            refuse_untrusted_script(Some(&trusted), Some(&stored), Some(&other)).is_err(),
+            "turning a stored task into a Script is a change"
+        );
+    }
+
+    /// Both write handlers gate a Script task on the requester BEFORE persisting.
+    #[test]
+    fn both_task_write_handlers_gate_a_script_before_persisting() {
+        let src = include_str!("scheduler.rs");
+        for (handler, write) in [
+            (
+                "pub async fn create_scheduled_task(",
+                "pg.insert_scheduled_task(",
+            ),
+            (
+                "pub async fn update_scheduled_task(",
+                "pg.update_scheduled_task(",
+            ),
+        ] {
+            let (_, body) = src.split_once(handler).expect(handler);
+            let (before_gate, _) = body
+                .split_once("refuse_untrusted_script(")
+                .expect("gate call");
+            let (before_persist, _) = body.split_once(write).expect("persist call");
+            assert!(
+                before_gate.len() < before_persist.len(),
+                "{handler} must refuse before {write}"
+            );
+        }
     }
 
     /// Both write handlers gate the probe on the requester BEFORE persisting.
