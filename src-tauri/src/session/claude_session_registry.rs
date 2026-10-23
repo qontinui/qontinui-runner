@@ -55,6 +55,28 @@
 //!   dropped rather than reported as open. PID membership alone does not prove
 //!   the row is the process's own (pid reuse) — that is what
 //!   [`registry_row_validity`] adds.
+//!
+//! # The `procStart` clocks (which platforms validate)
+//!
+//! Read from the Claude Code 2.1.307 bundle on 2026-10-23 (no Linux
+//! `sessions/<pid>.json` exists on this fleet to read instead):
+//! - **Windows** writes a FILETIME (100-ns ticks since 1601 UTC) from Bun's
+//!   `windowsProcessCreationTime`, with `pidDomain: "win32:<host>"`. Compared
+//!   against [`ProcessSnapshot::creation_filetimes`] to the microsecond. This
+//!   is the clock the 2026-10-21 census validated against live files.
+//! - **Linux / WSL** writes `ps -o lstart= -p <pid>` run with `TZ=UTC LC_ALL=C`
+//!   (`"Fri Oct 23 09:15:30 2026"`), with `pidDomain:
+//!   "win32:<machine-id>:<pid-ns>"` (sic — the prefix is the same string).
+//!   Compared against the snapshot's `/proc/<pid>/stat` start time
+//!   ([`ProcessSnapshot::creation_times`], btime + starttime/HZ) to within
+//!   [`LSTART_TOLERANCE_SECS`]. Second granularity only, and NOT yet checked
+//!   against a real Linux registry file — so a caller that must not regress
+//!   off Windows (the account migration) treats an unvalidatable row there as
+//!   "identity not checked", not as a refusal: see
+//!   `terminal::migration_identity::PROC_START_CLOCK_VERIFIED`.
+//!
+//! [`ProcessSnapshot::creation_filetimes`]: crate::process_capture::process_tree::ProcessSnapshot::creation_filetimes
+//! [`ProcessSnapshot::creation_times`]: crate::process_capture::process_tree::ProcessSnapshot::creation_times
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -301,6 +323,21 @@ pub fn read_live_sessions(
 /// than truncating) source.
 pub const PROC_START_TOLERANCE_TICKS: u64 = 10;
 
+/// Tolerance, in seconds, between a Linux row's `ps -o lstart` `procStart`
+/// and the snapshot's `/proc` start time. Both are `btime + starttime / HZ`
+/// floored to the second, but `ps` may derive boot time from uptime, which can
+/// land a second either side.
+pub const LSTART_TOLERANCE_SECS: i64 = 1;
+
+/// Parse a `ps -o lstart=` timestamp written under `TZ=UTC LC_ALL=C`
+/// (`"Fri Oct 23 09:15:30 2026"`, day space-padded) into Unix seconds.
+pub fn parse_lstart_utc(raw: &str) -> Option<i64> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    chrono::NaiveDateTime::parse_from_str(&collapsed, "%a %b %d %H:%M:%S %Y")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
 /// Why a row is positively NOT evidence of a live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleRow {
@@ -329,6 +366,13 @@ pub enum UnknownRow {
     /// The snapshot has no comparable creation time for the pid (non-Windows,
     /// or CIM reported none).
     CreationTimeUnavailable,
+    /// `<pid>.json` names a LIVE claude pid but could not be read or parsed
+    /// (even after one retry) — most likely caught mid-write. Its session id
+    /// is unknown, so it may be any session's holder.
+    UnreadableFile,
+    /// A `sessions/` directory exists but could not be listed — every row in
+    /// it is unknown.
+    RegistryDirUnreadable,
 }
 
 impl UnknownRow {
@@ -339,6 +383,8 @@ impl UnknownRow {
             UnknownRow::MalformedProcStart => "registry row procStart is malformed",
             UnknownRow::UnsupportedPidDomain => "registry row pidDomain is not comparable",
             UnknownRow::CreationTimeUnavailable => "process creation time unavailable",
+            UnknownRow::UnreadableFile => "a live claude's registry file could not be read or parsed",
+            UnknownRow::RegistryDirUnreadable => "a sessions/ directory could not be listed",
         }
     }
 }
@@ -397,13 +443,25 @@ pub fn registry_row_validity(
             return RowValidity::Unknown(UnknownRow::UnsupportedPidDomain);
         }
     }
-    let Ok(row_ticks) = raw.parse::<u64>() else {
+    if let Ok(row_ticks) = raw.parse::<u64>() {
+        // Windows: FILETIME.
+        let Some(&snap_ticks) = snapshot.creation_filetimes.get(&pid) else {
+            return RowValidity::Unknown(UnknownRow::CreationTimeUnavailable);
+        };
+        return if row_ticks.abs_diff(snap_ticks) < PROC_START_TOLERANCE_TICKS {
+            RowValidity::Valid
+        } else {
+            RowValidity::Stale(StaleRow::ProcStartMismatch)
+        };
+    }
+    // Linux / WSL: `ps -o lstart` in UTC (see the module doc).
+    let Some(row_secs) = parse_lstart_utc(raw) else {
         return RowValidity::Unknown(UnknownRow::MalformedProcStart);
     };
-    let Some(&snap_ticks) = snapshot.creation_filetimes.get(&pid) else {
+    let Some(&snap_secs) = snapshot.creation_times.get(&pid).filter(|s| **s > 0) else {
         return RowValidity::Unknown(UnknownRow::CreationTimeUnavailable);
     };
-    if row_ticks.abs_diff(snap_ticks) < PROC_START_TOLERANCE_TICKS {
+    if (row_secs - snap_secs).abs() <= LSTART_TOLERANCE_SECS {
         RowValidity::Valid
     } else {
         RowValidity::Stale(StaleRow::ProcStartMismatch)
@@ -459,35 +517,173 @@ pub fn parse_registry_row(
     })
 }
 
-/// Read EVERY `<config_dir>/sessions/*.json` (no pid filter) and validate each
-/// against `snapshot`. Fail-open per file like [`read_live_sessions`]. An
-/// unreadable process table is NOT fail-open: every row then reads
-/// [`UnknownRow::ProcessTableUnreadable`], which is how a consumer tells "no
-/// evidence" from "no duplicates". Sorted by `(config_dir, pid)`.
-pub fn read_registry_rows(
-    config_dirs: &[std::path::PathBuf],
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
-) -> Vec<RegistryRow> {
-    let mut out = Vec::new();
+/// One `<config_dir>/sessions/*.json` file as read from disk, not yet
+/// validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRegistryFile {
+    /// The owning account's config dir.
+    pub config_dir: std::path::PathBuf,
+    /// The pid the FILE NAME carries (`<pid>.json`); `None` for a name that is
+    /// not a pid.
+    pub file_pid: Option<u32>,
+    /// The file's text, or why it could not be read / parsed as JSON (after
+    /// one retry).
+    pub content: Result<String, String>,
+}
+
+/// Every registry file under every config dir, read ONCE per poll tick on the
+/// blocking pool and shared by the binder's provider rung, the confirmed-record
+/// re-bind, the title refresh and the duplicate-host detector (plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`,
+/// review fix 8). Pure data: validating it against a snapshot is
+/// [`rows_from_raw`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawRegistry {
+    pub files: Vec<RawRegistryFile>,
+    /// `sessions/` directories that exist but could not be listed.
+    pub dir_errors: Vec<(std::path::PathBuf, String)>,
+    /// `false` for the default (never read) value — a consumer must then read
+    /// "no evidence", never "no rows".
+    pub complete: bool,
+}
+
+/// How long [`read_raw_registry`] waits before its one retry of a file it could
+/// not read or parse — long enough for Claude Code to finish a rewrite.
+const REGISTRY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn read_registry_file_once(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("not JSON: {e}"))?;
+    Ok(text)
+}
+
+/// Read every `<config_dir>/sessions/*.json` (blocking). A file that fails to
+/// read or parse is retried ONCE after [`REGISTRY_RETRY_DELAY`]; a missing
+/// `sessions/` is normal and silent; any OTHER listing error is recorded in
+/// [`RawRegistry::dir_errors`], never dropped.
+pub fn read_raw_registry(config_dirs: &[std::path::PathBuf]) -> RawRegistry {
+    let mut raw = RawRegistry {
+        complete: true,
+        ..RawRegistry::default()
+    };
     for dir in config_dirs {
-        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
-            continue; // no sessions dir on this account — normal
+        let sessions = dir.join("sessions");
+        let entries = match std::fs::read_dir(&sessions) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                raw.dir_errors.push((dir.clone(), e.to_string()));
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    raw.dir_errors.push((dir.clone(), e.to_string()));
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(row) = parse_registry_row(&bytes, dir, snapshot) {
-                out.push(row);
-            }
+            let file_pid = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok());
+            let content = read_registry_file_once(&path).or_else(|_| {
+                std::thread::sleep(REGISTRY_RETRY_DELAY);
+                read_registry_file_once(&path)
+            });
+            raw.files.push(RawRegistryFile {
+                config_dir: dir.clone(),
+                file_pid,
+                content,
+            });
+        }
+    }
+    raw
+}
+
+/// Validate a [`RawRegistry`] against `snapshot` into [`RegistryRow`]s.
+///
+/// - A parseable row is validated by [`registry_row_validity`].
+/// - A file that will not read/parse (or carries no `sessionId`) whose
+///   FILE-NAME pid is a live countable claude becomes an
+///   [`UnknownRow::UnreadableFile`] row with an EMPTY session id — it may be
+///   any session's holder (2026-10-23 review: dropping it let a mid-write
+///   second holder vanish and the migration read `Confirmed`). Such a file
+///   for a pid that is not a live claude is stale and dropped.
+/// - Each unlistable `sessions/` dir, and a registry that was never read
+///   (`complete == false`), becomes one pid-0 [`UnknownRow::RegistryDirUnreadable`]
+///   row.
+///
+/// Sorted by `(config_dir, pid)`.
+pub fn rows_from_raw(
+    raw: &RawRegistry,
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Vec<RegistryRow> {
+    let mut out = Vec::new();
+    if !raw.complete {
+        out.push(RegistryRow {
+            pid: 0,
+            session_id: String::new(),
+            config_dir: std::path::PathBuf::new(),
+            kind: None,
+            validity: RowValidity::Unknown(UnknownRow::RegistryDirUnreadable),
+        });
+    }
+    for (dir, _why) in &raw.dir_errors {
+        out.push(RegistryRow {
+            pid: 0,
+            session_id: String::new(),
+            config_dir: dir.clone(),
+            kind: None,
+            validity: RowValidity::Unknown(UnknownRow::RegistryDirUnreadable),
+        });
+    }
+    for file in &raw.files {
+        let parsed = file
+            .content
+            .as_ref()
+            .ok()
+            .and_then(|text| parse_registry_row(text, &file.config_dir, snapshot));
+        if let Some(row) = parsed {
+            out.push(row);
+            continue;
+        }
+        let Some(pid) = file.file_pid else { continue };
+        if snapshot.names.is_empty()
+            || crate::process_capture::process_tree::is_countable_claude(pid, snapshot)
+        {
+            out.push(RegistryRow {
+                pid,
+                session_id: String::new(),
+                config_dir: file.config_dir.clone(),
+                kind: None,
+                validity: if snapshot.names.is_empty() {
+                    RowValidity::Unknown(UnknownRow::ProcessTableUnreadable)
+                } else {
+                    RowValidity::Unknown(UnknownRow::UnreadableFile)
+                },
+            });
         }
     }
     out.sort_by(|a, b| a.config_dir.cmp(&b.config_dir).then(a.pid.cmp(&b.pid)));
     out
+}
+
+/// [`read_raw_registry`] then [`rows_from_raw`] — blocking. An unreadable
+/// process table is NOT fail-open: every row then reads
+/// [`UnknownRow::ProcessTableUnreadable`], which is how a consumer tells "no
+/// evidence" from "no duplicates".
+pub fn read_registry_rows(
+    config_dirs: &[std::path::PathBuf],
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Vec<RegistryRow> {
+    rows_from_raw(&read_raw_registry(config_dirs), snapshot)
 }
 
 /// Find the live-registry row for ONE session id, WITHOUT taking a
