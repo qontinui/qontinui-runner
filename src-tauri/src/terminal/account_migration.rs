@@ -19,9 +19,12 @@
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
 //!    session's account is exhausted. Conversation text that merely quotes a
 //!    limit message never migrates anything.
-//! 3. **Pick target** — the non-exhausted, credential-valid, non-cooled
-//!    account whose spare weekly capacity is closest to expiring
-//!    (`pick_migration_target` — the same `ai_provider::config::cmp_rank` key
+//! 3. **Pick target** — a non-exhausted, credential-valid, non-cooled account,
+//!    chosen by the selection mode's handoff strategy (`pick_migration_target`;
+//!    `AlternatingHandoff`, the default, and `WeightedRandom` are described in
+//!    `ai_provider::account_usage`). Every other mode, and the fallback when no
+//!    account is under pace, takes the account whose spare weekly capacity is
+//!    closest to expiring (the same `ai_provider::config::cmp_rank` key
 //!    the spawn-time picker uses: `exhausted` dominates, then the pace tier,
 //!    then, among accounts under their projected pace, the HIGHEST
 //!    `expected_utilization` — the window furthest along — because unused
@@ -101,6 +104,13 @@ pub struct MigrationOutcome {
 /// `agent_runtime`'s state-access pattern.
 pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
     use tauri::Manager;
+
+    // Migration moves a session between subscription accounts, and those are
+    // off while a model gateway is declared (`crate::model_gateway`).
+    if crate::model_gateway::gateway_declared() {
+        crate::model_gateway::note_subscription_path_off("account_migration");
+        return;
+    }
 
     let Some(app) = crate::tauri_app_handle::current() else {
         return;
@@ -232,6 +242,8 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
                 error = %e,
                 "session migration failed"
             );
+            // The session never reached `dst`: it must not count as a handoff.
+            crate::ai_provider::unrecord_handoff(&dst);
             emit_skipped(&app, &record, &src, &format!("migration-failed: {e}"));
         }
     }
@@ -715,6 +727,10 @@ pub fn migrate_session(
     dst_config_dir: &str,
 ) -> Result<MigrationOutcome, String> {
     use tauri::Manager;
+
+    if crate::model_gateway::gateway_declared() {
+        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
+    }
 
     let working_dir = record.working_dir.clone().ok_or_else(|| {
         "session record has no working_dir — cannot locate transcript".to_string()

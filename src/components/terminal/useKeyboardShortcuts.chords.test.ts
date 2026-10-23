@@ -21,7 +21,7 @@ import { join } from "path";
 
 import { describe, expect, it } from "vitest";
 
-import { isCtrlShiftChord } from "@/lib/globalChords";
+import { GLOBAL_CHORDS, isCtrlShiftChord, matchesChord } from "@/lib/globalChords";
 
 const SOURCE = readFileSync(join(__dirname, "useKeyboardShortcuts.ts"), "utf8");
 
@@ -37,6 +37,9 @@ describe("useKeyboardShortcuts — chord matching", () => {
     // The palette chord is claimed from another component tree too, so
     // it is spelled by the shared TABLE rather than an inline letter.
     expect(SOURCE).toContain("matchesChord(e, GLOBAL_CHORDS.commandPalette)");
+    // The work-mode chord is declared in the shared table too (plan
+    // `2026-10-11-runner-terminal-tmux-work-mode`, Phase 4).
+    expect(SOURCE).toContain("matchesChord(e, GLOBAL_CHORDS.terminalWorkMode)");
     for (const letter of [
       "b",
       "t",
@@ -74,6 +77,22 @@ describe("useKeyboardShortcuts — chord matching", () => {
     for (const letter of letters) {
       expect(letter).toBe(letter.toLowerCase());
     }
+  });
+
+  it("keeps the table's work-mode chord off every inline Ctrl+Shift letter", () => {
+    // The two registries must not share a spelling: an inline
+    // `isCtrlShiftChord(e, "y")` would fire beside the table's chord.
+    const inline = [...SOURCE.matchAll(/isCtrlShiftChord\(e, "([^"]+)"\)/g)].map((m) =>
+      m[1].toLowerCase(),
+    );
+    expect(GLOBAL_CHORDS.terminalWorkMode).toEqual({ key: "y", shift: true, meta: false });
+    expect(inline).not.toContain("y");
+    expect(
+      matchesChord({ key: "Y", ctrlKey: true, shiftKey: true }, GLOBAL_CHORDS.terminalWorkMode),
+    ).toBe(true);
+    expect(
+      matchesChord({ key: "y", ctrlKey: true, shiftKey: false }, GLOBAL_CHORDS.terminalWorkMode),
+    ).toBe(false);
   });
 
   it("still matches when CapsLock lowercased the key (the actual failure)", () => {
