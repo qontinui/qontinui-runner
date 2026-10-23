@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -1191,10 +1192,15 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
-    assignTabToZone: (zoneIdx: number, tabId: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
+    /**
+     * Place a restored session at its recorded GRID zone — into the grid in
+     * grid mode, into the grid snapshot in tmux mode (never onto the screen).
+     */
+    placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    assignments: Record<number, string>;
+    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
+    gridView: { assignments: Record<number, string> };
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -1229,8 +1235,10 @@ interface UseTerminalInitializationParams {
     clearSavedLayout: () => void;
     hasSavedLayout: () => boolean;
   };
+  /** The grid as persisted: `useZoneLayout().gridView` plus the zone cosmetics. */
   layoutState: {
     layoutId: string;
+    assignments: Record<number, string>;
     zoneLabels: Record<number, string>;
     zoneNotes: Record<number, string>;
     pinnedZones: Set<number>;
@@ -1594,7 +1602,7 @@ export function useTerminalInitialization({
             saved.layoutId === FLOW_GRID_ID ||
             LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
           ) {
-            zoneLayout.setLayoutId(saved.layoutId);
+            zoneLayout.setLayoutId(saved.layoutId, { source: "restore" });
           }
         }
 
@@ -1633,8 +1641,15 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-              zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                zoneLayout.gridView.assignments,
+              )
+            ) {
+              zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
             updateTab(tabId, {
@@ -1712,8 +1727,15 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-            zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              zoneLayout.gridView.assignments,
+            )
+          ) {
+            zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
           updateTab(tabId, {
@@ -1838,7 +1860,7 @@ export function useTerminalInitialization({
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
             if (tabId && session.zoneIndex >= 0) {
-              zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+              zoneLayout.placeRestoredTab(session.zoneIndex, tabId);
               applyZoneCosmetics(session.zoneIndex);
             }
           }
@@ -2057,7 +2079,7 @@ export function useTerminalInitialization({
     sessionPersistence.saveSessionLayout({
       layoutId: layoutState.layoutId,
       tabs,
-      assignments: zoneLayout.assignments,
+      assignments: layoutState.assignments,
       zoneLabels: layoutState.zoneLabels,
       zoneNotes: layoutState.zoneNotes,
       pinnedZones: layoutState.pinnedZones,
@@ -2066,7 +2088,7 @@ export function useTerminalInitialization({
   }, [
     pageId,
     tabs,
-    zoneLayout.assignments,
+    layoutState.assignments,
     layoutState.layoutId,
     layoutState.focusedZone,
     layoutState.zoneLabels,
@@ -2080,10 +2102,6 @@ export function useTerminalInitialization({
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
-  const zoneLayoutRef = useRef(zoneLayout);
-  useEffect(() => {
-    zoneLayoutRef.current = zoneLayout;
-  }, [zoneLayout]);
   const layoutStateRef = useRef(layoutState);
   useEffect(() => {
     layoutStateRef.current = layoutState;
@@ -2099,7 +2117,7 @@ export function useTerminalInitialization({
         sessionPersistence.saveSessionLayout({
           layoutId: ls.layoutId,
           tabs: currentTabs,
-          assignments: zoneLayoutRef.current.assignments,
+          assignments: ls.assignments,
           zoneLabels: ls.zoneLabels,
           zoneNotes: ls.zoneNotes,
           pinnedZones: ls.pinnedZones,
@@ -2126,7 +2144,8 @@ export function useTerminalInitialization({
       const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
       const pathMap = await sessionPersistence.saveScrollbackBuffers(terminalTabs);
       const tabIdToSessionIndex: Record<string, number> = {};
-      const currentAssignments = zoneLayoutRef.current.assignments;
+      // The same assignments the layout save walks, so the indices line up.
+      const currentAssignments = layoutStateRef.current.assignments;
       const assignedTabIds = new Set(Object.values(currentAssignments));
       let idx = 0;
       for (const [, tabId] of Object.entries(currentAssignments)) {
