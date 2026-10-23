@@ -111,7 +111,7 @@ function restoreMayBeUnpainted(): boolean {
   if (!read.success || read.hidden !== false || read.changed !== false) return true;
   if (read.restore === null) return false;
   const restoredAt = read.restore?.restoredAt;
-  if (typeof restoredAt !== "number") return true;
+  if (typeof restoredAt !== "number" || !Number.isFinite(restoredAt)) return true;
   return Date.now() - restoredAt < RECENT_RESTORE_MS;
 }
 

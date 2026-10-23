@@ -11,6 +11,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 let hidden = false;
 let devControls = true;
 let lastRestore: { restoredAt: number } | null = null;
+/** When set, the show's answer verbatim: an SDK read the hook must not trust. */
+let showOverride: unknown = undefined;
 const calls: string[] = [];
 const bodies: unknown[] = [];
 
@@ -25,6 +27,7 @@ vi.mock("@qontinui/ui-bridge/control", () => ({
     bodies.push(body);
     const changed = hidden !== body.hidden;
     hidden = body.hidden;
+    if (!body.hidden && showOverride !== undefined) return showOverride;
     if (!body.hidden) {
       // The SDK's show: a real restore when text was hidden, else the last one.
       if (changed) lastRestore = { restoredAt: Date.now() };
@@ -42,6 +45,7 @@ beforeEach(() => {
   hidden = false;
   devControls = true;
   lastRestore = null;
+  showOverride = undefined;
   calls.length = 0;
   bodies.length = 0;
 });
@@ -104,6 +108,25 @@ describe("text visibility ownership (clock-free)", () => {
       success: true,
       data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
     });
+  });
+
+  it.each([
+    ["a refused read", { success: false, code: "INVALID_REQUEST", error: "x" }],
+    [
+      "a read that changed the page",
+      { success: true, hidden: false, changed: true, restore: null },
+    ],
+    ["a restore with no restoredAt", { success: true, hidden: false, changed: false, restore: {} }],
+    [
+      "a NaN restoredAt",
+      { success: true, hidden: false, changed: false, restore: { restoredAt: Number.NaN } },
+    ],
+  ])("query fails closed on %s: it waits for the fence", async (_, read) => {
+    showOverride = read;
+    const waitForPaint = vi.fn(paint);
+    const reply = await runTextVisibilityRequest({ query: true }, waitForPaint);
+    expect(waitForPaint).toHaveBeenCalledTimes(1);
+    expect(reply).toMatchObject({ data: { paintFence: "animation_frame" } });
   });
 
   it("query after a recent restore waits for the fence, and passes a timed-out one on", async () => {

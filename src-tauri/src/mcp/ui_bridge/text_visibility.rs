@@ -448,8 +448,10 @@ fn probe_fence_unproven(probe: Option<&Value>) -> Option<String> {
 }
 
 /// The probe the arm sends before frame A: the hook answers `{hidden,
-/// paintFence}` from `textHidden()`, read on both sides of a paint fence, with
-/// no page-state change.
+/// paintFence}` from `textHidden()`, with no page-state change. It reads on
+/// both sides of a paint fence only while a restore may still be unpainted (a
+/// hidden page, or the SDK's last restore within the hook's window); otherwise
+/// it answers at once with `paintFence: "not_needed"`.
 pub(crate) fn probe_body() -> Value {
     serde_json::json!({"query": true})
 }
@@ -510,7 +512,8 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   and not block.
 ///
 /// Before frame A the webview is asked whether its text is already hidden
-/// ([`probe_body`]). Only `hidden: false` behind a painted fence proceeds
+/// ([`probe_body`]). Only `hidden: false` behind a painted fence, or with
+/// `paintFence: "not_needed"` (no recent restore, or dev controls off), proceeds
 /// ([`probe_fence_unproven`]): hidden, a timed-out or missing fence, or no
 /// usable answer refuses at once — no frame A, no hide, nothing to restore.
 /// The probe is one more webview round trip, and it runs with every capture
@@ -1361,14 +1364,24 @@ mod tests {
     /// same way.
     #[tokio::test]
     async fn an_unanswered_probe_takes_no_frame_a_and_hides_nothing() {
-        for probe in [
-            fails("UI Bridge request timed out"),
-            ok(json!({"success": true, "query": true, "hidden": null})),
-            ok(json!({"success": false, "error": "x"})),
+        for (probe, why) in [
+            (
+                fails("UI Bridge request timed out"),
+                "the webview did not answer",
+            ),
+            (
+                ok(json!({"success": true, "query": true, "hidden": null})),
+                "differed before and after the probe's paint fence",
+            ),
+            (
+                ok(json!({"success": false, "error": "x"})),
+                "carries no hidden flag",
+            ),
         ] {
             let (out, events) = run_with_probe(probe.clone(), vec![], vec![ok("frame-a")]).await;
             let err = out.frame_a.expect_err("unknown is not visible");
             assert!(err.contains("unknown"), "{probe:?}: {err}");
+            assert!(err.contains(why), "{probe:?}: {err}");
             assert!(out.run.is_none(), "{probe:?}");
             assert_eq!(events, ["permits", "probe"], "{probe:?}");
         }
@@ -1376,8 +1389,9 @@ mod tests {
 
     /// `hidden: false` counts only behind a painted fence: a restore writes its
     /// state at once and paints later, so a timed-out or missing fence is
-    /// unknown and refuses before frame A. With dev controls off the hook needs
-    /// no fence (nothing can have been hidden there), and the arm proceeds.
+    /// unknown and refuses before frame A. When the hook needs no fence
+    /// (`not_needed`: no recent restore to paint, or dev controls off so nothing
+    /// can have been hidden there), the arm proceeds.
     #[tokio::test]
     async fn a_probe_whose_paint_fence_is_unproven_refuses_before_frame_a() {
         for probe in [
