@@ -221,13 +221,14 @@ pub fn snapshot_idle_verdict(lines: &[String], cursor_row: u16) -> IdleVerdict {
 /// Fail closed: any other row, or a recap block that does not close, means
 /// the glyph stays busy.
 ///
-/// Measured over 40 finished panes' grids (Claude Code 2.1.309, plan
+/// Measured over the census's 44 finished panes (Claude Code 2.1.309, plan
 /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`
 /// census): blank rows; the `/clear to save …` context hint (often with an
 /// update notice); the input box's top edge, which carries the session's
 /// name (`──── my-session ─`); and, on some panes, a `※ recap: …`
 /// paragraph between the turn line and the hint, usually closed by a
-/// `(… /config)` hint (one census pane's was not). Inside an open recap its
+/// `(… /config)` hint (one census pane's was not). With this rule 40 of the
+/// 44 read idle; the other 4 fail on the completed-turn line's own wording. Inside an open recap its
 /// prose rows are admitted, but never a row that starts a transcript item;
 /// after a closed recap, only blank, hint and edge rows. Any other row means
 /// the turn line is not the one that just ended, and the glyph stays busy.
@@ -272,10 +273,15 @@ fn is_turn_to_input_gap(rows: &[String]) -> bool {
     })
 }
 
-/// A row that begins a transcript item rather than continuing prose: an
-/// assistant bullet, a tool-result elbow, an echoed prompt, or a spinner.
+/// The leading glyphs of a transcript item: the assistant bullet in both its
+/// renderings (`●`, and `⏺` — see `terminal/transport_cost.rs`), the
+/// tool-result elbow, an echoed prompt, and the todo-list checkboxes.
+const TRANSCRIPT_ITEM_GLYPHS: &[char] = &['●', '⏺', '⎿', PROMPT_MARKER, '☐', '☒', '✔', '✓'];
+
+/// A row that begins a transcript item rather than continuing prose: one of
+/// [`TRANSCRIPT_ITEM_GLYPHS`], or a spinner.
 fn starts_transcript_item(trimmed: &str) -> bool {
-    trimmed.starts_with(['●', '⎿', PROMPT_MARKER])
+    trimmed.starts_with(TRANSCRIPT_ITEM_GLYPHS)
         || trimmed
             .chars()
             .next()
@@ -297,7 +303,7 @@ fn closes_recap(trimmed: &str) -> bool {
 
 /// The context hint row. Recognised by its START — `new task?` and a
 /// `/clear` — not by the full `/clear to save` text: on a narrow pane the row
-/// is cut short with `…` (12 of the 40 census panes), so the full phrase is
+/// is cut short with `…` (12 of the census's 44 finished panes), so the full phrase is
 /// not there to match.
 fn is_context_hint_row(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
@@ -666,6 +672,22 @@ mod tests {
             snapshot_idle_verdict(&item_in_recap, 7),
             IdleVerdict::Glyph('✻')
         );
+        // Every transcript-item glyph ends a recap's admission.
+        for item in [
+            "⏺ Next step",
+            "☐ Run the tests",
+            "☒ Lint",
+            "✔ Build",
+            "✓ Done",
+        ] {
+            let mut grid = measured.clone();
+            grid[4] = format!("  {item}");
+            assert_eq!(
+                snapshot_idle_verdict(&grid, 7),
+                IdleVerdict::Glyph('✻'),
+                "{item}"
+            );
+        }
         let mut result_in_recap = measured.clone();
         result_in_recap[4] = "  ⎿  Ran 3 tests".to_string();
         assert_eq!(
