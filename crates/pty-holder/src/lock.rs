@@ -294,6 +294,64 @@ impl PaneLock {
         self.file.sync_data()
     }
 
+    /// Replace the record of a pane that is ALREADY being served — a holder
+    /// upgrade's successor naming itself (plan Phase 8) — without ever
+    /// exposing an empty file.
+    ///
+    /// [`PaneLock::write_record`] truncates first, so a concurrent reader can
+    /// see nothing and report the pane's holder as unidentified. Here the new
+    /// record is padded with trailing spaces (JSON whitespace, which
+    /// [`read_record`] accepts) to at least the old record's length and written
+    /// over it from offset 0 in one write, with no truncation: a reader sees
+    /// the old record or the new one. A read torn across that single small
+    /// write could see a prefix of one and the rest of the other, which fails
+    /// to parse and reads as unidentified — UNKNOWN, never a wrong holder,
+    /// short of a torn mix that happens to be valid JSON. The file never
+    /// shrinks, so a later shorter record keeps the padding.
+    ///
+    /// The lock FILE is never replaced (no write-to-temp-and-rename): the
+    /// `flock` belongs to this inode, and a rename would hand every later
+    /// locker a different, unlocked file.
+    pub fn rewrite_record(&mut self, record: &LockRecord) -> io::Result<()> {
+        rewrite_record_in(&mut self.file, record)
+    }
+
+    /// Take over the lock a holder upgrade's predecessor passed down as an
+    /// inherited fd (plan Phase 8, D12a). The fd shares the predecessor's
+    /// open file DESCRIPTION, and an `flock` belongs to the description, so
+    /// the lock is held continuously across the swap: a prober never finds
+    /// the pane's lock free (which it would read as a dead holder) while the
+    /// predecessor lets go. Verified, not assumed: `path` must still name the
+    /// inherited file, and a non-blocking `LOCK_EX` on it must succeed — on a
+    /// description that already holds the lock that is a no-op.
+    #[cfg(unix)]
+    pub fn adopt_inherited(file: File, path: &Path) -> io::Result<PaneLock> {
+        if !sys::try_lock_exclusive(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the inherited lock fd does not hold the pane lock",
+            ));
+        }
+        if !sys::still_names(&file, path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} no longer names the inherited lock file", path.display()),
+            ));
+        }
+        Ok(PaneLock {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The lock file's fd, for a holder upgrade to pass to its successor
+    /// (plan Phase 8). Never unlock or close it through this.
+    #[cfg(unix)]
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.file.as_raw_fd()
+    }
+
     /// Empty the record, while holding the lock: a reader then sees "holder
     /// unidentified", and a sweep signals nothing for the pane. The fallback
     /// when a record could not be REWRITTEN.
@@ -305,6 +363,26 @@ impl PaneLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// [`PaneLock::rewrite_record`] on any open handle of a held lock file — a
+/// `dup` of the holder's own lock fd, for a predecessor that takes its pane
+/// back after its successor died (plan Phase 8).
+pub fn rewrite_record_in(file: &mut File, record: &LockRecord) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let old_len = file.metadata()?.len();
+    if (bytes.len() as u64) < old_len {
+        bytes.resize(old_len as usize, b' ');
+    }
+    if bytes.len() as u64 > MAX_RECORD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock record would exceed MAX_RECORD_LEN",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&bytes)?;
+    file.sync_data()
 }
 
 /// Read the record from a lock file WITHOUT taking the lock. `None` when the

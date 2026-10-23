@@ -121,6 +121,7 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
+mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
@@ -247,6 +248,7 @@ mod scenarios;
 mod scheduler;
 mod scheduler_probe;
 mod scheduler_remote_agent;
+mod scheduler_script;
 mod scheduler_service;
 mod schema_registry;
 mod screen;
@@ -266,6 +268,9 @@ mod session_pr_reconciler; // Runner-local per-session PR attribution → projec
 mod session_attribution;
 mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
+// Model gateway (plan 2026-10-09-spec-front-end-of-the-software-factory Phase 9, D12):
+// where every model call goes when an install declares a gateway.
+mod model_gateway;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
@@ -380,6 +385,13 @@ mod env_test_lock_hierarchy_guard;
 // 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
 mod expect_ratchet;
+// A harness runner and a subject runner (QONTINUI_INSTANCE_ROOT) on one host:
+// the subject driven through the real writers leaves the harness's files
+// byte-identical. Plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+// Phase 3.
+#[cfg(test)]
+mod subject_isolation_harness;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -869,6 +881,28 @@ fn runner_plans_dir_setting() -> Option<String> {
         paths.plans_dir,
         &paths.plans_dir_by_tenant,
         None,
+    )
+}
+
+/// The env collector's account-selection door: the effective mode and the
+/// input that decided it, as wire strings. Re-resolved per call, so a fleet
+/// policy change or a pin edit reaches the next capture.
+///
+/// The source reads `unknown` (the mode is still what applies right now)
+/// until coord has answered the fleet-policy domain in this process: a
+/// capture taken before the poller's first answer would otherwise report
+/// `local` on a machine the fleet is about to override. A PINNED machine is
+/// `pinned` regardless — the fleet's answer cannot change that.
+fn runner_effective_account_selection() -> (&'static str, &'static str) {
+    // Flag FIRST (Acquire), value second: the poller stores the fleet value
+    // and THEN raises the flag (Release), so reading in this order can never
+    // pair a raised flag with the pre-answer `None` (which would report
+    // `local` on a fleet-managed machine).
+    let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
+    let (mode, source) = crate::claude_accounts::effective_selection();
+    (
+        mode.as_str(),
+        crate::claude_accounts::reported_selection_source(source, answered),
     )
 }
 
@@ -1792,23 +1826,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Sentry for crash reporting (release builds only).
     // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
+    //
+    // Gated on the tenant's `egress_telemetry` switch (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), read at
+    // boot: a flip applies at the next start, and the persisted answer makes a
+    // tenant `off` hold before the first poll from the second start onwards.
     #[cfg(not(debug_assertions))]
-    let _sentry_guard = std::env::var("SENTRY_DSN").ok().map(|dsn| {
-        let guard = sentry::init((
-            dsn,
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                environment: Some("beta".into()),
-                before_send: Some(std::sync::Arc::new(|event| {
-                    info!("Sending error to Sentry: {:?}", event);
-                    Some(event)
-                })),
-                ..Default::default()
-            },
-        ));
-        info!("Sentry crash reporting initialized");
-        guard
-    });
+    let _sentry_guard = std::env::var("SENTRY_DSN")
+        .ok()
+        .filter(|_| egress::telemetry_permitted_at_boot())
+        .map(|dsn| {
+            let guard = sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    environment: Some("beta".into()),
+                    before_send: Some(std::sync::Arc::new(|event| {
+                        info!("Sending error to Sentry: {:?}", event);
+                        Some(event)
+                    })),
+                    ..Default::default()
+                },
+            ));
+            info!("Sentry crash reporting initialized");
+            guard
+        });
 
     // Initialize DisplayProcessor with ActionLogProfile
     let mut display_processor = DisplayProcessor::new();
@@ -2150,6 +2192,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // capture and the scan agree on what "unset" means.
                 qontinui_runner_lib::env_agent::collectors::publish_plans_dir(
                     runner_plans_dir_setting,
+                );
+                // And for the effective account-selection mode + its source
+                // (`fleet` | `local` | `pinned`): the resolver and the
+                // fleet-policy cache it reads live in this crate, so the
+                // `claude_accounts` section reports what actually governs
+                // through this door rather than a re-derived second rule.
+                qontinui_runner_lib::env_agent::collectors::publish_account_selection(
+                    runner_effective_account_selection,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
@@ -2932,10 +2982,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::comparison::list_comparisons,
             commands::comparison::start_comparison,
             commands::config::build_ai_launch_command,
+            commands::config::build_ai_resume_command,
             commands::config::get_auto_load_last_config,
             commands::config::get_claude_account_launch_commands,
             commands::config::get_claude_config_dirs,
             commands::config::get_claude_default_launch_command,
+            commands::config::get_claude_session_permission,
+            commands::config::get_model_gateway,
             commands::config::get_current_configuration,
             commands::config::get_include_summary_step_by_default,
             commands::config::get_last_config_path,
@@ -2945,6 +2998,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_claude_account_launch_commands,
             commands::config::save_claude_config_dirs,
             commands::config::save_claude_default_launch_command,
+            commands::config::save_claude_session_permission,
+            commands::config::save_model_gateway,
             commands::config::save_include_summary_step_by_default,
             commands::config::save_last_monitor_index,
             commands::config::save_last_monitor_indices,
@@ -3451,11 +3506,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_explorer::preview_exploration_plan,
             commands::state_explorer::start_exploration,
             commands::state_machine::clear_action_log,
-            commands::state_machine::execute_transition,
             commands::state_machine::get_action_log_view,
-            commands::state_machine::get_active_states,
-            commands::state_machine::get_available_transitions,
-            commands::state_machine::navigate_to_multiple_states,
             commands::state_machine::navigate_to_state,
             commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
             commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
@@ -3632,10 +3683,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             ui_error::clear_ui_error,
             ui_error::get_ui_error,
             ui_error::report_ui_error,
-            commands::verification::clear_pending_verification,
-            commands::verification::load_pending_verification,
-            commands::verification::save_pending_verification,
-            commands::verification::update_verification_status,
             commands::video::get_video_recording_status,
             commands::video::start_video_recording,
             commands::video::stop_video_recording,
@@ -4453,6 +4500,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 session_pr_reconciler::start(lifecycle_store.clone());
                 let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
+                // The egress switches' session-tenant lookups (relay frames,
+                // remote attach) read the lifecycle store and the AI-session
+                // registrar through this handle; both are managed by now.
+                egress::install_session_tenant_lookup(app.handle().clone());
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
                 // child process / remote host / `cat`'d file emits). This hook
@@ -5227,13 +5278,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
                 //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
                 //   GET, materializing each handoff_request as a child session.
-                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
-                //   resolved from machine.json (None → dormant); dual-write
-                //   stays off until `session_coordination_enabled` flips.
+                //   Phase 10 flag-poll always spawns and re-reads the
+                //   machine.json `active_tenant_id` every tick (unpinned →
+                //   it asks coord nothing), so a tenant switch is followed
+                //   without a restart; dual-write stays off until that
+                //   tenant's `session_coordination_enabled` flips.
                 //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
-                //   DEVICE-scoped surface — it polls the DEFAULT binding's
-                //   tenant policy and presents the default device-JWT slot
-                //   (unparameterized `coord_get`) by construction.
+                //   DEVICE-scoped surface — it polls the PINNED tenant's
+                //   policy and presents that tenant's own device-JWT slot
+                //   (`tenant_policy_scope`).
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
@@ -5316,7 +5369,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // gets the same per-runner profile layout. The launch_env
                 // field delegates to crate::instance::webview2_data_dir(),
                 // which prefers the env var and falls back to the shared
-                // qontinui_types helper. Returns None on non-Windows.
+                // qontinui_types helper. Off Windows: None except under an
+                // instance root (a subject's own `<root>/webview`).
                 let data_dir: Option<std::path::PathBuf> =
                     setup_launch_env.webview2_user_data_dir.clone();
                 let is_secondary = instance::is_secondary();
@@ -5982,8 +6036,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     } else {
                         info!("Restate durable execution enabled — preparing server");
-                        let app_data_dir = dirs::data_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        let app_data_dir = qontinui_runner_lib::instance_env::platform_dir(
+                            qontinui_runner_lib::instance_env::PlatformDir::Data,
+                        )
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("qontinui-runner");
                         match restate::lifecycle::ensure_restate_binary(
                             &restate_settings,

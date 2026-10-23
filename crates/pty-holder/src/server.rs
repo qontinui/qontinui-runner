@@ -79,6 +79,20 @@ use crate::protocol::{
 use crate::pty::Pane;
 use crate::transport::{self, Conn, DeadlineIo, Listener};
 
+/// Why a non-Unix holder answers `prepare_upgrade` with `unsupported` (plan
+/// D12 / Phase 8): a ConPTY handle cannot be handed to another process. The
+/// honest actions for an incompatible or defective holder there are "leave it
+/// running" and "end it and resume" (Phase 6) — never "upgrade".
+pub const UPGRADE_UNSUPPORTED_ON_THIS_OS: &str = "holder upgrade is Unix-only (plan D12a): a \
+     ConPTY cannot be handed to another process; leave this holder running, or end the pane \
+     and resume it";
+
+/// Whether a holder on THIS platform can be upgraded in place (plan Phase 8).
+/// What a UI offering "upgrade the holder" must check: only `true` on Unix.
+pub const fn upgrade_supported() -> bool {
+    cfg!(unix)
+}
+
 /// Most concurrent connections one holder serves. Each costs a thread (two
 /// once attached); the runner needs one or two. Past this a client gets
 /// `rejected {busy}`.
@@ -168,6 +182,10 @@ pub struct HolderInfo {
     pub holder_pid: u32,
     pub child_pid: Option<u32>,
     pub started_at_unix_ms: u64,
+    /// What `prepare_upgrade` needs (plan Phase 8, Unix). `None` in a holder
+    /// with no pane (dispatch unit tests), which answers `unsupported`.
+    #[cfg(unix)]
+    pub upgrade: Option<crate::handoff::UpgradeCtx>,
 }
 
 /// A holder that holds its lock, owns its pane's child, and has bound its
@@ -187,7 +205,7 @@ pub struct Holder {
     record: LockRecord,
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -235,11 +253,23 @@ impl Holder {
         };
         let spec = crate::spec::consume_spec(pane_dir, pane_id).map_err(StartError::Spec)?;
         let pane = Pane::spawn(&spec).map_err(StartError::Child)?;
+        let scrollback = Arc::new(Mutex::new(crate::scrollback::ScrollbackWriter::new(
+            pane_dir,
+            pane_id,
+            pane.child_pid(),
+        )));
         let info = HolderInfo {
             pane_id: pane_id.clone(),
             holder_pid: std::process::id(),
             child_pid: Some(pane.child_pid()),
             started_at_unix_ms: now_unix_ms(),
+            #[cfg(unix)]
+            upgrade: Some(crate::handoff::UpgradeCtx {
+                pane_dir: pane_dir.to_path_buf(),
+                lock_fd: lock.as_raw_fd(),
+                log: log_path(pane_dir, pane_id),
+                scrollback: Arc::clone(&scrollback),
+            }),
         };
         let record = LockRecord {
             holder_pid: info.holder_pid,
@@ -273,14 +303,12 @@ impl Holder {
                 return Err(StartError::Io(e));
             }
         };
-        let scrollback =
-            crate::scrollback::ScrollbackWriter::new(pane_dir, pane_id, pane.child_pid());
         Ok(Holder {
             info: Arc::new(info),
             pane,
             listener,
             log: log_path(pane_dir, pane_id),
-            scrollback: Arc::new(Mutex::new(scrollback)),
+            scrollback,
             lock,
             record,
         })
@@ -288,6 +316,30 @@ impl Holder {
 
     pub fn info(&self) -> &HolderInfo {
         &self.info
+    }
+
+    /// A holder assembled by a holder upgrade's successor (plan Phase 8,
+    /// `crate::handoff::adopt`): the lock it inherited, the pane it adopted
+    /// and the endpoint it took over. It then [`Holder::run`]s like any other.
+    #[cfg(unix)]
+    pub(crate) fn from_parts(
+        info: HolderInfo,
+        pane: Arc<Pane>,
+        listener: Listener,
+        log: PathBuf,
+        scrollback: Arc<Mutex<crate::scrollback::ScrollbackWriter>>,
+        lock: PaneLock,
+        record: LockRecord,
+    ) -> Holder {
+        Holder {
+            info: Arc::new(info),
+            pane,
+            listener,
+            log,
+            scrollback,
+            lock,
+            record,
+        }
     }
 
     pub fn pane(&self) -> &Arc<Pane> {
@@ -331,12 +383,7 @@ impl Holder {
             // end below.
             log_line(&log, &format!("scrollback thread: {e}"));
         }
-        let accept_pane = Arc::clone(&pane);
-        let accept_log = log.clone();
-        let spawned = std::thread::Builder::new()
-            .name("pty-holder-accept".into())
-            .spawn(move || accept_loop(&listener, &info, &accept_pane, &accept_log));
-        if let Err(e) = spawned {
+        if let Err(e) = spawn_accept_loop(listener, info, Arc::clone(&pane), log.clone()) {
             // No accept loop: the pane runs on, unreachable but alive and
             // counted (its lock is held), until the child exits.
             eprintln!("pty-holder: accept thread: {e}");
@@ -396,7 +443,7 @@ impl Holder {
 /// The transient scope unit this holder runs in, when the spawner put it in
 /// one (`crate::spawn`'s scope route). Recorded in the lock so a boot sweep can
 /// stop what a dead holder left in it.
-fn own_scope_unit() -> Option<String> {
+pub(crate) fn own_scope_unit() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let cgroup = crate::reap::own_holder_scope_cgroup()?;
@@ -408,6 +455,27 @@ fn own_scope_unit() -> Option<String> {
     }
 }
 
+/// Connections being served, across EVERY accept loop of this holder — a
+/// predecessor that re-bound its endpoint after a dead successor runs two
+/// (review r3 nit), and [`MAX_CONNECTIONS`] bounds them together. A holder
+/// process serves exactly one pane, so the count is process-wide.
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Run [`accept_loop`] on a thread of its own. A holder upgrade's predecessor
+/// that takes its pane back after a dead successor replaced its socket starts
+/// a second one on a fresh listener (plan Phase 8).
+pub(crate) fn spawn_accept_loop(
+    listener: Listener,
+    info: Arc<HolderInfo>,
+    pane: Arc<Pane>,
+    log: PathBuf,
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("pty-holder-accept".into())
+        .spawn(move || accept_loop(&listener, &info, &pane, &log))
+        .map(|_| ())
+}
+
 /// Accept forever, one thread per connection, at most [`MAX_CONNECTIONS`] at
 /// once. An accept error NEVER ends the holder — it holds a live pane, and an
 /// endpoint problem is not a reason to end a session (Phase 1 hand-off). A
@@ -417,7 +485,7 @@ fn own_scope_unit() -> Option<String> {
 /// `transport::windows::STUCK_INSTANCE_FATAL_AFTER`) is logged and retried
 /// every [`ACCEPT_BACKOFF_FATAL`].
 fn accept_loop(listener: &Listener, info: &Arc<HolderInfo>, pane: &Arc<Pane>, log: &Path) {
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = &ACTIVE_CONNECTIONS;
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         let conn = match listener.accept() {
@@ -448,7 +516,7 @@ fn accept_loop(listener: &Listener, info: &Arc<HolderInfo>, pane: &Arc<Pane>, lo
         }
         let info = Arc::clone(info);
         let pane = Arc::clone(pane);
-        let slot = Arc::clone(&active);
+        let slot = active;
         let spawned = std::thread::Builder::new()
             .name("pty-holder-conn".into())
             .spawn(move || {
@@ -504,6 +572,9 @@ pub(crate) enum Action {
     },
     Kill,
     Detach,
+    /// Hand the pane to a successor holder (plan Phase 8, Unix).
+    #[cfg(unix)]
+    PrepareUpgrade,
 }
 
 /// One connection's flow flags, shared with its pump.
@@ -599,6 +670,10 @@ pub(crate) fn serve_conn_with(
     let mut state = ConnState::AwaitHello;
     // This connection's input generation, once it became the input stream.
     let mut input_gen: Option<u64> = None;
+    // Unix: this connection's registration as an input stream, so a
+    // committing holder upgrade can drain it (`Pane::drain_input_for_handoff`).
+    #[cfg(unix)]
+    let mut input_reg: Option<u64> = None;
     loop {
         let read = if state == ConnState::AwaitHello {
             // One deadline for the whole first frame (DeadlineIo re-arms it
@@ -649,6 +724,23 @@ pub(crate) fn serve_conn_with(
                 // nothing the client sends after the `ok` can be overtaken by
                 // an older connection's input.
                 if matches!(state, ConnState::InputOnly(_)) && input_gen.is_none() {
+                    #[cfg(unix)]
+                    if let Some(p) = pane {
+                        // Refused while an upgrade commits: no `ok`, so the
+                        // client sends nothing here and reconnects to the
+                        // successor.
+                        match conn.try_clone().ok().and_then(|c| p.register_input_conn(c)) {
+                            Some(id) => input_reg = Some(id),
+                            None => {
+                                reject(
+                                    &writer,
+                                    RejectReason::Busy,
+                                    "this holder is handing its pane to a successor",
+                                );
+                                break;
+                            }
+                        }
+                    }
                     input_gen = pane.map(|p| p.supersede_input());
                 }
                 if send_reply(&writer, &reply).is_err() {
@@ -734,9 +826,37 @@ pub(crate) fn serve_conn_with(
                 let _ = send_reply(&writer, &ok("detach"));
                 break;
             }
+            #[cfg(unix)]
+            Action::PrepareUpgrade => {
+                let reply = match (pane, &info.upgrade) {
+                    (Some(pane), Some(ctx)) => {
+                        let result = crate::handoff::prepare_upgrade(ctx, info, pane);
+                        let reply = result.reply();
+                        if matches!(result, crate::handoff::UpgradeResult::Committed { .. }) {
+                            // The successor owns the pane: tell the requester,
+                            // then leave at once (no pane-end work, no
+                            // destructor — `handoff::exit_after_handoff`).
+                            let _ = send_reply(&writer, &reply);
+                            crate::handoff::exit_after_handoff();
+                        }
+                        reply
+                    }
+                    _ => Reply::Unsupported {
+                        verb: "prepare_upgrade".into(),
+                        reason: "this holder has no pane to hand over".into(),
+                    },
+                };
+                if send_reply(&writer, &reply).is_err() {
+                    break;
+                }
+            }
         }
     }
     // Teardown: stop this connection's pump (if any) and close both halves.
+    #[cfg(unix)]
+    if let (Some(p), Some(id)) = (pane, input_reg) {
+        p.unregister_input_conn(id);
+    }
     flow.closed.store(true, Ordering::SeqCst);
     if let Some(p) = pane {
         p.notify();
@@ -1070,9 +1190,14 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             versions: PROTOCOL_VERSIONS.to_vec(),
             started_at_unix_ms: info.started_at_unix_ms,
         })),
+        // Envelope verb (D15): answerable whatever was negotiated, so a runner
+        // far ahead of this holder can still replace it.
+        #[cfg(unix)]
+        (_, Request::PrepareUpgrade) => Action::PrepareUpgrade,
+        #[cfg(not(unix))]
         (_, Request::PrepareUpgrade) => Action::Reply(Reply::Unsupported {
             verb: "prepare_upgrade".into(),
-            reason: "holder upgrade is plan Phase 8; this build does not implement it".into(),
+            reason: UPGRADE_UNSUPPORTED_ON_THIS_OS.into(),
         }),
         // Version 1 verbs.
         (Negotiated(v) | Attached(v) | InputOnly(v), Request::Ping) if v >= 1 => {
@@ -1188,6 +1313,8 @@ mod tests {
             holder_pid: 7,
             child_pid: None,
             started_at_unix_ms: 1,
+            #[cfg(unix)]
+            upgrade: None,
         }
     }
 
@@ -1229,6 +1356,14 @@ mod tests {
             handle_request(&mut s, Request::Census, &i),
             Action::Reply(Reply::CensusReply(_))
         ));
+        // Unix: a handoff action (served as `unsupported` by a holder with no
+        // pane); elsewhere `unsupported` straight away (plan D12).
+        #[cfg(unix)]
+        assert_eq!(
+            handle_request(&mut s, Request::PrepareUpgrade, &i),
+            Action::PrepareUpgrade
+        );
+        #[cfg(not(unix))]
         assert!(matches!(
             handle_request(&mut s, Request::PrepareUpgrade, &i),
             Action::Reply(Reply::Unsupported { .. })

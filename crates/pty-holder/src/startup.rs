@@ -38,6 +38,14 @@
 /// Close every fd >= 3 this process inherited.
 #[cfg(unix)]
 pub fn close_inherited_fds() {
+    close_inherited_fds_except(&[]);
+}
+
+/// [`close_inherited_fds`], keeping `keep` open — a holder upgrade's successor
+/// (plan Phase 8) inherits its pane's master, lock and control channel at
+/// fixed numbers (`crate::handoff`) and must close everything else.
+#[cfg(unix)]
+pub fn close_inherited_fds_except(keep: &[i32]) {
     let dir = if std::path::Path::new("/proc/self/fd").is_dir() {
         "/proc/self/fd"
     } else {
@@ -52,7 +60,7 @@ pub fn close_inherited_fds() {
             .collect(),
         Err(_) => return,
     };
-    for fd in fds.into_iter().filter(|&fd| fd > 2) {
+    for fd in fds.into_iter().filter(|&fd| fd > 2 && !keep.contains(&fd)) {
         // SAFETY: closing an fd number this process owns; nothing in this
         // process holds a Rust handle to any fd >= 3 at this point (callers run
         // this first thing in `main`).
