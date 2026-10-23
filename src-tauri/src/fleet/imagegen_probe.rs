@@ -60,16 +60,20 @@
 //!   loop, and refuses a declared `Content-Length` over the cap before reading
 //!   anything. The deadline is checked AFTER each read, never before one, so a
 //!   body that has already arrived is never thrown away: a read that ends past
-//!   the deadline keeps the body if it is complete (its declared length is
-//!   met, or it parses as a whole JSON document) and gives up otherwise.
+//!   the deadline keeps the body if it is complete (its declared
+//!   `Content-Length` is met or, when no length is declared, it parses as a
+//!   whole JSON document) and gives up otherwise.
 //! * **What is bounded, exactly.** From the moment the client is built, a probe
 //!   costs less than 2 × [`REQUEST_TIMEOUT`] (4 s): the send, connect
 //!   ([`CONNECT_TIMEOUT`]) and name resolution included, plus at most one read
 //!   that started before the deadline. That holds for a hostname endpoint as
 //!   well as an IP literal, because names resolve through
-//!   `outbound_net::os_dns` (`getaddrinfo` on its own detached thread, capped at
-//!   `os_dns::LOOKUP_TIMEOUT`), not reqwest's default resolver, whose lookup on
-//!   the client's blocking pool a dropped client would wait for. BUILDING the
+//!   `outbound_net::os_dns`, which runs `getaddrinfo` on its own detached
+//!   thread. The send's timeout then ends the wait for a slow lookup, and
+//!   dropping the client never waits for the lookup to finish, as it would for
+//!   reqwest's default resolver, which runs it on the client's blocking pool.
+//!   (`os_dns`'s own 10 s lookup cap is longer than this bound and plays no
+//!   part in it.) BUILDING the
 //!   client is not bounded: `reqwest::blocking::Client::build` starts the
 //!   client's runtime thread and sets up TLS and waits for both with no
 //!   timeout. That is why the deadline starts after the build, so a slow build
@@ -345,13 +349,18 @@ fn read_body_by_deadline(
     }
 }
 
-/// True when `body` is already the whole response: its declared length is met,
-/// or it parses as one complete JSON document. A model list is a JSON object,
-/// and no proper prefix of a JSON object parses, so a body that parses is not a
-/// truncated one. Pure.
+/// True when `body` is already the whole response. With a declared
+/// `Content-Length`, ONLY that length decides: a prefix that happens to parse
+/// as JSON is not complete while declared bytes are still missing, and
+/// accepting it would advertise from a response the server had not finished.
+/// With no declared length, the body is complete when it parses as one whole
+/// JSON document: a model list is a JSON object, and no proper prefix of a
+/// JSON object parses. Pure.
 fn body_is_complete(body: &[u8], declared_len: Option<u64>) -> bool {
-    declared_len.is_some_and(|n| body.len() as u64 >= n)
-        || serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok()
+    match declared_len {
+        Some(n) => body.len() as u64 >= n,
+        None => serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok(),
+    }
 }
 
 /// The ids of the `/v1/models` entries that declare image output. `None` when
@@ -658,8 +667,10 @@ mod tests {
     /// timeout of its own and is slow on a loaded box; here it takes 1.5 s of
     /// a 2 s deadline (the test seam), and the response then completes
     /// 1.5 s after the connection, inside the deadline counted from the build.
-    /// A deadline taken before the build would expire mid-body (at +0.5 s, with
-    /// two of three parts missing) and cache `false` for a healthy upstream.
+    /// A deadline taken before the build would already have passed (at +0.5 s
+    /// after the connection) when the read ending at +0.9 s returns with one of
+    /// three parts still missing, so the probe would give up and cache `false`
+    /// for a healthy upstream.
     #[test]
     fn a_slow_client_build_does_not_spend_the_deadline() {
         let parts = marked_list_in_parts(3);
@@ -695,6 +706,52 @@ mod tests {
         assert!(
             body_is_complete(half, Some(half.len() as u64)),
             "a met declared length"
+        );
+        assert!(
+            !body_is_complete(full, Some(full.len() as u64 + 1)),
+            "a declared length decides alone: a parsing prefix short of it is not complete"
+        );
+    }
+
+    /// A declared `Content-Length` decides completeness on its own. The server
+    /// declares 500 bytes, sends a valid MARKED 363-byte model list in two
+    /// parts (the second arriving past the deadline), and then 137 bytes of
+    /// junk later still. When the deadline is checked, the 363 bytes parse as
+    /// JSON, but 137 declared bytes are missing, so the response is
+    /// unfinished. The probe must give up, not advertise from it.
+    #[test]
+    fn a_parsing_prefix_short_of_the_declared_length_is_not_advertised() {
+        let parts = marked_list_in_parts(2);
+        let marked_len = LLAMA_SWAP_WITH_IMAGE.len();
+        let declared = 500;
+        assert!(
+            marked_len < declared,
+            "the fixture must leave declared bytes missing"
+        );
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {declared}\r\n\r\n"
+        );
+        let base = serve_scheduled(
+            head,
+            vec![
+                (Duration::from_millis(700), parts[0].clone()),
+                (Duration::from_millis(1200), parts[1].clone()),
+                (
+                    Duration::from_millis(1600),
+                    vec![b'x'; declared - marked_len],
+                ),
+            ],
+            Duration::from_secs(5),
+        );
+        let ok = probe_endpoint(
+            &base,
+            Duration::from_millis(500),
+            Duration::from_millis(1000),
+        );
+        assert!(
+            !ok,
+            "a body short of its declared length must not advertise"
         );
     }
 
@@ -815,6 +872,25 @@ mod tests {
         assert!(
             squeezed.contains("POSITIVE_VERDICT_TTL,super::HOST_PROBE_TTL,"),
             "capability_tokens must pass POSITIVE_VERDICT_TTL then HOST_PROBE_TTL"
+        );
+    }
+
+    /// The probe's client resolves through `outbound_net::os_dns`, which is what
+    /// keeps a dropped client from waiting on a lookup (module docs, "What is
+    /// bounded, exactly"). Pinned in the production source, because swapping
+    /// the resolver changes no behaviour any loopback test can observe.
+    #[test]
+    fn the_probe_client_resolves_through_os_dns() {
+        let src = include_str!("imagegen_probe.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module");
+        let squeezed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains(
+                ".dns_resolver(qontinui_runner_lib::outbound_net::os_dns::os_resolver())"
+            ),
+            "the probe's client builder must call dns_resolver(os_dns::os_resolver())"
         );
     }
 
