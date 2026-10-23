@@ -738,6 +738,48 @@ mod tests {
         assert!(input_prompt_ready(&hinted).is_err());
     }
 
+    /// Plan `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-
+    /// for-a-spinner` fixtures E and F — SYNTHESIZED, modelling Claude Code
+    /// 2.1.309. The completed-turn line no longer makes the screen read busy,
+    /// so these two pin that the draft and dialog refusals stand on their own:
+    /// `Err` from both checks, before the predicate fix (busy screen) and
+    /// after it (draft / dialog).
+    #[test]
+    fn fixture_e_unsent_draft_under_a_completed_turn_is_refused() {
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                edge(),
+                "❯\u{a0}draft text not sent".to_string(),
+                edge(),
+                "  new task? /clear to save 399.4k tokens · Auto-updating…".to_string(),
+            ],
+            2,
+            21,
+        );
+        assert!(exit_prompt_ready(&s).is_err());
+        assert!(input_prompt_ready(&s).is_err());
+    }
+
+    #[test]
+    fn fixture_f_permission_dialog_under_a_completed_turn_is_refused() {
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                " Bash command".to_string(),
+                "   rm -rf build".to_string(),
+                " Do you want to proceed?".to_string(),
+                " ❯ 1. Yes".to_string(),
+                "   2. Yes, and don't ask again for rm commands in this project".to_string(),
+                "   3. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            4,
+            3,
+        );
+        assert!(exit_prompt_ready(&s).is_err());
+        assert!(input_prompt_ready(&s).is_err());
+    }
+
     fn draft_prompt() -> ScreenText {
         screen(
             vec![
