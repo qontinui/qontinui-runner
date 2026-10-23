@@ -1095,65 +1095,78 @@ mod tests {
     }
 
     /// Two arms at once against one webview whose frames show whether its text
-    /// is hidden: each must see its own frame A with text and frame B without.
+    /// is hidden: each must see its own frame A with text and frame B without,
+    /// and each arm's steps (frame A, hide, frame B, restore) must run as one
+    /// block — never interleaved with the other arm's.
     #[tokio::test]
     async fn concurrent_arms_do_not_interleave() {
         use std::sync::atomic::{AtomicI64, Ordering};
         // `hiddenAt` of the live hide, 0 when the text is visible.
         let hidden_at = Arc::new(AtomicI64::new(0));
         let clock = Arc::new(AtomicI64::new(1));
-        let arm = |hidden_at: Arc<AtomicI64>, clock: Arc<AtomicI64>| async move {
-            let (h1, c1) = (hidden_at.clone(), clock.clone());
-            let send = move |_kind: &'static str, body: Value| {
-                let (h, c) = (h1.clone(), c1.clone());
-                async move {
-                    tokio::task::yield_now().await;
-                    let want = body["hidden"].as_bool().unwrap_or_default();
-                    let was = h.load(Ordering::SeqCst);
-                    let reply = if want {
-                        let at = if was == 0 {
-                            c.fetch_add(1, Ordering::SeqCst)
-                        } else {
-                            was
-                        };
-                        h.store(at, Ordering::SeqCst);
-                        json!({"success": true, "hidden": true, "changed": was == 0,
+        // Which arm took each step, in order.
+        let steps: Arc<Mutex<Vec<u8>>> = Default::default();
+        let arm = |id: u8, hidden_at: Arc<AtomicI64>, clock: Arc<AtomicI64>| {
+            let steps = steps.clone();
+            async move {
+                let (h1, c1, s1) = (hidden_at.clone(), clock.clone(), steps.clone());
+                let send = move |_kind: &'static str, body: Value| {
+                    let (h, c) = (h1.clone(), c1.clone());
+                    s1.lock().unwrap().push(id);
+                    async move {
+                        tokio::task::yield_now().await;
+                        let want = body["hidden"].as_bool().unwrap_or_default();
+                        let was = h.load(Ordering::SeqCst);
+                        let reply = if want {
+                            let at = if was == 0 {
+                                c.fetch_add(1, Ordering::SeqCst)
+                            } else {
+                                was
+                            };
+                            h.store(at, Ordering::SeqCst);
+                            json!({"success": true, "hidden": true, "changed": was == 0,
                                "hiddenAt": at})
-                    } else {
-                        h.store(0, Ordering::SeqCst);
-                        json!({"success": true, "hidden": false, "changed": was != 0,
+                        } else {
+                            h.store(0, Ordering::SeqCst);
+                            json!({"success": true, "hidden": false, "changed": was != 0,
                                "restore": {"verified": true}})
-                    };
-                    tokio::task::yield_now().await;
-                    Ok(reply)
-                }
-            };
-            let h2 = hidden_at.clone();
-            let capture = move || {
-                let h = h2.clone();
-                async move {
-                    tokio::task::yield_now().await;
-                    let text_hidden = h.load(Ordering::SeqCst) != 0;
-                    tokio::task::yield_now().await;
-                    Ok::<bool, String>(text_hidden)
-                }
-            };
-            let c2 = clock.clone();
-            capture_text_hidden_pair(
-                send,
-                || std::future::ready(Ok::<(), String>(())),
-                capture,
-                move || c2.fetch_add(1, Ordering::SeqCst),
-                || {},
-                |_| {},
-                |_| {},
-            )
-            .await
+                        };
+                        tokio::task::yield_now().await;
+                        Ok(reply)
+                    }
+                };
+                let (h2, s2) = (hidden_at.clone(), steps.clone());
+                let capture = move || {
+                    let h = h2.clone();
+                    s2.lock().unwrap().push(id);
+                    async move {
+                        tokio::task::yield_now().await;
+                        let text_hidden = h.load(Ordering::SeqCst) != 0;
+                        tokio::task::yield_now().await;
+                        Ok::<bool, String>(text_hidden)
+                    }
+                };
+                let c2 = clock.clone();
+                capture_text_hidden_pair(
+                    send,
+                    || std::future::ready(Ok::<(), String>(())),
+                    capture,
+                    move || c2.fetch_add(1, Ordering::SeqCst),
+                    || {},
+                    |_| {},
+                    |_| {},
+                )
+                .await
+            }
         };
         let (one, two) = tokio::join!(
-            arm(hidden_at.clone(), clock.clone()),
-            arm(hidden_at.clone(), clock.clone())
+            arm(1, hidden_at.clone(), clock.clone()),
+            arm(2, hidden_at.clone(), clock.clone())
         );
+        let mut order = steps.lock().unwrap().clone();
+        assert_eq!(order.len(), 8, "four steps per arm: {order:?}");
+        order.dedup();
+        assert_eq!(order.len(), 2, "the two arms' steps interleaved: {order:?}");
         for out in [one, two] {
             assert_eq!(out.frame_a, Ok(false), "frame A must show the text");
             assert_eq!(out.frame_b, Ok(true), "frame B must be the hidden page");
