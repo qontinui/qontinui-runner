@@ -22,12 +22,13 @@ import type {
   ClaudeConfigDirsData,
   DiscoveredDir,
 } from "./types";
-import { EXECUTION_MODE_OPTIONS } from "./types";
+import { EXECUTION_MODE_OPTIONS, SELECTION_MODE_OPTIONS } from "./types";
 import type { CliExecutionMode } from "../types";
 import {
   accountSelectionModeLabel,
   compareForAccountSelectionMode,
   displayedAccountSelection,
+  hasDeterministicPick,
 } from "../types";
 
 interface ClaudeCliSectionProps {
@@ -478,7 +479,7 @@ export function ClaudeCliSection({
                 const isLiveActive = live?.is_active ?? false;
                 const isRateLimited = live?.is_rate_limited ?? false;
                 const isBest =
-                  !isManualMode &&
+                  hasDeterministicPick(effectiveSelectionMode) &&
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
@@ -744,68 +745,29 @@ export function ClaudeCliSection({
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "manual",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "manual"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Manual</div>
-                  <div className="text-[10px] text-muted-foreground">Select account above</div>
-                </button>
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "highest_expected_usage",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "highest_expected_usage"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Highest Expected Usage</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    Auto-select the under-pace account closest to its reset
-                  </div>
-                </button>
-                <button
-                  onClick={() =>
-                    setSettings((prev) => ({
-                      ...prev,
-                      claude_cli: {
-                        ...prev.claude_cli,
-                        account_selection_mode: "least_usage",
-                      },
-                    }))
-                  }
-                  className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode === "least_usage"
-                      ? "bg-primary/10 ring-1 ring-primary/30"
-                      : "bg-muted/30 hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="text-xs font-medium">Least Usage</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    Auto-select &amp; failover on rate-limit
-                  </div>
-                </button>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {SELECTION_MODE_OPTIONS.map((option) => (
+                  <button
+                    key={option.mode}
+                    onClick={() =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        claude_cli: {
+                          ...prev.claude_cli,
+                          account_selection_mode: option.mode,
+                        },
+                      }))
+                    }
+                    className={`p-2.5 rounded-lg text-left transition-colors ${
+                      settings.claude_cli.account_selection_mode === option.mode
+                        ? "bg-primary/10 ring-1 ring-primary/30"
+                        : "bg-muted/30 hover:bg-muted/50"
+                    }`}
+                  >
+                    <div className="text-xs font-medium">{option.label}</div>
+                    <div className="text-[10px] text-muted-foreground">{option.hint}</div>
+                  </button>
+                ))}
               </div>
             </div>
           )}
