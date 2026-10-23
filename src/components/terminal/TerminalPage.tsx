@@ -64,12 +64,14 @@ import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import {
   CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE,
   CREATE_TERMINAL_SIGNATURE,
+  GET_TERMINAL_WORK_MODE_SIGNATURE,
   GET_ZONE_VIEW_STATE_SIGNATURE,
   LIST_RUNNER_WINDOWS_SIGNATURE,
   LIST_TERMINALS_SIGNATURE,
   MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
   OPEN_TERMINAL_WINDOW_SIGNATURE,
   POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
+  workModeSignature,
   countTerminalTabs,
   popOutPageSignature,
   zoneViewSignature,
@@ -533,6 +535,10 @@ function TerminalPageInner({
         // and survive reload, unlike the in-memory maximize state; the inverse
         // request restores the grid the operator left (`gridSnapshot`).
         effect: "write",
+        // Like the handler, the signature reads the ref only when `predict`
+        // runs, never during render.
+        // eslint-disable-next-line react-hooks/refs
+        signature: workModeSignature(() => workModeRef.current.workMode),
         // The ref is read when the ACTION is invoked, never during render:
         // `guardedHandler` only stores `run`. The compiler cannot see through
         // the call, so it reports the closure as a render-time ref read.
@@ -560,6 +566,7 @@ function TerminalPageInner({
           "Return { mode, shownTabId, sidebarOpen } — the read that lets a caller assert the work mode without inferring it from a DOM snapshot. The CommandBar's `terminal.work-mode-toggle` element shows the same mode by name.",
         // `read` — a query.
         effect: "read",
+        signature: GET_TERMINAL_WORK_MODE_SIGNATURE,
         handler: () => ({
           mode: workModeRef.current.workMode,
           shownTabId: workModeRef.current.shownTabId,
