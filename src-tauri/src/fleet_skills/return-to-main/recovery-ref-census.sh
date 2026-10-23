@@ -182,7 +182,7 @@ CRED="not_needed"
 [ "${#REFS[@]}" -gt 0 ] && CRED="owner_tenant_per_repo"
 
 registration_json() { # <repo> <wip_ref>
-  printf '{"claim_kind":"recovery_ref","resource_key":%s,"predicate":{"kind":"time_elapsed","duration_secs":1209600},"continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap",%s,%s,"--device",%s],"target_device_id":%s},"clearance_audience":"agent","gate_class":"routine-review"}' \
+  printf '{"claim_kind":"recovery_ref","resource_key":%s,"predicate":{"kind":"time_elapsed","duration_secs":1209600},"continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap",%s,%s,"--device",%s],"target_device_id":%s,"pin":"strict"},"clearance_audience":"agent","gate_class":"routine-review"}' \
     "$(js "$DEVICE:$1:$2")" "$(js "$1")" "$(js "$2")" "$(js "$DEVICE")" "$(js "$DEVICE")"
 }
 

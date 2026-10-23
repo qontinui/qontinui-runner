@@ -69,6 +69,7 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("GET", "/backup", "backup"),
     ("GET", "/ui-bridge/control/elements", "elements"),
     ("POST", "/shell-commands/{id}/run", "shell_run"),
+    ("POST", "/settings/ai/api-key", "ai_api_key"),
 ];
 
 fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>) -> Harness {
@@ -931,7 +932,7 @@ async fn default_policy_enforces_doors_and_shadows_allowlists() {
     }
 }
 
-/// R1: the grace admits ONLY the built-in default dev origins. An
+/// R1: the grace admits ONLY the built-in `GRACE_ORIGINS`. An
 /// operator-added Trusted origin (env or settings) is refused at a graced
 /// door, while still Trusted for non-door routes.
 #[tokio::test]
@@ -970,8 +971,8 @@ async fn operator_added_trusted_origin_refused_at_graced_door() {
     }
     assert_eq!(h.calls.get("shell_run"), 0);
     assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 0);
-    // The default dev origins are admitted, and the grace counter moves.
-    for origin in ["http://localhost:3001", "http://127.0.0.1:9875"] {
+    // The GRACE_ORIGINS are admitted, and the grace counter moves.
+    for origin in ["http://localhost:3001", "http://127.0.0.1:3001"] {
         let (status, _, _) = send(
             &h,
             req(
@@ -1016,6 +1017,292 @@ async fn default_origin_lookalikes_do_not_get_the_grace() {
     }
     assert_eq!(h.calls.get("shell_run"), 0);
     assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`, Phase 2
+// ---------------------------------------------------------------------------
+
+/// A grace request to `POST /settings/ai/api-key` under the default policy.
+fn ai_key_req(h: &Harness, origin: &str) -> HttpRequest<Body> {
+    req(
+        "POST",
+        "/settings/ai/api-key",
+        &[("host", &host(h)), ("origin", origin)],
+        "",
+    )
+}
+
+/// RG-1: the grace is narrowed to the `:3001` origins. The `:9875` dev
+/// supervisor origins are refused at a graced door, and stay Trusted for
+/// non-door routes.
+#[tokio::test]
+async fn rg_01_supervisor_origins_refused_at_graced_door() {
+    let h = harness("");
+    for origin in ["http://localhost:9875", "http://127.0.0.1:9875"] {
+        let (status, _, body) = send(&h, ai_key_req(&h, origin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}: {body}");
+        assert_eq!(
+            code(&body).as_deref(),
+            Some(CODE_CROSS_ORIGIN_REFUSED),
+            "{body}"
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["context"]["class"], "trusted", "{origin}");
+        // Still Trusted on a non-door route.
+        let (status, headers, _) = send(
+            &h,
+            req(
+                "GET",
+                "/unified-workflows",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{origin}");
+        assert_eq!(acao(&headers).as_deref(), Some(origin));
+    }
+    assert_eq!(h.calls.get("ai_api_key"), 0);
+    assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 0);
+}
+
+/// RG-2: a `:3001` grace admission is metered per route on `/health`.
+#[tokio::test]
+async fn rg_02_grace_admission_metered_by_route() {
+    let h = harness("");
+    let origin = "http://127.0.0.1:3001";
+    let (status, _, body) = send(&h, ai_key_req(&h, origin)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.calls.get("ai_api_key"), 1);
+    let health = h.guard.health_json(None);
+    let rows = health["graceAdmitted"]["byRoute"]
+        .as_array()
+        .unwrap_or_else(|| panic!("graceAdmitted.byRoute missing: {health}"));
+    assert_eq!(rows.len(), 1, "{health}");
+    let row = &rows[0];
+    assert_eq!(row["origin"], origin);
+    assert_eq!(row["method"], "POST");
+    assert_eq!(row["route"], "/settings/ai/api-key");
+    assert_eq!(row["count"], 1);
+    let first = row["firstSeenAt"].as_str().expect("firstSeenAt set");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(first).is_ok(),
+        "firstSeenAt is RFC 3339: {first}"
+    );
+    // A second admission moves the same row, not a new one.
+    let (status, _, _) = send(&h, ai_key_req(&h, origin)).await;
+    assert_eq!(status, StatusCode::OK);
+    let health = h.guard.health_json(None);
+    let rows = health["graceAdmitted"]["byRoute"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{health}");
+    assert_eq!(rows[0]["count"], 2);
+    assert_eq!(rows[0]["firstSeenAt"], first);
+    let last = rows[0]["lastSeenAt"].as_str().expect("lastSeenAt set");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(last).unwrap()
+            >= chrono::DateTime::parse_from_rfc3339(first).unwrap()
+    );
+    assert_eq!(health["graceAdmitted"]["trusted"], 2);
+}
+
+/// RG-3: `installedAt` is captured at construction and is RFC 3339, so a zero
+/// `graceAdmitted` read can be dated.
+#[test]
+fn rg_03_installed_at_is_rfc3339() {
+    let g = OriginGuard::new(
+        None,
+        None,
+        None,
+        None,
+        Arc::new(|| 9876),
+        Arc::new(|| Arc::new(Vec::new())),
+    );
+    let health = g.health_json(None);
+    let at = health["installedAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("installedAt missing: {health}"));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+        "installedAt is RFC 3339: {at}"
+    );
+}
+
+/// RG-4: disclosure guard. The per-route rows name origins, so they are
+/// shown only where `recent` is; browser classes see the total alone.
+#[tokio::test]
+async fn rg_04_by_route_withheld_from_browser_classes() {
+    let h = harness("");
+    let (status, _, _) = send(&h, ai_key_req(&h, WEB)).await;
+    assert_eq!(status, StatusCode::OK);
+    for class in [
+        OriginClass::Foreign,
+        OriginClass::Trusted,
+        OriginClass::Extension,
+    ] {
+        let health = h.guard.health_json(Some(class));
+        assert!(
+            health["graceAdmitted"].get("byRoute").is_none(),
+            "{class:?}: {health}"
+        );
+        assert!(health.get("recent").is_none(), "{class:?}: {health}");
+        assert_eq!(health["graceAdmitted"]["trusted"], 1, "{class:?}");
+    }
+    // Over HTTP, a Foreign `/health` read carries no rows either.
+    let (status, _, body) = send(
+        &h,
+        req(
+            "GET",
+            "/health",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("byRoute"), "{body}");
+    assert!(!body.contains("settings/ai/api-key"), "{body}");
+}
+
+/// The grace decision the middleware reaches for `origin` at the AI-key door.
+fn grace_decision(origin: &str) -> Decision {
+    Decision {
+        class: OriginClass::Trusted,
+        verdict: Verdict::GraceAdmitted,
+        method: "POST".to_string(),
+        origin: Some(origin.to_string()),
+        route: Some("/settings/ai/api-key".to_string()),
+    }
+}
+
+/// RG-5: the grace WARN has its own sighting set. 512 distinct Foreign shadow
+/// sightings fill the shared shadow set's cap, and a grace admission after
+/// that still counts as a first sighting — so "zero grace lines" can mean
+/// zero use.
+///
+/// Asserted on the sighting predicate, not on a captured log line: a scoped
+/// `tracing` capture is racy under parallel `cargo test` (a parallel test can
+/// be the first to hit the WARN callsite on a thread with no subscriber and
+/// cache its interest as `never`). The middleware gates the WARN on
+/// `first_grace_sighting`, so after one admission the key must already be
+/// spent; with the WARN back on the shared, capped set it would still be
+/// fresh.
+///
+/// Side effect: this fills the PROCESS-WIDE shadow `SEEN` set to its 512 cap
+/// for the rest of the test binary, so no later shadow WARN is logged in this
+/// process. No test asserts on a shadow WARN.
+#[tokio::test]
+async fn rg_05_grace_warn_survives_a_full_shadow_sighting_set() {
+    let h = harness("");
+    for i in 0..512 {
+        let origin = format!("https://shadow-fill-{i}.example");
+        let (status, _, _) = send(
+            &h,
+            req(
+                "GET",
+                "/sessions",
+                &[("host", &host(&h)), ("origin", &origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "shadowed by default");
+    }
+    assert_eq!(
+        h.guard.health_json(None)["shadowWouldRefuse"]["foreign"],
+        512
+    );
+    // Anti-vacuity: the shared shadow set really is at its cap now.
+    let shadow = Decision {
+        class: OriginClass::Foreign,
+        verdict: Verdict::ShadowWouldRefuse,
+        method: "GET".to_string(),
+        origin: Some("https://shadow-fill-after-cap.example".to_string()),
+        route: Some("/sessions".to_string()),
+    };
+    assert!(
+        !first_shadow_sighting(&shadow),
+        "the shared shadow set should be capped after 512 sightings"
+    );
+    // One grace admission through the middleware spends its key in the
+    // guard's own set (that is the WARN's gate)...
+    let (status, _, _) = send(&h, ai_key_req(&h, WEB)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !h.guard.first_grace_sighting(&grace_decision(WEB)),
+        "the middleware did not gate the grace WARN on the guard's own sighting set"
+    );
+    // ...and a fresh grace key is still a first sighting despite the full
+    // shadow set, exactly once.
+    let fresh = grace_decision("http://127.0.0.1:3001");
+    assert!(h.guard.first_grace_sighting(&fresh));
+    assert!(!h.guard.first_grace_sighting(&fresh));
+}
+
+/// RG-6 (plan acceptance 6): no `.rs`/`.ts`/`.tsx` file under `src-tauri/src`
+/// or `src` still rests on the false premise that qontinui-web PR 1380 retires
+/// the grace. The needles are split, and this file is skipped, so the test
+/// does not match itself.
+#[test]
+fn rg_06_no_stale_1380_premise_text() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "node_modules") {
+                    continue;
+                }
+                walk(&p, out);
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| matches!(x, "rs" | "ts" | "tsx"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&manifest.join("src"), &mut files);
+    walk(&manifest.join("../src"), &mut files);
+    // Anti-vacuity: the walk reached both trees, including the three files
+    // that carried the premise.
+    for must in [
+        "src/mcp/origin_guard.rs",
+        "src/settings.rs",
+        "src/components/settings/AllowedOriginsSettings.tsx",
+    ] {
+        assert!(
+            files.iter().any(|f| f.ends_with(must)),
+            "walk missed {must}"
+        );
+    }
+    let needles = [
+        concat!("1380", " deploys"),
+        concat!(
+            "until the web app update ",
+            "that removes that need is deployed"
+        ),
+    ];
+    let mut hits = Vec::new();
+    for f in &files {
+        if f.ends_with("src/mcp/origin_guard/tests.rs") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for needle in needles {
+            if src.contains(needle) {
+                hits.push(format!("{} says {needle:?}", f.display()));
+            }
+        }
+    }
+    assert!(hits.is_empty(), "stale premise text: {hits:#?}");
 }
 
 /// R2: every extension scheme is the Extension class; Extension never gets a
@@ -1239,6 +1526,54 @@ fn second_review_doors() {
     assert!(!is_credential_door("GET", "/state-explorer/history"));
 }
 
+/// `POST /control/sessions/resume` spawns `claude --resume` under the user's
+/// account: it is a credential door, so no browser origin (trusted included)
+/// reaches it, and it sits on no browser allowlist. The read-only siblings
+/// under `/control/sessions/` stay ordinary routes.
+#[test]
+fn resume_door_is_a_credential_door_and_on_no_allowlist() {
+    assert!(is_credential_door("POST", "/control/sessions/resume"));
+    assert!(!is_credential_door(
+        "GET",
+        "/control/sessions/restore-census"
+    ));
+    for list in [TRUSTED_ROUTES, FOREIGN_ROUTES] {
+        assert!(!list.contains(&("POST", "/control/sessions/resume")));
+    }
+    assert!(!route_allowed(
+        OriginClass::Trusted,
+        "POST",
+        "/control/sessions/resume"
+    ));
+    assert!(!route_allowed(
+        OriginClass::Foreign,
+        "POST",
+        "/control/sessions/resume"
+    ));
+    assert!(route_allowed(
+        OriginClass::NonBrowser,
+        "POST",
+        "/control/sessions/resume"
+    ));
+}
+
+/// Vet V4 of plan
+/// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`:
+/// the mid-session edit-sibling route writes under a caller-named path, so it
+/// is a door — and a registered route, so the entry covers something. Its
+/// read-only siblings stay off the list.
+#[test]
+fn the_edit_sibling_route_is_a_registered_door() {
+    assert!(is_credential_door("POST", "/agent-worktrees/edit-sibling"));
+    assert!(!is_credential_door("GET", "/agent-worktrees/edit-sibling"));
+    assert!(!is_credential_door("GET", "/agent-worktrees/reclaimable"));
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(registered.contains(&(
+        "POST".to_string(),
+        "/agent-worktrees/edit-sibling".to_string()
+    )));
+}
+
 /// Grace tripwire: every graced route is a door and a registered route, and
 /// nothing is both extension-only and allowlisted or a door.
 #[test]
@@ -1255,6 +1590,12 @@ fn grace_and_extension_only_lists_are_well_formed() {
             "grace entry is not a door: {m} {p}"
         );
         assert!(reg(m, p), "grace entry not registered: {m} {p}");
+    }
+    for o in GRACE_ORIGINS {
+        assert!(
+            DEFAULT_TRUSTED_ORIGINS.contains(o),
+            "grace origin is not a default Trusted origin: {o}"
+        );
     }
     for (m, p) in EXTENSION_ONLY_ROUTES {
         assert!(reg(m, p), "extension-only entry not registered: {m} {p}");

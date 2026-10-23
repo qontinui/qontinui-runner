@@ -15,9 +15,11 @@
 //! PINNED at creation keeps its tenant, but one frozen UNPINNED (the normal
 //! single-tenant shape, and a restored/adopted nonce with no recorded tenant)
 //! re-reads the machine pin on every request (`coord_mcp::decide_session_tenant`
-//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. And
-//! the dual-write gate and the nonce restore read the pin once at startup, so
-//! they see a switch only at the next runner start. [`PIN_SURFACES`] is the
+//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. The
+//! dual-write gate follows a switch within one flag-poll interval, because its
+//! poll re-reads the pin each tick. Only the coord-mcp nonce restore and the
+//! boot-time on-disk nonce adoption read the pin once at startup, so they see
+//! a switch only at the next runner start. [`PIN_SURFACES`] is the
 //! per-consumer table; `PUT /tenant/active` reports it with a live count.
 //!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)
@@ -270,10 +272,23 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "new_session_tenant",
         timing: PinTiming::Live,
-        readers: &["session/mod.rs::resolve_new_session_tenant"],
+        readers: &[
+            "session/mod.rs::resolve_new_session_tenant",
+            "session/mod.rs::resolve_new_session_tenant_in",
+        ],
         detail: "the tenant a NEW session is recorded under, read at its creation \
                  (also reached through claude_session/coord_register.rs, which calls this \
-                 resolver per registration)",
+                 resolver per registration; the `_in` form, for a session whose spawn \
+                 directory is known, reads the pin only after the workspace and repo tiers \
+                 named no tenant)",
+    },
+    PinSurface {
+        surface: "transcript_autobind_mint",
+        timing: PinTiming::Live,
+        readers: &["session/transcript_autobind.rs::mint_gate"],
+        detail: "the tenant a transcript-bound row is MINTED under, read on every mint \
+                 attempt (an unpinned multi-tenant device mints nothing); no running session \
+                 moves",
     },
     PinSurface {
         surface: "coord_mcp_mint_and_provisioning",
@@ -324,6 +339,16 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  resource_sample publish_once)",
     },
     PinSurface {
+        surface: "register_heartbeat_slot_fallback_default",
+        timing: PinTiming::Live,
+        readers: &["fleet.rs::read_active_tenant"],
+        detail: "the register heartbeat's DEFAULT tenant when paired_user.json and a usable \
+                 legacy slot both miss (fleet.rs resolve_heartbeat_binding_set): re-read on \
+                 every heartbeat (30 s) that reaches the per-tenant-slot fallback, and honoured \
+                 only while it is among the usable slots coord's bound set lists \
+                 (heartbeat_slot_fallback); no other resolver reads it",
+    },
+    PinSurface {
         surface: "session_outbox_tenant_backfill",
         timing: PinTiming::Live,
         readers: &[
@@ -348,13 +373,24 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  registration, the coord-mcp doctor, GET /tenant/active)",
     },
     PinSurface {
+        surface: "egress_switch_scope",
+        timing: PinTiming::Live,
+        readers: &[
+            "mcp/fleet_policy_poller.rs::poll_egress_once",
+            "egress.rs::production_scope",
+        ],
+        detail: "the tenant whose egress switches (plan 2026-10-10-spec-front-end-phase-9-\
+                 generic-boundary) are polled and applied to calls that name no tenant: sampled \
+                 at the first egress check of the process, then re-read on every \
+                 fleet-policy poll (≤ 45 s)",
+    },
+    PinSurface {
         surface: "session_coordination_dual_write_gate",
-        timing: PinTiming::NextStart,
-        readers: &["session/dual_write.rs::new"],
-        detail: "DualWriteGate::new resolves its tenant once at construction and this process \
-                 keeps it. CoordSync::start_flag_poll_task (session/coord_sync.rs) does not read \
-                 the pin: it consumes that frozen value, so the flag poll runs only for the \
-                 tenant read at startup",
+        timing: PinTiming::Live,
+        readers: &["session/coord_sync.rs::run_flag_poll_loop"],
+        detail: "the flag poll re-reads the pin each tick, so a switch takes effect within about \
+                 one QONTINUI_SESSION_FLAG_POLL_SECS interval (default 60s), plus at most one \
+                 fetch already in flight for the previous tenant",
     },
     PinSurface {
         surface: "coord_mcp_nonce_restore",
@@ -1179,7 +1215,6 @@ mod tests {
             [
                 "coord_mcp.rs::adopt_on_disk_nonce",
                 "coord_mcp.rs::restore_proxy_nonces_from",
-                "session/dual_write.rs::new",
             ]
             .into_iter()
             .collect()

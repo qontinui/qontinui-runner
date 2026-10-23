@@ -671,6 +671,74 @@ mod tests {
         assert!(r.present.is_none());
     }
 
+    const UNPUSHED_TARGET_ENV: &str = "QONTINUI_TEST_UNPUSHED_TARGET";
+
+    /// The `has_unpushed` reading of a `git cherry` answer, exactly as
+    /// [`probe_git_branch_state`] derives it.
+    fn unpushed(cherry: &str) -> bool {
+        cherry.lines().any(|l| l.trim_start().starts_with('+'))
+    }
+
+    /// Child of [`has_unpushed_ignores_an_inherited_git_dir`]: skipped in a
+    /// normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by has_unpushed_ignores_an_inherited_git_dir"]
+    fn inherited_git_dir_child_has_unpushed_reads_the_named_repo() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(UNPUSHED_TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let decoy_git_dir = reexec::child_input("GIT_DIR").expect("set with the child flag");
+        reexec::assert_inherited_git_dir(&decoy_git_dir);
+        let target = PathBuf::from(target);
+
+        // Control: a raw, UNscrubbed `git -C <target> cherry` answers for the
+        // inherited decoy, which has nothing unpushed.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["cherry", "origin/main"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            !unpushed(&String::from_utf8_lossy(&out.stdout)),
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        // The probe's own read answers for the worktree it names.
+        let cherry = git_read(&target, &["cherry", "origin/main"]).expect("cherry answers");
+        assert!(
+            unpushed(&cherry),
+            "git_read must read the worktree it names — a false `has_unpushed: false` \
+             here permits reclaiming a worktree with unpushed work; got {cherry:?}"
+        );
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The probe executor's reclaim SAFETY predicate (`has_unpushed`, read via
+    /// [`git_read`]) under a `GIT_DIR` the process INHERITED (set on a
+    /// re-executed child only).
+    #[test]
+    fn has_unpushed_ignores_an_inherited_git_dir() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let target = reexec::repo_with_origin_main(true);
+        let decoy = reexec::repo_with_origin_main(false);
+        assert!(unpushed(
+            &git_read(target.path(), &["cherry", "origin/main"]).expect("cherry")
+        ));
+        assert!(!unpushed(
+            &git_read(decoy.path(), &["cherry", "origin/main"]).expect("cherry")
+        ));
+        reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_has_unpushed_reads_the_named_repo",
+            &decoy.path().join(".git"),
+            &[(UNPUSHED_TARGET_ENV, target.path().as_os_str())],
+        );
+    }
+
     /// `probe_git_branch_state` resolves the trunk through
     /// [`crate::git_trunk`], which runs git OUTSIDE this module's
     /// [`READ_ONLY_GIT`] gate. The module's contract is that a probe never

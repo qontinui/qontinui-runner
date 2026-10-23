@@ -418,6 +418,11 @@ pub struct AuthManager {
     /// [`Self::with_storage_force_keychain`] for why this exists.
     #[cfg(test)]
     force_keychain_enabled: bool,
+    /// Test-only override that forces [`Self::keychain_enabled`] to `false`
+    /// regardless of `QONTINUI_DISABLE_KEYCHAIN` — see
+    /// [`Self::with_storage_no_keychain`].
+    #[cfg(test)]
+    force_keychain_disabled: bool,
 }
 
 impl AuthManager {
@@ -434,6 +439,8 @@ impl AuthManager {
             machine_file: crate::machine_identity::machine_file_path(),
             #[cfg(test)]
             force_keychain_enabled: false,
+            #[cfg(test)]
+            force_keychain_disabled: false,
         }
     }
 
@@ -446,6 +453,10 @@ impl AuthManager {
         #[cfg(test)]
         if self.force_keychain_enabled {
             return true;
+        }
+        #[cfg(test)]
+        if self.force_keychain_disabled {
+            return false;
         }
         keychain_enabled_env()
     }
@@ -475,6 +486,21 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
+        }
+    }
+
+    /// As [`Self::with_storage`], but [`Self::keychain_enabled`] always
+    /// returns `false` for this instance: no keychain read or write at all,
+    /// whatever `QONTINUI_DISABLE_KEYCHAIN` says, and without mutating that
+    /// process-global env var (which would race every parallel test reading
+    /// it). For hermetic tests that store and read tokens and must never
+    /// block on — or leave entries in — a real OS keychain.
+    #[cfg(test)]
+    pub fn with_storage_no_keychain(secure_storage: SecureStorage) -> Self {
+        Self {
+            force_keychain_disabled: true,
+            ..Self::with_storage(secure_storage)
         }
     }
 
@@ -500,6 +526,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: true,
+            force_keychain_disabled: false,
         }
     }
 
@@ -516,6 +543,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: Some(machine_file),
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
         }
     }
 
@@ -2313,11 +2341,7 @@ pub(crate) fn default_binding_tenant() -> Option<Uuid> {
 
 /// [`default_binding_tenant`] without the collapse.
 pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")));
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir();
     // No storage dir resolvable at all — a machine that cannot say where its
     // own state lives has not established anything.
     let Some(base) = base else {
@@ -2394,11 +2418,7 @@ pub(crate) fn device_binding_count() -> usize {
 /// or the file does not parse. The one file read both binding-count parsers
 /// share; each classifies the absence its own way.
 fn read_paired_user_value() -> Option<serde_json::Value> {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir()?;
     let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes).ok()
 }

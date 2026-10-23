@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use super::transport_stats::{self, Leg};
 use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 
@@ -20,7 +20,7 @@ use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
-use super::grid::{Grid, GridPerformer};
+use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
 use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
 use super::types::{TerminalId, TerminalInfo};
@@ -172,16 +172,24 @@ fn tee_into_scrollback(
 /// The counter is bumped even when the grid lock is poisoned: an extra scan is
 /// always safe, a missed one is not.
 ///
+/// `stream_start` is the absolute stream offset of `data`'s first byte. The
+/// grid records how far it has absorbed the stream under the same lock as the
+/// parse, at the last point no escape sequence or UTF-8 character was open
+/// ([`Grid::absorb_stream`]), so a snapshot's `stream_offset` names bytes its
+/// cells fully reflect and a clean place for a fresh parser to resume.
+///
 /// Shared with the scan-gate regression test so both drive the identical path.
 fn advance_grid(
     grid: &Arc<Mutex<Grid>>,
     grid_generation: &Arc<AtomicU64>,
     parser: &mut vte::Parser,
     data: &[u8],
+    stream_start: u64,
 ) {
     if let Ok(mut g) = grid.lock() {
         let mut perf = GridPerformer::new(&mut g);
         parser.advance(&mut perf, data);
+        g.absorb_stream(stream_start, data);
     }
     // Release: pairs with the Acquire load in `TerminalSession::grid_generation`
     // so observing this value implies the grid mutation above is visible.
@@ -297,11 +305,17 @@ pub(crate) struct WireFlow {
     /// relay reconnect re-presents the grant.
     sent: Mutex<bool>,
     wire_paused: AtomicBool,
+    /// `io.unwatched_pauses_source()`, read once: when false, `hidden` never
+    /// contributes to the wire state (a PTY-holder pane's grid and state
+    /// tracking live HERE, so an unwatched tier must keep its bytes flowing).
+    hidden_pauses: bool,
 }
 
 impl WireFlow {
     pub(crate) fn new(io: Arc<dyn PaneIo>) -> Self {
+        let hidden_pauses = io.unwatched_pauses_source();
         Self {
+            hidden_pauses,
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
@@ -330,8 +344,8 @@ impl WireFlow {
     fn sync(&self) {
         // Held across the decision AND the send — see the `sent` field's note.
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        let desired =
-            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        let desired = self.gate_paused.load(Ordering::Acquire)
+            || (self.hidden_pauses && self.hidden.load(Ordering::Acquire));
         if *sent == desired {
             return;
         }
@@ -461,11 +475,19 @@ fn digest_is_owed(tier: VisibilityTier, unwatched_interval: Option<Duration>) ->
 /// accumulated frame once it reaches this size even if `?2026l` hasn't
 /// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
 const SYNC_FLUSH_BYTE_CAP: usize = 256 * 1024;
+/// Size of one PTY read on the reader thread. A coalesced frame can overshoot
+/// [`SYNC_FLUSH_BYTE_CAP`] by up to one read, so this sets the largest chunk the
+/// emission gate admits, and with it how far past [`FLOW_HIGH_WATERMARK`] the
+/// gap can be when the gate pauses.
+const PTY_READ_BYTES: usize = 8192;
 /// Time cap for a held sync frame: flush once the block has been open this
 /// long, so a slow producer mid-frame can't stall output past ~one frame.
-const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+pub(super) const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Synchronized-output (DEC 2026) frame coalescer for the reader thread.
+///
+/// `pub(super)` (with [`SYNC_FLUSH_TIME_CAP`]) so `daemon_pane_io`'s Phase 2b
+/// test can drive a restored holder stream through this exact pipeline.
 ///
 /// Full-screen TUIs (Claude Code) bracket each whole-frame redraw in
 /// `?2026h … ?2026l`. Emitting per-PTY-read would split a frame across
@@ -483,14 +505,14 @@ const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_milli
 /// receives `(payload, offset)` to broadcast as one event; `offset` is the
 /// absolute stream offset of the payload's first byte (a correct replay
 /// boundary — the first held byte's offset for a coalesced frame).
-struct SyncFrameCoalescer {
+pub(super) struct SyncFrameCoalescer {
     pending: Vec<u8>,
     pending_offset: u64,
     started_at: Option<std::time::Instant>,
 }
 
 impl SyncFrameCoalescer {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending: Vec::new(),
             pending_offset: 0,
@@ -501,7 +523,13 @@ impl SyncFrameCoalescer {
     /// Feed one read's processed `data` (stamped at `offset`) plus the live
     /// `in_sync` parser state observed right after advancing it into the grid.
     /// Emits zero or one coalesced event via `emit`.
-    fn feed<F: FnMut(&[u8], u64)>(&mut self, data: &[u8], offset: u64, in_sync: bool, mut emit: F) {
+    pub(super) fn feed<F: FnMut(&[u8], u64)>(
+        &mut self,
+        data: &[u8],
+        offset: u64,
+        in_sync: bool,
+        mut emit: F,
+    ) {
         if in_sync {
             // Mid-frame: hold this chunk. Stamp the held frame's offset on the
             // FIRST held byte (a correct replay boundary).
@@ -533,7 +561,7 @@ impl SyncFrameCoalescer {
     /// Flush a held frame if it has been open at least [`SYNC_FLUSH_TIME_CAP`].
     /// Called before each (blocking) read so a slow producer mid-frame still
     /// flushes within ~one frame rather than waiting for the next byte.
-    fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
+    pub(super) fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
         if let Some(started) = self.started_at {
             if started.elapsed() >= SYNC_FLUSH_TIME_CAP && !self.pending.is_empty() {
                 emit(&self.pending, self.pending_offset);
@@ -561,15 +589,15 @@ impl SyncFrameCoalescer {
 /// keeps its own offset-free payload.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalOutputWire<'a> {
-    terminal_id: &'a str,
-    data: &'a str,
+pub(super) struct TerminalOutputWire<'a> {
+    pub(super) terminal_id: &'a str,
+    pub(super) data: &'a str,
     /// Absolute byte offset of this chunk's first byte in the session's
     /// output stream (the value of `total_bytes_produced` before this chunk
     /// was teed). Lets the frontend dedup a scrollback-ring replay against
     /// live chunks — see `terminal_get_scrollback` and the frontend's
     /// `scrollbackReplay.ts`.
-    offset: u64,
+    pub(super) offset: u64,
 }
 
 /// Emit one `terminal-output` event to the webview.
@@ -579,19 +607,59 @@ struct TerminalOutputWire<'a> {
 /// every webview emission for a session goes through one place with one wire
 /// shape. `encoded` is already base64; `offset` is the absolute stream offset
 /// of its first byte.
-fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offset: u64) {
+fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offset: u64) -> bool {
     let event = TerminalOutputWire {
         terminal_id,
         data: encoded,
         offset,
     };
-    if let Err(e) = app.emit("terminal-output", &event) {
-        warn!(
-            terminal_id = %terminal_id,
-            error = %e,
-            "Failed to emit terminal output event"
-        );
+    let started = Instant::now();
+    let emitted = app.emit("terminal-output", &event);
+    transport_stats::record_webview_emit(encoded, started.elapsed());
+    match emitted {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "Failed to emit terminal output event"
+            );
+            false
+        }
     }
+}
+
+/// Count `len` bytes into `bytes_sent`, THEN emit them.
+///
+/// The order is load-bearing. [`TerminalSession::ack`] clamps acked at sent,
+/// so an ack for these bytes that landed before the count would be discarded:
+/// an under-ack, which can keep a paused gate shut. Counting first means every
+/// byte a frontend can ack is counted by the time its ack lands. (Release
+/// pairs with the Acquire loads in `ack`.)
+///
+/// An emit that fails delivered nothing, so nothing will ever ack it: the
+/// bytes are un-counted ([`uncount`]).
+fn count_then_emit(
+    bytes_sent: &AtomicU64,
+    bytes_acked: &AtomicU64,
+    len: u64,
+    emit: impl FnOnce() -> bool,
+) {
+    bytes_sent.fetch_add(len, Ordering::Release);
+    if !emit() {
+        uncount(bytes_sent, bytes_acked, len);
+    }
+}
+
+/// Take back `len` bytes counted for an emit that failed. acked is pulled down
+/// to the new sent in case a reset already covered them, so no surplus is
+/// left. The reader thread is the only writer of `bytes_sent`, so the value it
+/// reads back is current. A reset or an ack that straddles this (it read
+/// `sent` before the subtraction, and raises acked after) re-clamps on its own
+/// side: [`TerminalSession::reset_flow_control`], [`TerminalSession::ack`].
+fn uncount(bytes_sent: &AtomicU64, bytes_acked: &AtomicU64, len: u64) {
+    let sent = bytes_sent.fetch_sub(len, Ordering::AcqRel) - len;
+    bytes_acked.fetch_min(sent, Ordering::AcqRel);
 }
 
 /// ANSI bracketed-paste begin marker.
@@ -1621,7 +1689,29 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let opened = LocalPty::open(&id, cols, rows)?;
+        // The pane's backend: in-process `LocalPty`, or — behind
+        // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
+        // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+        // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
+        // environment is assembled, so an `openpty` failure leaves none of
+        // that side-effecting work behind; a holder pane has no PTY in this
+        // process to open.
+        //
+        // Cost of the read (review round 2, N10): `get_terminal_settings`
+        // is `read_settings_from_disk`, the mtime-keyed in-process settings
+        // cache — one `stat` and a clone on a hit, no file read or parse. That
+        // is the same per-spawn price this function already pays for
+        // `get_performance_settings` (the scrollback capacity, `spawn_with_io`), not a
+        // new kind of read.
+        let backend = crate::terminal::daemon_pane_io::pane_backend_for(
+            &crate::settings::get_terminal_settings(),
+        );
+        let opened = match backend {
+            crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
+                Some(LocalPty::open(&id, cols, rows)?)
+            }
+            crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
+        };
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell. Whether it
@@ -1794,7 +1884,13 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        let sealed = ScrubbedCommand::seal(cmd);
+        let io: Arc<dyn PaneIo> = match opened {
+            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
+                &id, sealed, cols, rows,
+            )?,
+        };
 
         Self::spawn_with_io(
             id,
@@ -1853,9 +1949,11 @@ impl TerminalSession {
             "Terminal session spawned"
         );
 
-        // Assign to Windows Job Object for crash safety
+        // Assign to Windows Job Object for crash safety — the pid the pane
+        // allows, which is `None` for a PTY-holder pane (its child must outlive
+        // this runner; see `PaneIo::job_enroll_pid`).
         #[cfg(target_os = "windows")]
-        if let Some(pid) = child_pid {
+        if let Some(pid) = io.job_enroll_pid() {
             Self::assign_to_job_object(pid);
         }
 
@@ -1933,7 +2031,7 @@ impl TerminalSession {
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
                 let mut parser = vte::Parser::new();
-                let mut buf = [0u8; 8192];
+                let mut buf = [0u8; PTY_READ_BYTES];
                 // Phase 4 — sync-output (DEC 2026) frame coalescing. While the
                 // VT parser is inside a `?2026h … ?2026l` block (Claude's TUI
                 // brackets each full-frame redraw this way), accumulate the
@@ -1991,6 +2089,7 @@ impl TerminalSession {
                 // and (through them) the coord output pipe receive every chunk,
                 // in order, byte-identical, in every tier.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
+                    transport_stats::record_frame(payload.len());
                     let tier = reader_visibility.tier();
                     let sent = reader_bytes_sent.load(Ordering::Relaxed);
                     let acked = reader_bytes_acked.load(Ordering::Relaxed);
@@ -2028,19 +2127,29 @@ impl TerminalSession {
                     // does not need encoding here — one encode per flush
                     // window instead of one per chunk.
                     let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
-                        Some(STANDARD.encode(payload))
+                        Some(transport_stats::encode(payload))
                     } else {
                         None
                     };
+                    transport_stats::classify_encode(
+                        &reader_app,
+                        &reader_id,
+                        encoded.is_some(),
+                        admission == WebviewAdmission::Now,
+                        to_sse,
+                        to_ws,
+                    );
 
                     // Broadcast to HTTP/SSE subscribers (skipped when none —
                     // the `send` would drop the value anyway, and the clone is
                     // a full copy of the base64 payload).
                     if let (true, Some(encoded)) = (to_sse, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Sse, payload.len());
                         let _ = reader_output_tx.send(encoded.clone());
                     }
                     // Broadcast to backend relay for remote mobile access
                     if let (true, Some(encoded)) = (to_ws, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Ws, payload.len());
                         crate::event_system::broadcast_ws_notification(
                             &reader_app,
                             "terminal-output",
@@ -2076,7 +2185,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2087,19 +2196,24 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
                             let encoded = encoded.expect("Now always encodes");
-                            emit_terminal_output(&reader_app, &reader_id, &encoded, offset);
                             // Flow control accounts only for bytes delivered
                             // under the gate — i.e. the `focused` tier and the
                             // exit flush. Counting held/hidden bytes would let
                             // the gap balloon while nobody can ack, so the pane
                             // would find the gate already paused on its way
                             // back to `focused`.
-                            reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            // Counted BEFORE the emit; see `count_then_emit`.
+                            count_then_emit(
+                                &reader_bytes_sent,
+                                &reader_bytes_acked,
+                                payload.len() as u64,
+                                || emit_terminal_output(&reader_app, &reader_id, &encoded, offset),
+                            );
                         }
                         WebviewAdmission::Skip => unreachable!("returned above"),
                     }
@@ -2124,6 +2238,7 @@ impl TerminalSession {
                             break;
                         }
                         Ok(n) => {
+                            transport_stats::record_reader_chunk(n);
                             let data = interceptor.process(&reader_id, &buf[..n]);
 
                             // Tee processed output into the per-session
@@ -2160,6 +2275,7 @@ impl TerminalSession {
                                 &reader_grid_generation,
                                 &mut parser,
                                 &data,
+                                chunk_offset,
                             );
 
                             // Sync-output-aware emit (Phase 4). Read the live
@@ -2246,7 +2362,7 @@ impl TerminalSession {
                         emit_terminal_output(
                             &reader_app,
                             &reader_id,
-                            &STANDARD.encode(&window),
+                            &transport_stats::encode(&window),
                             window_offset,
                         );
                     }
@@ -3876,7 +3992,42 @@ impl TerminalSession {
     /// offset-gap detection treats it like any other jump and resyncs from
     /// the scrollback ring.
     pub fn ack(&self, bytes: u64) {
-        self.bytes_acked.fetch_add(bytes, Ordering::Relaxed);
+        self.ack_around(bytes, || {});
+    }
+
+    /// [`Self::ack`], running `between` once, after the clamp has read `sent`
+    /// and before the CAS that raises acked. Production passes a no-op; the
+    /// test passes the un-count this has to survive.
+    fn ack_around(&self, bytes: u64, between: impl FnOnce()) {
+        // Clamped: acked never passes sent. Bytes sent before a reset are
+        // covered by it (`reset_flow_control` sets acked = sent), so their late
+        // acks, and acks for a background window that was never counted, are
+        // excess. Dropping the excess here is what keeps a surplus from ever
+        // existing, so it cannot carry into the next burst or the next reset.
+        //
+        // It never drops an ack the gate needs: the reader counts a chunk into
+        // `bytes_sent` before emitting it, so every byte a frontend can ack is
+        // already counted when its ack lands. See `reset_flow_control`.
+        let mut between = Some(between);
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                let sent = self.bytes_sent.load(Ordering::Acquire);
+                if let Some(between) = between.take() {
+                    between();
+                }
+                Some(acked.saturating_add(bytes).min(sent).max(acked))
+            });
+        // Then re-clamp to the CURRENT sent, as `reset_flow_control` does: a
+        // failed emit can be un-counted (`uncount`) after the clamp above read
+        // `sent` and before its CAS landed. `uncount`'s own `fetch_min` ran
+        // before that CAS, so without this acked could end up past sent by up
+        // to one frame.
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                Some(acked.min(self.bytes_sent.load(Ordering::Acquire)))
+            });
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let acked = self.bytes_acked.load(Ordering::Relaxed);
         if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK {
@@ -4008,7 +4159,7 @@ impl TerminalSession {
         };
         // Emit under the lock: it is this session's webview ordering point.
         if let Some((window, offset)) = taken {
-            emit_terminal_output(app, &self.id, &STANDARD.encode(&window), offset);
+            emit_terminal_output(app, &self.id, &transport_stats::encode(&window), offset);
         }
     }
 
@@ -4193,17 +4344,113 @@ impl TerminalSession {
         (data, start_offset)
     }
 
+    /// Snapshot the cell grid; with `reset_flow`, reset flow control first
+    /// (`terminal_get_grid`'s `resetFlowControl`).
+    ///
+    /// The reconnect path asks for this only once its `terminal-output`
+    /// listener exists in the runner (it awaits the Tauri `listen()` before the
+    /// call). That is the condition that matters: every byte counted after this
+    /// reset is emitted after it (the reader counts before it emits), so it
+    /// reaches that listener and is acked; every byte counted before it is
+    /// covered by it. The reset at the reconnect's mount ring read could not
+    /// promise that, because no listener existed yet: a frame tee'd into the
+    /// ring before that reset but counted after it went to nobody, and nothing
+    /// acked it.
+    ///
+    /// The reset needs no grid lock (only the listener ordering above), so it
+    /// runs before the lock is taken: it can reach a remote pane's source
+    /// (`set_gate_paused`), which must not happen under the grid lock.
+    ///
+    /// Known limitations of a painted reconnect: the paint restores the SCREEN
+    /// as of the snapshot. Lines that scrolled off it between the mount ring
+    /// read and the snapshot are in neither the ring the pane replayed nor the
+    /// paint, so the pane's scrollback has a hole there until it remounts. And
+    /// when the snapshot offset S is behind the mount ring's end E, the pane
+    /// replays [S, E) after the paint, so those bytes may appear twice in its
+    /// scrollback (once from the ring, once from the replay).
+    pub fn grid_snapshot(&self, reset_flow: bool) -> Result<GridSnapshot, String> {
+        if reset_flow {
+            self.reset_flow_control();
+        }
+        let g = self
+            .grid
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        Ok(g.snapshot())
+    }
+
     /// Reset flow control counters so a reconnecting frontend doesn't hit backpressure.
     ///
-    /// Over-ack tolerance: render callbacks for writes issued BEFORE this
-    /// reset may still ack afterwards, briefly pushing `bytes_acked` above
-    /// `bytes_sent`. The gate computes the gap with `saturating_sub`, so the
-    /// skew reads as gap 0 — a bounded, one-shot blind margin (at most the
-    /// pre-reset in-flight bytes) before backpressure re-engages. This is
-    /// intentional; do not "fix" the saturating_sub.
+    /// # Acks that arrive after a reset
+    ///
+    /// The frontend acks every byte it RECEIVES, once (`ackedWriteQueue.ts`).
+    /// Some of those acks are for bytes the runner has already written off, and
+    /// are excess:
+    ///
+    /// - bytes sent before a reset and acked after it: a write whose render
+    ///   callback was still pending, a chunk the pane buffered during mount or
+    ///   held during a resync;
+    /// - an uncounted background hold window, drained on the tier edge ahead of
+    ///   a counted send (`WebviewAdmission::Now`) or flushed by the visibility
+    ///   sweeper, which a now-visible pane writes and acks;
+    /// - settled-without-write acks for any of the above, and the reconnect
+    ///   path's held chunks that its grid paint already shows.
+    ///
+    /// [`Self::ack`] clamps `bytes_acked` at `bytes_sent`, which discards the
+    /// excess as it lands, so a surplus (acked > sent) never exists. It cannot
+    /// weaken backpressure for the next burst, and it cannot carry across
+    /// resets and compound. What excess can still do is land on bytes sent
+    /// AFTER the reset that the pane has not acked yet, so the gap reads low
+    /// for a while. That is bounded by the excess the pane can send for one
+    /// reset: what it held unacked when the reset ran (at most the gap then,
+    /// `FLOW_HIGH_WATERMARK` plus one emitted chunk, since the gate stops
+    /// counting above High) plus at most one background hold window
+    /// (`BACKGROUND_HOLD_BYTE_CAP` plus the chunk that tripped it) per tier
+    /// edge. It ends at the next reset (acked = sent) or once the pane's own
+    /// acks for those bytes are clamped away. That costs a delay before
+    /// backpressure engages, never a frozen pane, PROVIDED every counted byte
+    /// is acked once after it is counted. An under-ack is the dangerous
+    /// direction: an unacked remainder above [`FLOW_LOW_WATERMARK`] keeps a
+    /// paused gate shut forever. Four ways to break that proviso are closed:
+    ///
+    /// - an ack landing before its bytes are counted: the reader counts first
+    ///   (`count_then_emit`), and un-counts an emit that failed;
+    /// - a reset erasing a concurrent ack: this raises acked with `fetch_max`
+    ///   rather than storing over it;
+    /// - bytes counted after a reset and emitted to no handler: the reconnect
+    ///   path resets at the grid snapshot, once its `terminal-output` listener
+    ///   exists in the runner, not at its earlier ring read
+    ///   ([`Self::grid_snapshot`]);
+    /// - a reset or an ack straddling a failed emit's un-count, which could
+    ///   leave acked above sent: each re-clamps acked to the current sent.
+    ///
+    /// `flow_reset_and_ack_clamp_keep_acked_at_or_under_sent` pins this
+    /// against the real gate and coalescer.
     pub fn reset_flow_control(&self) {
-        let sent = self.bytes_sent.load(Ordering::Relaxed);
-        self.bytes_acked.store(sent, Ordering::Relaxed);
+        self.reset_flow_control_around(|| {});
+    }
+
+    /// [`Self::reset_flow_control`], running `between` after `sent` is read and
+    /// before acked is raised to it. Production passes a no-op; the test passes
+    /// the concurrent send and ack this has to survive.
+    fn reset_flow_control_around(&self, between: impl FnOnce()) {
+        let sent = self.bytes_sent.load(Ordering::Acquire);
+        between();
+        // `fetch_max`, not `store`: an ack that landed after the load can have
+        // raised acked past this `sent` (for bytes counted since), and a store
+        // would erase it, an under-ack of up to one frame.
+        self.bytes_acked.fetch_max(sent, Ordering::AcqRel);
+        // Then re-clamp to the CURRENT sent: a failed emit un-counted since the
+        // load (`uncount`) can have dropped sent below the value just raised
+        // to, which would leave a surplus. `fetch_update` retries if an ack
+        // moves acked meanwhile, and it reads sent after acked, so a byte an
+        // ack already covered is counted in the sent it reads (the reader
+        // counts before it emits): it never lowers acked below a real ack.
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                Some(acked.min(self.bytes_sent.load(Ordering::Acquire)))
+            });
         // A reset supersedes any pending resume-marker: the resetting
         // consumer refetches the ring, which already covers the skipped
         // bytes.
@@ -4688,12 +4935,15 @@ impl TerminalSession {
         // Release the pane's handles — for a local PTY this closes the OS pipe
         // and unblocks the reader thread which may be stuck in a blocking
         // read() call. Bounded for the same reason as the writer above.
+        // `release` can fail for more than a spent budget — a holder pane
+        // released after a kill that did not land says so in its error — so
+        // the log carries the pane's own reason rather than assuming one.
         if let Err(e) = self.io.release(lock_budget) {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
-                "Could not release the pane within the shutdown budget — the \
-                 handle will be released by process exit"
+                "pane release reported an error (see `error`); any handle it \
+                 could not release is released by process exit"
             );
         }
 
@@ -5055,6 +5305,13 @@ pub(crate) mod tests {
     /// `Environment` read).
     #[test]
     fn pty_finalize_child_env_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
             cmd.env(name, "hunter2");
@@ -5099,6 +5356,13 @@ pub(crate) mod tests {
     /// running the same tail `spawn` runs.
     #[test]
     fn pty_finalize_child_env_scrub_beats_a_caller_supplied_credential() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         // As if `extra_env` had carried both a legitimate pin and a credential.
         cmd.env("CLAUDE_CONFIG_DIR", "/caller/pinned");
@@ -6020,7 +6284,7 @@ pub(crate) mod tests {
         let mut coalescer = SyncFrameCoalescer::new();
         let emitted = Arc::new(Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
         let mut read = |data: &[u8], offset: u64, coalescer: &mut SyncFrameCoalescer| {
-            advance_grid(&grid, &generation, &mut parser, data);
+            advance_grid(&grid, &generation, &mut parser, data, offset);
             let in_sync = grid.lock().unwrap().sync_output();
             let sink = emitted.clone();
             coalescer.feed(data, offset, in_sync, move |p, o| {
@@ -8499,6 +8763,238 @@ pub(crate) mod tests {
         assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1));
     }
 
+    /// Pins the ack clamp documented on [`TerminalSession::reset_flow_control`]:
+    ///
+    /// - excess acks arriving after a reset leave acked == sent, never more;
+    /// - an ack for a byte sent after the reset still counts, in full, and one
+    ///   ack can never be split so part of it is lost;
+    /// - across many burst / reset / excess-ack cycles, with the coalescer's
+    ///   largest frame (`SYNC_FLUSH_BYTE_CAP - 1 + PTY_READ_BYTES`) as the
+    ///   chunk, the gate pauses at High plus one chunk every cycle (a surplus
+    ///   would let a burst run further each time) and reopens once the pane
+    ///   acks down to Low.
+    #[test]
+    fn flow_reset_and_ack_clamp_keep_acked_at_or_under_sent() {
+        // The largest frame the coalescer can emit from PTY reads: a held frame
+        // one byte under the cap, tipped over by one full read.
+        let mut coalescer = SyncFrameCoalescer::new();
+        let mut frames: Vec<usize> = Vec::new();
+        coalescer.feed(&vec![b'x'; PTY_READ_BYTES - 1], 0, true, |p, _| {
+            frames.push(p.len())
+        });
+        for _ in 0..SYNC_FLUSH_BYTE_CAP / PTY_READ_BYTES {
+            if !frames.is_empty() {
+                break;
+            }
+            coalescer.feed(&vec![b'x'; PTY_READ_BYTES], 0, true, |p, _| {
+                frames.push(p.len())
+            });
+        }
+        let max_frame = (SYNC_FLUSH_BYTE_CAP - 1 + PTY_READ_BYTES) as u64;
+        assert_eq!(frames, vec![max_frame as usize]);
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let sent = |s: &TerminalSession| s.bytes_sent.load(Ordering::Relaxed);
+        let acked = |s: &TerminalSession| s.bytes_acked.load(Ordering::Relaxed);
+        let gap = |s: &TerminalSession| sent(s).saturating_sub(acked(s));
+        let send = |s: &TerminalSession, n: u64| {
+            s.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        };
+
+        // Excess acks after a reset are discarded, not banked.
+        send(&session, 50_000);
+        session.reset_flow_control();
+        session.ack(50_000); // a write in flight at the reset renders now
+        assert_eq!(
+            acked(&session),
+            sent(&session),
+            "excess ack must clamp at sent"
+        );
+
+        // A post-reset ack still counts, in full.
+        send(&session, 30_000);
+        session.ack(10_000);
+        assert_eq!(gap(&session), 20_000, "a post-reset ack must count");
+        session.ack(20_000);
+        assert_eq!(gap(&session), 0);
+        // An ack that is partly excess keeps its in-range part.
+        send(&session, 7_000);
+        session.ack(9_000);
+        assert_eq!(acked(&session), sent(&session));
+
+        // Many cycles. Each: the pane renders nothing until the gate pauses; a
+        // ring read resets; the pane then acks the whole pre-reset backlog plus
+        // an uncounted background window, all of it excess.
+        let mut gate = EmissionGate::new();
+        for cycle in 0..20 {
+            let mut admitted = 0u64;
+            for _ in 0..1_000 {
+                if !gate.should_emit(gap(&session)) {
+                    break;
+                }
+                send(&session, max_frame);
+                admitted += max_frame;
+            }
+            assert!(gate.is_paused(), "cycle {cycle}: backpressure must engage");
+            assert!(
+                admitted > FLOW_HIGH_WATERMARK && admitted <= FLOW_HIGH_WATERMARK + max_frame,
+                "cycle {cycle}: the burst admitted {admitted}, not High plus one frame"
+            );
+            let backlog = gap(&session);
+            session.reset_flow_control();
+            session.ack(backlog);
+            session.ack(256 * 1024); // an uncounted background window
+            assert_eq!(acked(&session), sent(&session), "cycle {cycle}: no surplus");
+
+            // The gate reopens only once the gap is back at or under Low.
+            send(&session, 40_000);
+            assert!(
+                !gate.should_emit(gap(&session)),
+                "cycle {cycle}: still paused"
+            );
+            session.ack(40_000 - FLOW_LOW_WATERMARK);
+            assert!(
+                gate.should_emit(gap(&session)),
+                "cycle {cycle}: must reopen at Low"
+            );
+            session.ack(FLOW_LOW_WATERMARK);
+            assert_eq!(gap(&session), 0);
+        }
+
+        // The pause threshold is High plus ONE chunk whatever the chunk size, not
+        // just for a max frame (which alone overshoots High by enough to hide a
+        // gate that pauses late).
+        for chunk in [PTY_READ_BYTES as u64, 40_000, max_frame] {
+            let mut gate = EmissionGate::new();
+            let mut sent = 0u64;
+            for _ in 0..1_000 {
+                if !gate.should_emit(sent) {
+                    break;
+                }
+                sent += chunk;
+            }
+            assert!(gate.is_paused(), "chunk {chunk}: the gate must pause");
+            assert!(
+                sent > FLOW_HIGH_WATERMARK && sent <= FLOW_HIGH_WATERMARK + chunk,
+                "chunk {chunk}: pre-reset gap {sent} exceeds High plus one chunk"
+            );
+        }
+    }
+
+    /// A reset raises acked to the `sent` it read; it must not store over an
+    /// ack that landed in between (for bytes counted after that read), or the
+    /// pane's acks for those bytes are lost: an under-ack.
+    #[test]
+    fn reset_flow_control_never_erases_a_concurrent_ack() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.reset_flow_control_around(|| {
+            // After the reset read `sent`: one more frame is counted, and the
+            // pane acks everything it has received, that frame included.
+            session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+            session.ack(50_000 + 8_192);
+        });
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            session.bytes_sent.load(Ordering::Relaxed),
+            "the reset erased an ack that landed while it ran"
+        );
+    }
+
+    /// A reset that reads `sent` before a failed emit's un-count and raises
+    /// acked after it must not leave acked above sent: that is a surplus, the
+    /// thing the ack clamp exists to rule out.
+    #[test]
+    fn reset_flow_control_straddling_an_uncount_leaves_no_surplus() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.ack(50_000);
+        // The reader counts a frame; its emit fails.
+        session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+        // A reset reads sent (58 192), then the un-count lands, then the reset
+        // raises acked.
+        session.reset_flow_control_around(|| {
+            uncount(&session.bytes_sent, &session.bytes_acked, 8_192);
+        });
+        assert_eq!(session.bytes_sent.load(Ordering::Relaxed), 50_000);
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            50_000,
+            "the reset left a surplus over the un-counted bytes"
+        );
+    }
+
+    /// An ack whose clamp read `sent` before a failed emit's un-count, and
+    /// whose CAS landed after it, must not leave acked above sent.
+    #[test]
+    fn ack_straddling_an_uncount_leaves_no_surplus() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.ack(40_000);
+        // The reader counts a frame; its emit fails.
+        session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+        // The pane acks the rest of what it had (and some excess): the clamp
+        // reads sent = 58 192, then the un-count lands, then the CAS.
+        session.ack_around(18_192, || {
+            uncount(&session.bytes_sent, &session.bytes_acked, 8_192);
+        });
+        assert_eq!(session.bytes_sent.load(Ordering::Relaxed), 50_000);
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            50_000,
+            "the ack left a surplus over the un-counted bytes"
+        );
+    }
+
+    /// `count_then_emit` counts before it emits (an ack can follow the emit at
+    /// once, and `ack` clamps at sent), and un-counts an emit that failed.
+    #[test]
+    fn count_then_emit_counts_first_and_uncounts_a_failed_emit() {
+        let sent = AtomicU64::new(100);
+        let acked = AtomicU64::new(100);
+        count_then_emit(&sent, &acked, 40, || {
+            assert_eq!(
+                sent.load(Ordering::Relaxed),
+                140,
+                "emitted before it was counted"
+            );
+            true
+        });
+        assert_eq!(sent.load(Ordering::Relaxed), 140);
+
+        // A failed emit, while a reset ran (acked = sent, these bytes included):
+        // nothing was delivered, so nothing is left counted, and no surplus.
+        count_then_emit(&sent, &acked, 60, || {
+            acked.store(sent.load(Ordering::Relaxed), Ordering::Relaxed);
+            false
+        });
+        assert_eq!(sent.load(Ordering::Relaxed), 140);
+        assert_eq!(acked.load(Ordering::Relaxed), 140);
+    }
+
+    /// The reconnect path's reset happens at the grid snapshot, after its
+    /// handler exists: a frame counted after the ring read's reset and emitted
+    /// to no handler is covered here, or nothing would ever ack it.
+    #[test]
+    fn grid_snapshot_resets_flow_control_only_when_asked() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let gap = |s: &TerminalSession| {
+            s.bytes_sent
+                .load(Ordering::Relaxed)
+                .saturating_sub(s.bytes_acked.load(Ordering::Relaxed))
+        };
+        session.reset_flow_control(); // the mount ring read
+        session.bytes_sent.fetch_add(60_000, Ordering::Relaxed); // a held frame, emitted to nobody
+        session.emission_skipped.store(true, Ordering::Relaxed);
+
+        session.grid_snapshot(false).unwrap();
+        assert_eq!(gap(&session), 60_000, "a plain snapshot must not reset");
+
+        session.grid_snapshot(true).unwrap();
+        assert_eq!(gap(&session), 0, "the reconnect snapshot must reset");
+        assert!(!session.emission_skipped.load(Ordering::Relaxed));
+    }
+
     /// REGRESSION (scan-gate watermark, PR #961 review F1).
     ///
     /// Replays the exact reader-loop interleaving that permanently wedged the
@@ -8563,7 +9059,13 @@ pub(crate) mod tests {
         );
 
         // Reader step 2: the preempted advance completes.
-        advance_grid(&session.grid, &session.grid_generation, &mut parser, prompt);
+        advance_grid(
+            &session.grid,
+            &session.grid_generation,
+            &mut parser,
+            prompt,
+            0,
+        );
         assert!(
             {
                 let g = session.grid.lock().unwrap();

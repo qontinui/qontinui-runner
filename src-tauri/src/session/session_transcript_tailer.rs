@@ -151,7 +151,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::claude_session::coord_register::{AiCoordRegistrar, TranscriptBindRefusal};
+use crate::claude_session::coord_register::{
+    AiCoordRegistrar, ResumeParams, TranscriptBindRefusal,
+};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 
@@ -217,13 +219,16 @@ pub enum Admit {
 }
 
 /// What the caller of [`SessionTranscriptTailer::bind_and_replay`] asks for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BindRequest {
     /// An existing coord session to adopt — ONLY one the caller has confirmed
     /// with coord belongs to this Claude session in this tenant.
     pub adopt: Option<Uuid>,
     /// The caller's resolved tenant, stamped on a fresh registration.
     pub tenant: Option<Uuid>,
+    /// Account / config dir stamped on a FRESHLY minted coord row (an adopted
+    /// row already exists, so nothing is written for it).
+    pub resume: ResumeParams,
 }
 
 /// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
@@ -258,7 +263,8 @@ pub struct BindOutcome {
 /// parse prose to decide whether to retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindRefusal {
-    /// Gate 1 (`Settings.cloud_sync_enabled`) is off. Nothing was written —
+    /// Transcript sync's gate is closed (the user's toggle or the tenant's
+    /// `egress_transcript_sync`). Nothing was written —
     /// not the binding, not a byte.
     SyncDisabled,
     /// The registrar declined to bind (`QONTINUI_SESSION_AUTOMATION_REGISTER`
@@ -556,26 +562,36 @@ struct Coverage {
     transcript_holes: u64,
     /// First-seen batches held because their line boundary was unreadable.
     held_batches: u64,
-    /// Gate 1 as observed at the last append. `None` until an append is seen —
+    /// Auto-bind outcomes (unfinished-resume Phase 1): sessions bound by
+    /// adopting the row coord already had, by minting a new row, and attempts
+    /// that could not settle (coord unreadable, consent off, bind refused).
+    autobind_adopted: u64,
+    autobind_minted: u64,
+    autobind_deferred: u64,
+    /// Transcript sync's gate (the user's toggle AND the tenant's
+    /// `egress_transcript_sync`) as observed at the last append. `None` until
+    /// an append is seen —
     /// which is why the report models it as an option: "no data yet" and
     /// "consent withheld" are different answers and a bare `false` conflates
     /// them.
-    cloud_sync_enabled: Option<bool>,
+    transcript_sync_permitted: Option<bool>,
     /// Counters at the last summary, so the reporter can stay quiet on an
     /// idle fleet without losing the ability to say "still nothing bound".
     /// Compared field by field, not as a sum: a held batch moves one count
     /// from `appends_emitted` to `held_batches`, which a sum cannot see.
-    last_reported: [u64; 5],
+    last_reported: [u64; 8],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
 /// can serve it without reformatting.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageReport {
-    /// Gate 1 as observed at the last append; `None` before the first one. A
+    /// Transcript sync's gate (the user's toggle AND the tenant's
+    /// `egress_transcript_sync`) as observed at the last append; `None` before
+    /// the first one. A
     /// zero-everything report means something different in each of the three
     /// states.
-    pub cloud_sync_enabled: Option<bool>,
+    pub transcript_sync_permitted: Option<bool>,
     /// Distinct sessions whose appends reached the outbox.
     pub sessions_tailed: usize,
     /// Distinct sessions currently missing a coord binding.
@@ -591,6 +607,56 @@ pub struct CoverageReport {
     /// First-seen batches held (not emitted) because their line boundary
     /// could not be read; the next batch retries.
     pub held_batches: u64,
+    /// Transcripts the watcher bound itself by adopting coord's existing row.
+    pub autobind_adopted: u64,
+    /// Transcripts the watcher bound by minting a new coord row (coord said
+    /// `unknown`).
+    pub autobind_minted: u64,
+    /// Auto-bind attempts that did not bind (coord unreadable / unresolved,
+    /// Gate 1 off, registrar refusal). Retried on the next throttle window.
+    pub autobind_deferred: u64,
+}
+
+/// How an auto-bind attempt ended, for the coverage counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoBindKind {
+    Adopted,
+    Minted,
+    Deferred,
+}
+
+impl SessionTranscriptTailer {
+    /// Is `session_key` already mapped to a coord session in this process?
+    pub fn is_bound(&self, session_key: &str) -> bool {
+        self.registrar.session_id_for(session_key).is_some()
+    }
+
+    /// An undelivered `Started` row for `session_key` already in the outbox
+    /// (see [`AiCoordRegistrar::pending_started_session_for`]). Blocking.
+    pub fn pending_started_row(&self, session_key: &str) -> Option<Uuid> {
+        self.registrar.pending_started_session_for(session_key)
+    }
+
+    /// Record that the watcher SAW `session_key` and it has no binding, so the
+    /// coverage report counts it in `sessions_unbound` even before it appends
+    /// a byte — an idle, closed transcript is exactly the session the
+    /// unfinished-resume sweep must be able to find. A bound key is left alone.
+    pub fn note_seen_unbound(&self, session_key: &str) {
+        if self.is_bound(session_key) {
+            return;
+        }
+        self.lock_coverage().unbound.insert(session_key.to_string());
+    }
+
+    /// Count one auto-bind outcome (see [`AutoBindKind`]).
+    pub fn note_autobind(&self, kind: AutoBindKind) {
+        let mut cov = self.lock_coverage();
+        match kind {
+            AutoBindKind::Adopted => cov.autobind_adopted += 1,
+            AutoBindKind::Minted => cov.autobind_minted += 1,
+            AutoBindKind::Deferred => cov.autobind_deferred += 1,
+        }
+    }
 }
 
 impl SessionTranscriptTailer {
@@ -632,7 +698,7 @@ impl SessionTranscriptTailer {
             file_start,
             appended,
             truncated,
-            crate::settings::get_cloud_sync_enabled(),
+            self.transcript_sync_open(session_key),
         );
     }
 
@@ -646,9 +712,9 @@ impl SessionTranscriptTailer {
         file_start: u64,
         appended: &str,
         truncated: bool,
-        cloud_sync_enabled: bool,
+        transcript_sync_permitted: bool,
     ) {
-        match self.admit(session_key, appended.len(), cloud_sync_enabled) {
+        match self.admit(session_key, appended.len(), transcript_sync_permitted) {
             Admit::Emit => self.emit_batch(session_key, path, file_start, appended, truncated),
             Admit::Withheld => {
                 self.withhold_batch(session_key, path, file_start, appended.len());
@@ -657,22 +723,36 @@ impl SessionTranscriptTailer {
         }
     }
 
+    /// Transcript sync's gate for `session_key`, asked in the tenant the
+    /// registrar recorded for that session — the strictest bound tenant when
+    /// it recorded none (e.g. a session this process has not registered since
+    /// a restart): the tenant's `egress_transcript_sync` AND the user's own
+    /// toggle.
+    pub(crate) fn transcript_sync_open(&self, session_key: &str) -> bool {
+        crate::egress::transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(
+            self.registrar.recorded_tenant(session_key),
+        ))
+        .is_open()
+    }
+
     /// Gate 1 and the binding, with the coverage bookkeeping. `true` = this
     /// batch should be emitted (then call [`Self::try_emit_batch`] or
     /// [`Self::emit_batch`]); `false` = drop it. Never blocks on a session
     /// lock.
     ///
-    /// Gate 1 (`Settings.cloud_sync_enabled`) is resolved by the caller rather
+    /// The gate ([`crate::egress::transcript_sync_permitted`]: the user's
+    /// `Settings.cloud_sync_enabled` AND the tenant's `egress_transcript_sync`)
+    /// is resolved by the caller rather
     /// than inside the emitter because the coverage summary needs its value —
     /// "off" and "on but reaching nobody" are different diagnoses. The emit
     /// path then calls `emit_inner`, which by contract does NOT re-check it.
-    pub fn admit(&self, session_key: &str, len: usize, cloud_sync_enabled: bool) -> Admit {
+    pub fn admit(&self, session_key: &str, len: usize, transcript_sync_permitted: bool) -> Admit {
         if len == 0 {
             return Admit::Drop;
         }
-        if !cloud_sync_enabled {
+        if !transcript_sync_permitted {
             let mut cov = self.lock_coverage();
-            cov.cloud_sync_enabled = Some(false);
+            cov.transcript_sync_permitted = Some(false);
             cov.appends_skipped_gate_off += 1;
             return Admit::Withheld;
         }
@@ -684,7 +764,7 @@ impl SessionTranscriptTailer {
         let bound = self.registrar.session_id_for(session_key).is_some();
 
         let mut cov = self.lock_coverage();
-        cov.cloud_sync_enabled = Some(true);
+        cov.transcript_sync_permitted = Some(true);
         if bound {
             cov.tailed.insert(session_key.to_string());
             cov.unbound.remove(session_key);
@@ -1163,9 +1243,9 @@ impl SessionTranscriptTailer {
         session_key: &str,
         path: &Path,
         req: BindRequest,
-        cloud_sync_enabled: bool,
+        transcript_sync_permitted: bool,
     ) -> Result<BindOutcome, BindRefusal> {
-        if !cloud_sync_enabled {
+        if !transcript_sync_permitted {
             return Err(BindRefusal::SyncDisabled);
         }
         let lock = self.session_lock(session_key);
@@ -1191,7 +1271,7 @@ impl SessionTranscriptTailer {
             None => {
                 let id = self
                     .registrar
-                    .bind_transcript_session(session_key, req.adopt, req.tenant)
+                    .bind_transcript_session(session_key, req.adopt, req.tenant, req.resume.clone())
                     .map_err(|e| match e {
                         TranscriptBindRefusal::RegistrationDisabled => {
                             BindRefusal::RegistrationDisabled
@@ -1403,7 +1483,7 @@ impl SessionTranscriptTailer {
     pub fn coverage(&self) -> CoverageReport {
         let cov = self.lock_coverage();
         CoverageReport {
-            cloud_sync_enabled: cov.cloud_sync_enabled,
+            transcript_sync_permitted: cov.transcript_sync_permitted,
             sessions_tailed: cov.tailed.len(),
             sessions_unbound: cov.unbound.len(),
             unbound_session_ids: cov
@@ -1418,6 +1498,9 @@ impl SessionTranscriptTailer {
             appends_skipped_gate_off: cov.appends_skipped_gate_off,
             transcript_holes: cov.transcript_holes,
             held_batches: cov.held_batches,
+            autobind_adopted: cov.autobind_adopted,
+            autobind_minted: cov.autobind_minted,
+            autobind_deferred: cov.autobind_deferred,
         }
     }
 
@@ -1453,6 +1536,9 @@ impl SessionTranscriptTailer {
             report.appends_skipped_gate_off,
             report.transcript_holes,
             report.held_batches,
+            report.autobind_adopted,
+            report.autobind_minted,
+            report.autobind_deferred,
         ];
 
         let mut cov = self.lock_coverage();
@@ -1467,22 +1553,23 @@ impl SessionTranscriptTailer {
 
         if blind {
             tracing::warn!(
-                cloud_sync_enabled = ?report.cloud_sync_enabled,
+                transcript_sync_permitted = ?report.transcript_sync_permitted,
                 sessions_unbound = report.sessions_unbound,
                 unbound_session_ids = %report.unbound_session_ids.join(","),
                 appends_skipped_unbound = report.appends_skipped_unbound,
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
+                autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: RUNNING BUT REACHING NO PANE — every watched \
-                 transcript lacks a coord session binding, so nothing is being synced. A \
-                 binding is written by the claude --resume sniffer \
-                 (claude_resume_sniff -> AiCoordRegistrar::register_sniffed_session) or on \
-                 request by POST /sessions/transcript-bind; a pane neither reaches is never \
-                 bound. GET /sessions/transcript-coverage serves these counts."
+                 transcript lacks a coord session binding, so nothing is being synced. The \
+                 watcher binds each transcript itself (transcript_autobind) and the \
+                 claude --resume sniffer binds typed resumes; nothing bound here means \
+                 Gate 1 is off, coord is unreadable (autobind_deferred), or registration \
+                 is disabled. GET /sessions/transcript-coverage serves these counts."
             );
         } else {
             tracing::info!(
-                cloud_sync_enabled = ?report.cloud_sync_enabled,
+                transcript_sync_permitted = ?report.transcript_sync_permitted,
                 sessions_tailed = report.sessions_tailed,
                 sessions_unbound = report.sessions_unbound,
                 unbound_session_ids = %report.unbound_session_ids.join(","),
@@ -1492,6 +1579,9 @@ impl SessionTranscriptTailer {
                 appends_skipped_gate_off = report.appends_skipped_gate_off,
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
+                autobind_adopted = report.autobind_adopted,
+                autobind_minted = report.autobind_minted,
+                autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: coverage"
             );
         }
@@ -1662,7 +1752,7 @@ mod tests {
 
         assert!(transcript_offsets(&outbox).is_empty());
         let r = t.coverage();
-        assert_eq!(r.cloud_sync_enabled, Some(false));
+        assert_eq!(r.transcript_sync_permitted, Some(false));
         assert_eq!(r.appends_skipped_gate_off, 1);
         assert_eq!(r.appends_skipped_unbound, 0);
         assert_eq!(r.sessions_tailed, 0);
@@ -1685,7 +1775,7 @@ mod tests {
         let r = t.coverage();
         assert_eq!(r.appends_emitted, 2);
         assert_eq!(r.bytes_emitted, 6);
-        assert_eq!(r.cloud_sync_enabled, Some(true));
+        assert_eq!(r.transcript_sync_permitted, Some(true));
     }
 
     /// **Restart mid-session** — the Phase 2(a) case. A pane is tailed, the
@@ -2013,6 +2103,7 @@ mod tests {
                     BindRequest {
                         adopt: Some(existing),
                         tenant: None,
+                        ..BindRequest::default()
                     },
                     true,
                 ) {
@@ -2057,6 +2148,7 @@ mod tests {
                     BindRequest {
                         adopt: Some(held),
                         tenant: None,
+                        ..BindRequest::default()
                     },
                     true,
                 ) {
@@ -2429,6 +2521,7 @@ mod tests {
                 BindRequest {
                     adopt: Some(bound),
                     tenant: None,
+                    ..BindRequest::default()
                 },
                 true,
             )
@@ -2444,6 +2537,7 @@ mod tests {
                 BindRequest {
                     adopt: Some(other),
                     tenant: None,
+                    ..BindRequest::default()
                 },
                 true,
             ),

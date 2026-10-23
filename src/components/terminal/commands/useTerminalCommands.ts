@@ -17,6 +17,8 @@
  *   - `terminal.maximize`    — `/maximize [<n>]`
  *   - `terminal.close`       — `/close [<n>]`
  *   - `terminal.layout`      — `/layout <preset>`
+ *   - `terminal.mode`        — `/terminal.mode [grid|tmux]` (alias `/work-mode`;
+ *                              no argument toggles)
  *   - `terminal.restart`     — `/restart [<n>]`
  *   - `terminal.swap`        — `/swap <a> <b>`
  *
@@ -61,9 +63,17 @@ import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
+import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
+import { describeThrown } from "@/lib/utils";
 import type { ApprovalReport } from "../approveAll";
+import {
+  WORK_MODE_NAMES,
+  applyWorkModeRequest,
+  parseWorkModeRequest,
+  type WorkModeChange,
+} from "../terminalWorkModeControl";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -224,6 +234,7 @@ const SCHEMA = {
     tabId: "string (explicit tab id; takes precedence over zone)",
   },
   layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
+  mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
 } as const;
@@ -617,6 +628,31 @@ export function resolveTenantArg(
   return { error: `no tenant binding matches "${value}"` };
 }
 
+/**
+ * The `/terminal.mode` verdict. A state report whose sentence is exactly the
+ * shared acknowledgement — "entered tmux mode", "left tmux mode — grid
+ * restored" — and a noop (`·`, "work mode was already tmux") when the mode was
+ * already the requested one, unless that request still opened the Session
+ * Manager, which is then the change it reports.
+ */
+export function workModeEffect(change: WorkModeChange): EffectReport {
+  if (change.changed) {
+    return change.mode === "tmux"
+      ? stateEffect(
+          "entered",
+          "tmux mode",
+          true,
+          change.sidebarOpened ? { detail: "session manager opened" } : {},
+        )
+      : stateEffect("left", "tmux mode", true, { detail: "grid restored" });
+  }
+  return change.sidebarOpened
+    ? stateEffect("opened", "the session manager", true, {
+        detail: `already in ${change.mode} mode`,
+      })
+    : stateEffect(change.mode, "work mode", false);
+}
+
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   const session = useTerminalSession();
   const {
@@ -895,6 +931,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: SCHEMA.maximize,
     patterns: [/^maximize(?:\s+(?<zone>\d+))?$/i, /^fullscreen(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      // tmux work mode already shows one session at full size and the layout
+      // ignores maximize there: refuse by name, exactly as the UI Bridge
+      // maximize actions do, rather than report a change nothing made.
+      if (zoneLayout.workMode === "tmux") return fail("tmux-mode", MAXIMIZE_IN_TMUX_ERROR);
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
@@ -1017,9 +1057,17 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // `useZoneLayout` rather than re-derived here for the obvious reason: a
       // second copy of the capacity rule would drift from the first, which is
       // the shape of this defect one level up.
-      const grown = computeAutoGrowLayoutId(normalized, tabs.length);
+      //
+      // `/layout` is an operator request, so in tmux mode it EXITS to the grid
+      // (`useZoneLayout::setLayoutId`) — the grid it lands in is a grid-mode
+      // one, and auto-grow is predicted for grid mode accordingly. Leaving the
+      // mode is itself a change, so it never reports the noop arm, and the
+      // detail says the mode was left rather than letting the swap to a grid
+      // pass as a plain preset change.
+      const leftTmux = zoneLayout.workMode === "tmux";
+      const grown = computeAutoGrowLayoutId(normalized, tabs.length, "grid");
       const effective = grown ?? normalized;
-      const wasAlready = zoneLayout.layoutId === effective;
+      const wasAlready = !leftTmux && zoneLayout.layoutId === effective;
       // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
       // delegates to `applyLayout`, which does three things besides writing
       // the id: it clears the maximized zone, re-flows unassigned tabs into
@@ -1031,14 +1079,46 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      zoneLayout.setLayoutId(normalized);
-      const detail =
+      zoneLayout.setLayoutId(normalized, { source: "operator" });
+      const layoutDetail =
         grown !== null
           ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
+      const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
+    },
+  });
+
+  // ── 8b. /terminal.mode ────────────────────────────────────────────────
+  // Grid ⇄ tmux work mode. The decision, the Session Manager side effect and
+  // the acknowledgement sentence all come from `applyWorkModeRequest`, the
+  // rule the CommandBar toggle, Ctrl+Shift+Y and the UI Bridge action share,
+  // so the four surfaces cannot report different things for one change.
+  useCommandAction({
+    id: "terminal.mode",
+    slash: "/terminal.mode",
+    aliases: ["/work-mode"],
+    label: "Switch terminal work mode",
+    description:
+      "Switch between grid mode (every session in a zone) and tmux mode (one session on screen, the rest live off-screen; the session manager opens as its navigator). No argument toggles.",
+    paramSchema: SCHEMA.mode,
+    patterns: [/^(?<mode>tmux|grid)\s+mode$/i, /^work\s+mode\s+(?<mode>tmux|grid)$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
+      const parsed = parseWorkModeRequest(args.mode);
+      if (!parsed.ok) return fail("invalid-mode", parsed.error);
+      const change = applyWorkModeRequest(
+        {
+          workMode: zoneLayout.workMode,
+          enterTmuxMode: zoneLayout.enterTmuxMode,
+          exitTmuxMode: zoneLayout.exitTmuxMode,
+          showSidebar: workflowGen.showSidebar,
+          setShowSidebar: workflowGen.setShowSidebar,
+        },
+        parsed.request,
+      );
+      return ok(workModeEffect(change));
     },
   });
 
@@ -2006,6 +2086,30 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         },
       });
       return copied ? ok({ count: n }) : fail("clipboard-failed", "clipboard write failed");
+    },
+  });
+
+  // ── /elevated ────────────────────────────────────────────────────────
+  // Opens a separate Administrator PowerShell window through a UAC prompt. It
+  // is not a PTY tab (see `open_elevated_terminal`), so there is no tab id to
+  // report and nothing to zone-assign.
+  useCommandAction({
+    id: "terminal.elevated",
+    slash: "/elevated",
+    aliases: ["/admin"],
+    label: "Open elevated terminal",
+    description:
+      "Open an Administrator PowerShell window (Windows UAC prompt). The window is " +
+      "separate from the runner's terminal tabs.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^(?:open\s+)?(?:elevated|admin(?:istrator)?)\s+(?:terminal|shell|powershell)$/i],
+    handler: async (): Promise<CommandResult> => {
+      try {
+        await invoke("open_elevated_terminal");
+      } catch (err) {
+        return fail("elevation-failed", describeThrown(err, "could not open elevated terminal"));
+      }
+      return ok(effect("launched", "elevated terminal", 1));
     },
   });
 
