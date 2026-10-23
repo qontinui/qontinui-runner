@@ -5034,6 +5034,14 @@ mod text_hidden_tests {
     /// Both handlers refuse an untrusted origin BEFORE any frame is captured,
     /// any text hidden or any frame B decoded — all of which happen in
     /// `capture_frames`.
+    ///
+    /// A source scan, so it has an inherent limit: it reads the gate statement,
+    /// not control flow, and a gate wrapped in a block that never runs (`if
+    /// false { … }`) still passes it. What the refusal decides is pinned
+    /// behaviourally by `frame_b_is_refused_to_an_untrusted_origin` on
+    /// [`refuse_untrusted_frame_b`] itself; no handler-level 403 test exists,
+    /// because these handlers take a full `ApiState` that this crate's tests
+    /// have no constructor for.
     #[test]
     fn both_handlers_gate_the_origin_before_any_capture_or_decode() {
         let src = include_str!("vision_routes.rs");

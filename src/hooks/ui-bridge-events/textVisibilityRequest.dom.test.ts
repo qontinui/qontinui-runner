@@ -85,8 +85,11 @@ describe("text visibility in the runner webview (DOM)", () => {
     await runTextVisibilityRequest({ hidden: true, ttlMs: 1_000 }, async () => "timeout");
     vi.advanceTimersByTime(600);
 
-    const probe = await runTextVisibilityRequest({ query: true });
-    expect(probe).toEqual({ success: true, data: { success: true, query: true, hidden: true } });
+    const probe = await runTextVisibilityRequest({ query: true }, async () => "animation_frame");
+    expect(probe).toEqual({
+      success: true,
+      data: { success: true, query: true, hidden: true, paintFence: "animation_frame" },
+    });
     const arm = await runTextVisibilityRequest(
       { hidden: true, ttlMs: 15_000, onlyIfVisible: true },
       async () => "timeout",

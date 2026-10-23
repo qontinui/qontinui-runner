@@ -95,16 +95,24 @@ export function textVisibilityBody(payload: object): Record<string, unknown> {
  * Two fields only the runner's own arm (`capture_text_hidden_pair` in
  * `text_visibility.rs`) sends, never forwarded to the SDK:
  *
- * - `query: true` — read-only: answer `{hidden}` from the SDK's
- *   `textHidden()` and change nothing. Answered without the dev-controls gate:
- *   reading changes nothing, and where the gate is closed nothing can be
- *   hidden. The arm asks this before frame A. (The direct HTTP route cannot
- *   send it: its validation requires `hidden`.)
+ * - `query: true` — the probe: answer `{hidden, paintFence}` from the SDK's
+ *   `textHidden()`, with no page-state change (`textHidden()` may lazily
+ *   create the SDK's shared state slot, nothing more). The state is read on
+ *   both sides of a paint fence, because a restore — the SDK's TTL, or a
+ *   restore whose reply the runner never saw — writes synchronously and
+ *   paints later: `hidden: false` is answered only once a frame has painted
+ *   it, and `hidden: null` when the state moved during the wait. Where dev
+ *   controls are off nothing can ever have been hidden in this realm, so the
+ *   answer is `hidden: false` with `paintFence: "not_needed"` and no wait (a
+ *   throttled webview would otherwise time the fence out for nothing). The
+ *   arm asks this before frame A.
  * - `onlyIfVisible: true` — hide only when text is not already hidden. When it
  *   is, answer `{hidden: true, changed: false, wasHidden: true}` WITHOUT
  *   calling the SDK, so another caller's hide is neither re-armed nor touched.
- *   The direct route never sends it: an explicit re-hide re-arms the TTL, as
- *   the SDK documents.
+ *
+ * The direct HTTP route (`POST /ui-bridge/control/text-visibility`) refuses a
+ * body carrying either field with a 400, so only the arm sends them; an
+ * explicit re-hide there re-arms the TTL, as the SDK documents.
  *
  * Every reply that reached the SDK carries `wasHidden`: `textHidden()` read
  * immediately before `setTextVisibility`, in the same synchronous run, so no
@@ -119,7 +127,19 @@ export async function runTextVisibilityRequest(
 ): Promise<TextVisibilityReply> {
   const { query, onlyIfVisible, ...body } = textVisibilityBody(payload);
   if (query === true) {
-    return { success: true, data: { success: true, query: true, hidden: textHidden() } };
+    if (!devControlsEnabled()) {
+      return {
+        success: true,
+        data: { success: true, query: true, hidden: false, paintFence: "not_needed" },
+      };
+    }
+    const before = textHidden();
+    const paintFence = await waitForPaint();
+    const after = textHidden();
+    return {
+      success: true,
+      data: { success: true, query: true, hidden: before === after ? after : null, paintFence },
+    };
   }
   if (!devControlsEnabled()) {
     return { success: false, error: DEV_CONTROLS_REFUSAL.error, data: { ...DEV_CONTROLS_REFUSAL } };

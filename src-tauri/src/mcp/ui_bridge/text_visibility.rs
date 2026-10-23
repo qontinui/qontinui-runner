@@ -119,12 +119,27 @@ fn whole_u64(v: &Value) -> Option<u64> {
     })
 }
 
+/// Fields only [`capture_text_hidden_pair`] sends to the hook
+/// ([`probe_body`], [`arm_hide_body`]); refused on the direct route.
+pub(crate) const ARM_ONLY_FIELDS: [&str; 2] = ["query", "onlyIfVisible"];
+
 /// Validate a `POST /control/text-visibility` body. Mirrors the SDK rules:
 /// `hidden` is a boolean; `ttlMs` is checked only on a hide (a show has no TTL,
 /// so whatever a caller sends along with `hidden: false` is ignored, not
 /// refused).
 pub(crate) fn validate_text_visibility_body(body: &Value) -> Result<(), String> {
     let obj = body.as_object().ok_or("body must be a JSON object")?;
+    // The runner arm's own fields: on this route `query` would turn a restore
+    // into a probe answering 200, and `onlyIfVisible` would change what an
+    // explicit hide does. The webview hook honours them from the arm alone.
+    for arm_only in ARM_ONLY_FIELDS {
+        if obj.contains_key(arm_only) {
+            return Err(format!(
+                "{arm_only} is not a field of this route (it is reserved for the runner's \
+                 own captureTextHidden arm)"
+            ));
+        }
+    }
     let hidden = match obj.get("hidden") {
         Some(Value::Bool(b)) => *b,
         other => {
@@ -391,8 +406,32 @@ fn hide_is_ours(hide: &Value) -> Option<bool> {
         .map(|was| !was)
 }
 
-/// The read-only probe the arm sends before frame A: the hook answers
-/// `{hidden}` from `textHidden()` and changes nothing.
+/// Why a probe answering `hidden: false` still does not prove frame A would
+/// show the text: a restore writes its state at once and paints later, so the
+/// answer counts only once the hook's paint fence released on a painted frame
+/// (`animation_frame`), or the hook said no fence was needed (dev controls
+/// off: nothing can have been hidden in that realm). `None` when it is proven.
+fn probe_fence_unproven(probe: Option<&Value>) -> Option<String> {
+    match probe
+        .and_then(|v| v.get("paintFence"))
+        .and_then(Value::as_str)
+    {
+        Some("animation_frame" | "not_needed") => None,
+        Some(other) => Some(format!(
+            "whether the page's text is painted visible is unknown (the probe's paint fence \
+             answered {other:?}, so a restore may not have been painted yet)"
+        )),
+        None => Some(
+            "whether the page's text is painted visible is unknown (the probe carries no \
+             paint fence)"
+                .to_string(),
+        ),
+    }
+}
+
+/// The probe the arm sends before frame A: the hook answers `{hidden,
+/// paintFence}` from `textHidden()`, read on both sides of a paint fence, with
+/// no page-state change.
 pub(crate) fn probe_body() -> Value {
     serde_json::json!({"query": true})
 }
@@ -453,8 +492,12 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   and not block.
 ///
 /// Before frame A the webview is asked whether its text is already hidden
-/// ([`probe_body`]). Only an answer of `hidden: false` proceeds: hidden, or no
-/// usable answer, refuses at once — no frame A, no hide, nothing to restore.
+/// ([`probe_body`]). Only `hidden: false` behind a painted fence proceeds
+/// ([`probe_fence_unproven`]): hidden, a timed-out or missing fence, or no
+/// usable answer refuses at once — no frame A, no hide, nothing to restore.
+/// The probe is one more webview round trip, and it runs with every capture
+/// permit held: on a stalled webview, other runner-window captures wait for it
+/// up to the UI Bridge request timeout.
 ///
 /// The hide ([`arm_hide_body`]) then says whose hide it is ([`hide_is_ours`]):
 /// - THIS call's: frame B is taken and the page restored, whether or not frame
@@ -469,9 +512,9 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 /// - UNKNOWN — the hide request errored or timed out after it may have been
 ///   sent, the call was cancelled before the hide reply, or the reply carries
 ///   no `wasHidden`: the page is RESTORED (holding the lock and permits), then
-///   the id bumped, and no frame B is returned. Frame A stands: the probe saw
-///   the text visible before it, and the unknown is about the hide only. The
-///   arm's TTL is short, and a page left text-hidden poisons every capture
+///   the id bumped, and no frame B is returned. Frame A is refused too: the
+///   lost `wasHidden` is the only thing that could have shown another caller's
+///   hide landing after the probe, during frame A. The arm's TTL is short, and a page left text-hidden poisons every capture
 ///   until it fires; the one hide this can wrongly undo is a concurrent
 ///   dev-only direct-route (`control/text-visibility`) hide.
 /// - A refused hide (`success: false`), or a request that provably never left
@@ -522,7 +565,7 @@ where
     // page someone else had hidden is never returned as "text rendered".
     let probe = send(REQUEST_TYPE, probe_body()).await;
     let refused_before_a = match probe.as_ref().map(|v| v.get("hidden")) {
-        Ok(Some(Value::Bool(false))) => None,
+        Ok(Some(Value::Bool(false))) => probe_fence_unproven(probe.as_ref().ok()),
         Ok(Some(Value::Bool(true))) => Some(
             "the page's text was already hidden by another caller, so frame A would not show \
              it"
@@ -626,6 +669,21 @@ where
          frame B may have been composited before the glyphs went transparent"
             .to_string()
     });
+
+    // Unknown: a hide by another caller may have landed after the probe and
+    // covered frame A (its `wasHidden: true` would have said so), so frame A
+    // is not kept either.
+    if ours.is_none() {
+        frame_a = Err(if landed {
+            "frame A was not kept: whose hide it is is unknown (the reply carries no \
+             wasHidden), so another caller's hide may have covered frame A"
+                .to_string()
+        } else {
+            "frame A was not kept: the hide request failed, so whether another caller's hide \
+             covered frame A is unknown"
+                .to_string()
+        });
+    }
 
     // Ours: frame B. Unknown: none — restore only.
     let mut frame_b = match ours {
@@ -772,6 +830,34 @@ mod tests {
         );
     }
 
+    /// The arm's own fields are refused on the direct route: `query` would turn
+    /// a restore into a probe answering 200, `onlyIfVisible` would change what
+    /// an explicit hide does.
+    #[tokio::test]
+    async fn the_direct_route_refuses_the_arm_only_fields() {
+        for body in [
+            json!({"hidden": false, "query": true}),
+            json!({"hidden": true, "query": false}),
+            json!({"hidden": true, "onlyIfVisible": true}),
+            json!({"hidden": false, "onlyIfVisible": false}),
+        ] {
+            let (sent, send) = webview(vec![]);
+            let (status, Json(reply)) = direct_set(body.clone(), send, || {}, |_| {})
+                .await
+                .expect_err("must be refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let error = reply.error.unwrap_or_default();
+            assert!(
+                error.contains("reserved for the runner's own"),
+                "{body}: {error}"
+            );
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "{body}: nothing may reach the webview"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_direct_route_sends_the_webview_the_body_as_given() {
         let (sent, send) = webview(vec![Ok(json!({"success": true, "hidden": true}))]);
@@ -872,11 +958,11 @@ mod tests {
 
     /// The probe's answers.
     fn visible() -> Value {
-        json!({"success": true, "query": true, "hidden": false})
+        json!({"success": true, "query": true, "hidden": false, "paintFence": "animation_frame"})
     }
 
     fn already_hidden() -> Value {
-        json!({"success": true, "query": true, "hidden": true})
+        json!({"success": true, "query": true, "hidden": true, "paintFence": "animation_frame"})
     }
 
     fn restored(verified: bool) -> Value {
@@ -1096,6 +1182,10 @@ mod tests {
         .await;
         let err = out.frame_b.expect_err("no frame B for an unknown hide");
         assert!(err.contains("whether it landed is unknown"), "{err}");
+        let err = out
+            .frame_a
+            .expect_err("frame A may be under another caller's hide");
+        assert!(err.contains("frame A was not kept"), "{err}");
         assert!(has(&events, "show"), "{events:?}");
         assert_eq!(events.last().map(String::as_str), Some("bump"));
         assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
@@ -1199,6 +1289,38 @@ mod tests {
         }
     }
 
+    /// `hidden: false` counts only behind a painted fence: a restore writes its
+    /// state at once and paints later, so a timed-out or missing fence is
+    /// unknown and refuses before frame A. With dev controls off the hook needs
+    /// no fence (nothing can have been hidden there), and the arm proceeds.
+    #[tokio::test]
+    async fn a_probe_whose_paint_fence_is_unproven_refuses_before_frame_a() {
+        for probe in [
+            json!({"success": true, "query": true, "hidden": false, "paintFence": "timeout"}),
+            json!({"success": true, "query": true, "hidden": false}),
+        ] {
+            let (out, events) =
+                run_with_probe(ok(probe.clone()), vec![], vec![ok("frame-a")]).await;
+            let err = out
+                .frame_a
+                .expect_err("an unpainted restore is not visible text");
+            assert!(err.contains("painted visible is unknown"), "{probe}: {err}");
+            assert!(out.run.is_none(), "{probe}");
+            assert_eq!(events, ["permits", "probe"], "{probe}");
+        }
+        let not_needed =
+            json!({"success": true, "query": true, "hidden": false, "paintFence": "not_needed"});
+        let (out, events) = run_with_probe(
+            ok(not_needed),
+            vec![ok(hid()), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
+        )
+        .await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        assert_eq!(out.frame_b, Ok("frame-b"));
+        assert!(has(&events, "show"), "{events:?}");
+    }
+
     /// Another caller hid the text between the probe and the hide — possibly
     /// during frame A. The hook left that hide alone (`wasHidden: true`), so
     /// frame A is refused, no frame B is taken, and nothing is restored.
@@ -1247,8 +1369,9 @@ mod tests {
     }
 
     /// No boolean `wasHidden`: whose hide it is is unknown, so the page is
-    /// restored and no frame B is returned. Frame A stands: the probe saw the
-    /// text visible before it, and the unknown concerns the hide only.
+    /// restored and no frame B is returned. Frame A is refused too: the lost
+    /// `wasHidden` is what would have shown another caller's hide landing after
+    /// the probe, during frame A.
     #[tokio::test]
     async fn an_unattributable_hide_is_restored_not_measured() {
         for anon in [
@@ -1262,7 +1385,10 @@ mod tests {
             )
             .await;
             assert!(out.frame_b.unwrap_err().contains("unknown"), "{anon}");
-            assert_eq!(out.frame_a, Ok("frame-a"), "{anon}");
+            let err = out
+                .frame_a
+                .expect_err("frame A may be under another caller's hide");
+            assert!(err.contains("whose hide it is is unknown"), "{anon}: {err}");
             assert!(has(&events, "show"), "{anon}: {events:?}");
             assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
         }
@@ -1367,7 +1493,8 @@ mod tests {
                         tokio::task::yield_now().await;
                         let was = h.load(Ordering::SeqCst);
                         let reply = if body.get("query") == Some(&json!(true)) {
-                            json!({"success": true, "query": true, "hidden": was})
+                            json!({"success": true, "query": true, "hidden": was,
+                                   "paintFence": "animation_frame"})
                         } else if body["hidden"].as_bool() == Some(true) {
                             if !was {
                                 h.store(true, Ordering::SeqCst);
