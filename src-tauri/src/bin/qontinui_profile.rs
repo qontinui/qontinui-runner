@@ -21,6 +21,9 @@
 //! qontinui_profile tier                       # print the runner tier this settings.json resolves to
 //! qontinui_profile tier --set local           # record an explicit tier choice (headless TierStep)
 //! qontinui_profile tier --clear-choice        # un-pin: re-open the install to tier inference
+//! qontinui_profile network                    # print the profile's outbound proxy / CA trust block
+//! qontinui_profile network --proxy-url http://proxy:3128 --trust os   # set fields (next runner start)
+//! qontinui_profile network --unset no-proxy   # remove one field; `--clear` removes the block
 //! qontinui_profile env capture                # push this box's secret-free config to the twin
 //! qontinui_profile env pull                   # preview what would change here to match canonical
 //! ```
@@ -61,14 +64,15 @@
 //! so the destructive paths are unreachable when help is requested.
 
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use qontinui_runner_lib::pair::{
     coord_http_base, pair_via_browser, pair_with_auth_token, pair_with_pair_code, persist_pairing,
     resolve_cli_web_base, tenant_id_from_oauth_claim, CliWebBaseSource, PairCompleteResponse,
 };
 use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
-    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
+    load_strict, network_profile_name, profiles_path, AuthConfig, BlobConfig, EgressProfile,
+    NetworkProfile, Profile, ProfilesFile, TrustMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +117,13 @@ enum Cmd {
         /// Host / IP for DB, Redis, blob, and coord URLs. Defaults to localhost.
         #[arg(long, default_value = "localhost")]
         host: String,
+        /// Default for the six outbound data flows (transcript sync, code
+        /// mirror, terminal streaming, telemetry, update check, skill mirror)
+        /// written as the profile's `egress.default`. `off` is the self-hosted
+        /// deployment's switch: every flow stays off until coord answers
+        /// otherwise for the tenant. Omitted: no profile opinion (on).
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        egress_default: Option<String>,
     },
     /// Print the absolute profiles.json path.
     Path,
@@ -161,6 +172,69 @@ enum Cmd {
         #[arg(long)]
         clear_choice: bool,
     },
+    /// Read or write the profile's `network` block — the outbound HTTP proxy
+    /// and corporate CA trust the runner exports at startup (HTTPS_PROXY /
+    /// HTTP_PROXY / NO_PROXY, NODE_EXTRA_CA_CERTS, git's Schannel backend).
+    ///
+    /// Edits the profile the runner itself reads it from: `$QONTINUI_ENV`,
+    /// else the file's `active`, else `dev`. With no flags it PRINTS that
+    /// block (credentials withheld). Any change reaches a runner only on its
+    /// next start; a running runner is never touched.
+    Network {
+        /// Edit this profile instead of the one the runner would read.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+        /// The HTTP proxy, `http://[user:password@]host:port`. Only an
+        /// `http://` proxy can carry the runner's WebSockets; any other
+        /// scheme leaves them direct (a warning says so).
+        #[arg(long, value_name = "URL")]
+        proxy_url: Option<String>,
+        /// Hosts that bypass the proxy, comma-separated (`NO_PROXY` syntax).
+        /// Loopback is always exempt and need not be listed.
+        #[arg(long, value_name = "LIST")]
+        no_proxy: Option<String>,
+        /// A PEM file holding the corporate root, handed to Node (the
+        /// `claude` CLI) as the additive NODE_EXTRA_CA_CERTS. Must exist.
+        #[arg(long, value_name = "PATH")]
+        ca_bundle: Option<PathBuf>,
+        /// `os` points the runner's git at the OS trust store (Windows
+        /// Schannel, unless git config already chose); `bundled` leaves
+        /// every stack on its own bundle.
+        #[arg(long, value_enum)]
+        trust: Option<TrustArg>,
+        /// Remove one field (repeatable).
+        #[arg(long, value_enum, value_name = "FIELD")]
+        unset: Vec<NetworkField>,
+        /// Remove the whole `network` block. Mutually exclusive with every
+        /// setter and `--unset`.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// `network --trust` values; mirrors [`TrustMode`].
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustArg {
+    Os,
+    Bundled,
+}
+
+impl From<TrustArg> for TrustMode {
+    fn from(t: TrustArg) -> Self {
+        match t {
+            TrustArg::Os => TrustMode::Os,
+            TrustArg::Bundled => TrustMode::Bundled,
+        }
+    }
+}
+
+/// `network --unset` field names.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkField {
+    ProxyUrl,
+    NoProxy,
+    CaBundle,
+    Trust,
 }
 
 // `EnvCmd` (the `env enroll/capture/pull/apply/show/scope-root` subcommand tree) lives in
@@ -232,7 +306,10 @@ fn main() -> ExitCode {
         Cmd::Show => cmd_show(),
         Cmd::List => cmd_list(),
         Cmd::Use { name } => cmd_use(&name),
-        Cmd::Init { host } => cmd_init(&host),
+        Cmd::Init {
+            host,
+            egress_default,
+        } => cmd_init(&host, egress_default.as_deref()),
         Cmd::Path => cmd_path(),
         // `machine` is a legacy alias — both variants dispatch to the same
         // device handlers. Phase 3 unified the canonical name on `device`.
@@ -256,6 +333,25 @@ fn main() -> ExitCode {
         // binary's pre-GUI CLI mode (`qontinui-runner env …`), in the lib.
         Cmd::Env { sub } => ExitCode::from(qontinui_runner_lib::profile_cli::run_env(sub)),
         Cmd::Tier { set, clear_choice } => cmd_tier(set.as_deref(), clear_choice),
+        Cmd::Network {
+            profile,
+            proxy_url,
+            no_proxy,
+            ca_bundle,
+            trust,
+            unset,
+            clear,
+        } => cmd_network(
+            profile.as_deref(),
+            NetworkEdit {
+                proxy_url,
+                no_proxy,
+                ca_bundle,
+                trust: trust.map(TrustMode::from),
+                unset,
+                clear,
+            },
+        ),
     }
 }
 
@@ -314,6 +410,21 @@ fn cmd_show() -> ExitCode {
                 "coord_url":    p.coord_url,
                 "api_url":      p.api_url,
                 "auth":         auth_view,
+                // Read by the same rule as the runner's startup step.
+                "network":      qontinui_runner_lib::profiles::network_with_source()
+                    .map(|(n, _)| network_view(&n)),
+                // The machine's default for the six outbound data flows
+                // (`on` | `off`); `null` is no profile opinion.
+                "egress_default": match qontinui_runner_lib::profiles::active_egress_profile() {
+                    qontinui_runner_lib::profiles::ActiveEgress::Profile(e) => {
+                        json!(e.and_then(|e| e.default))
+                    }
+                    qontinui_runner_lib::profiles::ActiveEgress::FileAbsent => json!(null),
+                    // The runner reads an unusable file as `off`; say so.
+                    qontinui_runner_lib::profiles::ActiveEgress::Unreadable(why) => {
+                        json!(format!("off (profiles.json unusable: {why})"))
+                    }
+                },
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             ExitCode::SUCCESS
@@ -414,7 +525,7 @@ fn cmd_use(name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_init(host: &str) -> ExitCode {
+fn cmd_init(host: &str, egress_default: Option<&str>) -> ExitCode {
     let path = match profiles_path() {
         Some(p) => p,
         None => {
@@ -438,6 +549,25 @@ fn cmd_init(host: &str) -> ExitCode {
         }
     }
 
+    let file = starter_profiles(host, egress_default);
+    if let Err(e) = atomic_write(&path, &file) {
+        eprintln!("write {} failed: {}", path.display(), e);
+        return ExitCode::from(2);
+    }
+    println!(
+        "wrote {} (active=canonical, host={}{})",
+        path.display(),
+        host,
+        egress_default
+            .map(|d| format!(", egress.default={d}"))
+            .unwrap_or_default()
+    );
+    ExitCode::SUCCESS
+}
+
+/// The starter profiles.json `init` writes. Pure, so the `--egress-default`
+/// arm is testable without writing the operator's real file.
+fn starter_profiles(host: &str, egress_default: Option<&str>) -> ProfilesFile {
     let mut profiles = HashMap::new();
     let canonical = Profile {
         // Seeds the CANONICAL STACK, deliberately. A newly provisioned box on
@@ -469,18 +599,272 @@ fn cmd_init(host: &str) -> ExitCode {
             token: None,
         }),
         network: None,
+        egress: egress_default.map(|d| EgressProfile {
+            default: Some(d.to_string()),
+        }),
     };
     profiles.insert("canonical".to_string(), canonical);
-    let file = ProfilesFile {
+    ProfilesFile {
         active: Some("canonical".to_string()),
         profiles,
+    }
+}
+
+// ============================================================================
+// network subcommand
+// ============================================================================
+
+/// One `network` invocation's requested change.
+#[derive(Debug, Default)]
+struct NetworkEdit {
+    proxy_url: Option<String>,
+    no_proxy: Option<String>,
+    ca_bundle: Option<PathBuf>,
+    trust: Option<TrustMode>,
+    unset: Vec<NetworkField>,
+    clear: bool,
+}
+
+impl NetworkEdit {
+    fn is_read(&self) -> bool {
+        self.proxy_url.is_none()
+            && self.no_proxy.is_none()
+            && self.ca_bundle.is_none()
+            && self.trust.is_none()
+            && self.unset.is_empty()
+            && !self.clear
+    }
+}
+
+/// The `network` block as `show` / `network` print it: the proxy with any
+/// credential withheld, everything else as stored.
+fn network_view(n: &NetworkProfile) -> serde_json::Value {
+    json!({
+        "proxy_url": n.proxy_url.as_deref().map(qontinui_runner_lib::outbound_net::redact_proxy_url),
+        "no_proxy":  n.no_proxy,
+        "ca_bundle": n.ca_bundle,
+        "trust":     n.trust,
+    })
+}
+
+/// Apply `edit` to `current`, returning the new block (`None` = no block)
+/// plus warnings to print. Refuses a contradictory or invalid edit without
+/// changing anything. `bundle_exists` is injected so tests need no files.
+fn apply_network_edit(
+    current: Option<NetworkProfile>,
+    edit: &NetworkEdit,
+    bundle_exists: &dyn Fn(&Path) -> bool,
+) -> Result<(Option<NetworkProfile>, Vec<String>), String> {
+    let sets_any = edit.proxy_url.is_some()
+        || edit.no_proxy.is_some()
+        || edit.ca_bundle.is_some()
+        || edit.trust.is_some();
+    if edit.clear && (sets_any || !edit.unset.is_empty()) {
+        return Err(
+            "--clear removes the whole block; it cannot be combined with a setter or --unset"
+                .into(),
+        );
+    }
+    let unsets = |f: NetworkField| edit.unset.contains(&f);
+    for (field, set) in [
+        (NetworkField::ProxyUrl, edit.proxy_url.is_some()),
+        (NetworkField::NoProxy, edit.no_proxy.is_some()),
+        (NetworkField::CaBundle, edit.ca_bundle.is_some()),
+        (NetworkField::Trust, edit.trust.is_some()),
+    ] {
+        if set && unsets(field) {
+            let flag = field
+                .to_possible_value()
+                .map_or_else(|| format!("{field:?}"), |v| v.get_name().to_string());
+            return Err(format!("--{flag} is both set and unset in one call"));
+        }
+    }
+    if edit.clear {
+        return Ok((None, Vec::new()));
+    }
+
+    let mut warnings = Vec::new();
+    // The stored proxy always carries its scheme: hyper-util and git accept a
+    // bare `host:port`, but Node (the `claude` CLI) reads `proxy:3128` as a
+    // URL whose scheme is `proxy:`.
+    let mut proxy_url = None;
+    if let Some(raw) = &edit.proxy_url {
+        let raw = raw.trim();
+        let candidate = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("http://{raw}")
+        };
+        let parsed = url::Url::parse(&candidate)
+            .ok()
+            .filter(|u| u.host_str().is_some_and(|h| !h.is_empty()));
+        let Some(parsed) = parsed else {
+            return Err("--proxy-url does not parse as a URL with a host".into());
+        };
+        if !qontinui_runner_lib::outbound_net::proxy_scheme_is_tunnellable(parsed.scheme()) {
+            warnings.push(format!(
+                "a {}:// proxy cannot carry the runner's WebSockets; they will connect DIRECT \
+                 (HTTP clients still use it)",
+                parsed.scheme()
+            ));
+        }
+        proxy_url = Some(candidate.trim_end_matches('/').to_string());
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            warnings.push(
+                "the proxy URL carries a credential: it is stored in profiles.json in plain text \
+                 and was visible on this command line"
+                    .into(),
+            );
+        }
+    }
+    // A relative bundle would resolve against the RUNNER's working directory
+    // once exported as NODE_EXTRA_CA_CERTS, not this command's.
+    let ca_bundle = match &edit.ca_bundle {
+        Some(bundle) => {
+            let abs = std::path::absolute(bundle)
+                .map_err(|e| format!("--ca-bundle {}: {e}", bundle.display()))?;
+            if !bundle_exists(&abs) {
+                return Err(format!("--ca-bundle {} does not exist", abs.display()));
+            }
+            Some(abs)
+        }
+        None => None,
     };
-    if let Err(e) = atomic_write(&path, &file) {
-        eprintln!("write {} failed: {}", path.display(), e);
+
+    let mut next = current.unwrap_or_default();
+    if proxy_url.is_some() {
+        next.proxy_url = proxy_url;
+    }
+    if let Some(v) = &edit.no_proxy {
+        // An empty list is the same as none.
+        let v = v.trim();
+        next.no_proxy = (!v.is_empty()).then(|| v.to_string());
+    }
+    if ca_bundle.is_some() {
+        next.ca_bundle = ca_bundle;
+    }
+    if let Some(v) = edit.trust {
+        next.trust = Some(v);
+    }
+    for f in &edit.unset {
+        match f {
+            NetworkField::ProxyUrl => next.proxy_url = None,
+            NetworkField::NoProxy => next.no_proxy = None,
+            NetworkField::CaBundle => next.ca_bundle = None,
+            NetworkField::Trust => next.trust = None,
+        }
+    }
+    // An all-empty block reads exactly like no block at startup; store none.
+    let empty = next == NetworkProfile::default();
+    Ok((if empty { None } else { Some(next) }, warnings))
+}
+
+fn cmd_network(profile_arg: Option<&str>, edit: NetworkEdit) -> ExitCode {
+    let Some(path) = profiles_path() else {
+        eprintln!("could not resolve home directory");
+        return ExitCode::from(2);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "read {} failed: {e}\n\
+                 Run 'qontinui_profile init' first.",
+                path.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let file: ProfilesFile = match serde_json::from_slice(&bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("parse failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let name = profile_arg.map(str::to_string).unwrap_or_else(|| {
+        network_profile_name(&file, std::env::var("QONTINUI_ENV").ok().as_deref())
+    });
+    let Some(profile) = file.profiles.get(&name) else {
+        let mut available: Vec<&str> = file.profiles.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        eprintln!(
+            "profile '{name}' not found. Available: {}",
+            available.join(", ")
+        );
+        return ExitCode::from(1);
+    };
+
+    if edit.is_read() {
+        let out = json!({
+            "profile": name,
+            "network": profile.network.as_ref().map(network_view),
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        return ExitCode::SUCCESS;
+    }
+
+    let (next, warnings) =
+        match apply_network_edit(profile.network.clone(), &edit, &|p: &Path| p.is_file()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    let view = next.as_ref().map(network_view);
+    // Rewrite ONLY `profiles.<name>.network` in the raw document, so keys the
+    // typed `ProfilesFile` does not model survive the edit.
+    let written = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|mut doc| {
+            set_network_value(&mut doc, &name, next.as_ref())?;
+            atomic_write_value(&path, &doc).map_err(|e| e.to_string())
+        });
+    if let Err(e) = written {
+        eprintln!("write {} failed: {e}", path.display());
         return ExitCode::from(2);
     }
-    println!("wrote {} (active=canonical, host={})", path.display(), host);
+    let out = json!({ "profile": name, "network": view });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    eprintln!("applies at the runner's next start; a running runner keeps its startup values");
     ExitCode::SUCCESS
+}
+
+/// Set (or, for `None`, remove) `profiles.<name>.network` in a raw
+/// profiles.json document, leaving every other key as it was.
+fn set_network_value(
+    doc: &mut serde_json::Value,
+    name: &str,
+    network: Option<&NetworkProfile>,
+) -> Result<(), String> {
+    let profile = doc
+        .get_mut("profiles")
+        .and_then(|p| p.get_mut(name))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("profiles.{name} is not an object"))?;
+    match network {
+        Some(n) => {
+            let v = serde_json::to_value(n).map_err(|e| e.to_string())?;
+            profile.insert("network".to_string(), v);
+        }
+        None => {
+            profile.remove("network");
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write_value(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
+    let pretty = serde_json::to_vec_pretty(doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &pretty)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn atomic_write(path: &Path, file: &ProfilesFile) -> std::io::Result<()> {
@@ -1602,6 +1986,221 @@ mod tests {
     use clap::error::ErrorKind;
     use clap::CommandFactory;
 
+    fn no_files(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn network_edit_sets_fields_onto_an_absent_block() {
+        let edit = NetworkEdit {
+            proxy_url: Some(" http://proxy.example.test:3128 ".into()),
+            trust: Some(TrustMode::Os),
+            ..NetworkEdit::default()
+        };
+        let (next, warnings) = apply_network_edit(None, &edit, &no_files).unwrap();
+        let next = next.expect("a block is written");
+        assert_eq!(
+            next.proxy_url.as_deref(),
+            Some("http://proxy.example.test:3128")
+        );
+        assert_eq!(next.trust, Some(TrustMode::Os));
+        assert_eq!(next.no_proxy, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn network_edit_keeps_untouched_fields_and_unsets_named_ones() {
+        let current = NetworkProfile {
+            proxy_url: Some("http://p.example.test:1".into()),
+            no_proxy: Some(".corp.example.test".into()),
+            ca_bundle: Some(PathBuf::from("/corp/root.pem")),
+            trust: Some(TrustMode::Bundled),
+        };
+        let edit = NetworkEdit {
+            unset: vec![NetworkField::NoProxy],
+            trust: Some(TrustMode::Os),
+            ..NetworkEdit::default()
+        };
+        let (next, _) = apply_network_edit(Some(current), &edit, &no_files).unwrap();
+        let next = next.unwrap();
+        assert_eq!(next.proxy_url.as_deref(), Some("http://p.example.test:1"));
+        assert_eq!(next.no_proxy, None);
+        assert_eq!(next.ca_bundle, Some(PathBuf::from("/corp/root.pem")));
+        assert_eq!(next.trust, Some(TrustMode::Os));
+    }
+
+    #[test]
+    fn network_edit_that_empties_the_block_removes_it() {
+        let current = NetworkProfile {
+            trust: Some(TrustMode::Os),
+            ..NetworkProfile::default()
+        };
+        let edit = NetworkEdit {
+            unset: vec![NetworkField::Trust],
+            ..NetworkEdit::default()
+        };
+        assert_eq!(
+            apply_network_edit(Some(current.clone()), &edit, &no_files)
+                .unwrap()
+                .0,
+            None
+        );
+        let clear = NetworkEdit {
+            clear: true,
+            ..NetworkEdit::default()
+        };
+        assert_eq!(
+            apply_network_edit(Some(current), &clear, &no_files)
+                .unwrap()
+                .0,
+            None
+        );
+    }
+
+    #[test]
+    fn network_edit_refuses_contradictions_and_bad_input() {
+        let both = NetworkEdit {
+            proxy_url: Some("http://p.example.test:1".into()),
+            unset: vec![NetworkField::ProxyUrl],
+            ..NetworkEdit::default()
+        };
+        assert!(apply_network_edit(None, &both, &no_files).is_err());
+        let clear_and_set = NetworkEdit {
+            clear: true,
+            trust: Some(TrustMode::Os),
+            ..NetworkEdit::default()
+        };
+        assert!(apply_network_edit(None, &clear_and_set, &no_files).is_err());
+        let no_host = NetworkEdit {
+            proxy_url: Some("http://".into()),
+            ..NetworkEdit::default()
+        };
+        assert!(apply_network_edit(None, &no_host, &no_files).is_err());
+        let missing_bundle = NetworkEdit {
+            ca_bundle: Some(PathBuf::from("/nope/root.pem")),
+            ..NetworkEdit::default()
+        };
+        assert!(apply_network_edit(None, &missing_bundle, &no_files).is_err());
+        let ok = apply_network_edit(None, &missing_bundle, &|_: &Path| true).unwrap();
+        // `absolute` adds a drive prefix on Windows; compare against it.
+        assert_eq!(
+            ok.0.unwrap().ca_bundle,
+            Some(std::path::absolute("/nope/root.pem").unwrap())
+        );
+        let err = apply_network_edit(None, &both, &no_files).unwrap_err();
+        assert!(err.contains("--proxy-url"), "names the flag: {err}");
+    }
+
+    #[test]
+    fn network_edit_stores_a_schemeless_proxy_with_its_scheme() {
+        let edit = NetworkEdit {
+            proxy_url: Some("proxy.example.test:3128".into()),
+            ..NetworkEdit::default()
+        };
+        let (next, _) = apply_network_edit(None, &edit, &no_files).unwrap();
+        assert_eq!(
+            next.unwrap().proxy_url.as_deref(),
+            Some("http://proxy.example.test:3128")
+        );
+    }
+
+    #[test]
+    fn network_edit_stores_a_relative_bundle_as_absolute() {
+        let edit = NetworkEdit {
+            ca_bundle: Some(PathBuf::from("corp/root.pem")),
+            ..NetworkEdit::default()
+        };
+        let (next, _) = apply_network_edit(None, &edit, &|_: &Path| true).unwrap();
+        let stored = next.unwrap().ca_bundle.unwrap();
+        assert!(stored.is_absolute(), "{}", stored.display());
+        assert!(stored.ends_with("corp/root.pem"), "{}", stored.display());
+    }
+
+    #[test]
+    fn network_write_keeps_keys_the_typed_file_does_not_model() {
+        let mut doc = json!({
+            "active": "dev",
+            "future_top_level": 1,
+            "profiles": {"dev": {"api_url": "http://a.example.test", "future_key": true,
+                                 "network": {"trust": "os"}}}
+        });
+        let n = NetworkProfile {
+            no_proxy: Some(".corp.example.test".into()),
+            ..NetworkProfile::default()
+        };
+        set_network_value(&mut doc, "dev", Some(&n)).unwrap();
+        assert_eq!(doc["future_top_level"], 1);
+        assert_eq!(doc["profiles"]["dev"]["future_key"], true);
+        assert_eq!(
+            doc["profiles"]["dev"]["network"]["no_proxy"],
+            ".corp.example.test"
+        );
+        set_network_value(&mut doc, "dev", None).unwrap();
+        assert!(doc["profiles"]["dev"].get("network").is_none());
+        assert_eq!(doc["profiles"]["dev"]["api_url"], "http://a.example.test");
+        assert!(set_network_value(&mut doc, "missing", None).is_err());
+    }
+
+    #[test]
+    fn network_edit_warns_on_an_untunnellable_or_credentialed_proxy() {
+        let socks = NetworkEdit {
+            proxy_url: Some("socks5://p.example.test:1080".into()),
+            ..NetworkEdit::default()
+        };
+        let (_, w) = apply_network_edit(None, &socks, &no_files).unwrap();
+        assert!(w.iter().any(|w| w.contains("DIRECT")), "{w:?}");
+        let cred = NetworkEdit {
+            proxy_url: Some("http://u:secret@p.example.test:1".into()),
+            ..NetworkEdit::default()
+        };
+        let (_, w) = apply_network_edit(None, &cred, &no_files).unwrap();
+        assert!(w.iter().any(|w| w.contains("credential")), "{w:?}");
+        assert!(w.iter().all(|w| !w.contains("secret")), "{w:?}");
+    }
+
+    #[test]
+    fn network_view_withholds_the_proxy_credential() {
+        let n = NetworkProfile {
+            proxy_url: Some("http://u:secret@p.example.test:1".into()),
+            ..NetworkProfile::default()
+        };
+        let shown = network_view(&n).to_string();
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("p.example.test"), "{shown}");
+    }
+
+    #[test]
+    fn network_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "qontinui_profile",
+            "network",
+            "--proxy-url",
+            "http://p.example.test:1",
+            "--trust",
+            "bundled",
+            "--unset",
+            "no-proxy",
+            "--unset",
+            "ca-bundle",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Network {
+                proxy_url,
+                trust,
+                unset,
+                clear,
+                ..
+            }) => {
+                assert_eq!(proxy_url.as_deref(), Some("http://p.example.test:1"));
+                assert_eq!(trust, Some(TrustArg::Bundled));
+                assert_eq!(unset, vec![NetworkField::NoProxy, NetworkField::CaBundle]);
+                assert!(!clear);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
     #[test]
     fn device_init_write_leaves_no_temp_debris() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -2110,7 +2709,13 @@ mod tests {
     fn init_defaults_to_localhost() {
         let cli = Cli::try_parse_from(["qontinui_profile", "init"]).expect("parses");
         match cli.cmd {
-            Some(Cmd::Init { host }) => assert_eq!(host, "localhost"),
+            Some(Cmd::Init {
+                host,
+                egress_default,
+            }) => {
+                assert_eq!(host, "localhost");
+                assert_eq!(egress_default, None);
+            }
             other => panic!("expected Init, got {:?}", other),
         }
     }
@@ -2120,9 +2725,33 @@ mod tests {
         let cli = Cli::try_parse_from(["qontinui_profile", "init", "--host", "192.168.1.42"])
             .expect("parses");
         match cli.cmd {
-            Some(Cmd::Init { host }) => assert_eq!(host, "192.168.1.42"),
+            Some(Cmd::Init { host, .. }) => assert_eq!(host, "192.168.1.42"),
             other => panic!("expected Init, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn init_accepts_egress_default_off_and_writes_it() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "init", "--egress-default", "off"])
+            .expect("parses");
+        let Some(Cmd::Init {
+            host,
+            egress_default,
+        }) = cli.cmd
+        else {
+            panic!("expected Init");
+        };
+        assert_eq!(egress_default.as_deref(), Some("off"));
+        let file = starter_profiles(&host, egress_default.as_deref());
+        let json = serde_json::to_value(&file).unwrap();
+        assert_eq!(json["profiles"]["canonical"]["egress"]["default"], "off");
+        // Without the flag the key is absent, not `null`.
+        let plain = serde_json::to_value(starter_profiles("localhost", None)).unwrap();
+        assert!(plain["profiles"]["canonical"].get("egress").is_none());
+        // Anything but on/off is refused at the door.
+        assert!(
+            Cli::try_parse_from(["qontinui_profile", "init", "--egress-default", "maybe"]).is_err()
+        );
     }
 
     #[test]

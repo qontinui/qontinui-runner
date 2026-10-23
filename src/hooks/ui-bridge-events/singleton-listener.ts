@@ -61,14 +61,36 @@ interface HandlerBox<T> {
 }
 
 interface Subscription<T> {
-  /** In-flight or resolved listen() promise (for race-safe teardown). */
+  /**
+   * In-flight or resolved listen() promise (for race-safe teardown). `null`
+   * once a listen() has REJECTED: that listener never existed, so it is
+   * dropped, and the next acquisition or readiness probe listens again.
+   */
   listenPromise: Promise<UnlistenFn> | null;
   /** Live handlers — the single listener fans out to every one of them. */
   handlers: Set<HandlerBox<T>>;
+  /** The stable trampoline every listen() for this subscription registers. */
+  dispatch: (event: Event<T>) => void;
 }
 
 // Keyed by event name. `unknown` payloads; each acquire() narrows.
 const subscriptions = new Map<string, Subscription<unknown>>();
+
+/**
+ * Start (or restart) `sub`'s listen(). A rejection drops the promise, so a
+ * later acquisition or `singletonListenerReady` retries instead of every
+ * consumer waiting forever on a listener that was never installed. The
+ * handler set is kept: a retry that succeeds reaches every live handler.
+ */
+function startListen<T>(eventName: string, sub: Subscription<T>): Promise<UnlistenFn> {
+  const promise = listen<T>(eventName, sub.dispatch);
+  sub.listenPromise = promise;
+  promise.catch((e) => {
+    console.warn(`[singleton-listener] listen("${eventName}") failed; will retry:`, e);
+    if (sub.listenPromise === promise) sub.listenPromise = null;
+  });
+  return promise;
+}
 
 /**
  * Acquire the singleton listener for `eventName`, installing it on first
@@ -86,31 +108,35 @@ export function acquireSingletonListener<T>(eventName: string, handler: Handler<
   const box: HandlerBox<T> = { fn: handler };
 
   if (!sub) {
+    const handlers = new Set([box]);
     const created: Subscription<T> = {
       listenPromise: null,
-      handlers: new Set([box]),
-    };
-    // Stable trampoline: closed over `created`, so it always fans out to the
-    // current handler set. The Tauri listener is registered with THIS
-    // function once and never re-registered. Iterating the Set directly is
-    // safe — JS Set iteration tolerates deletion mid-iteration (a handler
-    // that releases its own subscription) — and avoids an array allocation
-    // on a per-output-chunk hot path.
-    created.listenPromise = listen<T>(eventName, (event) => {
-      for (const h of created.handlers) {
-        try {
-          void h.fn(event);
-        } catch (e) {
-          // One faulty consumer must not starve its siblings on a shared
-          // listener — that is the whole point of the fan-out.
-          console.error(`[singleton-listener] handler for "${eventName}" threw:`, e);
+      handlers,
+      // Stable trampoline: closed over the handler set, so it always fans out
+      // to the current handlers. The Tauri listener is registered with THIS
+      // function (again only if a listen() failed). Iterating the Set directly
+      // is safe — JS Set iteration tolerates deletion mid-iteration (a handler
+      // that releases its own subscription) — and avoids an array allocation
+      // on a per-output-chunk hot path.
+      dispatch: (event) => {
+        for (const h of handlers) {
+          try {
+            void h.fn(event);
+          } catch (e) {
+            // One faulty consumer must not starve its siblings on a shared
+            // listener — that is the whole point of the fan-out.
+            console.error(`[singleton-listener] handler for "${eventName}" threw:`, e);
+          }
         }
-      }
-    });
+      },
+    };
+    startListen(eventName, created);
     sub = created;
     subscriptions.set(eventName, created as Subscription<unknown>);
   } else {
     sub.handlers.add(box);
+    // Its listen() failed: this acquisition retries it.
+    if (!sub.listenPromise) startListen(eventName, sub);
   }
 
   const acquired = sub;
@@ -145,6 +171,39 @@ export function acquireSingletonListener<T>(eventName: string, handler: Handler<
         });
     }
   };
+}
+
+/**
+ * Resolves once the listener for `eventName` is live in the backend: Tauri's
+ * `listen()` resolves only after the runner has registered it, and events
+ * emitted before that reach no handler. `acquireSingletonListener` starts the
+ * `listen()` without awaiting it, so a caller that must not miss an event
+ * emitted after some point (a flow-control reset whose bytes it has to ack)
+ * awaits this first. Resolves `true` when the listener is live, and `false`
+ * when there is no subscription or its `listen()` failed twice: it never
+ * rejects, so awaiting it cannot hang a mount. When the attempt it awaits
+ * fails, it retries once before answering (and the next acquisition retries
+ * too).
+ */
+export async function singletonListenerReady(eventName: string): Promise<boolean> {
+  const sub = subscriptions.get(eventName);
+  if (!sub) return false;
+  const live = async (promise: Promise<UnlistenFn>) => {
+    try {
+      await promise;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Await the attempt in flight, or start one if the last one failed.
+  if (await live(sub.listenPromise ?? startListen(eventName, sub))) return true;
+  // That attempt failed. The pane waiting here is the one that needs the
+  // listener (the terminal demux registers only once, so no later acquisition
+  // would retry for it): try ONE more time, unless the subscription was torn
+  // down or someone else already retried, in which case await theirs.
+  if (subscriptions.get(eventName) !== sub) return false;
+  return live(sub.listenPromise ?? startListen(eventName, sub));
 }
 
 /** Test-only: number of live singleton subscriptions. */
