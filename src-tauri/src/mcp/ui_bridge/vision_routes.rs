@@ -5024,7 +5024,8 @@ mod text_hidden_tests {
             );
             let gate = pos(body, "refuse_untrusted_frame_b(");
             assert!(
-                body[gate..].contains("principal.as_deref()"),
+                body.get(gate..)
+                    .is_some_and(|rest| rest.contains("principal.as_deref()")),
                 "{handler} must gate on the requester it was given"
             );
             assert!(
