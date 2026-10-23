@@ -4,9 +4,12 @@
 //! `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`,
 //! Phase 6.
 //!
-//! **Report-only.** `GET /restart-readiness` renders the aggregate as
-//! `live_claude.by_activity`; nothing reads it into a verdict. An idle session
-//! still dies on a restart, so "idle" here never means "safe to kill".
+//! **The aggregate is report-only.** `GET /restart-readiness` renders it as
+//! `live_claude.by_activity`; nothing reads the four-way [`Activity`] split
+//! into a verdict. An idle session still dies on a restart, so "idle" here
+//! never means "safe to kill". The wind-down verdict reads the RECORD half
+//! only, through [`wind_down_record`] — never the pane-first [`classify`] — and
+//! it treats `waiting` as blocked on a human, not as idle.
 //!
 //! # Two evidence sources, in precedence order
 //!
@@ -70,7 +73,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::session::wind_down_observer::TerminalObservation;
-use qontinui_runner_lib::wind_down::{GridIdle, Sideband, SidebandState};
+use qontinui_runner_lib::wind_down::{
+    GridIdle, RecordStatus, SessionRecord, Sideband, SidebandState,
+};
 
 /// A `busy`/`shell` session counts as `working` only when it exchanged a
 /// message within this window (30 min, the plan's `--active-minutes` default);
@@ -256,6 +261,36 @@ pub fn classify_from_record(reading: &RecordReading, now_ms: i64) -> Activity {
     }
 }
 
+/// The wind-down verdict's record input (plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+/// D3). Built on [`classify_from_record`] — NEVER [`classify`], which lets the
+/// pane decide first and would re-import the screen heuristic the verdict
+/// stopped trusting for "is it working?".
+///
+/// Only a record whose status is literally `idle` AND that
+/// [`classify_from_record`] calls [`Activity::Idle`] maps to
+/// [`RecordStatus::Idle`]. `waiting` is split out: the activity report counts
+/// it idle, but on Claude Code 2.1.309 it means a permission prompt or an open
+/// question is waiting on a human (its `waitingFor` field says which), and a
+/// session blocked on a human is not finished. Anything that is not a parsed
+/// record is [`RecordStatus::Unknown`].
+pub fn wind_down_record(reading: &RecordReading, now_ms: i64) -> SessionRecord {
+    let RecordReading::Parsed(ev) = reading else {
+        return SessionRecord::UNKNOWN;
+    };
+    let status = match ev.status.as_str() {
+        "idle" if classify_from_record(reading, now_ms) == Activity::Idle => RecordStatus::Idle,
+        "waiting" => RecordStatus::Waiting,
+        "busy" => RecordStatus::Busy,
+        "shell" => RecordStatus::Shell,
+        _ => RecordStatus::Unknown,
+    };
+    SessionRecord {
+        status,
+        last_message_ms: ev.last_message_ms,
+    }
+}
+
 /// The full precedence: a decisive pane observation, else the record.
 pub fn classify(
     observation: Option<&TerminalObservation>,
@@ -358,6 +393,29 @@ pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
     })
 }
 
+/// Admits ONE blocking record read at a time per flag: a read that timed out
+/// and was abandoned is still running (a blocking thread cannot be cancelled),
+/// and starting another per poll would leak a thread each time on a hung
+/// filesystem. Clears the flag when dropped — when the read finishes or
+/// unwinds, not when the caller stops waiting for it.
+pub struct InFlightRead(&'static std::sync::atomic::AtomicBool);
+
+impl InFlightRead {
+    /// `None` while another read holding `flag` is still running.
+    pub fn try_acquire(flag: &'static std::sync::atomic::AtomicBool) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for InFlightRead {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Read Claude Code's record for each of `pids` across `config_dirs`.
 ///
 /// Each `sessions/` dir is listed ONCE and only the wanted `<pid>.json` files
@@ -368,6 +426,26 @@ pub fn read_records(
     config_dirs: &[PathBuf],
     pids: &[LivePid],
     proc_start: &dyn Fn(u32) -> Option<String>,
+) -> HashMap<u32, RecordReading> {
+    read_records_with(config_dirs, pids, proc_start, ACTIVITY_TRANSCRIPT_STATUSES)
+}
+
+/// The statuses whose transcript tail the activity report reads: only
+/// `busy`/`shell` need a message age to tell `working` from `stale`.
+pub const ACTIVITY_TRANSCRIPT_STATUSES: &[&str] = &["busy", "shell"];
+
+/// The statuses whose transcript tail the wind-down verdict reads: an `idle`
+/// record must also show a transcript quiet for the grace period. Every other
+/// status already rules a close out, so it pays no tail read.
+pub const WIND_DOWN_TRANSCRIPT_STATUSES: &[&str] = &["idle"];
+
+/// [`read_records`], reading the transcript tail for exactly the records whose
+/// status is in `transcript_statuses`.
+pub fn read_records_with(
+    config_dirs: &[PathBuf],
+    pids: &[LivePid],
+    proc_start: &dyn Fn(u32) -> Option<String>,
+    transcript_statuses: &[&str],
 ) -> HashMap<u32, RecordReading> {
     let wanted: std::collections::HashSet<u32> = pids.iter().map(|p| p.pid).collect();
     // pid -> every (config dir, record path) that names it.
@@ -396,7 +474,7 @@ pub fn read_records(
         .map(|&live| {
             let reading = match found.get(&live.pid) {
                 None => RecordReading::Missing,
-                Some(candidates) => read_one(live, candidates, proc_start),
+                Some(candidates) => read_one(live, candidates, proc_start, transcript_statuses),
             };
             (live.pid, reading)
         })
@@ -407,6 +485,7 @@ fn read_one(
     live: LivePid,
     candidates: &[(PathBuf, PathBuf)],
     proc_start: &dyn Fn(u32) -> Option<String>,
+    transcript_statuses: &[&str],
 ) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
     let mut reused = false;
@@ -444,7 +523,7 @@ fn read_one(
             RecordReading::Unparseable
         };
     };
-    if ev.status == "busy" || ev.status == "shell" {
+    if transcript_statuses.contains(&ev.status.as_str()) {
         if let (Some(cwd), Some(session_id)) = (raw.cwd.as_deref(), raw.session_id.as_deref()) {
             let transcript =
                 crate::terminal::transcript::session_transcript_path(dir, cwd, session_id);
@@ -476,7 +555,11 @@ mod tests {
     }
 
     fn obs(sideband: Sideband, grid: GridIdle) -> TerminalObservation {
-        TerminalObservation { sideband, grid }
+        TerminalObservation {
+            sideband,
+            grid,
+            prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+        }
     }
 
     fn working_since(age_min: i64) -> Sideband {
@@ -888,6 +971,83 @@ mod tests {
                 Activity::Unknown
             );
         }
+    }
+
+    /// The wind-down record input (plan
+    /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+    /// D3), read from real files the way the verdict reads them: only a
+    /// literal `idle` record is `Idle`, and it carries its transcript's last
+    /// message; `waiting` — for either `waitingFor` value Claude Code 2.1.309
+    /// writes — `busy` and `shell` keep their own status; anything unreadable
+    /// is `Unknown`.
+    #[test]
+    fn wind_down_record_maps_every_status_and_reads_the_idle_transcript() {
+        let root = scratch("wind-down");
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let cwd = "/work/repo";
+        let rec = |pid: u32, body: String| {
+            std::fs::write(dir.join(format!("sessions/{pid}.json")), body).unwrap();
+        };
+        let with = |pid: u32, status: &str, extra: &str| {
+            format!(
+                r#"{{"pid":{pid},"sessionId":"s{pid}","cwd":"{cwd}","status":"{status}","statusUpdatedAt":{}{extra}}}"#,
+                NOW - 600 * MIN
+            )
+        };
+        rec(30, with(30, "idle", ""));
+        rec(
+            31,
+            with(31, "waiting", r#","waitingFor":"permission prompt""#),
+        );
+        rec(32, with(32, "waiting", r#","waitingFor":"input needed""#));
+        rec(33, with(33, "busy", ""));
+        rec(34, with(34, "shell", ""));
+        rec(35, with(35, "napping", ""));
+        rec(36, "{garbage".to_string());
+        rec(37, with(37, "idle", "")); // idle, but no transcript on disk
+        let last = chrono::DateTime::from_timestamp_millis(NOW - 45 * MIN)
+            .unwrap()
+            .to_rfc3339();
+        let transcript = crate::terminal::transcript::session_transcript_path(&dir, cwd, "s30");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"assistant\",\"timestamp\":\"{last}\"}}\n"),
+        )
+        .unwrap();
+
+        let pids: Vec<LivePid> = (30..=38).map(live).collect();
+        let readings = read_records_with(&[dir], &pids, &no_proc, WIND_DOWN_TRANSCRIPT_STATUSES);
+        let record = |pid: u32| wind_down_record(&readings[&pid], NOW);
+        assert_eq!(
+            record(30),
+            SessionRecord {
+                status: RecordStatus::Idle,
+                last_message_ms: Some(NOW - 45 * MIN),
+            }
+        );
+        assert_eq!(record(31).status, RecordStatus::Waiting);
+        assert_eq!(record(32).status, RecordStatus::Waiting);
+        assert_eq!(record(33).status, RecordStatus::Busy);
+        assert_eq!(record(34).status, RecordStatus::Shell);
+        for pid in [35, 36, 38] {
+            assert_eq!(record(pid), SessionRecord::UNKNOWN, "pid {pid}");
+        }
+        // An idle record whose transcript is missing has no message age.
+        assert_eq!(
+            record(37),
+            SessionRecord {
+                status: RecordStatus::Idle,
+                last_message_ms: None,
+            }
+        );
+        // The activity report still never pays an idle record's tail read.
+        let activity = read_records(&[root.path().join(".claude")], &[live(30)], &no_proc);
+        let RecordReading::Parsed(ev) = &activity[&30] else {
+            panic!("{:?}", activity[&30]);
+        };
+        assert_eq!(ev.last_message_ms, None);
     }
 
     #[test]

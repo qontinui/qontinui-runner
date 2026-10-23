@@ -21,30 +21,48 @@
 //! Evaluated in this fixed order, first match wins:
 //!
 //! 1. **Any unknown input → [`Eligibility::Unknown`].** An unreadable coord
-//!    work axis, an unreadable sideband slot, a grid that could not be
-//!    observed, or a children hint that could not be computed. *"`finished` is
-//!    a declaration, never an inference"* — so an unknown is never promoted to
-//!    anything that could later authorise a close.
+//!    work axis, an unreadable sideband slot, a pane that could not be
+//!    observed (its grid or its input area), or a children hint that could
+//!    not be computed. *"`finished` is a declaration, never an inference"* —
+//!    so an unknown is never promoted to anything that could later authorise
+//!    a close.
 //! 2. **A `working` sideband state → [`Eligibility::Ineligible`].** Because
-//!    the grace clock starts at the LATER of the grid-idle time and the
-//!    sideband's set-time (rule 6), a `working` report also restarts the grace
-//!    period once the session stops reporting `working`.
-//! 3. **A grid that does not look idle → `Ineligible`.**
-//! 4. **Live child processes → `Ineligible`.** `has_live_children` is a hint,
+//!    the grace clock starts at the LATER of the transcript's last message and
+//!    the sideband's set-time (rule 8), a `working` report also restarts the
+//!    grace period once the session stops reporting `working`.
+//! 3. **Claude Code's own record is not `idle` → `Ineligible`** —
+//!    `record_busy`, `record_waiting` (blocked on a human: a permission prompt
+//!    or a question), `record_shell` (a background command), or
+//!    `record_unknown` (absent, unreadable, unrecognised). This is the "is it
+//!    working?" answer (plan
+//!    `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+//!    D3): the typed signal outranks the screen. The rendered grid's
+//!    turn-complete heuristic no longer decides it — a grid that reads busy
+//!    (reported as `idleEvidence`) does not block a close by itself.
+//! 4. **The input area is not an empty prompt → `Ineligible`
+//!    (`prompt_not_ready`).** The grid's one remaining job: a VETO on positive
+//!    evidence the record cannot see — an unsent draft, an open dialog, or no
+//!    input prompt under the cursor.
+//! 5. **Live child processes → `Ineligible`.** `has_live_children` is a hint,
 //!    so it is used as a necessary condition and never a sufficient one.
-//! 5. **A terminal session that is not `finished` → `Ineligible`, forever.**
+//! 6. **A terminal session that is not `finished` → `Ineligible`, forever.**
 //!    An idle-but-unfinished session is never closed automatically; the
 //!    operator's *finish-and-close* click is the declaration. Looping and
 //!    steward sessions are EXEMPT from this rule (D6): they never finish by
 //!    design, and their iteration boundary is the idle window itself. The
 //!    work axis is not even consulted for them, so an unreadable coord does
 //!    not make a loop `Unknown`.
-//! 6. **Grace.** Eligible once `now >= since + grace`, where `since` is the
-//!    latest of the grid-idle-since time, the sideband set-time and — for a
-//!    terminal session whose coord row carried it — the time the `finished`
-//!    declaration was made; before that, [`Eligibility::NotYet`] with the
-//!    instant it would become eligible. When coord serves no transition time
-//!    the declaration does not bound the window.
+//! 7. **An idle record whose transcript age cannot be read → `Ineligible`
+//!    (`transcript_age_unknown`).** The grace needs a clock to run from.
+//! 8. **Grace.** Eligible once `now >= since + grace`, where `since` is the
+//!    latest of the transcript's last `user`/`assistant` message, the sideband
+//!    set-time and — for a terminal session whose coord row carried it — the
+//!    time the `finished` declaration was made; before that,
+//!    [`Eligibility::NotYet`] with the instant it would become eligible. When
+//!    coord serves no transition time the declaration does not bound the
+//!    window. The grid's idle window is NOT one of the clocks any more: it is
+//!    reset by every repaint (an auto-updating footer churns it), and the
+//!    transcript records an operator's return directly.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -154,8 +172,10 @@ pub enum GridIdle {
 /// ([`IdleVerdict`]); [`GridBusyEvidence::GenerationMoved`] is the observer's
 /// own: the grid changed while it was being read.
 ///
-/// There is deliberately no `Idle` value: evidence exists only beside a busy
-/// grid, and "idle" next to `reason: grid_busy` would be a contradiction.
+/// There is deliberately no `Idle` value: evidence exists only for a busy
+/// grid. Since D3 a busy grid no longer blocks a close by itself, so this is
+/// reported beside whatever `reason` decided — the audit trail for the
+/// screen heuristic, never a verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridBusyEvidence {
     /// A processing indicator — the matched `PROCESSING_INDICATORS`
@@ -214,6 +234,62 @@ impl GridBusyEvidence {
     }
 }
 
+/// Claude Code's own per-process status (`<config-dir>/sessions/<pid>.json`
+/// `status`), reduced to the distinctions a close needs. The runner reads it
+/// in `session::claude_activity`; anything unreadable, absent, unparseable,
+/// ambiguous, from a reused pid or with an unrecognised status word is
+/// [`RecordStatus::Unknown`].
+///
+/// Measured on Claude Code 2.1.309 (plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+/// Phase 0): `idle` appears only once a turn has ended at an empty prompt;
+/// a pending permission prompt or an open question reads `waiting`; mid-turn
+/// the record reads `busy` (thinking, a background subagent) or `shell` (a
+/// background Bash). So only `idle` can authorise a close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordStatus {
+    Idle,
+    /// Blocked on a human — a permission prompt or a question.
+    Waiting,
+    Busy,
+    /// A background shell command is running.
+    Shell,
+    Unknown,
+}
+
+/// The record input to [`eligibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub status: RecordStatus,
+    /// When the session's transcript last carried a real `user`/`assistant`
+    /// message (unix millis). `None` when it could not be read.
+    pub last_message_ms: Option<i64>,
+}
+
+impl SessionRecord {
+    /// No record could be read.
+    pub const UNKNOWN: Self = Self {
+        status: RecordStatus::Unknown,
+        last_message_ms: None,
+    };
+}
+
+/// What the pane's input area shows, judged by the same checks
+/// `terminal::graceful_exit` runs before typing `/exit` — MINUS the
+/// turn-complete predicate, so a pane the screen heuristic reads busy can
+/// still be [`PromptScreen::Ready`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptScreen {
+    /// An empty `❯` input line under the cursor, no dialog near it.
+    Ready,
+    /// Positive evidence a close would destroy something or answer something:
+    /// unsent text in the input, a numbered choice, a dialog marker, or no
+    /// input prompt on the cursor row at all.
+    NotReady,
+    /// The pane could not be read.
+    Unknown,
+}
+
 /// Everything [`eligibility`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EligibilityInputs {
@@ -221,6 +297,10 @@ pub struct EligibilityInputs {
     pub work_status: WorkStatus,
     pub sideband: Sideband,
     pub grid: GridIdle,
+    /// The pane's input area — the grid's veto (rule 7).
+    pub prompt: PromptScreen,
+    /// Claude Code's own record and the transcript's last-message time.
+    pub record: SessionRecord,
     /// `None` when the process snapshot could not answer.
     pub has_live_children: Option<bool>,
     /// When coord's row became `finished` (unix millis), when coord served the
@@ -237,18 +317,36 @@ pub struct EligibilityInputs {
 #[serde(rename_all = "snake_case")]
 pub enum IneligibleReason {
     SidebandWorking,
-    GridBusy,
     LiveChildren,
     NotFinished,
+    /// Claude Code's record says `busy`.
+    RecordBusy,
+    /// Claude Code's record says `waiting` — blocked on a human.
+    RecordWaiting,
+    /// Claude Code's record says `shell` — a background command is running.
+    RecordShell,
+    /// No usable record: absent, unparseable, ambiguous, a reused pid, or an
+    /// unrecognised status. Unknown is never closable.
+    RecordUnknown,
+    /// The record says `idle` but the transcript's last message time could
+    /// not be read, so the grace cannot be measured from it.
+    TranscriptAgeUnknown,
+    /// The input area shows an unsent draft, a dialog, or no prompt at all.
+    PromptNotReady,
 }
 
 impl IneligibleReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SidebandWorking => "sideband_working",
-            Self::GridBusy => "grid_busy",
             Self::LiveChildren => "live_children",
             Self::NotFinished => "not_finished",
+            Self::RecordBusy => "record_busy",
+            Self::RecordWaiting => "record_waiting",
+            Self::RecordShell => "record_shell",
+            Self::RecordUnknown => "record_unknown",
+            Self::TranscriptAgeUnknown => "transcript_age_unknown",
+            Self::PromptNotReady => "prompt_not_ready",
         }
     }
 }
@@ -321,7 +419,7 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
             reason: UnknownReason::SidebandUnreadable,
         };
     }
-    if inputs.grid == GridIdle::Unknown {
+    if inputs.grid == GridIdle::Unknown || inputs.prompt == PromptScreen::Unknown {
         return Eligibility::Unknown {
             reason: UnknownReason::GridUnknown,
         };
@@ -346,33 +444,50 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
         Sideband::NeverReported | Sideband::Unreadable => None,
     };
 
-    // (3) The grid.
-    let GridIdle::Idle {
-        since_ms: grid_since,
-    } = inputs.grid
-    else {
-        return Eligibility::Ineligible {
-            reason: IneligibleReason::GridBusy,
-        };
+    // (3) Claude Code's record: only `idle` can close.
+    let not_idle = match inputs.record.status {
+        RecordStatus::Idle => None,
+        RecordStatus::Busy => Some(IneligibleReason::RecordBusy),
+        RecordStatus::Waiting => Some(IneligibleReason::RecordWaiting),
+        RecordStatus::Shell => Some(IneligibleReason::RecordShell),
+        RecordStatus::Unknown => Some(IneligibleReason::RecordUnknown),
     };
+    if let Some(reason) = not_idle {
+        return Eligibility::Ineligible { reason };
+    }
 
-    // (4) Children.
+    // (4) The grid's veto: an unsent draft, a dialog, no prompt.
+    if inputs.prompt == PromptScreen::NotReady {
+        return Eligibility::Ineligible {
+            reason: IneligibleReason::PromptNotReady,
+        };
+    }
+
+    // (5) Children.
     if has_live_children {
         return Eligibility::Ineligible {
             reason: IneligibleReason::LiveChildren,
         };
     }
 
-    // (5) The finished declaration, for terminal sessions only.
+    // (6) The finished declaration, for terminal sessions only.
     if finished_required && inputs.work_status != WorkStatus::Finished {
         return Eligibility::Ineligible {
             reason: IneligibleReason::NotFinished,
         };
     }
 
-    // (6) Grace, from the latest of the clocks: grid idle, the sideband report,
-    // and (terminal sessions only) the `finished` declaration.
-    let mut since_ms = sideband_set_at.map_or(grid_since, |s| s.max(grid_since));
+    // (7) The transcript clock.
+    let Some(last_message_ms) = inputs.record.last_message_ms else {
+        return Eligibility::Ineligible {
+            reason: IneligibleReason::TranscriptAgeUnknown,
+        };
+    };
+
+    // (8) Grace, from the latest of the clocks: the transcript's last
+    // message, the sideband report, and (terminal sessions only) the
+    // `finished` declaration.
+    let mut since_ms = sideband_set_at.map_or(last_message_ms, |s| s.max(last_message_ms));
     if finished_required {
         if let Some(finished_at) = inputs.finished_at_ms {
             since_ms = since_ms.max(finished_at);
@@ -400,16 +515,18 @@ pub struct WindDownView {
     pub until: Option<i64>,
     /// Why, for `ineligible` and `unknown`.
     pub reason: Option<&'static str>,
-    /// Which clause made the grid read busy ([`GridBusyEvidence::wire`]),
-    /// exactly when `reason` is `grid_busy`; `null` otherwise. Additive: no
-    /// other field changed when it was added.
+    /// Which clause made the grid read busy ([`GridBusyEvidence::wire`])
+    /// whenever the pane's grid reads busy, whatever `reason` says; `null`
+    /// for an idle or unobservable grid. Since D3 a busy grid is not itself
+    /// a reason — it is reported here so the screen heuristic stays
+    /// auditable.
     pub idle_evidence: Option<String>,
     pub kind: SessionKind,
 }
 
 impl WindDownView {
     /// `grid` is the observation the verdict was computed from; it supplies
-    /// `idleEvidence` when the verdict is `grid_busy`.
+    /// `idleEvidence` whenever it reads busy.
     pub fn from_verdict(verdict: &Eligibility, kind: SessionKind, grid: GridIdle) -> Self {
         let (since, until, reason) = match *verdict {
             Eligibility::Eligible { since_ms } => (Some(since_ms), None, None),
@@ -417,14 +534,9 @@ impl WindDownView {
             Eligibility::Ineligible { reason } => (None, None, Some(reason.as_str())),
             Eligibility::Unknown { reason } => (None, None, Some(reason.as_str())),
         };
-        let idle_evidence = match (*verdict, grid) {
-            (
-                Eligibility::Ineligible {
-                    reason: IneligibleReason::GridBusy,
-                },
-                GridIdle::Busy { evidence },
-            ) => Some(evidence.wire()),
-            _ => None,
+        let idle_evidence = match grid {
+            GridIdle::Busy { evidence } => Some(evidence.wire()),
+            GridIdle::Idle { .. } | GridIdle::Unknown => None,
         };
         Self {
             eligibility: verdict.as_str(),
@@ -562,10 +674,155 @@ mod tests {
             work_status: WorkStatus::Finished,
             sideband: Sideband::NeverReported,
             grid: GridIdle::Idle { since_ms: 1_000 },
+            prompt: PromptScreen::Ready,
+            record: IDLE_RECORD,
             has_live_children: Some(false),
             finished_at_ms: None,
             grace: GRACE,
         }
+    }
+
+    /// Claude Code's record says `idle`; the transcript's last message was at
+    /// t=1000, the same instant the fixture's grid went idle.
+    const IDLE_RECORD: SessionRecord = SessionRecord {
+        status: RecordStatus::Idle,
+        last_message_ms: Some(1_000),
+    };
+
+    // ---- the typed signal outranks the screen (plan
+    //      2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-
+    //      for-a-spinner, Phase 3 / D3) -------------------------------------
+
+    /// (a) A record that says `busy` is never eligible, across a simulated
+    /// turn whose screen goes quiet mid-turn (thinking, a background
+    /// subagent) and whose transcript stops moving for longer than the grace.
+    #[test]
+    fn d3_a_busy_record_is_never_eligible_across_a_turn() {
+        let mut i = eligible_terminal();
+        i.record = SessionRecord {
+            status: RecordStatus::Busy,
+            last_message_ms: Some(1_000),
+        };
+        for (grid, now) in [
+            (GridIdle::Idle { since_ms: 1_000 }, 1_000 + GRACE_MS),
+            (BUSY_GRID, 1_000 + 2 * GRACE_MS),
+            (GridIdle::Idle { since_ms: 1_000 }, 1_000 + 10 * GRACE_MS),
+            (GridIdle::Idle { since_ms: 1_000 }, i64::MAX),
+        ] {
+            i.grid = grid;
+            assert_eq!(
+                eligibility(&i, now),
+                Eligibility::Ineligible {
+                    reason: IneligibleReason::RecordBusy
+                },
+                "{grid:?} at {now}"
+            );
+        }
+    }
+
+    /// (b) `waiting` — a permission prompt or an open question — is blocked
+    /// on a human, never finished. The record's `waitingFor` value
+    /// ("permission prompt" / "input needed") does not change that; the
+    /// runner-side mapping test pins both.
+    #[test]
+    fn d3_b_a_waiting_record_is_not_eligible() {
+        let mut i = eligible_terminal();
+        i.record.status = RecordStatus::Waiting;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Ineligible {
+                reason: IneligibleReason::RecordWaiting
+            }
+        );
+    }
+
+    /// (c) `shell` — a background Bash is running.
+    #[test]
+    fn d3_c_a_shell_record_is_not_eligible() {
+        let mut i = eligible_terminal();
+        i.record.status = RecordStatus::Shell;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Ineligible {
+                reason: IneligibleReason::RecordShell
+            }
+        );
+    }
+
+    /// (d) No readable record is not closable, and neither is an idle record
+    /// whose transcript age cannot be established.
+    #[test]
+    fn d3_d_an_unknown_record_or_transcript_age_is_not_eligible() {
+        let mut i = eligible_terminal();
+        i.record = SessionRecord::UNKNOWN;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Ineligible {
+                reason: IneligibleReason::RecordUnknown
+            }
+        );
+        let mut i = eligible_terminal();
+        i.record.last_message_ms = None;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Ineligible {
+                reason: IneligibleReason::TranscriptAgeUnknown
+            }
+        );
+    }
+
+    /// (e)/(f) An idle record and an old transcript do not outrank POSITIVE
+    /// screen evidence of an unsent draft or an open dialog — the grid's one
+    /// remaining job. (The screen → `NotReady` mapping for a draft and a
+    /// permission dialog is pinned beside `graceful_exit`'s check.)
+    #[test]
+    fn d3_e_f_a_draft_or_dialog_on_screen_vetoes_an_idle_record() {
+        let mut i = eligible_terminal();
+        i.prompt = PromptScreen::NotReady;
+        for now in [1_000 + GRACE_MS, i64::MAX] {
+            assert_eq!(
+                eligibility(&i, now),
+                Eligibility::Ineligible {
+                    reason: IneligibleReason::PromptNotReady
+                }
+            );
+        }
+        // A screen that could not be read cannot vouch for an empty input.
+        let mut i = eligible_terminal();
+        i.prompt = PromptScreen::Unknown;
+        assert_eq!(
+            eligibility(&i, i64::MAX),
+            Eligibility::Unknown {
+                reason: UnknownReason::GridUnknown
+            }
+        );
+    }
+
+    /// (g) An idle record, an old transcript and an empty prompt are eligible
+    /// once the transcript has been quiet for the grace — EVEN when the
+    /// turn-complete screen heuristic reads the grid busy. The grace runs
+    /// from the last transcript message, not from the grid.
+    #[test]
+    fn d3_g_idle_record_old_transcript_clean_prompt_is_eligible_after_grace() {
+        let mut i = eligible_terminal();
+        i.grid = GridIdle::Busy {
+            evidence: GridBusyEvidence::Glyph('✻'),
+        };
+        assert_eq!(
+            eligibility(&i, 1_000 + GRACE_MS - 1),
+            Eligibility::NotYet {
+                since_ms: 1_000,
+                until_ms: 1_000 + GRACE_MS
+            }
+        );
+        assert_eq!(
+            eligibility(&i, 1_000 + GRACE_MS),
+            Eligibility::Eligible { since_ms: 1_000 }
+        );
+        // A grid idle window that started LATER no longer delays it: the
+        // screen is a veto, not a clock.
+        i.grid = GridIdle::Idle { since_ms: 400_000 };
+        assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible());
     }
 
     // ---- rule 6: grace ----------------------------------------------------
@@ -599,9 +856,7 @@ mod tests {
     #[test]
     fn a_since_in_the_future_is_not_yet_never_eligible() {
         let mut i = eligible_terminal();
-        i.grid = GridIdle::Idle {
-            since_ms: 5_000_000,
-        };
+        i.record.last_message_ms = Some(5_000_000);
         assert!(matches!(eligibility(&i, 1_000), Eligibility::NotYet { .. }));
     }
 
@@ -719,7 +974,7 @@ mod tests {
     #[test]
     fn an_older_sideband_report_does_not_move_the_clock_back() {
         let mut i = eligible_terminal();
-        i.grid = GridIdle::Idle { since_ms: 900_000 };
+        i.record.last_message_ms = Some(900_000);
         i.sideband = Sideband::Reported {
             state: SidebandState::NotWorking,
             set_at_ms: 10,
@@ -737,17 +992,15 @@ mod tests {
         assert!(eligibility(&i, i64::MAX).is_eligible());
     }
 
-    // ---- rule 3: grid -----------------------------------------------------
+    // ---- rules 3 and 4: the record decides, the screen vetoes ---------------
 
     #[test]
-    fn busy_grid_is_ineligible() {
+    fn a_busy_grid_alone_no_longer_blocks_a_close() {
         let mut i = eligible_terminal();
         i.grid = BUSY_GRID;
         assert_eq!(
             eligibility(&i, i64::MAX),
-            Eligibility::Ineligible {
-                reason: IneligibleReason::GridBusy
-            }
+            Eligibility::Eligible { since_ms: 1_000 }
         );
     }
 
@@ -812,11 +1065,11 @@ mod tests {
             };
 
             let mut busy = base;
-            busy.grid = BUSY_GRID;
+            busy.record.status = RecordStatus::Busy;
             assert!(matches!(
                 eligibility(&busy, i64::MAX),
                 Eligibility::Ineligible {
-                    reason: IneligibleReason::GridBusy
+                    reason: IneligibleReason::RecordBusy
                 }
             ));
 
@@ -1037,7 +1290,7 @@ mod tests {
     #[test]
     fn a_finished_declaration_before_the_idle_window_does_not_move_it() {
         let mut i = eligible_terminal();
-        i.grid = GridIdle::Idle { since_ms: 50_000 };
+        i.record.last_message_ms = Some(50_000);
         i.finished_at_ms = Some(10);
         assert_eq!(
             eligibility(&i, 50_000 + GRACE_MS),
@@ -1119,22 +1372,22 @@ mod tests {
     }
 
     #[test]
-    fn idle_evidence_is_reported_exactly_beside_grid_busy() {
+    fn idle_evidence_is_reported_for_every_busy_grid_whatever_the_reason() {
         let grid = GridIdle::Busy {
             evidence: GridBusyEvidence::Glyph('✻'),
         };
         let mut i = eligible_terminal();
         i.grid = grid;
-        let verdict = eligibility(&i, i64::MAX);
-        let view = WindDownView::from_verdict(&verdict, SessionKind::Terminal, grid);
-        assert_eq!(view.reason, Some("grid_busy"));
+        // Eligible on the record, and the screen heuristic's busy reading is
+        // still on the record beside it.
+        let view =
+            WindDownView::from_verdict(&eligibility(&i, i64::MAX), SessionKind::Terminal, grid);
+        assert_eq!(view.eligibility, "eligible");
         assert_eq!(view.idle_evidence.as_deref(), Some("glyph:✻"));
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["idleEvidence"], "glyph:✻");
-        assert_eq!(json["reason"], "grid_busy");
 
-        // A busy grid behind a reason that decided FIRST is not reported: the
-        // field explains `grid_busy` and nothing else.
+        // Beside a reason that decided on something else, too.
         let mut unknown = i;
         unknown.work_status = WorkStatus::Unknown;
         let v = WindDownView::from_verdict(
@@ -1143,17 +1396,39 @@ mod tests {
             grid,
         );
         assert_eq!(v.reason, Some("work_status_unknown"));
-        assert_eq!(v.idle_evidence, None);
+        assert_eq!(v.idle_evidence.as_deref(), Some("glyph:✻"));
 
-        // An idle grid never carries evidence.
+        // An idle or unobservable grid never carries evidence.
         let idle = eligible_terminal();
-        let v = WindDownView::from_verdict(
-            &eligibility(&idle, i64::MAX),
-            SessionKind::Terminal,
-            idle.grid,
-        );
-        assert_eq!(v.idle_evidence, None);
-        assert!(serde_json::to_value(&v).unwrap()["idleEvidence"].is_null());
+        for grid in [idle.grid, GridIdle::Unknown] {
+            let v = WindDownView::from_verdict(
+                &eligibility(&idle, i64::MAX),
+                SessionKind::Terminal,
+                grid,
+            );
+            assert_eq!(v.idle_evidence, None);
+            assert!(serde_json::to_value(&v).unwrap()["idleEvidence"].is_null());
+        }
+    }
+
+    #[test]
+    fn every_ineligible_reason_has_a_distinct_wire_word() {
+        let all = [
+            IneligibleReason::SidebandWorking,
+            IneligibleReason::LiveChildren,
+            IneligibleReason::NotFinished,
+            IneligibleReason::RecordBusy,
+            IneligibleReason::RecordWaiting,
+            IneligibleReason::RecordShell,
+            IneligibleReason::RecordUnknown,
+            IneligibleReason::TranscriptAgeUnknown,
+            IneligibleReason::PromptNotReady,
+        ];
+        let words: std::collections::HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(words.len(), all.len());
+        for r in all {
+            assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
+        }
     }
 
     #[test]

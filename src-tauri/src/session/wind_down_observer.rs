@@ -30,7 +30,14 @@
 //!   (`StatusFetch::finished_at_by_session_id`); absent on a coord that does not
 //!   serve it, in which case the declaration does not bound the idle window;
 //! - **sideband** — the pane's runner-local last OSC 9999 state;
-//! - **grid** — the pane's tracked idle observation;
+//! - **grid** — the pane's tracked idle observation (reported as
+//!   `idleEvidence`; it no longer decides "is it working?");
+//! - **prompt** — the pane's input area through
+//!   `graceful_exit::exit_input_area_clear`: the grid's one remaining job, a
+//!   veto on an unsent draft or an open dialog;
+//! - **record** — Claude Code's own `sessions/<pid>.json` status through
+//!   `claude_activity::classify_from_record`, plus the transcript's last
+//!   message time, read off the executor under [`RECORD_READ_TIMEOUT`];
 //! - **children** — `has_live_children` from the pass's own snapshot, passed
 //!   through as the `Option` it already is: `None` (the snapshot never
 //!   enumerated that pid) must reach `eligibility` as `ChildrenUnknown` rather
@@ -42,13 +49,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::mcp::session_work_status::StatusFetch;
+use crate::session::claude_activity;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
-use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass};
+use crate::session::tracking_health::{
+    LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass, TrackingHealthReport,
+};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{
-    self, EligibilityInputs, GridIdle, SessionKind, Sideband, SidebandState, WindDownView,
-    WorkStatus,
+    self, EligibilityInputs, GridIdle, PromptScreen, SessionKind, SessionRecord, Sideband,
+    SidebandState, WindDownView, WorkStatus,
 };
 
 /// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
@@ -100,6 +110,7 @@ pub fn observe_and_apply(
     app: &tauri::AppHandle,
     pass: &mut TrackingHealthPass,
     finished_at_by_session: &HashMap<String, i64>,
+    records: &HashMap<u32, SessionRecord>,
     grace: Duration,
 ) -> ObservedInputs {
     use tauri::Manager;
@@ -131,6 +142,7 @@ pub fn observe_and_apply(
         &terminal_by_session,
         &observations,
         finished_at_by_session,
+        records,
         &steward_terminal_ids,
         &looping_terminal_ids,
         grace,
@@ -246,7 +258,16 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
     };
 
     let observed = match pass.as_mut() {
-        Some(p) => observe_and_apply(app, p, &status_fetch.finished_at_by_session_id, grace),
+        Some(p) => {
+            let records = read_wind_down_records(&p.report).await;
+            observe_and_apply(
+                app,
+                p,
+                &status_fetch.finished_at_by_session_id,
+                &records,
+                grace,
+            )
+        }
         None => ObservedInputs::default(),
     };
 
@@ -308,11 +329,78 @@ pub async fn recheck(
         .and_then(|proc| proc.wind_down.clone())
 }
 
+/// How long the wind-down record read may take. A read that fails or times
+/// out costs the records — every process reads `record_unknown`, which is
+/// never closable — never the verdict's availability.
+pub const RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Set while a wind-down record read is running; see
+/// [`claude_activity::InFlightRead`].
+static RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claude Code's record for every top-level terminal-hosted process in the
+/// report, reduced to the wind-down input. The transcript tail is read for
+/// `idle` records too (the grace runs from the last message). Empty — every
+/// process `record_unknown` — when the read fails, times out, or an earlier
+/// read is still running.
+async fn read_wind_down_records(report: &TrackingHealthReport) -> HashMap<u32, SessionRecord> {
+    let pids: Vec<claude_activity::LivePid> = report
+        .terminal_hosted
+        .iter()
+        .filter(|p| !p.nested_under_claude)
+        .map(|p| claude_activity::LivePid {
+            pid: p.pid,
+            process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
+        })
+        .collect();
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let Some(guard) = claude_activity::InFlightRead::try_acquire(&RECORD_READ_IN_FLIGHT) else {
+        tracing::warn!(
+            "wind-down: a previous Claude Code session-record read is still in flight — \
+             skipped; every session reads record_unknown"
+        );
+        return HashMap::new();
+    };
+    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let read = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        claude_activity::read_records_with(
+            &config_dirs,
+            &pids,
+            &claude_activity::proc_start_ticks,
+            claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES,
+        )
+    });
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match tokio::time::timeout(RECORD_READ_TIMEOUT, read).await {
+        Ok(Ok(readings)) => readings
+            .iter()
+            .map(|(pid, reading)| (*pid, claude_activity::wind_down_record(reading, now_ms)))
+            .collect(),
+        Ok(Err(e)) => {
+            tracing::warn!("wind-down: Claude Code session-record read failed ({e})");
+            HashMap::new()
+        }
+        Err(_) => {
+            tracing::warn!(
+                "wind-down: Claude Code session-record read exceeded {RECORD_READ_TIMEOUT:?}"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 /// What one terminal pane showed wind-down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalObservation {
     pub sideband: Sideband,
     pub grid: GridIdle,
+    /// The input area, judged by `graceful_exit::exit_input_area_clear` — the
+    /// grid's veto on a close (unsent draft, dialog, no prompt).
+    pub prompt: PromptScreen,
 }
 
 impl TerminalObservation {
@@ -320,6 +408,7 @@ impl TerminalObservation {
     pub const UNOBSERVABLE: Self = Self {
         sideband: Sideband::Unreadable,
         grid: GridIdle::Unknown,
+        prompt: PromptScreen::Unknown,
     };
 }
 
@@ -388,6 +477,7 @@ pub fn wind_down_for_process(
     terminal_by_session: &HashMap<String, String>,
     observations: &HashMap<String, TerminalObservation>,
     finished_at_by_session: &HashMap<String, i64>,
+    records: &HashMap<u32, SessionRecord>,
     steward_terminal_ids: &HashSet<String>,
     looping_terminal_ids: &HashSet<String>,
     grace: Duration,
@@ -421,6 +511,13 @@ pub fn wind_down_for_process(
         work_status,
         sideband: observation.sideband,
         grid: observation.grid,
+        prompt: observation.prompt,
+        // No record read for this pid (none found, a failed or timed-out
+        // read) is UNKNOWN, which is never closable.
+        record: records
+            .get(&process.pid)
+            .copied()
+            .unwrap_or(SessionRecord::UNKNOWN),
         // Passed through, NOT re-wrapped in `Some`. A snapshot that never
         // enumerated this pid carries `None` here, and that has to survive as
         // far as `eligibility`, which turns it into `ChildrenUnknown`. Wrapping
@@ -444,6 +541,7 @@ pub fn apply_wind_down(
     terminal_by_session: &HashMap<String, String>,
     observations: &HashMap<String, TerminalObservation>,
     finished_at_by_session: &HashMap<String, i64>,
+    records: &HashMap<u32, SessionRecord>,
     steward_terminal_ids: &HashSet<String>,
     looping_terminal_ids: &HashSet<String>,
     grace: Duration,
@@ -455,6 +553,7 @@ pub fn apply_wind_down(
             terminal_by_session,
             observations,
             finished_at_by_session,
+            records,
             steward_terminal_ids,
             looping_terminal_ids,
             grace,
@@ -477,12 +576,22 @@ pub fn observe_terminals(
                 Some(session) => TerminalObservation {
                     sideband: sideband_from(session.last_agent_status()),
                     grid: session.observe_grid_idle(),
+                    prompt: prompt_screen_from(&session.grid_screen()),
                 },
                 None => TerminalObservation::UNOBSERVABLE,
             };
             (terminal_id, observation)
         })
         .collect()
+}
+
+/// The grid's veto input: [`crate::terminal::graceful_exit::exit_input_area_clear`]
+/// over one screen read.
+pub fn prompt_screen_from(screen: &crate::terminal::graceful_exit::ScreenText) -> PromptScreen {
+    match crate::terminal::graceful_exit::exit_input_area_clear(screen) {
+        Ok(()) => PromptScreen::Ready,
+        Err(_) => PromptScreen::NotReady,
+    }
 }
 
 /// Terminal ids the looping-agent registry currently attributes to an agent.
@@ -587,6 +696,7 @@ mod tests {
             TerminalObservation {
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 1_000 },
+                prompt: PromptScreen::Ready,
             },
         )]
         .into();
@@ -597,6 +707,14 @@ mod tests {
                 &terminal_by_session,
                 &observations,
                 &finished_at,
+                &[(
+                    1,
+                    SessionRecord {
+                        status: qontinui_runner_lib::wind_down::RecordStatus::Idle,
+                        last_message_ms: Some(1_000),
+                    },
+                )]
+                .into(),
                 &HashSet::new(),
                 &HashSet::new(),
                 grace,
@@ -613,6 +731,52 @@ mod tests {
         // The same map entry is not consulted for a row that does not read
         // finished (and that row is ineligible anyway).
         assert_eq!(view("working", i64::MAX).reason, Some("not_finished"));
+    }
+
+    /// (e)/(f) at the seam: the screen that becomes the verdict's `prompt`
+    /// input. A draft or a permission dialog under a completed-turn line is
+    /// NotReady; an empty prompt is Ready even when the turn-complete
+    /// heuristic would read the grid busy.
+    #[test]
+    fn prompt_screen_vetoes_a_draft_and_a_dialog_only() {
+        use crate::terminal::graceful_exit::ScreenText;
+        let edge = "─".repeat(75);
+        let screen = |rows: Vec<&str>, cursor_row: u16, cursor_col: u16| ScreenText {
+            lines: rows.into_iter().map(str::to_string).collect(),
+            cursor_row,
+            cursor_col,
+        };
+        let draft = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM",
+                &edge,
+                "❯\u{a0}draft text",
+                &edge,
+            ],
+            2,
+            12,
+        );
+        assert_eq!(prompt_screen_from(&draft), PromptScreen::NotReady);
+        let dialog = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM",
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. No, and tell Claude what to do differently (esc)",
+            ],
+            2,
+            3,
+        );
+        assert_eq!(prompt_screen_from(&dialog), PromptScreen::NotReady);
+        let clean_but_odd_wording = screen(
+            vec!["✻ Cooked for about 5 minutes", &edge, "❯\u{a0}", &edge],
+            2,
+            2,
+        );
+        assert_eq!(
+            prompt_screen_from(&clean_but_odd_wording),
+            PromptScreen::Ready
+        );
     }
 
     #[test]

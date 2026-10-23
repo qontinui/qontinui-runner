@@ -2191,9 +2191,17 @@ mod tests {
     // the verdict a candidate must carry before `graceful_exit` is called.
 
     use qontinui_runner_lib::wind_down::{
-        eligibility, Eligibility, EligibilityInputs, GridIdle, IneligibleReason, Sideband,
-        SidebandState, WorkStatus,
+        eligibility, Eligibility, EligibilityInputs, GridIdle, IneligibleReason, PromptScreen,
+        RecordStatus, SessionRecord, Sideband, SidebandState, WorkStatus,
     };
+
+    /// Claude Code's record says `idle`, last message at `at_ms`.
+    fn idle_record(at_ms: i64) -> SessionRecord {
+        SessionRecord {
+            status: RecordStatus::Idle,
+            last_message_ms: Some(at_ms),
+        }
+    }
 
     const GRACE: Duration = Duration::from_secs(600);
     const GRACE_MS: i64 = 600_000;
@@ -2215,6 +2223,8 @@ mod tests {
             grid: GridIdle::Idle {
                 since_ms: idle_since,
             },
+            prompt: PromptScreen::Ready,
+            record: idle_record(idle_since),
             has_live_children: Some(false),
             finished_at_ms: None,
             grace: GRACE,
@@ -2263,6 +2273,8 @@ mod tests {
                 work_status,
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 0 },
+                prompt: PromptScreen::Ready,
+                record: idle_record(0),
                 has_live_children: Some(false),
                 finished_at_ms: None,
                 grace: GRACE,
@@ -2279,6 +2291,8 @@ mod tests {
                 work_status: WorkStatus::Unknown,
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 0 },
+                prompt: PromptScreen::Ready,
+                record: idle_record(0),
                 has_live_children: Some(false),
                 finished_at_ms: None,
                 grace: GRACE,
