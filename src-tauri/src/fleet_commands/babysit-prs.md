@@ -691,8 +691,19 @@ run, and the same content flattened into `coord_pr_status` `blockers`
 (`escalate-path hits: agent: …; operator: …`). It is computed from the head's
 FILES (`qontinui-coord` `pr_merge::escalate_evidence::clearable_by` /
 `escalate_hit_rows`), so it is present even while an earlier tier masks the
-escalate one — the line then reads "pending behind `<code>`"; clear that tier
-first. One PR can carry hits with different values; each is handled on its own:
+escalate one — the line then reads "pending behind `<code>`". That names a
+masking tier only when `<code>` is a real block code; then clear that tier
+first. **`none` is not one:** coord renders the verdict code `none` as a masking
+tier (`qontinui-coord` `mcp/tools.rs`, the `masking` match beside the
+`hit_table_blocker_line` call, which treats only `escalate-path-matched` and an
+absent code as unmasked; an absent code renders no line at all), so ``pending behind `none` `` names no tier at all.
+`none` is the PASS code: the predicate has already decided those hits do not
+block, and the line beside it is a card display defect. Do not wait for a
+`none` tier to clear (it never will), and do not spend a review on those hits
+for this reason — if the PR still does not land, re-evaluate it once (Step 5,
+lever 1) and treat the hits as blocking only if the fresh code is
+`escalate-path-matched`. The steward's Step 2 row **Green candidates discarded
+at the land seam** is the same case seen from the train. One PR can carry hits with different values; each is handled on its own:
 
 - **`agent`** (`infra`, `dependencies`, `other`, `migrations`, off the secret
   floor, in every disposition including `block_hard`) — you clear it. Call `coord_submit_escalate_evidence` (on the device default tool

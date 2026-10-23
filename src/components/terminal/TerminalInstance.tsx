@@ -66,7 +66,7 @@ import {
   type TerminalOutputPayload,
 } from "./terminalEventDemux";
 import { declarePaneTier } from "./terminalVisibilityTiers";
-import { PaneVisibilityService } from "./paneVisibilityService";
+import { PaneVisibilityService, mountBootstrapPlan } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
 import { describeThrown } from "@/lib/utils";
 
@@ -1326,10 +1326,14 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // ~10x5 from a 0x0 box and the subsequent terminal_resize
         // SIGWINCHes Claude into a 10x5 redraw — the Rust grid is then
         // destructively resized and stays at 10x5 forever.
+        const hasLayout = () => {
+          const cc = containerRef.current;
+          return !!cc && cc.clientWidth > 0 && cc.clientHeight > 0;
+        };
         const waitForLayout = async (): Promise<boolean> => {
           const c = containerRef.current;
           if (!c) return false;
-          if (c.clientWidth > 0 && c.clientHeight > 0) return true;
+          if (hasLayout()) return true;
           return new Promise<boolean>((resolve) => {
             const ro = new ResizeObserver(() => {
               if (disposed) {
@@ -1337,17 +1341,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 resolve(false);
                 return;
               }
-              const cc = containerRef.current;
-              if (cc && cc.clientWidth > 0 && cc.clientHeight > 0) {
+              if (hasLayout()) {
                 ro.disconnect();
                 resolve(true);
               }
             });
             ro.observe(c);
-            // Safety timeout — give up after 1s and try anyway.
+            // Safety timeout — stop waiting after 1s and report what the box
+            // measures then. A pane mounted hidden (`display: none`) still has
+            // none, and claiming otherwise resized its PTY to the backend's
+            // default size; it re-fits when it is revealed.
             setTimeout(() => {
               ro.disconnect();
-              resolve(true);
+              resolve(hasLayout());
             }, 1000);
           });
         };
@@ -1357,6 +1363,15 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (disposed) return;
         const laidOut = await waitForLayout();
         if (disposed) return;
+        // A pane mounted hidden skips both halves: it has no box to fit, and
+        // a grid paint over its (stream-stale) buffer would splice history
+        // once the reveal resync replays the dropped window. See
+        // `mountBootstrapPlan`.
+        const bootstrapPlan = mountBootstrapPlan({
+          hasLayout: laidOut,
+          visible: visibleRef.current,
+          behind: paneService.behind,
+        });
 
         /** The reconnect path's paint: whether it ran, and the snapshot's stream offset. */
         let lateAttachPaint: { painted: boolean; offset: number | undefined } = {
@@ -1364,7 +1379,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           offset: undefined,
         };
         try {
-          if (laidOut) {
+          if (bootstrapPlan.resize) {
             backend.fit();
             // Sanity check: refuse to ship a tiny resize that would wipe
             // the grid. Claude's TUI requires a non-trivial viewport;
@@ -1398,33 +1413,47 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // The mount ring read's reset could not: no listener existed yet,
           // so a frame tee'd into the ring before it but counted after it
           // went to nobody (see `PaneOutputStream.beginLateAttach`).
-          const fetchGrid = () =>
-            invoke<{ success: boolean; data: GridSnapshot | null }>("terminal_get_grid", {
-              terminalId,
-              resetFlowControl: isReconnecting,
-            });
-          const result =
-            isReconnecting && !outputUnsub
-              ? await stream.lateAttach({
-                  register: () => {
-                    outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
-                  },
-                  listening: () => awaitOutputListener("reconnect"),
-                  isCancelled: () => disposed,
-                  snapshot: fetchGrid,
-                })
-              : await fetchGrid();
-          if (result?.success && result.data && !disposed) {
-            // On reconnect, paint only a snapshot that says which stream bytes
-            // it reflects; otherwise the replay below covers them, and doing
-            // both would apply relative output twice.
-            const offset = result.data.stream_offset;
-            const painted = bootstrapPaint(
-              result.data,
-              isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
-              !isReconnecting || offset !== undefined,
-            );
-            lateAttachPaint = { painted, offset };
+          if (bootstrapPlan.paint) {
+            const fetchGrid = () =>
+              invoke<{ success: boolean; data: GridSnapshot | null }>("terminal_get_grid", {
+                terminalId,
+                resetFlowControl: isReconnecting,
+              });
+            const result =
+              isReconnecting && !outputUnsub
+                ? await stream.lateAttach({
+                    register: () => {
+                      outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
+                    },
+                    listening: () => awaitOutputListener("reconnect"),
+                    isCancelled: () => disposed,
+                    snapshot: fetchGrid,
+                  })
+                : await fetchGrid();
+            if (
+              result?.success &&
+              result.data &&
+              !disposed &&
+              // Re-checked after the fetch: a pane hidden while it was in
+              // flight has started dropping chunks, so the paint is no
+              // longer safe.
+              mountBootstrapPlan({
+                hasLayout: laidOut,
+                visible: visibleRef.current,
+                behind: paneService.behind,
+              }).paint
+            ) {
+              // On reconnect, paint only a snapshot that says which stream bytes
+              // it reflects; otherwise the replay below covers them, and doing
+              // both would apply relative output twice.
+              const offset = result.data.stream_offset;
+              const painted = bootstrapPaint(
+                result.data,
+                isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
+                !isReconnecting || offset !== undefined,
+              );
+              lateAttachPaint = { painted, offset };
+            }
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
@@ -1432,7 +1461,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (disposed) return;
 
         if (isReconnecting) {
-          // Registered here only if the bootstrap above threw first. The
+          // Registered here only if the bootstrap above threw first or skipped
+          // its paint (a pane reconnected while hidden). The
           // resync this then requests resets the counters, so it too waits
           // for the listener.
           if (!outputUnsub) {
@@ -1910,7 +1940,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * classification: `classifyTabs` marks every tab of a preset layout
      * "assigned" (all mounted) and never consults viewport proximity, so a
      * flow-mode-only tier would leave preset layouts — maximized single view,
-     * compact zone cards, `HiddenTerminal`'s off-grid parking — paying full
+     * compact zone cards, the parked cells of unzoned / off-screen tabs — paying full
      * cost for panes nobody can see.
      *
      * The WebGL LRU is told too: a hidden pane is the first candidate to be
