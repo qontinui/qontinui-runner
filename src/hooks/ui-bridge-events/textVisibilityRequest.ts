@@ -89,7 +89,16 @@ export function textVisibilityBody(payload: object): Record<string, unknown> {
   return rest;
 }
 
-/** Run one text-visibility message against the webview's own DOM. */
+/**
+ * Run one text-visibility message against the webview's own DOM.
+ *
+ * The reply carries two stamps from this webview's own `Date.now()`:
+ * `receivedAt`, taken immediately BEFORE the SDK call, and `answeredAt`, taken
+ * after the paint wait. A hide's `hiddenAt` (the SDK's, from the same clock) at
+ * or after `receivedAt` was created by THIS request; one before it is another
+ * caller's that this request only re-armed. The runner decides ownership from
+ * that one comparison, on one clock.
+ */
 export async function runTextVisibilityRequest(
   payload: object,
   waitForPaint: () => Promise<PaintFence> = nextPaint,
@@ -97,13 +106,14 @@ export async function runTextVisibilityRequest(
   if (!devControlsEnabled()) {
     return { success: false, error: DEV_CONTROLS_REFUSAL.error, data: { ...DEV_CONTROLS_REFUSAL } };
   }
+  const receivedAt = Date.now();
   const result = setTextVisibility(textVisibilityBody(payload));
   if (!result.success) {
-    return { success: false, error: result.error, data: result };
+    return { success: false, error: result.error, data: { ...result, receivedAt } };
   }
   if (!result.changed) {
-    return { success: true, data: result };
+    return { success: true, data: { ...result, receivedAt, answeredAt: Date.now() } };
   }
   const paintFence = await waitForPaint();
-  return { success: true, data: { ...result, paintFence } };
+  return { success: true, data: { ...result, paintFence, receivedAt, answeredAt: Date.now() } };
 }

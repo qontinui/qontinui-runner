@@ -2512,9 +2512,9 @@ async fn capture_text_hidden_arm(
         send,
         acquire,
         || capture_runner_window_frame_permitted(state),
-        // Monotonic: the arm only measures durations with it.
+        // Monotonic: the arm only measures a duration with it (frame A's end to
+        // the hide's send).
         move || i64::try_from(clock_origin.elapsed().as_millis()).unwrap_or(i64::MAX),
-        i64::try_from(super::request::get_ui_bridge_timeout_ms()).unwrap_or(i64::MAX),
         || bump_mutation_id(state),
         |delay_ms| schedule_mutation_bump(state, delay_ms),
         abort_restore,
@@ -5036,14 +5036,24 @@ mod text_hidden_tests {
                 "{handler} must refuse before capturing, hiding or decoding"
             );
             // And its result must be acted on: a call whose refusal is ignored
-            // gates nothing.
-            let gate_to_capture = body
-                .get(gate..pos(body, "capture_frames("))
-                .expect("gate precedes capture");
+            // gates nothing. The gate STATEMENT — from the call to its first
+            // `;` — must map the refusal to the 403 and `?` it, and must start
+            // the statement (no `let _ =` or other binding swallowing it).
+            let statement = body
+                .get(gate..)
+                .and_then(|rest| rest.split_once(';'))
+                .map(|(stmt, _)| format!("{stmt};"))
+                .expect("the gate statement ends");
             assert!(
-                gate_to_capture.contains("StatusCode::FORBIDDEN")
-                    && gate_to_capture.contains(")?;"),
-                "{handler} must return the 403: {gate_to_capture}"
+                statement.contains("StatusCode::FORBIDDEN") && statement.ends_with(")?;"),
+                "{handler} must return the 403: {statement}"
+            );
+            let line_start = body.get(..gate).map_or("", |head| {
+                head.rsplit_once('\n').map_or(head, |(_, line)| line)
+            });
+            assert!(
+                line_start.trim().is_empty() && !line_start.contains("let _"),
+                "{handler}: the gate must not be bound away: `{line_start}`"
             );
             assert!(gate < pos(body, "check_text_hidden_request("), "{handler}");
         }
@@ -5085,13 +5095,13 @@ mod text_hidden_tests {
             call.contains("capture_runner_window_frame_permitted(state)"),
             "{call}"
         );
-        // Durations on a monotonic clock, bounded by the request's own timeout.
+        // A duration on a monotonic clock; ownership itself reads the
+        // webview's clock alone.
         assert!(call.contains("clock_origin.elapsed()"), "{call}");
         assert!(
             !body.contains("Utc::now"),
             "the arm must not time anything on the wall clock"
         );
-        assert!(call.contains("get_ui_bridge_timeout_ms()"), "{call}");
         assert!(
             call.contains("schedule_mutation_bump(state, delay_ms)"),
             "{call}"

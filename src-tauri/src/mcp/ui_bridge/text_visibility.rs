@@ -299,6 +299,15 @@ fn is_true(v: &Value, key: &str) -> bool {
 }
 
 /// A failed or refused hide, as one line naming the SDK's code when it gave one.
+/// A hide request that never left the runner, as one line.
+fn never_sent_message(hide: &Value) -> String {
+    let error = hide
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("no error message");
+    format!("the hide request never left the runner, so nothing was hidden: {error}")
+}
+
 fn hide_failure_message(hide: &Value) -> String {
     let code = hide.get("code").and_then(Value::as_str);
     let error = hide
@@ -362,80 +371,70 @@ impl<P, R: FnOnce(PairLockGuard, P)> Drop for ArmGuard<P, R> {
     }
 }
 
-/// Slack on top of the measured round trip when attributing a hide: what
-/// integer-millisecond rounding needs (each clock reading is truncated to a
-/// whole ms, and the comparison spans four of them), and no more — every ms of
-/// slack widens the window in which a foreign hide reads as ours.
-pub(crate) const OWNERSHIP_SLACK_MS: f64 = 2.0;
-
-/// Whose hide the reply shows, read on ONE clock — the webview's. `hiddenAt`
-/// is the hide state's creation time (a re-hide keeps it) and `timestamp` the
-/// moment the webview answered, both its `Date.now()`. A hide THIS request
-/// created was created while the request was being served, so `timestamp -
-/// hiddenAt` is at most the runner's measured round trip `rtt_ms` (plus
-/// [`OWNERSHIP_SLACK_MS`]); an earlier caller's hide is older than that. The
-/// runner's own clock never enters it, so a webview clock skewed against the
-/// runner's cannot flip the answer.
+/// Whose hide the reply shows, on ONE clock — the webview's. The hook stamps
+/// `receivedAt` with its `Date.now()` immediately before calling the SDK, and
+/// the SDK stamps `hiddenAt` from the same clock when it creates the hide state
+/// (a re-hide keeps the original). So `hiddenAt >= receivedAt` exactly when
+/// THIS request created the hide; an earlier `hiddenAt` is another caller's,
+/// which this request only re-armed. No round trip, no slack, and no runner
+/// clock: a skew between the two machines' clocks cannot enter.
 ///
-/// `Some(true)`: ours. `Some(false)`: another caller's, which this call only
-/// re-armed. `None`: unknown — the reply lacks `hiddenAt` or `timestamp`, or
-/// the round trip is not a plausible one (negative, or past `rtt_ceiling_ms`,
-/// the request's own timeout), so it cannot bound anything.
+/// `Some(true)`: ours. `Some(false)`: another caller's. `None`: the reply lacks
+/// `hiddenAt` or `receivedAt` (a frontend predating the stamp) — unknown.
+///
+/// The one ambiguity left: a foreign hide created in the same webview
+/// millisecond as `receivedAt` reads as ours.
 ///
 /// Not `changed`: a re-hide of another caller's state answers `changed: true`
 /// whenever the app added elements meanwhile, and `changed: false` says
 /// nothing about who created the state.
-fn hide_is_ours(hide: &Value, rtt_ms: i64, rtt_ceiling_ms: i64) -> Option<bool> {
-    if !(0..=rtt_ceiling_ms).contains(&rtt_ms) {
-        return None;
-    }
+fn hide_is_ours(hide: &Value) -> Option<bool> {
     let hidden_at = hide.get("hiddenAt").and_then(Value::as_f64)?;
-    let answered_at = hide.get("timestamp").and_then(Value::as_f64)?;
-    Some(answered_at - hidden_at <= rtt_ms as f64 + OWNERSHIP_SLACK_MS)
+    let received_at = hide.get("receivedAt").and_then(Value::as_f64)?;
+    Some(hidden_at >= received_at)
 }
 
-/// Whether the hide already covered the page when frame A finished:
-/// `hiddenAt` (webview clock) at or before frame A's completion mapped onto the
-/// webview clock. The reply's `timestamp` was taken somewhere between the
-/// hide's send and its reply on the runner clock, so the mapping is known only
-/// within that window, and `anchor_ms` picks which end it is anchored at:
-/// - at the SEND (`hide_sent_at_ms`), the LATEST mapping — for a hide already
-///   known to be another caller's, so an uncertain case refuses frame A;
-/// - at the REPLY (`hide_replied_at_ms`), the EARLIEST mapping — run on every
-///   hide, ours included: a hide that predates frame A's end even on that
-///   mapping cannot be this call's (a hide this call made is created after it
-///   was sent), whatever [`hide_is_ours`] concluded.
-///
-/// `frame_a_done_ms` and `anchor_ms` are runner-side times on one monotonic
-/// clock; only their difference is used.
-fn frame_a_was_hidden(hide: &Value, frame_a_done_ms: i64, anchor_ms: i64) -> Option<bool> {
+/// Whether another caller's hide already covered the page when frame A
+/// finished. Frame A's end is mapped onto the webview clock through the hide
+/// request. The runner sent it `hide_sent_at_ms - frame_a_done_ms` ms after
+/// frame A returned (a duration on the runner's monotonic clock), and the
+/// webview received it at `receivedAt`, no earlier than the send. So frame A
+/// ended at least that gap before `receivedAt`: no later than
+/// `receivedAt - (hide_sent_at_ms - frame_a_done_ms)` on the webview clock.
+/// Refusing when `hiddenAt` is at or before that LATEST possible mapping errs
+/// toward refusing frame A. Only the gap crosses clocks, never a reading.
+fn frame_a_was_hidden(hide: &Value, frame_a_done_ms: i64, hide_sent_at_ms: i64) -> Option<bool> {
     let hidden_at = hide.get("hiddenAt").and_then(Value::as_f64)?;
-    let answered_at = hide.get("timestamp").and_then(Value::as_f64)?;
-    let frame_a_done_webview = answered_at - (anchor_ms - frame_a_done_ms) as f64;
+    let received_at = hide.get("receivedAt").and_then(Value::as_f64)?;
+    let frame_a_done_webview = received_at - (hide_sent_at_ms - frame_a_done_ms) as f64;
     Some(hidden_at <= frame_a_done_webview)
 }
 
 /// Whether a failed hide request PROVABLY never reached the webview: the error
 /// is one `ui_bridge_request_sync` returns before the request is emitted — an
 /// open circuit breaker, the frontend never becoming ready, the UI Bridge
-/// concurrency gate, an unknown window, or the emit itself failing. Nothing was
-/// hidden, so nothing is restored. Any other error (a timeout after the send
+/// concurrency gate, an unknown window, or the request failing to serialize.
+/// Nothing was hidden, so nothing is restored. Any other error (a timeout after the send
 /// above all) leaves it unknown whether the hide landed, and is restored.
 ///
 /// Matched on the messages `request.rs` and `circuit_breaker.rs` produce; a
 /// test pins that each one still exists there, so a reworded message fails the
 /// build's tests rather than silently turning into "unknown".
 pub(crate) fn hide_never_sent(error: &str) -> bool {
-    const BEFORE_SEND: [&str; 6] = [
-        "UI Bridge temporarily unavailable (circuit breaker open)",
-        "frontend_not_ready",
-        "UI Bridge semaphore closed",
-        "UI Bridge concurrency limit reached (timeout acquiring permit)",
-        "No runner window labeled",
-        "Failed to emit UI Bridge request",
-    ];
     BEFORE_SEND.iter().any(|m| error.contains(m))
 }
+
+/// The errors [`hide_never_sent`] reads as "never left the runner". An emit
+/// failure is deliberately NOT one: Tauri's emit can fail after a partial
+/// delivery, so that error is restored (a redundant restore costs one request).
+pub(crate) const BEFORE_SEND: [&str; 6] = [
+    "UI Bridge temporarily unavailable (circuit breaker open)",
+    "frontend_not_ready",
+    "UI Bridge semaphore closed",
+    "UI Bridge concurrency limit reached (timeout acquiring permit)",
+    "No runner window labeled",
+    "Failed to serialize UiBridgeRequestEnvelope",
+];
 
 /// Frame A, then every glyph in the runner's own webview hidden, frame B, and
 /// the page restored — under one lock, with the capture permits held
@@ -453,11 +452,8 @@ pub(crate) fn hide_never_sent(error: &str) -> bool {
 /// - `capture` takes one frame of the runner window, the permits already held:
 ///   frame A, and — only after the webview confirmed THIS call's hide — frame B.
 /// - `now_ms` reads a MONOTONIC runner clock (elapsed ms from a fixed origin).
-///   It times frame A and the hide's round trip — durations only, never
-///   compared with the webview's clock — so a wall-clock step cannot turn a
-///   round trip negative.
-/// - `rtt_ceiling_ms` is the hide request's own timeout: a measured round trip
-///   past it (or below zero) is not plausible, and ownership reads unknown.
+///   It times only the gap from frame A's end to the hide's send, a runner-side
+///   duration ([`frame_a_was_hidden`]); a wall-clock step cannot distort it.
 /// - `bump` bumps the vision mutation id: before the hide and after the restore.
 /// - `bump_after_ttl` schedules the bump for the SDK's own TTL restore.
 /// - `abort_restore` restores the page if this future is cancelled or unwinds
@@ -477,8 +473,7 @@ pub(crate) fn hide_never_sent(error: &str) -> bool {
 ///   page before frame A finished ([`frame_a_was_hidden`]).
 /// - UNKNOWN — the hide request errored or timed out after it may have been
 ///   sent, the call was cancelled before the hide reply, or the reply cannot be
-///   attributed (no `hiddenAt`/`timestamp`, or an implausible round trip): the
-///   page is
+///   attributed (no `hiddenAt`/`receivedAt`): the page is
 ///   RESTORED (holding the lock and permits), then the id bumped, and no frame
 ///   B is returned. The arm's TTL is short, and a page left text-hidden poisons
 ///   every capture until it fires; the one hide this can wrongly undo is a
@@ -492,7 +487,6 @@ pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, N, B, T,
     acquire: A,
     capture: C,
     now_ms: N,
-    rtt_ceiling_ms: i64,
     bump: B,
     bump_after_ttl: T,
     abort_restore: R,
@@ -548,30 +542,26 @@ where
     bump();
     let hide_sent_at_ms = now_ms();
     let hide_reply = send(REQUEST_TYPE, hide_body).await;
-    let hide_replied_at_ms = now_ms();
-    let rtt_ms = hide_replied_at_ms - hide_sent_at_ms;
     let (hide, landed, never_sent) = match hide_reply {
         Ok(v) => (v, true, false),
         Err(e) => {
             let never_sent = hide_never_sent(&e);
-            (
-                serde_json::json!({"success": false, "error": e}),
-                false,
-                never_sent,
-            )
+            (serde_json::json!({"success": false, "error": e}), false, never_sent)
         }
     };
-    // The webview answered and did not hide, or the request provably never
-    // left the runner: nothing was hidden, so nothing is restored, and the
-    // permits go at once.
-    let refused =
-        never_sent || (landed && !(is_true(&hide, "success") && is_true(&hide, "hidden")));
-    if refused {
-        // The webview answered and did not hide: nothing to restore.
+    if never_sent || (landed && !(is_true(&hide, "success") && is_true(&hide, "hidden"))) {
+        // Nothing was hidden — the request never left the runner, or the
+        // webview answered and refused — so nothing is restored, and the lock
+        // and permits go at once.
         guard.disarm();
+        let error = if never_sent {
+            never_sent_message(&hide)
+        } else {
+            hide_failure_message(&hide)
+        };
         return TextHiddenPair {
             frame_a,
-            frame_b: Err(hide_failure_message(&hide)),
+            frame_b: Err(error),
             run: Some(TextVisibilityRun {
                 hide,
                 restore: None,
@@ -580,17 +570,7 @@ where
             }),
         };
     }
-    let mut ours = if landed {
-        hide_is_ours(&hide, rtt_ms, rtt_ceiling_ms)
-    } else {
-        None
-    };
-    // Run on every hide, whatever `ours` says: one that predates frame A's end
-    // even on the earliest clock mapping cannot be this call's, and frame A,
-    // taken under it, shows the hidden page.
-    if landed && frame_a_was_hidden(&hide, frame_a_done_ms, hide_replied_at_ms) == Some(true) {
-        ours = Some(false);
-    }
+    let ours = if landed { hide_is_ours(&hide) } else { None };
     if ours == Some(false) {
         // Provably another caller's hide: left to that caller, whose TTL this
         // re-hide re-armed to CAPTURE_TTL_MS.
@@ -623,8 +603,8 @@ where
             .await
             .map_err(|e| format!("frame B (text hidden) capture failed: {e}")),
         _ => not_taken(if landed {
-            "whose hide it is is unknown (the reply carries no hiddenAt/timestamp, or the \
-             round trip is implausible); the page was restored"
+            "whose hide it is is unknown (the reply carries no hiddenAt/receivedAt); the \
+             page was restored"
         } else {
             "the hide request failed, so whether it landed is unknown; the page was restored"
         }),
@@ -847,11 +827,11 @@ mod tests {
 
     type Events = Arc<Mutex<Vec<String>>>;
 
-    /// The runner clock's readings, in order: frame A done, hide sent, hide
-    /// reply received (a 20 ms round trip).
+    /// The runner clock's readings, in order: frame A done, hide sent.
     const FRAME_A_DONE: i64 = 1_000;
     const HIDE_SENT: i64 = 2_000;
-    const HIDE_RECV: i64 = 2_020;
+    /// When the webview received the hide (its `receivedAt`), at zero skew.
+    const RECEIVED: i64 = HIDE_SENT + 3;
 
     /// The webview's clock: the runner's plus `skew` ms.
     fn webview_at(runner_ms: i64, skew: i64) -> i64 {
@@ -859,23 +839,26 @@ mod tests {
     }
 
     /// A hide THIS call made, on a webview clock `skew` ms off the runner's:
-    /// created while the request was served, answered just after.
+    /// received, then created by the SDK.
     fn hid_with_skew(skew: i64) -> Value {
         json!({"success": true, "hidden": true, "changed": true, "ttlMs": CAPTURE_TTL_MS,
-               "hiddenAt": webview_at(HIDE_SENT + 5, skew),
-               "timestamp": webview_at(HIDE_SENT + 15, skew)})
+               "receivedAt": webview_at(RECEIVED, skew),
+               "hiddenAt": webview_at(RECEIVED + 2, skew),
+               "answeredAt": webview_at(RECEIVED + 12, skew)})
     }
 
     fn hid() -> Value {
         hid_with_skew(0)
     }
 
-    /// Another caller's hide, created at runner time `created`, re-armed by
-    /// this call's hide request.
+    /// A hide with `hiddenAt` at webview time `created`, as this call's hide
+    /// request (received at `RECEIVED`) found it — another caller's whenever
+    /// `created` precedes `RECEIVED`.
     fn theirs(created: i64, skew: i64) -> Value {
         json!({"success": true, "hidden": true, "changed": true,
+               "receivedAt": webview_at(RECEIVED, skew),
                "hiddenAt": webview_at(created, skew),
-               "timestamp": webview_at(HIDE_SENT + 15, skew)})
+               "answeredAt": webview_at(RECEIVED + 12, skew)})
     }
 
     fn restored(verified: bool) -> Value {
@@ -900,9 +883,6 @@ mod tests {
     /// One scripted run of the arm against a fake webview, captures and runner
     /// clock; every step (clock reads included) lands in `events`. `stalled`
     /// is notified when a `None` step is reached.
-    /// The request timeout the scripted runs bound the round trip by.
-    const RTT_CEILING: i64 = 10_000;
-
     fn run_scripted(
         events: Events,
         stalled: Arc<tokio::sync::Notify>,
@@ -914,18 +894,18 @@ mod tests {
             stalled,
             replies,
             frames,
-            [FRAME_A_DONE, HIDE_SENT, HIDE_RECV],
+            [FRAME_A_DONE, HIDE_SENT],
         )
     }
 
-    /// [`run_scripted`] with the runner clock's three readings given: frame A
-    /// done, hide sent, hide reply received.
+    /// [`run_scripted`] with the runner clock's two readings given: frame A
+    /// done, hide sent.
     fn run_scripted_with_clock(
         events: Events,
         stalled: Arc<tokio::sync::Notify>,
         replies: Vec<Step<Value>>,
         frames: Vec<Step<&'static str>>,
-        readings: [i64; 3],
+        readings: [i64; 2],
     ) -> BoxFut<TextHiddenPair<&'static str>> {
         let replies = Arc::new(Mutex::new(replies.into_iter()));
         let frames = Arc::new(Mutex::new(frames.into_iter()));
@@ -989,7 +969,6 @@ mod tests {
             acquire,
             capture,
             now_ms,
-            RTT_CEILING,
             bump,
             ttl,
             abort,
@@ -997,7 +976,7 @@ mod tests {
     }
 
     async fn run_with_clock(
-        readings: [i64; 3],
+        readings: [i64; 2],
         replies: Vec<Step<Value>>,
         frames: Vec<Step<&'static str>>,
     ) -> (TextHiddenPair<&'static str>, Vec<String>) {
@@ -1068,14 +1047,13 @@ mod tests {
                 "bump".into(),
                 "clock".into(),
                 "hide".into(),
-                "clock".into(),
                 "capture".into(),
                 "show".into(),
                 "bump".into(),
             ],
             "the permits before frame A; frame A stamped AFTER it returns; a TTL bump \
-             scheduled with the hide; the hide's round trip timed; a bump before the hide \
-             and after the restore; no guard restore once restored"
+             scheduled with the hide; the send stamped; a bump before the hide and after \
+             the restore; no guard restore once restored"
         );
         let run = out.run.expect("a hide was sent");
         assert_eq!(run.page_restored, Some(true));
@@ -1230,12 +1208,20 @@ mod tests {
 
     /// A foreign hide that landed DURING frame A's capture — after it started,
     /// at (or just before) the moment it returned — covers frame A: refused.
-    /// So is one inside the clock-mapping uncertainty after it: the reply's
-    /// webview `timestamp` (HIDE_SENT + 15 here) is only known to lie within
-    /// the round trip, and the check errs toward refusing frame A.
+    /// So is one inside the clock-mapping uncertainty after it: frame A's end
+    /// maps to `receivedAt - (S - F)` (1003 here), the LATEST it can have been
+    /// on the webview clock, since the webview received the hide no earlier
+    /// than the send. Just past that, frame A stands.
     #[tokio::test]
     async fn a_hide_landing_mid_frame_a_refuses_frame_a() {
-        for created in [FRAME_A_DONE - 5, FRAME_A_DONE, FRAME_A_DONE + 15] {
+        let mapped = RECEIVED - (HIDE_SENT - FRAME_A_DONE);
+        let (out, _) = run(
+            vec![ok(theirs(mapped + 1, 0))],
+            vec![ok("frame-a"), ok("frame-b")],
+        )
+        .await;
+        assert_eq!(out.frame_a, Ok("frame-a"), "a hide after the mapped end");
+        for created in [FRAME_A_DONE - 5, FRAME_A_DONE, mapped] {
             let (out, _) = run(
                 vec![ok(theirs(created, 0))],
                 vec![ok("frame-a"), ok("frame-b")],
@@ -1248,44 +1234,58 @@ mod tests {
         }
     }
 
-    /// Ownership and the frame-A check read the WEBVIEW's clock only: a webview
-    /// clock 5 s ahead of or behind the runner's flips neither answer.
+    /// Ownership reads the WEBVIEW's clock only, and the frame-A check takes
+    /// only a runner DURATION across: a webview clock 5 s ahead of or behind
+    /// the runner's, or a runner clock whose both readings sit 5 s off, flips
+    /// neither answer.
     #[tokio::test]
-    async fn a_skewed_webview_clock_flips_neither_answer() {
-        for skew in [-5_000, 5_000] {
-            let (out, events) = run(
-                vec![ok(hid_with_skew(skew)), ok(restored(true))],
-                vec![ok("frame-a"), ok("frame-b")],
-            )
-            .await;
-            assert_eq!(out.frame_b, Ok("frame-b"), "our own hide at skew {skew}");
-            assert!(has(&events, "show"), "skew {skew}: {events:?}");
+    async fn a_skewed_clock_flips_neither_answer() {
+        for skew in [0, -5_000, 5_000] {
+            for runner in [0, -5_000, 5_000] {
+                let clock = [FRAME_A_DONE + runner, HIDE_SENT + runner];
+                let at = format!("webview skew {skew}, runner skew {runner}");
+                let (out, events) = run_with_clock(
+                    clock,
+                    vec![ok(hid_with_skew(skew)), ok(restored(true))],
+                    vec![ok("frame-a"), ok("frame-b")],
+                )
+                .await;
+                assert_eq!(out.frame_a, Ok("frame-a"), "{at}");
+                assert_eq!(out.frame_b, Ok("frame-b"), "our own hide at {at}");
+                assert!(has(&events, "show"), "{at}: {events:?}");
 
-            let (out, events) = run(
-                vec![ok(theirs(1_500, skew))],
-                vec![ok("frame-a"), ok("frame-b")],
-            )
-            .await;
-            assert_eq!(out.frame_a, Ok("frame-a"), "skew {skew}");
-            assert!(out.frame_b.is_err(), "another caller's hide at skew {skew}");
-            assert!(!has(&events, "show"), "skew {skew}: {events:?}");
+                let (out, events) = run_with_clock(
+                    clock,
+                    vec![ok(theirs(1_500, skew))],
+                    vec![ok("frame-a"), ok("frame-b")],
+                )
+                .await;
+                assert_eq!(out.frame_a, Ok("frame-a"), "{at}");
+                assert!(out.frame_b.is_err(), "another caller's hide at {at}");
+                assert!(!has(&events, "show"), "{at}: {events:?}");
 
-            let (out, _) = run(
-                vec![ok(theirs(500, skew))],
-                vec![ok("frame-a"), ok("frame-b")],
-            )
-            .await;
-            assert!(out.frame_a.is_err(), "hidden before frame A at skew {skew}");
+                let (out, _) = run_with_clock(
+                    clock,
+                    vec![ok(theirs(500, skew))],
+                    vec![ok("frame-a"), ok("frame-b")],
+                )
+                .await;
+                assert!(out.frame_a.is_err(), "hidden before frame A at {at}");
+            }
         }
     }
 
-    /// No `hiddenAt` or no `timestamp`: whose hide it is is unknown, so the
-    /// page is restored and no frame B is returned.
+    /// No `hiddenAt` or no `receivedAt` (a frontend predating the stamp):
+    /// whose hide it is is unknown, so the page is restored and no frame B is
+    /// returned — even when the hide is far older than frame A.
     #[tokio::test]
     async fn an_unattributable_hide_is_restored_not_measured() {
         for anon in [
             json!({"success": true, "hidden": true, "changed": true}),
-            json!({"success": true, "hidden": true, "hiddenAt": HIDE_SENT}),
+            json!({"success": true, "hidden": true, "hiddenAt": RECEIVED + 2}),
+            json!({"success": true, "hidden": true, "hiddenAt": 500,
+                   "timestamp": RECEIVED + 12}),
+            json!({"success": true, "hidden": true, "receivedAt": RECEIVED}),
         ] {
             let (out, events) = run(
                 vec![ok(anon.clone()), ok(restored(true))],
@@ -1396,6 +1396,8 @@ mod tests {
                         let want = body["hidden"].as_bool().unwrap_or_default();
                         let was = h.load(Ordering::SeqCst);
                         let reply = if want {
+                            // Received, then (if not already hidden) created.
+                            let received = c.fetch_add(1, Ordering::SeqCst);
                             let at = if was == 0 {
                                 c.fetch_add(1, Ordering::SeqCst)
                             } else {
@@ -1403,7 +1405,7 @@ mod tests {
                             };
                             h.store(at, Ordering::SeqCst);
                             json!({"success": true, "hidden": true, "changed": was == 0,
-                                   "hiddenAt": at, "timestamp": c.load(Ordering::SeqCst)})
+                                   "receivedAt": received, "hiddenAt": at})
                         } else {
                             h.store(0, Ordering::SeqCst);
                             json!({"success": true, "hidden": false, "changed": was != 0,
@@ -1430,7 +1432,6 @@ mod tests {
                     || std::future::ready(Ok::<(), String>(())),
                     capture,
                     move || c2.fetch_add(1, Ordering::SeqCst),
-                    RTT_CEILING,
                     || {},
                     |_| {},
                     |_, _| {},
@@ -1457,17 +1458,17 @@ mod tests {
         );
     }
 
-    /// The realistic gap: frame A done 1 ms before the hide is sent. A foreign
-    /// hide created 5 ms before frame A finished (hiddenAt 1994, reply at 2015
-    /// with a 20 ms round trip, so `timestamp - hiddenAt` = 21 is within the
-    /// round trip plus the slack) reads as ours by the clock alone — but it
-    /// predates frame A's end even on the earliest mapping, so it cannot be
-    /// this call's: frame A is refused and the hide left alone.
+    /// The reviewer's counter-example: frame A done 1 ms before the hide is
+    /// sent (F 1999, S 2000), a foreign hide created 4 ms before the send
+    /// (1996), the request received at 2003. Under the old round-trip rule it
+    /// read as ours; on one clock it is foreign (1996 < 2003), and frame A,
+    /// mapped to no later than 2003 - 1 = 2002, was taken under it: refused,
+    /// and the foreign hide is left alone.
     #[tokio::test]
-    async fn a_foreign_hide_just_before_frame_a_ends_is_never_ours() {
+    async fn the_reviewer_counter_example_reads_foreign_and_refuses_frame_a() {
         let (out, events) = run_with_clock(
-            [HIDE_SENT - 1, HIDE_SENT, HIDE_RECV],
-            vec![ok(theirs(HIDE_SENT - 6, 0))],
+            [HIDE_SENT - 1, HIDE_SENT],
+            vec![ok(theirs(HIDE_SENT - 4, 0))],
             vec![ok("frame-a"), ok("frame-b")],
         )
         .await;
@@ -1485,11 +1486,10 @@ mod tests {
         );
         assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
 
-        // And at that same gap, this call's OWN hide is still ours: the check
-        // uses the earliest mapping, so it does not flag a hide made after the
-        // send.
+        // At that same gap, this call's OWN hide is still ours, and frame A
+        // stands: the frame-A check runs on foreign hides only.
         let (out, events) = run_with_clock(
-            [HIDE_SENT - 1, HIDE_SENT, HIDE_RECV],
+            [HIDE_SENT - 1, HIDE_SENT],
             vec![ok(hid()), ok(restored(true))],
             vec![ok("frame-a"), ok("frame-b")],
         )
@@ -1499,14 +1499,13 @@ mod tests {
         assert!(has(&events, "show"), "{events:?}");
     }
 
-    /// The slack is rounding only: a foreign hide older than the round trip
-    /// plus a few ms is foreign, not ours (with frame A far enough back that
-    /// the frame-A check does not decide it).
+    /// The ownership boundary is exact, on the webview clock: a hide created
+    /// one webview ms before `receivedAt` is another caller's; one created in
+    /// the same ms is read as ours (the one ambiguity left).
     #[tokio::test]
-    async fn a_hide_older_than_the_round_trip_plus_rounding_is_foreign() {
-        // timestamp - hiddenAt = 25 against a 20 ms round trip.
+    async fn a_hide_one_webview_ms_before_receipt_is_foreign_and_one_at_it_is_ours() {
         let (out, events) = run(
-            vec![ok(theirs(HIDE_SENT + 15 - 25, 0))],
+            vec![ok(theirs(RECEIVED - 1, 0))],
             vec![ok("frame-a"), ok("frame-b")],
         )
         .await;
@@ -1517,27 +1516,15 @@ mod tests {
             "{err}"
         );
         assert!(!has(&events, "show"), "{events:?}");
-    }
 
-    /// A round trip that is not plausible — negative, or past the request's
-    /// own timeout — bounds nothing: ownership is unknown, and the page is
-    /// restored with no frame B.
-    #[tokio::test]
-    async fn an_implausible_round_trip_makes_ownership_unknown() {
-        for readings in [
-            [FRAME_A_DONE, HIDE_SENT, HIDE_SENT - 10],
-            [FRAME_A_DONE, HIDE_SENT, HIDE_SENT + RTT_CEILING + 1],
-        ] {
-            let (out, events) = run_with_clock(
-                readings,
-                vec![ok(hid()), ok(restored(true))],
-                vec![ok("frame-a"), ok("frame-b")],
-            )
-            .await;
-            let err = out.frame_b.expect_err("no frame B for an unknown owner");
-            assert!(err.contains("unknown"), "{readings:?}: {err}");
-            assert!(has(&events, "show"), "{readings:?}: {events:?}");
-        }
+        let (out, events) = run(
+            vec![ok(theirs(RECEIVED, 0)), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
+        )
+        .await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        assert_eq!(out.frame_b, Ok("frame-b"));
+        assert!(has(&events, "show"), "{events:?}");
     }
 
     /// An error returned before the request was emitted proves the hide never
@@ -1551,17 +1538,20 @@ mod tests {
             "UI Bridge semaphore closed",
             r#"{"error":"frontend_not_ready","detail":"..."}"#,
             "No runner window labeled 'x'. Discover live windows via ...",
-            "Failed to emit UI Bridge request: closed",
+            "Failed to serialize UiBridgeRequestEnvelope: key must be a string",
         ] {
             assert!(hide_never_sent(error), "{error}");
             let (out, events) = run(vec![fails(error)], vec![ok("frame-a")]).await;
-            assert!(out.frame_b.is_err(), "{error}");
+            let err = out.frame_b.expect_err(error);
+            assert!(err.contains("never left the runner"), "{error}: {err}");
             assert!(!has(&events, "show"), "{error}: {events:?}");
             assert!(!has(&events, "abort-restore"), "{error}: {events:?}");
             assert_eq!(out.frame_a, Ok("frame-a"), "{error}");
         }
         for error in [
             "UI Bridge request timed out after 10000ms",
+            // An emit can fail after a partial delivery: restored.
+            "Failed to emit UI Bridge request: closed",
             "something else",
         ] {
             assert!(!hide_never_sent(error), "{error}");
@@ -1571,25 +1561,23 @@ mod tests {
         }
     }
 
-    /// The pre-send messages `hide_never_sent` matches are the ones the UI
-    /// Bridge request path actually returns: reword one there and this fails.
+    /// Every pre-send message `hide_never_sent` matches — the real
+    /// [`BEFORE_SEND`], not a copy — is one the UI Bridge request path actually
+    /// returns: reword one there and this fails.
     #[test]
     fn the_pre_send_messages_still_exist_where_they_are_produced() {
         let request = include_str!("request.rs");
         let breaker = include_str!("circuit_breaker.rs");
-        for message in [
-            "UI Bridge concurrency limit reached (timeout acquiring permit)",
-            "UI Bridge semaphore closed",
-            "\"error\": \"frontend_not_ready\"",
-            "No runner window labeled",
-            "Failed to emit UI Bridge request",
-        ] {
+        for message in BEFORE_SEND {
             assert!(
-                request.contains(message),
-                "request.rs no longer says {message}"
+                request.contains(message) || breaker.contains(message),
+                "neither request.rs nor circuit_breaker.rs says {message}"
             );
         }
-        assert!(breaker.contains("UI Bridge temporarily unavailable (circuit breaker open)"));
+        assert!(
+            !BEFORE_SEND.iter().any(|m| m.contains("Failed to emit")),
+            "an emit failure may follow a partial delivery: it is restored"
+        );
     }
 
     /// The production call sites, pinned by source: the guard path is wired to
