@@ -138,6 +138,28 @@
 # A bogus ref exits 128 at `rev-parse`, which is rendered UNKNOWN (2), never
 # MISSING. "I could not resolve the ref" is not "the file is not there".
 #
+# ── ⚠️ THE CHECKOUT PATH CROSSES INTO git.exe NATIVE-SPELLED ────────────────
+#
+# Point 2 above removes the mangle from the REF. It did not remove it from the
+# ROOT, and that hole made every read UNKNOWN on Git Bash for Windows. The
+# default root is `$PWD`, which MSYS spells `/c/<dir>/...`; a caller's
+# `--root` is usually spelled the same way. git.exe is a NATIVE binary and only
+# understands that spelling because MSYS converts the argument on its way
+# across -- and this fleet routinely EXPORTS `MSYS_NO_PATHCONV=1` (it is the
+# documented cure for the `ref:.claude/...` mangle in raw `git show`), which is
+# inherited and silently turns the conversion off. Measured 2026-10-19 on a
+# Windows box: `MSYS_NO_PATHCONV=1 pinned-read.sh sha origin/main` -> rc 2, and
+# the same for a full 40-hex sha that `git rev-parse` itself resolved, from any
+# cwd and with any POSIX-spelled `--root`; a `C:/...` `--root` worked. An
+# UNKNOWN for every ref is honest but useless, and it reads as "the ref does
+# not exist".
+#
+# So every path this file hands to git is either converted to the native
+# spelling (the root, through lib/native-path.sh's `native_path_m`, ONE owner of
+# that boundary) or never handed over as an argument at all (`recheck` hashes
+# the copy through stdin, so bash opens the file, not git). On Linux both are
+# the identity.
+#
 # ── ONE PRODUCER, NO TWIN ───────────────────────────────────────────────────
 #
 # Consumers are bash hooks and a Python linter that only needs to PARSE the
@@ -269,6 +291,47 @@ else
 fi
 unset _pin_gitscope_lib
 
+# ── native path spelling (see "THE CHECKOUT PATH CROSSES INTO git.exe") ─────
+#
+# lib/native-path.sh owns the MSYS -> Windows path boundary; it is the identity
+# where there is no cygpath (Linux, CI). If it is not beside this file, the
+# fallback below does the one conversion that needs no cygpath (`/c/x` ->
+# `c:/x`), and ONLY on an MSYS/Cygwin host (`uname -s`), so a Linux `/w/repo`
+# is never rewritten. It covers a `/<drive>/...` root only: an MSYS-virtual
+# root such as `/tmp/...` or `/home/...` needs cygpath, so without the library
+# it passes through unchanged (exactly as before this boundary was handled) and
+# a stderr NOTE says the read may come back UNKNOWN for that reason.
+_pin_native_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/native-path.sh"
+if [ -r "$_pin_native_lib" ]; then
+  # shellcheck source=native-path.sh
+  . "$_pin_native_lib"
+fi
+unset _pin_native_lib
+
+# _pin_native <path> — <path> in the spelling git.exe can open. Only an
+# MSYS-absolute path (`/...`) needs it; a relative or already-native path is
+# returned without a fork, so the cost lands on the one shape that needs it.
+_pin_native() {
+  case "${1-}" in
+    /*) ;;
+    *)  printf '%s' "${1-}"; return 0 ;;
+  esac
+  if declare -F native_path_m >/dev/null 2>&1; then
+    printf '%s' "$(native_path_m "$1")"
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) printf '%s' "$1"; return 0 ;;
+  esac
+  case "$1" in
+    /[A-Za-z]/*) printf '%s:/%s' "${1:1:1}" "${1:3}" ;;
+    *)
+      echo "pinned-read: NOTE lib/native-path.sh is not beside this file, so '$1' reaches git.exe MSYS-spelled; with MSYS_NO_PATHCONV=1 set that read is UNKNOWN for this reason" >&2
+      printf '%s' "$1" ;;
+  esac
+}
+
 # ── The sentinels ───────────────────────────────────────────────────────────
 #
 # One spelling, used by every field that can fail to resolve. Deliberately the
@@ -301,9 +364,13 @@ PIN_EMPTY_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8
 # `--no-optional-locks` is GIT-LEVEL and must precede the subcommand: the
 # `status --no-optional-locks` spelling is `error: unknown option`, which a
 # `2>/dev/null` renders as a clean empty result.
+#
+# The root is native-spelled HERE, at the one place it crosses into git.exe, so
+# no public function -- sourced or executed -- can hand git an MSYS path. A
+# root `_pin_main` already converted comes back from `_pin_native` unforked.
 _pin_git() {
   local root="$1"; shift
-  git --no-optional-locks -c core.quotePath=false -C "$root" "$@"
+  git --no-optional-locks -c core.quotePath=false -C "$(_pin_native "$root")" "$@"
 }
 
 # _pin_now — the measurement timestamp, UTC, seconds.
@@ -648,21 +715,27 @@ pin_recheck() {
   fi
   # ⚠️ THE RE-RESOLUTION. `saved_sha` is what the ref WAS; comparing against it
   # would pass every copy forever -- the new-vs-new diff of b3d269a4 again.
-  new_sha="$(pin_sha "$s_root" "$s_ref")" || new_sha=""
+  # Native-spelled ONCE for the git calls below (the sidecar keeps the POSIX
+  # spelling, which the `[ -d ]` above and every emitted line still use).
+  local g_root; g_root="$(_pin_native "$s_root")"
+  new_sha="$(pin_sha "$g_root" "$s_ref")" || new_sha=""
   if [ -z "$new_sha" ]; then
     _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "" "$s_blob" "" "" ref_unresolvable
     echo "pinned-read: ref '$s_ref' no longer resolves in '$s_root' -- UNKNOWN" >&2
     return "$PIN_RC_UNKNOWN"
   fi
-  local_blob="$(_pin_git "$s_root" hash-object --no-filters -- "$file" 2>/dev/null)" || local_blob=""
+  # Through STDIN, not as a path argument: bash opens the file, so its MSYS
+  # spelling never reaches git.exe (see "THE CHECKOUT PATH CROSSES INTO
+  # git.exe"). `--no-filters` keeps the raw bytes either way.
+  local_blob="$(_pin_git "$g_root" hash-object --no-filters --stdin 2>/dev/null <"$file")" || local_blob=""
   if ! _pin_is_oid "$local_blob"; then
     _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "" "" hash_failed
     echo "pinned-read: could not hash '$file' -- UNKNOWN" >&2
     return "$PIN_RC_UNKNOWN"
   fi
-  typ="$(_pin_git "$s_root" cat-file -t "${new_sha}:${s_path}" 2>/dev/null)" || typ=""
+  typ="$(_pin_git "$g_root" cat-file -t "${new_sha}:${s_path}" 2>/dev/null)" || typ=""
   case "$typ" in
-    blob) cur="$(_pin_git "$s_root" rev-parse --verify -q "${new_sha}:${s_path}" 2>/dev/null)" || cur=""
+    blob) cur="$(_pin_git "$g_root" rev-parse --verify -q "${new_sha}:${s_path}" 2>/dev/null)" || cur=""
           _pin_is_oid "$cur" || cur="$PIN_UNKNOWN"
           reason=ref_moved_blob ;;
     "")   cur="none"; reason=missing_at_ref ;;
@@ -752,6 +825,8 @@ _pin_main() {
     esac
   done
   [ -n "$root" ] || root="$PWD"
+  # Once, so every git call below takes `_pin_native`'s no-fork arm.
+  root="$(_pin_native "$root")"
   [ $# -ge 1 ] || { echo "pinned-read: no verb given" >&2; _pin_usage >&2; return 2; }
 
   local verb="$1"; shift
