@@ -30,15 +30,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  AppWindow,
-  Download,
-  Maximize2,
-  Minimize2,
-  RefreshCw,
-  Tag,
-  X,
-} from "lucide-react";
+import { AppWindow, Download, Maximize2, Minimize2, RefreshCw, Tag, X } from "lucide-react";
 
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
@@ -46,16 +38,43 @@ import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminal
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
+  /**
+   * The zone whose label the label button edits (`useZoneLayout().cosmeticZoneFor`):
+   * `zoneIdx` in grid mode, the shown session's grid zone in tmux mode.
+   * `null` hides the label button — the session has no zone to label.
+   */
+  labelZone: number | null;
   /** Threaded from `ZoneGrid`'s prop (sourced from `useZoneActions`).
    *  Optional so the export button can degrade to disabled rather than
    *  throwing when the prop isn't wired (unusual; covers test mounts). */
   onExportZone?: (zoneIdx: number, format: "text" | "markdown" | "json") => void;
+  /**
+   * Render as a static, always-visible cluster for embedding in a header (the
+   * maximized view's title bar) instead of the hover-revealed top-right overlay.
+   */
+  inline?: boolean;
+}
+
+/**
+ * Width, in CSS px, the overlay cluster spans from the cell's right edge when it
+ * shows `buttons` buttons: `right-1` (4) + border (2) + `px-1` (8), and per
+ * button `p-1` + a `w-3` icon (20) with a `gap-0.5` (2) between neighbours.
+ * `ZoneLabel` reserves at least this much on hover so the cluster never covers
+ * the header's cwd label; keep it in step with the classes below.
+ */
+export function hoverActionsSpanPx(buttons: number): number {
+  return 4 + 2 + 8 + buttons * 20 + Math.max(0, buttons - 1) * 2;
 }
 
 const EXPORT_FORMATS = ["text", "markdown", "json"] as const;
 type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
-export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProps) {
+export function ZoneHoverActions({
+  zoneIdx,
+  labelZone,
+  onExportZone,
+  inline,
+}: ZoneHoverActionsProps) {
   const session = useTerminalSession();
   const { zoneLayout, closeTerminal, sessionStates } = session;
   const transitionEffects = useTransitionEffects();
@@ -65,13 +84,26 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
 
   const tabId = zoneLayout.assignments[zoneIdx];
   const isMaximized = zoneLayout.maximizedZone === zoneIdx;
-  const state = tabId ? sessionStates[tabId] ?? "idle" : "idle";
+  // tmux mode already shows the one session at full size; maximize does
+  // nothing there, so it is not offered.
+  const canMaximize = zoneLayout.workMode !== "tmux";
+  const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
   const canRestart = !!tabId && (state === "completed" || state === "error");
   const hasTab = !!tabId;
 
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
+  // The popover edits ONE zone's label. When the zone it edits changes under
+  // it — a keyboard swap in tmux mode shows another session, whose cosmetics
+  // are another grid zone — the draft belongs to the zone it was opened for,
+  // and an Enter would write it onto the new session's label. Close it instead
+  // (adjusted during render, so no frame shows the popover over the new zone).
+  const [labelInputZone, setLabelInputZone] = useState(labelZone);
+  if (labelInputZone !== labelZone) {
+    setLabelInputZone(labelZone);
+    setShowLabelInput(false);
+  }
   const [showWindowMenu, setShowWindowMenu] = useState(false);
   const [windowList, setWindowList] = useState<RunnerWindowRecord[]>([]);
 
@@ -91,7 +123,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
       if (showLabelInput && labelPopoverRef.current && !labelPopoverRef.current.contains(target)) {
         // Commit on outside-click — same convention as the launch-menu
         // close handler so a click-away doesn't silently discard typing.
-        labelsAndTags.setZoneLabel(zoneIdx, labelDraft.trim());
+        if (labelZone !== null) labelsAndTags.setZoneLabel(labelZone, labelDraft.trim());
         setShowLabelInput(false);
       }
       if (showWindowMenu && windowMenuRef.current && !windowMenuRef.current.contains(target)) {
@@ -100,7 +132,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [showExportMenu, showLabelInput, showWindowMenu, labelDraft, labelsAndTags, zoneIdx]);
+  }, [showExportMenu, showLabelInput, showWindowMenu, labelDraft, labelsAndTags, labelZone]);
 
   useEffect(() => {
     if (showLabelInput) {
@@ -133,11 +165,12 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
       // Seed the draft with the current label (if any) so the operator
       // can edit-in-place rather than retyping. Use empty-string when
       // unset rather than undefined to keep the input controlled.
-      setLabelDraft(labelsAndTags.zoneLabels[zoneIdx] ?? "");
+      if (labelZone === null) return;
+      setLabelDraft(labelsAndTags.zoneLabels[labelZone] ?? "");
       setShowLabelInput((prev) => !prev);
       setShowExportMenu(false);
     },
-    [labelsAndTags.zoneLabels, zoneIdx],
+    [labelsAndTags.zoneLabels, labelZone],
   );
 
   const openExportMenu = useCallback(
@@ -222,21 +255,31 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
       // buttons are clickable once visible. Enter delay lives on the
       // group-hover variant only — exit transition fires immediately
       // for a snappy "mouse left" feel.
-      className="absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150"
+      className={
+        inline
+          ? "relative shrink-0"
+          : "absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150"
+      }
+      // Inline (maximized header): keep clicks/double-clicks from reaching the
+      // header, whose double-click restores the zone.
+      onDoubleClick={inline ? (e) => e.stopPropagation() : undefined}
+      onMouseDown={inline ? (e) => e.stopPropagation() : undefined}
       data-page-element="zone-hover-actions"
       data-zone-index={zoneIdx}
     >
       <div className="flex items-center gap-0.5 px-1 py-0.5 bg-[#13141f]/90 border border-[#2a2d3d] rounded backdrop-blur-sm shadow-md">
         {/* Maximize / restore */}
-        <button
-          type="button"
-          onClick={handleMaximize}
-          className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors"
-          title={isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"}
-          aria-label={isMaximized ? "Restore zone" : "Maximize zone"}
-        >
-          {isMaximized ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
-        </button>
+        {canMaximize && (
+          <button
+            type="button"
+            onClick={handleMaximize}
+            className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors"
+            title={isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"}
+            aria-label={isMaximized ? "Restore zone" : "Maximize zone"}
+          >
+            {isMaximized ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
+          </button>
+        )}
 
         {/* Restart — visually gated */}
         <button
@@ -260,20 +303,22 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
         </button>
 
         {/* Label */}
-        <button
-          type="button"
-          onClick={openLabel}
-          className={`p-1 rounded transition-colors ${
-            showLabelInput
-              ? "text-[#bb9af7] bg-[#bb9af7]/10"
-              : "text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10"
-          }`}
-          title="Edit zone label"
-          aria-label="Edit zone label"
-          aria-expanded={showLabelInput}
-        >
-          <Tag className="w-3 h-3" />
-        </button>
+        {labelZone !== null && (
+          <button
+            type="button"
+            onClick={openLabel}
+            className={`p-1 rounded transition-colors ${
+              showLabelInput
+                ? "text-[#bb9af7] bg-[#bb9af7]/10"
+                : "text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10"
+            }`}
+            title="Edit zone label"
+            aria-label="Edit zone label"
+            aria-expanded={showLabelInput}
+          >
+            <Tag className="w-3 h-3" />
+          </button>
+        )}
 
         {/* Export */}
         <div className="relative" ref={exportRef}>
@@ -381,7 +426,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
             onKeyDown={(e) => {
               e.stopPropagation();
               if (e.key === "Enter") {
-                labelsAndTags.setZoneLabel(zoneIdx, labelDraft.trim());
+                if (labelZone !== null) labelsAndTags.setZoneLabel(labelZone, labelDraft.trim());
                 setShowLabelInput(false);
               } else if (e.key === "Escape") {
                 setShowLabelInput(false);

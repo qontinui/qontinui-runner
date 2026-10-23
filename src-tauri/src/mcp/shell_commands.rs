@@ -307,7 +307,8 @@ pub async fn run_shell_command_handler(
 
     // ── Container isolation path (with security policy) ────────────
     let security_settings = crate::settings::get_security_settings();
-    let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
+    let security_policy =
+        crate::security::PolicyEngine::resolve_for_runtime(None, &security_settings);
 
     // Enforce command policy before execution
     if let Err(denial) =
