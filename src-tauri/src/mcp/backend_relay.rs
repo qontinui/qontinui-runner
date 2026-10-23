@@ -4281,7 +4281,7 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         }
     }
 
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(120))
         .build()
     {

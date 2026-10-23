@@ -181,10 +181,10 @@ impl LibrarySyncService {
     pub fn new() -> Self {
         Self {
             auth_manager: AuthManager::new(),
-            client: reqwest::Client::builder()
+            client: qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client()),
         }
     }
 

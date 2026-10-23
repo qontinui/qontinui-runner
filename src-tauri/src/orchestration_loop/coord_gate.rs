@@ -540,7 +540,7 @@ impl LiveCoordGateClient {
     }
 
     fn http_client(&self) -> Result<reqwest::Client, CoordGateError> {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .timeout(self.timeout)
             .build()
             .map_err(|e| CoordGateError::Failed(format!("coord_gate: http client build: {e:#}")))

@@ -74,13 +74,12 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
             // churn is how the runner accumulated hundreds of half-live
             // connections. `pool_idle_timeout` keeps a warm connection across
             // the 30s heartbeat tick so the steady state is zero handshakes.
-            // `os_resolver`: the OS's own resolver on bounded dedicated
+            // `client_builder`: the OS's own resolver on bounded dedicated
             // threads — never hickory (which ignores a VPN's DNS routing and
             // cost 5.5 s per lookup on 2020Dell) and never tokio's shared
             // blocking pool (the queue this client was created to escape).
             // `outbound_net::os_dns` has both measurements.
-            match reqwest::Client::builder()
-                .dns_resolver(qontinui_runner_lib::outbound_net::os_dns::os_resolver())
+            match qontinui_runner_lib::outbound_net::client_builder()
                 .pool_max_idle_per_host(32)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_keepalive(Duration::from_secs(60))

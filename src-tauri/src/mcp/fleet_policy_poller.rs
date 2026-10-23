@@ -2419,7 +2419,7 @@ async fn check_fleet_policy_capability() -> CapabilityCheck {
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!("{}/health", base.trim_end_matches('/'));
 
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -2843,7 +2843,7 @@ async fn fetch_fleet_policy_with(
         base.trim_end_matches('/')
     );
 
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

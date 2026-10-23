@@ -177,7 +177,7 @@ async fn build_summary(
     // (b) URLs / issue refs in the task description.
     let urls = extract_urls(task_description);
     if !urls.is_empty() {
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent("qontinui-runner-prehydration")
             .build()

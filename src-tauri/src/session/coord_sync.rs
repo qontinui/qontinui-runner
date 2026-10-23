@@ -255,7 +255,7 @@ impl CoordSync {
         ));
         let stale = Duration::from_secs(env_u64("QONTINUI_SESSION_STALE_SECS", DEFAULT_STALE_SECS));
 
-        let http = reqwest::Client::builder()
+        let http = qontinui_runner_lib::outbound_net::client_builder()
             // Per-request timeout — slow enough to ride out a hiccup,
             // fast enough that the drain loop doesn't stall on a hung
             // coord. 30s matches the `agent_claims` heartbeat client.
@@ -271,7 +271,7 @@ impl CoordSync {
             .build()
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "coord_sync: reqwest client build failed; using default");
-                reqwest::Client::new()
+                qontinui_runner_lib::outbound_net::client()
             });
 
         Self {
@@ -308,7 +308,7 @@ impl CoordSync {
             inner: Arc::new(CoordSyncInner {
                 outbox,
                 coord_url,
-                http: reqwest::Client::builder()
+                http: qontinui_runner_lib::outbound_net::client_builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .unwrap(),
@@ -6187,7 +6187,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let err = reqwest::Client::new()
+        let err = qontinui_runner_lib::outbound_net::client()
             .get(format!("http://127.0.0.1:{port}/sessions"))
             .send()
             .await

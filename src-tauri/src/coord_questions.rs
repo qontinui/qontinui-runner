@@ -128,7 +128,7 @@ pub async fn post_question(
         device_id,
     };
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| CoordQuestionError::Http(format!("reqwest builder: {e}")))?;
@@ -194,7 +194,7 @@ pub async fn poll_answer(
         coord_base.trim_end_matches('/'),
         question_id
     );
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| CoordQuestionError::Http(format!("reqwest builder: {e}")))?;

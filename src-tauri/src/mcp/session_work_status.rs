@@ -365,7 +365,9 @@ fn shared_client() -> Result<reqwest::Client, reqwest::Error> {
     if let Some(c) = CLIENT.get() {
         return Ok(c.clone());
     }
-    let c = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
+    let c = qontinui_runner_lib::outbound_net::client_builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()?;
     Ok(CLIENT.get_or_init(|| c).clone())
 }
 

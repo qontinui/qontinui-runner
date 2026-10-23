@@ -65,7 +65,7 @@ impl CoordInstallClient {
     /// default binding: `/coord/installs/declare` persists a row whose tenant
     /// coord prefers to take from `principal.tenant_id`, i.e. from this bearer.
     pub fn new(base: impl Into<String>, scope: TenantScope) -> Result<Self, CoordError> {
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| CoordError::Client(e.to_string()))?;
@@ -129,7 +129,7 @@ impl CoordInstallClient {
         let url = self.url("/coord/fs/observations");
         // Use a tighter client than the 30s declare/verify one — this is
         // best-effort and must not stall the route.
-        let client = match reqwest::Client::builder()
+        let client = match qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
         {

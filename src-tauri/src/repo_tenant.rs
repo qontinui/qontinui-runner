@@ -233,7 +233,7 @@ async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         // Strictly below CWD_TENANT_BUDGET, so a slow coord surfaces as this
         // read's own error (named) rather than the resolver's generic timeout.
         .timeout(CANONICAL_REPOS_HTTP_TIMEOUT)
@@ -455,7 +455,7 @@ async fn fetch_repo_tenants(slug: String) -> Result<RepoTenantsAnswer, RepoTenan
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/repos/tenants");
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         // Strictly below CWD_TENANT_BUDGET, so a slow coord surfaces as this
         // read's own error (named) rather than the resolver's generic timeout.
         .timeout(REPO_TENANTS_HTTP_TIMEOUT)

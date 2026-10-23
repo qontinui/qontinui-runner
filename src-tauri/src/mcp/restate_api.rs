@@ -177,7 +177,7 @@ async fn get_restate_workflow_state(
         execution_id
     );
 
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     match client
         .post(&url)
         .json(&serde_json::json!(null))

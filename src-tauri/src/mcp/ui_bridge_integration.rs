@@ -9,7 +9,6 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1954,10 +1953,10 @@ async fn handle_health_check(
         Err(e) => return Json(ApiResponse::error(e)),
     };
 
-    let client = Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
     let now = chrono::Utc::now().timestamp();
 
     let mut updated = Vec::new();
