@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -552,46 +553,41 @@ export function recordBelongsToRestore(
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
  *
- * Autonomous resume (`--permission-mode bypassPermissions`, matching the
- * zone-profile + shell-integration resume builders): a boot-restored session
- * is unattended, so a bare `claude --resume` would stall forever on its first
- * permission prompt. Aligned with PR #547 — whichever lands second resolves
- * the textual conflict by keeping this union form.
+ * Every resume, for every provider, is RENDERED BY THE BACKEND
+ * (`build_ai_resume_command`), never assembled here. The backend owns the two decisions a typed resume must not
+ * get wrong: which `CLAUDE_CONFIG_DIR` the session runs under (a declared model
+ * gateway replaces the recorded subscription dir, so a subscription token can
+ * never ride a gateway-routed session) and the permission posture (bypass, or
+ * the operator's allow-list). The resume-summary env thresholds ride along
+ * under the default `"full"` policy.
  *
- * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
- * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
- * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
- * the resume-summary env thresholds are applied ONLY when the resolved program
- * is Claude — they are CLI-specific and harmless to omit for other providers.
+ * A non-Claude provider is rendered there too (review N7): the backend
+ * applies the gateway's provider refusal and validates/quotes the session id.
  */
-export function buildResumeCmd(
+export async function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
-): string {
-  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
-  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
-  // boot restore is not Claude-hardcoded.
-  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
-  const program = argv[0];
-  const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
-  const env: Array<[string, string]> = [];
-  if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
-  if (isClaude && policy === "full") {
-    env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
-    env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
-  }
-  if (env.length === 0) return `${base}\r`;
+): Promise<string> {
+  // Every provider is rendered by the backend (review N7): a provider that
+  // cannot route through a declared model gateway is refused there, and the
+  // session id is validated/quoted there — never assembled here.
+  const resumeProvider = provider ?? "claude";
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  const resp = await invoke<CommandResponse>("build_ai_resume_command", {
+    sessionId,
+    provider: resumeProvider,
+    configDir: configDir ?? null,
+    isWindows,
+    fullResume: policy === "full",
+  });
+  const command = (resp?.data as { command?: string } | null | undefined)?.command;
+  if (!resp?.success || !command) {
+    throw new Error(resp?.message ?? "build_ai_resume_command returned no command");
+  }
+  return `${command}\r`;
 }
 
 /**
@@ -642,7 +638,17 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  let resumeCmd: string;
+  try {
+    resumeCmd = await buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  } catch (err) {
+    // The backend refused to render a resume (e.g. an unresolved model
+    // gateway). Type nothing; park the tab for an explicit retry and keep the
+    // restore-pending marker, exactly like an unverified resume.
+    console.warn(`[TerminalPage] resume not rendered for ${claudeSessionId}:`, err);
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    return "failed";
+  }
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -1186,10 +1192,15 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
-    assignTabToZone: (zoneIdx: number, tabId: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
+    /**
+     * Place a restored session at its recorded GRID zone — into the grid in
+     * grid mode, into the grid snapshot in tmux mode (never onto the screen).
+     */
+    placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    assignments: Record<number, string>;
+    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
+    gridView: { assignments: Record<number, string> };
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -1224,8 +1235,10 @@ interface UseTerminalInitializationParams {
     clearSavedLayout: () => void;
     hasSavedLayout: () => boolean;
   };
+  /** The grid as persisted: `useZoneLayout().gridView` plus the zone cosmetics. */
   layoutState: {
     layoutId: string;
+    assignments: Record<number, string>;
     zoneLabels: Record<number, string>;
     zoneNotes: Record<number, string>;
     pinnedZones: Set<number>;
@@ -1590,7 +1603,7 @@ export function useTerminalInitialization({
             saved.layoutId === FLOW_GRID_ID ||
             LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
           ) {
-            zoneLayout.setLayoutId(saved.layoutId);
+            zoneLayout.setLayoutId(saved.layoutId, { source: "restore" });
           }
         }
 
@@ -1629,8 +1642,15 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-              zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                zoneLayout.gridView.assignments,
+              )
+            ) {
+              zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
             updateTab(tabId, {
@@ -1708,8 +1728,15 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-            zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              zoneLayout.gridView.assignments,
+            )
+          ) {
+            zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
           updateTab(tabId, {
@@ -1834,7 +1861,7 @@ export function useTerminalInitialization({
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
             if (tabId && session.zoneIndex >= 0) {
-              zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+              zoneLayout.placeRestoredTab(session.zoneIndex, tabId);
               applyZoneCosmetics(session.zoneIndex);
             }
           }
@@ -2053,7 +2080,7 @@ export function useTerminalInitialization({
     sessionPersistence.saveSessionLayout({
       layoutId: layoutState.layoutId,
       tabs,
-      assignments: zoneLayout.assignments,
+      assignments: layoutState.assignments,
       zoneLabels: layoutState.zoneLabels,
       zoneNotes: layoutState.zoneNotes,
       pinnedZones: layoutState.pinnedZones,
@@ -2062,7 +2089,7 @@ export function useTerminalInitialization({
   }, [
     pageId,
     tabs,
-    zoneLayout.assignments,
+    layoutState.assignments,
     layoutState.layoutId,
     layoutState.focusedZone,
     layoutState.zoneLabels,
@@ -2076,10 +2103,6 @@ export function useTerminalInitialization({
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
-  const zoneLayoutRef = useRef(zoneLayout);
-  useEffect(() => {
-    zoneLayoutRef.current = zoneLayout;
-  }, [zoneLayout]);
   const layoutStateRef = useRef(layoutState);
   useEffect(() => {
     layoutStateRef.current = layoutState;
@@ -2095,7 +2118,7 @@ export function useTerminalInitialization({
         sessionPersistence.saveSessionLayout({
           layoutId: ls.layoutId,
           tabs: currentTabs,
-          assignments: zoneLayoutRef.current.assignments,
+          assignments: ls.assignments,
           zoneLabels: ls.zoneLabels,
           zoneNotes: ls.zoneNotes,
           pinnedZones: ls.pinnedZones,
@@ -2122,7 +2145,8 @@ export function useTerminalInitialization({
       const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
       const pathMap = await sessionPersistence.saveScrollbackBuffers(terminalTabs);
       const tabIdToSessionIndex: Record<string, number> = {};
-      const currentAssignments = zoneLayoutRef.current.assignments;
+      // The same assignments the layout save walks, so the indices line up.
+      const currentAssignments = layoutStateRef.current.assignments;
       const assignedTabIds = new Set(Object.values(currentAssignments));
       let idx = 0;
       for (const [, tabId] of Object.entries(currentAssignments)) {

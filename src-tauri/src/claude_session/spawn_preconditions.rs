@@ -214,6 +214,79 @@ pub struct TrustPrecondition {
     pub verdict: TrustVerdict,
 }
 
+/// The CLI's second trust reading for a LINKED worktree: the one that gates the
+/// project permission grants in `.claude/settings.json`, which it keys on the
+/// PRIMARY checkout (`.git` → `gitdir` → `commondir`) rather than on the
+/// worktree root `project_key` names. A spawn whose worktree key reads trusted
+/// still raises the CLI's backstop dialog ("This folder pre-approves N tool
+/// permissions …") when this one does not, so without it a spawn stalled on
+/// that dialog would report `trusted` — pointing away from its own cause.
+/// [`crate::claude_session::trust_gate::mints_primary_checkout_trust`] is the
+/// write half; this is its observable.
+///
+/// Like the plain verdict it is taken BEFORE the trust gate writes, so it
+/// answers "would this spawn have faced the backstop dialog?" — an `untrusted`
+/// here beside a gate that went on to mint the key is the gate doing its job,
+/// not the cause of a later stall. The gate's own `primary_checkout_write_outcome`
+/// is what records the write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExplicitTrustPrecondition {
+    /// The primary checkout's `projects` key, verified from both ends of git's
+    /// worktree link. `None` when that verification failed — `verdict` is then
+    /// `Unknown` carrying the reason.
+    pub primary_key: Option<String>,
+    pub verdict: TrustVerdict,
+}
+
+/// The explicit-trust reading for `cwd`, read from `config_file`, or `None`
+/// when the cwd is not inside a linked worktree. The primary is derived by the
+/// SAME verified resolver the trust gate mints through
+/// ([`crate::claude_session::trust_gate::verified_primary_checkout`]), so the
+/// verdict and the write can never key two different entries.
+///
+/// "Linked worktree" is decided off the `.git` FILE's `gitdir:` line naming a
+/// dir under `…/worktrees/`. A submodule also has a `.git` file, but its line
+/// names `…/modules/…`; it has no primary checkout to report, and treating it as
+/// an unverifiable worktree would warn on every spawn into one. The line is
+/// only a classifier — the key itself comes from the verified resolver.
+pub(crate) fn explicit_trust_for(
+    cwd: &Path,
+    config_file: Option<&Path>,
+) -> Option<ExplicitTrustPrecondition> {
+    let root = workspace_trust::git_root(&std::fs::canonicalize(cwd).ok()?)?;
+    let dot_git = std::fs::read_to_string(root.join(".git")).ok()?;
+    let admin = dot_git
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim()
+        .replace('\\', "/");
+    if Path::new(&admin).parent()?.file_name()? != std::ffi::OsStr::new("worktrees") {
+        return None;
+    }
+    let (primary_key, verdict) =
+        match crate::claude_session::trust_gate::verified_primary_checkout(cwd) {
+            Err(reason) => (
+                None,
+                TrustVerdict::Unknown {
+                    reason: format!("the primary checkout could not be verified: {reason}"),
+                },
+            ),
+            Ok((_, key)) => {
+                let verdict = match config_file {
+                    Some(file) => trust_verdict_in(file, &key),
+                    None => TrustVerdict::Unknown {
+                        reason: "no account config file resolved".to_string(),
+                    },
+                };
+                (Some(key), verdict)
+            }
+        };
+    Some(ExplicitTrustPrecondition {
+        primary_key,
+        verdict,
+    })
+}
+
 /// Read `projects[key].hasTrustDialogAccepted` out of one account config file.
 ///
 /// Pure over the filesystem, so the fixture cases (flag true / explicitly false /
@@ -771,6 +844,10 @@ pub struct SpawnPreconditionSnapshot {
     /// Which arm of the account resolver produced `account_config_dir`.
     pub config_dir_source: String,
     pub trust: TrustVerdict,
+    /// See [`ExplicitTrustPrecondition`]. Absent from the wire when the
+    /// cwd is not a linked worktree, so such a spawn's body is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_trust: Option<ExplicitTrustPrecondition>,
     pub credential: CredentialProbe,
 }
 
@@ -791,6 +868,7 @@ pub struct SpawnPreconditions {
     account_config_file: Option<String>,
     config_dir_source: String,
     trust: TrustVerdict,
+    explicit_trust: Option<ExplicitTrustPrecondition>,
     credential: watch::Receiver<CredentialProbe>,
 }
 
@@ -807,6 +885,13 @@ impl SpawnPreconditions {
         config_dir_source: &str,
     ) -> Self {
         let trust = trust_precondition(cwd, config_dir);
+        // Only here, not in `trust_precondition`: the gate paths that call that
+        // never read this, and the gate verifies the primary itself.
+        // A cwd with no derivable key (relative, unresolved) is skipped: it would
+        // canonicalize against the RUNNER's own cwd and describe another tree.
+        let explicit_trust = trust.project_key.as_ref().and_then(|_| {
+            explicit_trust_for(Path::new(cwd), trust.config_file.as_deref().map(Path::new))
+        });
 
         let (tx, credential) = watch::channel(CredentialProbe::Pending);
         match tokio::runtime::Handle::try_current() {
@@ -839,6 +924,7 @@ impl SpawnPreconditions {
             account_config_file: trust.config_file,
             config_dir_source: config_dir_source.to_string(),
             trust: trust.verdict,
+            explicit_trust,
             credential,
         };
         me.log_trust();
@@ -878,6 +964,34 @@ impl SpawnPreconditions {
                 "spawn precondition: trust_precondition could not be established"
             ),
         }
+        let Some(explicit) = &self.explicit_trust else {
+            return;
+        };
+        let primary_key = explicit.primary_key.as_deref().unwrap_or("<unverified>");
+        match &explicit.verdict {
+            TrustVerdict::Trusted => debug!(
+                verdict = "trusted",
+                primary_key,
+                %derivation,
+                "spawn precondition: explicit_trust (primary checkout)"
+            ),
+            TrustVerdict::Untrusted { reason } => warn!(
+                verdict = "untrusted",
+                reason = *reason,
+                primary_key,
+                %derivation,
+                "spawn precondition: explicit_trust — the primary checkout is not trusted, so \
+                 this spawn would face the CLI's backstop dialog for the project's permission \
+                 grants (reported only; the trust gate may mint it next)"
+            ),
+            TrustVerdict::Unknown { reason } => warn!(
+                verdict = "unknown",
+                reason = %reason,
+                primary_key,
+                %derivation,
+                "spawn precondition: explicit_trust could not be established"
+            ),
+        }
     }
 
     /// The trust verdict this spawn resolved, taken BEFORE any pre-accept write.
@@ -885,7 +999,9 @@ impl SpawnPreconditions {
     /// Exposed for [`crate::claude_session::trust_gate`], which ACTS on it
     /// (Phase 2). It is deliberately the only trust probe in the spawn path: a
     /// second derivation would key a different question and still read as
-    /// authoritative.
+    /// authoritative. (`explicit_trust` keys a different question on purpose —
+    /// the primary checkout's entry — and is named apart so it cannot be taken
+    /// for this one.)
     pub fn trust_verdict(&self) -> &TrustVerdict {
         &self.trust
     }
@@ -904,6 +1020,7 @@ impl SpawnPreconditions {
             account_config_file: self.account_config_file.clone(),
             config_dir_source: self.config_dir_source.clone(),
             trust: self.trust.clone(),
+            explicit_trust: self.explicit_trust.clone(),
             credential: self.credential(),
         }
     }
@@ -1119,6 +1236,154 @@ mod tests {
             trust_precondition(&cwd, Some(dir.as_str())).verdict,
             TrustVerdict::Trusted
         );
+    }
+
+    // --------------------------------------------- explicit (primary) trust
+
+    use crate::claude_session::trust_gate::test_fixtures::linked_worktree_fixture;
+
+    /// A linked worktree plus an empty account dir:
+    /// `(tempdir, primary, worktree, account dir)`.
+    fn linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let (tmp, primary, wt) = linked_worktree_fixture(&[]);
+        let acct = tmp.path().join("acct");
+        std::fs::create_dir(&acct).unwrap();
+        (tmp, primary, wt, acct)
+    }
+
+    /// Write an account config trusting exactly `keys`; returns the file.
+    fn trust_keys(acct: &Path, keys: &[&str]) -> PathBuf {
+        let mut entry = serde_json::Map::new();
+        entry.insert(TRUST_FLAG.to_string(), serde_json::Value::Bool(true));
+        let projects: serde_json::Map<String, serde_json::Value> = keys
+            .iter()
+            .map(|k| (k.to_string(), serde_json::Value::Object(entry.clone())))
+            .collect();
+        let mut doc = serde_json::Map::new();
+        doc.insert(
+            PROJECTS_KEY.to_string(),
+            serde_json::Value::Object(projects),
+        );
+        let file = acct.join(CONFIG_FILE);
+        std::fs::write(&file, serde_json::Value::Object(doc).to_string()).unwrap();
+        file
+    }
+
+    /// The defect #1868 closed on the write side, seen from the instrument: the
+    /// worktree key reads trusted while the primary does not, which is exactly
+    /// the spawn that still raises the backstop dialog. The plain verdict alone
+    /// reports `trusted` for it.
+    #[test]
+    fn a_worktree_trusted_only_at_its_own_key_reports_explicit_untrusted() {
+        let (_tmp, primary, wt, acct) = linked_worktree();
+        let cfg = trust_keys(&acct, &[&workspace_trust::project_key(&wt).unwrap()]);
+
+        assert_eq!(
+            trust_precondition(wt.to_str().unwrap(), acct.to_str()).verdict,
+            TrustVerdict::Trusted
+        );
+        let explicit = explicit_trust_for(&wt, Some(cfg.as_path())).expect("a linked worktree");
+        assert_eq!(explicit.primary_key, workspace_trust::project_key(&primary));
+        assert_eq!(
+            explicit.verdict,
+            TrustVerdict::Untrusted {
+                reason: "no entry for this project key"
+            }
+        );
+    }
+
+    #[test]
+    fn a_trusted_primary_reads_explicit_trusted() {
+        let (_tmp, primary, wt, acct) = linked_worktree();
+        let cfg = trust_keys(&acct, &[&workspace_trust::project_key(&primary).unwrap()]);
+        // From a subdirectory too: the reading keys the enclosing worktree.
+        let sub = wt.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            explicit_trust_for(&sub, Some(cfg.as_path()))
+                .unwrap()
+                .verdict,
+            TrustVerdict::Trusted
+        );
+    }
+
+    /// The primary checkout and a plain repo are not linked worktrees: their own
+    /// key is the explicit key, so there is no second reading to report.
+    #[test]
+    fn a_primary_checkout_carries_no_explicit_reading() {
+        let (_tmp, primary, _wt, acct) = linked_worktree();
+        let cfg = trust_keys(&acct, &[]);
+        assert_eq!(explicit_trust_for(&primary, Some(cfg.as_path())), None);
+    }
+
+    /// A submodule's `.git` file names `…/modules/…`, not `…/worktrees/…`: it is
+    /// not asked, so a spawn into one does not warn on every launch.
+    #[test]
+    fn a_submodule_shaped_git_file_carries_no_explicit_reading() {
+        let (_tmp, primary, _wt, acct) = linked_worktree();
+        let sub = primary.join("vendored");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/vendored\n").unwrap();
+        let cfg = trust_keys(&acct, &[]);
+        assert_eq!(explicit_trust_for(&sub, Some(cfg.as_path())), None);
+    }
+
+    /// A worktree link that cannot be verified back to its admin dir is
+    /// UNKNOWN, carrying why — never silently dropped, never read as untrusted.
+    #[test]
+    fn an_unverifiable_worktree_link_is_explicit_unknown() {
+        let (_tmp, _primary, wt, acct) = linked_worktree();
+        std::fs::write(wt.join(".git"), "gitdir: /nowhere/.git/worktrees/x\n").unwrap();
+        let cfg = trust_keys(&acct, &[]);
+        let explicit = explicit_trust_for(&wt, Some(cfg.as_path())).expect("still worktree-shaped");
+        assert_eq!(explicit.primary_key, None);
+        assert!(
+            matches!(&explicit.verdict, TrustVerdict::Unknown { reason }
+                if reason.contains("could not be verified")),
+            "{:?}",
+            explicit.verdict
+        );
+    }
+
+    /// No account config file resolved is UNKNOWN for this reading as well,
+    /// with the key still reported so the operator knows which entry to check.
+    #[test]
+    fn no_config_file_is_explicit_unknown_with_the_key() {
+        let (_tmp, primary, wt, _acct) = linked_worktree();
+        let explicit = explicit_trust_for(&wt, None).unwrap();
+        assert_eq!(explicit.primary_key, workspace_trust::project_key(&primary));
+        assert!(matches!(explicit.verdict, TrustVerdict::Unknown { .. }));
+    }
+
+    /// The stall body carries the reading — here the one-key-only shape, so the
+    /// assertion is about the keying, not an absent file — and leaves it off the
+    /// wire for a spawn that is not in a linked worktree.
+    #[test]
+    fn the_stalled_body_carries_explicit_trust_only_for_a_linked_worktree() {
+        let (_tmp, primary, wt, acct) = linked_worktree();
+        trust_keys(&acct, &[&workspace_trust::project_key(&wt).unwrap()]);
+        let acct_s = acct.to_string_lossy().into_owned();
+        let body = |cwd: &Path| {
+            let pre = SpawnPreconditions::evaluate(
+                cwd.to_str().unwrap(),
+                None,
+                Some(acct_s.as_str()),
+                "manual",
+            );
+            serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None)).unwrap()
+        };
+        let in_wt = body(&wt);
+        assert_eq!(in_wt["trust"]["verdict"], "trusted");
+        assert_eq!(in_wt["explicit_trust"]["verdict"]["verdict"], "untrusted");
+        assert_eq!(
+            in_wt["explicit_trust"]["verdict"]["reason"],
+            "no entry for this project key"
+        );
+        assert_eq!(
+            in_wt["explicit_trust"]["primary_key"].as_str(),
+            workspace_trust::project_key(&primary).as_deref()
+        );
+        assert!(body(&primary).get("explicit_trust").is_none());
     }
 
     // ------------------------------------------------------------ exp decode

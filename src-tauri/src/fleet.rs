@@ -2289,7 +2289,9 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     };
     let url = format!("{base}/coord/devices/register");
 
-    let client = reqwest::Client::builder()
+    // OS resolver: under the old hickory resolver this request spent its whole
+    // 5 s cap on DNS on a VPN box (outbound_net::os_dns).
+    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
@@ -5305,7 +5307,8 @@ pub async fn publish_tree_state() -> Result<(), String> {
         Err(e) => return Err(format!("read_dir {root}: {e}", root = root.display())),
     };
 
-    let client = reqwest::Client::builder()
+    // OS resolver — see the register heartbeat above and outbound_net::os_dns.
+    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
