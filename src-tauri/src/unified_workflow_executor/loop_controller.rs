@@ -863,8 +863,12 @@ impl LoopController {
 
             if abandon_canary {
                 // Undo the overrides already applied, and record no canary run.
-                Self::restore_canary_config(&canary_config_originals);
-                canary_config_originals.clear();
+                // A restore that fails here (the outage that abandoned the
+                // canary can fail it too) stays in the list, so the end-of-run
+                // restore retries it.
+                canary_config_originals =
+                    Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals)
+                        .await;
                 active_canary = None;
             }
             let is_canary_run = active_canary.is_some();
@@ -935,7 +939,7 @@ impl LoopController {
                         stage_num, total_stages
                     ))
                     .await;
-                Self::restore_canary_config(&canary_config_originals);
+                Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
                 flow_enforcer.record_end(&config.workflow_id, None).await;
                 return WorkflowResult {
                     success: false,
@@ -992,7 +996,7 @@ impl LoopController {
                                 max, stage_num, total_stages
                             ))
                             .await;
-                        Self::restore_canary_config(&canary_config_originals);
+                        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1152,7 +1156,7 @@ impl LoopController {
                             .await
                             .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
                             .await;
-                        Self::restore_canary_config(&canary_config_originals);
+                        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1759,7 +1763,7 @@ impl LoopController {
                             .on_workflow_complete(&loop_result, start.elapsed(), sessions)
                             .await;
                     }
-                    Self::restore_canary_config(&canary_config_originals);
+                    Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
                     flow_enforcer.record_end(&config.workflow_id, None).await;
                     return WorkflowResult {
                         success: false,
@@ -2961,7 +2965,7 @@ impl LoopController {
         }
 
         // Restore canary config overrides
-        Self::restore_canary_config(&canary_config_originals);
+        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
 
         // Record flow control end for concurrency tracking
         flow_enforcer.record_end(&config.workflow_id, None).await;
@@ -2985,9 +2989,26 @@ impl LoopController {
         }
     }
 
-    /// Restore canary config overrides to their original values.
-    fn restore_canary_config(_originals: &[(String, Option<serde_json::Value>)]) {
-        // Canary config restore removed — settings persistence now via PgDb.
+    /// Restore canary config overrides to their original values in PG: a key
+    /// that had a value gets it back, a key that had none is deleted.
+    ///
+    /// Until 2026-10-24 this was an empty stub ("settings persistence now via
+    /// PgDb"), so every canary override applied with `set_setting` stayed in
+    /// the settings table after the run, and the abandon-on-unreadable-original
+    /// arm above "undid" nothing. Returns the entries whose write FAILED (each
+    /// already logged), in application order, so a caller can retry them — the
+    /// abandon arm keeps them for the end-of-run restore.
+    async fn restore_canary_config(
+        pg: &crate::database::pg::PgDb,
+        originals: &[(String, Option<serde_json::Value>)],
+    ) -> Vec<(String, Option<serde_json::Value>)> {
+        restore_settings(originals, |key, original| async move {
+            match original {
+                Some(value) => pg.set_setting(&key, &value).await,
+                None => pg.delete_setting(&key).await.map(|_| ()),
+            }
+        })
+        .await
     }
 
     /// Multi-agent fix: triage failures into groups, run specialized fix agents
@@ -3659,6 +3680,111 @@ fn stage_loop_entry_for(
         | ResumePoint::CompletionPhase { .. }
         | ResumePoint::StageStart { .. }
         | ResumePoint::AllStagesComplete { .. } => (0, run_agentic_first && stage_idx == 0),
+    }
+}
+
+/// Write every `(key, original)` back through `write`, in REVERSE application
+/// order (so a key overridden twice ends at the first original recorded for
+/// it). `write` receives `Some(value)` to set and `None` to delete. Returns the
+/// entries whose write failed, in application order, each logged at `warn!`.
+async fn restore_settings<F, Fut>(
+    originals: &[(String, Option<serde_json::Value>)],
+    mut write: F,
+) -> Vec<(String, Option<serde_json::Value>)>
+where
+    F: FnMut(String, Option<serde_json::Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut failed = Vec::new();
+    for (key, original) in originals.iter().rev() {
+        if let Err(e) = write(key.clone(), original.clone()).await {
+            warn!("CANARY: could not restore setting {} to its original: {}", key, e);
+            failed.push((key.clone(), original.clone()));
+        }
+    }
+    failed.reverse();
+    failed
+}
+
+#[cfg(test)]
+mod canary_restore_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Store = Mutex<HashMap<String, serde_json::Value>>;
+
+    async fn restore_into(
+        store: &Store,
+        originals: &[(String, Option<serde_json::Value>)],
+        fail_key: Option<&str>,
+    ) -> Vec<(String, Option<serde_json::Value>)> {
+        restore_settings(originals, |key, original| async move {
+            if fail_key == Some(key.as_str()) {
+                return Err("PG pool error: database unavailable".to_string());
+            }
+            let mut s = store.lock().unwrap();
+            match original {
+                Some(v) => {
+                    s.insert(key, v);
+                }
+                None => {
+                    s.remove(&key);
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// The canary applied two overrides (one key had a value, one had none);
+    /// the restore must put the first back and delete the second.
+    #[tokio::test]
+    async fn restore_puts_originals_back_and_deletes_keys_that_had_none() {
+        let store: Store = Mutex::new(HashMap::from([
+            ("model".to_string(), serde_json::json!("canary-model")),
+            ("temperature".to_string(), serde_json::json!(0.9)),
+        ]));
+        let originals = vec![
+            ("model".to_string(), Some(serde_json::json!("baseline-model"))),
+            ("temperature".to_string(), None),
+        ];
+        let failed = restore_into(&store, &originals, None).await;
+        assert!(failed.is_empty());
+        let s = store.lock().unwrap();
+        assert_eq!(s.get("model"), Some(&serde_json::json!("baseline-model")));
+        assert!(!s.contains_key("temperature"), "a key with no original is deleted");
+    }
+
+    /// A key recorded twice ends at its FIRST original (reverse-order restore).
+    #[tokio::test]
+    async fn a_key_overridden_twice_ends_at_its_first_original() {
+        let store: Store = Mutex::new(HashMap::new());
+        let originals = vec![
+            ("k".to_string(), Some(serde_json::json!(1))),
+            ("k".to_string(), Some(serde_json::json!(2))),
+        ];
+        restore_into(&store, &originals, None).await;
+        assert_eq!(store.lock().unwrap().get("k"), Some(&serde_json::json!(1)));
+    }
+
+    /// A write that fails is returned for retry (and the rest still restore).
+    #[tokio::test]
+    async fn a_failed_restore_is_returned_for_retry() {
+        let store: Store = Mutex::new(HashMap::from([
+            ("a".to_string(), serde_json::json!("override")),
+            ("b".to_string(), serde_json::json!("override")),
+        ]));
+        let originals = vec![
+            ("a".to_string(), Some(serde_json::json!("orig-a"))),
+            ("b".to_string(), Some(serde_json::json!("orig-b"))),
+        ];
+        let failed = restore_into(&store, &originals, Some("a")).await;
+        assert_eq!(failed, vec![("a".to_string(), Some(serde_json::json!("orig-a")))]);
+        assert_eq!(store.lock().unwrap().get("b"), Some(&serde_json::json!("orig-b")));
+        // The retry the end-of-run restore performs.
+        assert!(restore_into(&store, &failed, None).await.is_empty());
+        assert_eq!(store.lock().unwrap().get("a"), Some(&serde_json::json!("orig-a")));
     }
 }
 
