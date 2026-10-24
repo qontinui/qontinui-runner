@@ -476,6 +476,14 @@ def cmd_proxy(mcp_json, hdr_out):
             lines.append("%s: %s\n" % (k, v))
     with open(hdr_out, "w") as fh:
         fh.write("".join(lines))
+        # The transport-rung declaration, set EXPLICITLY (check #89): this
+        # reader enumerates the whole headers block, and a runner that writes a
+        # declaration INTO that block (the http arm's `native_mcp`) must never
+        # have it ride along on a call this script makes over the loopback door.
+        # Only beside a credential: an EMPTY file is how a refused nonce falls
+        # through to the bootstrap, so a lone declaration must not fill it.
+        if lines:
+            fh.write("x-qontinui-transport: loopback_proxy\n")
     print(str(srv["url"]).rstrip("/"))
 
 
