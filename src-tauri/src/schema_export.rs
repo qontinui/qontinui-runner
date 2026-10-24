@@ -888,6 +888,30 @@ pub fn export_all_schemas() -> Value {
     add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
     add!("FrontierEntry", qj::FrontierEntry);
     add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
+    // ── journey queries + the temporal track (same plan, Phases 2 and 4).
+    // The answer VALUES of `GET /apps/{app_id}/journey/*` — the shared query
+    // results (their sub-types — nodes, edges, coverage, search frontier —
+    // are `$defs`), the runner's two route-local answer, and the
+    // vision-core timeline and edge-timing types the ledger stores and
+    // `edge-timing` returns. The `Observation<T>` envelope around them is
+    // registered with its own plan, not here. (11) ──
+    add!("JourneyFilter", qj::JourneyFilter);
+    add!("JourneyGraph", qj::JourneyGraph);
+    add!("JourneyReachable", qj::JourneyReachable);
+    add!("JourneySteps", qj::JourneySteps);
+    add!("JourneyDeadEnds", qj::JourneyDeadEnds);
+    add!("JourneyPriorKnowledge", qj::JourneyPriorKnowledge);
+    add!("JourneyFrontier", qj::JourneyFrontier);
+    add!(
+        "JourneyUnmeasuredDepartures",
+        qj::JourneyUnmeasuredDepartures
+    );
+    add!(
+        "JourneyEdgeTimingAnswer",
+        crate::journey_wire::JourneyEdgeTimingAnswer
+    );
+    add!("ChangeTimeline", qontinui_vision_core::ChangeTimeline);
+    add!("EdgeTiming", qontinui_vision_core::EdgeTiming);
     // ── qontinui-types: page (plan
     // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
     // qontinui-schemas#186). The bounded-read wire contract every list
@@ -989,14 +1013,31 @@ mod tests {
         // + the 1 image-slot spec (ImageSlotSpec — plan
         // 2026-10-13-image-generation-and-visual-judgment Phase 14,
         // qontinui-schemas#230; its sub-types are `$defs`) = 570.
-        // The codegen's "Processing N top-level types" line should read 570 here.
-        assert_eq!(obj.len(), 570, "Expected 570 schema entries");
+        // + the 11 journey query / temporal-track answer types (JourneyFilter,
+        // JourneyGraph, JourneyReachable, JourneySteps, JourneyDeadEnds,
+        // JourneyPriorKnowledge, JourneyFrontier, JourneyUnmeasuredDepartures,
+        // JourneyEdgeTimingAnswer, ChangeTimeline, EdgeTiming — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phases 2 and 4) = 581.
+        // The codegen's "Processing N top-level types" line should read 581 here.
+        assert_eq!(obj.len(), 581, "Expected 581 schema entries");
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
             "JourneyEdgeObservation",
             "FrontierEntry",
             "JourneyLedgerHealth",
+            "JourneyFilter",
+            "JourneyGraph",
+            "JourneyReachable",
+            "JourneySteps",
+            "JourneyDeadEnds",
+            "JourneyPriorKnowledge",
+            "JourneyFrontier",
+            "JourneyUnmeasuredDepartures",
+            "JourneyEdgeTimingAnswer",
+            "ChangeTimeline",
+            "EdgeTiming",
         ] {
             assert!(obj.contains_key(journey), "Missing {journey} schema");
         }

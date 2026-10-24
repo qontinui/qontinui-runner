@@ -8753,6 +8753,55 @@ mod tests {
             "only codes the producer set are hoisted"
         );
     }
+    /// Plan 2026-09-20 Phase 4 wire-through: the default-on `timeline` and the
+    /// `expectStates` / `withinMs` answers survive the guard on every arm, so
+    /// the journey ledger (and the caller) receive what the SDK produced.
+    #[test]
+    fn execute_with_diff_keeps_the_timeline_on_every_arm() {
+        let timeline = crate::journey::test_fixtures::timeline_json(vec![], 120);
+        let arms = [
+            // Relay success (top-level ActionDiffResult).
+            serde_json::json!({ "actionSuccess": true, "diff": {}, "timeline": timeline.clone() }),
+            // In-process success envelope.
+            serde_json::json!({ "success": true, "data": {
+                "actionSuccess": true, "diff": {}, "timeline": timeline.clone() } }),
+            // Relay failure.
+            serde_json::json!({ "actionSuccess": false, "diff": {}, "timeline": timeline.clone() }),
+            // In-process failure.
+            serde_json::json!({ "success": true, "data": {
+                "actionSuccess": false, "diff": {}, "timeline": timeline.clone() } }),
+            // A producer that does not report actionSuccess.
+            serde_json::json!({ "actionResult": {}, "diff": {}, "timeline": timeline.clone() }),
+        ];
+        for body in arms {
+            let out = guard_execute_with_diff(body.clone());
+            let kept = out
+                .get("timeline")
+                .or_else(|| out.get("data").and_then(|d| d.get("timeline")));
+            assert_eq!(kept, Some(&timeline), "timeline stripped from {body}");
+            assert!(
+                matches!(
+                    crate::journey::capture::diff_timeline(&out),
+                    crate::journey::capture::DiffTimeline::Parsed(_)
+                ),
+                "the ledger reader finds it on {body}"
+            );
+        }
+    }
+
+    /// The request is forwarded whole: the four Phase 4 request fields reach
+    /// the SDK. Pinned on the source because the handler is async I/O.
+    #[test]
+    fn execute_with_diff_forwards_the_request_body_whole() {
+        let src = include_str!("sdk_client.rs");
+        let body = src
+            .split("\nasync fn handle_ct_execute_with_diff(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("handle_ct_execute_with_diff present");
+        assert!(body.contains("body.clone(),\n        Method::POST,"));
+        assert!(body.contains("Some(body.clone()),"));
+    }
 }
 
 #[cfg(test)]
