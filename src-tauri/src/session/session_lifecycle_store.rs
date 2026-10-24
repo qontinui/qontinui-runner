@@ -6950,7 +6950,7 @@ mod tests {
     }
 
     /// A second finish that carries a reason is a new declaration: it
-    /// RESTAMPS the mark (strictly later), clears `finish_synced` and re-sends
+    /// RESTAMPS the mark (always a DIFFERENT stamp), clears `finish_synced` and re-sends
     /// the finish carrying the NEW stamp — so a revived session finished again
     /// is dated by its second finish. A reason-less re-finish is the
     /// read-back / retry door and moves nothing. Unmark must clear the marker,
