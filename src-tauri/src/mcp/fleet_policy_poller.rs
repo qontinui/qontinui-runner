@@ -2,9 +2,12 @@
 //! `install_interception` (P3 + P4 of
 //! `2026-06-08-fleet-policy-channel-redesign.md`), `fleet_resources` (Part B
 //! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`),
-//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`)
-//! and `account_selection_mode` (Phase 1 of
-//! `2026-09-27-fleet-policy-domain-for-account-selection-mode.md`).
+//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`),
+//! `account_selection_mode` (Phase 1 of
+//! `2026-09-27-fleet-policy-domain-for-account-selection-mode.md`) and
+//! `permission_auto_accept` (Phase 2 of
+//! `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`;
+//! cache #6 below — an ANSWERED gate with coord-owned default).
 //!
 //! Coord exposes `GET /coord/fleet-policy?domain=<d>` (FleetPrincipal /
 //! device-JWT gated) which returns the EFFECTIVE interception level resolved
@@ -994,6 +997,296 @@ fn next_account_selection(outcome: &PollOutcome) -> Option<Option<AccountSelecti
 /// Render a fleet account-selection value for a log line or the config report.
 fn describe_account_selection(mode: Option<AccountSelectionMode>) -> &'static str {
     mode.map_or("(no fleet opinion — local mode governs)", |m| m.as_str())
+}
+
+// ===========================================================================
+// Process-global cache #6 — the tenant-wide permission auto-accept dial
+// ===========================================================================
+//
+// Plan `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+// D1. Read by [`crate::session::permission_accept`], which decides — live, per
+// `PermissionRequest` — whether the runner's pad answers a session's dialog.
+//
+// The posture is plan capture's ANSWERED gate, and deliberately NOT its no-row
+// default: only a level coord has ANSWERED in this process is acted on, and the
+// level is whatever coord's `effective_level` says on every 2xx — the no-row
+// answer included. Coord owns this domain's default (`domain_default_level`
+// answers `on` for a tenant with no row, plan Phase 1); the runner keeps no
+// default of its own for it. A coord that predates that Phase answers a no-row
+// `off`, and the runner then stays off — the fail-closed direction for a dial
+// that decides who answers a permission prompt. Concretely:
+//
+// - Before the FIRST 2xx in this process ⇒ UNANSWERED ⇒ nothing is accepted.
+// - A 2xx ⇒ answered, level = coord's `effective_level`, normalized onto
+//   `on` | `off`; anything else is UNRECOGNISED and is not `on`.
+// - A **401 / 404** keeps the last-good level and does not mark an answer (the
+//   plan-capture reasoning: neither is a statement about the tenant's policy).
+// - A network / decode error keeps last-good. Unpaired ⇒ skipped quietly.
+// - A poisoned lock reads as UNRECOGNISED — never `on`.
+//
+// The `resolved_scope` of each 2xx is cached beside the level, because the two
+// consumers read the SAME level with different bars. The interactive verdict
+// needs only an answered `on` (any scope — after coord's Phase 1 the no-row
+// default IS `on`). The stream-json path refuses headless requests, so it acts
+// only on an `off` the tenant CHOSE: an answered `off` whose scope is an
+// explicit row (not `none`). A coord that predates Phase 1 answers this domain
+// `off` with `resolved_scope: "none"` (the unknown-domain default) — a runner
+// shipped first must not read that as "deny every headless tool request".
+
+/// The fleet-policy domain carrying the permission auto-accept dial.
+pub(crate) const PERMISSION_AUTO_ACCEPT_DOMAIN: &str = "permission_auto_accept";
+
+/// The level that turns auto-accept ON. The ONE spelling the verdict compares
+/// against ([`crate::session::permission_accept::permission_accept_verdict`]).
+pub(crate) const PERMISSION_AUTO_ACCEPT_ON: &str = "on";
+
+/// The level that turns auto-accept OFF — the only level the stream-json path
+/// acts on (an answered `off` from an EXPLICIT row denies a headless control
+/// request, D5; see [`PERMISSION_AUTO_ACCEPT_SCOPE`]).
+pub(crate) const PERMISSION_AUTO_ACCEPT_OFF: &str = "off";
+
+/// What an unrecognised level (and the cache before any answer, and a poisoned
+/// lock) normalizes to: the empty string, which is neither `on` nor `off`.
+const PERMISSION_AUTO_ACCEPT_UNRECOGNISED: &str = "";
+
+/// The cached level (`on` | `off` | [`PERMISSION_AUTO_ACCEPT_UNRECOGNISED`]).
+static PERMISSION_AUTO_ACCEPT_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
+
+fn permission_auto_accept_cache() -> &'static RwLock<String> {
+    PERMISSION_AUTO_ACCEPT_LEVEL
+        .get_or_init(|| RwLock::new(PERMISSION_AUTO_ACCEPT_UNRECOGNISED.to_string()))
+}
+
+/// Whether THIS process has received a 2xx answer for
+/// [`PERMISSION_AUTO_ACCEPT_DOMAIN`]. Never reset: once coord has answered,
+/// later failures keep last-good, so the cached level is a real answer.
+static PERMISSION_AUTO_ACCEPT_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+fn set_permission_auto_accept_answered(answered: bool) {
+    PERMISSION_AUTO_ACCEPT_ANSWERED.store(answered, Ordering::Release);
+}
+
+fn set_permission_auto_accept_level(level: &str) {
+    if let Ok(mut g) = permission_auto_accept_cache().write() {
+        *g = level.to_string();
+    }
+}
+
+/// The `resolved_scope` of the last 2xx (`none` = no row, coord's domain
+/// default applied; `tenant` / `repo` / … = an explicit row), or `None` before
+/// any answer, on a coord that sends no scope, and behind a poisoned lock.
+static PERMISSION_AUTO_ACCEPT_SCOPE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn permission_auto_accept_scope_cache() -> &'static RwLock<Option<String>> {
+    PERMISSION_AUTO_ACCEPT_SCOPE.get_or_init(|| RwLock::new(None))
+}
+
+fn set_permission_auto_accept_scope(scope: Option<String>) {
+    if let Ok(mut g) = permission_auto_accept_scope_cache().write() {
+        *g = scope;
+    }
+}
+
+/// See [`PERMISSION_AUTO_ACCEPT_SCOPE`]. Lock-only.
+pub(crate) fn permission_auto_accept_scope() -> Option<String> {
+    permission_auto_accept_scope_cache()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// The dial as it stands RIGHT NOW: `(answered, level)`. Reads the answered
+/// flag FIRST (Acquire), then the level; a poisoned lock reads as unrecognised.
+/// Lock-only, safe on the request path — the pad and the stream-json
+/// dispatcher both read it once per decision.
+pub(crate) fn permission_auto_accept_dial() -> (bool, String) {
+    let answered = PERMISSION_AUTO_ACCEPT_ANSWERED.load(Ordering::Acquire);
+    (
+        answered,
+        read_cached_level(
+            permission_auto_accept_cache(),
+            PERMISSION_AUTO_ACCEPT_UNRECOGNISED,
+        ),
+    )
+}
+
+/// Normalize coord's `effective_level` onto `on` | `off`. PURE. Trimmed and
+/// ASCII-case-insensitive; absent, empty and every other value normalize to
+/// [`PERMISSION_AUTO_ACCEPT_UNRECOGNISED`] — a level this runner cannot
+/// identify is never an authorization to answer a prompt.
+fn normalize_permission_auto_accept_level(raw: Option<&str>) -> String {
+    let level = raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if level == PERMISSION_AUTO_ACCEPT_ON || level == PERMISSION_AUTO_ACCEPT_OFF {
+        level
+    } else {
+        PERMISSION_AUTO_ACCEPT_UNRECOGNISED.to_string()
+    }
+}
+
+/// Classify a 2xx body. PURE. Always [`PollOutcome::Updated`] with coord's own
+/// level — including the no-row answer (`resolved_scope: "none"`), whose level
+/// is coord's domain default for this domain. See the section comment for why
+/// the runner adds no default of its own here.
+fn permission_auto_accept_outcome_for_body(body: &FleetPolicyResponse) -> PollOutcome {
+    PollOutcome::Updated(normalize_permission_auto_accept_level(
+        body.effective_level.as_deref(),
+    ))
+}
+
+/// Map a fetch failure onto this domain's outcome. PURE. A **401** and a
+/// **404** KEEP last-good (as [`plan_capture_outcome_for_error`] does, for the
+/// same reasons): neither says anything about the tenant's policy, and a reset
+/// would flip an explicit `off` the tenant chose.
+fn permission_auto_accept_outcome_for_error(err: FetchError) -> PollOutcome {
+    match err {
+        FetchError::AuthOrAbsent(status) => PollOutcome::Kept(format!(
+            "coord answered {status} — not a statement about the tenant's \
+             {PERMISSION_AUTO_ACCEPT_DOMAIN} policy, keeping last-good"
+        )),
+        other => level_outcome_for_error(other),
+    }
+}
+
+/// Whether `outcome` marks [`PERMISSION_AUTO_ACCEPT_ANSWERED`]. PURE. Only a
+/// 2xx does.
+fn is_authoritative_permission_auto_accept_answer(outcome: &PollOutcome) -> bool {
+    matches!(outcome, PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow)
+}
+
+/// The WRITE, if any, that `outcome` implies for the level cache. PURE.
+/// `None` ⇒ no write at all (last-good kept because nothing was written).
+fn next_permission_auto_accept_level(outcome: &PollOutcome) -> Option<String> {
+    match outcome {
+        PollOutcome::Updated(level) => Some(level.clone()),
+        // Never produced for this domain (the body classifier always answers
+        // `Updated`); an answer that carried no level is not `on`.
+        PollOutcome::UpdatedNoRow => Some(PERMISSION_AUTO_ACCEPT_UNRECOGNISED.to_string()),
+        PollOutcome::ResetOff(_) | PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
+    }
+}
+
+/// Apply one poll outcome to the cache: the level write, then the answered
+/// flag. The SAME function the poll loop calls, so a test drives the shipping
+/// sequence ("unanswered, then answered `on`", "an on→off flip") rather than a
+/// copy of it.
+///
+/// The scope moves ONLY with an authoritative answer — a kept failure says
+/// nothing new about which row is in force.
+fn apply_permission_auto_accept_poll(poll: &PermissionAutoAcceptPoll) {
+    if let Some(level) = next_permission_auto_accept_level(&poll.outcome) {
+        set_permission_auto_accept_level(&level);
+    }
+    if is_authoritative_permission_auto_accept_answer(&poll.outcome) {
+        set_permission_auto_accept_scope(poll.resolved_scope.clone());
+        set_permission_auto_accept_answered(true);
+    }
+}
+
+/// What one permission auto-accept poll yields: the cache outcome plus the
+/// scope coord reported beside it (`None` on any non-2xx, and on a coord that
+/// predates the field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionAutoAcceptPoll {
+    outcome: PollOutcome,
+    resolved_scope: Option<String>,
+}
+
+/// One poll of the [`PERMISSION_AUTO_ACCEPT_DOMAIN`] cache.
+async fn poll_permission_auto_accept_once() -> PermissionAutoAcceptPoll {
+    match fetch_fleet_policy(PERMISSION_AUTO_ACCEPT_DOMAIN).await {
+        Ok(body) => permission_auto_accept_poll_for_body(&body),
+        Err(e) => PermissionAutoAcceptPoll {
+            outcome: permission_auto_accept_outcome_for_error(e),
+            resolved_scope: None,
+        },
+    }
+}
+
+/// A 2xx body → outcome + its trimmed `resolved_scope`. PURE.
+fn permission_auto_accept_poll_for_body(body: &FleetPolicyResponse) -> PermissionAutoAcceptPoll {
+    PermissionAutoAcceptPoll {
+        outcome: permission_auto_accept_outcome_for_body(body),
+        resolved_scope: body
+            .resolved_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// Test-only RAII pin over the permission auto-accept dial. SERIALIZES every
+/// test that reads or writes the dial (the pad, the stream-json dispatcher and
+/// this module's own tests) and RESTORES "unanswered" on `Drop`, so a failing
+/// assertion cannot leak an answered `on` into another test.
+///
+/// Sits UNDER `env_lock` in the test-lock hierarchy, exactly like
+/// [`AccountSelectionPin`]: acquired through [`crate::test_env::hierarchy_lock`].
+///
+/// NEVER compiled into a release binary.
+#[cfg(test)]
+pub(crate) struct PermissionAutoAcceptPin(crate::test_env::TestLockGuard);
+
+#[cfg(test)]
+impl PermissionAutoAcceptPin {
+    /// Pin the level AS AN AUTHORITATIVE ANSWER from an EXPLICIT tenant row
+    /// (stands in for a 2xx poll with `resolved_scope: "tenant"`).
+    pub(crate) fn set(&self, level: &str) {
+        self.set_with_scope(level, Some("tenant"));
+    }
+
+    /// Pin an authoritative answer with an explicit `resolved_scope` —
+    /// `Some("none")` is coord's no-row default, `None` a coord that sends no
+    /// scope.
+    pub(crate) fn set_with_scope(&self, level: &str, scope: Option<&str>) {
+        set_permission_auto_accept_level(level);
+        set_permission_auto_accept_scope(scope.map(str::to_string));
+        set_permission_auto_accept_answered(true);
+    }
+
+    /// Back to the cold-start state: no answer, no level, no scope.
+    pub(crate) fn set_unanswered(&self) {
+        set_permission_auto_accept_level(PERMISSION_AUTO_ACCEPT_UNRECOGNISED);
+        set_permission_auto_accept_scope(None);
+        set_permission_auto_accept_answered(false);
+    }
+
+    /// Feed one poll through the shipping apply path: `Some(level)` is a 2xx
+    /// from an explicit tenant row, `None` a transient failure.
+    pub(crate) fn apply(&self, outcome_level: Option<&str>) {
+        let poll = match outcome_level {
+            Some(level) => PermissionAutoAcceptPoll {
+                outcome: PollOutcome::Updated(normalize_permission_auto_accept_level(Some(level))),
+                resolved_scope: Some("tenant".to_string()),
+            },
+            None => PermissionAutoAcceptPoll {
+                outcome: PollOutcome::Kept("test: transient failure".to_string()),
+                resolved_scope: None,
+            },
+        };
+        apply_permission_auto_accept_poll(&poll);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PermissionAutoAcceptPin {
+    fn drop(&mut self) {
+        set_permission_auto_accept_level(PERMISSION_AUTO_ACCEPT_UNRECOGNISED);
+        set_permission_auto_accept_scope(None);
+        set_permission_auto_accept_answered(false);
+    }
+}
+
+/// Acquire the pin in the cold-start (unanswered) state. Blocks until any
+/// other pinning test has released it.
+#[cfg(test)]
+pub(crate) fn pin_permission_auto_accept_for_test() -> PermissionAutoAcceptPin {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let pin = PermissionAutoAcceptPin(crate::test_env::hierarchy_lock(&LOCK));
+    pin.set_unanswered();
+    pin
 }
 
 // ===========================================================================
@@ -2488,10 +2781,11 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
 
     info!(
         "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN},\
-         {ACCOUNT_SELECTION_DOMAIN}, egress_*×6, interval={}s, fail-safe defaults: \
-         mode={DEFAULT_MODE}, session floors unset, account selection unset (local mode \
-         governs); domain default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture \
-         writes held until coord answers)",
+         {ACCOUNT_SELECTION_DOMAIN},{PERMISSION_AUTO_ACCEPT_DOMAIN}, egress_*×6, interval={}s, \
+         fail-safe defaults: mode={DEFAULT_MODE}, session floors unset, account selection unset \
+         (local mode governs), permission auto-accept unanswered (nothing accepted); domain \
+         default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until \
+         coord answers)",
         POLL_INTERVAL.as_secs()
     );
 
@@ -2508,6 +2802,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // value is the wrong thing to compare for this domain.
     let mut last_logged_plan_capture: Option<String> = None;
     let mut last_logged_account_selection: Option<String> = None;
+    let mut last_logged_permission_auto_accept: Option<String> = None;
     // One key PER DOCUMENT: the three session-briefing documents fail
     // independently (coord can serve one and 404 another), so a shared marker
     // would suppress one document's transition because another's was logged.
@@ -2780,6 +3075,64 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                 }
             }
             last_logged_account_selection = Some(account_selection_key);
+        }
+
+        // Sixth cache: the tenant-wide permission auto-accept dial. Its own
+        // request and its own cache, so no other domain's failure withholds it;
+        // a flip reaches RUNNING sessions within one tick, because the pad reads
+        // the cache per prompt rather than at spawn.
+        let permission_auto_accept_poll = poll_permission_auto_accept_once().await;
+        apply_permission_auto_accept_poll(&permission_auto_accept_poll);
+        let permission_auto_accept_outcome = permission_auto_accept_poll.outcome;
+        let permission_auto_accept_key = plan_capture_log_key(&permission_auto_accept_outcome);
+        if is_new_outcome(
+            last_logged_permission_auto_accept.as_ref(),
+            &permission_auto_accept_key,
+        ) {
+            match &permission_auto_accept_outcome {
+                PollOutcome::Updated(level) => {
+                    info!(
+                        "fleet_policy_poller: permission auto-accept ({PERMISSION_AUTO_ACCEPT_DOMAIN}) \
+                         = {} (resolved_scope={}) — runner sessions' PermissionRequest dialogs are {}",
+                        if level.is_empty() { "(unrecognised level)" } else { level },
+                        permission_auto_accept_poll
+                            .resolved_scope
+                            .as_deref()
+                            .unwrap_or("(absent)"),
+                        if level == PERMISSION_AUTO_ACCEPT_ON {
+                            "auto-accepted (outside the never-answered classes)"
+                        } else {
+                            "left to the dialog"
+                        }
+                    );
+                }
+                PollOutcome::UpdatedNoRow => {
+                    info!(
+                        "fleet_policy_poller: coord answered {PERMISSION_AUTO_ACCEPT_DOMAIN} with no \
+                         level — dialogs are left to the dialog"
+                    );
+                }
+                PollOutcome::SkippedNoJwt => {
+                    info!(
+                        "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
+                         {PERMISSION_AUTO_ACCEPT_DOMAIN} poll; nothing is auto-accepted until \
+                         coord answers"
+                    );
+                }
+                PollOutcome::ResetOff(status) => {
+                    warn!(
+                        "fleet_policy_poller: coord returned {status} for \
+                         {PERMISSION_AUTO_ACCEPT_DOMAIN} — keeping the last-good level"
+                    );
+                }
+                PollOutcome::Kept(err) => {
+                    warn!(
+                        "fleet_policy_poller: {PERMISSION_AUTO_ACCEPT_DOMAIN} poll failed ({err}) — \
+                         keeping the last-good level"
+                    );
+                }
+            }
+            last_logged_permission_auto_accept = Some(permission_auto_accept_key);
         }
 
         // Fourth cache: the three operator-editable session-briefing documents.
@@ -4810,6 +5163,162 @@ mod tests {
         // A restored document is `cached` by default — it has NOT been checked
         // against coord in this process.
         assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache #6 — the permission auto-accept dial
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_auto_accept_domain_and_words_are_pinned() {
+        // The domain string is the wire contract with coord's Phase 1 default
+        // and the qontinui-web panel's PUT.
+        assert_eq!(PERMISSION_AUTO_ACCEPT_DOMAIN, "permission_auto_accept");
+        assert_eq!(PERMISSION_AUTO_ACCEPT_ON, "on");
+        assert_eq!(PERMISSION_AUTO_ACCEPT_OFF, "off");
+    }
+
+    #[test]
+    fn permission_auto_accept_levels_normalize_to_on_off_or_unrecognised() {
+        for (raw, want) in [
+            (Some("on"), "on"),
+            (Some(" ON "), "on"),
+            (Some("off"), "off"),
+            (Some("Off"), "off"),
+            (Some(""), ""),
+            (Some("record"), ""),
+            (Some("gate"), ""),
+            (Some("true"), ""),
+            (None, ""),
+        ] {
+            assert_eq!(normalize_permission_auto_accept_level(raw), want, "{raw:?}");
+        }
+    }
+
+    /// Coord owns the default: a no-row answer is taken at coord's own level,
+    /// never rewritten to a runner default. A pre-Phase-1 coord answers `off`
+    /// there, and the runner stays off.
+    #[test]
+    fn permission_auto_accept_takes_coords_level_on_every_2xx_including_no_row() {
+        let decode = |raw: &str| serde_json::from_str::<FleetPolicyResponse>(raw).unwrap();
+        for (raw, want, scope) in [
+            (
+                r#"{"domain":"permission_auto_accept","effective_level":"on","resolved_scope":"none"}"#,
+                "on",
+                Some("none"),
+            ),
+            // TODAY's coord (before the plan's Phase 1): the unknown-domain
+            // default, `off` from no row.
+            (
+                r#"{"effective_level":"off","resolved_scope":"none","default_source":"product"}"#,
+                "off",
+                Some("none"),
+            ),
+            (
+                r#"{"effective_level":"off","resolved_scope":" tenant "}"#,
+                "off",
+                Some("tenant"),
+            ),
+            (
+                r#"{"effective_level":"on","resolved_scope":"repo"}"#,
+                "on",
+                Some("repo"),
+            ),
+            (r#"{"resolved_scope":"tenant"}"#, "", Some("tenant")),
+            (r#"{"effective_level":"off"}"#, "off", None),
+            (
+                r#"{"effective_level":"off","resolved_scope":""}"#,
+                "off",
+                None,
+            ),
+        ] {
+            let poll = permission_auto_accept_poll_for_body(&decode(raw));
+            assert_eq!(
+                poll.outcome,
+                PollOutcome::Updated(want.to_string()),
+                "{raw}"
+            );
+            assert_eq!(poll.resolved_scope.as_deref(), scope, "{raw}");
+            assert!(is_authoritative_permission_auto_accept_answer(
+                &poll.outcome
+            ));
+            assert_eq!(
+                next_permission_auto_accept_level(&poll.outcome),
+                Some(want.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn permission_auto_accept_401_404_and_failures_keep_last_good_and_answer_nothing() {
+        for err in [
+            FetchError::AuthOrAbsent(401),
+            FetchError::AuthOrAbsent(404),
+            FetchError::Failed("request: dns".into()),
+        ] {
+            let outcome = permission_auto_accept_outcome_for_error(err);
+            assert!(matches!(outcome, PollOutcome::Kept(_)), "{outcome:?}");
+            assert!(!is_authoritative_permission_auto_accept_answer(&outcome));
+            assert_eq!(next_permission_auto_accept_level(&outcome), None);
+        }
+        let skipped = permission_auto_accept_outcome_for_error(FetchError::NoJwt);
+        assert_eq!(skipped, PollOutcome::SkippedNoJwt);
+        assert!(!is_authoritative_permission_auto_accept_answer(&skipped));
+        assert_eq!(next_permission_auto_accept_level(&skipped), None);
+    }
+
+    /// The shipping apply path: unanswered before the first 2xx, answered
+    /// after it, and a 401 after an explicit `off` does NOT reopen anything.
+    #[test]
+    fn permission_auto_accept_apply_path_is_answered_only_by_a_2xx() {
+        let _pin = pin_permission_auto_accept_for_test();
+        let failed = |err| PermissionAutoAcceptPoll {
+            outcome: permission_auto_accept_outcome_for_error(err),
+            resolved_scope: None,
+        };
+        let answered = |level: &str, scope: &str| PermissionAutoAcceptPoll {
+            outcome: PollOutcome::Updated(level.to_string()),
+            resolved_scope: Some(scope.to_string()),
+        };
+        assert_eq!(permission_auto_accept_dial(), (false, String::new()));
+        assert_eq!(permission_auto_accept_scope(), None);
+
+        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(401)));
+        assert_eq!(permission_auto_accept_dial(), (false, String::new()));
+
+        apply_permission_auto_accept_poll(&answered("off", "tenant"));
+        assert_eq!(permission_auto_accept_dial(), (true, "off".to_string()));
+        assert_eq!(permission_auto_accept_scope().as_deref(), Some("tenant"));
+
+        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(404)));
+        assert_eq!(
+            permission_auto_accept_dial(),
+            (true, "off".to_string()),
+            "a 404 keeps an explicit off"
+        );
+        assert_eq!(
+            permission_auto_accept_scope().as_deref(),
+            Some("tenant"),
+            "a failure does not move the scope"
+        );
+
+        apply_permission_auto_accept_poll(&answered("on", "none"));
+        assert_eq!(permission_auto_accept_dial(), (true, "on".to_string()));
+        assert_eq!(permission_auto_accept_scope().as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn the_permission_auto_accept_poll_runs_inside_the_poller_loop() {
+        let src = include_str!("fleet_policy_poller.rs");
+        let body = src
+            .split_once("async fn poller_loop(")
+            .unwrap()
+            .1
+            .split_once("\nasync fn fetch_fleet_policy(")
+            .unwrap()
+            .0;
+        assert!(body.contains("poll_permission_auto_accept_once().await"));
+        assert!(body.contains("apply_permission_auto_accept_poll(&permission_auto_accept_poll)"));
     }
 
     // -----------------------------------------------------------------------
