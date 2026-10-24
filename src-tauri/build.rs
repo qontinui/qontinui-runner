@@ -589,8 +589,10 @@ fn hide_external_bin_from_tauri_build() {
 /// dir: remove each ZERO-LENGTH `qontinui-pr` / `qontinui_profile` copy
 /// tauri-build left there. Only a zero-length file is removed — no build
 /// produces one except that copy chain — and never content. The profile dir is
-/// derived exactly as tauri-build derives it:
-/// `OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out`.
+/// the directory tauri-build's unchecked `.parent()` ×3 reaches on cargo's
+/// layout, `OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out`; on any other
+/// shape `profile_dir_from_out_dir` answers `None` and the repair does nothing
+/// rather than guess.
 fn remove_zero_length_sidecar_copies_from_profile_dir() {
     let Ok(target) = std::env::var("TARGET") else {
         return;
@@ -1673,6 +1675,22 @@ mod build_profile_stamp_tests {
                 "D:/r/target/x86_64-pc-windows-msvc/release-checked"
             ))
         );
+    }
+
+    /// The shape cargo actually hands a build script on Windows: backslashes,
+    /// optionally under a `\\?\` verbatim prefix.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_backslash_out_dir_stamps_its_profile_dir() {
+        assert_eq!(
+            stamp(r"D:\r\target-agent\debug\build\qontinui-runner-0a1b\out"),
+            "debug"
+        );
+        assert_eq!(
+            stamp(r"\\?\D:\r\target-agent\release-checked\build\qontinui-runner-0a1b\out"),
+            "release-checked"
+        );
+        assert_eq!(stamp(r"D:\r\target\debug\build\pkg-1\not-out"), "unknown");
     }
 
     /// Anything that is not cargo's layout is UNKNOWN — never a guessed
