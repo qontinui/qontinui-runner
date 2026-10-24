@@ -38,6 +38,7 @@ pub mod observable_bridge;
 // modules (`profile_cli`, `env_agent`) can suppress console-window flashes
 // too; the runner bin imports this one copy (`main.rs`), so its process-global
 // gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
+pub mod git_layout;
 pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;

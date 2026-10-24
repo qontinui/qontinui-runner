@@ -332,6 +332,22 @@ pub(crate) fn probe_reclaim_dirty(
         // An un-stringable path is a tree we cannot even ask about.
         return DirtyVerdict::Unknown;
     };
+    // A tree in which git provably finds no repository (a pruned worktree's
+    // dangling `gitdir:`, or no `.git` anywhere up the chain) can only answer
+    // with a failed probe, so its verdict is known without spawning one: the
+    // SAME `verdict_from_outcome` mapping a failed `git status` gets, from the
+    // same `.git` presence reading. Plan
+    // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+    // Phase 1 — these rows were 12-13 failing git calls each.
+    if qontinui_runner_lib::git_layout::git_provably_absent(path) {
+        let git_presence = probe_git_presence(path);
+        let outcome = crate::process_helpers::ProbeOutcome::Degraded(
+            crate::process_helpers::DegradeReason::Status,
+        );
+        let verdict = verdict_from_outcome(&outcome, git_presence);
+        warn_if_unknown(path, git_presence, verdict, label);
+        return verdict;
+    }
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", path_str, "status", "--porcelain"]);
     probe_reclaim_dirty_with(path, cmd, timeout, label)
@@ -347,8 +363,22 @@ pub(crate) fn probe_reclaim_dirty_with(
     label: &str,
 ) -> DirtyVerdict {
     let git_presence = probe_git_presence(path);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     let outcome = crate::process_helpers::run_probe(cmd, timeout, label);
     let verdict = verdict_from_outcome(&outcome, git_presence);
+    warn_if_unknown(path, git_presence, verdict, label);
+    verdict
+}
+
+/// The WARN an UNKNOWN dirtiness verdict always carries, whichever path
+/// produced it.
+fn warn_if_unknown(
+    path: &std::path::Path,
+    git_presence: GitPresence,
+    verdict: DirtyVerdict,
+    label: &str,
+) {
     if verdict == DirtyVerdict::Unknown {
         // WARN, not debug: this is the arm that REFUSES a delete. If a tree
         // is stuck here forever, the log is where that becomes visible. The
@@ -368,7 +398,6 @@ pub(crate) fn probe_reclaim_dirty_with(
              refusing to treat it as clean"
         );
     }
-    verdict
 }
 
 #[cfg(test)]
