@@ -54,9 +54,9 @@ as free text. Map what you are waiting on to exactly one kind:
 | **Verify a runner fix once the device serves it** | `runner_served_sha` + a typed `continuation` | `{device_id, repo, expected_sha}` plus `continuation {action:"run_skill", skill, hint, target_device_id, repos}` and an `expires_at`. It replaces the `[VERIFICATION:PENDING]` output-text marker the runner deleted: output text never schedules verification. Register BEFORE the device rebuilds (a `continuation_dropped_born_cleared:` response means verify now, in-session); the `hint` opens with a device-identity guard, worded to run BEFORE the skill, because `target_device_id` is only a preference (canonical: `_gate-registration` → "Predicate choice guidance") |
 | A **fault firing** (an alert going open) | `alert_open` | `{alert_kind, alert_key?, alert_id?}` — clears while a `coord.alerts` row of `alert_kind` is UNRESOLVED: *"resume when X breaks"*, not *"resume when X is fixed"* (the negated form was deliberately not added). `alert_key` narrows to one watcher's dedupe key, `alert_id` to one episode — and a resolved/absent/wrong-kind `alert_id` REGISTERS `misconfigured` rather than being refused, so read the verdict back. The evaluator never returns `Failed`, but the sweep's unevaluable escalation still can, from outside it. Omit `tenant_id` — coord stamps it; another tenant's is refused, your own is accepted. Landed qontinui-coord#2239, 2026-09-19 (canonical: `_gate-registration`) |
 | A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — **both required**, and it is a CONJUNCTION: healthy AND the deployed rev *includes* `expected_rev`, never a health-only check. `service` is an EXACT vocabulary, not free text — `coord` or `web`, **no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target `coord_query_release_state` prints). The three lookups this predicate conjoins normalize differently and the health one does raw `==` on an alert key segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED — the gate could clear while a critical deploy alert was open. A service coord does not observe at all used to register cleanly and then fail closed on every tick forever, silently. Both are REFUSED at the door — **once the coord answering you is SERVING qontinui-coord#2315**, which landed on coord `main` 2026-09-21 (`72c50b3f`); landed is not serving, which is this table's own subject. Until then a near-miss spelling is accepted and silently half-evaluates. Canonical: `_gate-registration` → "Merged is not deployed" |
-| **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Registering `pr_merged` on a deploy-shaped `phase_name` answers with a non-blocking `deploy_order_predicate_weaker:` steer (same coord#2315, same caveat — landed on coord `main`, serving unconfirmed) (branch on the **prefix**, never on `warnings[].is_empty()`). That steer reads the ANCHOR's `phase_name`, so a **claim-anchored** registration (`claim_kind` + `resource_key`) carries none and gets no steer at all — at this door, which registers claim-anchored gates routinely, the choice is entirely yours. For a SCHEMA change this is a third question again — `migration_at_head` is single-schema; for "table X exists on database Y" use `schema_object_exists`. Canonical: `_gate-registration` → "Merged is not deployed" |
+| **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Registering `pr_merged` on a deploy-shaped `phase_name` answers with a non-blocking `deploy_order_predicate_weaker:` steer (same coord#2315, same caveat — landed on coord `main`, serving unconfirmed) (branch on the **prefix**, never on `warnings[].is_empty()`). That steer reads the ANCHOR's `phase_name`, so a **claim-anchored** registration (`claim_kind` + `resource_key`) carries none and gets no steer at all — at this door, which registers claim-anchored gates routinely, the choice is entirely yours. For a SCHEMA change this is a third question again — `migration_at_head` `{schema: "coord"}` answers "the whole chain is applied" (database-wide); for "table X exists on the database coord is connected to" (the serving database) use `schema_object_exists`. Canonical: `_gate-registration` → "Merged is not deployed" |
 | A claim going terminal (released/expired) | `claim_terminal` | claim-anchored, not plan-anchored (`claim_kind`+`resource_key`) |
-| A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the only free-text-ish kind, and the human escape hatch |
+| A human decision / judgment | `operator_approval` | `{prompt}` — cleared by an operator decision; closed-list decisions and on-page verification only (see `_gate-registration` → "Sensitive-work rule"); the only free-text-ish kind, and the human escape hatch |
 | CI going green | `ci_green` | the ref/workflow that must pass |
 | A **PR's** CI going green across pushes | `pr_ci_green` | `{repo, pr_number}` — the HEAD-FOLLOWING sibling of `ci_green`: it re-resolves the PR's head from `coord.repo_branches` on every sweep, so ONE `gate_id` (and any continuation on it) survives a rebase, a fix commit or a regenerated artifact, clearing when CI is green on whatever the head then is. **A red head is `Open` with a loud reason, never `Failed`** — the only terminal arms come from the PR lifecycle: merged/ff-landed clears it, closed without a land record fails it. Choose it over `ci_green` whenever the PR may need a NEW head before it goes green — `ci_green` pins one `head_sha` and goes terminally `Failed` on a red check, so a `ci_green` gate on a head that gets replaced can never clear and wakes nobody. The field is `pr_number`, not `pr` (one spelling with `pr_merged`) (canonical: `_gate-registration`) |
 | A published GitHub Release catching up with its `v*` tag | `release_in_sync` | `{repo?}` — a repo's published GitHub Release is in sync with its latest `v*` tag; `repo` defaults to `qontinui/qontinui-runner`, so a bare `{}` gates the runner installer, and when present it must be `owner/name` (a bare slug is refused). It reads the release observer's PERSISTED observation, not a live probe: `in_sync` clears; `in_flight` (building / inside grace) and `unknown` stay `Open` quietly; `stale` (tag pushed, nothing published past grace) and `failed_deploy` (a stuck DRAFT) stay `Open` with a LOUD reason and self-heal when the release is fixed; only `rolled_back` (a published release un-published or deleted) is `Failed` (canonical: `_gate-registration`) |
@@ -65,7 +65,7 @@ as free text. Map what you are waiting on to exactly one kind:
 | A metric crossing a threshold | `metric_threshold` | `{metric, labels, op, value, window_secs?}` — name `labels` explicitly (e.g. `coord_ci_runner_count` MUST filter `{status:"idle"}`) |
 | A time window / burn-in elapsing | `time_elapsed` | `{since (default now), duration_secs}` |
 | A vetted plan that is ready, dispatchable work | `unit_ready` | `{work_unit_id, ready_status}` — auto-clears when the unit reaches `ready_status` + sibling gates cleared; **NOT** `operator_approval`. Transition the unit FIRST (one `→ vetted` call carrying an `independence` declaration) and key `ready_status` on `vetted` — never on the status a refused transition left, which on a fresh unit is `""` and clears at once; on a refused transition register no `unit_ready` gate (canonical: `_gate-registration`) |
-| A schema/alembic reaching head | `migration_at_head` | `{schema}` — delegates to the live schema observer (`applied_head == chain_head`) |
+| The WHOLE alembic chain applied to the serving database (database-wide) | `migration_at_head` | `{schema: "coord"}` — reads coord's PERSISTED schema observation (`applied_head == chain_head`), not a live probe. `schema` is a constant guard (any value but `"coord"` sits `Open` forever), and a gate registered before coord's observation reflects the new chain head is born cleared (canonical: `_gate-registration` → the SCHEMA-change traps; *What "born cleared" means*). For ONE table/column, use `schema_object_exists` below |
 | A specific **schema object** (table or column) existing on the database coord itself is connected to | `schema_object_exists` | `{schema, object, column?}` — checked against `information_schema.tables`/`.columns` only. There is **no `constraint`/`index` arity** (indexes are absent from `information_schema` and `pg_catalog` is deliberately never read); naming one is not refused, it silently probes a table that does not exist and sits `Open` forever. A **view** *is* reachable via the table arm. Three outcomes, two stored tags: found → `Cleared`; a definitive empty read → `Open` (not there *yet* — a wait, not a rejection); a failed read → `Indeterminate{reason}`, non-clearing but stored as the `open` tag, so read `verdict_reason` rather than the tag. Unlike `migration_at_head`, `schema` is **not** pinned to one value — name it explicitly. |
 | Infra drift / active-negation clearing | `infra_drift_clear` | `{}` — delegates to the live infra observer (no active negation) |
 | A repo **file / workflow / migration file** existing | `file_exists` — **usable again.** The 2026-08-05 fleet-wide 403 was root-caused and FIXED by coord `e6f486b8` (2026-08-15), which is deployed; a live re-probe on 2026-08-31 registered `201` and cleared. Residual: that probe was one PUBLIC repo — re-probe before relying on it against a private one. | `{repo, path, on_ref?}` — file **contents/presence**, unlike `ref_exists` |
@@ -128,15 +128,16 @@ session can attest the gate itself versus whether only an operator can:
   green", "the migration applied cleanly", "a dual run emitted evidence"). The
   completing session closes the loop via `coord_attest_gate` instead of waiting
   on a human click.
-- **`operator`** — needs **business / judgment / strategy** input, or **on-page
-  human verification**, or anything **security / credential / billing /
-  strategy-sensitive**. Only an operator clears it.
+- **`operator`** — a genuine closed-list operator **decision** (product /
+  strategy, an item-2 resource only a human can grant), or **on-page human
+  verification**. Only an operator clears it.
 
-**Default is `operator`** when omitted (the safe default). **Sensitive work
-(security / credential / billing / strategy) ALWAYS registers as
-`operator_approval` with `clearance_audience: operator` and notify-only** — never
-an auto-resuming observation gate, never an `agent`-attestable one, even under
-auto mode. When in doubt whether a blocker is sensitive, treat it as sensitive.
+**Default is `operator`** when omitted (the safe default). **Sensitivity
+alone never creates or upgrades a gate.** Security / credential / billing
+subject matter never by itself makes a blocker `operator_approval` or
+`operator`-audience: if the wait is observable, gate on the observable;
+otherwise proceed (subject to the served tier) and post a durable
+notification. Canonical: `_gate-registration` → "Sensitive-work rule".
 
 **Also pass `gate_class` — LIVE, and `/blocked` should classify BY DEFAULT.**
 coord PRs #1246/#1249 and web #872 landed; the round trip is verified in
@@ -145,9 +146,8 @@ authority matters, so pick a class rather than omitting reflexively:
 
 - **`security-surface`** — the deferred work this gate guards would itself fire
   a `security-and-autonomy` path glob or content trigger. You have already made
-  that match to decide how to implement; reuse the answer. Note that the
-  Sensitive-work rule above is stricter and independent — it forces
-  `clearance_audience: operator` regardless of class.
+  that match to decide how to implement; reuse the answer. The class does
+  not force `clearance_audience: operator` — sensitivity never does (above).
 - **`ops-confirm`** — you are blocked on a deploy, sweep, migration, or config
   application landing.
 - **`routine-review`** — a mechanical follow-up another session can judge from
@@ -225,21 +225,21 @@ hint field: append the brief to the prompt after a blank line. (Canonical:
 `_gate-registration` → "The brief — a continuation with no `hint` is a fresh
 agent with no context" — keep copies in sync.)
 
-**Still omit the CONTINUATION when** the blocker is **sensitive** (security /
-credential / billing / strategy) — those notify a human and never auto-spawn.
-**That is the only omit case in `/blocked`** — and it is the continuation that
-is omitted, never the `hint` of one you did attach: an attached continuation
+**There is no omit case in `/blocked` for sensitive subject matter** (security /
+credential / billing): sensitivity alone never creates or upgrades a gate,
+and a gate it does take carries a continuation like any other
+(`_gate-registration` → "Sensitive-work rule"). And an attached continuation
 always carries a brief, per the block above.
 
-**Hard guard — if you are CLOSING, attach the continuation regardless of the
-expected wait.** Charter rule 10's ≲2h monitor window is a reason **not to run
-`/blocked` at all** (inside that window you are not blocked, you are waiting —
-stay alive, monitor, and finish the item), **never** a reason to register a gate
-and drop the dispatcher. A session closing for an unrelated reason (context
-exhaustion, usage limit, an imminent crash) whose blocker happens to be a
-20-minute CI wait must still attach: a watched gate with no dispatcher on a dead
-session is precisely the silent stall this procedure exists to prevent. A
-non-sensitive `operator_approval` gate IS unbounded in time and always takes a
+**Hard guard — attach the continuation regardless of the expected wait.** A
+session never stays alive to wait (operator decision 2026-10-17, which retires
+the ≲2h keep-alive arm of `planning-and-scope` `dependency-wait-and-resume`):
+waiting is never owed work, so even a 20-minute CI wait or deploy is a gate whose
+continuation does the follow-up, and the session stops. A short expected wait is
+**never** a reason to skip `/blocked`, nor a reason to register a gate and drop
+the dispatcher: a watched gate with no dispatcher on a closed session is
+precisely the silent stall this procedure exists to prevent. A
+genuine `operator_approval` gate IS unbounded in time and always takes a
 continuation — but Step 5's plan-anchored HTTP fallback **403s**
 `operator_approval` (`operator_approval_requires_operator_auth`), so that
 exception is registerable only over MCP `coord_register_gate` or the
@@ -281,7 +281,9 @@ JWT all work), first reachable transport wins:
    fresh device JWT per request); or the acting-user-service token
    (`bash …/scripts/coord-acting-bearer.sh` — sourced from **`$COORD_AGENT_JWT`
    ONLY**: no `.mcp.json` carries a bearer anymore, every config is
-   proxy-shaped) — all on the same two routes. It
+   proxy-shaped; its exit 4 means coord refused that token as a presenter — only a paired
+   device JWT or an allocated-authenticated agent token is admitted — so to
+   register, fall through to `/gate` Step 4b) — all on the same two routes. It
    accepts any predicate-cleared kind; `operator_approval` is rejected **403** (a
    human decision, never a work queue).
 3. **Claim-anchored gates** have no slug: register via MCP `coord_register_gate`
@@ -366,28 +368,66 @@ spelling of one host is what the wrong-host mechanism looks like from inside.
 Enumerate before you conclude —
 
 <!-- detector-reach-fence:start -->
-> **A capability negative cites a CENSUS, never a probe.** Before recording
-> "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run the route census,
-> `coord-route-census.sh <fragment>`, from wherever your deployment installs
-> it — spelled by its absolute path, because a bare relative path resolves
-> only from the checkout that ships it, and a session standing anywhere else
-> gets exit 127
-> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
-> a working tree and never a live host) — and paste its trailer verbatim
-> beside the claim:
-> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
-> Where no census tool is reachable at all, the negative cannot be settled and
-> is UNVERIFIED.
-> A 401, 404 or 405 on ONE spelling of
+> **A capability negative cites EMITTED EVIDENCE, never a probe.** Before
+> recording "no door", "agents cannot", "this route does not exist" or any
+> other claim that a capability is ABSENT, paste beside it, verbatim, ONE of
+> the two lines that can evidence one (items 1 and 2; item 3 can only refute
+> one) — each from a tool run from wherever your deployment installs it,
+> spelled by its absolute path, because a bare relative path resolves only
+> from the checkout that ships it, and a session standing anywhere else gets
+> exit 127:
+>
+> 1. **A census trailer** from the route census,
+>    `coord-route-census.sh <fragment>` (it reads `origin/main` of BOTH
+>    `qontinui-coord` and `qontinui-web`, never a working tree and never a
+>    live host):
+>    `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+>    — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+>    `routes=UNKNOWN` (exit 2) settles nothing; `routes=0` with both refs
+>    resolved is the only honest negative; `routes=` above 0 contradicts it;
+>    `admits=unknown` on a listed row means unmeasured, never "operator-only".
+> 2. **A `FLOOR-CLAIM:` line** from
+>    `coord-revive.sh --floor-claim` (the coord-revive skill's resolver)
+>    whose verdict is `FLOOR` — `verdict=LIVE` contradicts the negative, and
+>    `verdict=UNKNOWN` settles nothing.
+> 3. **A `refusal-read:` line is NOT evidence FOR a negative.** It comes from
+>    `refusal-remedy.sh`:
+>    `refusal-read: code=<code> tool=<tool> state=<REMEDY_WORKS|REMEDY_PRECONDITION_UNMET|REMEDY_FAILED|NO_REMEDY_PROBE|UNKNOWN> detail=<token> measured=<ISO>`
+>    — and a typed refusal shows coord ANSWERED and named a precondition, so
+>    it never stamps a negative. Any state that shows coord answered
+>    CONTRADICTS the negative whose code (or the tool the probe called) it
+>    matches: `state=REMEDY_WORKS`, `REMEDY_PRECONDITION_UNMET` with
+>    `detail=` `session_not_owned_by_caller`, `caller_owns_no_active_session`,
+>    `harness_session_id_required_measured`, `header_not_honored` or
+>    `stale_build`, and `REMEDY_FAILED detail=build_current`. Publish the
+>    precondition and its remedy instead of the negative. Every other line
+>    shows nothing either way: `UNKNOWN`, `NO_REMEDY_PROBE` (no probe ran),
+>    `REMEDY_FAILED detail=orient_refused` (the probe's own call was
+>    refused), a detail this list does not name.
+>
+> Where no census tool is reachable at all, a route negative cannot be
+> settled and is UNVERIFIED.
+>
+> A stamp counts only when the tool EMITTED it on this box; a line you typed,
+> however well-formed, is not evidence. It counts only beside the negative it
+> is offered for: a census only for a negative about the route it names —
+> never a refusal, never one in a sentence naming a coord tool — and only
+> when censuses cover every route that negative names; a `FLOOR-CLAIM:` for
+> a door or credential negative with no refusal in it — and every negative
+> in the text, clause by clause, needs its own. A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
-> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
-> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
-> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
-> could not read a source and settles nothing; `routes=0` with both refs
-> resolved is the only honest negative, and `admits=unknown` on a listed row
-> means unmeasured, never "operator-only".
+> `coord.qontinui.io` and answers on `api.qontinui.io`. `_routes` is not a
+> census either — of the five `user_id`-bearing credential doors (roster in
+> `knowledge-base/qontinui-specific/coord-gates-and-access.md`), "three of
+> them are not routes at all, and one of them (door 5) is a file on local disk
+> that no route census, `_routes` enumeration or allowlist read can surface."
+> So **a credential-door class-negative is settled by probing the roster,
+> never by enumerating a surface**, and a report that could not probe a
+> member says `UNKNOWN (door N unprobed)` for it rather than folding the miss
+> into a class verdict. A claim without accepted evidence is **UNVERIFIED and
+> is not recorded** — not as a finding, not as a memory, not as a plan
+> premise. The publication-time capability-negative gate quotes this very
+> block as its deny message.
 <!-- detector-reach-fence:end -->
 
 **NEVER report a gate as registered without a returned `gate_id`.** A silent "no

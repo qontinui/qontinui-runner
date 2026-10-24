@@ -74,7 +74,7 @@
 #      run -- `git cherry <upstream> HEAD`, which is exactly a patch-id sweep
 #      SCOPED to `merge-base..upstream`. Measured on this box: 22 ms on
 #      qontinui-runner (38 behind), 296 ms on qontinui-web (144 behind), 327 ms
-#      on qontinui-dev-notes (1338 behind).
+#      on the plans repository (1338 behind).
 #
 # WHY THE CONTENT TEST CANNOT BE THE WHOLE ANSWER -- read this before
 # "simplifying" step 4 away. The commissioning plan specified patch-id as the
