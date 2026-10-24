@@ -445,6 +445,84 @@ set -e
 # can leave it behind; it is not part of the comparison either way.
 rm -rf "$SCRATCH_DIR/.tmp-schemas"
 
+# ── Declared pending registrations (the tolerance CI already applies) ──────
+#
+# qontinui-schemas checks in bindings ahead of the runner PR that registers
+# them, declares each wait in codegen/pending-registration.toml, and its CI
+# checker lets an ACTIVE wait absorb its own binding. Without the same
+# tolerance here, regenerating against this repo's Rust "deletes" every such
+# binding and the hook refused every runner push that touched src-tauri/src/
+# over drift CI does not count (findings 2fada332, 72b07886). The ACTIVE
+# decision is qontinui-schemas' own module; see lib/pending-registration.sh.
+#
+# COMPARE_DIR is what the regeneration is compared against: the baseline
+# itself, or a scratch copy of it minus the absorbed waits. Every unknown
+# absorbs nothing, which is the comparison this hook always made.
+#
+# Placed BEFORE the write tripwire fires, deliberately: this step imports a
+# module FROM the schemas checkout, so it belongs inside the window the
+# tripwire proves read-only. Skipped when codegen failed, an arm that exits
+# below without comparing anything.
+COMPARE_DIR="$BASELINE_DIR"
+PENDING_LIB="$SCRIPT_DIR/lib/pending-registration.sh"
+if [ "$GEN_RC" -ne 0 ]; then
+    :
+elif [ -f "$PENDING_LIB" ]; then
+    # shellcheck source=lib/pending-registration.sh
+    . "$PENDING_LIB"
+    PENDING_ABSORBED=""
+    PENDING_NOT_ABSORBED=""
+    pending_registration_active_types "$SCHEMAS_DIR" "$SCRATCH_ROOT/pending-head"
+    case "$PENDING_STATE" in
+        none) : ;;
+        ok)
+            log "pending registrations read at qontinui-schemas ${PENDING_HEAD_SHA:0:12} (its HEAD)"
+            # Every declared wait that is NOT active, with the module's own
+            # reason. An expired token, a rate limit or a network error reads
+            # `INERT (unknown(...))`; without this line the push would be
+            # refused over drift with no word on why the wait did not apply.
+            case "$PENDING_ROWS" in
+                *": INERT"*)
+                    log "declared pending registrations NOT active (absorbing nothing for these):"
+                    while IFS= read -r pending_row; do
+                        case "$pending_row" in *": INERT"*) log "    $pending_row" ;; esac
+                    done <<< "$PENDING_ROWS" ;;
+            esac
+            if [ -n "$PENDING_ACTIVE_TYPES" ]; then
+                # shellcheck disable=SC2086  # one type name per word, by construction
+                if pending_registration_absorb "$BASELINE_DIR" "$SCRATCH_DIR" \
+                        "$SCRATCH_ROOT/baseline-pending-absorbed" \
+                        $PENDING_ACTIVE_TYPES; then
+                    # Only a copy that actually absorbed something replaces the
+                    # baseline, so the OK message never claims an absorption.
+                    [ -z "$PENDING_ABSORBED" ] || COMPARE_DIR="$SCRATCH_ROOT/baseline-pending-absorbed"
+                else
+                    PENDING_ABSORBED=""
+                    PENDING_NOT_ABSORBED=""
+                    log "NOTE — could not build the pending-absorbed comparison copy;"
+                    log "       comparing against the full baseline (absorbing nothing)."
+                fi
+            fi
+            if [ -n "${PENDING_ABSORBED:-}" ]; then
+                log "pending registrations absorbed (declared in $PENDING_REGISTRATION_TOML_REL, ACTIVE now):"
+                printf '%s\n' "$PENDING_ABSORBED" | sed 's/^/[gen-events-drift]     /'
+            fi
+            if [ -n "${PENDING_NOT_ABSORBED:-}" ]; then
+                log "declared ACTIVE but not absorbed:"
+                printf '%s\n' "$PENDING_NOT_ABSORBED" | sed 's/^/[gen-events-drift]     /'
+            fi
+            ;;
+        *)
+            log "NOTE — pending registrations UNKNOWN: $PENDING_UNKNOWN_REASON."
+            log "       Absorbing nothing, so a binding qontinui-schemas declares as"
+            log "       waiting on an open runner PR is reported as drift below."
+            ;;
+    esac
+else
+    log "NOTE — missing $PENDING_LIB, so declared pending registrations are not"
+    log "       absorbed; comparing against the full baseline."
+fi
+
 # ── Guard 3 (fire): did we touch a repo we do not own? ──────────────────────
 
 tripwire_fired() {
@@ -542,12 +620,17 @@ rm -f "$GEN_LOG"
 # `git diff --no-index` works on plain directories outside any repository and
 # exits 1 when they differ. It reports added/removed files too, so a type that
 # disappeared from the Rust side is drift as much as one that changed shape.
-if git diff --no-index --quiet -- "$BASELINE_DIR" "$SCRATCH_DIR"; then
+if git diff --no-index --quiet -- "$COMPARE_DIR" "$SCRATCH_DIR"; then
     # Deliberately not "matches the checked-in output". The tree IS checked in
     # today (550 files), but this compares the copy ON THIS DISK, which can be
     # stale or hand-edited relative to what qontinui-schemas has committed —
     # a weaker claim. CI's check-generated-drift.sh makes the index-aware one.
-    log "OK — regenerated bindings match the ones on disk at $BASELINE_DIR."
+    if [ "$COMPARE_DIR" = "$BASELINE_DIR" ]; then
+        log "OK — regenerated bindings match the ones on disk at $BASELINE_DIR."
+    else
+        log "OK — regenerated bindings match the ones on disk at $BASELINE_DIR,"
+        log "     apart from the ACTIVE pending registrations absorbed above."
+    fi
     exit 0
 fi
 
@@ -623,7 +706,7 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     log "below are therefore already upstream: the shared checkout's artifact is"
     log "simply behind this repo's Rust."
     echo
-    git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
+    git --no-pager diff --no-index --stat -- "$COMPARE_DIR" "$SCRATCH_DIR" || true
     print_dirty_checkout_note log
     echo
     log "Nothing to do for this $STAGE. To clear it for everyone:"
@@ -659,7 +742,7 @@ else
     fail "this $STAGE. Failing closed, for the same reason 'unavailable' does."
 fi
 echo >&2
-git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || true
+git --no-pager diff --no-index --stat -- "$COMPARE_DIR" "$SCRATCH_DIR" >&2 || true
 echo >&2
 fail "Refresh the shared bindings by regenerating and committing them there:"
 print_remedy

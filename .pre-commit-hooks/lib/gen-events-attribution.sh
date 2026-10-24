@@ -661,6 +661,32 @@ _gen_events_read_z() {
 # shallow clone or a remote-less checkout cannot answer the question, and
 # guessing "pre-existing" there would silently downgrade a real failure. The
 # caller fails closed on it.
+#
+# A REBASED push is measured from the newer of two bases (finding 8d16b76e).
+# `push_base_ref` prefers `@{upstream}`, which for a pushed branch that was then
+# rebased onto a newer main is the OLD remote branch. merge-base(HEAD, it) is
+# then the OLD base, and every main commit the rebase pulled in read as
+# "committed" by this push — so a frontend-only branch was blamed for all of
+# main's codegen drift. A commit already on the default branch is upstream by
+# definition, which is exactly what "pre-existing" means here; so when
+# merge-base(HEAD, <default branch>) DESCENDS from the upstream merge-base, it
+# is the base. It can only move the base forward along HEAD's own history, past
+# commits main already carries — never past one of the push's own.
+gen_events_attribution_advance_base() {
+    local repo="$1" default_ref mb
+    default_ref="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    [ -n "$default_ref" ] || default_ref="origin/main"
+    [ "$default_ref" != "$ATTRIBUTION_BASE_REF" ] || return 0
+    git -C "$repo" rev-parse --verify --quiet "${default_ref}^{commit}" >/dev/null 2>&1 || return 0
+    mb="$(git -C "$repo" merge-base HEAD "$default_ref" 2>/dev/null || true)"
+    [ -n "$mb" ] && [ "$mb" != "$ATTRIBUTION_BASE_SHA" ] || return 0
+    if git -C "$repo" merge-base --is-ancestor "$ATTRIBUTION_BASE_SHA" "$mb" 2>/dev/null; then
+        ATTRIBUTION_BASE_REF="$default_ref"
+        ATTRIBUTION_BASE_SHA="$mb"
+    fi
+    return 0
+}
+
 gen_events_attribution() {
     local repo="$1"
     ATTRIBUTION_STATE="unavailable"
@@ -691,6 +717,7 @@ gen_events_attribution() {
         ATTRIBUTION_UNAVAILABLE_REASON="could not compute merge-base(HEAD, $ref)"
         return 0
     fi
+    gen_events_attribution_advance_base "$repo"
 
     # The markdown exclusion applies only while its premise holds for the tree
     # being attributed. `&& rc=0 || rc=$?` rather than a bare assignment: the
