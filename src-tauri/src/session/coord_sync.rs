@@ -2937,22 +2937,6 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     JsonValue::Object(body)
 }
 
-/// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
-/// outbox payload. The registrar records the work-progress fields flat in the
-/// payload (`session_status`, optional `last_progress_at` / `progress_detail`);
-/// coord's `UpdateSessionRequest` nests them under `progress` and stamps
-/// `last_progress_at = now()` when omitted. Advances the work-progress axis
-/// (`coord.sessions.last_progress_at`), independent of the liveness heartbeat.
-///
-/// `tool_name` / `tool_input_digest` / `model` are the TOOL-GRAIN half (plan
-/// `2026-08-11-coord-hook-sourced-agent-status`), written by the OSC 9999
-/// sideband (`terminal::agent_status_sideband`) and by the Claude Code
-/// `PostToolUse` hook. **Coord accepts them only once that plan's Phase 2
-/// widens `ProgressUpdate`.** Forwarding them before then is safe and inert,
-/// not a 4xx: coord's `ProgressUpdate` carries no `deny_unknown_fields`, so
-/// serde drops an unknown key rather than rejecting the body. (Verified
-/// against `qontinui-coord/src/sessions.rs`.) The three pre-existing keys
-/// above are byte-identical to what they were.
 /// The `PATCH /sessions/:id` body for a `finished` outbox row.
 ///
 /// `{progress:{session_status:"finished", last_progress_at:<RFC 3339>}}`,
@@ -2960,10 +2944,13 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
 /// runner's own mark, `SessionLifecycleStore::set_finished`) rendered with
 /// millisecond precision in UTC. coord's `ProgressUpdate::last_progress_at` is
 /// a `DateTime<Utc>`, and coord uses an explicit one as the write instant of
-/// the whole report, so it is ALSO the instant its transition clock
-/// (`state_started_at`, served back as `since`) moves to (plan
+/// the whole report, so WHENEVER this report moves coord's transition clock
+/// (`state_started_at`, served back as `since`) it moves it to this instant
+/// (plan
 /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
-/// Phase 3 (b)). Without it a late drain post-dates the finish, which is the
+/// Phase 3 (b)). That is on a real status change on any coord, and on every
+/// finish — finished → finished included — only on a coord carrying that
+/// plan's Phase 2. Without it a late drain post-dates the finish, which is the
 /// unsafe direction for a reader deciding whether a prompt came after it.
 ///
 /// A payload with no usable `finished_at` (a row queued by an older build, a
@@ -2985,6 +2972,22 @@ fn finished_body(payload: &JsonValue) -> JsonValue {
     json!({ "progress": JsonValue::Object(progress) })
 }
 
+/// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
+/// outbox payload. The registrar records the work-progress fields flat in the
+/// payload (`session_status`, optional `last_progress_at` / `progress_detail`);
+/// coord's `UpdateSessionRequest` nests them under `progress` and stamps
+/// `last_progress_at = now()` when omitted. Advances the work-progress axis
+/// (`coord.sessions.last_progress_at`), independent of the liveness heartbeat.
+///
+/// `tool_name` / `tool_input_digest` / `model` are the TOOL-GRAIN half (plan
+/// `2026-08-11-coord-hook-sourced-agent-status`), written by the OSC 9999
+/// sideband (`terminal::agent_status_sideband`) and by the Claude Code
+/// `PostToolUse` hook. **Coord accepts them only once that plan's Phase 2
+/// widens `ProgressUpdate`.** Forwarding them before then is safe and inert,
+/// not a 4xx: coord's `ProgressUpdate` carries no `deny_unknown_fields`, so
+/// serde drops an unknown key rather than rejecting the body. (Verified
+/// against `qontinui-coord/src/sessions.rs`.) The three pre-existing keys
+/// above are byte-identical to what they were.
 fn progress_body(payload: &JsonValue) -> JsonValue {
     let mut progress = serde_json::Map::new();
     if let Some(status) = payload.get("session_status") {
@@ -5631,6 +5634,79 @@ mod tests {
                 "session_status": "finished",
                 "last_progress_at": "1970-01-01T00:00:00.001Z",
             } })
+        );
+    }
+
+    /// End to end (review round 1): a RESTAMPED mark drains with the NEW time.
+    /// The lifecycle store's restamp → its finish observer → the registrar's
+    /// `finished` outbox row → `push_record` → the PATCH coord receives, whose
+    /// `last_progress_at` is the SECOND finish's stamp, not the first's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restamped_finish_drains_with_the_new_last_progress_at() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let coord_row = Uuid::new_v4();
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_row));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |r| reg.forward_finish_change(r));
+        }
+        store.record_open(test_open_record("s"));
+
+        let first = store
+            .set_finished("s", true, Some("first".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        store.mark_finish_synced("s", Some(first));
+        // Revived, then finished again: a reason-carrying re-finish restamps.
+        let again = store
+            .set_finished("s", true, Some("again".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert_ne!(again, first);
+
+        let rows: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(rows.len(), 2, "the first finish and the re-sent one: {rows:?}");
+        let last = rows.last().unwrap();
+        assert_eq!(last.payload["finished_at"], again, "the re-sent row carries the NEW stamp");
+        let outcome = push_record(&coord.inner, last).await;
+        assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
+
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(again)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let g = rec.lock().await;
+        let (id, body) = g.patches.last().expect("the re-sent finish was PATCHed");
+        assert_eq!(*id, coord_row, "addressed to the session's coord row by PATH");
+        assert_eq!(body["progress"]["session_status"], "finished");
+        assert_eq!(
+            body["progress"]["last_progress_at"],
+            expected.as_str(),
+            "coord is told the SECOND finish's time: {body}"
         );
     }
 
