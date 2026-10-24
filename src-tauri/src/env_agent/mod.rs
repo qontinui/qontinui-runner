@@ -199,8 +199,8 @@ pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to build PG pool: {e}"))?;
     // Guarded like every runner pool: the breaker fails fast after a connect
     // failure and bounds each reconnect trial itself, since this pool carries
-    // no timeouts. A CLI has no background runtime, so a due caller runs the
-    // trial inline.
+    // no timeouts. On a CLI's current-thread runtime no prober can run, so a
+    // due caller runs the trial inline.
     publish_pg_pool(crate::pg_circuit::GuardedPool::new(pool));
     Ok(())
 }

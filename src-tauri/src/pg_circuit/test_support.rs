@@ -68,21 +68,26 @@ impl PgStandIn {
         let (m, a) = (mode_cell.clone(), accepts.clone());
         let task = tokio::spawn(async move {
             // Silent sockets are parked here so they stay open (never
-            // written, never closed) until the stand-in is dropped.
+            // written, never closed) until the stand-in is dropped; served
+            // connections live in a JoinSet, so dropping the stand-in (which
+            // aborts this task) aborts them too.
             let mut parked: Vec<TcpStream> = Vec::new();
+            let mut served = tokio::task::JoinSet::new();
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
-                    continue;
+                    // A listener that cannot accept will not recover; stop
+                    // rather than spin.
+                    break;
                 };
                 a.fetch_add(1, Ordering::SeqCst);
                 match Mode::from_u8(m.load(Ordering::SeqCst)) {
                     Mode::Silent => parked.push(sock),
                     Mode::Refuse => drop(sock),
                     Mode::Fake => {
-                        tokio::spawn(serve_fake(sock));
+                        served.spawn(serve_fake(sock));
                     }
                     Mode::AuthError => {
-                        tokio::spawn(serve_auth_error(sock));
+                        served.spawn(serve_auth_error(sock));
                     }
                 }
             }

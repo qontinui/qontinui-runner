@@ -597,8 +597,8 @@ pub(super) async fn gather_ui_error_signals(
 ) -> UiErrorSignals {
     let ui_error = state.app_state.ui_error.get().await;
     let recent_crash = state.app_state.crash_dumps.get().await;
-    // `pg_reachable = None`: this signal gatherer does not run a DB round-trip;
-    // the bounded PG liveness probe lives only in the `/health` handler (B-5).
+    // `pg_reachable` / `pg_schema_ok` come from the CACHED PG health snapshot
+    // (`database::pg::health`): no DB round-trip, age-bounded.
     let ui_dead = crate::ui_error::ui_stale(
         last_pong,
         last_pong_age_ms,
@@ -625,6 +625,8 @@ pub(super) async fn gather_ui_error_signals(
         ui_dead: Some(ui_dead),
         native_ui_wedged: native_ui.wedged,
         embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+        pg_reachable: crate::database::pg::health::status_pg_reachable(),
+        pg_schema_ok: crate::database::pg::health::status_pg_schema_ok(),
         ..Default::default()
     });
     let json = match &ui_error {

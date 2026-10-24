@@ -380,10 +380,11 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Read the /health-driven embedding probe cache. `None` (probe
             // hasn't run yet) collapses to "healthy" so a pre-probe heartbeat
             // doesn't flap to "degraded" on boot.
-            // `pg_reachable = None`: the heartbeat loop does not run a DB
-            // round-trip (the bounded PG liveness probe lives only in the
-            // `/health` handler), so it passes unknown rather than probing on
-            // every tick.
+            // `pg_reachable` / `pg_schema_ok` come from the CACHED PG health
+            // snapshot (`database::pg::health`): no DB round-trip per tick,
+            // age-bounded (stale or never observed is `None`), and a breaker
+            // that is open reads `Some(false)` — so a down database reaches
+            // this off-box heartbeat's `derived_status`.
             //
             // `ui_dead` is a REAL value here, not `None`. A dead WebView2 host
             // is invisible to `ui_error` (the React error boundary cannot run)
@@ -428,6 +429,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     ui_dead: Some(ui_dead),
                     native_ui_wedged: native_ui.wedged,
                     embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                    pg_reachable: crate::database::pg::health::status_pg_reachable(),
+                    pg_schema_ok: crate::database::pg::health::status_pg_schema_ok(),
                     relay_connected,
                     ..Default::default()
                 });
