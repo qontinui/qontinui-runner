@@ -2345,8 +2345,10 @@ pub(crate) enum ComponentSources {
 
 impl ComponentSources {
     /// The sources a request is answered from, decided by whether the relay
-    /// forwarded it.
-    pub(crate) fn for_request(headers: &HeaderMap) -> Self {
+    /// forwarded it. Private: its one production caller is [`components_read`],
+    /// so a component read's sources always come from that request's own
+    /// headers, and no code outside this module can select them another way.
+    fn for_request(headers: &HeaderMap) -> Self {
         if crate::mcp::relay_path_policy::is_relayed_request(headers) {
             Self::RunnerOnly
         } else {
@@ -2455,14 +2457,18 @@ fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiRespons
 /// F2 (Direction B) envelope shape: `data` is `{components: [...],
 /// wrapperComponents}` (object-shaped, matches every other rich endpoint
 /// convention and aligns with the SDK relay); see [`components_envelope`].
+///
+/// The handler only extracts: it hands the request's own headers to
+/// [`components_read`], which decides the sources from them. A test cannot
+/// build the `ApiState` this needs, so
+/// `the_component_handler_hands_its_request_headers_to_the_read_core` pins
+/// this body by scraping it.
 pub async fn ui_bridge_get_components_handler(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
-    let sources = ComponentSources::for_request(&headers);
-    info!("UI Bridge API: Getting all components ({sources:?})");
     components_read(
-        sources,
+        &headers,
         &state.app_registry,
         &state.app_dispatcher,
         ui_bridge_request_sync(&state, "get_components", serde_json::json!({})),
@@ -2470,18 +2476,23 @@ pub async fn ui_bridge_get_components_handler(
     .await
 }
 
-/// [`ui_bridge_get_components_handler`] past its extractors. `ipc` is the read
-/// of the runner's own registry. It runs alongside the wrappers' half that
-/// `sources` selects, and the two are merged. Split out so a test can drive
-/// the whole read (source selection, fan-out, merge and envelope) against a
-/// registry and dispatcher of its own, which an `ApiState` cannot be built
-/// around.
+/// [`ui_bridge_get_components_handler`] past its extractors: `headers` are the
+/// request's own, `registry` and `dispatcher` reach the WebSocket wrappers,
+/// and `ipc` is the read of the runner's own registry. The sources are chosen
+/// here, from `headers` ([`ComponentSources`]). The IPC read runs alongside the
+/// wrappers' half that choice selects, and the two are merged. Split out so a
+/// test can drive the whole read (source selection from the headers, fan-out,
+/// merge and envelope) against a registry and dispatcher of its own, which an
+/// `ApiState` cannot be built around.
 pub(crate) async fn components_read(
-    sources: ComponentSources,
+    headers: &HeaderMap,
     registry: &AppRegistry,
     dispatcher: &AppDispatcher,
     ipc: impl std::future::Future<Output = Result<serde_json::Value, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
+    let sources = ComponentSources::for_request(headers);
+    info!("UI Bridge API: Getting all components ({sources:?})");
+
     // Fan out to WS-transport wrappers in parallel with the IPC call.
     let (ipc_result, mut ws_components) =
         tokio::join!(ipc, ws_components_for(sources, registry, dispatcher));
@@ -6230,37 +6241,151 @@ mod ws_dispatch_selection_tests {
         assert_eq!(local.await.unwrap(), vec![json!({ "id": "wrapper-1" })]);
     }
 
-    /// The read core under each source selection, with the runner's own
-    /// registry stubbed. A relayed read returns the runner's entries alone and
-    /// says the wrappers were withheld. When the runner's own read fails, a
-    /// relayed read is an ERROR: with no wrapper half to fall back to, an
-    /// empty list would claim the runner registers nothing.
+    /// Request headers carrying the relay's marker, the way
+    /// `backend_relay::relay_http_to_base` stamps every forwarded request. The
+    /// name is spelled as a literal, as in
+    /// `the_relay_marker_selects_the_runner_only_read`.
+    fn relayed_headers() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-qontinui-relayed"),
+            axum::http::HeaderValue::from_static("http_request"),
+        );
+        headers
+    }
+
+    /// The read core chooses its sources from the request headers it is
+    /// handed, with the runner's own registry stubbed. A request bearing the
+    /// relay's marker returns the runner's entries alone, says the wrappers
+    /// were withheld, and returns at once although a live wrapper never
+    /// answers. When the runner's own read fails, a relayed read is an ERROR:
+    /// with no wrapper half to fall back to, an empty list would claim the
+    /// runner registers nothing.
     #[tokio::test]
     async fn a_relayed_read_returns_the_runners_registry_or_its_error() {
         let (registry, dispatcher, _relay, _conn, mut rx) = hung_wrapper().await;
 
-        let body = components_read(
-            ComponentSources::RunnerOnly,
-            &registry,
-            &dispatcher,
-            async { Ok::<_, String>(json!([{ "id": "runner-1" }])) },
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            components_read(&relayed_headers(), &registry, &dispatcher, async {
+                Ok::<_, String>(json!([{ "id": "runner-1" }]))
+            }),
         )
         .await
+        .expect("a relayed read must not wait on a wrapper")
         .expect("the runner's own registry answered")
         .0;
         assert_eq!(body["data"]["components"], json!([{ "id": "runner-1" }]));
         assert_eq!(body["data"]["wrapperComponents"], json!("withheld"));
 
-        let failed = components_read(
-            ComponentSources::RunnerOnly,
-            &registry,
-            &dispatcher,
-            async { Err::<serde_json::Value, _>("UI Bridge request timed out".to_string()) },
+        let failed = tokio::time::timeout(
+            Duration::from_secs(5),
+            components_read(&relayed_headers(), &registry, &dispatcher, async {
+                Err::<serde_json::Value, _>("UI Bridge request timed out".to_string())
+            }),
         )
-        .await;
+        .await
+        .expect("a relayed read must not wait on a wrapper");
         let (status, _) = failed.expect_err("a failed runner read is not an empty list");
         assert!(status.is_server_error(), "{status}");
         assert!(rx.try_recv().is_err(), "no wrapper was asked either time");
+    }
+
+    /// The other half of the read core's selection: handed headers WITHOUT the
+    /// marker, the same core asks the live wrapper, merges its reply after the
+    /// runner's own entries, and says the wrappers were included. This is what
+    /// makes the relayed half above discriminating: the wrapper is live and
+    /// dispatchable, and a marked request leaves it alone anyway.
+    #[tokio::test]
+    async fn an_unmarked_read_asks_the_wrappers_and_says_so() {
+        let (registry, dispatcher, relay, conn, mut rx) = hung_wrapper().await;
+
+        let (registry_h, dispatcher_h) = (registry.clone(), dispatcher.clone());
+        let local = tokio::spawn(async move {
+            components_read(
+                &axum::http::HeaderMap::new(),
+                &registry_h,
+                &dispatcher_h,
+                async { Ok::<_, String>(json!([{ "id": "runner-1" }])) },
+            )
+            .await
+            .map(|body| body.0)
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an unmarked read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-1" }])),
+                    error: None,
+                },
+            )
+            .await;
+        let body = local
+            .await
+            .unwrap()
+            .expect("the runner's own registry answered");
+        assert_eq!(
+            body["data"]["components"],
+            json!([{ "id": "runner-1" }, { "id": "wrapper-1" }])
+        );
+        assert_eq!(body["data"]["wrapperComponents"], json!("included"));
+    }
+
+    /// `ui_bridge_get_components_handler` extracts an `ApiState`, which no test
+    /// can build (it owns a `tauri::AppHandle`), so no test runs it. Its body
+    /// is the one place a request's own headers reach [`components_read`],
+    /// where the sources are chosen, and every test of that core supplies
+    /// headers of its own. So the body is pinned by scraping it, as
+    /// `every_element_read_handler_advertises_custom_actions` does. A handler
+    /// that passed `components_read` any other `HeaderMap` (an empty one, a
+    /// rebuilt or edited copy) would send every relayed read to the WebSocket
+    /// wrappers again while all of those tests stayed green.
+    ///
+    /// The handler must take `headers: HeaderMap` and use it exactly once, as
+    /// `components_read`'s first argument. It must name no `ComponentSources`
+    /// and build no `HeaderMap` of its own. Whitespace is ignored, so a
+    /// `cargo fmt` reflow does not trip the pin.
+    #[test]
+    fn the_component_handler_hands_its_request_headers_to_the_read_core() {
+        let src = include_str!("elements.rs").replace("\r\n", "\n");
+        let (_, after) = src
+            .split_once("pub async fn ui_bridge_get_components_handler(")
+            .expect("ui_bridge_get_components_handler not found in elements.rs");
+        // A handler ends at its first column-0 closing brace.
+        let (body, _) = after
+            .split_once("\n}\n")
+            .expect("ui_bridge_get_components_handler has no column-0 closing brace");
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("headers:HeaderMap,"),
+            "the handler must extract the request's headers: {body}"
+        );
+        assert!(
+            compact.contains("components_read(&headers,"),
+            "the handler must hand its own `headers` to `components_read`: {body}"
+        );
+        assert_eq!(
+            compact.matches("headers").count(),
+            2,
+            "`headers` must be bound once (the extractor) and used once (the \
+             `components_read` argument), so nothing rebinds or edits it: {body}"
+        );
+        for chosen_elsewhere in ["ComponentSources", "HeaderMap::", "HeaderMap{"] {
+            assert!(
+                !compact.contains(chosen_elsewhere),
+                "the handler must leave source selection to `components_read`, \
+                 but it contains `{chosen_elsewhere}`: {body}"
+            );
+        }
     }
 }
 
