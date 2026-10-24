@@ -884,10 +884,16 @@ mod tests {
     fn a_symref_chain_falls_back_to_the_cli() {
         let t = tempfile::tempdir().unwrap();
         let c = clone_on_feature(t.path(), "main");
-        git(&c, &["symbolic-ref", "refs/heads/alias", "refs/heads/feature"]);
+        git(
+            &c,
+            &["symbolic-ref", "refs/heads/alias", "refs/heads/feature"],
+        );
         git(&c, &["symbolic-ref", "HEAD", "refs/heads/alias"]);
         let repo = open(&c).unwrap();
-        assert!(head_branch(&repo).is_err(), "git2 must decline a HEAD chain");
+        assert!(
+            head_branch(&repo).is_err(),
+            "git2 must decline a HEAD chain"
+        );
         let mut tally = Tally::default();
         let got = or_cli(Some(&repo), &mut tally, head_branch, || {
             cli(&c, &["symbolic-ref", "--short", "HEAD"])
