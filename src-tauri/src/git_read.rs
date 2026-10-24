@@ -175,13 +175,28 @@ fn not_a_symref_chain(repo: &Repository, target: &str) -> Read<()> {
 /// rule (`%s`) reads `$GIT_DIR/<name>`, and on a case-insensitive filesystem a
 /// branch named `head` finds `HEAD` there: `rev-parse head` answers HEAD's
 /// commit and `symbolic-ref --short` prints `heads/head`. libgit2 skips that
-/// rule for a one-level name that is not all caps, so it would answer with
-/// the branch. Such a name is left to the CLI (a harmless decline for
-/// `config` or `index`, which the CLI resolves to the branch too).
+/// rule for every one-level name outside [`read_through_percent_s_by_both`],
+/// so it would answer with the branch. Such a name is left to the CLI (a
+/// harmless decline for `config` or `index`, whose file is no ref, so the CLI
+/// resolves the branch too).
 fn shadowed_by_a_git_dir_file(repo: &Repository, name: &str) -> bool {
     [repo.path(), repo.commondir()]
         .iter()
         .any(|d| d.join(name).is_file())
+}
+
+/// True for a name BOTH git and libgit2 read as `$GIT_DIR/<name>` (DWIM's
+/// `%s` rule): non-empty, only `A-Z` and `_`, and — libgit2's
+/// `is_valid_normalized_name` — neither starting nor ending with `_`. git's
+/// own rule is wider: it reads every valid one-level name through `%s`,
+/// lowercase included (measured with git 2.53: `.git/foo` answers
+/// `rev-parse foo`). So a name outside this set that a git-dir file shadows
+/// is left to the CLI.
+fn read_through_percent_s_by_both(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        && !name.starts_with('_')
+        && !name.ends_with('_')
 }
 
 /// True for a spec git could read as an object id rather than a ref name.
@@ -194,16 +209,14 @@ fn hex_shaped(spec: &str) -> bool {
 /// — libgit2's `git_reference_dwim` uses the same list in the same order),
 /// WITHOUT looking the object up: `rev-parse --verify` prints a dangling ref's
 /// target too. `None` when no rule names a ref. A hex-shaped spec is `Err`:
-/// git may read it as an (abbreviated) object id. So is a lowercase-bearing
-/// spec a git-dir file shadows ([`shadowed_by_a_git_dir_file`]); an all-caps
-/// name (`HEAD`, `ORIG_HEAD`) is read through `%s` by both, so it is not.
+/// git may read it as an (abbreviated) object id. So is a spec a git-dir file
+/// shadows ([`shadowed_by_a_git_dir_file`]) unless both read it through `%s`
+/// ([`read_through_percent_s_by_both`]: `HEAD`, `ORIG_HEAD`).
 fn resolve_ref(repo: &Repository, spec: &str) -> Read<Option<Oid>> {
     if hex_shaped(spec) {
         return Err(unsupported("a hex-shaped revision"));
     }
-    if !spec.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
-        && shadowed_by_a_git_dir_file(repo, spec)
-    {
+    if !read_through_percent_s_by_both(spec) && shadowed_by_a_git_dir_file(repo, spec) {
         return Err(unsupported("a revision a git-dir file shadows"));
     }
     let Some(r) = found(repo.resolve_reference_from_short_name(spec))? else {
@@ -955,8 +968,11 @@ mod tests {
 
     /// A name a git-dir file shadows goes to the CLI, for ref reads and for
     /// `symbolic-ref --short` alike. `config` is a file in every git dir, so
-    /// that arm runs everywhere; `head` is the arm where git2 and the CLI
-    /// would really disagree, and it exists only on a case-insensitive
+    /// that arm runs everywhere (git and libgit2 agree there; the decline is
+    /// harmless). The `foo` arm is a REAL disagreement on every filesystem: a
+    /// file `.git/foo` holding HEAD's id makes `rev-parse foo` answer HEAD,
+    /// while libgit2 would answer with the branch. The `head` arm is the same
+    /// disagreement as it occurs naturally, only on a case-insensitive
     /// filesystem (where `.git/head` opens `HEAD`).
     #[test]
     fn a_name_a_git_dir_file_shadows_falls_back_to_the_cli() {
@@ -979,6 +995,78 @@ mod tests {
         assert_eq!(tally.fell_back, 1);
         // The branch itself is an ordinary name and still answers in-process.
         assert!(verify_ref(&repo, "feature").unwrap().is_some());
+
+        // `symbolic-ref --short` on a shadowed branch: git2 declines, and the
+        // CLI (which finds no ref in `.git/config`) prints the bare name.
+        git(&c, &["checkout", "-q", "config"]);
+        assert!(head_branch(&repo).is_err(), "git2 must decline");
+        let mut tally = Tally::default();
+        let got = or_cli(Some(&repo), &mut tally, head_branch, || {
+            cli(&c, &["symbolic-ref", "--short", "HEAD"])
+        });
+        assert_eq!(got.as_deref(), Some("config"));
+        assert_eq!(tally.fell_back, 1);
+        git(&c, &["checkout", "-q", "feature"]);
+
+        // A real disagreement on any filesystem: `.git/foo` holds HEAD's id,
+        // branch `foo` points one commit back.
+        let head = git(&c, &["rev-parse", "HEAD"]);
+        git(&c, &["branch", "foo", "HEAD~1"]);
+        std::fs::write(c.join(".git").join("foo"), format!("{head}\n")).unwrap();
+        let want = cli(&c, &["rev-parse", "--verify", "--quiet", "foo"]);
+        if want.as_deref() != Some(head.as_str()) {
+            eprintln!(
+                "note: this git does not read .git/foo for `foo`; only the decline is checked"
+            );
+        }
+        assert!(verify_ref(&repo, "foo").is_err(), "git2 must decline");
+        // libgit2's own DWIM, the read the decline replaces, names the BRANCH
+        // (HEAD~1), not the file: this is the answer that would have shipped.
+        let branch_tip = git(&c, &["rev-parse", "refs/heads/foo"]);
+        assert_eq!(
+            repo.resolve_reference_from_short_name("foo")
+                .unwrap()
+                .target()
+                .map(|o| o.to_string()),
+            Some(branch_tip.clone())
+        );
+        assert_ne!(branch_tip, head, "premise: the branch is not HEAD");
+        let mut tally = Tally::default();
+        let got = or_cli(
+            Some(&repo),
+            &mut tally,
+            |r| verify_ref(r, "foo"),
+            || cli(&c, &["rev-parse", "--verify", "--quiet", "foo"]),
+        );
+        assert_eq!(got, want);
+        assert_eq!(tally.fell_back, 1);
+
+        // `symbolic-ref --short` with HEAD on the shadowed `foo`: git finds
+        // the `.git/foo` file under its first rule and prints `heads/foo`
+        // (git 2.53); git2 must decline rather than print `foo`.
+        git(&c, &["checkout", "-q", "refs/heads/foo"]);
+        git(&c, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
+        assert!(head_branch(&repo).is_err(), "git2 must decline");
+        let want = cli(&c, &["symbolic-ref", "--short", "HEAD"]);
+        if want.as_deref() != Some("heads/foo") {
+            eprintln!(
+                "note: this git prints {want:?} for a shadowed `foo`; only the decline is checked"
+            );
+        }
+        let mut tally = Tally::default();
+        let got = or_cli(Some(&repo), &mut tally, head_branch, || {
+            cli(&c, &["symbolic-ref", "--short", "HEAD"])
+        });
+        assert_eq!(got, want);
+        assert_eq!(tally.fell_back, 1);
+        git(&c, &["symbolic-ref", "HEAD", "refs/heads/feature"]);
+        git(&c, &["checkout", "-q", "-f", "feature"]);
+        // A trailing `_` is read through `%s` by git and not by libgit2.
+        assert!(!read_through_percent_s_by_both("FOO_"));
+        assert!(!read_through_percent_s_by_both("_FOO"));
+        assert!(!read_through_percent_s_by_both("FOO-BAR"));
+        assert!(read_through_percent_s_by_both("ORIG_HEAD"));
+        assert!(read_through_percent_s_by_both("HEAD"));
 
         if c.join(".git").join("head").is_file() {
             git(&c, &["branch", "head", "HEAD~1"]);

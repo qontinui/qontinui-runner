@@ -471,7 +471,11 @@ mod tests {
         assert_eq!(memo.len(), 2, "at the cap");
         // Re-storing a directory already held does not empty the memo.
         std::fs::write(dirs[0].join(".git").join("index"), b"DIRC-moved").unwrap();
-        memo.local_facts(&dirs[0], OID, now, AGE, || Some(facts(2)));
+        assert_eq!(
+            memo.local_facts(&dirs[0], OID, now, AGE, || Some(facts(2))),
+            Some(facts(2)),
+            "the moved fingerprint recaptured"
+        );
         assert_eq!(memo.len(), 2, "an existing key is replaced in place");
         // A third directory empties it first, then is stored alone.
         memo.local_facts(&dirs[2], OID, now, AGE, || Some(facts(3)));
