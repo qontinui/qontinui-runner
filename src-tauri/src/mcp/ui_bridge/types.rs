@@ -47,12 +47,7 @@ impl RequestHints for UIBridgeActionRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedActions": [
-                "click", "doubleClick", "double_click", "double", "right", "middle",
-                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
-                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
-                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
-            ]
+            "allowedActions": crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES
         }))
     }
 }
@@ -1387,5 +1382,21 @@ mod readiness_classification_tests {
                 "{msg} must not classify as FRONTEND_NOT_READY"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod allowed_actions_tests {
+    use super::*;
+
+    /// The shape-error `allowedActions` list is derived from the route's own
+    /// allowlist, so it cannot drift from what `validate_action_name` accepts.
+    #[test]
+    fn action_request_allowed_actions_equal_supported_action_names() {
+        let data = UIBridgeActionRequest::shape_error_data().expect("data");
+        assert_eq!(
+            data["allowedActions"],
+            serde_json::json!(crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES)
+        );
     }
 }
