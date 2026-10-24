@@ -21,6 +21,7 @@ use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
+use crate::database::pg::UnlessUnavailable;
 use crate::findings::{
     Finding, FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding,
 };
@@ -63,6 +64,9 @@ pub struct WorktreeInfo {
 enum BuildReplayErr {
     /// PG global isn't initialized — no way to read the output_log.
     NoPg,
+    /// The output_log read failed on a database outage: whether there is
+    /// history is UNKNOWN, never "no history".
+    Unreadable(String),
 }
 
 /// Sender half of the AI-output persister channel, paired with the depth of
@@ -1776,9 +1780,12 @@ impl ClaudeSession {
     ///
     /// Returns:
     /// - `Ok(Some(prompt))` — there is history; send this as the initial prompt.
-    /// - `Ok(None)` — no `session_ctx`, empty output_log, or no parseable turns.
+    /// - `Ok(None)` — no `session_ctx`, empty output_log, no parseable turns, or a
+    ///   NON-outage read error (read as an empty log).
     /// - `Err(BuildReplayErr::NoPg)` — PG global isn't initialized; caller
     ///   typically aborts the respawn since persistence won't work either way.
+    /// - `Err(BuildReplayErr::Unreadable)` — the database is down: the history
+    ///   is UNKNOWN, and each caller treats it exactly like `NoPg`.
     fn build_replay_from_history(
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
@@ -1796,8 +1803,9 @@ impl ClaudeSession {
             None => return Err(BuildReplayErr::NoPg),
         };
 
-        let output_log =
-            tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
+        let output_log = tauri::async_runtime::block_on(pg.get_task_output(task_run_id))
+            .default_unless_unavailable()
+            .map_err(BuildReplayErr::Unreadable)?;
 
         if output_log.is_empty() {
             info!(
@@ -1920,6 +1928,14 @@ impl ClaudeSession {
                     );
                     None
                 }
+                Err(BuildReplayErr::Unreadable(e)) => {
+                    warn!(
+                        "promote_to_worktree: conversation history unreadable ({}); respawning \
+                         without replay context for {}",
+                        e, self.session_id
+                    );
+                    None
+                }
             };
 
         // 6. Kill the existing CLI. cwd is immutable; this is the only way to
@@ -1978,9 +1994,11 @@ impl ClaudeSession {
 
     /// Auto-restart the session on another account after a rate-limit exit.
     ///
-    /// Reads conversation history from the DB output_log, rotates the account,
+    /// Rotates the account, reads conversation history from the DB output_log,
     /// spawns a new ClaudeSession with a replay prompt, and re-registers it
-    /// in the SessionManager.
+    /// in the SessionManager. Every path that gives up says why, in the
+    /// session's own output, after the "Switching account and restarting
+    /// session..." line the caller already emitted.
     fn auto_restart_on_rate_limit(
         app_handle: &tauri::AppHandle,
         session_id: &str,
@@ -1990,12 +2008,27 @@ impl ClaudeSession {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account
+        // Every abandon path below says why, in the session's own output.
+        let not_restarted = |why: String| {
+            warn!("Session {}: not restarted: {}", session_id, why);
+            if let Some(ctx) = session_ctx {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(
+                        app_handle,
+                        &format!("The session was not restarted: {}", why),
+                        "status",
+                        None,
+                        Some(ctx),
+                    );
+                }));
+            }
+        };
+
+        // 1. Rotate to another account. The account IS rate-limited whether or
+        //    not this session restarts, and for a CLI session this call is the
+        //    only thing that puts it in cooldown, so it runs first.
         if !rotate_account_on_rate_limit() {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
-            );
+            not_restarted("no alternative account is available".into());
             return;
         }
 
@@ -2011,11 +2044,24 @@ impl ClaudeSession {
             session_id, label
         );
 
-        // 2. Read conversation history from DB
+        // 2. Read conversation history from DB. On an outage (no PG, or a
+        //    DATABASE_UNAVAILABLE error) the restart is abandoned rather than
+        //    run without the history, and the user is told why. (A non-outage
+        //    read error still reads as no history; see build_replay_from_history.)
         let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
             Ok(replay) => replay,
             Err(BuildReplayErr::NoPg) => {
-                warn!("No PG connection for reading conversation history");
+                not_restarted(
+                    "the account was switched, but there is no database connection to read \
+                     its conversation history"
+                        .into(),
+                );
+                return;
+            }
+            Err(BuildReplayErr::Unreadable(e)) => {
+                not_restarted(format!(
+                    "the account was switched, but its conversation history could not be read ({e})"
+                ));
                 return;
             }
         };
@@ -2025,7 +2071,7 @@ impl ClaudeSession {
         {
             Some(sm) => sm.inner().clone(),
             None => {
-                warn!("SessionManager not available for auto-restart");
+                not_restarted("the session manager is not available".into());
                 return;
             }
         };
@@ -2054,16 +2100,18 @@ impl ClaudeSession {
                 let new_session = Arc::new(new_session);
 
                 // Send replay prompt if we have conversation context
+                let mut context_restored = false;
                 if let Some(ref replay_prompt) = conversation_context {
-                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
-                        warn!("Failed to send replay prompt: {}", e);
+                    match new_session.send_initial_prompt(replay_prompt) {
+                        Ok(_) => context_restored = true,
+                        Err(e) => warn!("Failed to send replay prompt: {}", e),
                     }
                 }
 
                 // Remove old session and re-register under the same ID
                 sm.remove(session_id);
                 if let Err(e) = sm.register(session_id, new_session.clone()) {
-                    warn!("Failed to re-register session after restart: {}", e);
+                    not_restarted(format!("the new session could not be registered ({e})"));
                     return;
                 }
 
@@ -2082,8 +2130,13 @@ impl ClaudeSession {
                         emit_ai_output(
                             app_handle,
                             &format!(
-                                "Session restarted on account '{}'. Conversation context restored.",
-                                label
+                                "Session restarted on account '{}'. {}",
+                                label,
+                                if context_restored {
+                                    "Conversation context restored."
+                                } else {
+                                    "No prior conversation was replayed."
+                                }
                             ),
                             "status",
                             None,

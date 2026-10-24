@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::types::{api_error, ApiResponse, ApiState};
+use crate::database::pg::UnlessUnavailable;
 use crate::worktree;
 
 // =============================================================================
@@ -467,8 +468,8 @@ pub async fn compare_worktrees_handler(
                 .pg_db
                 .get_task_run(task_run_id)
                 .await
-                .ok()
-                .flatten()
+                .or_unless_unavailable(None)
+                .map_err(crate::mcp::pg_guard::db_unavailable_error)?
                 .map(|run| {
                     format!(
                         "Status: {}, Summary: {}",

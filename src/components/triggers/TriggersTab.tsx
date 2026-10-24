@@ -215,7 +215,9 @@ export function TriggersTab({ className = "" }: TriggersTabProps) {
                 }`}
               />
               <span>
-                {status.enabled_triggers}/{status.total_triggers} enabled
+                {status.total_triggers == null || status.enabled_triggers == null
+                  ? "trigger count unknown"
+                  : `${status.enabled_triggers}/${status.total_triggers} enabled`}
               </span>
               {status.active_executions > 0 && (
                 <span className="text-yellow-400">{status.active_executions} running</span>

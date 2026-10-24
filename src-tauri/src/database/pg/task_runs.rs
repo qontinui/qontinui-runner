@@ -4,6 +4,7 @@
 //! (AI session mgmt, iteration tracking, checkpoint ops) remain on SQLite.
 
 use super::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::types::*;
 
 fn non_empty(s: String) -> Option<String> {
@@ -157,7 +158,10 @@ impl PgDb {
             Some(r) => {
                 let mut tr = full_task_run!(r);
                 // Get output separately (stored in the same row for PG)
-                tr.output_log = self.get_task_output(id).await.unwrap_or_default();
+                tr.output_log = self
+                    .get_task_output(id)
+                    .await
+                    .default_unless_unavailable()?;
                 Ok(Some(tr))
             }
             None => Ok(None),

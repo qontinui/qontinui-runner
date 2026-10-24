@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 
 use super::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::types::{
     CreateVerificationTestInput, TestResult, TestResultStatus, TestType, VerificationTest,
 };
@@ -574,7 +575,7 @@ impl PgDb {
         let recent = self
             .list_test_results(test_id, None, None, Some(limit))
             .await
-            .unwrap_or_default();
+            .default_unless_unavailable()?;
 
         Ok(serde_json::json!({
             "total_runs": total_runs,

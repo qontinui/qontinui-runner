@@ -65,6 +65,7 @@ use tokio_tungstenite::tungstenite::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::mcp::task_supervisor;
 use crate::mcp::types::ApiState;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
@@ -4899,12 +4900,26 @@ async fn handle_chat_generate_workflow(api_state: &Arc<ApiState>, data: &Value) 
         }));
     }
 
-    let output_log = api_state
+    let output_log = match api_state
         .app_state
         .pg_db
         .get_task_output(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(output_log) => output_log,
+        // An outage is not "no conversation history". Same frame type the
+        // client waits for, so its spinner resolves.
+        Err(e) => {
+            return Some(serde_json::json!({
+                "type": "chat_workflow_generated",
+                "task_run_id": task_run_id,
+                "success": false,
+                "code": "DATABASE_UNAVAILABLE",
+                "error": e
+            }))
+        }
+    };
 
     if output_log.is_empty() {
         return Some(serde_json::json!({
@@ -5011,12 +5026,25 @@ async fn handle_chat_get_output(api_state: &Arc<ApiState>, data: &Value) -> Opti
         }));
     }
 
-    let output = api_state
+    let output = match api_state
         .app_state
         .pg_db
         .get_task_output(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(output) => output,
+        // An outage is not an empty output log. The task_run_id routes the
+        // frame to the chat socket (devices_ws forwards none without it).
+        Err(e) => {
+            return Some(serde_json::json!({
+                "type": "error",
+                "task_run_id": task_run_id,
+                "code": "DATABASE_UNAVAILABLE",
+                "error": e
+            }))
+        }
+    };
     Some(serde_json::json!({
         "type": "chat_output",
         "task_run_id": task_run_id,

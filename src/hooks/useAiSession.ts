@@ -14,6 +14,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { FrameBatchScheduler } from "@/lib/ai-streaming/frameBatchScheduler";
 import { StreamingTextBuffer, formatRetainedResponse } from "@/lib/ai-streaming/streamingBuffer";
 import { describeThrown } from "@/lib/utils";
+import { aiOutputOf } from "@/lib/ai-session/aiOutput";
 
 /** Payload from the "ai-output" Tauri event. */
 interface AiOutputEvent {
@@ -187,17 +188,32 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         if (state && state !== "not_found" && state !== "closed") {
           // Session is alive in SessionManager — restore normally
           setTaskRunId(savedId);
+          taskRunIdRef.current = savedId; // Sync ref immediately (the reply below is guarded on it)
           setSessionState(state as AiSessionState);
 
           // Load message history from DB
           invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
             .then((outputResponse) => {
-              if (outputResponse.success && outputResponse.data?.output_log) {
-                const parsed = parseOutputLog(outputResponse.data.output_log as string);
-                setMessages(parsed);
+              // A late reply for a session that is no longer observed (the user
+              // switched) settles nothing.
+              if (taskRunIdRef.current !== savedId) return;
+              // A DB outage still returns the live in-memory output: show it,
+              // and say the persisted history could not be read.
+              const { log, historyUnavailable } = aiOutputOf(outputResponse);
+              if (log) {
+                setMessages(parseOutputLog(log));
+              }
+              if (!outputResponse.success) {
+                const fallback = historyUnavailable ? "database unavailable" : "unknown error";
+                setLastReadError(`history read failed: ${outputResponse.message ?? fallback}`);
+                setReadStatus("failed");
               }
             })
-            .catch(() => {});
+            .catch((e) => {
+              if (taskRunIdRef.current !== savedId) return;
+              setLastReadError(`history read failed: ${describeThrown(e, "unknown error")}`);
+              setReadStatus("failed");
+            });
           return;
         }
 
@@ -205,11 +221,14 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         // (it may be in the process of being resumed after a runner restart)
         invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
           .then((outputResponse) => {
-            if (
-              !outputResponse.success ||
-              !outputResponse.data?.output_log ||
-              !(outputResponse.data.output_log as string).trim()
-            ) {
+            const { log, historyUnavailable } = aiOutputOf(outputResponse);
+            if (historyUnavailable && !log?.trim()) {
+              // The database could not be read: whether the session still
+              // exists is UNKNOWN, so keep the saved id for the next mount
+              // rather than forgetting a session because the DB was down.
+              return;
+            }
+            if (!log?.trim()) {
               // No output in DB either — session is truly gone
               instanceStorage.removeItem(STORAGE_KEY);
               return;
@@ -220,7 +239,7 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
             setSessionState("restoring");
 
             // Load conversation history so user sees previous messages immediately
-            const parsed = parseOutputLog(outputResponse.data.output_log as string);
+            const parsed = parseOutputLog(log);
             setMessages(parsed);
 
             // Poll for the backend to resume the session
@@ -432,10 +451,15 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         const outputResponse = await invoke<CommandResponse>("get_ai_output", {
           taskRunId: newTaskRunId,
         });
-        if (outputResponse.success && outputResponse.data?.output_log) {
-          parsedMessages = parseOutputLog(outputResponse.data.output_log as string);
-        } else if (!outputResponse.success) {
-          readError ??= `history read failed: ${outputResponse.message ?? "unknown error"}`;
+        // On a DB outage the reply is `success: false` yet still carries the
+        // live in-memory output: show it, and report the history read failed.
+        const { log, historyUnavailable } = aiOutputOf(outputResponse);
+        if (log) {
+          parsedMessages = parseOutputLog(log);
+        }
+        if (!outputResponse.success) {
+          const fallback = historyUnavailable ? "database unavailable" : "unknown error";
+          readError ??= `history read failed: ${outputResponse.message ?? fallback}`;
         }
       } catch (e) {
         console.error("[useAiSession] Failed to load session messages:", e);
@@ -590,9 +614,9 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
       const response = await invoke<CommandResponse>("get_ai_output", {
         taskRunId,
       });
-      if (response.success && response.data?.output_log) {
-        const parsed = parseOutputLog(response.data.output_log as string);
-        setMessages(parsed);
+      const { log } = aiOutputOf(response);
+      if (log) {
+        setMessages(parseOutputLog(log));
       }
     } catch (e) {
       console.error("[useAiSession] Failed to get output:", e);

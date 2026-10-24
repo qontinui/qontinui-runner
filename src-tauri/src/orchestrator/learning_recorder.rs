@@ -6,6 +6,7 @@
 //! inference helpers used by the online learning coordinator, and the
 //! async judge spawners that run fire-and-forget after a workflow completes.
 
+use crate::database::pg::UnlessUnavailable;
 use chrono::Utc;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::{debug, info, warn};
@@ -291,7 +292,7 @@ pub async fn update_q_routing_table_pg(
     let entries = pg
         .get_q_entries_for_state(&state_key)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
     let (current_q, current_visits) = entries
         .iter()
         .find(|(a, _, _)| a == architecture)
@@ -422,11 +423,18 @@ pub fn spawn_rag_judge_if_eligible(
         };
 
         // 3. Get outcome summary as the generated output
-        let generated_output = pg_db
+        let generated_output = match pg_db
             .get_execution_trace_summary(&task_run_id)
             .await
-            .ok()
-            .flatten();
+            .or_unless_unavailable(None)
+        {
+            Ok(output) => output,
+            Err(e) => {
+                // An outage is not "no output": never judge an absent output.
+                warn!("RAG judge: skipped for task {}: {}", task_run_id, e);
+                return;
+            }
+        };
 
         let input = crate::meta_optimizer::agentic_metrics::rag_judge::RagJudgeInput {
             task_run_id: task_run_id.clone(),
@@ -525,8 +533,7 @@ async fn gather_llm_judge_input_pg(
     let execution_trace_summary = pg
         .get_execution_trace_summary(task_run_id)
         .await
-        .ok()
-        .flatten();
+        .or_unless_unavailable(None)?;
 
     Ok(
         crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {

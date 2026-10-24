@@ -33,11 +33,16 @@ pub fn compute_content_hash(
 
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
-pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
+///
+/// The read's error is KEPT: an unreadable state is neither "duplicate" nor
+/// "new", so the caller (`parser::is_duplicate_recommendation`, and through it
+/// `parser::save_parsed_recommendations`) fails the save
+/// rather than skip a recommendation (which would report "0 created") or
+/// insert a possible duplicate.
+pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> Result<bool, String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
     })
-    .unwrap_or(false)
 }
 
 // ── JSON payloads expected inside `recommended_value` ────────────────
@@ -957,5 +962,17 @@ pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fail_safe_tests {
+    use super::*;
+
+    /// An unreadable dedup check is an error, never "not a duplicate".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_duplicate_check_is_an_error() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        assert!(is_content_duplicate(&pg, "hash").is_err());
     }
 }

@@ -10,7 +10,7 @@ use crate::comparison::{
     axis_adjusted_confidence, axis_facts_from_entries_json, recommendation_from_entries_json,
     ComparisonStatus, BRIDGE_MIN_CONFIDENCE,
 };
-use crate::database::pg::PgDb;
+use crate::database::pg::{PgDb, UnlessUnavailable};
 
 /// Convert a completed comparison run's winner into a meta-optimizer recommendation.
 ///
@@ -300,11 +300,11 @@ pub fn build_validation_comparison(
     }
 
     // Find a recent workflow to use as benchmark
+    // An outage is an error, never "no benchmark workflow".
     let workflow_id: Option<String> = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(pg_db.get_most_recent_workflow_id())
     })
-    .ok()
-    .flatten();
+    .or_unless_unavailable(None)?;
 
     let workflow_id = match workflow_id {
         Some(id) => id,

@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::settings::{RunnerInstanceConfig, SpawnPlacement};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -53,12 +54,14 @@ struct InstanceHandle {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DeregisterResult {
     pub removed_in_memory: bool,
-    pub removed_db: bool,
+    /// `None` when the DB registry could not be reached (`DATABASE_UNAVAILABLE`):
+    /// unknown, never "no row".
+    pub removed_db: Option<bool>,
 }
 
 impl DeregisterResult {
     pub fn any(self) -> bool {
-        self.removed_in_memory || self.removed_db
+        self.removed_in_memory || self.removed_db == Some(true)
     }
 }
 
@@ -218,7 +221,12 @@ impl InstanceManager {
         let removed_in_memory = registered.remove(id).is_some();
         drop(registered);
 
-        let removed_db = self.pg_db.remove_runner_instance(id).await.unwrap_or(false);
+        let removed_db = self
+            .pg_db
+            .remove_runner_instance(id)
+            .await
+            .or_unless_unavailable(false)
+            .ok();
 
         DeregisterResult {
             removed_in_memory,

@@ -12,6 +12,7 @@
 use crate::auth::AuthManager;
 use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::TaskRun;
 use crate::error::AppError;
 use crate::findings::types::{Finding, FindingStatus};
@@ -904,7 +905,7 @@ impl AITaskSyncService {
         let dq_rows = db
             .get_deferred_questions_for_task_run(task_id)
             .await
-            .unwrap_or_default();
+            .default_unless_unavailable()?;
         if !dq_rows.is_empty() {
             let sync_questions: Vec<DeferredQuestionSyncRequest> =
                 dq_rows.iter().map(json_to_deferred_question_sync).collect();

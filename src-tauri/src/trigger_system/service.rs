@@ -740,13 +740,14 @@ impl TriggerService {
 
     /// Get overall system status.
     pub async fn get_status(&self) -> TriggerSystemStatus {
-        let (total, enabled) = self
-            .deps
-            .app_state
-            .pg_db
-            .get_trigger_stats()
-            .await
-            .unwrap_or((0, 0));
+        // A failed read is UNKNOWN (`null`), never "0 triggers".
+        let (total, enabled) = match self.deps.app_state.pg_db.get_trigger_stats().await {
+            Ok((total, enabled)) => (Some(total), Some(enabled)),
+            Err(e) => {
+                debug!("trigger status: counts unknown: {}", e);
+                (None, None)
+            }
+        };
         let active_watchers = {
             let handles = self.watcher_handles.read().await;
             handles.len() as u64

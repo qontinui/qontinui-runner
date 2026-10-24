@@ -4,6 +4,7 @@
 //! allowing the frontend to display it in the same format.
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::TaskRun;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -1516,11 +1517,15 @@ pub async fn get_task_run_migrated_logs_summary(
     task_run_id: String,
 ) -> Result<AiDataResponse<TaskRunMigratedLogsSummary>, String> {
     // Get events
-    let events = state
+    let events = match state
         .pg_db()
         .get_task_run_events(&task_run_id, None, None)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(v) => v,
+        Err(e) => return Ok(AiDataResponse::err_coded("DATABASE_UNAVAILABLE", e)),
+    };
 
     // Count events by type
     let mut events_by_type = std::collections::HashMap::new();
@@ -1529,18 +1534,26 @@ pub async fn get_task_run_migrated_logs_summary(
     }
 
     // Get screenshots
-    let screenshots = state
+    let screenshots = match state
         .pg_db()
         .get_task_run_screenshots(&task_run_id, None)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(v) => v,
+        Err(e) => return Ok(AiDataResponse::err_coded("DATABASE_UNAVAILABLE", e)),
+    };
 
     // Get Playwright results
-    let playwright_results = state
+    let playwright_results = match state
         .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(v) => v,
+        Err(e) => return Ok(AiDataResponse::err_coded("DATABASE_UNAVAILABLE", e)),
+    };
 
     Ok(AiDataResponse::ok(TaskRunMigratedLogsSummary {
         task_run_id,

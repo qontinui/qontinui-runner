@@ -15,6 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
 use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
@@ -30,14 +31,18 @@ use crate::database::types::{Observation, ObservationSearchResult};
 
 /// Fetch observations from PostgreSQL for graph enrichment.
 /// Uses a single batch query instead of N+1 individual fetches.
-/// Returns empty vectors if PG is unavailable — graph still builds from SQLite.
+/// A failed read still yields empty vectors, but a down database is an `Err`
+/// (`DATABASE_UNAVAILABLE`): an outage never reads as "no observations".
 async fn fetch_observations_for_graph(
     pg_db: &crate::database::pg::PgDb,
-) -> (Vec<ObservationSearchResult>, Vec<Observation>) {
+) -> Result<(Vec<ObservationSearchResult>, Vec<Observation>), String> {
     let pg = pg_db;
 
     // Single batch query for full observations (replaces N+1 pattern)
-    let full = pg.get_all_observations_full(500).await.unwrap_or_default();
+    let full = pg
+        .get_all_observations_full(500)
+        .await
+        .default_unless_unavailable()?;
 
     // Build preview versions for load_observations_from_pg (needs content_preview)
     let previews: Vec<ObservationSearchResult> = full
@@ -60,7 +65,7 @@ async fn fetch_observations_for_graph(
         })
         .collect();
 
-    (previews, full)
+    Ok((previews, full))
 }
 
 // ============================================================================
@@ -306,7 +311,9 @@ async fn summary_handler(
     let workflow_name = query.workflow_name;
 
     // Pre-fetch observations from PG (async) before the sync graph build
-    let (obs_previews, obs_full) = fetch_observations_for_graph(&state.app_state.pg_db).await;
+    let (obs_previews, obs_full) = fetch_observations_for_graph(&state.app_state.pg_db)
+        .await
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
     let has_observations = !obs_previews.is_empty();
 

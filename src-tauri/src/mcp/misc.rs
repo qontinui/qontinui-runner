@@ -55,8 +55,9 @@ pub struct StatusResponse {
     pub executor_state: String,
     pub config_loaded: bool,
     pub config_path: Option<String>,
-    /// Whether an AI analysis is currently in progress
-    pub ai_analysis_running: bool,
+    /// Whether an AI analysis is currently in progress. `null` when the
+    /// database read failed — unknown, never `false`.
+    pub ai_analysis_running: Option<bool>,
 }
 
 /// Tool version response for MCP caching
@@ -656,14 +657,15 @@ pub async fn get_status(
         )
     })?;
 
-    // Check AI analysis status via PG
-    let ai_running = !state
-        .app_state
-        .pg_db
-        .get_running_task_runs(None)
-        .await
-        .unwrap_or_default()
-        .is_empty();
+    // Check AI analysis status via PG. A failed read is UNKNOWN (`null`),
+    // never `false`: a down database must not read as "no AI running".
+    let ai_running = match state.app_state.pg_db.get_running_task_runs(None).await {
+        Ok(runs) => Some(!runs.is_empty()),
+        Err(e) => {
+            tracing::debug!("/status: ai_analysis_running unknown: {}", e);
+            None
+        }
+    };
 
     let instance_name = crate::instance::instance_name();
     let api_port = state
@@ -1843,6 +1845,15 @@ async fn delete_instance(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     let result = state.instance_manager.deregister_instance(&id).await;
 
+    if !result.any() && result.removed_db.is_none() {
+        // Not in memory, and the DB registry could not be read: unknown, not 404.
+        return Err(crate::mcp::pg_guard::db_unavailable_error(format!(
+            "{} instance '{}' is not in the in-memory map and the DB registry is unavailable",
+            qontinui_runner_lib::pg_circuit::DB_UNAVAILABLE_TOKEN,
+            id
+        )));
+    }
+
     if !result.any() {
         return Err((
             axum::http::StatusCode::NOT_FOUND,
@@ -1854,7 +1865,7 @@ async fn delete_instance(
     }
 
     tracing::info!(
-        "Deregistered instance '{}' (in_memory={}, db={})",
+        "Deregistered instance '{}' (in_memory={}, db={:?})",
         id,
         result.removed_in_memory,
         result.removed_db
@@ -1965,17 +1976,18 @@ async fn list_runners(State(state): State<Arc<ApiState>>) -> Json<serde_json::Va
 /// POST /instances/purge-stale — immediately clean up stale/dead instances.
 async fn purge_stale_instances(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<serde_json::Value>> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let (marked, cleaned) = crate::instance_health::purge_stale_instances(
         &state.app_state.pg_db,
         &state.instance_manager,
     )
-    .await;
+    .await
+    .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
-    Json(ApiResponse::success(serde_json::json!({
+    Ok(Json(ApiResponse::success(serde_json::json!({
         "marked_unhealthy": marked,
         "cleaned_up": cleaned,
-    })))
+    }))))
 }
 
 // ─── Spawn-placement preview endpoint ───────────────────────────────────────

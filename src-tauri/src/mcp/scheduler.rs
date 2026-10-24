@@ -11,6 +11,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::mcp::origin_guard::{OriginClass, RequesterPrincipal};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::scheduler::{ScheduledTaskExt, TaskExecutionRecordExt};
@@ -291,9 +292,12 @@ pub async fn create_scheduled_task(
     }
 
     let now = chrono::Utc::now();
-    let zone = crate::scheduler::ScheduleZone::from_settings(
-        &pg.get_scheduler_settings().await.unwrap_or_default(),
-    );
+    let settings = pg
+        .get_scheduler_settings()
+        .await
+        .default_unless_unavailable()
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
+    let zone = crate::scheduler::ScheduleZone::from_settings(&settings);
     scheduled_task.next_run =
         crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
             .map(|dt| dt.to_rfc3339());
@@ -435,9 +439,12 @@ pub async fn update_scheduled_task(
     }
 
     let now = chrono::Utc::now();
-    let zone = crate::scheduler::ScheduleZone::from_settings(
-        &pg.get_scheduler_settings().await.unwrap_or_default(),
-    );
+    let settings = pg
+        .get_scheduler_settings()
+        .await
+        .default_unless_unavailable()
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
+    let zone = crate::scheduler::ScheduleZone::from_settings(&settings);
     scheduled_task.next_run = if scheduled_task.enabled {
         crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
             .map(|dt| dt.to_rfc3339())

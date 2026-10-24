@@ -9,6 +9,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::database::pg::UnlessUnavailable;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
@@ -254,12 +255,20 @@ pub async fn resume_interrupted_workflows(
     for task_run in &running_workflows {
         // Skip Restate-managed workflows — Restate handles their resume automatically
         if crate::settings::load_settings().restate.enabled {
-            if app_state
+            let is_restate = match app_state
                 .pg_db
                 .is_restate_workflow(&task_run.id)
                 .await
-                .unwrap_or(false)
+                .or_unless_unavailable(false)
             {
+                Ok(is_restate) => is_restate,
+                Err(e) => {
+                    // An outage is not "not Restate-managed": leave it alone.
+                    tracing::warn!("startup resume skipped task run {}: {}", task_run.id, e);
+                    continue;
+                }
+            };
+            if is_restate {
                 info!(
                     "Skipping Restate-managed workflow {} — Restate handles resume",
                     task_run.id

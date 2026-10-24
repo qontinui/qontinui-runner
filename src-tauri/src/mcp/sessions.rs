@@ -36,6 +36,7 @@ use std::sync::Arc;
 use tauri::Manager;
 use tracing::{info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::AiSessionContext;
 use crate::mcp::types::ApiState;
@@ -622,12 +623,18 @@ async fn get_transcript(
     // session_id used by the on-disk JSONL transcripts. The DB stores
     // the worker's persisted output_log by task_run_id, which is the
     // canonical "what the agent did" record an agentic reviewer needs.
-    let output = state
+    // An outage is not an empty transcript: the on-disk fallback below still
+    // runs, and if it has nothing either the answer is 503, not `[]`.
+    let (output, db_unavailable) = match state
         .app_state
         .pg_db
         .get_task_output(&id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(output) => (output, None),
+        Err(e) => (String::new(), Some(e)),
+    };
 
     if !output.trim().is_empty() {
         // Wrap the output_log in a single-message envelope so the response
@@ -662,6 +669,10 @@ async fn get_transcript(
                 messages: json_messages,
             }));
         }
+    }
+
+    if let Some(e) = db_unavailable {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, e));
     }
 
     Ok(Json(TranscriptResponse {

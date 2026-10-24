@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
@@ -609,26 +610,30 @@ pub async fn resume_task_run(
             .pg_db
             .get_unified_workflow_by_name(wf_name)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .or_else(|| {
-                let stripped = wf_name
-                    .strip_prefix("Project Reflection: ")
-                    .or_else(|| wf_name.strip_prefix("Reflection: "));
-                stripped.and_then(|name| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(state.app_state.pg_db.get_unified_workflow_by_name(name))
-                    })
-                    .ok()
-                    .flatten()
-                })
-            })
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("Workflow definition not found with name: {}", wf_name),
-                )
-            })?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // The prefix-stripped retry reports its error like the exact lookup
+        // above: an unreadable row must not read as "not found" (a 404).
+        let wf = match wf {
+            Some(wf) => Some(wf),
+            None => match wf_name
+                .strip_prefix("Project Reflection: ")
+                .or_else(|| wf_name.strip_prefix("Reflection: "))
+            {
+                Some(name) => state
+                    .app_state
+                    .pg_db
+                    .get_unified_workflow_by_name(name)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+                None => None,
+            },
+        };
+        let wf = wf.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Workflow definition not found with name: {}", wf_name),
+            )
+        })?;
         (wf.id.clone(), wf)
     } else {
         return Err((
@@ -1759,7 +1764,8 @@ pub async fn get_current_execution_steps(
         .pg_db
         .get_all_verification_phase_results(&task.id)
         .await
-        .unwrap_or_default()
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
         .collect();
@@ -2495,7 +2501,8 @@ pub async fn generate_workflow_from_session(
         .pg_db
         .get_task_output(&id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     if output_log.is_empty() {
         return Err((

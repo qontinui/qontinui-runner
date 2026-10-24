@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 
 // =============================================================================
 // Types
@@ -94,7 +95,7 @@ pub async fn build_model_profile(
     let (avg_cache_hit_rate, avg_cache_savings_usd) = pg
         .get_model_cache_stats(model_id, &period_start)
         .await
-        .unwrap_or((0.0, 0.0));
+        .or_unless_unavailable((0.0, 0.0))?;
 
     // Cost efficiency factors in cache reuse: models that achieve high cache hit
     // rates get a boost because effective cost is lower than nominal cost.

@@ -5,6 +5,7 @@
 //! and AI session history.
 
 use super::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use serde_json::json;
 
 // ============================================================================
@@ -1228,7 +1229,10 @@ impl PgDb {
         let ready: i64 = conn.query_one(
             "SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending' AND attempt_count < 3", &[],
         ).await.map(|r| r.get(0)).unwrap_or(0);
-        let recent = self.get_pending_discoveries().await.unwrap_or_default();
+        let recent = self
+            .get_pending_discoveries()
+            .await
+            .default_unless_unavailable()?;
         let preview: Vec<serde_json::Value> = recent.into_iter().take(10).collect();
         Ok(json!({
             "pending_count": pending_count,

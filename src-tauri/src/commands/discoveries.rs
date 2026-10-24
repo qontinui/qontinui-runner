@@ -130,7 +130,28 @@ pub struct SyncResultResponse {
     pub sent: u32,
     pub failed: u32,
     pub errors: Vec<String>,
-    pub remaining: u32,
+    /// `None` when the post-push status read failed: unknown, never 0. The
+    /// push result above stands either way.
+    pub remaining: Option<u32>,
+    /// Why `remaining` is unknown (the status read's error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_note: Option<String>,
+}
+
+/// How many discoveries are still pending, from the sync status. `None` with a
+/// note on ANY failed read, and on a status that carries no count — never a
+/// manufactured 0.
+async fn pending_remaining(state: &StorageCompartment) -> (Option<u32>, Option<String>) {
+    match state.pg_db().get_sync_status().await {
+        Ok(status) => match status["pending_count"].as_u64() {
+            Some(n) => (Some(u32::try_from(n).unwrap_or(u32::MAX)), None),
+            None => (
+                None,
+                Some("sync status carried no pending_count".to_string()),
+            ),
+        },
+        Err(e) => (None, Some(e)),
+    }
 }
 
 /// Trigger sync of pending discoveries to qontinui-web.
@@ -156,11 +177,16 @@ pub async fn sync_discoveries(
         .collect();
 
     if to_sync.is_empty() {
+        // Nothing parseable to push — but a pending row whose payload does not
+        // parse is still pending, so `remaining` comes from the same status
+        // read as the main path, never a manufactured 0.
+        let (remaining, remaining_note) = pending_remaining(&state).await;
         return Ok(DiscoveryResponse::ok(SyncResultResponse {
             sent: 0,
             failed: 0,
             errors: vec![],
-            remaining: 0,
+            remaining,
+            remaining_note,
         }));
     }
 
@@ -184,18 +210,20 @@ pub async fn sync_discoveries(
             errors.push(format!("{}: {}", sr.id, err_msg));
         }
     }
-    let remaining_status = state.pg_db().get_sync_status().await.unwrap_or_default();
-    let remaining = remaining_status["pending_count"].as_u64().unwrap_or(0) as u32;
+    // A failed status read after a successful push must not discard the push
+    // result: `remaining` becomes unknown instead.
+    let (remaining, remaining_note) = pending_remaining(&state).await;
 
     let response = SyncResultResponse {
         sent,
         failed,
         errors,
         remaining,
+        remaining_note,
     };
 
     info!(
-        "Sync complete: {} sent, {} failed, {} remaining",
+        "Sync complete: {} sent, {} failed, {:?} remaining",
         response.sent, response.failed, response.remaining
     );
 

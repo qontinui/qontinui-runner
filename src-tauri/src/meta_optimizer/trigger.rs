@@ -8,6 +8,7 @@
 //! 2. `is_meta_optimizer` column check on source task run
 //! 3. `is_fixer` / `is_reflection` / `is_follow_up` column checks on source
 
+use crate::database::pg::UnlessUnavailable;
 use tauri::Emitter;
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
@@ -242,9 +243,13 @@ pub fn check_and_launch_optimizers(
         let trid = source_task_run_id.clone();
         tokio::spawn(async move {
             // Resolve workflow name from the source task run
-            let workflow_name = match pg.get_task_run(&trid).await.ok().flatten() {
-                Some(tr) => tr.workflow_name,
-                None => None,
+            let workflow_name = match pg.get_task_run(&trid).await.or_unless_unavailable(None) {
+                Ok(Some(tr)) => tr.workflow_name,
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("Pattern distiller: skipped for source run {}: {}", trid, e);
+                    return;
+                }
             };
             let Some(wf) = workflow_name else {
                 debug!(
@@ -445,10 +450,19 @@ pub fn launch_optimizer_manual(
     // to prevent creating competing canaries for the same agent_type
     if optimizer_type == OptimizerType::MetaPrompt {
         if let Ok(Some(target)) = super::prompt_extractor::select_optimization_target(10, 0.30) {
-            if super::prompt_evolution::has_active_evolution(
+            // The operator is told the truth: an unreadable state is reported
+            // as such, never as "a canary is already in progress".
+            let active = super::prompt_evolution::active_evolution_state(
                 &deps.app_state.pg_db,
                 &target.agent_type,
-            ) {
+            )
+            .map_err(|e| {
+                format!(
+                    "Cannot trigger MetaPrompt optimizer: could not check for an active canary for {}: {}",
+                    target.agent_type, e
+                )
+            })?;
+            if active {
                 return Err(format!(
                     "Cannot trigger MetaPrompt optimizer: active canary already in progress for {}",
                     target.agent_type

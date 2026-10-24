@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::pipeline_traces;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
@@ -696,6 +697,10 @@ pub async fn get_learning_outcomes_handler(
     let tier = query.tier.unwrap_or_default();
 
     let make_err = |e: String| {
+        // An outage is a 503 with the guard's code, like every converted route.
+        if qontinui_runner_lib::pg_circuit::is_db_unavailable(&e) {
+            return crate::mcp::pg_guard::db_unavailable_error(e);
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to get learning outcomes: {}", e))),
@@ -739,7 +744,8 @@ pub async fn get_learning_outcomes_handler(
                     limit,
                 )
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(outcomes).unwrap_or_default(),
             )))
@@ -762,6 +768,10 @@ pub async fn get_generation_feedback_handler(
     let tier = query.tier.unwrap_or_default();
 
     let make_err = |e: String| {
+        // An outage is a 503 with the guard's code, like every converted route.
+        if qontinui_runner_lib::pg_circuit::is_db_unavailable(&e) {
+            return crate::mcp::pg_guard::db_unavailable_error(e);
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!(
@@ -800,7 +810,8 @@ pub async fn get_generation_feedback_handler(
                 .pg_db
                 .get_generation_feedback_l2(feedback_type.as_deref(), limit)
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(feedback).unwrap_or_default(),
             )))
@@ -1247,8 +1258,8 @@ pub async fn get_canaries_handler(
             .pg_db
             .get_recommendation_metadata(&c.recommendation_id)
             .await
-            .ok()
-            .flatten();
+            .or_unless_unavailable(None)
+            .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
         let (title, agent, rec_type) = rec_info.unwrap_or((None, None, None));
 

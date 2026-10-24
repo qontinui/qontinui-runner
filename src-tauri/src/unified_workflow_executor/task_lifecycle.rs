@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::event_system::EventBroadcaster;
 use crate::step_executor::ExecutionStepConfig;
 use crate::workflow_event_bus::{events, get_workflow_event_bus};
@@ -93,7 +94,13 @@ impl LoopController {
             let eid = execution_id.to_string();
             tokio::spawn(async move {
                 let sync_service = crate::commands::task_sync::AITaskSyncService::new();
-                let task = pg.get_task_run(&eid).await.ok().flatten();
+                let task = match pg.get_task_run(&eid).await.or_unless_unavailable(None) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        warn!("Task completion not synced to backend for {}: {}", eid, e);
+                        None
+                    }
+                };
                 if let Some(task) = task {
                     if let Err(e) = sync_service.sync_task_completed(&task).await {
                         warn!("Failed to sync task completion to backend: {}", e);
@@ -216,7 +223,7 @@ impl LoopController {
                         }
                         Err(e) => {
                             warn!(
-                                "Failed to parse meta-optimizer recommendations for task {}: {}",
+                                "Failed to save meta-optimizer recommendations for task {}: {}",
                                 eid, e
                             );
                         }
@@ -373,7 +380,13 @@ impl LoopController {
             let eid = execution_id.to_string();
             tokio::spawn(async move {
                 let sync_service = crate::commands::task_sync::AITaskSyncService::new();
-                let task = pg.get_task_run(&eid).await.ok().flatten();
+                let task = match pg.get_task_run(&eid).await.or_unless_unavailable(None) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        warn!("Task failure not synced to backend for {}: {}", eid, e);
+                        None
+                    }
+                };
                 if let Some(task) = task {
                     if let Err(e) = sync_service.sync_task_completed(&task).await {
                         warn!("Failed to sync task failure to backend: {}", e);
@@ -837,9 +850,17 @@ impl LoopController {
 /// - Key findings from verification phases
 /// - Error patterns encountered
 async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id: &str) {
-    let task_run = match pg.get_task_run(execution_id).await.ok().flatten() {
-        Some(tr) => tr,
-        None => return,
+    let task_run = match pg
+        .get_task_run(execution_id)
+        .await
+        .or_unless_unavailable(None)
+    {
+        Ok(Some(tr)) => tr,
+        Ok(None) => return,
+        Err(e) => {
+            warn!("auto-capture skipped for task run {}: {}", execution_id, e);
+            return;
+        }
     };
 
     let workflow_name = task_run
@@ -894,7 +915,7 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
     }
 
     // Extract findings from task knowledge (PG)
-    let findings = pg
+    let findings = match pg
         .get_task_knowledge_by_categories(
             execution_id,
             &["Finding", "RootCause", "Solution"],
@@ -902,7 +923,15 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
             false,
         )
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(findings) => findings,
+        Err(e) => {
+            // An outage is not "no findings": capture nothing this run.
+            tracing::warn!("auto-capture skipped for task run {}: {}", execution_id, e);
+            return;
+        }
+    };
 
     if !findings.is_empty() {
         content_lines.push(String::new());

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::trigger_system::github_api::{CiStatus, GitHubClient, ReviewStatus};
 use crate::unified_workflow_executor::CiFailureContext;
 use crate::AppState;
@@ -307,6 +308,18 @@ async fn poll_single_pr(
         ReviewStatus::ChangesRequested => "changes_requested",
     };
 
+    // The CiPassed idempotency read runs BEFORE the new state is saved: an
+    // outage here must leave the transition unconsumed, so the next poll
+    // sees CiPassed again and the review is still spawned.
+    let existing_review = if matches!(action, PrAction::CiPassed) {
+        pg_db
+            .has_review_subtask_for_pr(&watch.task_run_id, watch.pr_number)
+            .await
+            .or_unless_unavailable(false)?
+    } else {
+        false
+    };
+
     pg_db
         .update_pr_watch_state(&watch.id, new_checks_str, new_review_str, &pr.head_sha)
         .await?;
@@ -379,12 +392,8 @@ async fn poll_single_pr(
                 watch.task_run_id,
             );
 
-            // Spawn review subtask if one doesn't already exist (idempotency)
-            let existing_review = pg_db
-                .has_review_subtask_for_pr(&watch.task_run_id, watch.pr_number)
-                .await
-                .unwrap_or(false);
-
+            // Spawn review subtask if one doesn't already exist (idempotency;
+            // `existing_review` was read before the state write above).
             if !existing_review {
                 use crate::unified_workflow_executor::review_subtask::{
                     spawn_review_subtask, ReviewSubtaskConfig,

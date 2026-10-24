@@ -191,12 +191,13 @@ const DB_BACKED_EXACT: &[&str] = &[
     "/ui-bridge/control/workflow/*/status",
 ];
 
-/// DB-FREE routes that fall UNDER a [`DB_BACKED_PREFIXES`] entry and must keep
+/// Routes (DB-free, or degrading on their own) that fall UNDER a
+/// [`DB_BACKED_PREFIXES`] entry and must keep
 /// working in degraded mode. Checked FIRST; a match here means "never 503".
 /// `*` matches one path-param segment.
 const DB_EXEMPT: &[&str] = &[
     "/findings/summary",           // under /findings (misc; returns empty)
-    "/triggers/status",            // under /triggers
+    "/triggers/status",            // under /triggers; reads PG but degrades to null itself
     "/tests/execute-suite",        // under /tests
     "/mcp/memory/tool-descriptor", // under /mcp/memory
     "/scheduler/tasks/*/run",      // under /scheduler/tasks
@@ -295,6 +296,19 @@ fn db_unavailable_response(path: &str, facts: Option<DbUnavailable>) -> Response
         }
     }
     response
+}
+
+/// The handler-side 503 for an outage a handler met itself (the breaker
+/// tripped mid-request, or the route is not in the guard's tables): the
+/// same status and `code` the guard serves, carrying the error string.
+pub fn db_unavailable_error(message: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiResponse::error_with_code(
+            message,
+            "DATABASE_UNAVAILABLE",
+        )),
+    )
 }
 
 /// `axum::middleware::from_fn` guard. See module docs.

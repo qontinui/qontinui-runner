@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
 
@@ -202,12 +202,31 @@ pub fn get_evolution_history(
 
 /// Check whether there is an active (no verdict yet) evolution entry for an agent type.
 /// This indicates a canary is in progress and we should NOT create another rewrite.
+///
+/// Fails SAFE: an unreadable state reads as "active" (logged at `warn!`), so a
+/// database outage — or any other read failure — never lets a second rewrite
+/// through the guard. [`active_evolution_state`] is the same read with the
+/// error kept, for a caller that must report it.
 pub fn has_active_evolution(pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
+    match active_evolution_state(pg_db, agent_type) {
+        Ok(active) => active,
+        Err(e) => {
+            warn!(
+                agent_type,
+                error = %e,
+                "active-evolution check unreadable; treating it as active (fail safe)"
+            );
+            true
+        }
+    }
+}
+
+/// [`has_active_evolution`]'s read, with the error kept.
+pub fn active_evolution_state(pg_db: &Arc<PgDb>, agent_type: &str) -> Result<bool, String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.has_active_evolution(agent_type).await })
     })
-    .unwrap_or(false)
 }
 
 /// Get the most recent evolution entry for an agent type that was rejected.
@@ -224,13 +243,27 @@ pub fn get_latest_rejected(
 
 /// Check the cooldown: returns true if the last evolution entry for this agent_type
 /// was created less than `cooldown_hours` ago.
+///
+/// Fails SAFE: an unreadable state reads as "in cooldown" (logged at `warn!`),
+/// so a database outage — or any other read failure — never ends a cooldown
+/// early.
 pub fn is_in_cooldown(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cooldown_hours)).to_rfc3339();
-    tokio::task::block_in_place(|| {
+    let read = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.is_in_evolution_cooldown(agent_type, &cutoff).await })
-    })
-    .unwrap_or(false)
+    });
+    match read {
+        Ok(in_cooldown) => in_cooldown,
+        Err(e) => {
+            warn!(
+                agent_type,
+                error = %e,
+                "cooldown check unreadable; treating it as in cooldown (fail safe)"
+            );
+            true
+        }
+    }
 }
 
 /// Count consecutive recent rejections for an agent_type.
@@ -388,4 +421,33 @@ pub fn record_evolution_full_with_pg(
         score_before,
         baseline_prompt_hash,
     )
+}
+
+#[cfg(test)]
+mod fail_safe_tests {
+    use super::*;
+
+    /// A database that fails every call must never open the guards: an
+    /// unreadable state reads as an active evolution and as in cooldown, so a
+    /// PG outage cannot let a second rewrite through (plan
+    /// 2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout,
+    /// Phase 6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_active_evolution_guard_fails_safe_on_an_unreadable_database() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        assert!(
+            has_active_evolution(&pg, "fixer"),
+            "unreadable must read as active"
+        );
+    }
+
+    /// The cooldown guard, likewise: unreadable reads as in cooldown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cooldown_guard_fails_safe_on_an_unreadable_database() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        assert!(
+            is_in_cooldown(&pg, "fixer", 24),
+            "unreadable must read as in cooldown"
+        );
+    }
 }
