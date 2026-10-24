@@ -213,13 +213,35 @@ pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
     prompt_ready_with(screen, DIALOG_CHROME_MARKERS)
 }
 
+/// Is the input area clear — an empty `❯` input line under the cursor with no
+/// dialog showing — WITHOUT the turn-complete predicate? Everything
+/// [`exit_prompt_ready`] checks except `snapshot_looks_idle`, so it answers
+/// "would a close destroy a draft or answer a dialog?" on its own. The
+/// wind-down verdict reads it as the grid's veto (plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+/// D3), where whether the session is WORKING comes from Claude Code's record
+/// instead. Scans the full [`DIALOG_MARKERS`] list, like [`exit_prompt_ready`]:
+/// for a close, erring toward refusing is right.
+pub fn exit_input_area_clear(screen: &ScreenText) -> Result<(), String> {
+    input_area_clear_with(screen, DIALOG_MARKERS)
+}
+
 fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(), String> {
-    let Some(line) = prompt_line(screen) else {
-        return Err("no `❯` input prompt on the cursor row".to_string());
-    };
+    if prompt_line(screen).is_none() {
+        return Err(NO_PROMPT_ON_CURSOR_ROW.to_string());
+    }
     if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
         return Err("the screen does not look idle".to_string());
     }
+    input_area_clear_with(screen, dialog_markers)
+}
+
+const NO_PROMPT_ON_CURSOR_ROW: &str = "no `❯` input prompt on the cursor row";
+
+fn input_area_clear_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(), String> {
+    let Some(line) = prompt_line(screen) else {
+        return Err(NO_PROMPT_ON_CURSOR_ROW.to_string());
+    };
     if is_numbered_option(&line.input) {
         return Err("a numbered choice is selected — a dialog, not the input prompt".to_string());
     }
@@ -736,6 +758,97 @@ mod tests {
         let mut hinted = empty_prompt();
         hinted.lines[0] = "  Enter to confirm · Esc to cancel".to_string();
         assert!(input_prompt_ready(&hinted).is_err());
+    }
+
+    /// Plan `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-
+    /// for-a-spinner` fixtures E and F — SYNTHESIZED, modelling Claude Code
+    /// 2.1.309. The completed-turn line no longer makes the screen read busy,
+    /// so these two pin that the draft and dialog refusals stand on their own:
+    /// `Err` from both checks, before the predicate fix (busy screen) and
+    /// after it (draft / dialog).
+    #[test]
+    fn fixture_e_unsent_draft_under_a_completed_turn_is_refused() {
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                edge(),
+                "❯\u{a0}draft text not sent".to_string(),
+                edge(),
+                "  new task? /clear to save 399.4k tokens · Auto-updating…".to_string(),
+            ],
+            2,
+            21,
+        );
+        // The turn-complete predicate reads this screen IDLE, so the refusal
+        // below is the draft check's alone.
+        assert!(snapshot_looks_idle(&s.lines, s.cursor_row));
+        for why in [exit_prompt_ready(&s), input_prompt_ready(&s)] {
+            let why = why.unwrap_err();
+            assert!(why.contains("unsent text"), "{why}");
+        }
+        assert!(exit_input_area_clear(&s).is_err());
+    }
+
+    #[test]
+    fn fixture_f_permission_dialog_under_a_completed_turn_is_refused() {
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                " Bash command".to_string(),
+                "   rm -rf build".to_string(),
+                " Do you want to proceed?".to_string(),
+                " ❯ 1. Yes".to_string(),
+                "   2. Yes, and don't ask again for rm commands in this project".to_string(),
+                "   3. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            4,
+            3,
+        );
+        // Dialog text between the completed-turn line and the `❯` row means
+        // that line is not directly above the input, so the predicate already
+        // reads this busy; the refusal holds either way.
+        assert!(!snapshot_looks_idle(&s.lines, s.cursor_row));
+        assert!(exit_prompt_ready(&s).is_err());
+        assert!(input_prompt_ready(&s).is_err());
+        assert!(exit_input_area_clear(&s).is_err());
+
+        // The shape the predicate DOES read idle: the options directly under
+        // the completed-turn line. Refused by the numbered-choice check alone.
+        let s = screen(
+            vec![
+                "✻ Cooked for 5m 33s · done 8:55 PM".to_string(),
+                String::new(),
+                " ❯ 1. Yes".to_string(),
+                "   2. Yes, and don't ask again for rm commands in this project".to_string(),
+                "   3. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            2,
+            3,
+        );
+        assert!(snapshot_looks_idle(&s.lines, s.cursor_row));
+        for why in [exit_prompt_ready(&s), input_prompt_ready(&s)] {
+            let why = why.unwrap_err();
+            assert!(why.contains("numbered choice"), "{why}");
+        }
+        assert!(exit_input_area_clear(&s).is_err());
+    }
+
+    /// The wind-down veto is the input-area half of `exit_prompt_ready` alone:
+    /// a screen the turn-complete heuristic reads BUSY (an unrecognised
+    /// completed-turn wording) but whose input line is empty is clear, while
+    /// `exit_prompt_ready` — which types `/exit` — still refuses it.
+    #[test]
+    fn the_input_area_check_ignores_the_turn_complete_heuristic_only() {
+        let mut s = empty_prompt();
+        s.lines[0] = "✻ Cooked for about 5 minutes".to_string();
+        assert!(exit_prompt_ready(&s).is_err());
+        assert_eq!(exit_input_area_clear(&s), Ok(()));
+        assert_eq!(exit_input_area_clear(&empty_prompt()), Ok(()));
+        assert!(exit_input_area_clear(&draft_prompt()).is_err());
+        assert!(exit_input_area_clear(&permission_dialog()).is_err());
+        assert!(exit_input_area_clear(&turn_ending_in_a_question()).is_err());
+        let streaming = screen(vec!["output".into(), "❯ ".into()], 0, 0);
+        assert!(exit_input_area_clear(&streaming).is_err());
     }
 
     fn draft_prompt() -> ScreenText {

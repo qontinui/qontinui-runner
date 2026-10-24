@@ -184,7 +184,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — whether a session is still working is decided by Claude Code's own `sessions/<pid>.json` status (only `idle` can close; `busy`, `waiting`, `shell` and an absent or unreadable record are `record_busy` / `record_waiting` / `record_shell` / `record_unknown`), the screen only VETOES a close on an unsent draft, an open dialog or no prompt (`prompt_not_ready`), and the grace runs from the transcript's last message (`transcript_age_unknown` when it cannot be read); `windDown.idleEvidence` names which clause of the screen's turn-complete heuristic made the grid read busy (`indicator:<constant>`, `glyph:<char>`, `no_prompt`, `cursor_above_prompt`, `generation_moved`) whenever it does, beside whatever `reason` decided, and is null for an idle or unobservable grid; it is a matched constant, never screen text, and a report, never a reason; THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and an `eligible` session's `since` is the latest of its transcript's last message, its last sideband report and its `finished` declaration; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -758,16 +758,6 @@ pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// [`gather_activity_evidence`].
 pub static RECORD_READ_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Clears the in-flight flag when dropped — i.e. when the blocking read
-/// finishes or unwinds.
-struct InFlightRead(&'static AtomicBool);
-
-impl Drop for InFlightRead {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 /// The live processes whose activity the pane did NOT decide — the only ones
 /// whose Claude Code record is worth reading — with the census's process age
 /// for the record's identity check.
@@ -799,66 +789,50 @@ fn pids_needing_a_record(
 
 /// Assemble the activity evidence for one pass: the pane observations the
 /// wind-down observer already took, plus Claude Code's records for every
-/// process the pane could not decide, read from `config_dirs` off the
-/// executor and bounded by `read_timeout`. A read that fails or times out
-/// costs the records — those processes read `unknown`, never `idle`.
+/// process the pane could not decide. `prior` is the read the same pass
+/// already made for the wind-down verdict (`FreshPass::records`); only the
+/// processes it does not cover are read again, from `config_dirs()` — called
+/// inside the blocking section — off the executor and bounded by
+/// `read_timeout`. A read that fails or times out costs those records — the
+/// processes read `unknown`, never `idle`.
 /// `proc_start` is [`claude_activity::proc_start_ticks`] in production.
 ///
 /// `in_flight` admits ONE read at a time: while a read (even an abandoned,
 /// timed-out one) is still running, a new call skips the read and reports its
 /// undecided processes `unknown`. Production passes
 /// [`RECORD_READ_IN_FLIGHT`].
-pub async fn gather_activity_evidence(
+pub async fn gather_activity_evidence<D>(
     report: &TrackingHealthReport,
     observed: &ObservedInputs,
-    config_dirs: Vec<PathBuf>,
+    prior: HashMap<u32, claude_activity::RecordReading>,
+    config_dirs: D,
     proc_start: fn(u32) -> Option<String>,
     read_timeout: std::time::Duration,
     in_flight: &'static AtomicBool,
-) -> ActivityEvidence {
+) -> ActivityEvidence
+where
+    D: FnOnce() -> Vec<PathBuf> + Send + 'static,
+{
     let now_ms = chrono::Utc::now().timestamp_millis();
     let pane_by_pid = pane_observations_by_pid(report, observed);
-    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
-    let records = if pids.is_empty() {
-        HashMap::new()
-    } else if in_flight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // An earlier read is still running — it timed out and was abandoned,
-        // but a blocking thread cannot be cancelled. Starting another would
-        // leak one more thread per poll on a hung filesystem.
-        tracing::warn!(
-            "restart-readiness: a previous Claude Code session-record read is still in \
-             flight — skipped; every undecided process reads activity `unknown`"
-        );
-        HashMap::new()
-    } else {
-        let guard = InFlightRead(in_flight);
-        let read = tokio::task::spawn_blocking(move || {
-            // Released when the read ENDS (or unwinds), not when the caller
-            // stops waiting for it.
-            let _guard = guard;
-            claude_activity::read_records(&config_dirs, &pids, &proc_start)
-        });
-        match tokio::time::timeout(read_timeout, read).await {
-            Ok(Ok(records)) => records,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "restart-readiness: Claude Code session-record read failed ({e}) — \
-                     every undecided process reads activity `unknown`"
-                );
-                HashMap::new()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "restart-readiness: Claude Code session-record read exceeded {read_timeout:?} — \
-                     every undecided process reads activity `unknown`"
-                );
-                HashMap::new()
-            }
+    let pids: Vec<LivePid> = pids_needing_a_record(report, &pane_by_pid, now_ms)
+        .into_iter()
+        .filter(|p| !prior.contains_key(&p.pid))
+        .collect();
+    let mut records = prior;
+    if !pids.is_empty() {
+        let read = claude_activity::read_records_bounded(in_flight, read_timeout, move || {
+            claude_activity::read_records(&config_dirs(), &pids, &proc_start)
+        })
+        .await;
+        match read {
+            Ok(read) => records.extend(read),
+            Err(miss) => tracing::warn!(
+                "restart-readiness: {miss} — every undecided process it would have \
+                 covered reads activity `unknown`"
+            ),
         }
-    };
+    }
     ActivityEvidence {
         pane_by_pid,
         records,
@@ -1358,11 +1332,17 @@ pub async fn restart_readiness_handler(
     // Phase 4 the wind-down executor reads the same one and does act on it,
     // while drained. Do not restore the old "DRY RUN" wording: it described the
     // verdict, and stopped being true of it.
-    let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
+    let fresh = wind_down_observer::fresh_pass(
+        app,
+        wind_down::grace_from_env(),
+        claude_activity::ALL_TRANSCRIPT_STATUSES,
+    )
+    .await;
     let wind_down_observer::FreshPass {
         pass,
         status_fetch,
         observed,
+        records: wind_down_records,
         unknowns: pass_unknowns,
     } = fresh;
     unknowns.extend(pass_unknowns);
@@ -1371,15 +1351,17 @@ pub async fn restart_readiness_handler(
     // ── The ACTIVITY axis (report-only; the verdict never reads it) ───────
     //
     // The pane half is the observation `fresh_pass` already took for the
-    // wind-down verdicts — no second look at any pane. The record half reads
-    // Claude Code's `sessions/<pid>.json` only for processes the pane did not
-    // decide, off the executor and under `RECORD_READ_TIMEOUT`.
+    // wind-down verdicts — no second look at any pane. The record half reuses
+    // the records that pass read (with `busy`/`shell` tails too) and reads
+    // Claude Code's `sessions/<pid>.json` only for the undecided processes it
+    // did not cover, off the executor and under `RECORD_READ_TIMEOUT`.
     let activity_evidence = match pass.as_ref() {
         Some(p) => {
             gather_activity_evidence(
                 &p.report,
                 &observed,
-                crate::terminal::transcript::find_claude_config_dirs(),
+                wind_down_records,
+                crate::terminal::transcript::find_claude_config_dirs,
                 claude_activity::proc_start_ticks,
                 RECORD_READ_TIMEOUT,
                 &RECORD_READ_IN_FLIGHT,
@@ -1458,6 +1440,7 @@ mod tests {
         evaluate, LiveClaudeProcess, SessionWorkStatus, TrackedDeadRecord, TrackingHealthReport,
     };
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::Ordering;
 
     // Mirrors `tracking_health::tests::snap_with` — the same synthetic-snapshot
     // harness, so these tests drive the REAL `evaluate` body rather than a
@@ -2539,6 +2522,8 @@ mod tests {
             "the #[serde(rename)] on wind_down_candidates is gone: {verdict}"
         );
         assert!(BOUNDARY.contains("`windDownCandidates`"));
+        assert!(BOUNDARY.contains("`windDown.idleEvidence`"));
+        assert!(!BOUNDARY.contains("idle_evidence"));
     }
 
     #[test]
@@ -3115,9 +3100,29 @@ mod tests {
         }
     }
 
+    /// Claude Code's record says `idle` for every pid these fixtures use,
+    /// with the transcript quiet since t=1000 — the instant `IDLE_LONG_AGO`'s
+    /// grid went idle, so the record-first verdict keeps the same clock.
+    fn idle_records() -> HashMap<u32, qontinui_runner_lib::wind_down::SessionRecord> {
+        (0..100)
+            .map(|pid| {
+                (
+                    pid,
+                    qontinui_runner_lib::wind_down::SessionRecord {
+                        status: qontinui_runner_lib::wind_down::RecordStatus::Idle,
+                        last_message_ms: Some(1_000),
+                    },
+                )
+            })
+            .collect()
+    }
+
     const IDLE_LONG_AGO: TerminalObservation = TerminalObservation {
         sideband: Sideband::NeverReported,
         grid: GridIdle::Idle { since_ms: 1_000 },
+        prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+        screen_quiet_since_ms: Some(1_000),
+        last_input_at_ms: None,
     };
 
     #[test]
@@ -3157,6 +3162,7 @@ mod tests {
             &terminal_ids_by_session(&open),
             &observations,
             &HashMap::new(),
+            &idle_records(),
             &HashSet::new(),
             &loops,
             grace,
@@ -3210,6 +3216,85 @@ mod tests {
         assert!(procs[1].get("windDown").is_none(), "nested omits windDown");
     }
 
+    /// `windDown.idleEvidence` names the clause behind every busy grid, in its
+    /// wire spelling, and is `null` for an idle grid (plan
+    /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+    /// D2). Since D3 a busy grid does not block a close: with an idle record,
+    /// an old transcript and a clean prompt each of these panes is eligible,
+    /// and the evidence still rides beside the verdict.
+    #[test]
+    fn wind_down_reports_idle_evidence_for_a_busy_grid() {
+        use qontinui_runner_lib::wind_down::GridBusyEvidence;
+
+        let now_ms = 1_000 + 3_600_000;
+        let grace = std::time::Duration::from_secs(600);
+        let cases = [
+            (
+                GridBusyEvidence::Indicator("tokens ·"),
+                "indicator:tokens ·",
+            ),
+            (GridBusyEvidence::Glyph('✻'), "glyph:✻"),
+            (GridBusyEvidence::NoPrompt, "no_prompt"),
+            (GridBusyEvidence::CursorAbovePrompt, "cursor_above_prompt"),
+            (GridBusyEvidence::GenerationMoved, "generation_moved"),
+        ];
+        let mut open = vec![record("sess-idle", "t-idle", 1)];
+        let mut processes = vec![wind_down_proc(
+            1,
+            Some("sess-idle"),
+            Some("finished"),
+            false,
+            false,
+        )];
+        let mut observations: HashMap<String, TerminalObservation> =
+            [("t-idle".to_string(), IDLE_LONG_AGO)].into();
+        for (i, (evidence, _)) in cases.iter().enumerate() {
+            let (sid, tid) = (format!("sess-{i}"), format!("t-{i}"));
+            open.push(record(&sid, &tid, 1));
+            processes.push(wind_down_proc(
+                10 + i as u32,
+                Some(&sid),
+                Some("finished"),
+                false,
+                false,
+            ));
+            observations.insert(
+                tid,
+                TerminalObservation {
+                    sideband: Sideband::NeverReported,
+                    grid: GridIdle::Busy {
+                        evidence: *evidence,
+                    },
+                    prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                    screen_quiet_since_ms: Some(1_000),
+                    last_input_at_ms: None,
+                },
+            );
+        }
+
+        apply_wind_down(
+            &mut processes,
+            &terminal_ids_by_session(&open),
+            &observations,
+            &HashMap::new(),
+            &idle_records(),
+            &HashSet::new(),
+            &HashSet::new(),
+            grace,
+            now_ms,
+        );
+
+        let json = serde_json::to_value(&processes).unwrap();
+        let idle = &json[0]["windDown"];
+        assert_eq!(idle["eligibility"], "eligible");
+        assert!(idle["idleEvidence"].is_null(), "{idle}");
+        for (i, (_, wire)) in cases.iter().enumerate() {
+            let view = &json[i + 1]["windDown"];
+            assert_eq!(view["eligibility"], "eligible", "{view}");
+            assert_eq!(view["idleEvidence"], *wire, "{view}");
+        }
+    }
+
     #[test]
     fn wind_down_does_not_change_the_restart_verdict() {
         // An eligible finished session is already discounted by the work
@@ -3230,6 +3315,7 @@ mod tests {
             &terminal_ids_by_session(&open),
             &[("t-done".to_string(), IDLE_LONG_AGO)].into(),
             &HashMap::new(),
+            &idle_records(),
             &HashSet::new(),
             &HashSet::new(),
             std::time::Duration::from_secs(600),
@@ -3352,7 +3438,12 @@ mod tests {
                     1,
                     TerminalObservation {
                         sideband: Sideband::NeverReported,
-                        grid: GridIdle::Busy,
+                        grid: GridIdle::Busy {
+                            evidence: qontinui_runner_lib::wind_down::GridBusyEvidence::NoPrompt,
+                        },
+                        prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 (
@@ -3363,6 +3454,9 @@ mod tests {
                             set_at_ms: 1,
                         },
                         grid: GridIdle::Idle { since_ms: 1 },
+                        prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 (
@@ -3373,6 +3467,9 @@ mod tests {
                             set_at_ms: 1,
                         },
                         grid: GridIdle::Idle { since_ms: 1 },
+                        prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
             ]
@@ -3547,6 +3644,29 @@ mod tests {
         Some("77".to_string())
     }
 
+    /// Review finding 3: one record read per pass. Readings the wind-down
+    /// pass already made are reused as-is — the config dirs are not even
+    /// consulted when they cover every undecided process.
+    #[tokio::test]
+    async fn gather_activity_evidence_reuses_the_passs_records() {
+        let report = activity_report();
+        let prior: HashMap<u32, claude_activity::RecordReading> = (1..=9)
+            .map(|pid| (pid, claude_activity::RecordReading::Missing))
+            .collect();
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            prior.clone(),
+            || -> Vec<PathBuf> { panic!("no second read when the pass's read covers it") },
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
+        )
+        .await;
+        assert_eq!(evidence.records, prior);
+    }
+
     /// L1: the handler's evidence assembly, end to end against a temp config
     /// dir — pane-decided processes, record-decided ones, and a missing
     /// record, summing to `total`.
@@ -3571,7 +3691,12 @@ mod tests {
                     "t1".to_string(),
                     TerminalObservation {
                         sideband: Sideband::NeverReported,
-                        grid: GridIdle::Busy,
+                        grid: GridIdle::Busy {
+                            evidence: qontinui_runner_lib::wind_down::GridBusyEvidence::NoPrompt,
+                        },
+                        prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                        screen_quiet_since_ms: Some(1_000),
+                        last_input_at_ms: None,
                     },
                 ),
                 ("t2".to_string(), IDLE_LONG_AGO),
@@ -3583,7 +3708,8 @@ mod tests {
         let evidence = gather_activity_evidence(
             &report,
             &observed,
-            vec![dir],
+            HashMap::new(),
+            move || vec![dir],
             kernel_agrees,
             RECORD_READ_TIMEOUT,
             &IN_FLIGHT,
@@ -3631,7 +3757,8 @@ mod tests {
         let evidence = gather_activity_evidence(
             &report,
             &ObservedInputs::default(),
-            vec![dir],
+            HashMap::new(),
+            move || vec![dir],
             slow_once,
             std::time::Duration::from_millis(20),
             &IN_FLIGHT,
@@ -3679,7 +3806,11 @@ mod tests {
             gather_activity_evidence(
                 report,
                 observed,
-                vec![dir.to_path_buf()],
+                HashMap::new(),
+                {
+                    let dir = dir.to_path_buf();
+                    move || vec![dir]
+                },
                 kernel,
                 std::time::Duration::from_millis(timeout_ms),
                 &IN_FLIGHT,

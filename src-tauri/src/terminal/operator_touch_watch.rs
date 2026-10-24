@@ -196,7 +196,7 @@ pub fn scan_idle_touches_once() {
         };
         let since_ms = match session.observe_grid_idle() {
             qontinui_runner_lib::wind_down::GridIdle::Idle { since_ms } => since_ms,
-            qontinui_runner_lib::wind_down::GridIdle::Busy
+            qontinui_runner_lib::wind_down::GridIdle::Busy { .. }
             | qontinui_runner_lib::wind_down::GridIdle::Unknown => continue,
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
