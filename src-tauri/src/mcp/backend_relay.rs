@@ -7550,22 +7550,31 @@ mod tests {
     /// the server's PING inside 20 s, and one dispatch to a wrapper that never
     /// answers waits the command relay's 30 s.
     ///
-    /// The loopback API here serves the component route through the real read
-    /// core, `ui_bridge::elements::components_read`: source selection from the
-    /// request's headers, the WebSocket fan-out, the merge and the envelope.
-    /// Only the runner's own IPC read is stubbed. The registered wrapper is
-    /// live and never answers, and the dispatcher uses the PRODUCTION command
-    /// timeout. Relayed, the read returns at once with the runner's entries and
-    /// `wrapperComponents: "withheld"`, and the wrapper is sent nothing. The
-    /// same route read LOCALLY does send that wrapper `getComponents`, so the
-    /// wrapper was live and dispatchable the whole time.
+    /// The loopback API here stands in for the runner's router. It cannot mount
+    /// `ui_bridge_get_components_handler` itself, because that handler extracts
+    /// an `ApiState` no test can build. So its fallback does what the handler
+    /// does past its extractors: it hands the forwarded request's own headers
+    /// to the real read core, `ui_bridge::elements::components_read`, which
+    /// chooses the sources from them and runs the WebSocket fan-out, the merge
+    /// and the envelope. The fallback extracts the same `HeaderMap` the
+    /// handler does; what does not run is the handler's own body, and the one
+    /// stub is the runner's own IPC read. That the handler passes its request
+    /// headers through untouched is pinned by
+    /// `elements::ws_dispatch_selection_tests::the_component_handler_hands_its_request_headers_to_the_read_core`.
+    ///
+    /// The registered wrapper is live and never answers, and the dispatcher
+    /// uses the PRODUCTION command timeout. Relayed, the read returns at once
+    /// with the runner's entries and `wrapperComponents: "withheld"`, and the
+    /// wrapper is sent nothing. The same route read LOCALLY does send that
+    /// wrapper `getComponents`, so the wrapper was live and dispatchable the
+    /// whole time.
     #[tokio::test]
     async fn a_relayed_component_read_never_waits_on_a_websocket_app() {
         use crate::mcp::app_discovery::DiscoveredApp;
         use crate::mcp::app_dispatch::AppDispatcher;
         use crate::mcp::app_registry::{AppRegistry, AppTransport};
         use crate::mcp::command_relay::{CommandRelay, CommandResponse};
-        use crate::mcp::ui_bridge::elements::{components_read, ComponentSources};
+        use crate::mcp::ui_bridge::elements::components_read;
         use crate::mcp::ws_relay::WsConnectionManager;
 
         let registry = AppRegistry::new();
@@ -7605,12 +7614,9 @@ mod tests {
         let base = spawn_test_server(Router::new().fallback(move |headers: HeaderMap| {
             let (reg, disp) = (reg.clone(), disp.clone());
             async move {
-                components_read(
-                    ComponentSources::for_request(&headers),
-                    &reg,
-                    &disp,
-                    async { Ok::<_, String>(json!([{ "id": "runner-own" }])) },
-                )
+                components_read(&headers, &reg, &disp, async {
+                    Ok::<_, String>(json!([{ "id": "runner-own" }]))
+                })
                 .await
             }
         }))

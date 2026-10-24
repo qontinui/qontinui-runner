@@ -89,6 +89,9 @@
 //! Two web calls to routes the runner DOES register are refused as well, and
 //! the bullet above says why each one is: `GET /apps` and
 //! `POST /ui-bridge/control/visibility`.
+//! `the_web_calls_the_docs_name_as_refused_stay_refused` pins both refusals,
+//! so an entry that opens either one fails that test until this paragraph and
+//! the bullet above are updated with it.
 //!
 //! # What a relayed request looks like to the local API
 //!
@@ -861,6 +864,27 @@ pub(crate) mod tests {
                     "{method} {path}: traversal is refused, never resolved"
                 );
             }
+        }
+    }
+
+    /// The module docs name two web calls to REGISTERED routes that this arm
+    /// refuses on purpose: `useRunnerApps`'s `GET /apps`, and the dashboard's
+    /// occlusion sweep, `POST /ui-bridge/control/visibility`. This pins both,
+    /// so the prose cannot outlive the fact it states. An entry that opens
+    /// either one turns it red, including an entry a rebase carries in
+    /// (qontinui-runner#2178 proposes one for `GET /apps`). Whoever adds such an
+    /// entry updates the docs' qontinui-web bullet and their "Two web calls"
+    /// paragraph together with this list.
+    #[test]
+    fn the_web_calls_the_docs_name_as_refused_stay_refused() {
+        for (method, path) in [("GET", "/apps"), ("POST", "/ui-bridge/control/visibility")] {
+            assert_eq!(
+                relay_path_verdict(method, path),
+                RelayPathVerdict::NotAllowed,
+                "{method} {path} is relayable now, so the module docs that call it \
+                 refused are wrong: update the qontinui-web bullet and the \"Two web \
+                 calls\" paragraph, then this list"
+            );
         }
     }
 
