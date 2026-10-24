@@ -306,10 +306,12 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 /// delivering) off a *different stamp*, and the two calibrations must be free
 /// to move apart without one silently dragging the other. The 3s
 /// `ui-bridge-ping` cadence makes this 30 consecutive pings SENT and
-/// unanswered — [`classify_native_ui`] fires only when a ping was actually
-/// emitted inside this window after the last event pong, so a ping that was
-/// never sent (a dead ping thread, or the old runtime-starved ping task)
-/// reads `ping_not_emitted`, not undelivered.
+/// unanswered — [`classify_native_ui`] fires only when pings were emitted,
+/// unanswered, for this whole window (the run began after the last event pong
+/// and is at least this old) and are still being emitted
+/// ([`PING_EMIT_FRESH_MS`]). A ping that was never sent (a dead ping thread,
+/// or the old runtime-starved ping task) reads `ping_not_emitted`, not
+/// undelivered.
 pub const UI_EVENT_DEAD_AFTER_MS: u64 = UI_DEAD_AFTER_MS;
 
 /// Wall-clock ms of the last pong whose arrival PROVES the native event loop
@@ -319,9 +321,9 @@ pub const UI_EVENT_DEAD_AFTER_MS: u64 = UI_DEAD_AFTER_MS;
 ///
 /// `AppState::ui_bridge_last_pong` serves **two independent liveness facts
 /// through one slot**, and that is the defect. The frontend answers
-/// `ui-bridge-ping` over a Tauri event, but it ALSO runs an unconditional 3s
-/// HTTP pong as a safety net against a WebView2 JS→Rust IPC failure
-/// (`src/hooks/useUIBridgeEventHandler.ts`). WebView2 services `fetch` in the
+/// `ui-bridge-ping` (over HTTP first since the 2026-10-19 ui-wedge plan, the
+/// Tauri event as fallback), but it ALSO runs an unconditional 3s HTTP pong as
+/// a safety net (`src/hooks/useUIBridgeEventHandler.ts`). WebView2 services `fetch` in the
 /// browser/network process, **not** on the host's UI thread — so during a
 /// native message-loop hang with a live renderer the HTTP pong keeps landing,
 /// `ui_bridge_last_pong` stays fresh, [`ui_stale`] never fires and
@@ -331,10 +333,14 @@ pub const UI_EVENT_DEAD_AFTER_MS: u64 = UI_DEAD_AFTER_MS;
 /// This stamp advances **only** on evidence that the loop delivered something
 /// to the renderer:
 ///
-/// * the `ui-bridge-pong` Tauri event listener (round trip both ways);
-/// * `POST /ui-bridge/pong?source=event` — the ping WAS delivered, only the
-///   JS→Rust return leg fell back to HTTP (the very failure the safety net
-///   exists for, so its provenance must survive the fallback);
+/// * `POST /ui-bridge/pong?source=event` — the PRIMARY answer to a
+///   delivered ping: reaching the ping listener at all proves the loop
+///   delivered it, and the return leg goes over HTTP (served on `mcp-api-rt`)
+///   because a JS `emit` is an async Tauri command that runs on `app-rt` and
+///   never settles while `app-rt` is starved (`answerPing` in
+///   `src/hooks/ui-bridge-events/utils.ts`);
+/// * the `ui-bridge-pong` Tauri event listener — the fallback leg, used when
+///   the HTTP answer fails or does not settle in time;
 /// * `ui-bridge-response` / `POST /ui-bridge/ipc-response` — a
 ///   `ui-bridge-request` emitted through the loop reached the renderer and
 ///   was answered.
@@ -348,12 +354,13 @@ pub const UI_EVENT_DEAD_AFTER_MS: u64 = UI_DEAD_AFTER_MS;
 ///
 /// * native loop wedged, renderer alive → **event pong stale, any-pong
 ///   fresh** → this bug (2026-08-19). Only the split can express it — and
-///   only when a ping WAS sent: a stale event pong proves loop non-delivery
-///   only if the runner asked (a successful `ui-bridge-ping` emit after the
-///   last event pong, inside [`UI_EVENT_DEAD_AFTER_MS`]). With no such emit
-///   the stamp is stale because nobody asked, and the verdict is UNKNOWN
-///   (`ping_not_emitted`) — measured on spaceship 2026-10-18/19, when the
-///   ping task starved on `app-rt` for minutes while the loop pumped.
+///   only when the runner ASKED: a stale event pong proves loop non-delivery
+///   only if pings were emitted, unanswered, for the whole
+///   [`UI_EVENT_DEAD_AFTER_MS`] window and are still being emitted (the rule
+///   in [`classify_native_ui`]). Otherwise the stamp may be stale because
+///   nobody asked, and the verdict is UNKNOWN (`ping_not_emitted`) — measured
+///   on spaceship 2026-10-18/19, when the ping task starved on `app-rt` for
+///   minutes while the loop pumped.
 /// * renderer / browser process dead (the 2026-08-01 mode) → **both stale** →
 ///   [`ui_stale`] fires exactly as it already did; provenance changes nothing.
 /// * loop healthy → both fresh.
@@ -756,13 +763,25 @@ static FALSE_DEATH_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub fn record_ping_emit_ok() {
     let now = now_ms_epoch();
     PING_EMIT_OK_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-    // Open a new "unanswered" run when the previous one was answered: the
-    // first successful emit AFTER the last event pong is when the runner began
-    // asking a question nobody has answered yet.
     let pong = LAST_EVENT_PONG_MS.load(std::sync::atomic::Ordering::Relaxed);
     let first = FIRST_UNANSWERED_PING_OK_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if first <= pong {
-        FIRST_UNANSWERED_PING_OK_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    FIRST_UNANSWERED_PING_OK_MS.store(
+        next_first_unanswered(first, pong, now),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The start of the current unanswered run after a successful emit at `now`.
+///
+/// A new run OPENS at `now` when the previous one was answered — an event pong
+/// landed at or after its start (`first <= last_event_pong`), which includes
+/// "no run yet" (`first == 0`). Otherwise the run is still open and KEEPS its
+/// start: the runner has been asking since `first` and nobody has answered.
+fn next_first_unanswered(first: u64, last_event_pong: u64, now: u64) -> u64 {
+    if first <= last_event_pong {
+        now
+    } else {
+        first
     }
 }
 
@@ -1311,7 +1330,17 @@ pub const PING_EMIT_FRESH_MS: u64 = 10_000;
 /// relay and the diagnostics verdict cannot disagree about whether a ping was
 /// sent.
 pub fn ping_ask_at(now_ms: u64) -> PingAsk {
-    let last_ok = PING_EMIT_OK_MS.load(std::sync::atomic::Ordering::Relaxed);
+    ping_ask_from(
+        PING_EMIT_OK_MS.load(std::sync::atomic::Ordering::Relaxed),
+        now_ms,
+    )
+}
+
+/// [`ping_ask_at`] for a caller that already read `PING_EMIT_OK_MS` (the
+/// `/health` handler takes ONE snapshot of the ping atomics and publishes it
+/// beside this verdict), so the verdict and the published `lastPingEmitOk`
+/// cannot come from two different reads.
+pub fn ping_ask_from(last_ok: u64, now_ms: u64) -> PingAsk {
     let first_unanswered = FIRST_UNANSWERED_PING_OK_MS.load(std::sync::atomic::Ordering::Relaxed);
     PingAsk {
         last_ok,
@@ -2548,12 +2577,14 @@ mod tests {
         }
     }
 
-    /// Asked and unanswered for the whole window, still asking: fires.
+    /// Asked and unanswered for the whole window, still asking: fires. Built
+    /// against ONE instant, `ASKED_NOW`, so its four numbers agree.
+    const ASKED_NOW: u64 = SOME_PONG + 1 + UI_EVENT_DEAD_AFTER_MS;
     const ASKED: PingAsk = PingAsk {
-        last_ok: SOME_PONG + 900,
+        last_ok: ASKED_NOW - 100,
         last_ok_age_ms: 100,
         first_unanswered: SOME_PONG + 1,
-        first_unanswered_age_ms: UI_EVENT_DEAD_AFTER_MS,
+        first_unanswered_age_ms: ASKED_NOW - (SOME_PONG + 1),
     };
 
     /// Inputs for "renderer alive, event pong stale" with the ping half
@@ -2596,19 +2627,29 @@ mod tests {
     #[test]
     fn a_ping_last_emitted_before_the_window_does_not_fire() {
         // The 2026-10-19 spaceship reading: no successful emit for 421 s.
-        let v = classify_native_ui(stale_event_pong(None, ask(SOME_PONG + 1, SOME_PONG + 1, STALE_NOW + 330_000)));
+        let v = classify_native_ui(stale_event_pong(
+            None,
+            ask(SOME_PONG + 1, SOME_PONG + 1, STALE_NOW + 330_000),
+        ));
         assert_not_fired(v, "the ping stopped long ago");
     }
 
     #[test]
     fn emits_resumed_after_a_gap_do_not_fire_before_their_answer_is_due() {
         // The ping thread came back 5 ms ago after a long silence.
-        let v = classify_native_ui(stale_event_pong(None, ask(STALE_NOW - 5, STALE_NOW - 5, STALE_NOW)));
+        let v = classify_native_ui(stale_event_pong(
+            None,
+            ask(STALE_NOW - 5, STALE_NOW - 5, STALE_NOW),
+        ));
         assert_not_fired(v, "one emit 5 ms ago has not had time to be answered");
         // And 89 s into the new run it still has not.
         let v = classify_native_ui(stale_event_pong(
             None,
-            ask(STALE_NOW - 1_000, STALE_NOW - (UI_EVENT_DEAD_AFTER_MS - 1_000), STALE_NOW),
+            ask(
+                STALE_NOW - 1_000,
+                STALE_NOW - (UI_EVENT_DEAD_AFTER_MS - 1_000),
+                STALE_NOW,
+            ),
         ));
         assert_not_fired(v, "a run shorter than the window");
     }
@@ -2617,7 +2658,10 @@ mod tests {
     fn a_run_that_began_before_the_last_event_pong_does_not_fire() {
         // The run's first emit was answered (the pong came after it).
         for first in [SOME_PONG - 1, SOME_PONG] {
-            let v = classify_native_ui(stale_event_pong(None, ask(STALE_NOW - 100, first, STALE_NOW)));
+            let v = classify_native_ui(stale_event_pong(
+                None,
+                ask(STALE_NOW - 100, first, STALE_NOW),
+            ));
             assert_not_fired(v, "that run was answered by the last event pong");
         }
     }
@@ -2636,12 +2680,18 @@ mod tests {
             first_unanswered_age_ms: UI_EVENT_DEAD_AFTER_MS,
             ..ASKED
         };
-        assert_eq!(classify_native_ui(stale_event_pong(None, at)).reason, "events_undelivered");
+        assert_eq!(
+            classify_native_ui(stale_event_pong(None, at)).reason,
+            "events_undelivered"
+        );
         let short = PingAsk {
             first_unanswered_age_ms: UI_EVENT_DEAD_AFTER_MS - 1,
             ..ASKED
         };
-        assert_eq!(classify_native_ui(stale_event_pong(None, short)).reason, "ping_not_emitted");
+        assert_eq!(
+            classify_native_ui(stale_event_pong(None, short)).reason,
+            "ping_not_emitted"
+        );
     }
 
     #[test]
@@ -2650,7 +2700,10 @@ mod tests {
             last_ok_age_ms: PING_EMIT_FRESH_MS,
             ..ASKED
         };
-        assert_eq!(classify_native_ui(stale_event_pong(None, fresh)).reason, "events_undelivered");
+        assert_eq!(
+            classify_native_ui(stale_event_pong(None, fresh)).reason,
+            "events_undelivered"
+        );
         let stopped = PingAsk {
             last_ok_age_ms: PING_EMIT_FRESH_MS + 1,
             ..ASKED
@@ -2664,7 +2717,10 @@ mod tests {
     #[test]
     fn a_probe_that_answered_outranks_ping_not_emitted() {
         let v = classify_native_ui(stale_event_pong(Some(false), PingAsk::NONE));
-        assert_eq!(v.reason, "pumping", "the measured round trip wins over the unmade inference");
+        assert_eq!(
+            v.reason, "pumping",
+            "the measured round trip wins over the unmade inference"
+        );
         assert_eq!(v.wedged, Some(false));
     }
 
@@ -2677,7 +2733,10 @@ mod tests {
                 ..stale_event_pong(None, ping)
             });
             assert!(!v.events_undelivered);
-            assert_eq!(v.reason, "unknown", "the renderer is gone — `ui_dead` owns this");
+            assert_eq!(
+                v.reason, "unknown",
+                "the renderer is gone — `ui_dead` owns this"
+            );
             assert_eq!(v.wedged, None);
         }
     }
@@ -2700,25 +2759,43 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_emit_opens_an_unanswered_run_only_after_an_answer() {
-        // Drives the real atomics: an emit after the last event pong opens a
-        // run; a second emit before any pong keeps the run's start; an event
-        // pong then closes it and the next emit opens a new one.
-        record_ping_emit_ok();
-        let first = ping_ask_now().first_unanswered;
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        record_ping_emit_ok();
-        let a = ping_ask_now();
-        assert!(a.last_ok >= first);
-        if last_event_pong() < first {
-            assert_eq!(a.first_unanswered, first, "still the same unanswered run");
+    fn an_emit_opens_an_unanswered_run_only_after_an_answer() {
+        // (first, last_event_pong, now) -> the run's start after an emit at `now`.
+        let cases: &[(&str, u64, u64, u64, u64)] = &[
+            ("no run yet, never answered: opens", 0, 0, 1_000, 1_000),
+            ("no run yet, answered before: opens", 0, 500, 1_000, 1_000),
+            (
+                "open run, no pong since: keeps its start",
+                400,
+                300,
+                1_000,
+                400,
+            ),
+            (
+                "open run, pong at its start: closed, a new one opens",
+                400,
+                400,
+                1_000,
+                1_000,
+            ),
+            (
+                "open run, pong after its start: closed, a new one opens",
+                400,
+                900,
+                1_000,
+                1_000,
+            ),
+        ];
+        for &(why, first, pong, now, want) in cases {
+            assert_eq!(next_first_unanswered(first, pong, now), want, "{why}");
         }
-        record_event_pong();
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        record_ping_emit_ok();
-        let b = ping_ask_now();
-        // (Other tests may stamp pongs concurrently; only monotonicity is safe.)
-        assert!(b.first_unanswered >= a.first_unanswered);
+        // A run kept open across many emits still reports its FIRST emit, so
+        // its age grows with the whole unanswered stretch.
+        let mut first = 0;
+        for now in [10_000, 13_000, 16_000, 19_000] {
+            first = next_first_unanswered(first, 5_000, now);
+        }
+        assert_eq!(first, 10_000);
     }
 
     /// The mirror-image mode must NOT be reclassified. When the browser
@@ -3090,8 +3167,15 @@ mod tests {
         // emit succeeded for 421 s, yet `pingDelivery` read `ping_delivered`.
         // An old success says nothing about delivery now.
         assert_eq!(pd(NOW - (UI_DEAD_AFTER_MS + 1), 0), PingDelivery::Unknown);
-        assert_eq!(pd(NOW - UI_DEAD_AFTER_MS, 0), PingDelivery::Corroborated, "boundary inclusive");
-        assert!(!pd(NOW - (UI_DEAD_AFTER_MS + 1), 0).suppresses_recovery(), "UNKNOWN still recovers");
+        assert_eq!(
+            pd(NOW - UI_DEAD_AFTER_MS, 0),
+            PingDelivery::Corroborated,
+            "boundary inclusive"
+        );
+        assert!(
+            !pd(NOW - (UI_DEAD_AFTER_MS + 1), 0).suppresses_recovery(),
+            "UNKNOWN still recovers"
+        );
     }
 
     #[test]
@@ -3232,7 +3316,7 @@ mod tests {
         // the 2026-09-01 plan's Phase A specified.
         //
         // `classify_native_ui` computes
-        //   `events_undelivered = renderer_alive && events_stale`
+        //   `events_undelivered = renderer_alive && events_stale && ping_asked`
         // and `renderer_alive` is `last_pong > 0 && !ui_stale(.., UI_DEAD_AFTER_MS)`,
         // which is exactly `!ui_dead`. So `events_undelivered` is FALSE at
         // every instant `ui_dead` is TRUE: the two are mutually exclusive by
@@ -3258,7 +3342,10 @@ mod tests {
                     pong_age_ms,
                     last_event_pong: 1,
                     event_pong_age_ms,
-                    ping: PingAsk::NONE,
+                    // Pings sent and unanswered for the whole window: the
+                    // "we asked" half holds, so only `renderer_alive` can
+                    // keep `events_undelivered` false on these rows.
+                    ping: ASKED,
                 });
                 assert!(
                     ui_stale(1, pong_age_ms, UI_DEAD_AFTER_MS),

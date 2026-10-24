@@ -2211,9 +2211,10 @@ async fn health(
         pong_age_ms,
         last_event_pong: crate::ui_error::last_event_pong(),
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
-        // Against the same clock reading the `pingDelivery` verdict beside it
-        // was classified with.
-        ping: crate::ui_error::ping_ask_at(ping_now_ms),
+        // From the SAME snapshot (`last_ping_emit_ok`) and clock reading the
+        // `pingDelivery` verdict beside it was classified with, so the verdict
+        // and the published `lastPingEmitOk` come from one read.
+        ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
     });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
@@ -12303,8 +12304,11 @@ pub fn create_router(
         handle.listen("ui-bridge-pong", move |event| {
             // EVENT PROVENANCE, from whichever window answered: this pong
             // answered a `ui-bridge-ping` the event loop delivered, and
-            // travelled back as a Tauri event, so it proves the native loop
-            // is pumping. `ui_bridge_last_pong` cannot carry that fact — the
+            // travelled back as a Tauri event (the FALLBACK leg since the
+            // 2026-10-19 ui-wedge plan: the frontend answers over
+            // `POST /ui-bridge/pong?source=event` first, because a JS `emit`
+            // runs on `app-rt` and never settles while it is starved), so it
+            // proves the native loop is pumping. `ui_bridge_last_pong` cannot carry that fact — the
             // frontend also pongs unconditionally over HTTP, which WebView2
             // serves from its browser process while the UI thread is frozen.
             //

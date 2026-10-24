@@ -5611,6 +5611,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            // The 3s `ui-bridge-ping` emitter, on its OWN OS thread — never a
+            // tokio task. It used to be a `tokio::spawn` in
+            // `mcp_api::create_router`, which put it on `app-rt`: when
+            // `app-rt`'s workers were parked in synchronous process creation
+            // the ping stopped for minutes and `/health` called a pumping UI
+            // wedged. Started here — beside the API server spawn, so at the
+            // same point in boot as before, and ahead of the synchronous
+            // bridge/seed work below — but NOT from the router, because
+            // independence from the API runtime is the point (plan
+            // 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns,
+            // Phase 1). Idempotent per process.
+            match ui_ping::start_ui_ping_thread(app.handle().clone()) {
+                Ok(started) => info!(?started, "ui-bridge-ping thread"),
+                Err(e) => error!(
+                    error = %e,
+                    "the ui-bridge-ping thread did not start — the native-UI verdict will read                      ping_not_emitted (UNKNOWN), not wedged"
+                ),
+            }
+
             // Scan for crash dumps written by the previous process. Run in
             // parallel with the MCP server spawn above — the scan is a
             // read-only disk walk + ~1 file parse and completes in ms, so we
@@ -5725,19 +5744,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
-
-            // The 3s `ui-bridge-ping` emitter, on its OWN OS thread — never a
-            // tokio task. It used to be a `tokio::spawn` in
-            // `mcp_api::create_router`, which put it on `app-rt`: when
-            // `app-rt`'s workers were parked in synchronous process creation
-            // the ping stopped for minutes and `/health` called a pumping UI
-            // wedged. Started here, beside the heartbeat, because it must not
-            // depend on the API router (plan
-            // 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns,
-            // Phase 1). Idempotent per process.
-            if let Err(e) = ui_ping::start_ui_ping_thread(app.handle().clone()) {
-                error!(error = %e, "the ui-bridge-ping thread did not start");
-            }
 
             // Legacy headless/back-end email/password auto-login REMOVED
             // (Cognito-legacy-auth teardown). The web backend is Cognito-only;

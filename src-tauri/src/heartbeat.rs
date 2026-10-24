@@ -110,8 +110,10 @@ pub(crate) struct HeartbeatUiThread {
     /// stopped), which is NOT the same claim as `false` ("a round trip came
     /// back"). See `ui_error::NativeUiLiveness::wedged`.
     wedged: Option<bool>,
-    /// `"pumping" | "unknown" | "native_probe_wedged" |
-    /// "window_getter_unresponsive" | "events_undelivered"`.
+    /// `"pumping" | "unknown" | "ping_not_emitted" | "native_probe_wedged" |
+    /// "window_getter_unresponsive" | "events_undelivered"`. `ping_not_emitted`
+    /// (additive, 2026-10-24) is a non-wedged UNKNOWN: the event pong is stale
+    /// but pings were not sent and left unanswered for the whole window.
     reason: &'static str,
     /// The Win32 `SendMessageTimeoutW` rung. `null` = could not ask
     /// (non-Windows, or no main-window handle cached yet) — UNKNOWN, not fine.
