@@ -165,7 +165,8 @@ pub async fn sync_discoveries(
             sent: 0,
             failed: 0,
             errors: vec![],
-            remaining: 0,
+            remaining: Some(0),
+            remaining_note: None,
         }));
     }
 
