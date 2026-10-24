@@ -159,17 +159,9 @@ pub fn wip_state_is_honest_clean(state: Option<&str>) -> bool {
 // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
 // Phase 1), the one copy every `.git`-pointer reader in the runner now shares.
 pub use qontinui_runner_lib::git_layout::{git_dir_for, parse_gitdir_line};
-
-/// Read at most `max` bytes of a small file. Returns `None` on any IO error
-/// AND when the file is larger than `max` — a custody record that has grown
-/// past a few KB is not a custody record.
-fn read_bounded(path: &Path, max: u64) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > max {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
-}
+// The bounded reader too: `None` on any IO error AND when the file is larger
+// than `max` — a custody record that has grown past a few KB is not one.
+use qontinui_runner_lib::git_layout::read_bounded;
 
 /// Read the custody record for `worktree`, if one exists and parses.
 ///

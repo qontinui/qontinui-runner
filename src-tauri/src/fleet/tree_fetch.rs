@@ -14,11 +14,49 @@
 //! never fetched, and one fetch per interval refreshes every checkout that
 //! shares the refs. The pull executor's `<default>:<default>` ref sync is
 //! deduplicated the same way — the local default branch ref is shared too.
+//!
+//! "Once" means once per PUBLISHER CYCLE as well as once per interval. The
+//! directory loop walks hundreds of checkouts in order and a cycle can outlast
+//! the interval, so a time gate alone would let a linked worktree reached late
+//! in the cycle re-fetch the repository its primary fetched at the start. Each
+//! cycle therefore takes a generation ([`begin_cycle`]) and an attempt recorded
+//! in the same generation is always shared.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// The publisher's cycle generation; 0 until the first cycle begins.
+static CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// Begin a publisher cycle: every fetch and ref sync attempted until the next
+/// call shares one generation. Returns it (never 0).
+pub(super) fn begin_cycle() -> u64 {
+    CYCLE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// The generation [`begin_cycle`] last returned; `None` before the first.
+fn current_cycle() -> Option<u64> {
+    match CYCLE.load(Ordering::SeqCst) {
+        0 => None,
+        c => Some(c),
+    }
+}
+
+/// When a prior attempt answers for this one: it ran within the interval, or
+/// in the same publisher cycle. A caller outside any cycle passes `None` and
+/// gets the time rule alone.
+fn shared_with(
+    prior_at: Instant,
+    prior_cycle: Option<u64>,
+    now: Instant,
+    cycle: Option<u64>,
+) -> bool {
+    now.saturating_duration_since(prior_at) < tree_fetch_interval()
+        || (cycle.is_some() && prior_cycle == cycle)
+}
 
 /// Resolve the per-repo fetch interval. Reads `COORD_TREE_FETCH_INTERVAL_SECS`,
 /// falling back to `COORD_TREE_PUBLISH_INTERVAL_SECS`, then 60; floored at 5s.
@@ -46,34 +84,36 @@ pub(super) fn fetch_key(dir: &Path) -> Option<PathBuf> {
     qontinui_runner_lib::git_layout::common_dir_key(dir)
 }
 
-fn last_fetch_at() -> &'static Mutex<HashMap<PathBuf, Instant>> {
-    static LAST_FETCH: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+type FetchAttempt = (Instant, Option<u64>);
+
+fn last_fetch_at() -> &'static Mutex<HashMap<PathBuf, FetchAttempt>> {
+    static LAST_FETCH: OnceLock<Mutex<HashMap<PathBuf, FetchAttempt>>> = OnceLock::new();
     LAST_FETCH.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// True when `key` is due a fetch (never fetched, or last fetch is at least
-/// [`tree_fetch_interval`] ago). Records `now` as the attempt time when it
-/// returns true, so back-to-back ticks — and the other checkouts sharing the
-/// key — don't double-fetch.
-pub(super) fn fetch_due(key: &Path, now: Instant) -> bool {
-    let interval = tree_fetch_interval();
+/// True when `key` is due a fetch: never fetched, or the last attempt is
+/// neither within [`tree_fetch_interval`] nor in `cycle`. Records the attempt
+/// when it returns true, so back-to-back cycles — and the other checkouts
+/// sharing the key — don't double-fetch.
+pub(super) fn fetch_due(key: &Path, now: Instant, cycle: Option<u64>) -> bool {
     let mut map = last_fetch_at().lock().unwrap_or_else(|p| p.into_inner());
     let due = match map.get(key) {
-        Some(prev) => now.duration_since(*prev) >= interval,
+        Some((at, prior_cycle)) => !shared_with(*at, *prior_cycle, now, cycle),
         None => true,
     };
     if due {
-        map.insert(key.to_path_buf(), now);
+        map.insert(key.to_path_buf(), (now, cycle));
     }
     due
 }
 
-/// The one question the publisher's directory loop asks: should THIS
-/// directory run the fetch now? `None` for a directory git cannot open, and
-/// for one whose common dir was already fetched this interval.
-pub(super) fn fetch_target(dir: &Path, now: Instant) -> Option<PathBuf> {
+/// The one question a directory loop asks: should THIS directory run the
+/// fetch now? `None` for a directory git cannot open, and for one whose common
+/// dir was already fetched this interval or this `cycle` (the publisher passes
+/// its [`begin_cycle`] generation; a caller outside it passes `None`).
+pub(super) fn fetch_target(dir: &Path, now: Instant, cycle: Option<u64>) -> Option<PathBuf> {
     let key = fetch_key(dir)?;
-    fetch_due(&key, now).then_some(key)
+    fetch_due(&key, now, cycle).then_some(key)
 }
 
 type RefSyncKey = (PathBuf, String);
@@ -83,6 +123,7 @@ type RefSyncKey = (PathBuf, String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RefSyncAttempt {
     pub at: Instant,
+    pub cycle: Option<u64>,
     pub dir: PathBuf,
     pub outcome: Option<String>,
 }
@@ -95,21 +136,32 @@ fn last_ref_sync() -> &'static Mutex<HashMap<RefSyncKey, RefSyncAttempt>> {
 /// For the pull executor's `fetch origin <branch>:<branch>` from `dir`:
 /// `Ok(())` when this directory should run it now (and the attempt is
 /// recorded), `Err(prior)` when a checkout sharing `dir`'s common dir already
-/// attempted the same ref sync within [`tree_fetch_interval`] —
-/// `refs/heads/<branch>` is one ref for all of them. `prior.outcome` carries
-/// that attempt's own result once [`record_ref_sync_outcome`] has run, so the
-/// shared answer reports what actually happened rather than hiding it. A
-/// directory whose common dir cannot be read is always `Ok(())`: no shared
-/// answer it cannot justify.
+/// attempted the same ref sync within [`tree_fetch_interval`] or in the current
+/// publisher cycle — `refs/heads/<branch>` is one ref for all of them.
+/// `prior.outcome` carries that attempt's own result once
+/// [`record_ref_sync_outcome`] has run, so the shared answer reports what
+/// actually happened rather than hiding it. A directory whose common dir cannot
+/// be read is always `Ok(())`: no shared answer it cannot justify.
+///
+/// The pull executor runs only from the publisher's directory loop, so the
+/// cycle is the one [`begin_cycle`] last opened.
 pub(super) fn claim_ref_sync(dir: &Path, branch: &str, now: Instant) -> Result<(), RefSyncAttempt> {
+    claim_ref_sync_in(dir, branch, now, current_cycle())
+}
+
+fn claim_ref_sync_in(
+    dir: &Path,
+    branch: &str,
+    now: Instant,
+    cycle: Option<u64>,
+) -> Result<(), RefSyncAttempt> {
     let Some(common) = fetch_key(dir) else {
         return Ok(());
     };
-    let interval = tree_fetch_interval();
     let mut map = last_ref_sync().lock().unwrap_or_else(|p| p.into_inner());
     let key = (common, branch.to_string());
     if let Some(prior) = map.get(&key) {
-        if now.duration_since(prior.at) < interval {
+        if shared_with(prior.at, prior.cycle, now, cycle) {
             return Err(prior.clone());
         }
     }
@@ -117,6 +169,7 @@ pub(super) fn claim_ref_sync(dir: &Path, branch: &str, now: Instant) -> Result<(
         key,
         RefSyncAttempt {
             at: now,
+            cycle,
             dir: dir.to_path_buf(),
             outcome: None,
         },
@@ -180,15 +233,23 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dirs = layout(t.path());
         let now = Instant::now();
-        assert_eq!(fetch_target(&t.path().join("h"), now), None, "husk");
         assert_eq!(
-            fetch_target(&t.path().join("z"), now),
+            fetch_target(&t.path().join("h"), now, Some(1)),
+            None,
+            "husk"
+        );
+        assert_eq!(
+            fetch_target(&t.path().join("z"), now, Some(1)),
             None,
             "pruned worktree"
         );
         // And it stays unfetched on every later cycle.
         assert_eq!(
-            fetch_target(&t.path().join("h"), now + Duration::from_secs(3600)),
+            fetch_target(
+                &t.path().join("h"),
+                now + Duration::from_secs(3600),
+                Some(2)
+            ),
             None
         );
         drop(dirs);
@@ -201,7 +262,7 @@ mod tests {
         let now = Instant::now();
         let fetched: Vec<&PathBuf> = dirs
             .iter()
-            .filter(|d| fetch_target(d, now).is_some())
+            .filter(|d| fetch_target(d, now, Some(1)).is_some())
             .collect();
         // p (shared by a and b) and q: two repositories, two fetches — and the
         // checkout that runs each is the first one the walk meets.
@@ -212,12 +273,14 @@ mod tests {
         );
         // The next cycle, inside the interval: nothing.
         let soon = now + Duration::from_secs(1);
-        assert!(dirs.iter().all(|d| fetch_target(d, soon).is_none()));
+        assert!(dirs
+            .iter()
+            .all(|d| fetch_target(d, soon, Some(2)).is_none()));
         // Past the interval: the same two again.
         let later = now + tree_fetch_interval();
         assert_eq!(
             dirs.iter()
-                .filter(|d| fetch_target(d, later).is_some())
+                .filter(|d| fetch_target(d, later, Some(3)).is_some())
                 .count(),
             2
         );
@@ -228,9 +291,9 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let _ = layout(t.path());
         let now = Instant::now();
-        assert!(fetch_target(&t.path().join("a"), now).is_some());
-        assert!(fetch_target(&t.path().join("p"), now).is_none());
-        assert!(fetch_target(&t.path().join("b"), now).is_none());
+        assert!(fetch_target(&t.path().join("a"), now, Some(1)).is_some());
+        assert!(fetch_target(&t.path().join("p"), now, Some(1)).is_none());
+        assert!(fetch_target(&t.path().join("b"), now, Some(1)).is_none());
     }
 
     #[test]
@@ -238,8 +301,11 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let _ = layout(t.path());
         let now = Instant::now();
-        assert_eq!(claim_ref_sync(&t.path().join("p"), "main", now), Ok(()));
-        let prior = claim_ref_sync(&t.path().join("a"), "main", now)
+        assert_eq!(
+            claim_ref_sync_in(&t.path().join("p"), "main", now, Some(1)),
+            Ok(())
+        );
+        let prior = claim_ref_sync_in(&t.path().join("a"), "main", now, Some(1))
             .expect_err("a linked worktree shares refs/heads/main with its primary");
         assert_eq!(prior.dir, t.path().join("p"));
         assert_eq!(
@@ -247,24 +313,27 @@ mod tests {
             "the first attempt has not finished yet"
         );
         record_ref_sync_outcome(&t.path().join("p"), "main", "ref_sync_failed");
-        let prior = claim_ref_sync(&t.path().join("b"), "main", now).unwrap_err();
+        let prior = claim_ref_sync_in(&t.path().join("b"), "main", now, Some(1)).unwrap_err();
         assert_eq!(prior.outcome.as_deref(), Some("ref_sync_failed"));
         // A non-claimant's outcome is ignored.
         record_ref_sync_outcome(&t.path().join("a"), "main", "default_ref_sync");
-        let prior = claim_ref_sync(&t.path().join("b"), "main", now).unwrap_err();
+        let prior = claim_ref_sync_in(&t.path().join("b"), "main", now, Some(1)).unwrap_err();
         assert_eq!(prior.outcome.as_deref(), Some("ref_sync_failed"));
         assert_eq!(
-            claim_ref_sync(&t.path().join("a"), "master", now),
+            claim_ref_sync_in(&t.path().join("a"), "master", now, Some(1)),
             Ok(()),
             "another ref"
         );
         assert_eq!(
-            claim_ref_sync(&t.path().join("q"), "main", now),
+            claim_ref_sync_in(&t.path().join("q"), "main", now, Some(1)),
             Ok(()),
             "another repo"
         );
         let later = now + tree_fetch_interval();
-        assert_eq!(claim_ref_sync(&t.path().join("b"), "main", later), Ok(()));
+        assert_eq!(
+            claim_ref_sync_in(&t.path().join("b"), "main", later, Some(2)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -277,10 +346,58 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().to_path_buf();
         let t0 = Instant::now();
-        assert!(fetch_due(&p, t0), "first call should be due");
+        assert!(fetch_due(&p, t0, None), "first call should be due");
         assert!(
-            !fetch_due(&p, Instant::now()),
+            !fetch_due(&p, Instant::now(), None),
             "immediate re-call should not be due"
         );
+    }
+
+    #[test]
+    fn a_cycle_longer_than_the_interval_still_fetches_each_repo_once() {
+        // The publisher walks hundreds of checkouts in order; a cycle can
+        // outlast the interval. A linked worktree met past the interval in the
+        // SAME cycle must not re-fetch the repository its primary fetched.
+        let t = tempfile::tempdir().unwrap();
+        let _ = layout(t.path());
+        let start = Instant::now();
+        let late = start + tree_fetch_interval() + Duration::from_secs(1);
+        assert!(fetch_target(&t.path().join("p"), start, Some(7)).is_some());
+        assert!(
+            fetch_target(&t.path().join("a"), late, Some(7)).is_none(),
+            "same cycle: shared even past the interval"
+        );
+        assert!(
+            fetch_target(&t.path().join("b"), late, Some(8)).is_some(),
+            "the next cycle, past the interval: due again"
+        );
+        // Outside any cycle only the time rule applies.
+        let later = late + tree_fetch_interval();
+        assert!(fetch_target(&t.path().join("p"), later, None).is_some());
+    }
+
+    #[test]
+    fn a_ref_sync_is_shared_for_the_whole_cycle() {
+        let t = tempfile::tempdir().unwrap();
+        let _ = layout(t.path());
+        let start = Instant::now();
+        let late = start + tree_fetch_interval() + Duration::from_secs(1);
+        assert_eq!(
+            claim_ref_sync_in(&t.path().join("p"), "main", start, Some(7)),
+            Ok(())
+        );
+        assert!(claim_ref_sync_in(&t.path().join("a"), "main", late, Some(7)).is_err());
+        assert_eq!(
+            claim_ref_sync_in(&t.path().join("b"), "main", late, Some(8)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn begin_cycle_never_returns_zero_and_moves_forward() {
+        let a = begin_cycle();
+        let b = begin_cycle();
+        assert!(a > 0 && b > a);
+        assert!(current_cycle().is_some_and(|c| c >= b));
     }
 }

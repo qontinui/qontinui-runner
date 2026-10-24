@@ -74,6 +74,8 @@ fn git_capture(git: Command, repo: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = git;
     scrub_repo_local_git_env(&mut cmd);
     cmd.arg("-C").arg(repo).args(args);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, TRUNK_GIT_TIMEOUT, "git_trunk: git") else {
         return None;
     };

@@ -9,9 +9,11 @@
 //! fetch for all, and a trunk ref resolved for one is the trunk ref for all.
 //!
 //! Plan `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
-//! (Phase 1) lifted this out of the two lib-side copies that had grown it
-//! independently (`env_agent::collectors` and `observable_bridge::git_ops`) so
-//! the census and the tree publisher could key their per-repo work on it.
+//! (Phase 1) made this the one reader, built from `agent_worktree::custody`'s
+//! parser (first line only, both absolute-path shapes spelled out) and
+//! replacing the copies that had grown independently in
+//! `env_agent::collectors` and `observable_bridge::git_ops`, so the census and
+//! the tree publisher could key their per-repo work on it.
 
 use std::path::{Path, PathBuf};
 
@@ -38,20 +40,28 @@ pub fn gitdir_value(raw: &str) -> Option<&str> {
 
 /// Parse a `.git` FILE's contents into the git dir it names, resolving a
 /// relative value against `base` (the checkout holding the `.git` file).
-///
-/// `is_absolute` is false for `C:/x` on POSIX builds and for `/x` on Windows,
-/// so both shapes are spelled rather than trusting the platform rule.
 pub fn parse_gitdir_line(raw: &str, base: &Path) -> Option<PathBuf> {
-    let rest = gitdir_value(raw)?;
-    let p = PathBuf::from(rest);
+    Some(resolve_pointer(gitdir_value(raw)?, base))
+}
+
+/// `value` as a path, joined onto `base` unless it is absolute in EITHER
+/// platform's spelling: `is_absolute` is false for `C:/x` on POSIX builds and
+/// for `/x` on Windows, so both shapes are spelled rather than trusting the
+/// platform rule. Shared by the `gitdir:` pointer and the `commondir` file.
+fn resolve_pointer(value: &str, base: &Path) -> PathBuf {
+    let p = PathBuf::from(value);
     let looks_absolute = p.is_absolute()
-        || rest.starts_with('/')
-        || rest.starts_with('\\')
-        || rest
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value
             .as_bytes()
             .get(1)
-            .is_some_and(|c| *c == b':' && rest.as_bytes()[0].is_ascii_alphabetic());
-    Some(if looks_absolute { p } else { base.join(p) })
+            .is_some_and(|c| *c == b':' && value.as_bytes()[0].is_ascii_alphabetic());
+    if looks_absolute {
+        p
+    } else {
+        base.join(p)
+    }
 }
 
 /// Upper bound on a `.git` pointer file and a `commondir` file.
@@ -89,10 +99,8 @@ pub fn git_dir_and_common_dir(checkout: &Path) -> Option<(PathBuf, PathBuf)> {
             let t = text.trim();
             if t.is_empty() {
                 git_dir.clone()
-            } else if Path::new(t).is_absolute() {
-                PathBuf::from(t)
             } else {
-                git_dir.join(t)
+                resolve_pointer(t, &git_dir)
             }
         }
         None => git_dir.clone(),

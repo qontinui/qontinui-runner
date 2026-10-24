@@ -2086,6 +2086,8 @@ fn git_registered_worktrees(canonical: &Path) -> Vec<PathBuf> {
     };
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", canonical_str, "worktree", "list", "--porcelain"]);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     let ProbeOutcome::Captured(stdout) = run_probe(
         cmd,
         CENSUS_GIT_LOCAL_TIMEOUT,
@@ -2143,6 +2145,35 @@ fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Ve
     out
 }
 
+/// Test-only record of every `git` the census path spawns, per thread (a
+/// census walk is synchronous on its caller's thread). The process helpers
+/// live in the lib crate, where a bin test's `cfg(test)` does not reach, so
+/// the census-side spawn sites record here before handing the command over.
+/// It is what lets a test assert "no git ran" or "the trunk was resolved
+/// once" by counting the processes, not a counter inside the code under test.
+#[cfg(test)]
+pub(crate) mod spawn_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Note one spawn: its argument list, space-joined.
+    pub(crate) fn record(cmd: &std::process::Command) {
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        LOG.with(|l| l.borrow_mut().push(args.join(" ")));
+    }
+
+    /// Every spawn recorded on this thread since the last call.
+    pub(crate) fn take() -> Vec<String> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+
 /// Run a git query against a worktree, returning trimmed stdout on
 /// success.
 fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
@@ -2151,6 +2182,8 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     full.extend_from_slice(args);
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(&full);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     // Bounded: this runs inside the 300s census walk, once per worktree per
     // subcommand. An `index.lock` held by a concurrent git used to park the
     // blocking-pool thread the whole walk runs on, permanently.
@@ -2221,6 +2254,8 @@ fn fetch_trunk(canonical: &Path, trunk: Option<&str>) {
     .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
     .env("GIT_HTTP_LOW_SPEED_TIME", "20")
     .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     match run_probe(
         cmd,
         CENSUS_GIT_FETCH_TIMEOUT,
@@ -2254,9 +2289,16 @@ fn fetch_trunk(canonical: &Path, trunk: Option<&str>) {
 /// coord handles those via the PR `close_cause='merged'` signal.
 #[cfg(test)]
 fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
-    // Require a resolvable trunk; without it we can't answer.
-    let trunk = resolve_trunk_ref(worktree)?;
-    compute_landed_against(worktree, "HEAD", &trunk)
+    // Through the walk's own per-row path ([`landed_for_row`]: the trunk memo,
+    // the keyed commits, the cross-walk memo), so every regression case built
+    // on this helper exercises what production runs. An unresolvable trunk is
+    // `None` there too.
+    let head = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
+    landed_for_row(
+        worktree,
+        head.as_deref(),
+        &mut super::census_memo::WalkMemo::default(),
+    )
 }
 
 /// [`compute_landed_in_main`] for the revisions `head` and `trunk` — a ref name
@@ -2272,6 +2314,8 @@ fn compute_landed_against(worktree: &Path, head: &str, trunk: &str) -> Option<bo
     // "not landed" for a question we could not ask.
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", wt, "merge-base", "--is-ancestor", head, &trunk]);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     // `run_probe_QUIET`: `--is-ancestor` answers with its EXIT CODE, so exit 1
     // ("not an ancestor") is this probe's ordinary negative answer and the
     // documented path into the patch-id test below — not a fault. The loud
@@ -2717,12 +2761,14 @@ fn enumerate_worktrees_seamed(
         fetch_trunk(canonical, trunk.as_deref());
         // Seed the memo for this repo's common dir with the name just
         // resolved, so the walk does not resolve it a second time.
-        let _ = memo.trunk_for(canonical, &mut |dir: &Path| {
-            let name = trunk.clone()?;
-            let oid = git_capture(dir, &["rev-parse", "--verify", "--quiet", &name])
+        // `seed` REPLACES: a row of this repository reached earlier in the
+        // walk may have memoised a pre-fetch commit.
+        let seeded = trunk.clone().map(|name| {
+            let oid = git_capture(canonical, &["rev-parse", "--verify", "--quiet", &name])
                 .filter(|s| !s.is_empty());
-            Some(super::census_memo::Trunk { name, oid })
+            super::census_memo::Trunk { name, oid }
         });
+        memo.seed(canonical, seeded);
         let facts = canonical_facts(repo, &mut memo);
 
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -3257,7 +3303,7 @@ pub fn spawn_volume_publisher() {
 ///
 /// Interval read from `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS` (default
 /// 300s, floored at 30s), measured from the END of each walk
-/// ([`paced_census_loop`]), so a walk longer than the interval can never run
+/// ([`crate::paced_loop::run_paced`]), so a walk longer than the interval can never run
 /// back to back. Failures `warn!` and retry on the next cycle; the loop never
 /// panics.
 ///
@@ -3299,13 +3345,8 @@ pub fn spawn_census() {
                 crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
             ),
         };
-        paced_census_loop(Duration::from_secs(secs), None, &mut tick).await;
+        crate::paced_loop::run_paced(Duration::from_secs(secs), None, &mut tick).await;
     });
-}
-
-/// One unit of work [`paced_census_loop`] repeats.
-trait PacedCycle {
-    fn run(&mut self) -> impl std::future::Future<Output = ()> + Send + '_;
 }
 
 /// The production cycle: the shed-gated census walk.
@@ -3313,38 +3354,10 @@ struct PeriodicCensus {
     shed: crate::resource_guard::BackgroundShed,
 }
 
-impl PacedCycle for PeriodicCensus {
+impl crate::paced_loop::PacedCycle for PeriodicCensus {
     async fn run(&mut self) {
         let verdict = crate::resource_guard::background_work_verdict();
         census_cycle(&mut self.shed, &verdict, build_and_publish).await;
-    }
-}
-
-/// The census cadence: run `cycle`, then wait one full `interval` measured
-/// from the moment the cycle ENDED, and repeat (`max_cycles` bounds it for a
-/// test; production passes `None`).
-///
-/// It used to be a fixed `interval` tick with `MissedTickBehavior::Skip`. A
-/// walk longer than the interval (measured 2026-10-23 on spaceship: 1,920
-/// rows in 3,152 s against a 300 s tick) then restarted on the next tick
-/// boundary, so the walk ran back to back and its git spawn RATE was bounded
-/// only by how fast processes start — making each row cheaper would only have
-/// made the walk restart sooner. Pacing from the end makes the gap a full
-/// interval whatever the walk costs, so a cheaper row is a lower rate.
-/// Plan `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` D1.
-async fn paced_census_loop<C: PacedCycle>(
-    interval: Duration,
-    max_cycles: Option<usize>,
-    cycle: &mut C,
-) {
-    let mut ran = 0usize;
-    loop {
-        cycle.run().await;
-        ran += 1;
-        if max_cycles.is_some_and(|m| ran >= m) {
-            return;
-        }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -5644,6 +5657,7 @@ mod tests {",
         let tmp = tempfile::tempdir().unwrap();
         let (_canonical, _a, _b) = walk_fixture(tmp.path());
 
+        let _ = spawn_log::take();
         let mut facts_calls = 0usize;
         let mut rows = 0usize;
         let mut facts = |_: &str, _: &mut super::super::census_memo::WalkMemo| {
@@ -5678,6 +5692,14 @@ mod tests {",
         // The trunk is resolved once for the repo's common dir: the walk's own
         // seed after `fetch_trunk`, and every row served from the memo.
         assert_eq!(memo.resolutions, 1, "trunk resolved once per common dir");
+        // Counted at the processes too, so a row that resolved the trunk
+        // around the memo would show: ONE `origin/HEAD` read for 3 rows.
+        let spawned = spawn_log::take();
+        let trunk_reads = spawned
+            .iter()
+            .filter(|a| a.contains("symbolic-ref --short refs/remotes/origin/HEAD"))
+            .count();
+        assert_eq!(trunk_reads, 1, "trunk resolutions spawned: {spawned:?}");
     }
 
     #[test]
@@ -5782,7 +5804,14 @@ mod tests {",
         )
         .unwrap();
         let mut memo = super::super::census_memo::WalkMemo::default();
+        let _ = spawn_log::take();
         let row = capture_worktree_in("qontinui-probe", &wt, &CanonicalFacts::default(), &mut memo);
+        // The point of the shortcut, counted at the spawn sites: not one git.
+        assert_eq!(
+            spawn_log::take(),
+            Vec::<String>::new(),
+            "no git for a pruned row"
+        );
         assert_eq!(row.branch, None);
         assert_eq!(row.head_sha, None);
         assert_eq!(row.landed_in_main, None);
@@ -5803,53 +5832,22 @@ mod tests {",
         let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
         git(&["update-ref", "refs/remotes/origin/main", &head]);
         let mut memo = super::super::census_memo::WalkMemo::default();
+        let _ = spawn_log::take();
         let row = capture_worktree_in(
             "qontinui-probe",
             path,
             &CanonicalFacts::default(),
             &mut memo,
         );
+        let spawned = spawn_log::take();
+        assert!(
+            spawned.iter().any(|a| a.contains("status --porcelain")),
+            "a live tree is still probed: {spawned:?}"
+        );
+        assert!(spawned.iter().any(|a| a.contains("rev-parse HEAD")));
         assert_eq!(row.head_sha.as_deref(), Some(head.as_str()));
         assert!(row.branch.is_some());
         assert_eq!(row.landed_in_main, Some(true));
         assert!(row.is_dirty_known);
-    }
-
-    struct CountingCycle {
-        starts: Vec<tokio::time::Instant>,
-        work: Duration,
-    }
-
-    impl PacedCycle for CountingCycle {
-        async fn run(&mut self) {
-            self.starts.push(tokio::time::Instant::now());
-            tokio::time::sleep(self.work).await;
-        }
-    }
-
-    #[test]
-    fn the_census_waits_a_full_interval_after_each_walk_ends() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .start_paused(true)
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            // A walk (10 min) far longer than the interval (5 min) — the
-            // measured shape. A fixed tick would restart it at once.
-            let mut c = CountingCycle {
-                starts: Vec::new(),
-                work: Duration::from_secs(600),
-            };
-            paced_census_loop(Duration::from_secs(300), Some(3), &mut c).await;
-            assert_eq!(c.starts.len(), 3);
-            for w in c.starts.windows(2) {
-                assert_eq!(
-                    w[1] - w[0],
-                    Duration::from_secs(900),
-                    "next walk starts one interval after the previous one ENDED"
-                );
-            }
-        });
     }
 }
