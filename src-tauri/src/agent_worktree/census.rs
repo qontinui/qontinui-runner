@@ -2460,7 +2460,7 @@ fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
     let open = crate::git_read::open(canonical).ok();
     let mut tally = crate::git_read::Tally::default();
     let branch = canonical_branch_with(open.as_ref(), canonical, &mut tally);
-    let trunk = crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical);
+    let trunk = crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical, &mut tally);
     compute_canonical_base_divergence_against(open.as_ref(), canonical, branch, trunk, &mut tally)
 }
 
@@ -2537,7 +2537,7 @@ fn resolve_walk_trunk_with(
     dir: &Path,
     tally: &mut crate::git_read::Tally,
 ) -> Option<super::census_memo::Trunk> {
-    let name = crate::git_trunk::resolve_trunk_ref_with(open, dir)?;
+    let name = crate::git_trunk::resolve_trunk_ref_with(open, dir, tally)?;
     let oid = crate::git_read::or_cli(
         open,
         tally,
@@ -2899,7 +2899,8 @@ fn enumerate_worktrees_seamed(
         // One open of the canonical checkout serves the trunk name and, after
         // the fetch, its commit (libgit2 re-reads refs from disk per lookup).
         let open = crate::git_read::open(canonical).ok();
-        let trunk = crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical);
+        let trunk =
+            crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical, &mut memo.git_reads);
         fetch_trunk(canonical, trunk.as_deref());
         // Seed the memo for this repo's common dir with the name just
         // resolved, so the walk does not resolve it a second time.

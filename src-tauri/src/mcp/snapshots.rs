@@ -584,7 +584,11 @@ fn resolve_base(
         // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
         // (Phase 4) this module carried a second resolver whose rungs differed.
         let workdir = repo.workdir().unwrap_or_else(|| repo.path());
-        let default = match crate::git_trunk::resolve_trunk_ref_with(Some(repo), workdir) {
+        let default = match crate::git_trunk::resolve_trunk_ref_with(
+            Some(repo),
+            workdir,
+            &mut crate::git_read::Tally::default(),
+        ) {
             Some(trunk) => match crate::git_trunk::trunk_branch_of(trunk.clone()) {
                 Some(name) => {
                     let tip = repo

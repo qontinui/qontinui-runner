@@ -136,28 +136,28 @@ fn host_git() -> Command {
 /// [`resolve_trunk_ref_with`] instead of opening it twice.
 pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
     let opened = crate::git_read::open(repo).ok();
-    resolve_trunk_ref_with(opened.as_ref(), repo)
+    resolve_trunk_ref_with(
+        opened.as_ref(),
+        repo,
+        &mut crate::git_read::Tally::default(),
+    )
 }
 
 /// [`resolve_trunk_ref`] over a repository the caller already opened (`None`
 /// when it did not open): the git2 rung first, the CLI rungs on any git2
-/// error.
+/// error. Which path answered is counted in `tally`, like every other
+/// [`crate::git_read::or_cli`] fact, so a pass's fallback report includes
+/// the trunk resolution.
 pub(crate) fn resolve_trunk_ref_with(
     open: Option<&git2::Repository>,
     repo: &Path,
+    tally: &mut crate::git_read::Tally,
 ) -> Option<String> {
     #[cfg(test)]
     resolutions::note();
-    if let Some(r) = open {
-        match crate::git_read::resolve_trunk_ref(r) {
-            Ok(trunk) => return trunk,
-            Err(e) => tracing::debug!(
-                "git_trunk: in-process resolution for {} declined ({e}); asking the CLI",
-                repo.display()
-            ),
-        }
-    }
-    resolve_trunk_ref_on(repo, &host_git)
+    crate::git_read::or_cli(open, tally, crate::git_read::resolve_trunk_ref, || {
+        resolve_trunk_ref_on(repo, &host_git)
+    })
 }
 
 /// The CLI rungs alone — the parity reference `git_read`'s tests compare the
@@ -246,8 +246,9 @@ pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
 pub(crate) fn resolve_trunk_branch_with(
     open: Option<&git2::Repository>,
     repo: &Path,
+    tally: &mut crate::git_read::Tally,
 ) -> Option<String> {
-    trunk_branch_of(resolve_trunk_ref_with(open, repo)?)
+    trunk_branch_of(resolve_trunk_ref_with(open, repo, tally)?)
 }
 
 /// `origin/<branch>` -> `<branch>`; `None` for a trunk on another remote.

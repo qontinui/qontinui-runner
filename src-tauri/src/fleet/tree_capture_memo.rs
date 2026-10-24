@@ -8,19 +8,31 @@
 //! not changed since the last one, so those two answers are reused while
 //!
 //! * the tree's FINGERPRINT is unchanged — `(mtime, length)` of its git dir's
-//!   `HEAD` and `index`, the worktree root's own mtime, and the commit HEAD
-//!   names (already read in-process, so a commit or reset made from another
-//!   worktree of the repository moves it too); and
+//!   `HEAD` and `index`, of the common dir's `info/exclude` and of the root
+//!   `.gitignore` (the two ignore files an operator edits to heal an
+//!   untracked-file report), the worktree root's own mtime, and the commit
+//!   HEAD names (already read in-process, so a commit or reset made from
+//!   another worktree of the repository moves it too); and
 //! * the cached answer is younger than `COORD_TREE_CAPTURE_MAX_AGE_SECS`
 //!   (default [`DEFAULT_MAX_AGE_SECS`]; `0` disables the reuse entirely).
 //!
-//! The fingerprint does not see an edit to an already-tracked file (it moves
-//! neither `index` nor the root's mtime), so `dirty` can lag by up to the max
-//! age. That is the bound D3 accepts: every consumer that MUTATES a tree
-//! re-checks live git at apply time (the pull executor's `symbolic-ref` +
-//! `status`, `restore_default`'s re-verification), and the in-process facts —
-//! HEAD, branch, the behind counts — are recomputed every capture, so they
-//! follow every fetch.
+//! ## What the fingerprint does not see
+//!
+//! A change that moves none of those is invisible until the max age expires,
+//! so `dirty`, `dirty_files` and `untracked_count` can lag by up to the max
+//! age after any of:
+//!
+//! * an edit to an already-tracked file (moves neither `index` nor the root);
+//! * a file created, deleted or renamed BELOW the root — that moves only its
+//!   own directory's mtime, and the fingerprint reads the root's alone;
+//! * an edit to a nested `.gitignore`, to `core.excludesFile`, or to any
+//!   config `status` reads.
+//!
+//! That is the bound D3 accepts: every consumer that MUTATES a tree re-checks
+//! live git at apply time (the pull executor's `symbolic-ref` + `status`,
+//! `restore_default`'s re-verification), and the in-process facts — HEAD,
+//! branch, the behind counts — are recomputed every capture, so they follow
+//! every fetch. Set the max age to `0` where a report must never lag.
 //!
 //! **An answer is stored only when the fingerprint did not move while it was
 //! captured.** `git status` can rewrite the index itself (refreshing stat
@@ -38,6 +50,11 @@ pub(super) const MAX_AGE_ENV: &str = "COORD_TREE_CAPTURE_MAX_AGE_SECS";
 
 /// The default reuse bound: five minutes — five 60 s publisher cycles.
 pub(super) const DEFAULT_MAX_AGE_SECS: u64 = 300;
+
+/// Entries kept before the memo is emptied. Directories the publisher no
+/// longer walks (a removed worktree) are never visited again, so without a
+/// bound their entries would live for the process's life.
+const MEMO_CAP: usize = 4096;
 
 /// The reuse bound `raw` (the env value) selects: `None` when the reuse is
 /// disabled (`0`), the default when unset or unparseable.
@@ -67,20 +84,25 @@ fn stamp(path: &Path) -> Stamp {
 pub(super) struct Fingerprint {
     head_file: Stamp,
     index_file: Stamp,
+    exclude_file: Stamp,
+    root_gitignore: Stamp,
     root_mtime: Option<SystemTime>,
     head_oid: String,
 }
 
 /// The fingerprint of the checkout at `dir` whose HEAD names `head_oid`;
 /// `None` — never reuse — when its git dir does not resolve or its `HEAD`
-/// file cannot be read.
+/// file cannot be read. An absent ignore file stamps as `None`, so creating
+/// one moves the fingerprint too.
 pub(super) fn fingerprint(dir: &Path, head_oid: &str) -> Option<Fingerprint> {
-    let git_dir = qontinui_runner_lib::git_layout::git_dir_for(dir)?;
+    let (git_dir, common_dir) = qontinui_runner_lib::git_layout::git_dir_and_common_dir(dir)?;
     let head_file = stamp(&git_dir.join("HEAD"));
     head_file?;
     Some(Fingerprint {
         head_file,
         index_file: stamp(&git_dir.join("index")),
+        exclude_file: stamp(&common_dir.join("info").join("exclude")),
+        root_gitignore: stamp(&dir.join(".gitignore")),
         root_mtime: std::fs::metadata(dir).ok().and_then(|m| m.modified().ok()),
         head_oid: head_oid.to_string(),
     })
@@ -149,6 +171,9 @@ impl CaptureMemo {
         let mut map = self.lock();
         match (&facts, before) {
             (Some(f), Some(fp)) if fingerprint(dir, head_oid).as_ref() == Some(&fp) => {
+                if map.len() >= MEMO_CAP && !map.contains_key(dir) {
+                    map.clear();
+                }
                 map.insert(
                     dir.to_path_buf(),
                     Entry {
@@ -277,6 +302,56 @@ mod tests {
             "root moved"
         );
         assert_eq!(captures, 5);
+    }
+
+    /// Editing an ignore file is how an operator heals an untracked-file
+    /// report, and an in-place edit moves neither `index` nor the root's
+    /// mtime — so the ignore files are in the fingerprint themselves.
+    #[test]
+    fn an_ignore_file_edit_forces_recapture() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = tree(t.path());
+        let gitignore = dir.join(".gitignore");
+        std::fs::write(&gitignore, b"a\n").unwrap();
+        let memo = CaptureMemo::new();
+        let now = Instant::now();
+        let mut captures = 0usize;
+        let cycle = |memo: &CaptureMemo, captures: &mut usize| {
+            memo.local_facts(&dir, OID, now, AGE, || {
+                *captures += 1;
+                Some(facts(*captures))
+            })
+        };
+        assert_eq!(cycle(&memo, &mut captures), Some(facts(1)));
+        assert_eq!(cycle(&memo, &mut captures), Some(facts(1)), "reused");
+
+        // An in-place edit of the root .gitignore (a different length, so
+        // the change is visible whatever the mtime granularity).
+        std::fs::write(&gitignore, b"a\nscratch/\n").unwrap();
+        assert_eq!(
+            cycle(&memo, &mut captures),
+            Some(facts(2)),
+            ".gitignore moved"
+        );
+        assert_eq!(cycle(&memo, &mut captures), Some(facts(2)), "reused");
+
+        // Creating, then editing, the common dir's info/exclude — inside the
+        // git dir, so the root's mtime cannot carry it.
+        let info = dir.join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), b"x\n").unwrap();
+        assert_eq!(
+            cycle(&memo, &mut captures),
+            Some(facts(3)),
+            "info/exclude created"
+        );
+        std::fs::write(info.join("exclude"), b"x\nscratch.txt\n").unwrap();
+        assert_eq!(
+            cycle(&memo, &mut captures),
+            Some(facts(4)),
+            "info/exclude edited"
+        );
+        assert_eq!(captures, 4);
     }
 
     #[test]

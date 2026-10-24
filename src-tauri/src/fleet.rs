@@ -4186,8 +4186,9 @@ fn capture_tree_counted(
 }
 
 /// [`capture_tree_counted`] with the in-process reads switchable: `false`
-/// answers every fact through its CLI fallback — the pre-Phase-4 capture,
-/// which the end-to-end parity test compares against.
+/// answers every fact through its CLI fallback and bypasses the
+/// unchanged-tree memo — the pre-Phase-4/5 capture, which the end-to-end
+/// parity test compares against.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -4277,14 +4278,20 @@ fn capture_tree_over(
     // Dirty status — `git status --porcelain=v1` is one line per change —
     // and the untracked count: the two facts still spawned, reused for a tree
     // whose fingerprint has not moved within COORD_TREE_CAPTURE_MAX_AGE_SECS
-    // (Phase 5, `tree_capture_memo`).
-    let local = tree_capture_memo::CaptureMemo::global().local_facts(
-        repo_path,
-        &head_sha,
-        std::time::Instant::now(),
-        tree_capture_memo::max_age(),
-        || capture_local_facts(repo_str),
-    )?;
+    // (Phase 5, `tree_capture_memo`). The CLI-only capture (`in_process ==
+    // false`, the parity reference) never touches the memo, so it always
+    // spawns both and cannot be answered by a git2 capture's stored entry.
+    let local = if in_process {
+        tree_capture_memo::CaptureMemo::global().local_facts(
+            repo_path,
+            &head_sha,
+            std::time::Instant::now(),
+            tree_capture_memo::max_age(),
+            || capture_local_facts(repo_str),
+        )?
+    } else {
+        capture_local_facts(repo_str)?
+    };
     let status_str = local.status_porcelain.as_str();
     let dirty_files: Vec<String> = status_str
         .lines()
@@ -4371,7 +4378,7 @@ fn capture_tree_over(
     // to `None` for every detached capture.
     // Resolved ONCE per capture (it was resolved twice: here and for
     // `local_ahead` below), in-process over the open repository.
-    let default_branch = crate::git_trunk::resolve_trunk_branch_with(open, repo_path)
+    let default_branch = crate::git_trunk::resolve_trunk_branch_with(open, repo_path, tally)
         .unwrap_or_else(|| "main".to_string());
     let remote_ref = if head_detached || branch == "(detached)" {
         format!("origin/{default_branch}")

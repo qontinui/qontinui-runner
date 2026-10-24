@@ -40,6 +40,16 @@
 //! rules, the dirty probe's carve-outs, patch ids — are what reclaim's G1 gate
 //! and coord's pull verdicts read, and nothing here proves parity for them.
 //!
+//! ## Cost
+//!
+//! The commit walks ([`is_ancestor`], [`ahead_behind`]) are unbounded, exactly
+//! as the `merge-base` / `rev-list` calls they replace are: a divergence of N
+//! commits walks O(N) commits in-process instead of in a child git. Their
+//! callers already run them where the CLI wait used to block (the census walk
+//! and the publisher's `spawn_blocking` capture), so a long walk costs the
+//! same thread it always did, minus the three processes. No cap is applied,
+//! because a capped count would be an answer the CLI does not give.
+//!
 //! ## Opening
 //!
 //! [`open`] is `git2::Repository::open(path)`: exactly that directory, no
@@ -86,9 +96,20 @@ fn found<T>(r: Result<T, git2::Error>) -> Read<Option<T>> {
 /// History the CLI reads differently than libgit2: `refs/replace/*` (git
 /// substitutes the replacement object; libgit2 does not), `info/grafts`, and a
 /// shallow clone's cut-off parents. Any of them sends commit reads to the CLI.
+///
+/// A linked worktree's `shallow` file lives in the COMMON dir, not in the
+/// worktree's own git dir, so both are checked: `Repository::is_shallow`
+/// reads only the latter in the libgit2 versions this crate has used. An
+/// unreadable `shallow` file is treated as shallow.
 fn plain_history(repo: &Repository) -> Read<()> {
     if repo.is_shallow() {
         return Err(unsupported("shallow repository"));
+    }
+    match std::fs::metadata(repo.commondir().join("shallow")) {
+        Ok(m) if m.len() > 0 => return Err(unsupported("shallow repository (common dir)")),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unsupported("an unreadable shallow file")),
     }
     if repo.commondir().join("info").join("grafts").exists() {
         return Err(unsupported("info/grafts present"));
@@ -126,12 +147,35 @@ fn shorten_unambiguous(repo: &Repository, full: &str) -> Read<String> {
     if short.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
         return Err(unsupported("a top-level-ref-shaped name"));
     }
+    // git's first rule reads `$GIT_DIR/<short>` as a file, and on a
+    // case-insensitive filesystem a branch named `head` finds `HEAD` there
+    // (the CLI then prints `heads/head`). Any FILE of that name in either git
+    // dir is left to the CLI.
+    if [repo.path(), repo.commondir()]
+        .iter()
+        .any(|d| d.join(short).is_file())
+    {
+        return Err(unsupported("a name a git-dir file shadows"));
+    }
     for prefix in earlier {
         if found(repo.find_reference(&format!("{prefix}{short}")))?.is_some() {
             return Err(unsupported("an ambiguous short ref name"));
         }
     }
     Ok(short.to_string())
+}
+
+/// `Err` when `target` — the target a symbolic ref names — is itself a
+/// symbolic ref. `git symbolic-ref` follows such a chain to its last ref
+/// (`HEAD` -> `refs/heads/alias` -> `refs/heads/main` prints `main`), and the
+/// reads here print only the first hop, so a chain goes to the CLI.
+fn not_a_symref_chain(repo: &Repository, target: &str) -> Read<()> {
+    if let Some(r) = found(repo.find_reference(target))? {
+        if r.kind() == Some(git2::ReferenceType::Symbolic) {
+            return Err(unsupported("a symbolic ref naming another symbolic ref"));
+        }
+    }
+    Ok(())
 }
 
 /// True for a spec git could read as an object id rather than a ref name.
@@ -175,13 +219,15 @@ fn resolve_commit(repo: &Repository, spec: &str) -> Read<Option<Oid>> {
 
 /// `git symbolic-ref --short HEAD`: the checked-out branch, or `None` when
 /// HEAD is detached (the CLI exits non-zero there). An unborn branch still has
-/// its name, as on the CLI.
+/// its name, as on the CLI. A HEAD naming another symbolic ref is `Err`
+/// ([`not_a_symref_chain`]).
 pub(crate) fn head_branch(repo: &Repository) -> Read<Option<String>> {
     let head = repo.find_reference("HEAD")?;
     let Some(target) = head.symbolic_target_bytes() else {
         return Ok(None);
     };
     let target = std::str::from_utf8(target).map_err(|_| unsupported("a non-UTF-8 HEAD target"))?;
+    not_a_symref_chain(repo, target)?;
     shorten_unambiguous(repo, target).map(Some)
 }
 
@@ -267,12 +313,14 @@ pub(crate) fn ahead_behind(repo: &Repository, a: &str, b: &str) -> Read<Option<(
 /// `refs/remotes/origin/HEAD`'s target, shortened as `symbolic-ref --short`
 /// prints it and verified to resolve; (2) `origin/main`, verified; (3) `None`.
 /// Same order and the same verification as the CLI rungs — a stale
-/// `origin/HEAD` naming a deleted branch falls through, never trusted.
+/// `origin/HEAD` naming a deleted branch falls through, never trusted. An
+/// `origin/HEAD` naming another symbolic ref is `Err` ([`not_a_symref_chain`]).
 pub(crate) fn resolve_trunk_ref(repo: &Repository) -> Read<Option<String>> {
     if let Some(head) = found(repo.find_reference("refs/remotes/origin/HEAD"))? {
         if let Some(target) = head.symbolic_target_bytes() {
             let target = std::str::from_utf8(target)
                 .map_err(|_| unsupported("a non-UTF-8 origin/HEAD target"))?;
+            not_a_symref_chain(repo, target)?;
             let short = shorten_unambiguous(repo, target)?;
             if resolve_ref(repo, &short)?.is_some() {
                 return Ok(Some(short));
@@ -549,9 +597,13 @@ mod tests {
         let head = head_oid(&repo).map_err(e("head"))?;
         let h = head.clone().unwrap_or_default();
         let anc = |a: &str, b: &str| -> Result<Option<bool>, String> {
-            // The CLI's "could not ask" (exit 128) is git2's `Err` here.
-            match (resolve_commit(&repo, a), resolve_commit(&repo, b)) {
-                (Ok(Some(_)), Ok(Some(_))) => is_ancestor(&repo, a, b)
+            // A side that names no ref is the CLI's "could not ask" (exit
+            // 128), so `None`; a git2 ERROR resolving either side is a
+            // decline and is reported, never folded into that `None`.
+            let ra = resolve_commit(&repo, a).map_err(|err| format!("resolve {a}: {err}"))?;
+            let rb = resolve_commit(&repo, b).map_err(|err| format!("resolve {b}: {err}"))?;
+            match (ra, rb) {
+                (Some(_), Some(_)) => is_ancestor(&repo, a, b)
                     .map(Some)
                     .map_err(|err| format!("is_ancestor({a}, {b}): {err}")),
                 _ => Ok(None),
@@ -822,6 +874,112 @@ mod tests {
         assert!(is_ancestor(&repo, "HEAD", "origin/main").is_err());
         assert!(ahead_behind(&repo, "origin/main", "HEAD").is_err());
         // Ref reads are unaffected by replacement and still answer.
+        assert!(head_oid(&repo).is_ok());
+    }
+
+    /// A symbolic ref naming another symbolic ref: `symbolic-ref --short`
+    /// follows the chain to its end, so git2 declines rather than print the
+    /// first hop — and the fact, through [`or_cli`], is the CLI's.
+    #[test]
+    fn a_symref_chain_falls_back_to_the_cli() {
+        let t = tempfile::tempdir().unwrap();
+        let c = clone_on_feature(t.path(), "main");
+        git(&c, &["symbolic-ref", "refs/heads/alias", "refs/heads/feature"]);
+        git(&c, &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        let repo = open(&c).unwrap();
+        assert!(head_branch(&repo).is_err(), "git2 must decline a HEAD chain");
+        let mut tally = Tally::default();
+        let got = or_cli(Some(&repo), &mut tally, head_branch, || {
+            cli(&c, &["symbolic-ref", "--short", "HEAD"])
+        });
+        assert_eq!(got.as_deref(), Some("feature"), "the CLI follows the chain");
+        assert_eq!(
+            tally,
+            Tally {
+                in_process: 0,
+                fell_back: 1
+            }
+        );
+
+        // origin/HEAD -> origin/trunk -> origin/main.
+        git(
+            &c,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/trunk",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(
+            &c,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert!(
+            resolve_trunk_ref(&repo).is_err(),
+            "git2 must decline an origin/HEAD chain"
+        );
+        assert_eq!(
+            crate::git_trunk::resolve_trunk_ref_cli(&c).as_deref(),
+            Some("origin/main"),
+            "premise: the CLI rung follows the chain"
+        );
+        assert_eq!(
+            crate::git_trunk::resolve_trunk_ref(&c).as_deref(),
+            Some("origin/main"),
+            "the public resolver still answers what the CLI answers"
+        );
+    }
+
+    /// A linked worktree of a shallow clone: git keeps `shallow` in the
+    /// COMMON dir, so the worktree's own git dir has none — the commit reads
+    /// must still decline.
+    #[test]
+    fn a_shallow_clones_linked_worktree_falls_back_to_the_cli() {
+        let t = tempfile::tempdir().unwrap();
+        let r = super::fixtures::remote(t.path(), "main");
+        // `--depth` needs a URL: a plain local path clones without it.
+        let p = r.to_str().unwrap().replace('\\', "/");
+        let url = if p.starts_with('/') {
+            format!("file://{p}")
+        } else {
+            format!("file:///{p}")
+        };
+        let s = t.path().join("shallow");
+        git(
+            t.path(),
+            &["clone", "-q", "--depth", "1", &url, s.to_str().unwrap()],
+        );
+        let wt = t.path().join("shallow-wt");
+        git(
+            &s,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let repo = open(&wt).unwrap();
+        // Premise: the file is in the common dir and NOT in the git dir.
+        assert!(
+            repo.commondir().join("shallow").is_file(),
+            "the common dir carries shallow"
+        );
+        assert!(
+            !repo.path().join("shallow").exists(),
+            "the worktree's git dir carries no shallow of its own"
+        );
+        assert!(head_commit(&repo).is_err(), "head_commit must decline");
+        assert!(is_ancestor(&repo, "HEAD", "origin/main").is_err());
+        assert!(ahead_behind(&repo, "origin/main", "HEAD").is_err());
+        // Ref reads do not walk history and still answer.
         assert!(head_oid(&repo).is_ok());
     }
 
