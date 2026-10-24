@@ -40,9 +40,10 @@ pub fn export_all_schemas() -> Value {
         image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
         projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
-        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        spec_check as qsc, spec_model as qspm, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -736,6 +737,25 @@ pub fn export_all_schemas() -> Value {
     add!("CompletenessVerdict", qcv::CompletenessVerdict);
     add!("SectionVerdict", qcv::SectionVerdict);
     add!("SpecSection", qcv::SpecSection);
+    // spec_model — spec-artifact frontmatter (plan 2026-10-10 spec front end
+    // phase 6, Phase 2).
+    add!("EarsPattern", qspm::EarsPattern);
+    add!("CriterionVerification", qspm::CriterionVerification);
+    add!("SpecFrontmatter", qspm::SpecFrontmatter);
+    add!("RequestFrontmatter", qspm::RequestFrontmatter);
+    add!("RequirementFrontmatter", qspm::RequirementFrontmatter);
+    add!(
+        "InterfaceMappingFrontmatter",
+        qspm::InterfaceMappingFrontmatter
+    );
+    add!("StoryFrontmatter", qspm::StoryFrontmatter);
+    add!("SpecAcceptanceCriterion", qspm::SpecAcceptanceCriterion);
+    add!("SourceCitation", qspm::SourceCitation);
+    add!("SourceCitationKind", qspm::SourceCitationKind);
+    add!("ExternalRef", qspm::ExternalRef);
+    add!("TemplateRef", qspm::TemplateRef);
+    add!("MappingRow", qspm::MappingRow);
+    add!("SpecLanguage", qspm::SpecLanguage);
     add!("ProvenanceMix", qcv::ProvenanceMix);
     add!("CoverageGap", qcv::CoverageGap);
     add!("GapReason", qcv::GapReason);
