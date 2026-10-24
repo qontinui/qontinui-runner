@@ -80,24 +80,77 @@ pub(crate) fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String>
 ///
 /// Same blank-skipping rule as [`resolve_page_label`]: a whitespace-only
 /// candidate falls through instead of shadowing the next source.
+///
+/// Defence in depth: the `pageContext.name` arm is REFUSED when the name
+/// mirrors the pathname ([`name_mirrors_pathname`]) — the shape a generated
+/// `usePageContext({ name: pathname })` produces. The contract's guarantee is
+/// still the producer's (the hook-gen prompt never teaches a pathname-derived
+/// name); this only catches the verbatim and slug-equal forms. The co-occurrence
+/// resolver is unchanged by it: a refused name falls through to its pathname
+/// arm, which yields the same slug.
 pub(crate) fn resolve_declared_page_label(snapshot: &serde_json::Value) -> Option<String> {
     let page_context = snapshot.get("page").and_then(|p| p.get("pageContext"));
+    fn non_blank(v: Option<&serde_json::Value>) -> Option<&str> {
+        v.and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
+    }
 
-    let candidates = [
+    if let Some(id) = non_blank(
         page_context
             .and_then(|c| c.get("meta"))
             .and_then(|m| m.get("tabId")),
-        snapshot.get("activeTab"),
-        page_context.and_then(|c| c.get("name")),
-    ];
+    )
+    .or_else(|| non_blank(snapshot.get("activeTab")))
+    {
+        return Some(pathname_to_spec_id(id));
+    }
 
-    let raw = candidates
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .find(|s| !s.trim().is_empty())?;
+    let name = non_blank(page_context.and_then(|c| c.get("name")))?;
+    if name_mirrors_pathname(snapshot, name) {
+        return None;
+    }
+    Some(pathname_to_spec_id(name))
+}
 
-    Some(pathname_to_spec_id(raw))
+/// True when a page NAME (`pageContext.name`, or a SemanticSnapshot's
+/// `page.pageName`) is the snapshot's own `page.pathname` in disguise: equal
+/// to it verbatim, or slugging to the same id (`/search/secret` and
+/// `search-secret` both slug to `search-secret`). Such a name may carry user
+/// input, so the journey ledger must not store it as a `pageLabel`.
+///
+/// The one exception is a STATIC route the router vouches for: when
+/// `page.route.patternSource` is `"router"` and `page.route.pattern` equals
+/// the pathname, the path has no dynamic segment, so it carries no user input
+/// and a name that mirrors it (`"Settings"` on `/settings`) is kept. Without
+/// that assertion a string cannot tell `/settings` from `/<secret>`, so the
+/// name is refused — fail closed.
+///
+/// A tripwire, not a proof: a name built from PART of the path
+/// (`pathname.split('/')[2]`) is not caught.
+pub(crate) fn name_mirrors_pathname(snapshot: &serde_json::Value, name: &str) -> bool {
+    let page = snapshot.get("page");
+    let Some(pathname) = page
+        .and_then(|p| p.get("pathname"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let name = name.trim();
+    if name != pathname && pathname_to_spec_id(name) != pathname_to_spec_id(pathname) {
+        return false;
+    }
+    let route = page.and_then(|p| p.get("route"));
+    let router_static = route
+        .and_then(|r| r.get("patternSource"))
+        .and_then(|v| v.as_str())
+        == Some("router")
+        && route
+            .and_then(|r| r.get("pattern"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            == Some(pathname);
+    !router_static
 }
 
 /// Resolve the app that produced this snapshot, from the snapshot itself.
@@ -758,6 +811,73 @@ mod tests {
             resolve_page_label(&snap).as_deref(),
             Some("search-secret"),
             "the co-occurrence resolver's pathname arm must be unchanged"
+        );
+    }
+
+    #[test]
+    fn declared_label_refuses_a_name_that_mirrors_the_pathname() {
+        // `usePageContext({ name: pathname })` — verbatim and slug-equal forms.
+        for name in [
+            "/search/JP2SENTINEL",
+            "search-jp2sentinel",
+            "Search JP2SENTINEL",
+        ] {
+            let snap = json!({
+                "page": { "pathname": "/search/JP2SENTINEL", "pageContext": { "name": name } }
+            });
+            assert_eq!(resolve_declared_page_label(&snap), None, "{name:?}");
+            // The co-occurrence resolver falls through to the same slug.
+            assert_eq!(
+                resolve_page_label(&snap).as_deref(),
+                Some("search-jp2sentinel")
+            );
+        }
+        // An unasserted or dynamic route does not vouch for the path.
+        for route in [
+            json!({ "pattern": "/settings" }),
+            json!({ "pattern": "/[page]", "patternSource": "router" }),
+        ] {
+            let snap = json!({
+                "page": { "pathname": "/settings", "route": route,
+                          "pageContext": { "name": "Settings" } }
+            });
+            assert_eq!(resolve_declared_page_label(&snap), None);
+        }
+    }
+
+    #[test]
+    fn declared_label_keeps_a_fixed_name_and_a_router_static_route() {
+        let fixed = json!({
+            "page": { "pathname": "/search/JP2SENTINEL", "pageContext": { "name": "Search" } }
+        });
+        assert_eq!(
+            resolve_declared_page_label(&fixed).as_deref(),
+            Some("search")
+        );
+        let fallback = json!({
+            "page": { "pathname": "/search/JP2SENTINEL", "pageContext": { "name": "Unknown" } }
+        });
+        assert_eq!(
+            resolve_declared_page_label(&fallback).as_deref(),
+            Some("unknown")
+        );
+        let static_route = json!({
+            "page": { "pathname": "/settings",
+                      "route": { "pattern": "/settings", "patternSource": "router" },
+                      "pageContext": { "name": "Settings" } }
+        });
+        assert_eq!(
+            resolve_declared_page_label(&static_route).as_deref(),
+            Some("settings")
+        );
+        // An id arm is never refused: a tab id is not user input.
+        let tab = json!({
+            "activeTab": "settings",
+            "page": { "pathname": "/settings", "pageContext": { "name": "Settings" } }
+        });
+        assert_eq!(
+            resolve_declared_page_label(&tab).as_deref(),
+            Some("settings")
         );
     }
 

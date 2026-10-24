@@ -108,6 +108,13 @@ interface DeveloperPageContext {
 }
 \`\`\`
 
+**\`name\` is never derived from the pathname.** The runner slugs \`name\` into
+the journey ledger's page label, so a name taken from the pathname on \`/search/<what the user
+typed>\` stores \`search-<what the user typed>\`. Map each route you found to a
+FIXED name, and give every route you did not map the fixed fallback
+\`{ name: 'Unknown', section: 'unknown' }\` — never the pathname, raw or
+transformed.
+
 ### useUIState(options: UseUIStateOptions): UseUIStateReturn
 Registers a UI state with UI Bridge for state management.
 
@@ -294,7 +301,7 @@ Without \`not-found.tsx\` marking the signal, a 404 reports its concrete path
 as a router pattern. Never write \`pattern: pathname\` — the pathname is user
 input, not a pattern.
 
-For page context, derive the page name from the pathname:
+For page context, map each known route to a FIXED semantic name:
 \`\`\`tsx
 const pathname = usePathname();
 
@@ -303,7 +310,8 @@ const pageInfo = useMemo(() => {
   if (pathname === '/') return { name: 'Home', section: 'main' };
   if (pathname.startsWith('/dashboard')) return { name: 'Dashboard', section: 'dashboard' };
   // ... more routes
-  return { name: pathname, section: 'unknown' };
+  // Unmapped: a FIXED name. Never the pathname — it carries user input.
+  return { name: 'Unknown', section: 'unknown' };
 }, [pathname]);
 
 usePageContext(pageInfo);
@@ -367,15 +375,89 @@ in a data router an unmatched URL still yields \`[root]\`. If the root route's
 Never write \`pattern: location.pathname\` or a match's \`pathname\` — both are
 the URL the user is on, not a pattern.
 
-For page context, derive from the current route:
+For page context, map each known route to a FIXED semantic name:
 \`\`\`tsx
 const location = useLocation();
 
 const pageInfo = useMemo(() => {
   if (location.pathname === '/') return { name: 'Home', section: 'main' };
   // ... map routes to semantic names
-  return { name: location.pathname, section: 'unknown' };
+  // Unmapped: a FIXED name. Never the pathname — it carries user input.
+  return { name: 'Unknown', section: 'unknown' };
 }, [location.pathname]);
+
+usePageContext(pageInfo);
+\`\`\`
+`.trim();
+
+/**
+ * The Expo Router route-awareness recipe, shared by the integration guidance
+ * and the RN route-awareness category. It teaches the SDK's own helpers
+ * (`@qontinui/ui-bridge-native` `react/routePattern.ts`): they derive the
+ * template from `useSegments()` and fail closed to `null`, so the generated
+ * code never builds a pattern by hand and never touches the pathname.
+ * The hook and helpers first shipped together in ui-bridge-native 0.6.16
+ * (ui-bridge 9e5515f / bbe7d7a).
+ */
+const EXPO_ROUTE_AWARENESS = `
+\`\`\`tsx
+// app/_layout.tsx — mount <RouteAwareness /> once, inside UIBridgeNativeProvider
+import { useSegments } from 'expo-router';
+import {
+  expoRouterPattern,
+  expoRouterRouteStack,
+  isExpoRouterUnmatched,
+  useRouteAwareness,
+} from '@qontinui/ui-bridge-native';
+
+function RouteAwareness() {
+  const segments = useSegments(); // the FILE route: ["runner", "[id]"], never "42"
+  useRouteAwareness(
+    {
+      // "/runner/[id]"; null on +not-found or a segment that is not a route name.
+      pattern: expoRouterPattern(segments),
+      patternSource: 'router',
+      routeStack: expoRouterRouteStack(segments),
+    },
+    // +not-found: the hook reports pattern: null and drops params.
+    { unmatched: isExpoRouterUnmatched(segments) },
+  );
+  return null;
+}
+\`\`\`
+
+Use the SDK helpers; do not build the pattern by hand. Never write
+\`pattern: pathname\` or \`pattern: usePathname()\` — the pathname is user input,
+not a pattern — and do not pass \`useLocalSearchParams()\` as \`params\` from the
+root layout. Do NOT import \`@qontinui/ui-bridge/react\` in a React Native app: it
+is the DOM barrel, and \`@qontinui/ui-bridge\` is only an optional peer of
+\`@qontinui/ui-bridge-native\`. \`useRouteAwareness\`, \`expoRouterPattern\`,
+\`expoRouterRouteStack\` and \`isExpoRouterUnmatched\` are all exported by
+\`@qontinui/ui-bridge-native\` 0.6.16 and later. If the installed version is
+older, upgrade it; if you cannot, skip route awareness and say so rather than
+hand-building a pattern or importing it from elsewhere.
+`.trim();
+
+/**
+ * The Expo Router page-context recipe: the page name keys on the route
+ * TEMPLATE (`expoRouterPattern(useSegments())`), and every unmapped route gets
+ * a FIXED fallback name. The runner slugs `pageContext.name` into the journey
+ * ledger's `pageLabel`, so a pathname-derived name would store user input.
+ */
+const EXPO_PAGE_CONTEXT_BODY = `
+\`\`\`tsx
+import { useMemo } from 'react';
+import { useSegments } from 'expo-router';
+import { expoRouterPattern, usePageContext } from '@qontinui/ui-bridge-native';
+
+const route = expoRouterPattern(useSegments()); // "/(tabs)/prompts", "/runner/[id]", or null
+const pageInfo = useMemo(() => {
+  if (route === '/connect') return { name: 'Connect', section: 'onboarding' };
+  if (route === '/(tabs)/prompts') return { name: 'Prompts', section: 'tabs' };
+  // ... cover every screen file you found in app/
+  // Unmapped: a FIXED name. Never the pathname — it carries user input.
+  return { name: 'Unknown', section: 'unknown' };
+}, [route]);
 
 usePageContext(pageInfo);
 \`\`\`
@@ -394,50 +476,14 @@ it onto the host component along with \`ref\` and \`onLayout\`.
 For route awareness, use Expo Router hooks (NOT \`react-router-dom\`, NOT
 \`next/navigation\`):
 
-\`\`\`tsx
-import { useSegments, useLocalSearchParams } from 'expo-router';
-import { useRouteAwareness } from '@qontinui/ui-bridge-native';
+${EXPO_ROUTE_AWARENESS}
 
-const segments = useSegments(); // the FILE route: ["runner", "[id]"], never "42"
-const params = useLocalSearchParams();
+For page context, map Expo Router file routes to FIXED semantic names, keyed
+on the route template \`expoRouterPattern(useSegments())\` returns
+(\`app/connect.tsx\` → \`/connect\`, \`app/(tabs)/prompts.tsx\` →
+\`/(tabs)/prompts\`, \`app/runner/[id].tsx\` → \`/runner/[id]\`):
 
-// Expo Router's segments ARE the route template (expo-router's own docs:
-// app/profile/[user].tsx -> ["profile", "[user]"]), so the pattern is built
-// from them — no pathname, no helper. The unmatched route's segment is
-// \`+not-found\` (NOT_FOUND_ROUTE_NAME): report null there.
-const unmatched = segments.some((s) => s.startsWith('+'));
-
-useRouteAwareness({
-  pattern: unmatched ? null : '/' + segments.join('/'),
-  patternSource: 'router',
-  params: params as Record<string, string>,
-  routeStack: segments,
-});
-\`\`\`
-
-Never write \`pattern: pathname\` or \`pattern: usePathname()\` — the pathname
-is user input, not a pattern. Do NOT import \`@qontinui/ui-bridge/react\` in a
-React Native app: it is the DOM barrel, and \`@qontinui/ui-bridge\` is only an
-optional peer of \`@qontinui/ui-bridge-native\`. Before generating this call,
-check that the installed \`@qontinui/ui-bridge-native\` actually exports
-\`useRouteAwareness\` (the current ui-bridge-native, 0.6.15, does not); if it does not, skip route awareness
-and say so rather than importing it from elsewhere.
-
-For page context, map Expo Router file-based routes to semantic names:
-
-\`\`\`tsx
-// app/connect.tsx          → "/connect"
-// app/(tabs)/prompts.tsx   → "/(tabs)/prompts"
-// app/runner/[id].tsx      → "/runner/:id"
-const pathname = usePathname();
-const pageInfo = useMemo(() => {
-  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
-  // ... map routes to semantic names
-  return { name: pathname, section: 'unknown' };
-}, [pathname]);
-
-usePageContext(pageInfo);
-\`\`\`
+${EXPO_PAGE_CONTEXT_BODY}
 
 **Modal-presentation \`Stack.Screen\`s are still pages** — register them with
 \`usePageContext\` just like normal screens.
@@ -619,34 +665,7 @@ Generate: A single \`useRouteAwareness()\` call in a top-level component
 (typically \`app/_layout.tsx\` or a child of the \`UIBridgeProvider\`) that
 provides the full route info from \`expo-router\` hooks.
 
-\`\`\`tsx
-import { useSegments, useLocalSearchParams } from 'expo-router';
-import { useRouteAwareness } from '@qontinui/ui-bridge-native';
-
-const segments = useSegments(); // the FILE route: ["runner", "[id]"], never "42"
-const params = useLocalSearchParams();
-
-// Expo Router's segments ARE the route template (expo-router's own docs:
-// app/profile/[user].tsx -> ["profile", "[user]"]), so the pattern is built
-// from them — no pathname, no helper. The unmatched route's segment is
-// \`+not-found\` (NOT_FOUND_ROUTE_NAME): report null there.
-const unmatched = segments.some((s) => s.startsWith('+'));
-
-useRouteAwareness({
-  pattern: unmatched ? null : '/' + segments.join('/'),
-  patternSource: 'router',
-  params: params as Record<string, string>,
-  routeStack: segments,
-});
-\`\`\`
-
-Never write \`pattern: pathname\` or \`pattern: usePathname()\` — the pathname
-is user input, not a pattern. Do NOT import \`@qontinui/ui-bridge/react\` in a
-React Native app: it is the DOM barrel, and \`@qontinui/ui-bridge\` is only an
-optional peer of \`@qontinui/ui-bridge-native\`. Before generating this call,
-check that the installed \`@qontinui/ui-bridge-native\` actually exports
-\`useRouteAwareness\` (the current ui-bridge-native, 0.6.15, does not); if it does not, skip route awareness
-and say so rather than importing it from elsewhere.
+${EXPO_ROUTE_AWARENESS}
 
 **Do NOT use** \`useLocation()\` (that's react-router-dom) or
 \`next/navigation\` hooks — they don't exist in Expo.
@@ -660,7 +679,7 @@ Look for:
 - File-based route conventions:
   - \`app/foo.tsx\` → route \`/foo\`
   - \`app/(tabs)/bar.tsx\` → route \`/(tabs)/bar\` (group prefix is part of the path)
-  - \`app/[id].tsx\` → dynamic route \`/:id\`
+  - \`app/[id].tsx\` → dynamic route \`/[id]\`
   - \`app/index.tsx\` → \`/\`
 - Modal-presentation \`<Stack.Screen options={{ presentation: 'modal' }} />\`
   declarations — these are still distinct pages, not state-machine modals.
@@ -668,23 +687,12 @@ Look for:
   main app, \`(auth)\` is the auth flow).
 
 Generate: A \`usePageContext()\` call that derives the page name and section
-from \`usePathname()\`. Use a \`useMemo\` keyed on \`pathname\` with a mapping
-of every real route the app exposes — not guessed routes.
+from the route TEMPLATE, \`expoRouterPattern(useSegments())\` — never from
+\`usePathname()\`. Use a \`useMemo\` keyed on that template with a mapping of
+every real route the app exposes — not guessed routes — and the fixed fallback
+\`{ name: 'Unknown', section: 'unknown' }\` for the rest.
 
-\`\`\`tsx
-import { usePathname } from 'expo-router';
-import { usePageContext } from '@qontinui/ui-bridge-native';
-
-const pathname = usePathname();
-const pageInfo = useMemo(() => {
-  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
-  if (pathname === '/(tabs)/prompts') return { name: 'Prompts', section: 'tabs' };
-  // ... cover every screen file you found in app/
-  return { name: pathname, section: 'unknown' };
-}, [pathname]);
-
-usePageContext(pageInfo);
-\`\`\`
+${EXPO_PAGE_CONTEXT_BODY}
 
 There is no \`document.title\` in React Native — derive everything from the
 file-based routes you found in \`app/\`.

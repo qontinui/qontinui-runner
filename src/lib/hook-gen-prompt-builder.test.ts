@@ -174,9 +174,7 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
   const frameworks = ["nextjs", "react", "expo_router"];
 
   for (const framework of frameworks) {
-    const prompt = buildHookGenPrompt({ framework, project_path: "/x" }, [
-      "route-awareness",
-    ]);
+    const prompt = buildHookGenPrompt({ framework, project_path: "/x" }, ["route-awareness"]);
 
     it(`${framework}: asserts patternSource router`, () => {
       expect(prompt).toContain("patternSource: 'router'");
@@ -184,9 +182,7 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
 
     it(`${framework}: never generates a pathname as the pattern`, () => {
       // Code only: prose that names the anti-pattern in backticks is allowed.
-      expect(prompt).not.toMatch(
-        /(?<!`)pattern:\s*(location\.)?(pathname|usePathname\(\))(?!`)/,
-      );
+      expect(prompt).not.toMatch(/(?<!`)pattern:\s*(location\.)?(pathname|usePathname\(\))(?!`)/);
       expect(prompt).not.toMatch(/pattern: matches\[/);
       expect(prompt).not.toContain("routeStack: matches.map(m => m.pathname)");
       expect(prompt).not.toContain("matched: matches.length > 0");
@@ -207,7 +203,7 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
     expect(prompt).toContain("useMarkRouteUnmatched();");
   });
 
-  it("react router guidance requires a path=\"*\" route marking the signal", () => {
+  it('react router guidance requires a path="*" route marking the signal', () => {
     const prompt = buildHookGenPrompt({ framework: "react", project_path: "/x" }, [
       "route-awareness",
     ]);
@@ -217,7 +213,7 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
     expect(prompt).toContain("templates the path as `[...*]`");
   });
 
-  it("expo guidance builds the pattern from useSegments without the DOM barrel", () => {
+  it("expo guidance teaches the SDK route helpers, not a hand-built pattern", () => {
     const prompt = buildHookGenPrompt({ framework: "expo_router", project_path: "/x" }, [
       "route-awareness",
     ]);
@@ -225,9 +221,56 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
     expect(start).toBeGreaterThanOrEqual(0);
     const end = prompt.indexOf("\n### ", start + 1);
     const section = prompt.slice(start, end === -1 ? undefined : end);
-    expect(section).toContain("pattern: unmatched ? null : '/' + segments.join('/')");
+    for (const helper of ["expoRouterPattern", "expoRouterRouteStack", "isExpoRouterUnmatched"]) {
+      expect(section).toContain(`  ${helper},\n`);
+    }
+    expect(section).toContain("pattern: expoRouterPattern(segments),");
+    expect(section).toContain("routeStack: expoRouterRouteStack(segments),");
+    expect(section).toContain("{ unmatched: isExpoRouterUnmatched(segments) },");
+    expect(section).not.toContain("segments.join('/')");
+    expect(section).not.toContain("useLocalSearchParams()\n");
+    // The SDK DOES export the hook: the old "0.6.15 does not" claim is false.
+    expect(prompt).not.toMatch(/does not\)?;? if it does not, skip/);
+    expect(prompt).not.toContain("0.6.15");
+    expect(section).toContain("`@qontinui/ui-bridge-native` 0.6.16 and later");
     // The section's code imports no DOM barrel (prose may name it as a warning).
     expect(section).not.toMatch(/^import .* from '@qontinui\/ui-bridge\/react'/m);
     expect(section).not.toContain("routePatternFromParams(");
+  });
+});
+
+/**
+ * The runner slugs `pageContext.name` into the journey ledger's `pageLabel`
+ * (`state_discovery/capture.rs`, `spec_api/slug.rs`), so `name: pathname` on
+ * `/search/<secret>` stores `search-<secret>`. The contract forbids deriving
+ * `pageLabel` from the pathname in any form: the prompt must teach a FIXED
+ * fallback name.
+ */
+describe("buildHookGenPrompt — page names never come from the pathname", () => {
+  const frameworks = ["nextjs", "next_js", "react", "expo_router", "react_native", "vue"];
+
+  for (const framework of frameworks) {
+    const prompt = buildHookGenPrompt({ framework, project_path: "/x" }, [
+      "route-awareness",
+      "page-context",
+    ]);
+
+    it(`${framework}: no page name is the pathname`, () => {
+      expect(prompt).not.toMatch(/name:\s*(location\.)?pathname/);
+      expect(prompt).not.toMatch(/name:\s*usePathname\(\)/);
+    });
+
+    it(`${framework}: teaches the fixed fallback name`, () => {
+      expect(prompt).toContain("{ name: 'Unknown', section: 'unknown' }");
+    });
+  }
+
+  it("expo page context keys on the route template, not usePathname", () => {
+    const prompt = buildHookGenPrompt({ framework: "expo_router", project_path: "/x" }, [
+      "page-context",
+    ]);
+    expect(prompt).toContain("const route = expoRouterPattern(useSegments());");
+    expect(prompt).toContain("}, [route]);");
+    expect(prompt).not.toContain("const pathname = usePathname();");
   });
 });

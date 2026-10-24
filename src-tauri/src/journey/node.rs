@@ -13,7 +13,9 @@
 //! Nothing a row can carry is read from user input:
 //! - `pageLabel` comes from [`resolve_declared_page_label`] (tabId → activeTab →
 //!   slugged `pageContext.name`), or on a `SemanticSnapshot` from the slugged
-//!   `page.pageName` — never from `page.pathname`, raw or slugged;
+//!   `page.pageName` — never from `page.pathname`, raw or slugged. A NAME that
+//!   mirrors the pathname (`usePageContext({ name: pathname })`) is refused too
+//!   ([`name_mirrors_pathname`], a defence-in-depth tripwire);
 //! - `pathnameTemplate` is only ever a route PATTERN the app ASSERTS came from
 //!   its router: `page.route.pattern` is kept only when `page.route` also
 //!   carries `patternSource: "router"`, and is never derived. A string cannot
@@ -38,7 +40,9 @@ use qontinui_types::journey::JourneyNode;
 use qontinui_types::spec_check::{ClassificationStatus, SpecCheckResult};
 
 use crate::spec_api::slug::pathname_to_spec_id;
-use crate::state_discovery::capture::{resolve_declared_page_label, resolve_page_label};
+use crate::state_discovery::capture::{
+    name_mirrors_pathname, resolve_declared_page_label, resolve_page_label,
+};
 use crate::state_discovery::fingerprint::{extract_role, stable_element_fingerprint};
 
 /// The classification a state must carry to count as PRESENT in a node.
@@ -87,8 +91,9 @@ fn non_blank(v: Option<&serde_json::Value>) -> Option<&str> {
 /// route pattern has no producer that asserts it, so it is never read.
 pub(crate) fn page_identity(snapshot: &serde_json::Value) -> PageIdentity {
     let page = snapshot.get("page");
-    let semantic_page_name =
-        non_blank(page.and_then(|p| p.get("pageName"))).map(pathname_to_spec_id);
+    let semantic_page_name = non_blank(page.and_then(|p| p.get("pageName")))
+        .filter(|name| !name_mirrors_pathname(snapshot, name))
+        .map(pathname_to_spec_id);
 
     let page_label = resolve_declared_page_label(snapshot).or(semantic_page_name);
     let spec_lookup_label = page_label.clone().or_else(|| resolve_page_label(snapshot));
@@ -668,6 +673,23 @@ mod tests {
             "the SemanticSnapshot pattern has no asserting producer (D1)"
         );
         assert!(!id.template_untrusted, "the arm is not read at all");
+    }
+
+    #[test]
+    fn page_identity_refuses_a_page_name_that_mirrors_the_pathname() {
+        // `usePageContext({ name: pathname })` on both snapshot shapes: the
+        // runner slugs the name, so it would store `search-<secret>`.
+        for snap in [
+            json!({ "page": { "pathname": "/search/JP2SENTINEL",
+                              "pageContext": { "name": "/search/JP2SENTINEL" } } }),
+            json!({ "page": { "pathname": "/search/JP2SENTINEL",
+                              "pageName": "/search/JP2SENTINEL" } }),
+        ] {
+            let id = page_identity(&snap);
+            assert_eq!(id.page_label, None, "{snap}");
+            let node = build_node(&id, &SpecLookup::NoSpec);
+            assert!(!node.key().to_lowercase().contains("jp2sentinel"));
+        }
     }
 
     #[test]
