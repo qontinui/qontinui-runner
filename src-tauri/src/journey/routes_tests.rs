@@ -478,7 +478,7 @@ fn a_truncated_read_never_lists_a_dead_end_as_measured() {
 }
 
 #[test]
-fn prior_knowledge_is_measured_only_behind_a_closed_settle_gate() {
+fn prior_knowledge_is_never_measured_beside_an_open_frontier() {
     // C arrives only by a typed URL; A -> B is an affordance edge.
     let edges = vec![
         edge(1, "a", Some("b"), "affordance", "changed", "fp-a1"),
@@ -701,4 +701,37 @@ fn edge_timing_applies_trust_before_withdrawal() {
     );
     assert_eq!(v["value"]["rowsRejected"], 1, "{v:#}");
     assert_eq!(v["value"]["edgesInvalidated"], 0, "{v:#}");
+}
+
+#[test]
+fn prior_knowledge_is_measured_for_settled_nodes_despite_an_unrelated_doubt() {
+    // C arrives only by a typed URL. An explorer click A -> B is filtered out
+    // by ?run_kind=agent_action: a doubt about B (and an open graph-wide
+    // settle gate), not about C.
+    let mut filtered = edge(3, "a", Some("b"), "affordance", "changed", "fp-a2");
+    filtered.run_kind = RunKind::Explorer;
+    let edges = vec![
+        edge(1, "a", Some("b"), "affordance", "changed", "fp-a1"),
+        edge(2, "x", Some("c"), "push", "changed", "fp-x1"),
+        filtered,
+    ];
+    let filter = JourneyFilter {
+        run_kind: Some(RunKind::AgentAction),
+        ..JourneyFilter::default()
+    };
+    let g = build_graph(&edges, &[], &writing(), &filter);
+    let p = requires_prior_knowledge(&g);
+    assert!(
+        p.nodes.iter().any(|n| n.node_key == key("c")),
+        "the shared crate settles C: {p:?}"
+    );
+    assert!(
+        p.frontier.unsettled_because(&g.coverage, true).is_some(),
+        "the whole-graph gate is open, which must not void C"
+    );
+    let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+    assert_eq!(status(&v), "measured", "{v:#}");
+    // Over a read gap the same list is unknown.
+    let v = answer_prior_knowledge(&gappy("prior-knowledge"), &g);
+    assert_eq!(status(&v), "unknown", "{v:#}");
 }

@@ -350,10 +350,6 @@ enum Positive {
     /// make a listed node false, so the listing is `unknown` whenever the read
     /// has a gap, with the listing in `provenance.source.result`.
     Listing,
-    /// A [`Positive::Listing`] that is ALSO void while the shared settle gate
-    /// is open (`unsettled_because(&coverage, true)` names a code): every
-    /// listed node is an inference over the whole graph.
-    SettledListing,
 }
 
 /// The one rule (module doc): positive → measured, subject to `kind`;
@@ -396,16 +392,13 @@ fn answer<T: Serialize>(
     }
     let result_value = serde_json::to_value(result).unwrap_or(Value::Null);
 
-    // A listing over a gappy read, or a settled-listing over an open gate,
-    // is never measured: it falls through to the negative path, which names
-    // the gate's code or the first gap's and never answers `absent` (the
-    // unmeasured list is non-empty in both cases).
-    let gate_open = frontier.unsettled_because(coverage, true).is_some();
+    // A listing over a gappy read is never measured: it falls through to the
+    // negative path, which names the first gap's code and never answers
+    // `absent` (the unmeasured list is non-empty).
     let positive = positive
         && match kind {
             Positive::Witnessed => true,
             Positive::Listing => !ctx.gaps.any(),
-            Positive::SettledListing => !ctx.gaps.any() && !gate_open,
         };
     if positive {
         let prov = prov.with_source(source_of(ctx.query, ctx.app_id, None));
@@ -559,22 +552,21 @@ pub(crate) fn answer_dead_ends(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Val
     )
 }
 
-/// `prior-knowledge`: measured iff at least one node needs prior knowledge,
-/// the read has no gap, AND the shared settle gate is closed
-/// ([`Positive::SettledListing`]) — "no affordance arrives here" is a claim
-/// about the whole graph, so any unexplored part can falsify it.
+/// `prior-knowledge`: measured iff the shared crate lists at least one
+/// SETTLED node and the read has no gap ([`Positive::Listing`]).
 ///
-/// The shared crate already splits qualifying nodes: `nodes` are settled
-/// against every row the graph left out, `unsettled` are not. That split
-/// does NOT cover the open frontier (an unexplored affordance could lead into
-/// a listed node), so the whole-graph gate still applies to `nodes`. When the
-/// gate is closed and the read has no gap, `nodes` is `measured` — each one
-/// individually settled — and a non-empty `unsettled` DEGRADES it through an
+/// `requires_prior_knowledge` decides settledness per node — against every
+/// row the graph left out, a non-writing ledger, and any open or rejected
+/// frontier (all of which put every candidate in `unsettled`) — so `nodes`
+/// is trusted as the shared crate states it and no runner-side whole-graph
+/// gate is layered on top (it would void a settled node over an unrelated
+/// doubt, such as an unobserved departure elsewhere). A non-empty
+/// `unsettled` DEGRADES a measured `nodes` through an
 /// `unsettled_prior_knowledge_nodes` dimension rather than voiding it:
-/// demoting a settled node because a different node is doubtful would hide a
-/// true finding, while the degradation keeps "this list may be incomplete"
-/// on the wire. With no settled node, the answer is never `absent` while
-/// anything is unsettled.
+/// demoting a node that is settled on its own because a different node is
+/// doubtful would hide a true finding, while the degradation keeps "this
+/// list may be incomplete" on the wire. With no settled node the answer is
+/// never `absent` while anything is unsettled.
 pub(crate) fn answer_prior_knowledge(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
     let p = requires_prior_knowledge(graph);
     let positive = !p.nodes.is_empty();
@@ -591,7 +583,7 @@ pub(crate) fn answer_prior_knowledge(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) 
         ctx,
         &p,
         positive,
-        Positive::SettledListing,
+        Positive::Listing,
         &p.frontier,
         &p.coverage,
         true,
