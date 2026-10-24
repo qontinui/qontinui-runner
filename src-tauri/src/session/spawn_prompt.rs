@@ -1940,6 +1940,11 @@ mod script_tests {
         std::fs::create_dir(&bin).unwrap();
         let bash = which_host("bash").expect("bash is on PATH (this module drives bash)");
         std::os::unix::fs::symlink(&bash, bin.join("bash")).unwrap();
+        // `rm` removes the hook's private header file; no other tool is given.
+        let rm = which_host("rm").expect("rm is on PATH");
+        std::os::unix::fs::symlink(&rm, bin.join("rm")).unwrap();
+        let hook_tmp = tmp.path().join("hook-tmp");
+        std::fs::create_dir(&hook_tmp).unwrap();
         let argv = tmp.path().join("curl-argv.txt");
         bin_setup(&bin, &argv);
 
@@ -1957,6 +1962,7 @@ mod script_tests {
             ))
             .env_clear()
             .env("PATH", bin.display().to_string())
+            .env("TMPDIR", hook_tmp.display().to_string())
             .envs(envs.iter().copied());
         let started = std::time::Instant::now();
         let res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("the hook runs inside its budget");
@@ -1966,6 +1972,9 @@ mod script_tests {
             "the PermissionRequest hook must never fail a session: {}",
             String::from_utf8_lossy(&res.stderr)
         );
+        // The private header file never outlives the hook.
+        let left: Vec<_> = std::fs::read_dir(&hook_tmp).unwrap().collect();
+        assert!(left.is_empty(), "the hook left files behind: {left:?}");
         PrRun {
             stdout: String::from_utf8_lossy(&res.stdout).into_owned(),
             curl_args: std::fs::read_to_string(&argv)
@@ -2057,13 +2066,20 @@ mod script_tests {
                 allow.curl_args
             );
         }
-        // The request key rides a header; the nonce never leaves.
+        // The request key rides a header read from a private FILE (`-H @file`),
+        // never curl's argv; the nonce never leaves at all. The real-curl test
+        // below proves the header reaches the pad.
         assert!(
             allow
                 .curl_args
-                .iter()
-                .any(|a| a == &format!("X-Qontinui-Permreq-Key: {PR_KEY}")),
+                .windows(2)
+                .any(|w| w[0] == "-H" && w[1].starts_with('@') && w[1].len() > 1),
             "{:?}",
+            allow.curl_args
+        );
+        assert!(
+            !allow.curl_args.iter().any(|a| a.contains(PR_KEY)),
+            "the request key must not be in curl's argv: {:?}",
             allow.curl_args
         );
         let at = |f: &str| allow.curl_args.iter().position(|a| a == f).unwrap();
@@ -2187,6 +2203,12 @@ mod script_tests {
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 n,
                 ("QONTINUI_PERMREQ_KEY", "abc123"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", &PR_KEY[..63]),
             ],
         ] {
             let run = run_pr_hook(&envs, fake_curl(&tail));
