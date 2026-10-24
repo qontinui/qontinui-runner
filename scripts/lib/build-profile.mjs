@@ -3,9 +3,10 @@
 //
 // The default is `release-checked` -- release's optimization with debug
 // assertions kept (see the workspace Cargo.toml). A debug build is an
-// announced opt-in, spelled `dev` at every layer: `--profile dev` here,
-// `-RunnerProfile dev` in dev-start.ps1, `--primary-build-profile dev` in the
-// supervisor. Pure helpers only; build-exe.mjs does the I/O.
+// announced opt-in, spelled `dev`: `--profile dev` here. The same plan's
+// Phases 4 and 5 spell it `-RunnerProfile dev` in dev-start.ps1 and
+// `--primary-build-profile dev` in the supervisor. Pure helpers only;
+// build-exe.mjs does the I/O.
 
 export const DEFAULT_PROFILE = "release-checked";
 export const PROFILE_ENV = "QONTINUI_RUNNER_BUILD_PROFILE";
@@ -56,9 +57,14 @@ export function resolveProfile(argv, env) {
   return { profile, source };
 }
 
-/** The directory cargo writes a profile's output to: `dev` -> `debug`. */
+/**
+ * The directory cargo writes a profile's output to: `dev` and `test` ->
+ * `debug`, `bench` -> `release`, any other profile -> its own name.
+ */
 export function profileDir(profile) {
-  return profile === "dev" || profile === "test" ? "debug" : profile;
+  if (profile === "dev" || profile === "test") return "debug";
+  if (profile === "bench") return "release";
+  return profile;
 }
 
 /** The one line build:exe prints before cargo runs. */

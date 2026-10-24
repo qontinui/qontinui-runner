@@ -519,7 +519,8 @@ fn ensure_dist_placeholder() {
 
 /// The `bundle.externalBin` sidecars, spelled exactly as `tauri.conf.json`
 /// spells them. Keep in sync with it (a test pins that) and with
-/// `scripts/bundle-profile-sidecar.mjs` `SIDECAR_BINS`.
+/// `scripts/lib/sidecars.mjs` `SIDECAR_BINS`, the roster
+/// `scripts/bundle-profile-sidecar.mjs` and `scripts/build-exe.mjs` read.
 ///
 /// `qontinui-pty-holder` is the per-pane PTY holder (plan
 /// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2):
