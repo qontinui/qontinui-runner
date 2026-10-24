@@ -174,6 +174,10 @@ pub mod peer_user_guard;
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
 
+// The qontinui-web FRONTEND origin (pages like /connect-runner), distinct from
+// its API origin. Shared by the runner's `api_config` and `pair`.
+pub mod web_origin;
+
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
 // `cognito_sign_in` Tauri command in `commands::auth` drives it.

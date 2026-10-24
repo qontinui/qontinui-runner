@@ -294,6 +294,16 @@ reviewed = [
 ]
 
 [[disposition]]
+class = "dev_ports"
+file = "src/pair.rs"
+symbol = "BrowserPairPage::provenance"
+disposition = "dev_only_surface"
+note = "Operator-facing provenance text for `device pair --browser`: it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287)."
+reviewed = [
+    "to override (local dev: http://localhost:3001)\",",
+]
+
+[[disposition]]
 class = "supervisor_dependency"
 file = "src/mcp/session_briefing.rs"
 symbol = "session_briefing_handler"

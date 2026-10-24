@@ -2637,9 +2637,11 @@ pub struct PairBaseOrigin {
 /// Which rung of [`resolve_cli_web_base`] produced the web-backend base.
 ///
 /// Serves all three CLI pairing flows — `--pair-code` redemption,
-/// `--auth-token` `pair-cli`, AND the `--browser` flow's `/connect-runner`
-/// page. The rungs have DIFFERENT remediations when a request fails against
-/// the resolved host, and the URL alone does not distinguish them —
+/// `--auth-token` `pair-cli`, AND (indirectly) the `--browser` flow, whose
+/// `/connect-runner` page origin is DERIVED from this API base by
+/// [`resolve_browser_pair_page`] — the page itself is never opened on it.
+/// The rungs have DIFFERENT remediations when a request fails against the
+/// resolved host, and the URL alone does not distinguish them —
 /// `https://api.qontinui.io` looks identical whether it came from an operator
 /// export, a profile's `api_url`, or the compiled-in default. Reporting the
 /// winning arm turns "wrong host" from a guess into a one-line fix.
@@ -2703,8 +2705,9 @@ impl std::fmt::Display for CliWebBaseSource {
 }
 
 /// Resolve the qontinui-web backend base the CLI pairing flows dial, WITH the
-/// arm that produced it. The one ladder for `--pair-code`, `--auth-token` and
-/// `--browser`; three rungs, in order:
+/// arm that produced it. The one API-base ladder for `--pair-code`,
+/// `--auth-token` and `--browser` (which derives its FRONTEND page origin from
+/// this base — see [`resolve_browser_pair_page`]); three rungs, in order:
 ///
 /// 1. `env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
 /// 2. `profile` — the active profile's `api_url`, as returned by
@@ -2947,6 +2950,60 @@ mod cli_web_base_tests {
                 "a web-base remedy must not point at coord_url: {o:?}"
             );
         }
+    }
+
+    // `device pair --browser` must open /connect-runner on the web FRONTEND.
+    // 2026-10-18: it opened https://api.qontinui.io/connect-runner, which
+    // 404s, because the page URL was built from the API base.
+
+    #[test]
+    fn browser_pair_page_defaults_to_the_production_frontend() {
+        let page = resolve_browser_pair_page(None, None, None);
+        assert_eq!(page.page_url, "https://qontinui.io/connect-runner");
+        assert_eq!(page.frontend_base, "https://qontinui.io");
+        assert_eq!(page.api_base, "https://api.qontinui.io");
+        assert_eq!(page.api_source, CliWebBaseSource::ProdDefault);
+        // Pin the whole line the CLI prints: it must name both rungs and the
+        // override, with no stray whitespace.
+        let expected = [
+            "web frontend derived from API base https://api.qontinui.io, itself from the ",
+            "compiled-in production default (no $QONTINUI_WEB_BASE, no profile api_url); ",
+            "set $QONTINUI_WEB_FRONTEND_BASE to override (local dev: http://localhost:3001)",
+        ]
+        .concat();
+        assert_eq!(page.provenance(), expected);
+    }
+
+    #[test]
+    fn browser_pair_page_follows_the_api_base_overrides() {
+        // $QONTINUI_WEB_BASE keeps steering the page, via derivation.
+        let page = resolve_browser_pair_page(Some("https://api.staging.example/"), None, None);
+        assert_eq!(page.page_url, "https://staging.example/connect-runner");
+        assert_eq!(page.api_source, CliWebBaseSource::EnvOverride);
+        // So does a profile api_url.
+        let page = resolve_browser_pair_page(None, profile("https://api.p.example"), None);
+        assert_eq!(page.page_url, "https://p.example/connect-runner");
+        // A unified/dev origin with no `api.` label is used as-is.
+        let page = resolve_browser_pair_page(Some("http://127.0.0.1:8000"), None, None);
+        assert_eq!(page.page_url, "http://127.0.0.1:8000/connect-runner");
+    }
+
+    #[test]
+    fn browser_pair_page_frontend_override_wins_over_every_api_rung() {
+        let page = resolve_browser_pair_page(
+            Some("http://127.0.0.1:8000"),
+            profile("https://api.p.example"),
+            Some("http://localhost:3001/"),
+        );
+        assert_eq!(page.page_url, "http://localhost:3001/connect-runner");
+        assert_eq!(
+            page.frontend_source,
+            crate::web_origin::WebFrontendSource::EnvOverride
+        );
+        // The API base is untouched by the frontend override: API calls keep
+        // their own ladder.
+        assert_eq!(page.api_base, "http://127.0.0.1:8000");
+        assert_eq!(page.provenance(), "$QONTINUI_WEB_FRONTEND_BASE override");
     }
 }
 
@@ -3286,12 +3343,6 @@ pub(crate) struct CallbackCapture {
     pub token_id: Option<String>,
 }
 
-/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
-/// `POST /coord/devices/pair-start` to register the flow and obtain a
-/// coord-minted state nonce + redirect URL, opens the browser, waits for
-/// the user's click + redirect which delivers the device-token JWT
-/// directly via the callback query params (coord's `pair-complete` is
-/// called by the web frontend, not the runner).
 /// Body of the anonymous `POST /coord/devices/pair-start` that opens the
 /// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
 /// device and refuses a `pair-complete` for any other (`device_mismatch`,
@@ -3315,6 +3366,71 @@ fn pair_start_request_body(
     })
 }
 
+/// Where the browser pair flow sends the user, and which rungs chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserPairPage {
+    /// The `/connect-runner` page URL handed to coord as `web_pair_url`.
+    pub page_url: String,
+    /// The web-FRONTEND origin the page is served from.
+    pub frontend_base: String,
+    pub frontend_source: crate::web_origin::WebFrontendSource,
+    /// The web-API base the frontend origin was derived from (when it was).
+    pub api_base: String,
+    pub api_source: CliWebBaseSource,
+}
+
+impl BrowserPairPage {
+    /// Operator-facing provenance for the page origin: the frontend rung,
+    /// and — when derived — the API rung underneath it, since the two have
+    /// different fixes.
+    pub fn provenance(&self) -> String {
+        use crate::web_origin::{WebFrontendSource, WEB_FRONTEND_BASE_ENV};
+        match &self.frontend_source {
+            WebFrontendSource::EnvOverride => format!("${WEB_FRONTEND_BASE_ENV} override"),
+            WebFrontendSource::DerivedFromApiBase { api_base } => format!(
+                "web frontend derived from API base {api_base}, itself from the {}; set ${} \
+                 to override (local dev: http://localhost:3001)",
+                self.api_source, WEB_FRONTEND_BASE_ENV
+            ),
+        }
+    }
+}
+
+/// Resolve the `/connect-runner` page the browser pair flow opens. Pure — the
+/// caller passes the environment and the profile in.
+///
+/// `/connect-runner` is a qontinui-web FRONTEND page (Next.js). In production
+/// the frontend (`qontinui.io`) and the API (`api.qontinui.io`) are different
+/// hosts, and the API host answers the page path with `404 NOT_FOUND` — the
+/// 2026-10-18 defect, where this flow opened
+/// `https://api.qontinui.io/connect-runner`. So the page origin is resolved by
+/// [`crate::web_origin::resolve_web_frontend_base`]: `$QONTINUI_WEB_FRONTEND_BASE`,
+/// else derived from the API base that [`resolve_cli_web_base`] picks (so
+/// `$QONTINUI_WEB_BASE` and a profile `api_url` keep steering it).
+pub fn resolve_browser_pair_page(
+    web_base_env: Option<&str>,
+    profile: Option<(String, crate::profiles::ApiUrlSource)>,
+    frontend_env: Option<&str>,
+) -> BrowserPairPage {
+    let (api_base, api_source) = resolve_cli_web_base(web_base_env, profile);
+    let (frontend_base, frontend_source) =
+        crate::web_origin::resolve_web_frontend_base(frontend_env, &api_base);
+    BrowserPairPage {
+        page_url: format!("{frontend_base}/connect-runner"),
+        frontend_base,
+        frontend_source,
+        api_base,
+        api_source,
+    }
+}
+
+/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
+/// `POST /coord/devices/pair-start` to register the flow and obtain a
+/// coord-minted state nonce + redirect URL, opens the browser on the web
+/// FRONTEND's `/connect-runner` ([`resolve_browser_pair_page`]), waits for
+/// the user's click + redirect which delivers the device-token JWT
+/// directly via the callback query params (coord's `pair-complete` is
+/// called by the web frontend, not the runner).
 pub fn pair_via_browser(
     coord_base: &str,
     tenant_id: uuid::Uuid,
@@ -3327,15 +3443,21 @@ pub fn pair_via_browser(
     // coord's pair-complete.
     let device_id = read_device_id()?;
 
-    // Web backend URL: the one CLI web-base ladder ($QONTINUI_WEB_BASE, then
-    // the active profile's api_url, then the production default). This
-    // deliberately does NOT derive from `coord_base` — see
-    // `resolve_cli_web_base` for the reasoning and the measured failure.
-    let (web_base, web_source) = resolve_cli_web_base(
+    // The /connect-runner page lives on the web FRONTEND, not the API host.
+    // This deliberately does NOT derive from `coord_base` either — see
+    // `resolve_cli_web_base` for that measured failure.
+    let page = resolve_browser_pair_page(
         std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
         crate::profiles::api_url_with_source(),
+        std::env::var(crate::web_origin::WEB_FRONTEND_BASE_ENV)
+            .ok()
+            .as_deref(),
     );
-    eprintln!("Opening connect-runner on {web_base} ({web_source})");
+    eprintln!(
+        "Opening connect-runner on {} ({})",
+        page.frontend_base,
+        page.provenance()
+    );
     let hostname_now = detect_hostname();
 
     // Bind a port for the callback. Use 0 to let the OS pick — then read it
@@ -3355,7 +3477,7 @@ pub fn pair_via_browser(
 
     // Step 1: Call coord's pair-start to register the pairing flow and
     // obtain a coord-minted state nonce + redirect URL.
-    let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
+    let web_pair_url = page.page_url.clone();
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
     let pair_start_body = pair_start_request_body(
         &device_id,
