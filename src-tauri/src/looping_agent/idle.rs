@@ -26,6 +26,10 @@
 //! post-merge follow-up. So there is now exactly one indicator list to extend
 //! and one place the two-read rule lives.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.
 /// Sourced from the Claude Code TUI working line ("… esc to interrupt") and
@@ -52,20 +56,79 @@ pub const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '
 /// input box shows this caret.
 pub const PROMPT_MARKER: char = '❯';
 
+/// The turn-complete summary Claude Code leaves under a finished reply, e.g.
+/// `✻ Worked for 8m 49s · done 5:04 PM`. It opens with a spinner glyph, but it
+/// says the turn ENDED, so it is idle chrome and is exempt from the spinner
+/// veto (2). A working line never has this shape: it reads `✻ Cogitating…
+/// (12s · esc to interrupt)` or `✻ Waiting for 1 background agent to finish`.
+/// Any other tail (`… · 1 shell still running`) is not matched, so it keeps
+/// vetoing. Measured 2026-10-24 on a Linux box: this line, with the
+/// [`CLEAR_HINT`], was the only veto keeping 42 finished, idle panes at
+/// `grid_busy`, so none ever reached wind-down.
+static TURN_DONE_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*[✻✶✳✽✢∗] \p{L}+ for \d+[hms](?: \d+[hms])*(?: · done \d{1,2}:\d{2}(?: ?[AaPp][Mm])?)?\s*$",
+    )
+    .expect("TURN_DONE_LINE is a valid regex")
+});
+
+/// Claude Code's idle "new task? /clear to save 320.4k tokens · …" hint. It
+/// carries the `"tokens ·"` working indicator's text, so it is masked out of a
+/// line before the indicators are matched (1). Matched lowercased.
+static CLEAR_HINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/clear to save [0-9.]+[kmb]? tokens").expect("CLEAR_HINT is a valid regex")
+});
+
+/// Key hints a Claude Code dialog prints under its choices (lowercased).
+/// Unlike `do you want` / `allow`, these do not turn up in an ordinary
+/// finished turn, so near the bottom of the screen they mean a dialog is
+/// showing. `terminal::graceful_exit` refuses on the same list.
+pub const DIALOG_CHROME: &[&str] = &["enter to confirm", "esc to cancel"];
+
+/// How far above the last `❯` row a dialog is looked for. A dialog sits at the
+/// bottom of the screen; text further up is transcript, where a quoted dialog
+/// must not hold a finished session busy. `terminal::graceful_exit` scans the
+/// same depth above the cursor.
+pub const DIALOG_SCAN_ROWS: usize = 8;
+
+/// Whether the text after a `❯` marker is a numbered choice (`1. Yes`), i.e.
+/// a dialog's selection rather than the input line.
+fn is_numbered_choice(after_marker: &str) -> bool {
+    let mut chars = after_marker.trim_start().chars().peekable();
+    let mut digits = 0;
+    while chars.next_if(char::is_ascii_digit).is_some() {
+        digits += 1;
+    }
+    digits > 0 && chars.next() == Some('.') && chars.next() == Some(' ')
+}
+
+/// Whether `line` is the turn-complete summary ([`TURN_DONE_LINE`]).
+fn is_turn_done_line(line: &str) -> bool {
+    TURN_DONE_LINE.is_match(line)
+}
+
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for
 /// input. Pure over the snapshot. CONSERVATIVE: returns `false` (NOT idle)
 /// on any ambiguity. Idle requires ALL of:
 ///
 /// 1. NO processing-indicator text anywhere on screen
-///    ([`PROCESSING_INDICATORS`]).
-/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted).
+///    ([`PROCESSING_INDICATORS`]), outside the idle `/clear` hint
+///    ([`CLEAR_HINT`]).
+/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), outside
+///    the turn-complete summary line ([`TURN_DONE_LINE`]).
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
+/// 5. NO dialog is showing: from [`DIALOG_SCAN_ROWS`] above the last `❯` row
+///    down, no `❯` row is a numbered choice and no [`DIALOG_CHROME`] hint is
+///    drawn. A dialog draws `❯` on its selected choice, so without this a
+///    usage-limit or permission dialog passes (3) and (4), and a consumer that
+///    then submits would answer it.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
     // (1) any processing-indicator text ⇒ busy.
     for line in lines {
         let lower = line.to_ascii_lowercase();
+        let lower = CLEAR_HINT.replace_all(&lower, "");
         for ind in PROCESSING_INDICATORS {
             if lower.contains(ind) {
                 return false;
@@ -73,8 +136,12 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy.
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy, outside the
+    // turn-complete summary.
     for line in lines {
+        if is_turn_done_line(line) {
+            continue;
+        }
         for ch in line.chars() {
             if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
                 return false;
@@ -89,7 +156,25 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
     };
 
     // (4) cursor in the input area (at/below the prompt row).
-    (cursor_row as usize) >= prompt_row
+    if (cursor_row as usize) < prompt_row {
+        return false;
+    }
+
+    // (5) no dialog near the bottom of the screen.
+    let last_marker_row = lines
+        .iter()
+        .rposition(|l| l.contains(PROMPT_MARKER))
+        .unwrap_or(prompt_row);
+    let dialog = lines
+        .iter()
+        .skip(last_marker_row.saturating_sub(DIALOG_SCAN_ROWS))
+        .any(|l| {
+            let lower = l.to_lowercase();
+            DIALOG_CHROME.iter().any(|m| lower.contains(m))
+                || l.split_once(PROMPT_MARKER)
+                    .is_some_and(|(_, after)| is_numbered_choice(after))
+        });
+    !dialog
 }
 
 /// Context-low grid markers. The percentage form
@@ -196,6 +281,102 @@ mod tests {
         assert!(!snapshot_looks_idle(&lines(&["✶", "❯ "]), 1));
         // A bare middot in static UI must NOT veto (it is everywhere).
         assert!(snapshot_looks_idle(&lines(&["a · b", "❯ "]), 1));
+    }
+
+    /// The shapes measured on live panes on 2026-10-24. Every one of them was
+    /// a finished, idle session that this predicate read as busy.
+    #[test]
+    fn turn_done_summary_and_clear_hint_are_idle_chrome() {
+        for done in [
+            "✻ Worked for 8m 49s · done 5:04 PM",
+            "✻ Cooked for 44s · done 8:56 PM",
+            "✻ Sautéed for 5m 13s · done 8:54 PM",
+            "✻ Crunched for 1h 2m 3s",
+            "✻ Brewed for 18m 1s · done 21:08",
+        ] {
+            let grid = lines(&[
+                "SAFE TO CLOSE.",
+                done,
+                "  new task? /clear to save 320.4k tokens · ✔ Update installed · Restart to apply",
+                "─────────────────────────── post-merge-coord#3392 ─",
+                "❯ ",
+                "──────────────────────────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]);
+            assert!(snapshot_looks_idle(&grid, 4), "must be idle with: {done}");
+        }
+        // The hint truncated to the pane's width.
+        let grid = lines(&[
+            "✻ Cooked for 7m 8s · done 8:56 PM",
+            "  new task? /clear to save 320.4… · ✔ Update installed",
+            "❯ ",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 2));
+    }
+
+    #[test]
+    fn work_still_running_after_the_turn_vetoes_idle() {
+        for busy in [
+            // A background subagent runs inside claude, with no child process
+            // for the wind-down children check to see.
+            "✻ Waiting for 1 background agent to finish",
+            "✻ Cogitated for 1m 41s · done 5:09 AM · 1 shell still running",
+            "✻ Cogitating… (12s · esc to interrupt)",
+            "✻ Worked for",
+            "✻ Worked for 3s · done 5:09 AM · 2 background agents",
+        ] {
+            let grid = lines(&[busy, "❯ "]);
+            assert!(
+                !snapshot_looks_idle(&grid, 1),
+                "must be busy with line: {busy}"
+            );
+        }
+        // The hint is masked, not the whole line: an indicator beside it still
+        // vetoes.
+        let grid = lines(&[
+            "/clear to save 1.2k tokens · 3.4k tokens · esc to interrupt",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 1));
+    }
+
+    /// Measured 2026-10-24: a usage-limit dialog over a finished turn. Its
+    /// `❯` is the selected choice, so it passed (3) and (4), and only the
+    /// turn-complete line's glyph had been keeping it from reading idle.
+    #[test]
+    fn a_dialog_is_not_idle() {
+        let usage_limit = lines(&[
+            "✻ Worked for 2s · done 3:44 PM",
+            "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+            "   What do you want to do?",
+            "",
+            "   ❯ 1. Stop and wait for limit to reset",
+            "     2. Wait here, then continue automatically at Oct 28, 9pm",
+            "",
+            "   Enter to confirm · Esc to cancel",
+        ]);
+        assert!(!snapshot_looks_idle(&usage_limit, 7));
+        // Either half alone refuses.
+        assert!(!snapshot_looks_idle(&lines(&["Proceed?", "❯ 2. No"]), 1));
+        assert!(!snapshot_looks_idle(
+            &lines(&["❯ ", "Enter to confirm · Esc to cancel"]),
+            0
+        ));
+        // A dialog above a plain input prompt is still a dialog showing.
+        assert!(!snapshot_looks_idle(
+            &lines(&["❯ 1. Yes", "  2. No", "Esc to cancel", "❯ "]),
+            3
+        ));
+        // Numbered transcript output above the input box is not a dialog, and
+        // neither is a hint quoted in the transcript beyond the scan depth.
+        assert!(snapshot_looks_idle(
+            &lines(&["1. First, run the tests", "❯ "]),
+            1
+        ));
+        let mut quoted = vec!["it said: Esc to cancel"];
+        quoted.extend(["…"; DIALOG_SCAN_ROWS]);
+        quoted.push("❯ ");
+        assert!(snapshot_looks_idle(&lines(&quoted), 9));
     }
 
     #[test]
