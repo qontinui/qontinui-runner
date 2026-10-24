@@ -258,10 +258,13 @@ impl TriggerEvaluator {
                         .get("executor_state")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown");
+                    // `null` (or absent) is UNKNOWN — `/status` could not read
+                    // the AI-session table (a database outage) — and unknown is
+                    // never idle: an idle-gated action must not fire on it.
                     let ai_running = json
                         .get("ai_analysis_running")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     executor_state == "Ready" && !ai_running
                 } else {
                     false

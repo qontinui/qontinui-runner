@@ -21,6 +21,7 @@ use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
+use crate::database::pg::UnlessUnavailable;
 use crate::findings::{
     Finding, FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding,
 };
@@ -63,6 +64,9 @@ pub struct WorktreeInfo {
 enum BuildReplayErr {
     /// PG global isn't initialized — no way to read the output_log.
     NoPg,
+    /// The output_log read failed on a database outage: whether there is
+    /// history is UNKNOWN, never "no history".
+    Unreadable(String),
 }
 
 /// Sender half of the AI-output persister channel, paired with the depth of
@@ -1779,6 +1783,8 @@ impl ClaudeSession {
     /// - `Ok(None)` — no `session_ctx`, empty output_log, or no parseable turns.
     /// - `Err(BuildReplayErr::NoPg)` — PG global isn't initialized; caller
     ///   typically aborts the respawn since persistence won't work either way.
+    /// - `Err(BuildReplayErr::Unreadable)` — the database is down: the history
+    ///   is UNKNOWN, and each caller treats it exactly like `NoPg`.
     fn build_replay_from_history(
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
@@ -1796,8 +1802,9 @@ impl ClaudeSession {
             None => return Err(BuildReplayErr::NoPg),
         };
 
-        let output_log =
-            tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
+        let output_log = tauri::async_runtime::block_on(pg.get_task_output(task_run_id))
+            .default_unless_unavailable()
+            .map_err(BuildReplayErr::Unreadable)?;
 
         if output_log.is_empty() {
             info!(
@@ -1920,6 +1927,14 @@ impl ClaudeSession {
                     );
                     None
                 }
+                Err(BuildReplayErr::Unreadable(e)) => {
+                    warn!(
+                        "promote_to_worktree: conversation history unreadable ({}); respawning \
+                         without replay context for {}",
+                        e, self.session_id
+                    );
+                    None
+                }
             };
 
         // 6. Kill the existing CLI. cwd is immutable; this is the only way to
@@ -2016,6 +2031,13 @@ impl ClaudeSession {
             Ok(replay) => replay,
             Err(BuildReplayErr::NoPg) => {
                 warn!("No PG connection for reading conversation history");
+                return;
+            }
+            Err(BuildReplayErr::Unreadable(e)) => {
+                warn!(
+                    "Conversation history unreadable ({}); not restarting without it",
+                    e
+                );
                 return;
             }
         };

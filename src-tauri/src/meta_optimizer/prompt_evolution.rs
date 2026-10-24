@@ -202,12 +202,15 @@ pub fn get_evolution_history(
 
 /// Check whether there is an active (no verdict yet) evolution entry for an agent type.
 /// This indicates a canary is in progress and we should NOT create another rewrite.
+///
+/// Fails SAFE: an unreadable state reads as "active", so a database outage
+/// never lets a second rewrite through the guard.
 pub fn has_active_evolution(pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.has_active_evolution(agent_type).await })
     })
-    .unwrap_or(false)
+    .unwrap_or(true)
 }
 
 /// Get the most recent evolution entry for an agent type that was rejected.
@@ -224,13 +227,16 @@ pub fn get_latest_rejected(
 
 /// Check the cooldown: returns true if the last evolution entry for this agent_type
 /// was created less than `cooldown_hours` ago.
+///
+/// Fails SAFE: an unreadable state reads as "in cooldown", so a database
+/// outage never ends a cooldown early.
 pub fn is_in_cooldown(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cooldown_hours)).to_rfc3339();
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.is_in_evolution_cooldown(agent_type, &cutoff).await })
     })
-    .unwrap_or(false)
+    .unwrap_or(true)
 }
 
 /// Count consecutive recent rejections for an agent_type.

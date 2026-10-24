@@ -610,26 +610,30 @@ pub async fn resume_task_run(
             .pg_db
             .get_unified_workflow_by_name(wf_name)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .or_else(|| {
-                let stripped = wf_name
-                    .strip_prefix("Project Reflection: ")
-                    .or_else(|| wf_name.strip_prefix("Reflection: "));
-                stripped.and_then(|name| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(state.app_state.pg_db.get_unified_workflow_by_name(name))
-                    })
-                    .ok()
-                    .flatten()
-                })
-            })
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("Workflow definition not found with name: {}", wf_name),
-                )
-            })?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // The prefix-stripped retry reports its error like the exact lookup
+        // above: an unreadable row must not read as "not found" (a 404).
+        let wf = match wf {
+            Some(wf) => Some(wf),
+            None => match wf_name
+                .strip_prefix("Project Reflection: ")
+                .or_else(|| wf_name.strip_prefix("Reflection: "))
+            {
+                Some(name) => state
+                    .app_state
+                    .pg_db
+                    .get_unified_workflow_by_name(name)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+                None => None,
+            },
+        };
+        let wf = wf.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Workflow definition not found with name: {}", wf_name),
+            )
+        })?;
         (wf.id.clone(), wf)
     } else {
         return Err((

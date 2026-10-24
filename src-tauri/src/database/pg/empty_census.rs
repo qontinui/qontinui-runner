@@ -16,12 +16,21 @@
 //! # The census pattern
 //!
 //! A site is `<receiver>.<method>(<args>).await.<fallback>` — multi-line
-//! aware, since rustfmt splits the chain one call per line — where:
+//! aware, since rustfmt splits the chain one call per line — or the same read
+//! made from sync code through a bridge, `block_on(<receiver>.<method>(<args>))
+//! .<fallback>` (any `…block_on(`, optionally around an `async { … .await }`
+//! block, and inside any `block_in_place(|| …)` / `catch_unwind(…)` wrapper
+//! whose closers come before the fallback), where:
 //!
 //! - the call start matches [`CALL_START`]; `<args>` is paren-balanced (string
 //!   literals skipped), and what follows the closing paren matches
-//!   [`FALLBACK`] (`unwrap_or_default()`, `unwrap_or_else(|…|`,
-//!   `unwrap_or_else(path)`, `unwrap_or(`, `ok()`);
+//!   [`DIRECT_TAIL`] or — when the text before the receiver matches
+//!   [`BRIDGED_HEAD`] — [`BRIDGED_TAIL`], then one of [`FALLBACK_HEADS`]
+//!   (`unwrap_or_default()`, `unwrap_or_else(|…|`, `unwrap_or_else(path)`,
+//!   `unwrap_or(`, `ok()`);
+//! - a closure fallback whose body opens with `Err(` (a `catch_unwind` panic
+//!   arm, `.unwrap_or_else(|_| Err(..))`) is not a site: it yields an error,
+//!   never an empty value;
 //! - `<method>` is a `pub async fn` declared under `src/database/pg/` (the
 //!   `PgDb` method layer);
 //! - `<receiver>` is `db`, `PgDb::global()`, `PgDb::try_global()`, any
@@ -33,9 +42,13 @@
 //!
 //! The walk is `src-tauri/src/**/*.rs` (`clorinde` excluded, this file
 //! excluded because it spells the needles). Census at Phase 6, base
-//! `6043840b2`: 108 sites before (pg_db 47, pg 32, other `*pg*` receivers 23
-//! of which 11 the `pg_db()` accessor, self 5, db 1; PgDb::global() /
-//! PgDb::try_global() 0), 26 after — exactly [`ALLOWLIST`].
+//! `6043840b2`, direct spelling: 108 sites before (pg_db 47, pg 32, other
+//! `*pg*` receivers 23 — 12 of them the `pg_db()` accessor and 11 other
+//! aliases — self 5, db 1; PgDb::global() / PgDb::try_global() 0), 26 after.
+//! Bridged spelling (added in review; `catch_unwind` panic arms that map to
+//! `Err` excluded): 21 sites before, 16 after (5 converted: the replay-history
+//! read, the stage-name and reflection-prefix workflow lookups, and the
+//! comparison benchmark lookup). The 42 after are exactly [`ALLOWLIST`].
 //!
 //! Allowlist entries are keyed by file + the site's whitespace-stripped text
 //! (from the receiver through the fallback head), never by line number, and
@@ -49,10 +62,14 @@
 //! The scan is textual, not a parse. Char literals (`')'`), raw strings and
 //! comments inside a call's arguments can unbalance the paren match and hide
 //! a site; a fallback reached through an intermediate adapter
-//! (`.await.map(f).unwrap_or_default()`), an `if let Ok(..)` / `match` arm, or
-//! a receiver whose name does not contain `pg` (a `conn`, a renamed binding)
-//! is not matched. Two sites with identical text in one file share one
-//! allowlist entry and are told apart only by its count.
+//! (`.await.map(f).unwrap_or_default()`), an `if let Ok(..)` / `match` arm, a
+//! bridge that is not spelled `block_on(` directly around the call, or a
+//! receiver whose name does not contain `pg` (a `conn`, a renamed binding) is
+//! not matched. A bridged read wrapped as `catch_unwind(..).ok()` followed by
+//! `.and_then(|r| r.ok())` IS matched, at the `catch_unwind`'s `.ok()` — the
+//! PG error itself is dropped by the `and_then` after it. Two sites with
+//! identical text in one file share one allowlist entry and are told apart
+//! only by its count.
 //!
 //! Declared `#[cfg(test)]` in `database/pg/mod.rs`.
 
@@ -65,8 +82,25 @@ use regex::Regex;
 /// The receiver is an identifier, optionally a zero-argument accessor call.
 const CALL_START: &str = r"\b(PgDb::global\(\)|PgDb::try_global\(\)|[A-Za-z_][A-Za-z0-9_]*(?:\(\))?)\s*\.\s*([a-z_][a-z0-9_]*)\s*(?:::<[^>]*>\s*)?\(";
 
-/// What must follow the call's closing paren for it to be a census site.
-const FALLBACK: &str = r"^\s*\.await\s*\.\s*(unwrap_or_default\(\)|unwrap_or_else\(\s*\|[^|]*\||unwrap_or\(|ok\(\)|unwrap_or_else\(\s*[A-Za-z_][A-Za-z0-9_:]*\s*\))";
+/// The fallback heads a census site ends in.
+const FALLBACK_HEADS: &str = r"(unwrap_or_default\(\)|unwrap_or_else\(\s*\|[^|]*\||unwrap_or\(|ok\(\)|unwrap_or_else\(\s*[A-Za-z_][A-Za-z0-9_:]*\s*\))";
+
+/// What must follow a DIRECT call's closing paren before the fallback head.
+const DIRECT_TAIL: &str = r"^\s*\.await\s*\.\s*";
+
+/// The text just before a BRIDGED call's receiver: `block_on(`, optionally an
+/// `async [move] {`, then the receiver's owner chain (`self.`, `state.app_state.`).
+const BRIDGED_HEAD: &str =
+    r"block_on\(\s*(?:async\s+(?:move\s+)?\{\s*)?(?:[A-Za-z_][A-Za-z0-9_]*(?:\(\))?\s*\.\s*)*$";
+
+/// What must follow a BRIDGED call's closing paren before the fallback head:
+/// an optional `.await` (inside the async block), then the closers of the
+/// block, the `block_on(` and any wrapping `block_in_place(|| …)` /
+/// `catch_unwind(…)` — at least one `)`.
+const BRIDGED_TAIL: &str = r"^(?:\s*\.await)?\s*;?[\s)}]*\)\s*\.\s*";
+
+/// A closure fallback whose body is an `Err(..)` yields an error, not a value.
+const ERR_BODY: &str = r"^\s*\{?\s*Err\(";
 
 /// Declares the `PgDb` method names (the method layer lives in `database/pg/`).
 const PG_METHOD: &str = r"pub(?:\(crate\))?\s+async\s+fn\s+([a-z_0-9]+)";
@@ -88,7 +122,8 @@ const ALLOWLIST: &[Allowed] = &[
         count: 2,
         reason: "allocate_port: DB ports are a reservation hint beside the live is_port_in_use \
                  check; get_unified_instances: DB rows are an addendum to the settings.json slots, \
-                 each probed live",
+                 each probed live -- on an outage the picker lists only the configured slots and \
+                 does NOT say the list is incomplete (recorded follow-up: label that response)",
     },
     Allowed {
         file: "scheduler_service.rs",
@@ -125,8 +160,10 @@ const ALLOWLIST: &[Allowed] = &[
         file: "memory/unified_query.rs",
         site: r"pg.get_mental_models(limit).await.unwrap_or_default()",
         count: 1,
-        reason: "secondary score-boost read; the primary observation search just before it owns \
-                 the failure path",
+        reason: "secondary score-boost read inside one strategy of query_memory's multi-source \
+                 fusion, where every strategy degrades to an empty contribution and logs; the \
+                 primary observation search just before it does the same through a `match` this \
+                 census cannot see (recorded follow-up: a fusion-level degraded flag)",
     },
     Allowed {
         file: "unified_workflow_executor/loop_controller.rs",
@@ -230,6 +267,127 @@ const ALLOWLIST: &[Allowed] = &[
         count: 1,
         reason: "impact-radius prompt enrichment; a missing line degrades the prompt only",
     },
+    Allowed {
+        file: "claude_session/runner.rs",
+        site: r#"pg.get_source_task_run_id_for_reflection(&reflection_task_run_id)).ok()"#,
+        count: 1,
+        reason: "bridged: defensive inference of a reflection-fix context the caller did not wire \
+                 through; an unreadable row infers none and nothing is recorded for it",
+    },
+    Allowed {
+        file: "claude_session/runner.rs",
+        site: r#"pg.get_workflow_name_for_task_run(id)).ok()"#,
+        count: 1,
+        reason:
+            "bridged: optional workflow-name label on the causal-event rows inserted next; those \
+                 inserts fail on the same outage",
+    },
+    Allowed {
+        file: "meta_optimizer/canary.rs",
+        site: r#"pg_db.should_apply_canary(recommendation_id))}).unwrap_or("#,
+        count: 1,
+        reason:
+            "bridged: an unreadable traffic-split decision runs the baseline, the safe arm of an \
+                 opt-in canary",
+    },
+    Allowed {
+        file: "meta_optimizer/canary.rs",
+        site: r#"pg_db.get_active_template_canary(template_id))}).unwrap_or("#,
+        count: 1,
+        reason: "bridged: an unreadable template canary serves the default prompt content (a real \
+                 value), the safe arm",
+    },
+    Allowed {
+        file: "meta_optimizer/parser.rs",
+        site: r#"pg_db.reject_finding_recommendations(optimizer_run_id))}).unwrap_or("#,
+        count: 1,
+        reason: "bridged: the count feeds one info log line and nothing else",
+    },
+    Allowed {
+        file: "meta_optimizer/parser.rs",
+        site: r#"pg_db.query_pending_recommendations_by_type(&["rule_create","rule_update"],0.85,optimizer_run_id,))}).unwrap_or_default()"#,
+        count: 1,
+        reason:
+            "bridged: background auto-apply; an unreadable candidate list applies nothing this \
+                 pass (the skip a background loop owes) and the next optimizer run re-reads",
+    },
+    Allowed {
+        file: "meta_optimizer/parser.rs",
+        site: r#"pg_db.query_pending_recommendations_by_type(&["prompt_rewrite"],0.75,optimizer_run_id,))}).unwrap_or_default()"#,
+        count: 1,
+        reason:
+            "bridged: background auto-apply; an unreadable candidate list applies nothing this \
+                 pass (the skip a background loop owes) and the next optimizer run re-reads",
+    },
+    Allowed {
+        file: "meta_optimizer/parser.rs",
+        site: r#"pg_db.query_pending_recommendations_by_type(&["config_change"],0.75,optimizer_run_id,))}).unwrap_or_default()"#,
+        count: 1,
+        reason:
+            "bridged: background auto-apply; an unreadable candidate list applies nothing this \
+                 pass (the skip a background loop owes) and the next optimizer run re-reads",
+    },
+    Allowed {
+        file: "meta_optimizer/prompt_evolution.rs",
+        site: r#"pg_db.has_active_evolution(agent_type).await})}).unwrap_or("#,
+        count: 1,
+        reason:
+            "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as an active evolution, so \
+                 no second rewrite is created",
+    },
+    Allowed {
+        file: "meta_optimizer/prompt_evolution.rs",
+        site: r#"pg_db.is_in_evolution_cooldown(agent_type,&cutoff).await})}).unwrap_or("#,
+        count: 1,
+        reason: "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as in cooldown",
+    },
+    Allowed {
+        file: "meta_optimizer/prompt_evolution.rs",
+        site: r#"pg_db.count_consecutive_rejections(agent_type).await})}).unwrap_or("#,
+        count: 1,
+        reason: "bridged: feeds the cooldown length and the evolution row's counter; both guard \
+                 callers first pass has_active_evolution, which fails safe to active on an \
+                 unreadable row, and the row write it feeds fails on the same outage",
+    },
+    Allowed {
+        file: "meta_optimizer/prompt_evolution.rs",
+        site: r#"pg_db.has_baseline_drifted(agent_type,current_prompt_hash).await})}).unwrap_or("#,
+        count: 1,
+        reason:
+            "bridged: advisory only; the one caller (meta_optimizer::trigger) logs a warning and \
+                 does not block on it",
+    },
+    Allowed {
+        file: "meta_optimizer/prompt_extractor.rs",
+        site: r#"pg.get_active_prompt(&agent_type))}).ok()"#,
+        count: 1,
+        reason: "bridged: falls back to the documented default prompt for the agent type (a real \
+                 value)",
+    },
+    Allowed {
+        file: "meta_optimizer/recommendations.rs",
+        site: r#"pg_db.is_content_duplicate(content_hash))}).unwrap_or("#,
+        count: 1,
+        reason:
+            "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as a duplicate, so nothing \
+                 is inserted",
+    },
+    Allowed {
+        file: "step_executor/handlers/save_workflow_artifact.rs",
+        site: r#"pg.get_task_run(&id).await})})).ok()"#,
+        count: 1,
+        reason: "bridged: the optional prompt-extraction section of the pipeline artifact; an \
+                 unreadable row omits the section and nothing acts on its absence (matched at the \
+                 catch_unwind's `.ok()`; the `.and_then(|r| r.ok())` after it drops the PG error)",
+    },
+    Allowed {
+        file: "step_executor/handlers/save_workflow_artifact.rs",
+        site: r#"pg.get_unified_workflow_by_name(&name).await})})).ok()"#,
+        count: 1,
+        reason: "bridged: the optional prompt-extraction section of the pipeline artifact; an \
+                 unreadable row omits the section and nothing acts on its absence (matched at the \
+                 catch_unwind's `.ok()`; the `.and_then(|r| r.ok())` after it drops the PG error)",
+    },
 ];
 
 /// `src-tauri/src` holds ~1600 `.rs` files; a walker that lost the tree must
@@ -239,6 +397,8 @@ const MIN_FILES_WALKED: usize = 1000;
 const MIN_PG_METHODS: usize = 500;
 
 const EXCLUDED_DIR_NAMES: [&str; 1] = ["clorinde"];
+/// How far before a receiver [`BRIDGED_HEAD`] may reach.
+const BRIDGED_HEAD_WINDOW: usize = 200;
 const THIS_FILE: &str = "database/pg/empty_census.rs";
 
 /// One census site.
@@ -337,7 +497,10 @@ fn close_paren(bytes: &[u8], open: usize) -> Option<usize> {
 /// The census sites in one file.
 fn census_sites(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<Site> {
     let start = Regex::new(CALL_START).expect("CALL_START");
-    let fallback = Regex::new(FALLBACK).expect("FALLBACK");
+    let direct = Regex::new(&format!("{DIRECT_TAIL}{FALLBACK_HEADS}")).expect("DIRECT_TAIL");
+    let bridged = Regex::new(&format!("{BRIDGED_TAIL}{FALLBACK_HEADS}")).expect("BRIDGED_TAIL");
+    let bridged_head = Regex::new(BRIDGED_HEAD).expect("BRIDGED_HEAD");
+    let err_body = Regex::new(ERR_BODY).expect("ERR_BODY");
     let bytes = text.as_bytes();
     let mut sites = Vec::new();
     // Overlapping candidates: resume at each match's METHOD name, so in
@@ -354,9 +517,29 @@ fn census_sites(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<Site> 
         let Some(after) = close_paren(bytes, whole.end() - 1) else {
             continue;
         };
-        let Some(m) = text.get(after..).and_then(|tail| fallback.find(tail)) else {
-            continue;
+        let tail = text.get(after..).unwrap_or("");
+        let m = match direct.find(tail) {
+            Some(m) => m,
+            None => {
+                // The bridge must sit directly before the receiver (within a
+                // bounded window, cut on a char boundary).
+                let lo = whole.start().saturating_sub(BRIDGED_HEAD_WINDOW);
+                let lo = (lo..=whole.start())
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(whole.start());
+                let head = text.get(lo..whole.start()).unwrap_or("");
+                if !bridged_head.is_match(head) {
+                    continue;
+                }
+                let Some(m) = bridged.find(tail) else {
+                    continue;
+                };
+                m
+            }
         };
+        if m.as_str().ends_with('|') && tail.get(m.end()..).is_some_and(|b| err_body.is_match(b)) {
+            continue;
+        }
         let key: String = text
             .get(whole.start()..after + m.end())
             .unwrap_or("")
@@ -457,6 +640,36 @@ fn pg_error_to_empty_census_sees_a_multi_line_site() {
         "pg_db.get_task_output(&id).await.unwrap_or_default()"
     );
     assert_eq!(sites[0].line, 4);
+}
+
+#[test]
+fn pg_error_to_empty_census_sees_a_bridged_site_and_skips_an_err_arm() {
+    let methods: BTreeSet<String> = ["m".to_string()].into();
+    let hits = [
+        // tauri's sync bridge, the call directly inside.
+        "tauri::async_runtime::block_on(pg.m(id)).unwrap_or_default()",
+        // block_in_place around Handle::block_on, multi-line, receiver chain.
+        "tokio::task::block_in_place(|| {\n    tokio::runtime::Handle::current()\n        \
+         .block_on(state.app_state.pg_db.m(&id))\n})\n.ok()",
+        // an async block inside the bridge.
+        "block_in_place(|| Handle::current().block_on(async { pg_db.m(t).await }))\n.unwrap_or(false)",
+        "h.block_on(async move { pg.m(&id).await }).unwrap_or_else(|_| Vec::new())",
+    ];
+    for src in hits {
+        assert_eq!(census_sites("a.rs", src, &methods).len(), 1, "{src}");
+    }
+    let misses = [
+        // a catch_unwind panic arm maps to an Err, not to an empty value.
+        "catch_unwind(AssertUnwindSafe(|| h.block_on(async move { pg.m(&id).await })))\n\
+         .unwrap_or_else(|_| Err(\"panicked\".to_string()))",
+        // not a bridge: an ordinary function call around the read.
+        "wrap(pg.m(id)).unwrap_or_default()",
+        // outage-aware.
+        "block_on(pg.m(id)).default_unless_unavailable()?",
+    ];
+    for src in misses {
+        assert!(census_sites("a.rs", src, &methods).is_empty(), "{src}");
+    }
 }
 
 #[test]

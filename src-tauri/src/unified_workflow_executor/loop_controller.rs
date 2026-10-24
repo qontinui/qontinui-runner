@@ -815,8 +815,9 @@ impl LoopController {
                     }),
                     Err(_) => None,
                 };
-            // Set when an original setting could not be read: the run then
-            // executes as a plain baseline, never as a partial canary.
+            // Set when an original setting could not be read, or an override
+            // could not be written: the run then executes as a plain baseline,
+            // never as a partial canary.
             let mut abandon_canary = false;
 
             // Apply config overrides for canary runs
@@ -849,10 +850,14 @@ impl LoopController {
                             canary_config_originals.push((key.clone(), original));
                             let set_result = self.app_state.pg_db.set_setting(&key, &value).await;
                             if let Err(e) = set_result {
-                                warn!("CANARY: Failed to set config {}={}: {}", key, value, e);
-                            } else {
-                                info!("CANARY: Injecting config override {}={}", key, value);
+                                warn!(
+                                    "CANARY: Failed to set config {}={}, running as baseline: {}",
+                                    key, value, e
+                                );
+                                abandon_canary = true;
+                                break;
                             }
+                            info!("CANARY: Injecting config override {}={}", key, value);
                         }
                     }
                     Err(e) => {
@@ -939,7 +944,7 @@ impl LoopController {
                         stage_num, total_stages
                     ))
                     .await;
-                Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
+                Self::finish_canary_restore(&self.app_state.pg_db, &canary_config_originals).await;
                 flow_enforcer.record_end(&config.workflow_id, None).await;
                 return WorkflowResult {
                     success: false,
@@ -996,7 +1001,11 @@ impl LoopController {
                                 max, stage_num, total_stages
                             ))
                             .await;
-                        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
+                        Self::finish_canary_restore(
+                            &self.app_state.pg_db,
+                            &canary_config_originals,
+                        )
+                        .await;
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1156,7 +1165,11 @@ impl LoopController {
                             .await
                             .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
                             .await;
-                        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
+                        Self::finish_canary_restore(
+                            &self.app_state.pg_db,
+                            &canary_config_originals,
+                        )
+                        .await;
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1763,7 +1776,8 @@ impl LoopController {
                             .on_workflow_complete(&loop_result, start.elapsed(), sessions)
                             .await;
                     }
-                    Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
+                    Self::finish_canary_restore(&self.app_state.pg_db, &canary_config_originals)
+                        .await;
                     flow_enforcer.record_end(&config.workflow_id, None).await;
                     return WorkflowResult {
                         success: false,
@@ -2965,7 +2979,7 @@ impl LoopController {
         }
 
         // Restore canary config overrides
-        Self::restore_canary_config(&self.app_state.pg_db, &canary_config_originals).await;
+        Self::finish_canary_restore(&self.app_state.pg_db, &canary_config_originals).await;
 
         // Record flow control end for concurrency tracking
         flow_enforcer.record_end(&config.workflow_id, None).await;
@@ -2998,6 +3012,12 @@ impl LoopController {
     /// arm above "undid" nothing. Returns the entries whose write FAILED (each
     /// already logged), in application order, so a caller can retry them — the
     /// abandon arm keeps them for the end-of-run restore.
+    ///
+    /// KNOWN LIMIT: settings are process-global, so two canary runs that
+    /// overlap interfere — the second records the first's override as its
+    /// "original" and writes it back at its end, and the first's restore pulls
+    /// the second's overrides out mid-run. Restores that fail at the end of a
+    /// run are logged at `error!` and not persisted for a later retry.
     async fn restore_canary_config(
         pg: &crate::database::pg::PgDb,
         originals: &[(String, Option<serde_json::Value>)],
@@ -3009,6 +3029,24 @@ impl LoopController {
             }
         })
         .await
+    }
+
+    /// The last restore a run makes (end of run, or an early return): nothing
+    /// retries after it, so an override it could not restore is logged at
+    /// `error!` — it stays in the settings table until someone resets it.
+    async fn finish_canary_restore(
+        pg: &crate::database::pg::PgDb,
+        originals: &[(String, Option<serde_json::Value>)],
+    ) {
+        let left = Self::restore_canary_config(pg, originals).await;
+        if !left.is_empty() {
+            let keys: Vec<&str> = left.iter().map(|(k, _)| k.as_str()).collect();
+            error!(
+                "CANARY: {} override(s) could not be restored and stay in place: {:?}",
+                keys.len(),
+                keys
+            );
+        }
     }
 
     /// Multi-agent fix: triage failures into groups, run specialized fix agents
@@ -3683,10 +3721,12 @@ fn stage_loop_entry_for(
     }
 }
 
-/// Write every `(key, original)` back through `write`, in REVERSE application
-/// order (so a key overridden twice ends at the first original recorded for
-/// it). `write` receives `Some(value)` to set and `None` to delete. Returns the
-/// entries whose write failed, in application order, each logged at `warn!`.
+/// Write every key's ORIGINAL back through `write`. A key recorded more than
+/// once is restored to its FIRST recorded original only (a later record of it
+/// holds a value an earlier override wrote, so restoring or retrying it could
+/// put an override back). `write` receives `Some(value)` to set and `None` to
+/// delete. Returns the entries whose write failed, in application order, each
+/// logged at `warn!`.
 async fn restore_settings<F, Fut>(
     originals: &[(String, Option<serde_json::Value>)],
     mut write: F,
@@ -3695,10 +3735,18 @@ where
     F: FnMut(String, Option<serde_json::Value>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    let mut seen = std::collections::HashSet::new();
+    let firsts: Vec<&(String, Option<serde_json::Value>)> = originals
+        .iter()
+        .filter(|(k, _)| seen.insert(k.as_str()))
+        .collect();
     let mut failed = Vec::new();
-    for (key, original) in originals.iter().rev() {
+    for (key, original) in firsts.into_iter().rev() {
         if let Err(e) = write(key.clone(), original.clone()).await {
-            warn!("CANARY: could not restore setting {} to its original: {}", key, e);
+            warn!(
+                "CANARY: could not restore setting {} to its original: {}",
+                key, e
+            );
             failed.push((key.clone(), original.clone()));
         }
     }
@@ -3746,14 +3794,20 @@ mod canary_restore_tests {
             ("temperature".to_string(), serde_json::json!(0.9)),
         ]));
         let originals = vec![
-            ("model".to_string(), Some(serde_json::json!("baseline-model"))),
+            (
+                "model".to_string(),
+                Some(serde_json::json!("baseline-model")),
+            ),
             ("temperature".to_string(), None),
         ];
         let failed = restore_into(&store, &originals, None).await;
         assert!(failed.is_empty());
         let s = store.lock().unwrap();
         assert_eq!(s.get("model"), Some(&serde_json::json!("baseline-model")));
-        assert!(!s.contains_key("temperature"), "a key with no original is deleted");
+        assert!(
+            !s.contains_key("temperature"),
+            "a key with no original is deleted"
+        );
     }
 
     /// A key recorded twice ends at its FIRST original (reverse-order restore).
@@ -3768,6 +3822,36 @@ mod canary_restore_tests {
         assert_eq!(store.lock().unwrap().get("k"), Some(&serde_json::json!(1)));
     }
 
+    /// A duplicate key's retry carries its FIRST original, never the value an
+    /// earlier override wrote.
+    #[tokio::test]
+    async fn a_duplicate_key_is_retried_with_its_first_original_only() {
+        let store: Store = Mutex::new(HashMap::new());
+        let originals = vec![
+            ("k".to_string(), Some(serde_json::json!("orig"))),
+            ("k".to_string(), Some(serde_json::json!("override-1"))),
+        ];
+        let failed = restore_into(&store, &originals, Some("k")).await;
+        assert_eq!(
+            failed,
+            vec![("k".to_string(), Some(serde_json::json!("orig")))]
+        );
+    }
+
+    /// The real wiring: `restore_canary_config` against a database whose every
+    /// call fails returns every entry, in application order, for the
+    /// end-of-run restore to retry — the abandon arm's contract.
+    #[tokio::test]
+    async fn restore_canary_config_returns_every_entry_when_the_database_fails() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let originals = vec![
+            ("a".to_string(), Some(serde_json::json!(1))),
+            ("b".to_string(), None),
+        ];
+        let failed = LoopController::restore_canary_config(&pg, &originals).await;
+        assert_eq!(failed, originals);
+    }
+
     /// A write that fails is returned for retry (and the rest still restore).
     #[tokio::test]
     async fn a_failed_restore_is_returned_for_retry() {
@@ -3780,11 +3864,20 @@ mod canary_restore_tests {
             ("b".to_string(), Some(serde_json::json!("orig-b"))),
         ];
         let failed = restore_into(&store, &originals, Some("a")).await;
-        assert_eq!(failed, vec![("a".to_string(), Some(serde_json::json!("orig-a")))]);
-        assert_eq!(store.lock().unwrap().get("b"), Some(&serde_json::json!("orig-b")));
+        assert_eq!(
+            failed,
+            vec![("a".to_string(), Some(serde_json::json!("orig-a")))]
+        );
+        assert_eq!(
+            store.lock().unwrap().get("b"),
+            Some(&serde_json::json!("orig-b"))
+        );
         // The retry the end-of-run restore performs.
         assert!(restore_into(&store, &failed, None).await.is_empty());
-        assert_eq!(store.lock().unwrap().get("a"), Some(&serde_json::json!("orig-a")));
+        assert_eq!(
+            store.lock().unwrap().get("a"),
+            Some(&serde_json::json!("orig-a"))
+        );
     }
 }
 

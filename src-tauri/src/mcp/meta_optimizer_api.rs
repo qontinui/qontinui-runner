@@ -697,6 +697,10 @@ pub async fn get_learning_outcomes_handler(
     let tier = query.tier.unwrap_or_default();
 
     let make_err = |e: String| {
+        // An outage is a 503 with the guard's code, like every converted route.
+        if qontinui_runner_lib::pg_circuit::is_db_unavailable(&e) {
+            return crate::mcp::pg_guard::db_unavailable_error(e);
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to get learning outcomes: {}", e))),
@@ -764,6 +768,10 @@ pub async fn get_generation_feedback_handler(
     let tier = query.tier.unwrap_or_default();
 
     let make_err = |e: String| {
+        // An outage is a 503 with the guard's code, like every converted route.
+        if qontinui_runner_lib::pg_circuit::is_db_unavailable(&e) {
+            return crate::mcp::pg_guard::db_unavailable_error(e);
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!(

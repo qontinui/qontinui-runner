@@ -3,7 +3,6 @@
 //! These commands expose discovery functionality to the frontend and MCP API.
 
 use crate::commands::compartments::StorageCompartment;
-use crate::database::pg::UnlessUnavailable;
 use crate::discoveries::{
     self, sync_discoveries_batch, DiscoveryPayload, DiscoveryToSync, PendingDiscovery, SyncStatus,
 };
@@ -191,17 +190,16 @@ pub async fn sync_discoveries(
         }
     }
     // A failed status read after a successful push must not discard the push
-    // result: `remaining` becomes unknown instead.
-    let (remaining, remaining_note) = match state
-        .pg_db()
-        .get_sync_status()
-        .await
-        .default_unless_unavailable()
-    {
-        Ok(status) => (
-            Some(status["pending_count"].as_u64().unwrap_or(0) as u32),
-            None,
-        ),
+    // result: `remaining` becomes unknown instead — on ANY failed read, and on
+    // a status that carries no count, never a manufactured 0.
+    let (remaining, remaining_note) = match state.pg_db().get_sync_status().await {
+        Ok(status) => match status["pending_count"].as_u64() {
+            Some(n) => (Some(u32::try_from(n).unwrap_or(u32::MAX)), None),
+            None => (
+                None,
+                Some("sync status carried no pending_count".to_string()),
+            ),
+        },
         Err(e) => (None, Some(e)),
     };
 
