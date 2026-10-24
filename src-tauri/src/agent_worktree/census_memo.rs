@@ -39,6 +39,10 @@ pub(super) struct WalkMemo {
     /// How many times a trunk was actually RESOLVED (not served from the
     /// memo) — the observable the "once per common dir" test pins.
     pub resolutions: usize,
+    /// The walk's in-process (git2) reads and their CLI fallbacks, logged once
+    /// per walk (`crate::git_read::report`) so a box where git2 never answers
+    /// is visible.
+    pub git_reads: crate::git_read::Tally,
 }
 
 impl WalkMemo {

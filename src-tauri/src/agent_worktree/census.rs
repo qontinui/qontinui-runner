@@ -2195,6 +2195,14 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
+/// Split a `git log -1 --format=%ct%n%B` capture into the committer epoch and
+/// the body after it. A single line is an empty commit message: the capture
+/// is then just the epoch, so the trailer half degrades, never the timestamp.
+pub(crate) fn split_head_log(capture: &str) -> (Option<i64>, String) {
+    let (ct, body) = capture.split_once('\n').unwrap_or((capture, ""));
+    (ct.trim().parse::<i64>().ok(), body.to_string())
+}
+
 /// Refresh a repo's trunk remote-tracking ref, once per census tick.
 ///
 /// Every ancestry / patch-id test in [`compute_landed_in_main`] runs against
@@ -2290,30 +2298,39 @@ fn fetch_trunk(canonical: &Path, trunk: Option<&str>) {
 #[cfg(test)]
 fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     // Through the walk's own per-row path ([`landed_for_row`]: the trunk memo,
-    // the keyed commits, the cross-walk memo), so every regression case built
-    // on this helper exercises what production runs. An unresolvable trunk is
-    // `None` there too.
-    let head = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
+    // the keyed commits, the cross-walk memo, the git2 reads and their CLI
+    // fallback), so every regression case built on this helper exercises what
+    // production runs. An unresolvable trunk is `None` there too.
+    let open = crate::git_read::open(worktree).ok();
+    let head = crate::git_read::or_cli(
+        open.as_ref(),
+        &mut crate::git_read::Tally::default(),
+        crate::git_read::head_oid,
+        || git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty()),
+    );
     landed_for_row(
         worktree,
         head.as_deref(),
+        open.as_ref(),
         &mut super::census_memo::WalkMemo::default(),
     )
 }
 
-/// [`compute_landed_in_main`] for the revisions `head` and `trunk` — a ref name
-/// (`HEAD`, `origin/main`) or a commit id. The walk passes the commit ids it
-/// keys its [`super::census_memo::LandedMemo`] on, so the answer it stores is
-/// the answer FOR that key, even if HEAD or the trunk moves between the reads.
-fn compute_landed_against(worktree: &Path, head: &str, trunk: &str) -> Option<bool> {
-    let trunk = trunk.to_string();
-    let wt = worktree.to_str()?;
+/// The ancestry half of [`compute_landed_against`].
+enum Ancestry {
+    /// `head` is reachable from the trunk.
+    Yes,
+    /// It is not — or the CLI exited non-zero for another reason, which this
+    /// probe has always sent on to the patch-id test.
+    No,
+    /// The question could not be asked (spawn failure, timeout).
+    Unknown,
+}
 
-    // (1) Ancestry test — exit 0 means HEAD is an ancestor of the trunk.
-    // A spawn failure OR a timeout is an honest unknown: we must not report
-    // "not landed" for a question we could not ask.
+/// `git merge-base --is-ancestor <head> <trunk>` through the CLI.
+fn cli_is_ancestor(wt: &str, head: &str, trunk: &str) -> Ancestry {
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", wt, "merge-base", "--is-ancestor", head, &trunk]);
+    cmd.args(["-C", wt, "merge-base", "--is-ancestor", head, trunk]);
     #[cfg(test)]
     crate::agent_worktree::census::spawn_log::record(&cmd);
     // `run_probe_QUIET`: `--is-ancestor` answers with its EXIT CODE, so exit 1
@@ -2329,11 +2346,54 @@ fn compute_landed_against(worktree: &Path, head: &str, trunk: &str) -> Option<bo
         CENSUS_GIT_LOCAL_TIMEOUT,
         "worktree_census: merge-base --is-ancestor",
     ) {
-        ProbeOutcome::Captured(_) => return Some(true),
+        ProbeOutcome::Captured(_) => Ancestry::Yes,
         // Exit 1 is the legitimate "not an ancestor" answer — fall through to
         // the patch-id test below.
-        ProbeOutcome::Degraded(DegradeReason::Status) => {}
-        ProbeOutcome::Degraded(_) => return None,
+        ProbeOutcome::Degraded(DegradeReason::Status) => Ancestry::No,
+        ProbeOutcome::Degraded(_) => Ancestry::Unknown,
+    }
+}
+
+/// [`compute_landed_in_main`] for the revisions `head` and `trunk` — a ref name
+/// (`HEAD`, `origin/main`) or a commit id. The walk passes the commit ids it
+/// keys its [`super::census_memo::LandedMemo`] on, so the answer it stores is
+/// the answer FOR that key, even if HEAD or the trunk moves between the reads.
+///
+/// The ancestry test is read in-process ([`crate::git_read::is_ancestor`])
+/// over the row's open repository, the CLI when it did not open or git2
+/// declines; `cherry` stays on the CLI (plan D2: patch ids are not covered by
+/// a parity test).
+fn compute_landed_against(
+    open: Option<&git2::Repository>,
+    worktree: &Path,
+    head: &str,
+    trunk: &str,
+    tally: &mut crate::git_read::Tally,
+) -> Option<bool> {
+    let trunk = trunk.to_string();
+    let wt = worktree.to_str()?;
+
+    // (1) Ancestry test — HEAD reachable from the trunk means landed. A spawn
+    // failure OR a timeout is an honest unknown: we must not report "not
+    // landed" for a question we could not ask.
+    let ancestry = crate::git_read::or_cli(
+        open,
+        tally,
+        |r| {
+            crate::git_read::is_ancestor(r, head, &trunk).map(|yes| {
+                if yes {
+                    Ancestry::Yes
+                } else {
+                    Ancestry::No
+                }
+            })
+        },
+        || cli_is_ancestor(wt, head, &trunk),
+    );
+    match ancestry {
+        Ancestry::Yes => return Some(true),
+        Ancestry::No => {}
+        Ancestry::Unknown => return None,
     }
 
     // (2) Patch-id test via `git cherry`. Lines starting `-` are commits
@@ -2397,15 +2457,36 @@ pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
 /// operator a wrong-but-plausible advisory.
 #[cfg(test)]
 fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
-    compute_canonical_base_divergence_against(canonical, resolve_trunk_ref(canonical))
+    let open = crate::git_read::open(canonical).ok();
+    let mut tally = crate::git_read::Tally::default();
+    let branch = canonical_branch_with(open.as_ref(), canonical, &mut tally);
+    let trunk = crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical);
+    compute_canonical_base_divergence_against(open.as_ref(), canonical, branch, trunk, &mut tally)
 }
 
-/// [`compute_canonical_base_divergence`] against an already-resolved trunk.
-fn compute_canonical_base_divergence_against(
+/// [`compute_canonical_branch`] read in-process over an open repository, the
+/// CLI when it did not open or git2 declines.
+fn canonical_branch_with(
+    open: Option<&git2::Repository>,
     canonical: &Path,
-    trunk: Option<String>,
+    tally: &mut crate::git_read::Tally,
 ) -> Option<String> {
-    let branch = compute_canonical_branch(canonical)?;
+    crate::git_read::or_cli(open, tally, crate::git_read::head_branch, || {
+        compute_canonical_branch(canonical)
+    })
+}
+
+/// [`compute_canonical_base_divergence`] for an already-read `branch` against
+/// an already-resolved trunk; the ahead/behind counts are read in-process
+/// ([`crate::git_read::ahead_behind`]) with the `rev-list` CLI as fallback.
+fn compute_canonical_base_divergence_against(
+    open: Option<&git2::Repository>,
+    canonical: &Path,
+    branch: Option<String>,
+    trunk: Option<String>,
+    tally: &mut crate::git_read::Tally,
+) -> Option<String> {
+    let branch = branch?;
     // On the trunk branch itself there is no divergence to report.
     if let Some(t) = trunk.as_deref() {
         if t.strip_prefix("origin/") == Some(branch.as_str()) {
@@ -2419,7 +2500,16 @@ fn compute_canonical_base_divergence_against(
         return Some(format!("on:{branch}"));
     };
     let range = format!("{trunk}...HEAD");
-    match git_capture(canonical, &["rev-list", "--count", "--left-right", &range]) {
+    let left_right = crate::git_read::or_cli(
+        open,
+        tally,
+        |r| {
+            crate::git_read::ahead_behind(r, &trunk, "HEAD")
+                .map(|lr| lr.map(|(left, right)| format!("{left}\t{right}")))
+        },
+        || git_capture(canonical, &["rev-list", "--count", "--left-right", &range]),
+    );
+    match left_right {
         Some(lr) if !lr.is_empty() => Some(format!("on:{branch};{lr}")),
         _ => Some(format!("on:{branch}")),
     }
@@ -2440,39 +2530,71 @@ pub(super) struct CanonicalFacts {
 }
 
 /// The walk's trunk resolver: the trunk ref NAME ([`resolve_trunk_ref`]) and
-/// the commit it points at, read once per git common dir per walk.
-fn resolve_walk_trunk(dir: &Path) -> Option<super::census_memo::Trunk> {
-    let name = resolve_trunk_ref(dir)?;
-    let oid =
-        git_capture(dir, &["rev-parse", "--verify", "--quiet", &name]).filter(|s| !s.is_empty());
+/// the commit it points at, read once per git common dir per walk — both
+/// in-process over `open` when the checkout opened, the CLI otherwise.
+fn resolve_walk_trunk_with(
+    open: Option<&git2::Repository>,
+    dir: &Path,
+    tally: &mut crate::git_read::Tally,
+) -> Option<super::census_memo::Trunk> {
+    let name = crate::git_trunk::resolve_trunk_ref_with(open, dir)?;
+    let oid = crate::git_read::or_cli(
+        open,
+        tally,
+        |r| crate::git_read::verify_ref(r, &name),
+        || git_capture(dir, &["rev-parse", "--verify", "--quiet", &name]),
+    )
+    .filter(|s| !s.is_empty());
     Some(super::census_memo::Trunk { name, oid })
 }
 
 /// [`CanonicalFacts`] for `repo`, from the same canonical-path resolver the
 /// per-row code used ([`default_canonical_path`]); a missing or unresolvable
-/// canonical yields all three `None`, which coord reads as unsafe.
+/// canonical yields all three `None`, which coord reads as unsafe. The
+/// canonical checkout is opened ONCE for the branch, the trunk and the
+/// divergence counts.
 fn canonical_facts_for_repo(repo: &str, memo: &mut super::census_memo::WalkMemo) -> CanonicalFacts {
     let Some(canonical) = default_canonical_path(repo).ok() else {
         return CanonicalFacts::default();
     };
+    let open = crate::git_read::open(&canonical).ok();
+    let mut tally = crate::git_read::Tally::default();
     let trunk = memo
-        .trunk_for(&canonical, &mut resolve_walk_trunk)
+        .trunk_for(&canonical, &mut |d| {
+            resolve_walk_trunk_with(open.as_ref(), d, &mut tally)
+        })
         .map(|t| t.name);
+    let current_branch = canonical_branch_with(open.as_ref(), &canonical, &mut tally);
+    let base_divergence = compute_canonical_base_divergence_against(
+        open.as_ref(),
+        &canonical,
+        current_branch.clone(),
+        trunk,
+        &mut tally,
+    );
+    memo.git_reads.add(tally);
     CanonicalFacts {
-        current_branch: compute_canonical_branch(&canonical),
+        current_branch,
         is_dirty: compute_canonical_is_dirty(&canonical),
-        base_divergence: compute_canonical_base_divergence_against(&canonical, trunk),
+        base_divergence,
     }
 }
 
 /// `landed_in_main` for one row, through the walk's trunk memo and the
-/// cross-walk [`super::census_memo::LandedMemo`].
+/// cross-walk [`super::census_memo::LandedMemo`]. `open` is the row's
+/// repository, opened once by [`capture_worktree_in`].
 fn landed_for_row(
     worktree: &Path,
     head_sha: Option<&str>,
+    open: Option<&git2::Repository>,
     memo: &mut super::census_memo::WalkMemo,
 ) -> Option<bool> {
-    let trunk = memo.trunk_for(worktree, &mut resolve_walk_trunk)?;
+    let mut tally = crate::git_read::Tally::default();
+    let trunk = memo.trunk_for(worktree, &mut |d| {
+        resolve_walk_trunk_with(open, d, &mut tally)
+    });
+    memo.git_reads.add(tally);
+    let trunk = trunk?;
     let common = qontinui_runner_lib::git_layout::common_dir_key(worktree);
     let key = match (common, head_sha, trunk.oid.as_deref()) {
         (Some(c), Some(h), Some(t)) => Some((c, h.to_string(), t.to_string())),
@@ -2487,8 +2609,8 @@ fn landed_for_row(
     // Probe the KEYED commits, so a stored answer can never belong to
     // different commits than its key; without a full key, the live refs.
     let answer = match &key {
-        Some((_, h, t)) => compute_landed_against(worktree, h, t)?,
-        None => compute_landed_against(worktree, "HEAD", &trunk.name)?,
+        Some((_, h, t)) => compute_landed_against(open, worktree, h, t, &mut memo.git_reads)?,
+        None => compute_landed_against(open, worktree, "HEAD", &trunk.name, &mut memo.git_reads)?,
     };
     if let Some((c, h, t)) = &key {
         landed.put(c, h, t, answer);
@@ -2518,42 +2640,55 @@ fn capture_worktree_in(
     // construction). The dirty probe makes the same check itself and returns
     // the verdict a failed probe would have produced.
     let git_absent = qontinui_runner_lib::git_layout::git_provably_absent(worktree);
+    // Opened ONCE for every in-process read below (plan Phase 4): branch,
+    // HEAD, the last commit, the trunk and the ancestry test. A checkout that
+    // does not open falls back to the CLI for each, which is today's path.
+    let open = if git_absent {
+        None
+    } else {
+        crate::git_read::open(worktree).ok()
+    };
+    let open = open.as_ref();
+    let mut tally = crate::git_read::Tally::default();
     let branch = if git_absent {
         None
     } else {
-        git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty())
+        crate::git_read::or_cli(open, &mut tally, crate::git_read::head_branch, || {
+            git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty())
+        })
     };
     let head_sha = if git_absent {
         None
     } else {
-        git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())
+        crate::git_read::or_cli(open, &mut tally, crate::git_read::head_oid, || {
+            git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())
+        })
     };
 
-    // ONE spawn for two facts. `%ct%n%B` puts the committer epoch on the
-    // first line and the full commit body after it, so reading the
-    // `Session-Id:` trailer costs NOTHING on a walk that already takes 33
-    // minutes -- the alternative (a second `git log`) would have added
-    // ~1,250 process spawns per census.
-    let head_log = if git_absent {
+    // Two facts in one read. On the CLI fallback that is ONE spawn: `%ct%n%B`
+    // puts the committer epoch on the first line and the full commit body
+    // after it, so reading the `Session-Id:` trailer costs nothing extra -- a
+    // second `git log` would have added ~1,250 process spawns per census.
+    let head_log: Option<(Option<i64>, String)> = if git_absent {
         None
     } else {
-        git_capture(worktree, &["log", "-1", "--format=%ct%n%B"])
+        crate::git_read::or_cli(
+            open,
+            &mut tally,
+            |r| {
+                crate::git_read::head_commit(r)
+                    .map(|c| c.map(|c| (Some(c.committed_epoch), c.body)))
+            },
+            || {
+                git_capture(worktree, &["log", "-1", "--format=%ct%n%B"])
+                    .map(|s| split_head_log(&s))
+            },
+        )
     };
-    let (head_epoch_raw, head_body) = match head_log.as_deref() {
-        Some(s) => match s.split_once('\n') {
-            Some((ct, body)) => (Some(ct), body),
-            // A single line: an empty commit message. The capture is then
-            // just the epoch -- degrade the trailer half, never the
-            // timestamp.
-            None => (Some(s), ""),
-        },
-        None => (None, ""),
-    };
-    let head_age_secs = head_epoch_raw
-        .map(str::trim)
-        .and_then(|s| s.parse::<i64>().ok())
-        .map(|committed| chrono::Utc::now().timestamp().saturating_sub(committed));
-    let (head_session_id, head_session_name) = super::custody::parse_session_trailers(head_body);
+    let (head_epoch, head_body) = head_log.unwrap_or((None, String::new()));
+    let head_age_secs =
+        head_epoch.map(|committed| chrono::Utc::now().timestamp().saturating_sub(committed));
+    let (head_session_id, head_session_name) = super::custody::parse_session_trailers(&head_body);
 
     // is_dirty — reclaim-scoped: `git status --porcelain` MINUS the runner's
     // own untracked scaffolding (`.claude/`, `.coord-mcp-status`, `.mcp.json`).
@@ -2632,8 +2767,9 @@ fn capture_worktree_in(
     let landed_in_main = if git_absent {
         None
     } else {
-        landed_for_row(worktree, head_sha.as_deref(), memo)
+        landed_for_row(worktree, head_sha.as_deref(), open, memo)
     };
+    memo.git_reads.add(tally);
 
     // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
     // (NOT the reclaim executor's `probe_building`, which also counts recent
@@ -2692,12 +2828,15 @@ fn capture_worktree_in(
 /// captured (the chunked-emission feed — a row costs ~2s of git spawns, so
 /// push-per-row is what lets chunks flow DURING the walk).
 fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus)) {
-    enumerate_worktrees_seamed(
+    let memo = enumerate_worktrees_seamed(
         root,
         &mut canonical_facts_for_repo,
         &mut capture_worktree_in,
         on_row,
     );
+    // Once per walk: how many git facts git2 answered and how many fell back
+    // to the CLI (plan Risks: a box that always falls back must be visible).
+    crate::git_read::report("worktree_census", memo.git_reads);
 }
 
 /// The per-row computation [`enumerate_worktrees_seamed`] calls.
@@ -2757,17 +2896,26 @@ fn enumerate_worktrees_seamed(
         // The trunk NAME is resolved once for the refspec; its commit is read
         // AFTER the fetch, by the memo, so every row of this repo compares
         // against the refreshed trunk.
-        let trunk = resolve_trunk_ref(canonical);
+        // One open of the canonical checkout serves the trunk name and, after
+        // the fetch, its commit (libgit2 re-reads refs from disk per lookup).
+        let open = crate::git_read::open(canonical).ok();
+        let trunk = crate::git_trunk::resolve_trunk_ref_with(open.as_ref(), canonical);
         fetch_trunk(canonical, trunk.as_deref());
         // Seed the memo for this repo's common dir with the name just
         // resolved, so the walk does not resolve it a second time.
         // `seed` REPLACES: a row of this repository reached earlier in the
         // walk may have memoised a pre-fetch commit.
         let seeded = trunk.clone().map(|name| {
-            let oid = git_capture(canonical, &["rev-parse", "--verify", "--quiet", &name])
-                .filter(|s| !s.is_empty());
+            let oid = crate::git_read::or_cli(
+                open.as_ref(),
+                &mut memo.git_reads,
+                |r| crate::git_read::verify_ref(r, &name),
+                || git_capture(canonical, &["rev-parse", "--verify", "--quiet", &name]),
+            )
+            .filter(|s| !s.is_empty());
             super::census_memo::Trunk { name, oid }
         });
+        drop(open);
         memo.seed(canonical, seeded);
         let facts = canonical_facts(repo, &mut memo);
 
@@ -5658,6 +5806,7 @@ mod tests {",
         let (_canonical, _a, _b) = walk_fixture(tmp.path());
 
         let _ = spawn_log::take();
+        let _ = crate::git_trunk::resolutions::take();
         let mut facts_calls = 0usize;
         let mut rows = 0usize;
         let mut facts = |_: &str, _: &mut super::super::census_memo::WalkMemo| {
@@ -5692,14 +5841,22 @@ mod tests {",
         // The trunk is resolved once for the repo's common dir: the walk's own
         // seed after `fetch_trunk`, and every row served from the memo.
         assert_eq!(memo.resolutions, 1, "trunk resolved once per common dir");
-        // Counted at the processes too, so a row that resolved the trunk
-        // around the memo would show: ONE `origin/HEAD` read for 3 rows.
+        // Counted at the resolver too, so a row that resolved the trunk
+        // around the memo would show: ONE resolution for 3 rows. (Until Phase
+        // 4 this counted `symbolic-ref` spawns; the resolution is now read
+        // in-process, so the spawn count genuinely fell to 0 — asserted below.)
+        assert_eq!(
+            crate::git_trunk::resolutions::take(),
+            1,
+            "trunk resolutions at the resolver"
+        );
         let spawned = spawn_log::take();
         let trunk_reads = spawned
             .iter()
             .filter(|a| a.contains("symbolic-ref --short refs/remotes/origin/HEAD"))
             .count();
-        assert_eq!(trunk_reads, 1, "trunk resolutions spawned: {spawned:?}");
+        assert_eq!(trunk_reads, 0, "git2 answered the trunk: {spawned:?}");
+        assert_eq!(memo.git_reads.fell_back, 0, "{:?}", memo.git_reads);
     }
 
     #[test]
@@ -5775,7 +5932,11 @@ mod tests {",
         let common = qontinui_runner_lib::git_layout::common_dir_key(path).unwrap();
         super::super::census_memo::LandedMemo::global().put(&common, &head, &base, true);
         let mut memo = super::super::census_memo::WalkMemo::default();
-        assert_eq!(landed_for_row(path, Some(&head), &mut memo), Some(true));
+        let open = crate::git_read::open(path).ok();
+        assert_eq!(
+            landed_for_row(path, Some(&head), open.as_ref(), &mut memo),
+            Some(true)
+        );
     }
 
     #[test]
@@ -5789,7 +5950,11 @@ mod tests {",
         let landed = super::super::census_memo::LandedMemo::global();
         assert_eq!(landed.get(&common, &base, &base), None);
         let mut memo = super::super::census_memo::WalkMemo::default();
-        assert_eq!(landed_for_row(path, Some(&base), &mut memo), Some(true));
+        let open = crate::git_read::open(path).ok();
+        assert_eq!(
+            landed_for_row(path, Some(&base), open.as_ref(), &mut memo),
+            Some(true)
+        );
         assert_eq!(landed.get(&common, &base, &base), Some(true));
     }
 
@@ -5840,14 +6005,58 @@ mod tests {",
             &mut memo,
         );
         let spawned = spawn_log::take();
+        // Since Phase 4 the branch, HEAD, last commit, trunk and ancestry are
+        // read in-process, so the git a live row spawns is the dirty probe's
+        // `status` alone (plus `cherry` on a non-ancestor memo miss — not
+        // this row, whose HEAD is its trunk). The count genuinely fell from
+        // the CLI's six calls to one.
+        assert_eq!(
+            spawned.len(),
+            1,
+            "a live row spawns only the dirty probe: {spawned:?}"
+        );
         assert!(
-            spawned.iter().any(|a| a.contains("status --porcelain")),
+            spawned[0].contains("status --porcelain"),
             "a live tree is still probed: {spawned:?}"
         );
-        assert!(spawned.iter().any(|a| a.contains("rev-parse HEAD")));
         assert_eq!(row.head_sha.as_deref(), Some(head.as_str()));
         assert!(row.branch.is_some());
         assert_eq!(row.landed_in_main, Some(true));
         assert!(row.is_dirty_known);
+        assert!(row.head_age_secs.is_some(), "the last commit was read");
+        assert_eq!(memo.git_reads.fell_back, 0, "{:?}", memo.git_reads);
+    }
+
+    /// The other half of the fallback: a row whose checkout git2 cannot open
+    /// — a directory with no `.git` of its own inside a repository, which the
+    /// CLI answers for the PARENT — still gets the CLI's answers, unchanged.
+    #[test]
+    fn a_row_git2_cannot_open_falls_back_to_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let git = trunk_fixture(path);
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        let sub = path.join("husk");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(crate::git_read::open(&sub).is_err(), "premise");
+        let mut memo = super::super::census_memo::WalkMemo::default();
+        let _ = spawn_log::take();
+        let row = capture_worktree_in(
+            "qontinui-probe",
+            &sub,
+            &CanonicalFacts::default(),
+            &mut memo,
+        );
+        let spawned = spawn_log::take();
+        assert!(
+            spawned.iter().any(|a| a.contains("rev-parse HEAD")),
+            "the CLI answered: {spawned:?}"
+        );
+        assert_eq!(row.head_sha.as_deref(), Some(head.as_str()));
+        assert!(row.branch.is_some());
+        assert_eq!(row.landed_in_main, Some(true));
+        assert!(memo.git_reads.fell_back >= 4, "{:?}", memo.git_reads);
+        assert_eq!(memo.git_reads.in_process, 0, "{:?}", memo.git_reads);
     }
 }
