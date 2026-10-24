@@ -217,33 +217,7 @@ fn origin_url_from_config(config_path: &Path) -> Option<String> {
 /// config is unreadable, or no origin URL is declared — the caller treats all
 /// three as "not verified", never as a match.
 pub fn origin_url(checkout: &Path) -> Option<String> {
-    let dot_git = checkout.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let target = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-            .trim();
-        let target = PathBuf::from(target);
-        if target.is_absolute() {
-            target
-        } else {
-            checkout.join(target)
-        }
-    };
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(c) if !c.trim().is_empty() => {
-            let c = PathBuf::from(c.trim());
-            if c.is_absolute() {
-                c
-            } else {
-                git_dir.join(c)
-            }
-        }
-        _ => git_dir,
-    };
+    let (_, common) = crate::git_layout::git_dir_and_common_dir(checkout)?;
     origin_url_from_config(&common.join("config"))
 }
 
