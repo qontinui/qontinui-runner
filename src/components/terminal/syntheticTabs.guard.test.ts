@@ -25,9 +25,10 @@ function tab(partial: Partial<TerminalTab> & Pick<TerminalTab, "id">): TerminalT
 
 function transcript(
   partial: Partial<TranscriptSession> = {},
-): Pick<TranscriptSession, "injected_live_status" | "injected_tab"> {
+): Pick<TranscriptSession, "injected_location" | "injected_activity" | "injected_tab"> {
   return {
-    injected_live_status: undefined,
+    injected_location: undefined,
+    injected_activity: undefined,
     injected_tab: undefined,
     ...partial,
   };
@@ -58,11 +59,11 @@ describe("isSyntheticTab", () => {
 });
 
 describe("isInjectedSession", () => {
-  it("is true for a short-circuit fake (injected_live_status, no tab)", () => {
+  it("is true for a short-circuit fake (injected_location/activity, no tab)", () => {
     expect(
       isInjectedSession({
         zoneTabId: null,
-        _transcript: transcript({ injected_live_status: "active-in-zone" }),
+        _transcript: transcript({ injected_location: "hidden-here", injected_activity: "working" }),
       }),
     ).toBe(true);
   });

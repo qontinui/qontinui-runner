@@ -1146,7 +1146,7 @@
     {
       "id": "tmux-session-manager-navigator",
       "name": "tmux Session Manager Lists Every Live Session",
-      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list; a running off-screen row reads `data-session-status=\"active-off-screen\"` (\"Active, off screen\") where grid mode reads `active-in-zone`, and a tab-sourced row is never `frozen` (an idle, silent shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their status words so a hidden session needing you is visible from the list. Every row carries its two-axis status (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, D2) as `data-session-location` (`on-screen` | `hidden-here` | `outside-runner` | `other-device` | `not-running` | `unknown`) and `data-session-activity` (`needs-you` | `waiting-on-lock` | `working` | `idle-at-prompt` | `no-output-mid-tool` | `finished` | `exited` | `exited-error` | `unknown`), rendered as words (`data-testid=\"session-card-status\"`): the on-screen row reads `on-screen`, a running off-screen row `hidden-here`, and a tab-sourced row's silence reads `idle-at-prompt` (an idle shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
       "precondition": "tmux work mode is active (entering it opens the session manager)",
       "assertions": [
         {
@@ -1199,6 +1199,625 @@
               }
             },
             "label": "Tab-sourced live session row"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tmux-session-manager-navigator-elem-3",
+          "description": "An off-screen live session row reads its location as hidden here (two-axis status), not a single-axis status.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-session-location": "hidden-here"
+              }
+            },
+            "label": "Hidden-here session row"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-group-lens",
+      "name": "Session Manager Group Lens",
+      "description": "The Session Manager's default lens (`terminal.session-manager-group-by` = `groups`, plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 3): user groups first, then the Ungrouped section, with Suggest groups in the header. Conditional state: the Session Manager is open on its Live view with the group lens.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-group-lens-elem-0",
+          "description": "The Suggest groups header button is shown in the group lens.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.suggest-groups"
+            },
+            "label": "Suggest groups button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-group-lens-elem-1",
+          "description": "The Ungrouped section header is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.ungrouped-section"
+            },
+            "label": "Ungrouped section"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-group-suggestions",
+      "name": "Suggested Session Groups Dialog",
+      "description": "Suggest groups opens a preview of deterministic suggestions for ungrouped sessions (by plan, PR, repo+branch or repo; no AI). Nothing is created until a suggestion is accepted. Component `session-group-suggestions`: list-suggestions (read), accept-suggestion / dismiss-suggestion / accept-all (write). Conditional state: Suggest groups was clicked.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-group-suggestions-elem-0",
+          "description": "The suggestions dialog is open.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-group-suggestions"
+            },
+            "label": "Suggestions dialog"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-group-suggestions-elem-1",
+          "description": "Accept all is offered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-group-suggestions-accept-all"
+            },
+            "label": "Accept all suggestions"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-group-header",
+      "name": "User Group Header (Expanded)",
+      "description": "A user group renders a header (`terminal.session-org.group-header-<groupId>`) carrying `data-group-id`, `data-group-title`, `data-group-color-role` (one of the six group color roles, never a status color), `data-group-collapsed`, `data-group-member-count` and `data-group-needs-you-count`; its right-click menu holds Rename, Color, Collapse, New session in group, Move to page, Ungroup, Close group (destructive) and Delete group. Conditional state: a user group exists.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-group-header-elem-0",
+          "description": "An expanded user group header is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-group-collapsed": "false"
+              }
+            },
+            "label": "Expanded group header"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-group-collapsed",
+      "name": "User Group Header (Collapsed)",
+      "description": "A collapsed group renders only its header; its members are not rendered (and so cannot be swept into a Shift range or Ctrl+A), while the header still shows how many members need input (`data-group-needs-you-count`). Conditional state: a user group is collapsed.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-group-collapsed-elem-0",
+          "description": "A collapsed user group header is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-group-collapsed": "true"
+              }
+            },
+            "label": "Collapsed group header"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-query-bar",
+      "name": "Session Query Box and Chips",
+      "description": "The query box (D5 grammar: is:, where:, repo:, plan:, group:, title:, text:\"…\", idle>30m, OR, -negation) with one-click chips that toggle a token (Needs you, Working, Idle, No output, Finished, Ready to close, Outside runner, Pinned) and show matched / unknown counts (`data-count`, `data-unknown-count`, `aria-pressed`). The bar's `data-query` and `data-query-ok` mirror the parse. Component `session-query`: get-query / set-query / clear-query / toggle-chip (read), save-view / delete-view (write). Conditional state: the Session Manager is open on its Live view.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-query-bar-elem-0",
+          "description": "The session query bar is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.query-bar"
+            },
+            "label": "Query bar"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-query-bar-elem-1",
+          "description": "The query input is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.query-input"
+            },
+            "label": "Query input"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-query-bar-elem-2",
+          "description": "The Needs you chip is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.query-chip-needs-you"
+            },
+            "label": "Needs you chip"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-query-unknown-tail",
+      "name": "Query Unknown Tail",
+      "description": "When a query cannot be decided for some rows (a fact source unread), those rows are listed separately under the Unknown tail with the reason (`data-unknown-reason`) — never silently counted as non-matching. Conditional state: the active query has rows it cannot decide.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-query-unknown-tail-elem-0",
+          "description": "The Unknown tail is shown under the filtered list.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.query-unknown-tail"
+            },
+            "label": "Unknown tail"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-search-palette",
+      "name": "Session Search Palette",
+      "description": "Ctrl+Shift+Space (or `/sessions.find`) opens a palette searching live, previous and recently-closed sessions by title, topic, repo or transcript text. Component `session-search-palette`: search (read), activate (write: focuses a live session or resumes another), close (read). Conditional state: the palette was opened.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-search-palette-elem-0",
+          "description": "The session search palette is open.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.search-palette"
+            },
+            "label": "Search palette"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-search-palette-elem-1",
+          "description": "The palette input is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.search-palette-input"
+            },
+            "label": "Search palette input"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-bulk-bar",
+      "name": "Session Bulk Action Bar",
+      "description": "Selecting rows (click, Ctrl/Shift-click, Space, Ctrl+A, or Select all N shown) shows the bulk bar (`data-selected-count`): Close (destructive — opens the named confirmation), Finish, Add to group, New group, Pin, Unpin, Mute, Snooze, Move to page, Resume (write) and Clear (read). Conditional state: at least one row is selected.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-bulk-bar-elem-0",
+          "description": "The bulk action bar is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.bulk-bar"
+            },
+            "label": "Bulk bar"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-bulk-bar-elem-1",
+          "description": "Bulk Close is offered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.bulk.close"
+            },
+            "label": "Bulk close"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-ready-to-close",
+      "name": "Ready to Close Banner",
+      "description": "When sessions are finished (closable), a banner (`data-ready-count`) offers Review, which opens the close confirmation listing each with why it is finished. Conditional state: at least one live session is finished.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-ready-to-close-elem-0",
+          "description": "The Ready to close banner is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.ready-to-close"
+            },
+            "label": "Ready to close banner"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-ready-to-close-elem-1",
+          "description": "Review is offered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.ready-to-close.review"
+            },
+            "label": "Ready to close review"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-close-dialog",
+      "name": "Close Confirmation",
+      "description": "Every close path (row, group, bulk, Ready to close) goes through one confirmation that names each session, with a per-session Include tick; Close re-checks each item before acting and ends sessions through graceful_exit, never a kill. A session that is working requires Force close plus its second tick (D7). Conditional state: a close was requested.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-close-dialog-elem-0",
+          "description": "The close confirmation is open.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.close-dialog"
+            },
+            "label": "Close dialog"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-close-dialog-elem-1",
+          "description": "Cancel is offered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.close-cancel"
+            },
+            "label": "Close cancel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-close-dialog-elem-2",
+          "description": "Close is offered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.close-confirm"
+            },
+            "label": "Close confirm"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-force-close",
+      "name": "Force Close Confirmation",
+      "description": "Force close arms a second confirmation for sessions that are still working; it is destructive and still graceful_exit-only. Conditional state: Force close was clicked in the close confirmation.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-force-close-elem-0",
+          "description": "The force-close confirmation is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.force-close-confirm"
+            },
+            "label": "Force close confirm"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-recently-closed",
+      "name": "Recently Closed Sessions",
+      "description": "Closed sessions are listed under Recently closed (`data-shown-count`, `data-total-count`) with Resume (`terminal.session-org.recently-closed.resume-<sessionKey>`, write), whose outcome is read back (`data-reopen-state`). Conditional state: a session was closed from this runner.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-recently-closed-elem-0",
+          "description": "The Recently closed section is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.recently-closed"
+            },
+            "label": "Recently closed"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-hover-card",
+      "name": "Session Hover Card",
+      "description": "Hovering a row (or a rail item) opens a card with the session's repo, branch, PRs and why it is in its current state; each field is `data-hover-field=<key>` with `data-unknown` when its source is unread. Conditional state: a session row is hovered.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-hover-card-elem-0",
+          "description": "The hover card is open.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-org.hover-card"
+            },
+            "label": "Hover card"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "session-org-hover-card-elem-1",
+          "description": "The card names the repo.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-hover-field": "repo"
+              }
+            },
+            "label": "Hover card repo field"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-unseen-dot",
+      "name": "Unseen Activity Dot",
+      "description": "A session that produced output while not focused carries `data-session-unseen=\"true\"` and an unseen dot (`terminal.session-org.unseen-dot-<sessionId>`) until it is focused; an unread source reads `unknown`, never `false`. Conditional state: a session produced output while unfocused.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-unseen-dot-elem-0",
+          "description": "A row carries the unseen dot.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-session-unseen": "true"
+              }
+            },
+            "label": "Unseen row"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "session-org-rail-mode",
+      "name": "Session Manager Rail Mode",
+      "description": "Collapsed to a rail, the panel shows one status dot per rendered row (`terminal.session-org.rail-item-<sessionId>`, with location/activity/unseen attributes); hovering an item opens the hover card. Conditional state: the panel was collapsed to a rail.",
+      "isInitial": false,
+      "assertions": [
+        {
+          "id": "session-org-rail-mode-elem-0",
+          "description": "The panel is in rail mode.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-session-panel-mode": "rail"
+              }
+            },
+            "label": "Rail panel"
           },
           "source": "ai-generated",
           "reviewed": false,
@@ -1297,6 +1916,826 @@
         }
       ],
       "effect": "write"
+    },
+    {
+      "id": "session-org-open-suggestions",
+      "name": "Open group suggestions",
+      "description": "Suggest groups opens the preview; nothing is written.",
+      "fromStates": [
+        "session-org-group-lens"
+      ],
+      "activateStates": [
+        "session-org-group-suggestions"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.suggest-groups"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-accept-all-suggestions",
+      "name": "Accept all group suggestions",
+      "description": "Creates every suggested group with its members; each is reversible through its own ungroup / delete.",
+      "fromStates": [
+        "session-org-group-suggestions"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [
+        "session-org-group-suggestions"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-group-suggestions-accept-all"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-dismiss-suggestions-dialog",
+      "name": "Close the suggestions dialog",
+      "description": "Closes the preview without creating anything.",
+      "fromStates": [
+        "session-org-group-suggestions"
+      ],
+      "activateStates": [
+        "session-org-group-lens"
+      ],
+      "exitStates": [
+        "session-org-group-suggestions"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-group-suggestions-close"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-create-group",
+      "name": "Create a group",
+      "description": "`session-org` create-group (right-click a row → New group). Reversible by delete-group.",
+      "fromStates": [
+        "session-org-group-lens"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "create-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-rename-group",
+      "name": "Rename a group",
+      "description": "`session-org` rename-group, or Rename in the group menu / double-click the title.",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "rename-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-recolor-group",
+      "name": "Recolor a group",
+      "description": "`session-org` recolor-group: one of the six group color roles.",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "recolor-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-reorder-group",
+      "name": "Reorder a group",
+      "description": "`session-org` move-group (drag a group header).",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "move-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-move-session-to-group",
+      "name": "Move a session between groups",
+      "description": "`session-org` add-to-group (drag a row onto another group's header or rows).",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "add-to-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-ungroup-group",
+      "name": "Ungroup",
+      "description": "`session-org` ungroup-group: releases the members; the group stays.",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "ungroup-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-delete-group",
+      "name": "Delete a group",
+      "description": "`session-org` delete-group: removes the group only; its sessions stay, ungrouped.",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-lens"
+      ],
+      "exitStates": [
+        "session-org-group-header"
+      ],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "delete-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-collapse-group",
+      "name": "Collapse a group",
+      "description": "The header's collapse toggle (`terminal.session-org.group-collapse-<groupId>`) or `session-org` set-group-collapsed.",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-group-collapsed"
+      ],
+      "exitStates": [
+        "session-org-group-header"
+      ],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "set-group-collapsed"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-expand-group",
+      "name": "Expand a group",
+      "description": "The header's collapse toggle again, or `session-org` set-group-collapsed with collapsed=false.",
+      "fromStates": [
+        "session-org-group-collapsed"
+      ],
+      "activateStates": [
+        "session-org-group-header"
+      ],
+      "exitStates": [
+        "session-org-group-collapsed"
+      ],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "set-group-collapsed"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-close-session",
+      "name": "Close a session",
+      "description": "Row menu → Close (`terminal.session-org.session-menu.close-<sessionId>`) opens the named confirmation; `session-org` close ends the listed sessions through graceful_exit and answers each outcome. Ends a live conversation (D7).",
+      "fromStates": [
+        "session-org-group-lens"
+      ],
+      "activateStates": [
+        "session-org-recently-closed"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "close"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-close-group",
+      "name": "Close group",
+      "description": "Group menu → Close group (`terminal.session-org.group-menu.close-group-<groupId>`) asks first; `session-org` close-group ends every member through graceful_exit. Ends live conversations (D7).",
+      "fromStates": [
+        "session-org-group-header"
+      ],
+      "activateStates": [
+        "session-org-close-dialog"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-org"
+          },
+          "params": {
+            "action": "close-group"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-toggle-chip",
+      "name": "Toggle a query chip",
+      "description": "Clicking a chip toggles its token in the query; the list narrows. No stored state changes.",
+      "fromStates": [
+        "session-org-query-bar"
+      ],
+      "activateStates": [
+        "session-org-query-bar"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.query-chip-needs-you"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-set-query",
+      "name": "Set the query",
+      "description": "`session-query` set-query, or typing in the query input.",
+      "fromStates": [
+        "session-org-query-bar"
+      ],
+      "activateStates": [
+        "session-org-query-unknown-tail"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-query"
+          },
+          "params": {
+            "action": "set-query"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-save-view",
+      "name": "Save the query as a view",
+      "description": "`session-query` save-view: adds one saved view; deletable with delete-view.",
+      "fromStates": [
+        "session-org-query-bar"
+      ],
+      "activateStates": [
+        "session-org-query-bar"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.query-save-view"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-open-palette",
+      "name": "Open the session search palette",
+      "description": "Ctrl+Shift+Space (or `/sessions.find`).",
+      "fromStates": [
+        "session-org-query-bar"
+      ],
+      "activateStates": [
+        "session-org-search-palette"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "keyboard",
+          "target": {
+            "id": "terminal.session-org.session-list"
+          },
+          "params": {
+            "keys": "Ctrl+Shift+Space"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-palette-activate",
+      "name": "Activate a palette result",
+      "description": "`session-search-palette` activate: focuses a live session or resumes a previous / recently closed one (starts a process; ends nothing).",
+      "fromStates": [
+        "session-org-search-palette"
+      ],
+      "activateStates": [
+        "session-org-query-bar"
+      ],
+      "exitStates": [
+        "session-org-search-palette"
+      ],
+      "actions": [
+        {
+          "type": "componentAction",
+          "target": {
+            "id": "session-search-palette"
+          },
+          "params": {
+            "action": "activate"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "session-org-palette-close",
+      "name": "Close the palette",
+      "description": "Escape, or `session-search-palette` close.",
+      "fromStates": [
+        "session-org-search-palette"
+      ],
+      "activateStates": [
+        "session-org-query-bar"
+      ],
+      "exitStates": [
+        "session-org-search-palette"
+      ],
+      "actions": [
+        {
+          "type": "keyboard",
+          "target": {
+            "id": "terminal.session-org.search-palette-input"
+          },
+          "params": {
+            "keys": "Escape"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-select-visible",
+      "name": "Select every shown session",
+      "description": "Select all N shown (or Ctrl+A in the list) selects exactly the rendered rows; collapsed members are excluded.",
+      "fromStates": [
+        "session-org-query-bar"
+      ],
+      "activateStates": [
+        "session-org-bulk-bar"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-manager-select-visible"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-bulk-clear",
+      "name": "Clear the selection",
+      "description": "Clear (or Esc) empties the selection.",
+      "fromStates": [
+        "session-org-bulk-bar"
+      ],
+      "activateStates": [],
+      "exitStates": [
+        "session-org-bulk-bar"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.bulk.clear"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-bulk-close",
+      "name": "Bulk close",
+      "description": "Close on the bulk bar opens the confirmation naming each selected session.",
+      "fromStates": [
+        "session-org-bulk-bar"
+      ],
+      "activateStates": [
+        "session-org-close-dialog"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.bulk.close"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-ready-to-close-review",
+      "name": "Review ready-to-close sessions",
+      "description": "Review opens the confirmation with every finished session ticked and why it is finished.",
+      "fromStates": [
+        "session-org-ready-to-close"
+      ],
+      "activateStates": [
+        "session-org-close-dialog"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.ready-to-close.review"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-close-cancel",
+      "name": "Cancel a close",
+      "description": "Cancel (or Esc) closes the confirmation; nothing is closed.",
+      "fromStates": [
+        "session-org-close-dialog"
+      ],
+      "activateStates": [],
+      "exitStates": [
+        "session-org-close-dialog"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.close-cancel"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-close-confirm",
+      "name": "Confirm a close",
+      "description": "Close re-checks each ticked session, ends it through graceful_exit and lists it under Recently closed; partial failures are reported per session.",
+      "fromStates": [
+        "session-org-close-dialog"
+      ],
+      "activateStates": [
+        "session-org-recently-closed"
+      ],
+      "exitStates": [
+        "session-org-close-dialog"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.close-confirm"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-force-close",
+      "name": "Arm force close",
+      "description": "Force close shows the second confirmation for still-working sessions; nothing is closed yet.",
+      "fromStates": [
+        "session-org-close-dialog"
+      ],
+      "activateStates": [
+        "session-org-force-close"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.force-close"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-force-close-confirm",
+      "name": "Confirm force close",
+      "description": "Ends still-working sessions through graceful_exit (never a kill).",
+      "fromStates": [
+        "session-org-force-close"
+      ],
+      "activateStates": [
+        "session-org-recently-closed"
+      ],
+      "exitStates": [
+        "session-org-force-close",
+        "session-org-close-dialog"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.force-close-confirm"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "session-org-collapse-to-rail",
+      "name": "Collapse to a rail",
+      "description": "The header's rail toggle collapses the panel to status dots.",
+      "fromStates": [
+        "session-org-group-lens"
+      ],
+      "activateStates": [
+        "session-org-rail-mode"
+      ],
+      "exitStates": [
+        "session-org-group-lens"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.rail-toggle",
+            "ariaLabel": "Collapse the Session Manager to a rail"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
+    },
+    {
+      "id": "session-org-expand-rail",
+      "name": "Expand the rail",
+      "description": "The rail's toggle restores the full panel.",
+      "fromStates": [
+        "session-org-rail-mode"
+      ],
+      "activateStates": [
+        "session-org-group-lens"
+      ],
+      "exitStates": [
+        "session-org-rail-mode"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.session-org.rail-toggle",
+            "ariaLabel": "Expand the Session Manager"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "read"
     }
   ]
 }

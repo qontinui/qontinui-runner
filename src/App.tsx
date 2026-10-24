@@ -842,6 +842,29 @@ function AppContent() {
                       onReorganize={() => setShowReorganize(true)}
                       onCloseEmptyPages={terminalPages.closeEmptyPages}
                       emptyPageCount={terminalPages.emptyPageCount}
+                      onDropSessionTabs={(pageId, tabIds) => {
+                        // A session row or group dragged out of the Session
+                        // Manager: move its live tabs to this page, and say
+                        // how many moved — a partial move never reads as done.
+                        const pageName =
+                          terminalPages.visiblePages.find((p) => p.id === pageId)?.name ?? pageId;
+                        void Promise.allSettled(
+                          tabIds.map((terminalId) =>
+                            invoke("terminal_set_page", { terminalId, pageId }),
+                          ),
+                        ).then((results) => {
+                          const failed = results.filter((r) => r.status === "rejected");
+                          for (const r of failed) {
+                            console.error(`Failed to move a terminal to ${pageId}:`, r.reason);
+                          }
+                          showToast(
+                            failed.length === 0
+                              ? `Moved ${tabIds.length} to ${pageName}`
+                              : `Moved ${tabIds.length - failed.length} of ${tabIds.length} to ${pageName}`,
+                            failed.length === 0 ? "success" : "error",
+                          );
+                        });
+                      }}
                       isPinned={terminalPages.isPinned}
                       onPopOut={() => {
                         // Open a new pop-out OS window (same process) that hosts its
@@ -918,6 +941,7 @@ function AppContent() {
                               onNavigateToBuilder={navigateToBuilder}
                               onNavigateToActive={navigateToActive}
                               onSessionCountChange={setTerminalSessionCount}
+                              pages={terminalPages.visiblePages}
                             />
                           </TerminalPageProvider>
                         </TerminalSessionProvider>

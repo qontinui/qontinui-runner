@@ -6,7 +6,8 @@ interface ShortcutDef {
   description: string;
 }
 
-const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
+/** Exported so the chord test can pin every inline chord to a row here. */
+export const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
   {
     title: "Terminals",
     shortcuts: [
@@ -20,10 +21,29 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
       { keys: "Ctrl+Tab", description: "Next zone / tab" },
       { keys: "Ctrl+Shift+Tab", description: "Previous zone / tab" },
       { keys: "Ctrl+1-9", description: "Focus zone by number" },
-      { keys: "Ctrl+Shift+N", description: "Jump to next session needing input" },
+      {
+        keys: "Ctrl+Shift+N",
+        description: "Jump to next session needing input (a tab here, else a Session Manager row)",
+      },
+      { keys: "Ctrl+Shift+J", description: "Open next session with no output mid-tool" },
+      { keys: "Ctrl+Shift+\u2193", description: "Next session in the same group" },
+      { keys: "Ctrl+Shift+Backspace", description: "Reopen the last closed session (Resume)" },
       { keys: "Ctrl+Shift+\u2190", description: "Go back in focus history" },
       { keys: "Ctrl+Shift+\u2192", description: "Go forward in focus history" },
       { keys: "Escape", description: "Restore maximized zone / close panel" },
+    ],
+  },
+  {
+    title: "Session Manager list (focused)",
+    shortcuts: [
+      { keys: "Click", description: "Open the session" },
+      { keys: "Ctrl+Click", description: "Add / remove the session from the selection" },
+      { keys: "Shift+Click", description: "Select the range of shown sessions" },
+      { keys: "Ctrl+A", description: "Select every shown session" },
+      { keys: "\u2191 / \u2193", description: "Move the cursor" },
+      { keys: "Enter", description: "Open the session under the cursor" },
+      { keys: "Space", description: "Toggle the session under the cursor" },
+      { keys: "Escape", description: "Clear the selection" },
     ],
   },
   {
@@ -73,6 +93,7 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
       { keys: "Ctrl+Shift+L", description: "Cycle through layout presets" },
       { keys: "Ctrl+Shift+Y", description: "Toggle work mode (grid / tmux)" },
       { keys: "Ctrl+Shift+B", description: "Toggle session manager" },
+      { keys: "Ctrl+Shift+Space", description: "Find a session (live, previous, closed)" },
       { keys: "Ctrl+Shift+A", description: "Toggle auto-focus on needs-input" },
       { keys: "Ctrl+Shift+S", description: "Toggle sound notification" },
       { keys: "Ctrl+Shift+D", description: "Toggle focus mode (dim non-focused zones)" },

@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import { SessionSearchPaletteHost } from "./SessionSearchPaletteHost";
 import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
@@ -101,6 +102,7 @@ import { ProjectFolderChip } from "./ProjectFolderChip";
 import { useApplyZoneProfile } from "./useApplyZoneProfile";
 import { useZoneProfileRestore } from "./useZoneProfileRestore";
 import { useHotField } from "./useTerminalHotStore";
+import { memberOf } from "./useSessionOrg";
 
 const logger = createLogger("TerminalPage");
 
@@ -141,6 +143,8 @@ interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
   onSessionCountChange?: (count: number) => void;
+  /** The Terminal pages — the Session Manager's Move to page targets. */
+  pages?: readonly { id: string; name: string }[];
 }
 
 export function TerminalPage(props: TerminalPageProps) {
@@ -169,6 +173,7 @@ function TerminalPageInner({
   onNavigateToBuilder: _onNavigateToBuilder,
   onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
+  pages,
 }: TerminalPageProps) {
   // The page root, handed to every global-chord listener this page owns so
   // they can tell "the terminal is on screen" from "the terminal is mounted
@@ -1164,10 +1169,16 @@ function TerminalPageInner({
     terminalRefs: terminalRefs.current,
     workflowGen,
     sessionManager: {
-      frozenCount: sessionManager.frozenCount,
+      noOutputCount: sessionManager.noOutputCount,
       needsInputCount: sessionManager.needsInputCount,
       sessions: sessionManager.sessions,
-      resumeSession: sessionManager.resumeSession,
+      openSession: sessionManager.openSession,
+      allSessions: sessionManager.allSessions,
+      groupPlaceOf: (s) => {
+        const member = memberOf(sessionManager.org, sessionManager.sessionKeyOf(s));
+        return member?.groupId ? { groupId: member.groupId, order: member.order } : null;
+      },
+      reopenLastClosed: sessionManager.reopenLastClosed,
     },
     // App.tsx keeps this page mounted behind a `hidden` div on every other
     // tab, so the hook's `window` listener outlives the page's visibility.
@@ -1230,6 +1241,12 @@ function TerminalPageInner({
     configDir: string,
     context?: string,
     tenantId?: string,
+    /**
+     * Session Manager "New session in group": the working dir to spawn in,
+     * and a callback with each launched tab's pinned Claude session id (the
+     * key the group files it under).
+     */
+    placement?: { workingDir?: string; onPinned?: (claudeSessionId: string) => void },
   ): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
@@ -1242,7 +1259,7 @@ function TerminalPageInner({
     const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
     const createdTabIds: string[] = [];
     for (let i = 0; i < count; i++) {
-      const tabId = await createAndAssignTerminal(label, undefined, spawnTenant);
+      const tabId = await createAndAssignTerminal(label, placement?.workingDir, spawnTenant);
       if (tabId) createdTabIds.push(tabId);
     }
     // Tabs that actually received a launch command. A build failure disposes
@@ -1278,6 +1295,7 @@ function TerminalPageInner({
           updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
           rememberSessionId(tabId, pinnedSessionId, configDir);
           recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
+          placement?.onPinned?.(pinnedSessionId);
         } else {
           // Custom launch command (an alias that may drop the runner's
           // `--session-id` pin) — the id is unknown up front, so fall back to
@@ -1579,6 +1597,15 @@ function TerminalPageInner({
           <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
         )}
 
+        {/* The session search palette (Ctrl+Shift+Space, /sessions.find) —
+            mounted with the page, so it works while the panel is hidden. */}
+        <SessionSearchPaletteHost
+          manager={sessionManager}
+          zoneLayout={zoneLayout}
+          onResumePastSession={handleResumePastSession}
+          notify={(message, type) => workflowGen.setNotification({ message, type })}
+        />
+
         <div className="flex-1 flex flex-row overflow-hidden">
           {workflowGen.showSidebar && (
             <SessionManagerPanel
@@ -1588,7 +1615,14 @@ function TerminalPageInner({
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
               onScreenTabId={zoneLayout.shownTabId}
-              workMode={zoneLayout.workMode}
+              pages={pages}
+              currentPageId={pageId}
+              onNewSessionInGroup={({ workingDir, configDir, onPinned }) =>
+                void handleLaunchAiSession(1, configDir, undefined, undefined, {
+                  workingDir,
+                  onPinned,
+                })
+              }
             />
           )}
 

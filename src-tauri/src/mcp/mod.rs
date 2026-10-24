@@ -152,6 +152,7 @@ pub mod server;
 pub mod session_briefing;
 pub mod session_compliance;
 pub mod session_message_poller;
+pub mod session_org; // GET/POST /terminal/session-org — loopback twins of the Session Manager organization store (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 2)
 pub mod session_recap;
 pub mod session_repository;
 pub mod session_review;

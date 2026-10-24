@@ -12,7 +12,7 @@
  *
  * The fix is the house pattern already used by
  * `components/terminal/commands/registry.ts`, `lib/authOverlayStore.ts` and
- * `useLiveClaudeSessionNames.ts`: a module store with **cached snapshots that
+ * `useLiveClaudeSessions.ts`: a module store with **cached snapshots that
  * are invalidated on mutation**, consumed through `useSyncExternalStore`. No
  * store library is installed and none is needed.
  *
