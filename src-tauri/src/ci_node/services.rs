@@ -622,7 +622,7 @@ impl ServiceStack {
     ///
     /// An empty declaration list is a true no-op: no runtime is probed, so a
     /// machine with no Docker runs every manifest that does not ask for one.
-    pub(crate) async fn provision_services(
+    pub(crate) async fn provision(
         &mut self,
         services: &[CiService],
         log: &mut (dyn FnMut(String) + Send),
