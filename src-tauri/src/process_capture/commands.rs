@@ -10,6 +10,7 @@ use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
+use crate::database::pg::UnlessUnavailable;
 
 use super::primary_proxy;
 use super::types::*;
@@ -152,14 +153,14 @@ pub async fn get_process_output(
         .pg_db
         .get_process_sessions(Some(&id), 1)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     if let Some(session) = sessions.first() {
         let lines = state
             .pg_db
             .get_process_session_output(&session.id, tail as u32, 0)
             .await
-            .unwrap_or_default();
+            .default_unless_unavailable()?;
 
         // Convert ProcessSessionOutputLine -> OutputLine
         return Ok(lines

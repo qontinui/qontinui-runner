@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::skills::SkillDefinition;
@@ -297,7 +298,8 @@ pub async fn search_skills(
         .pg_db
         .list_user_skills()
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);
@@ -318,7 +320,8 @@ pub async fn instantiate_skill(
         .pg_db
         .list_user_skills()
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);

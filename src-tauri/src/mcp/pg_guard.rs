@@ -297,6 +297,19 @@ fn db_unavailable_response(path: &str, facts: Option<DbUnavailable>) -> Response
     response
 }
 
+/// The handler-side 503 for an outage a handler met itself (the breaker
+/// tripped mid-request, or the route is not in the guard's tables): the
+/// same status and `code` the guard serves, carrying the error string.
+pub fn db_unavailable_error(message: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiResponse::error_with_code(
+            message,
+            "DATABASE_UNAVAILABLE",
+        )),
+    )
+}
+
 /// `axum::middleware::from_fn` guard. See module docs.
 pub async fn pg_degraded_guard_middleware(req: Request, next: Next) -> Response {
     // Fast path: the breaker is Closed — straight through, one atomic load.

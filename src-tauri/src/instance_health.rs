@@ -10,6 +10,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::instance_manager::InstanceManager;
 
 /// How often the health monitor runs (seconds).
@@ -111,12 +112,16 @@ pub fn start_instance_health_monitor(pg_db: Arc<PgDb>, instance_manager: Arc<Ins
 
 /// Purge all stale/dead instances immediately.
 ///
-/// Called by `POST /instances/purge-stale` for on-demand cleanup.
-pub async fn purge_stale_instances(pg_db: &PgDb, instance_manager: &InstanceManager) -> (u64, u64) {
+/// Called by `POST /instances/purge-stale` for on-demand cleanup. A down
+/// database is an `Err` (`DATABASE_UNAVAILABLE`), never "0 purged".
+pub async fn purge_stale_instances(
+    pg_db: &PgDb,
+    instance_manager: &InstanceManager,
+) -> Result<(u64, u64), String> {
     let marked = pg_db
         .mark_stale_runner_instances(STALE_THRESHOLD_SECS)
         .await
-        .unwrap_or(0);
+        .or_unless_unavailable(0)?;
 
     // For on-demand purge: first probe unhealthy instances to give them a
     // chance to respond before deletion.
@@ -141,13 +146,16 @@ pub async fn purge_stale_instances(pg_db: &PgDb, instance_manager: &InstanceMana
     }
 
     // Remove instances that are still unhealthy/stopped after probing
-    let cleaned = pg_db.cleanup_dead_runner_instances(0).await.unwrap_or(0);
+    let cleaned = pg_db
+        .cleanup_dead_runner_instances(0)
+        .await
+        .or_unless_unavailable(0)?;
 
     // Also clean up in-memory: remove registered instances whose ports are gone
     let in_mem_purged = instance_manager.purge_unreachable_registered().await;
     let _ = instance_manager.get_running_ids().await;
 
-    (marked, cleaned + in_mem_purged as u64)
+    Ok((marked, cleaned + in_mem_purged as u64))
 }
 
 /// Startup cleanup: remove stale DB entries from a previous session.

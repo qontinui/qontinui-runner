@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::types::{CreateEntityProfileInput, ObservationSearchResult};
 use crate::reflection::graph_engine::KnowledgeGraph;
 use crate::reflection::graph_types::GraphNodeKind;
@@ -43,10 +44,10 @@ pub async fn generate_entity_profile(
     let observations = pg
         .search_observations(entity_label, None, 50)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!("Failed to search observations for entity profile: {}", e);
             vec![]
-        });
+        })?;
 
     let obs_count = observations.len();
     let obs_ids: Vec<i64> = observations.iter().map(|o| o.id).collect();

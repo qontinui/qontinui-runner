@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::event_system::EventBroadcaster;
 use crate::step_executor::ExecutionStepConfig;
 use crate::workflow_event_bus::{events, get_workflow_event_bus};
@@ -894,7 +895,7 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
     }
 
     // Extract findings from task knowledge (PG)
-    let findings = pg
+    let findings = match pg
         .get_task_knowledge_by_categories(
             execution_id,
             &["Finding", "RootCause", "Solution"],
@@ -902,7 +903,15 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
             false,
         )
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+    {
+        Ok(findings) => findings,
+        Err(e) => {
+            // An outage is not "no findings": capture nothing this run.
+            tracing::debug!("auto-capture skipped for {}: {}", execution_id, e);
+            return;
+        }
+    };
 
     if !findings.is_empty() {
         content_lines.push(String::new());

@@ -14,6 +14,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::database::pg::session_touched_files::{HotFileRow, HotSessionRow};
+use crate::database::pg::UnlessUnavailable;
 use crate::executor::file_registry::{FileConflict, FileLockInfo, FileRegistryInfo};
 use crate::mcp::types::ApiState;
 use crate::util::path_extraction::{extract_paths_via_ai, AiContextBundle, ExtractError};
@@ -872,7 +873,8 @@ async fn probe_conflicts(
             .pg_db
             .get_sessions_for_files(&candidates)
             .await
-            .unwrap_or_default()
+            .default_unless_unavailable()
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
             .into_iter()
             .map(|(file_path, task_run_id)| RecentEditor {
                 file_path,

@@ -1,6 +1,7 @@
 //! PostgreSQL check and check group operations via Clorinde-generated queries.
 
 use super::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::types::{Check, CheckGroup};
 
 fn non_empty(s: String) -> Option<String> {
@@ -311,7 +312,10 @@ impl PgDb {
             let updated: chrono::DateTime<chrono::Utc> = r.get(9);
             let id: String = r.get(0);
 
-            let checks = self.get_checks_in_group(&id).await.unwrap_or_default();
+            let checks = self
+                .get_checks_in_group(&id)
+                .await
+                .default_unless_unavailable()?;
 
             groups.push(CheckGroup {
                 id,

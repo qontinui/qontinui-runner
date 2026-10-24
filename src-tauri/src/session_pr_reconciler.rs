@@ -72,6 +72,7 @@ use uuid::Uuid;
 
 use crate::database::pg::session_pr_ops::SessionPrStatus;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 use crate::trigger_system::github_api::{has_coord_landed_label, GitHubClient};
 
@@ -1023,7 +1024,10 @@ async fn refresh_stored_statuses(
     refreshed: &HashSet<(String, i64)>,
     repo_dirs: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let stored = pg_db.list_session_prs(session_id).await.unwrap_or_default();
+    let stored = pg_db
+        .list_session_prs(session_id)
+        .await
+        .default_unless_unavailable()?;
     for row in stored {
         if refreshed.contains(&(row.repo.clone(), row.pr_number)) {
             continue;

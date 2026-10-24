@@ -520,8 +520,8 @@ async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<ApiResponse<Tri
         }
         None => Json(ApiResponse::success(TriggerSystemStatus {
             running: false,
-            total_triggers: 0,
-            enabled_triggers: 0,
+            total_triggers: None,
+            enabled_triggers: None,
             active_watchers: 0,
             active_executions: 0,
             dropped_events: 0,

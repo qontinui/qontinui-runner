@@ -328,8 +328,10 @@ pub struct SetEnabledRequest {
 #[derive(Debug, Serialize)]
 pub struct TriggerSystemStatus {
     pub running: bool,
-    pub total_triggers: u64,
-    pub enabled_triggers: u64,
+    /// `None` when the database read failed (or no service ran one): unknown,
+    /// never 0.
+    pub total_triggers: Option<u64>,
+    pub enabled_triggers: Option<u64>,
     pub active_watchers: u64,
     pub active_executions: u64,
     #[serde(default)]

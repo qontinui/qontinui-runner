@@ -146,8 +146,9 @@ export interface UpdateTriggerRequest {
 
 export interface TriggerSystemStatus {
   running: boolean;
-  total_triggers: number;
-  enabled_triggers: number;
+  /** `null` when the database read failed: unknown, never 0. */
+  total_triggers: number | null;
+  enabled_triggers: number | null;
   active_watchers: number;
   active_executions: number;
   dropped_events: number;

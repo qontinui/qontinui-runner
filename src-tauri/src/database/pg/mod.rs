@@ -91,6 +91,7 @@ pub mod token_usage;
 pub mod triggers;
 pub mod ui_bridge;
 pub mod ui_bridge_baselines;
+pub mod unavailable;
 pub mod verification_tests;
 pub mod watchers;
 pub mod workflow_state;
@@ -99,10 +100,16 @@ pub mod working_representations;
 pub mod worktrees;
 pub mod wsv_disagreements;
 
+#[cfg(test)]
+mod empty_census;
+
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 pub use qontinui_runner_lib::pg_circuit::GuardedPool;
+/// The outage-aware read fallbacks (plan Phase 6): a down database never
+/// reads as empty data. `empty_census` ratchets the bare forms.
+pub use unavailable::UnlessUnavailable;
 
 /// Global PgDb instance, set once during app initialization.
 /// Allows sync-context code (thread spawns, closures) to access PG

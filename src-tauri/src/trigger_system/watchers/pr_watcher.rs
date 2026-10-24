@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::trigger_system::github_api::{CiStatus, GitHubClient, ReviewStatus};
 use crate::unified_workflow_executor::CiFailureContext;
 use crate::AppState;
@@ -383,7 +384,7 @@ async fn poll_single_pr(
             let existing_review = pg_db
                 .has_review_subtask_for_pr(&watch.task_run_id, watch.pr_number)
                 .await
-                .unwrap_or(false);
+                .or_unless_unavailable(false)?;
 
             if !existing_review {
                 use crate::unified_workflow_executor::review_subtask::{

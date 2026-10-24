@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
@@ -1759,7 +1760,8 @@ pub async fn get_current_execution_steps(
         .pg_db
         .get_all_verification_phase_results(&task.id)
         .await
-        .unwrap_or_default()
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
         .collect();
@@ -2495,7 +2497,8 @@ pub async fn generate_workflow_from_session(
         .pg_db
         .get_task_output(&id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     if output_log.is_empty() {
         return Err((

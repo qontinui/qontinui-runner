@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::memory::importance;
 use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
@@ -691,11 +692,11 @@ async fn run_consolidation_inner(
     let archived_obs = pg
         .decay_and_archive_observations(config.archive_threshold)
         .await
-        .unwrap_or(0);
+        .or_unless_unavailable(0)?;
     let archived_models = pg
         .decay_and_archive_mental_models(config.archive_threshold)
         .await
-        .unwrap_or(0);
+        .or_unless_unavailable(0)?;
 
     stats.observations_archived = (archived_obs + archived_models) as i32;
     stats.observations_decayed = stats.observations_archived; // same for now

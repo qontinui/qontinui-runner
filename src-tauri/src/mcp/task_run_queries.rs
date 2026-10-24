@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::error;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::mcp::types::ApiState;
 
 // =============================================================================
@@ -978,7 +979,8 @@ pub async fn get_current_execution_steps(
         .pg_db
         .get_all_verification_phase_results(&task.id)
         .await
-        .unwrap_or_default()
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
         .collect();
@@ -1447,7 +1449,8 @@ pub async fn get_current_execution_batch(
         .pg_db
         .get_all_verification_phase_results(&task.id)
         .await
-        .unwrap_or_default()
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
         .collect::<Vec<_>>();
@@ -1509,7 +1512,8 @@ pub async fn get_trace_correlation(
         .pg_db
         .get_execution_spans(&trace_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     // error_events not yet queryable by trace_id on PgDb — return empty
     let errors: Vec<serde_json::Value> = Vec::new();

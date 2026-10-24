@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::meta_optimizer::beam_search::{BeamSearchConfig, BeamSearchState};
 use crate::meta_optimizer::duel_engine::{CandidatePool, DuelCandidate, DuelResult};
 use crate::meta_optimizer::pairwise_judge;
@@ -144,10 +145,10 @@ impl OptimizationPipeline {
         let mut beam = BeamSearchState::new(self.config.beam.clone(), agent_type, &seed_prompt);
 
         // Gather failure evidence for critique context (includes concrete span examples)
-        let evidence = self.gather_failure_evidence(&target).await;
+        let evidence = self.gather_failure_evidence(&target).await?;
 
         // Gather contrastive good/bad output pairs for richer beam search context
-        let contrastive = self.gather_contrastive_examples(agent_type).await;
+        let contrastive = self.gather_contrastive_examples(agent_type).await?;
 
         // Rejected prompts to avoid repeating: variants from prior evolution
         // entries whose canary verdict was 'reject'. Limited to recent history.
@@ -587,7 +588,7 @@ impl OptimizationPipeline {
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    async fn gather_failure_evidence(&self, target: &PromptGroupMetrics) -> String {
+    async fn gather_failure_evidence(&self, target: &PromptGroupMetrics) -> Result<String, String> {
         let mut evidence = format!(
             "Agent: {} | Phase: {} | Failure rate: {:.1}% | Samples: {} | Mean score: {:.2} | Mean iterations: {:.1} | Mean cost: ${:.4}",
             target.agent_type,
@@ -604,7 +605,7 @@ impl OptimizationPipeline {
             .pg_db
             .get_span_events_for_agent(&target.agent_type, 20)
             .await
-            .unwrap_or_default();
+            .default_unless_unavailable()?;
 
         let mut failure_examples: Vec<String> = Vec::new();
         const MAX_FAILURE_EXAMPLES: usize = 5;
@@ -653,7 +654,7 @@ impl OptimizationPipeline {
             }
         }
 
-        evidence
+        Ok(evidence)
     }
 
     /// Gather contrastive good/bad output pairs from recent span data.
@@ -661,12 +662,15 @@ impl OptimizationPipeline {
     /// Uses `TraceToTriplet::convert` to pair high-reward and low-reward outputs.
     /// The caller can feed these into the beam search as rejected_prompts or
     /// additional context for the rewrite LLM.
-    async fn gather_contrastive_examples(&self, agent_type: &str) -> Vec<ContrastiveTriplet> {
+    async fn gather_contrastive_examples(
+        &self,
+        agent_type: &str,
+    ) -> Result<Vec<ContrastiveTriplet>, String> {
         let exec_events = self
             .pg_db
             .get_span_events_for_agent(agent_type, 30)
             .await
-            .unwrap_or_default();
+            .default_unless_unavailable()?;
 
         // Collect all message triplets across executions
         let mut all_triplets = Vec::new();
@@ -676,7 +680,7 @@ impl OptimizationPipeline {
         }
 
         if all_triplets.len() < 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Produce contrastive pairs, limited to the most informative ones
@@ -684,7 +688,7 @@ impl OptimizationPipeline {
         // Keep only pairs with meaningful reward delta
         contrastive.retain(|c| c.reward_delta > 0.2);
         contrastive.truncate(10);
-        contrastive
+        Ok(contrastive)
     }
 
     fn skipped(&self, reason: &str) -> OptimizationCycleResult {

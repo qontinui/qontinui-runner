@@ -4,6 +4,7 @@
 //! This is one of the most heavily used tables (126+ callers for reflection_fixes).
 
 use super::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::reflection::types::{CreateReflectionFixInput, ReflectionFix};
 use crate::str_utils::truncate_str;
 use tracing::{debug, info, warn};
@@ -1068,7 +1069,10 @@ impl PgDb {
                     .and_then(|r| r.get(0));
 
                 if let Some(comp) = comp {
-                    let velocity = self.compute_change_velocity(&comp, 5).await.unwrap_or(0.0);
+                    let velocity = self
+                        .compute_change_velocity(&comp, 5)
+                        .await
+                        .or_unless_unavailable(0.0)?;
                     1.0 / (1.0 + velocity)
                 } else {
                     1.0

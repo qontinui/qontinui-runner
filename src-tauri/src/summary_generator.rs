@@ -10,6 +10,7 @@
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 use crate::doctor::DoctorHandle;
 use crate::findings::types::{
     Finding, FindingCategoryExt, FindingSeverityExt, FindingStatus, FindingStatusExt,
@@ -205,14 +206,14 @@ pub(crate) fn format_findings_for_summary(findings: &[Finding]) -> String {
 /// For unified workflow runs, the AI conversation output is stored in task_run_events
 /// (event_type='ai_output') rather than in the output_log field. This function
 /// reconstructs the output from those events for summary generation.
-async fn assemble_output_from_events(pg: &PgDb, task_run_id: &str) -> String {
+async fn assemble_output_from_events(pg: &PgDb, task_run_id: &str) -> Result<String, String> {
     let events = pg
         .get_task_run_events(task_run_id, Some("ai_output"), None)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     if events.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
 
     let mut parts = Vec::new();
@@ -237,7 +238,7 @@ async fn assemble_output_from_events(pg: &PgDb, task_run_id: &str) -> String {
         }
     }
 
-    parts.join("\n\n")
+    Ok(parts.join("\n\n"))
 }
 
 /// Build a workflow metadata section for the summary prompt.
@@ -248,14 +249,14 @@ async fn build_workflow_metadata(
     pg: &PgDb,
     task_run_id: &str,
     task: &crate::database::TaskRun,
-) -> String {
+) -> Result<String, String> {
     let mut parts = Vec::new();
 
     // Add verification phase results (structured data from database)
     let verification_results = pg
         .get_all_verification_phase_results(task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     if !verification_results.is_empty() {
         let last_iteration_idx = verification_results.len() - 1;
@@ -333,11 +334,11 @@ async fn build_workflow_metadata(
         }
     }
 
-    if parts.is_empty() {
+    Ok(if parts.is_empty() {
         String::new()
     } else {
         parts.join("\n")
-    }
+    })
 }
 
 /// Generate a summary for a completed task run
@@ -383,21 +384,21 @@ pub async fn generate_task_summary(
     let findings = pg
         .get_findings_for_task(task_run_id)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!("Failed to fetch findings for summary: {}", e);
             Vec::new()
-        });
+        })?;
     let findings_section = format_findings_for_summary(&findings);
 
     // Build structured workflow metadata (verification results, transition history)
-    let workflow_metadata = build_workflow_metadata(&pg, task_run_id, &task).await;
+    let workflow_metadata = build_workflow_metadata(&pg, task_run_id, &task).await?;
 
     // Prepare the output for summarization.
     // For unified workflow runs, output_log is often empty because AI output is stored
     // in task_run_events instead. Fall back to assembling from events.
     let raw_output = if task.output_log.trim().is_empty() {
         info!("output_log is empty, assembling from task_run_events");
-        assemble_output_from_events(&pg, task_run_id).await
+        assemble_output_from_events(&pg, task_run_id).await?
     } else {
         task.output_log.clone()
     };

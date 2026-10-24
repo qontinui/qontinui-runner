@@ -17,6 +17,7 @@ use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::database::pg::UnlessUnavailable;
 use crate::doctor::DoctorHandle;
 use crate::orchestrator::knowledge::KnowledgeBase;
 use crate::orchestrator::types::StageTransition;
@@ -2209,20 +2210,25 @@ impl LoopController {
                 }
 
                 if pg_learning_ok.is_ok() {
-                    let composite_score = pg_db_for_q
+                    match pg_db_for_q
                         .get_composite_agentic_score(&outcome.task_run_id)
                         .await
-                        .unwrap_or(0.0);
-
-                    if let Err(e) =
-                        crate::orchestrator::learning_recorder::update_q_routing_table_pg(
-                            &pg_db_for_q,
-                            &outcome,
-                            composite_score,
-                        )
-                        .await
+                        .or_unless_unavailable(0.0)
                     {
-                        warn!("Failed PG Q-routing update: {}", e);
+                        // An outage is not a 0.0 score: skip the Q update.
+                        Err(e) => debug!("PG Q-routing update skipped: {}", e),
+                        Ok(composite_score) => {
+                            if let Err(e) =
+                                crate::orchestrator::learning_recorder::update_q_routing_table_pg(
+                                    &pg_db_for_q,
+                                    &outcome,
+                                    composite_score,
+                                )
+                                .await
+                            {
+                                warn!("Failed PG Q-routing update: {}", e);
+                            }
+                        }
                     }
                 }
             });
@@ -2471,9 +2477,17 @@ impl LoopController {
                                         90,
                                     )
                                     .await
-                                    .unwrap_or(0.95);
+                                    .or_unless_unavailable(0.95);
+                                // An outage is not a percentile: extract nothing.
+                                let p90 = match p90 {
+                                    Ok(p90) => Some(p90),
+                                    Err(e) => {
+                                        debug!("strategy extraction skipped: {}", e);
+                                        None
+                                    }
+                                };
 
-                                if score > p90 && score > 0.7 {
+                                if p90.is_some_and(|p90| score > p90) && score > 0.7 {
                                     let strategy = crate::online_learning::strategy_evolution::extract_strategy_from_run(
                                         &crate::online_learning::strategy_evolution::HighPerformingRun {
                                             task_run_id: ol_outcome.task_run_id.clone(),

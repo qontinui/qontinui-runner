@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::pipeline_traces;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
@@ -739,7 +740,8 @@ pub async fn get_learning_outcomes_handler(
                     limit,
                 )
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(outcomes).unwrap_or_default(),
             )))
@@ -800,7 +802,8 @@ pub async fn get_generation_feedback_handler(
                 .pg_db
                 .get_generation_feedback_l2(feedback_type.as_deref(), limit)
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(feedback).unwrap_or_default(),
             )))

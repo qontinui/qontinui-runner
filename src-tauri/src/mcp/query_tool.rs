@@ -15,6 +15,7 @@ use tracing::{error, info};
 
 use crate::database::embedding_client::EmbeddingClient;
 use crate::database::hybrid_search::HybridSearchConfig;
+use crate::database::pg::UnlessUnavailable;
 use crate::mcp::types::{ApiResponse, ApiState};
 
 /// Create routes for the query tool.
@@ -518,7 +519,7 @@ async fn execute_hybrid_with_embedding_pg(
             let findings = pg
                 .get_findings_for_task(task_run_id)
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()?;
             let search_lower = search_text.to_lowercase();
             findings
                 .into_iter()
@@ -552,7 +553,7 @@ async fn execute_hybrid_with_embedding_pg(
             let runs = pg
                 .get_recent_task_runs((request.limit * 3) as u32, None)
                 .await
-                .unwrap_or_default();
+                .default_unless_unavailable()?;
             let search_lower = search_text.to_lowercase();
             runs.into_iter()
                 .filter(|r| {
@@ -594,17 +595,19 @@ async fn execute_hybrid_with_embedding_pg(
                 Some(request.limit as u32),
             )
             .await
-            .unwrap_or_default()
+            .default_unless_unavailable()?
         }
         "unified_workflows" => {
             // PG search for workflows (uses built-in search query)
             let search_text = request.search_text.as_deref().unwrap_or("");
             let workflows = if search_text.is_empty() {
-                pg.list_unified_workflows().await.unwrap_or_default()
+                pg.list_unified_workflows()
+                    .await
+                    .default_unless_unavailable()?
             } else {
                 pg.search_unified_workflows(search_text)
                     .await
-                    .unwrap_or_default()
+                    .default_unless_unavailable()?
             };
             workflows
                 .into_iter()

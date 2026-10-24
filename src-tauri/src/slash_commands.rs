@@ -5,6 +5,7 @@
 
 use crate::capability_manifest::{record_observation, record_provision, ProvisionReport, Rung};
 use crate::database::pg::parse_workflow_id;
+use crate::database::pg::UnlessUnavailable;
 use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use regex::Regex;
@@ -332,7 +333,10 @@ pub async fn sync_slash_commands(
     record_provision(&commands_dir.display().to_string(), report);
 
     // Get existing slash command workflows from PG
-    let existing = pg.list_slash_command_sources().await.unwrap_or_default();
+    let existing = pg
+        .list_slash_command_sources()
+        .await
+        .default_unless_unavailable()?;
     let existing_map: HashMap<String, (String, String)> = existing
         .into_iter()
         .filter_map(|(id, _name, source)| {

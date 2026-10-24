@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
+use crate::database::pg::UnlessUnavailable;
 
 // ── Severity weights ──────────────────────────────────────────────────
 
@@ -561,7 +562,18 @@ pub async fn auto_extract_spec_compliance(pg: &PgDb, task_run_id: &str) {
     let trid = task_run_id.to_string();
 
     // Check if this is a spec-generated workflow
-    let is_spec = pg.is_spec_generated_workflow(&trid).await.unwrap_or(false);
+    let is_spec = match pg
+        .is_spec_generated_workflow(&trid)
+        .await
+        .or_unless_unavailable(false)
+    {
+        Ok(is_spec) => is_spec,
+        Err(e) => {
+            // An outage is not "not spec-generated": skip, do not decide.
+            tracing::debug!("spec compliance auto-extract skipped for {}: {}", trid, e);
+            return;
+        }
+    };
 
     if !is_spec {
         return;
