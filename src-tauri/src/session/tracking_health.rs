@@ -398,6 +398,25 @@ pub struct LiveClaudeProcess {
     /// process complete, and an inherited declaration is not an observation
     /// about it.
     pub session_status: Option<String>,
+    /// When coord's row ENTERED [`Self::session_status`], in unix
+    /// MILLISECONDS — coord's `state_started_at`, served as `since` by
+    /// `GET /coord/sessions/work-status`. For a `finished` row it is coord's
+    /// finish time, which a reader compares against the session's last real
+    /// prompt to tell a revived session from one that finished again (plan
+    /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`).
+    ///
+    /// `None` = UNKNOWN, never "now" and never "the epoch": it is `None`
+    /// wherever [`Self::session_status`] is (a nested subagent, an ambiguous
+    /// or absent attribution, an unresolved row, every non-terminal-hosted
+    /// process), and also where coord served no parseable `since` (an older
+    /// coord). It is the coord time, beside — never instead of — the runner's
+    /// own `finishedAt` marker, which stays the resume authority.
+    ///
+    /// Filled by [`TrackingHealthReport::attach_status_since`]; [`evaluate`]
+    /// leaves it `None`. Serialized as JSON `null` when `None`, like
+    /// `sessionStatus`, so an absent key means a runner build that predates
+    /// the field.
+    pub session_status_since: Option<i64>,
     /// Does this process count as work in flight? `true` for every process
     /// except one whose [`Self::session_status`] resolved to exactly
     /// `finished`. See [`blocks_restart`] — this field IS that function's
@@ -560,6 +579,34 @@ impl TrackingHealthReport {
             &self.headless_exempt,
             &self.live_untracked,
         ]
+    }
+
+    /// Stamp [`LiveClaudeProcess::session_status_since`] from
+    /// `since_by_session_id` (coord's `since`, unix millis, keyed by
+    /// `claude_session_id`) onto every process in every class.
+    ///
+    /// Keyed on the `session_status` [`evaluate`] already decided, so the time
+    /// travels with exactly the status it dates: a process whose status is
+    /// `None` — a nested subagent, an ambiguous attribution, an unresolved
+    /// row, any non-terminal-hosted process — gets `None` here too, whatever
+    /// the map holds, and so does a resolved row the map has no time for.
+    /// Overwrites rather than merges, so a second call cannot leave a stale
+    /// time beside a status it does not date. Pure; no I/O.
+    pub fn attach_status_since(&mut self, since_by_session_id: &HashMap<String, i64>) {
+        for class in [
+            &mut self.terminal_hosted,
+            &mut self.holder_hosted,
+            &mut self.ai_plane,
+            &mut self.headless_exempt,
+            &mut self.live_untracked,
+        ] {
+            for p in class.iter_mut() {
+                p.session_status_since = match (&p.session_status, &p.session_id) {
+                    (Some(_), Some(id)) => since_by_session_id.get(id).copied(),
+                    _ => None,
+                };
+            }
+        }
     }
 
     /// Holder panes this runner cannot drive (unknown or incompatible). Each
@@ -950,6 +997,10 @@ pub fn evaluate(
             }),
             nested_under_claude,
             session_status: status.map(|s| s.as_wire()),
+            // Filled after the pass by `attach_status_since`, keyed on the
+            // `session_status` decided just above — so it can never be set
+            // where that is `None`.
+            session_status_since: None,
             session_id,
             blocks_restart: blocks_restart(status),
             wind_down: None,
@@ -1046,6 +1097,12 @@ fn age_s_from_creation(created_secs: Option<i64>, now_ms: i64) -> Option<i64> {
 /// network I/O. Only the on-demand `/restart-readiness` path resolves statuses,
 /// and it resolves them before calling this.
 ///
+/// `session_status_since_by_id` is the same read's `since` per session (unix
+/// millis), applied after [`evaluate`] by
+/// [`TrackingHealthReport::attach_status_since`]. It dates only a status this
+/// pass resolved, so it is inert beside an empty status map; [`run_periodic`]
+/// passes an empty one for the same reason as above.
+///
 /// **The PTY-holder census runs on every pass, both callers** (plan
 /// 2026-09-12 Phase 5, D9): one local-IPC handshake per holder pane, all under
 /// one deadline ([`crate::terminal::holder_census::CENSUS_TIMEOUT`]) — local,
@@ -1057,6 +1114,7 @@ pub async fn compute(
     session_manager: &Arc<crate::claude_session::SessionManager>,
     primary_boot_unix_millis: i64,
     session_status_by_id: &HashMap<String, SessionWorkStatus>,
+    session_status_since_by_id: &HashMap<String, i64>,
 ) -> Option<TrackingHealthPass> {
     // The PTY-holder census (plan 2026-09-12 Phase 5, D9): FRESH every pass,
     // one answered handshake per holder, all under one deadline. Taken BEFORE
@@ -1123,7 +1181,7 @@ pub async fn compute(
     let cwd_by_pid =
         crate::process_capture::process_tree::working_directories_for_pids(&live_pids).await;
 
-    let report = evaluate(
+    let mut report = evaluate(
         &snap,
         runner_pid,
         &open,
@@ -1136,6 +1194,7 @@ pub async fn compute(
         chrono::Utc::now().timestamp_millis(),
         &holders,
     );
+    report.attach_status_since(session_status_since_by_id);
 
     Some(TrackingHealthPass {
         report,
@@ -1162,6 +1221,7 @@ async fn run_once(
         // live process blocks, which is exactly what this task reported before
         // the work axis existed. `/health`'s numbers are unchanged, and this
         // 600 s task does no network I/O.
+        &HashMap::new(),
         &HashMap::new(),
     )
     .await
@@ -1321,6 +1381,7 @@ mod tests {
             nested_under_claude: false,
             session_id: None,
             session_status: None,
+            session_status_since: None,
             blocks_restart: true,
             wind_down: None,
         }
@@ -2174,6 +2235,125 @@ mod tests {
             1
         );
         assert!(report.partition_covers_total());
+    }
+
+    /// `sessionStatusSince` dates exactly the status it travels with: a
+    /// top-level process whose status resolved gets coord's `since`; a nested
+    /// subagent of that same session (status withheld), a resolved row coord
+    /// served no time for, a terminal-hosted row with no resolved status, and a
+    /// non-terminal-hosted process all stay `None` — UNKNOWN — even when the
+    /// map holds a time for their session id.
+    #[test]
+    fn status_since_is_attached_only_beside_a_resolved_top_level_status() {
+        let now_ms = 1_800_000_000_000;
+        // 1 -> 5 (terminal x) -> 6 (claude) -> 7 (nested claude)
+        // 1 -> 8 (terminal y) -> 9 (claude, status unresolved)
+        // 1 -> 10 (terminal z) -> 11 (claude, resolved, no `since` served)
+        // 1 -> 12 (claude, claimed by nothing)
+        let snap = snap_with(
+            &[(1, &[5, 8, 10, 12]), (5, &[6]), (6, &[7]), (8, &[9]), (10, &[11])],
+            &[],
+            &[
+                (6, "claude"),
+                (7, "claude"),
+                (9, "claude"),
+                (11, "claude"),
+                (12, "claude"),
+            ],
+        );
+        let records = vec![
+            record("sess-x", "t-x", now_ms - 60_000),
+            record("sess-y", "t-y", now_ms - 60_000),
+            record("sess-z", "t-z", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> = [
+            ("t-x".to_string(), 5u32),
+            ("t-y".to_string(), 8u32),
+            ("t-z".to_string(), 10u32),
+        ]
+        .into_iter()
+        .collect();
+        let statuses: HashMap<String, SessionWorkStatus> = [
+            ("sess-x".to_string(), SessionWorkStatus::Finished),
+            ("sess-z".to_string(), SessionWorkStatus::Working),
+        ]
+        .into_iter()
+        .collect();
+        // A time for every session id, including the unresolved `sess-y` —
+        // the status, not the map, decides whether a time is attached.
+        let since: HashMap<String, i64> = [
+            ("sess-x".to_string(), 1_789_293_600_000),
+            ("sess-y".to_string(), 1_789_293_601_000),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            now_ms - 3_600_000,
+            now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
+        );
+        assert!(
+            report
+                .classes()
+                .iter()
+                .flat_map(|c| c.iter())
+                .all(|p| p.session_status_since.is_none()),
+            "evaluate alone attaches no time"
+        );
+        report.attach_status_since(&since);
+
+        let by_pid = |pid: u32| {
+            report
+                .classes()
+                .into_iter()
+                .flat_map(|c| c.iter())
+                .find(|p| p.pid == pid)
+                .cloned()
+                .expect("pid in the report")
+        };
+        let root = by_pid(6);
+        assert_eq!(root.session_status.as_deref(), Some("finished"));
+        assert_eq!(
+            root.session_status_since,
+            Some(1_789_293_600_000),
+            "a resolved top-level row carries coord's since"
+        );
+        let nested = by_pid(7);
+        assert_eq!(nested.session_id.as_deref(), Some("sess-x"));
+        assert_eq!(
+            nested.session_status_since, None,
+            "a nested subagent's status is withheld, so is its time"
+        );
+        let unresolved = by_pid(9);
+        assert_eq!(unresolved.session_status, None);
+        assert_eq!(
+            unresolved.session_status_since, None,
+            "no resolved status, no time — even with one in the map"
+        );
+        let no_time = by_pid(11);
+        assert_eq!(no_time.session_status.as_deref(), Some("working"));
+        assert_eq!(
+            no_time.session_status_since, None,
+            "an older coord serving no since leaves it UNKNOWN"
+        );
+        let untracked = by_pid(12);
+        assert!(report.live_untracked.iter().any(|p| p.pid == 12));
+        assert_eq!(untracked.session_status_since, None);
+
+        // Wire shape: camelCase, and `null` (not absent) when unknown.
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["sessionStatusSince"], 1_789_293_600_000_i64);
+        let json = serde_json::to_value(&nested).unwrap();
+        assert!(json.get("sessionStatusSince").is_some_and(|v| v.is_null()));
     }
 
     /// **F2 regression.** A record whose terminal fails the PID-reuse guard

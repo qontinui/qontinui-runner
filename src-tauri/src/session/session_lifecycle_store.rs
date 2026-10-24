@@ -748,8 +748,10 @@ pub struct TerminalSessionRecord {
     /// operator's action.
     ///
     /// `false` on a finished record therefore means "coord write still owed".
-    /// The write is enqueued when the mark is made, again on any no-op
-    /// re-finish of the still-unsynced mark (`set_finished`'s retry door), AND
+    /// The write is enqueued when the mark is made, again when a re-finish
+    /// RESTAMPS it (`set_finished` with a reason, which clears this flag), again
+    /// on any no-op re-finish of the still-unsynced mark (`set_finished`'s retry
+    /// door), AND
     /// again when the session next gets a coord row in this process — a FRESH
     /// registration (`AiCoordRegistrar::register_inner`) or, for the terminal
     /// plane, its terminal being bound to its coord row
@@ -1028,8 +1030,8 @@ pub enum LocalOnlyReason {
     /// ephemeral stores), or the registrar it forwards to has been dropped.
     NoForwarder,
     /// The mark is already synced (coord ACKed it), so no coord write was
-    /// owed and none was queued: a no-op re-run on a synced mark, a no-op
-    /// unmark, or a reason-only rewrite on a synced mark.
+    /// owed and none was queued: a no-op re-run on a synced mark, or a no-op
+    /// unmark.
     NotRequeued,
 }
 
@@ -1048,12 +1050,13 @@ impl LocalOnlyReason {
 /// What a [`SessionLifecycleStore::set_finished`] call actually changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishChange {
-    /// The marker itself flipped (a fresh mark, or an unmark).
+    /// The marker itself was written: a fresh mark, a RESTAMP of an existing
+    /// one (a re-finish that carried a reason — `finished_at` moved to now and
+    /// coord is owed the write again), or an unmark.
     Marker,
-    /// The session was already finished; only `finish_reason` was rewritten.
-    ReasonOnly,
     /// Nothing was written — the marker was already in the requested state and
-    /// no reason was sent. The timestamp did not move.
+    /// no reason was sent (a read-back, or the retry door). The timestamp did
+    /// not move.
     None,
 }
 
@@ -1062,7 +1065,6 @@ impl FinishChange {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Marker => "marker",
-            Self::ReasonOnly => "reason_only",
             Self::None => "none",
         }
     }
@@ -1097,7 +1099,7 @@ impl FinishOutcome {
     ///
     /// ```json
     /// {"success": true, "session": <record>,
-    ///  "changed": "marker" | "reason_only" | "none",
+    ///  "changed": "marker" | "none",
     ///  "coord": {"queued": bool, "coordSessionId": <uuid|null>,
     ///            "reason": null | "no_coord_session" | "outbox_write_failed"
     ///                      | "no_forwarder" | "not_requeued"}}
@@ -1107,10 +1109,11 @@ impl FinishOutcome {
     /// the later verdict the drain's ACK stamps. A caller that must know coord
     /// APPLIED the mark re-reads `finishSynced`.
     ///
-    /// `queued: true` beside `changed: "reason_only"` re-queues the finished
-    /// MARKER, not the reason: the `Finished` row's payload carries no reason
-    /// text, so coord never receives the new reason — it lives in the local
-    /// record only.
+    /// `changed: "marker"` on an already-finished session is a RESTAMP: the
+    /// mark's `finishedAt` moved to now and `finishSynced` is `false` again
+    /// until coord ACKs the re-sent write. That write carries the new time
+    /// (as `last_progress_at`), never the reason text: the `Finished` row's
+    /// payload carries no reason, so a reason lives in the local record only.
     pub fn response_json(&self) -> serde_json::Value {
         let coord = match self.coord {
             FinishSync::Queued { coord_session_id } => serde_json::json!({
@@ -2175,23 +2178,44 @@ impl SessionLifecycleStore {
     /// running until it exits on its own.
     ///
     /// For a known session it returns a [`FinishOutcome`] naming what changed
-    /// — the marker, only the reason, or nothing — and whether coord was told
-    /// ([`FinishSync`]), so a caller can report what actually landed rather
-    /// than what it asked for, and a re-run can read the current sync verdict
-    /// instead of an error.
+    /// — the marker, or nothing — and whether coord was told ([`FinishSync`]),
+    /// so a caller can report what actually landed rather than what it asked
+    /// for, and a re-run can read the current sync verdict instead of an
+    /// error.
+    ///
+    /// **A re-finish that carries a reason RESTAMPS** (plan
+    /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
+    /// Phase 3): `finished_at` moves to now (strictly past the old stamp),
+    /// `finish_synced` is cleared and the finish is re-sent to coord, so a
+    /// session revived after its first finish and finished again carries the
+    /// SECOND finish time on both sides — and a reader comparing it with the
+    /// session's last prompt reads it finished, not revived. The re-sent row
+    /// carries the new stamp, so only coord's ACK of THAT write pairs with the
+    /// new mark ([`Self::mark_finish_synced`]); a late ACK of the old row is a
+    /// stale one and is ignored. Reported as [`FinishChange::Marker`], since
+    /// the mark — not only its reason — was rewritten.
+    ///
+    /// The REASON is the discriminator because it is the one the finish
+    /// protocol already draws: every declaring caller sends one
+    /// (`/finish-session`'s Step 1, `/unattended`, `/rewind-session`), while the
+    /// read-back after a finish is a reason-less re-POST whose whole job is to
+    /// read `finishSynced`. Restamping that read-back would clear the very flag
+    /// it reads, on every read, so it could never observe coord's ACK. A
+    /// reason equal to the stored one still restamps: it is a new declaration
+    /// that happens to give the same why.
     ///
     /// [`SetFinishedError::UnknownSession`] means the id is unknown, and
     /// nothing else; a poisoned registry lock is
     /// [`SetFinishedError::Unavailable`], so an unreadable registry can never
     /// read as "no such session".
     ///
-    /// A no-op re-finish on a mark coord has NOT ACKed (`finish_synced:
-    /// false`) is the retry door: nothing local is written (`changed:
-    /// None`), but the owed coord write is re-offered to the finish observer
-    /// and its verdict returned — so a mark that stayed local-only (no coord
-    /// row yet, an outbox write failure) can be pushed again by re-running the
-    /// same call. A duplicate enqueue is harmless (idempotent path-addressed
-    /// PATCH).
+    /// A re-finish with NO reason (or a blank one) is a no-op. On a mark coord
+    /// has NOT ACKed (`finish_synced: false`) it is the retry door: nothing
+    /// local is written (`changed: None`), but the owed coord write is
+    /// re-offered to the finish observer and its verdict returned — so a mark
+    /// that stayed local-only (no coord row yet, an outbox write failure) can
+    /// be pushed again by a reason-less re-run. A duplicate enqueue is harmless
+    /// (idempotent path-addressed PATCH).
     ///
     /// Each re-run while the mark stays unsynced appends one more `Finished`
     /// row, including while an earlier one is still pending: the outbox has
@@ -2227,14 +2251,15 @@ impl SessionLifecycleStore {
             .get_mut(claude_session_id)
             .ok_or(SetFinishedError::UnknownSession)?;
 
-        // A blank reason is no reason, and a reason equal to the stored one
-        // rewrites nothing — both are no-ops, never a `reason_only` change.
+        // A blank reason is no reason.
         let reason = non_empty(reason);
-        // Idempotent: re-finishing an already-finished session must not move
-        // its timestamp, or every repeat call would look like fresh work.
-        if finished == rec.finished_at.is_some()
-            && (!finished || reason.is_none() || reason == rec.finish_reason)
-        {
+        // A reason-less re-finish is a READ (the finish protocol's read-back,
+        // or the retry door) and must not move the timestamp: restamping it
+        // would clear `finish_synced` on every read-back, so the read-back
+        // could never see coord's ACK. A re-finish WITH a reason is a new
+        // declaration and falls through to the restamp below. A repeated
+        // unmark is a no-op whatever it carries.
+        if finished == rec.finished_at.is_some() && (!finished || reason.is_none()) {
             let current = rec.clone();
             // Release the map lock BEFORE the observer runs (it may read the
             // store, and it enqueues to the outbox). `finish_forward` stays
@@ -2253,21 +2278,19 @@ impl SessionLifecycleStore {
             });
         }
 
-        // Past the guard, an already-finished record can only be a reason
-        // rewrite (`finished` and a `reason` sent); anything else flips it.
-        let changed_kind = if finished && rec.finished_at.is_some() {
-            FinishChange::ReasonOnly
-        } else {
-            FinishChange::Marker
-        };
-
         if finished {
-            if rec.finished_at.is_none() {
-                rec.finished_at = Some(now);
-                // A fresh mark is unsynced by definition — the outbox owes coord
-                // a write, and the boot reconcile must not revert it meanwhile.
-                rec.finish_synced = false;
-            }
+            rec.finished_at = Some(match rec.finished_at {
+                None => now,
+                // A RESTAMP (a re-finish that carried a reason). Strictly past
+                // the old stamp even within one millisecond or across a
+                // backwards clock step, so the ACK matcher can always tell the
+                // re-sent write from the old one.
+                Some(prev) => now.max(prev.saturating_add(1)),
+            });
+            // A fresh or restamped mark is unsynced by definition — the outbox
+            // owes coord a write, and the boot reconcile must not revert it
+            // meanwhile.
+            rec.finish_synced = false;
             if let Some(r) = reason {
                 rec.finish_reason = Some(r);
             }
@@ -2285,19 +2308,14 @@ impl SessionLifecycleStore {
             }],
         );
         // Notify AFTER the durable local write and outside the map lock (the
-        // guard was consumed by `persist`). Fires for every write that owes
-        // coord a write — a fresh mark, a reason update on a mark coord has not
-        // ACKed yet, or an unmark (reaching here means it really changed). A
-        // duplicate enqueue is harmless: both coord writes are idempotent
-        // path-addressed PATCHes.
-        let coord = if changed.finished_at.is_none() || !changed.finish_synced {
-            self.forward_finish_change(&changed)
-        } else {
-            FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
-        };
+        // guard was consumed by `persist`). Every write that reaches here owes
+        // coord a write — a fresh mark, a restamp, or an unmark (reaching here
+        // means it really changed). A duplicate enqueue is harmless: both coord
+        // writes are idempotent path-addressed PATCHes.
+        let coord = self.forward_finish_change(&changed);
         Ok(FinishOutcome {
             record: changed,
-            changed: changed_kind,
+            changed: FinishChange::Marker,
             coord,
         })
     }
@@ -2320,9 +2338,9 @@ impl SessionLifecycleStore {
     /// the operator unmarked the session must not resurrect the marker.
     ///
     /// `acked_finished_at` is the `finished_at` the ACKed write carried. When
-    /// `Some`, only the SAME mark is stamped: after mark → unmark → re-mark, a
-    /// late ACK for the first mark must not report the second as synced
-    /// before its own write has drained. `None` stamps whatever mark is
+    /// `Some`, only the SAME mark is stamped: after mark → unmark → re-mark, or
+    /// a restamp, a late ACK for the first mark must not report the second as
+    /// synced before its own write has drained. `None` stamps whatever mark is
     /// current (a row written without the field).
     pub fn mark_finish_synced(&self, claude_session_id: &str, acked_finished_at: Option<i64>) {
         let mut m = match self.map.lock() {
@@ -6909,53 +6927,97 @@ mod tests {
         );
     }
 
-    /// Re-finishing must be idempotent: a repeat call must not move the
-    /// timestamp, or every retry would look like fresh work. Unmark must clear
-    /// the marker, the reason and the sync flag together.
+    /// A second finish that carries a reason is a new declaration: it
+    /// RESTAMPS the mark (strictly later), clears `finish_synced` and re-sends
+    /// the finish carrying the NEW stamp — so a revived session finished again
+    /// is dated by its second finish. A reason-less re-finish is the
+    /// read-back / retry door and moves nothing. Unmark must clear the marker,
+    /// the reason and the sync flag together.
     #[test]
-    fn set_finished_is_idempotent_and_unmark_leaves_no_residue() {
+    fn a_second_finish_restamps_and_re_sends_and_unmark_leaves_no_residue() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
+        // The finished_at of every record the observer was handed — i.e. of
+        // every coord write that was (re-)sent.
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<Option<i64>>>> = Default::default();
+        {
+            let sent = sent.clone();
+            store.attach_finish_observer(move |rec| {
+                sent.lock().unwrap().push(rec.finished_at);
+                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+            });
+        }
 
         store.record_open(rec("s"));
         let first = store.set_finished("s", true, Some("r1".into())).unwrap();
         assert_eq!(first.changed, FinishChange::Marker);
         let stamped = first.record.finished_at.unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![Some(stamped)]);
 
-        let again = store.set_finished("s", true, None).unwrap();
+        // The read-back: reason-less, so it reads and moves nothing.
+        let read = store.set_finished("s", true, None).unwrap();
         assert_eq!(
-            again.changed,
+            read.changed,
             FinishChange::None,
-            "re-finishing with no new reason is a no-op — no write, no restamp"
+            "a reason-less re-finish is a read — no write, no restamp"
         );
+        assert_eq!(read.record.finished_at, Some(stamped));
         assert_eq!(
-            again.coord,
-            FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
-            "a no-op on an UNSYNCED mark re-offers the owed write; with no \
-             forwarder attached it stays local-only"
+            sent.lock().unwrap().len(),
+            2,
+            "on an UNSYNCED mark the read re-offers the owed write (the retry door)"
         );
-        let snap = store
-            .all_records()
-            .into_iter()
-            .find(|r| r.claude_session_id == "s")
-            .unwrap();
-        assert_eq!(snap.finished_at, Some(stamped), "timestamp must not move");
+        assert_eq!(sent.lock().unwrap()[1], Some(stamped), "with the SAME stamp");
 
-        store.mark_finish_synced("s", None);
-        assert!(
-            store
-                .all_records()
-                .into_iter()
-                .find(|r| r.claude_session_id == "s")
-                .unwrap()
-                .finish_synced
-        );
+        store.mark_finish_synced("s", Some(stamped));
+        assert!(store.get("s").unwrap().finish_synced);
         assert_eq!(
             store.set_finished("s", true, None).unwrap().coord,
             FinishSync::LocalOnly(LocalOnlyReason::NotRequeued),
-            "a no-op on a SYNCED mark owes coord nothing"
+            "a reason-less read on a SYNCED mark owes coord nothing"
         );
+        assert_eq!(
+            store.get("s").unwrap().finished_at,
+            Some(stamped),
+            "and the read-back still sees the synced mark it is reading"
+        );
+        assert!(store.get("s").unwrap().finish_synced);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        // The session is revived and finishes AGAIN: a declaration, with a
+        // reason. Even the SAME reason restamps.
+        let again = store.set_finished("s", true, Some("r1".into())).unwrap();
+        assert_eq!(
+            again.changed,
+            FinishChange::Marker,
+            "a second declared finish rewrites the mark itself"
+        );
+        let restamped = again.record.finished_at.unwrap();
+        assert!(
+            restamped > stamped,
+            "the second finish is dated by itself: {restamped} > {stamped}"
+        );
+        assert!(
+            !again.record.finish_synced,
+            "a restamped mark is unsynced — coord is owed the new time"
+        );
+        assert_eq!(
+            again.coord,
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "the restamp was handed to the forwarder, not reported not_requeued"
+        );
+        assert_eq!(
+            sent.lock().unwrap().last(),
+            Some(&Some(restamped)),
+            "the re-sent write carries the NEW stamp"
+        );
+        let on_disk = SessionLifecycleStore::open(&path)
+            .unwrap()
+            .get("s")
+            .expect("persisted");
+        assert_eq!(on_disk.finished_at, Some(restamped), "the restamp is durable");
+        assert!(!on_disk.finish_synced);
 
         let un = store.set_finished("s", false, None).unwrap();
         assert_eq!(un.changed, FinishChange::Marker);
@@ -7038,17 +7100,21 @@ mod tests {
         );
     }
 
-    /// Review (adoption) L1: a blank reason, or the reason already stored, on
-    /// an already-finished mark rewrites nothing, so it is `changed: none`.
+    /// Review (adoption) L1, as amended by the restamp: a blank reason on an
+    /// already-finished mark is no reason — a read that rewrites nothing
+    /// (`changed: none`). Any real reason, the stored one included, is a new
+    /// declaration that restamps the mark (`changed: marker`).
     #[test]
-    fn a_blank_or_unchanged_reason_is_not_a_reason_only_rewrite() {
+    fn a_blank_reason_rewrites_nothing_and_any_reason_restamps() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(rec("s"));
-        store
+        let stamped = store
             .set_finished("s", true, Some("done".into()))
-            .expect("fresh mark");
-        for r in ["", "   ", "done"] {
+            .expect("fresh mark")
+            .record
+            .finished_at;
+        for r in ["", "   "] {
             let out = store
                 .set_finished("s", true, Some(r.to_string()))
                 .expect("known id");
@@ -7058,18 +7124,25 @@ mod tests {
                 "reason {r:?} rewrote nothing"
             );
             assert_eq!(out.record.finish_reason.as_deref(), Some("done"));
+            assert_eq!(out.record.finished_at, stamped, "and moved nothing");
         }
-        let out = store
-            .set_finished("s", true, Some("other".into()))
-            .expect("known id");
-        assert_eq!(out.changed, FinishChange::ReasonOnly);
-        assert_eq!(out.record.finish_reason.as_deref(), Some("other"));
+        let mut last = stamped;
+        for r in ["done", "other"] {
+            let out = store
+                .set_finished("s", true, Some(r.to_string()))
+                .expect("known id");
+            assert_eq!(out.changed, FinishChange::Marker, "reason {r:?} restamps");
+            assert_eq!(out.record.finish_reason.as_deref(), Some(r));
+            assert!(out.record.finished_at > last, "reason {r:?} moved the stamp");
+            last = out.record.finished_at;
+        }
     }
 
     /// The finish observer is the producer seam for coord's `Finished` outbox
     /// row: it must fire for a fresh mark and re-fire for a no-op repeat while
     /// the mark is UNSYNCED (the retry door), stay silent on a no-op unmark
-    /// and on an unknown id, and stop firing once coord has ACKed.
+    /// and on an unknown id, and — once coord has ACKed — stay silent on a
+    /// reason-less re-finish but fire for a reason-carrying one (a restamp).
     #[test]
     fn finish_observer_fires_only_while_a_coord_write_is_owed() {
         let dir = tempdir().unwrap();
@@ -7112,18 +7185,24 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().len(),
             3,
-            "a reason update on an UNSYNCED mark re-fires — coord still owes the write"
+            "a reason-carrying re-finish on an UNSYNCED mark restamps and re-fires"
         );
 
         store.mark_finish_synced("s", None);
-        let _ = store.set_finished("s", true, Some("later reason".into()));
         let _ = store.set_finished("s", true, None);
         assert_eq!(
             seen.lock().unwrap().len(),
             3,
-            "once coord has ACKed, neither a reason-only update nor a no-op owes \
-             coord anything"
+            "once coord has ACKed, a reason-less no-op owes coord nothing"
         );
+        let _ = store.set_finished("s", true, Some("later reason".into()));
+        assert_eq!(
+            *seen.lock().unwrap().last().unwrap(),
+            ("s".to_string(), true),
+            "but a reason-carrying re-finish on a SYNCED mark restamps, so coord \
+             is owed — and sent — the new finish"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
 
         let _ = store.set_finished("s", false, None);
         assert_eq!(

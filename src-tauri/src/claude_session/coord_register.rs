@@ -1267,7 +1267,9 @@ impl AiCoordRegistrar {
     /// onto the local record — the discriminator the boot reconcile turns on.
     ///
     /// `finished_at` rides in the payload too, so a late ACK for an older mark
-    /// cannot stamp a newer one synced (`mark_finish_synced`).
+    /// cannot stamp a newer one synced (`mark_finish_synced`), and the drain
+    /// sends it to coord as the PATCH's `last_progress_at`, so coord dates the
+    /// finish at the mark rather than at the drain.
     ///
     /// The coord id is resolved across every runner-hosted plane
     /// ([`Self::resolve_coord_session_id`]). Returns [`FinishSync::Queued`]
