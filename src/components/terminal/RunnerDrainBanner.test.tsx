@@ -10,6 +10,8 @@ import {
   drainBannerModel,
   deferredLabel,
   RESTORE_NOTE,
+  ROLE_RESTORE_NOTE,
+  ROLE_UNKNOWN_HEADING,
   UNKNOWN_HEADING,
 } from "./RunnerDrainBanner";
 import {
@@ -35,6 +37,102 @@ function snap(over: Partial<CoordDrainSnapshot>): CoordDrainSnapshot {
 }
 
 describe("drainBannerModel", () => {
+  it("says autonomous spawns are off when the drain is clear but the dispatch role closes the agent lane", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        deferredCount: 2,
+      }),
+    );
+    expect(m?.status).toBe("warning");
+    expect(m?.kind).toBe("role_closed");
+    expect(m?.heading).toMatch(/ci_node/);
+    expect(m?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    expect(m?.deferredLabel).toBe("2 deferred work items");
+    // Drained AND role-closed: the drain banner, but no promise that lifting
+    // the drain brings the tabs back.
+    const both = drainBannerModel(
+      snap({ state: "drained", autonomousSpawnsAllowed: false, agentLaneClosedByRole: true }),
+    );
+    expect(both?.kind).toBe("drained");
+    expect(both?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    // Unknown AND role-closed: same, no promise that a readable drain helps.
+    const unknownAndRole = drainBannerModel(
+      snap({
+        state: "unknown",
+        autonomousSpawnsAllowed: false,
+        bootReadPending: false,
+        agentLaneClosedByRole: true,
+      }),
+    );
+    expect(unknownAndRole?.kind).toBe("unknown");
+    expect(unknownAndRole?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    // An open role, or a runner that predates the field, keeps today's banner.
+    expect(
+      drainBannerModel(snap({ dispatchRole: "workhorse", agentLaneClosedByRole: false })),
+    ).toBeNull();
+    expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
+  });
+
+  it("says autonomous spawns are paused when the drain is clear but the dispatch role is unknown", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: null,
+        agentLaneClosedByRole: false,
+        dispatchRoleSource: "unknown",
+        deferredCount: 1,
+      }),
+    );
+    expect(m?.kind).toBe("unknown");
+    expect(m?.status).toBe("error");
+    expect(m?.heading).toBe(ROLE_UNKNOWN_HEADING);
+    expect(m?.detail).toMatch(/dispatch role/);
+    expect(m?.restoreNote).toBe(RESTORE_NOTE);
+    expect(m?.deferredLabel).toBe("1 deferred work item");
+    // A known source, or a runner predating the field, shows nothing.
+    expect(drainBannerModel(snap({ dispatchRoleSource: "coord" }))).toBeNull();
+    expect(
+      drainBannerModel(snap({ dispatchRoleSource: "not_enrolled", state: "not_enrolled" })),
+    ).toBeNull();
+    // A drained device still shows the drain.
+    expect(
+      drainBannerModel(
+        snap({ state: "drained", autonomousSpawnsAllowed: false, dispatchRoleSource: "unknown" }),
+      )?.kind,
+    ).toBe("drained");
+  });
+
+  it("says a closing role carried over from before the restart is not re-confirmed yet", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "persisted",
+        dispatchRoleObservedAt: "2026-10-20T08:00:00Z",
+      }),
+    );
+    expect(m?.kind).toBe("role_closed");
+    expect(m?.detail).toMatch(/before this runner started/);
+    expect(m?.detail).toMatch(/not re-confirmed/);
+    const fresh = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "coord",
+      }),
+    );
+    expect(fresh?.detail).toBeNull();
+  });
+
   it("renders nothing before the first read, when clear, and when not a coord device", () => {
     expect(drainBannerModel(null)).toBeNull();
     expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
