@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines five vision-core analyzers (layout, typography, color, dynamic, elements) with the 12-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag). Returns structured findings + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and eight L1 image assertions). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -11,8 +11,8 @@ that turn declarative visual questions into structured answers:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **No assertion reads the frame** — one is captured, and its provenance reported, but no verdict here consults it. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
+| `POST /ui-bridge/vision/analyze` | Run one of the six analyzers (layout/typography/color/dynamic/elements/image). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, `imageValues?` (the `image` analyzer's measurements — see below), and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **Only the L1 image assertions read the frame** (see the DSL table) — every other assertion evaluates from the snapshot, and for those the captured frame is reported as provenance but consulted by no verdict. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -73,9 +73,10 @@ binary there reads identically to an empty result.
 **Read the response's `verdict`. The server decides this now — you are not the
 gate.** Every `analyze` response carries an explicit `verdict`, and — with one
 exception — a `coverage` object: `elements`, `withGeometry`, `withStacking`,
-`withText`, `interactable`. Those are the same MEASUREMENTS `--stats` reports,
-but not the same spellings — the script prints prose ("118 with geometry, 96
-with stacking order, ..."), so do not grep its output for these keys. Note also
+`withText`, `interactable`. Those are the same MEASUREMENTS `--stats` reports
+(minus `withStacking`, which the projection can never populate), but not the
+same spellings — the script prints prose ("118 with geometry, 40 with text,
+..."), so do not grep its output for these keys. Note also
 that `coverage.elements` is the PROJECTED count (`snapshot.elements.len()`),
 i.e. `--stats`'s numerator, not its `projected/input` pair. The
 `coverage` is absent for either of two reasons, and they are different facts:
@@ -103,34 +104,48 @@ honestly-empty `Checked`.
 
 The `--stats` line still prints, and is still useful for seeing *why* a verdict
 came out the way it did before you send anything — but it is **no longer the
-defence**. It reports the same counters the server now computes for itself:
+defence**. Its element, geometry, text and interactive counts are the ones the
+server now computes for itself (`SnapshotCoverage`). The occluder, media and
+visibility-detail counts are local to the projector:
 
 ```
-projected 118/118 elements: 118 with geometry, 96 with stacking order, ...
+projected 118/118 elements: 118 with geometry, 40 with text, 78 interactive, 2 with a hit-tested occluder, 6 with media, 3 with visibility detail
 ```
 
-> **`Degraded` is green on purpose, and this is worth understanding.** Almost no
-> real snapshot carries stacking order — the projector emits `z_index` only when
-> the computed `zIndex` parses as an integer, and `auto` deliberately does not —
-> so a `Degraded`-fails-the-gate rule would fire on essentially every page and
-> teach everyone to ignore it. `Degraded` is a statement about *coverage*, not a
-> defect. Only `Blocked` is non-green.
+`with visibility detail` counts elements carrying `visibility_reason` or
+`occluded_pct`. A bridge predating the SDK's occlusion sweep (ui-bridge
+`4284cd2`) emits neither. On a page with hidden or covered images, a `0` there
+means the image analyzer cannot tell an image that paints nothing from one
+painted under an overlay.
+
+> **`Degraded` is green on purpose, and this is worth understanding.** No
+> snapshot from this projector carries stacking order: it never emits
+> `z_index`, because a `discover` payload holds only the CSS `zIndex`, which is
+> resolved per stacking context and inverts occlusion verdicts when compared
+> across them (vision-core's producer contract forbids projecting it). So a
+> `Degraded`-fails-the-gate rule would fire on every page and teach everyone to
+> ignore it. `Degraded` is a statement about *coverage*, not a defect. Only
+> `Blocked` is non-green. Occlusion direction then comes from the SDK's own
+> hit-test, `occluded_by`, which the projection carries verbatim.
 >
 > **And `coverage.withStacking` counts POPULATED ranks, not correct ones.** The
 > layout analyzer compares `z_index` across stacking contexts, while a CSS
-> `zIndex` read is per-context; where a producer emits the latter, occlusion
-> verdicts can invert while coverage reads 100 %. A high `withStacking` is not a
-> trust signal.
+> `zIndex` read is per-context; where some other producer emits the latter,
+> occlusion verdicts can invert while coverage reads 100 %. A high
+> `withStacking` is not a trust signal.
 
 ### No runner window? The checks still run.
 
 `analyze` and `assert` capture a frame **best-effort**. Layout, typography and
-elements are pure geometry over the snapshot, and no assertion in the DSL
-reads the frame at all, so a runner reporting `frontendState: "window_missing"`
-still answers every geometric question. A failed capture comes back as
+elements are pure geometry over the snapshot, and only the L1 image assertions
+read the frame, so a runner reporting `frontendState: "window_missing"` still
+answers every geometric question. A failed capture comes back as
 `frameError` in the response — check for it rather than assuming the pixels
-agreed. Only `color` and `dynamic` degrade, and they say so with a `skipped`
-finding.
+agreed. Only `color`, `dynamic` and `image` need the frame, and without one
+they answer `Blocked` with a `skipped` finding; the pixel-reading image
+assertions answer `outcome: "unknown"` (a slot placeholder marker still fails
+`no_placeholder_images`, since that needs no pixels, and `image_focal_visible`
+reads media facts, not the frame).
 
 The same holds for the `vision-audit` binary, where `--frame` is optional —
 that is the path qontinui-web's CI style gate uses, with no runner in the loop
@@ -183,7 +198,7 @@ serial, in that order; an unknown id 500s with `unknown vision target '<id>'`,
 and a target serving no screenshot fails loudly rather than silently capturing
 the runner desktop. Omit `target` for the default runner-desktop behavior.
 
-## The Five Analyzers
+## The Six Analyzers
 
 | Analyzer | What it checks |
 |---|---|
@@ -192,6 +207,17 @@ the runner desktop. Omit `target` for the default runner-desktop behavior.
 | **color** | WCAG contrast for every text element with both `fg_color` and `bg_color` populated. Flags individual sub-AA (4.5:1) elements + a "contrast density" warning when ≥25% of text fails. |
 | **dynamic** | Two-frame pixel diff. Currently requires the caller to wire up a `prior_frame` source; this maps to `vision/diff` for now. |
 | **elements** | Empty-snapshot detection, no-interactive / no-text smell, sub-24×24 interactive targets (WCAG 2.5.8). |
+| **image** | Per-image pixel VALUES, never a verdict. For every snapshot element carrying `media`, read from its crop of the frame: effective resolution and aspect distortion (object-fit aware), sharpness and compression blockiness, an OKLab palette with a photographic/flat class, busyness (also under text laid over it), pHash and dHash, placeholder signals, edge contrast against the surround, the natural-image region left visible, and saliency; for the page, colourfulness, clutter and white space, plus near-duplicate pairs. Needs the frame (`Blocked` without one); an image-free snapshot is `Degraded`, which is green. |
+
+**`image` answers in `imageValues`, not in `findings`.** Its findings are
+`info` only, so it can never trip a `--fail-on` threshold (the style gate runs
+`vision-audit analyze --analyzer all --fail-on critical`). Each value is an
+observation with its own provenance: a pixel value carries a `confidence` (the
+share of the image's box that was inside the frame and not painted over), and
+a value the producer did not measure is `unknown` with a code, never `0`. An
+image reported `visible: false` with no `visibility_reason` is unreadable, not
+left out. A check on those values gates only as an assertion with the caller's
+own threshold — see the image rows of the DSL table.
 
 ### `occlusion` vs `overlap` — they answer different questions
 
@@ -206,7 +232,7 @@ of those choices on purpose:
 |---|---|---|
 | Participants | `interactable` only | every element with a bbox |
 | Full containment | exempt (intentional nesting) | the WORST case, always reported |
-| Direction | none — symmetric pair | `z_index` names occluder → occluded |
+| Direction | none — symmetric pair | the SDK's hit-test (`occluded_by`), or a resolved paint rank (`z_index`), names occluder → occluded |
 | Severity | Warning | **Critical** when the covered element has text |
 
 The participant rule is the one that matters most in practice: what a floating
@@ -214,17 +240,19 @@ widget hides is nearly always a *label* — a name, a status, a count — and
 labels are never interactive, so `overlap` structurally cannot see this bug
 class.
 
-A finding reads:
+From this projection — which carries `occluded_by` and never `z_index` — a
+finding reads:
 
 ```
-[critical] occlusion: terminal-zone-minimap (z=30) covers 32% of
-           terminal-zone-header-8 (z=10) (text: "Zone 8: qontinui-web (a3f2c1d0)")
+[critical] occlusion: terminal-zone-header-8 is covered by terminal-zone-minimap
+           (reported by the snapshot producer's hit-test)
 ```
 
-**`occlusion_unknown` is not a pass.** When intersecting elements carry no
-usable stacking order the analyzer reports that it could not determine a
-direction. Treat it as UNKNOWN and fix the projection, never as "nothing is
-covered".
+**`occlusion_unknown` is not a pass.** When intersecting elements carry neither
+a hit-test attribution nor a usable paint rank, the analyzer reports that it
+could not determine a direction. Treat it as UNKNOWN, never as "nothing is
+covered" — and do not "fix" it by feeding CSS `zIndex` in as `z_index`, which
+inverts verdicts across stacking contexts.
 
 Ancestor/descendant pairs are exempt — a child painting over its own parent's
 box is what nesting *is*.
@@ -317,6 +345,35 @@ Each assertion is a tagged-JSON object:
 | `no_clipping` | `{"type":"no_clipping","region":{"x":0,"y":0,"w":1280,"h":720}}` |
 | `animation_settled` | `{"type":"animation_settled","region":null,"settle_frames":3}` |
 | `contrast_meets_wcag` | `{"type":"contrast_meets_wcag","element":"btn-save","level":"aa"}` |
+| `image_palette_within` | `{"type":"image_palette_within","element":"hero","palette":[{"r":20,"g":40,"b":90}],"max_delta_e":10,"min_coverage":0.6}` — at least `min_coverage` of the image's pixels lie within `max_delta_e` (CIEDE2000) of a palette colour. Reads the frame. |
+| `no_near_duplicate_images` | `{"type":"no_near_duplicate_images","max_hamming":6}` — no two images' pHashes within `max_hamming` bits. Reads the frame. |
+| `no_placeholder_images` | `{"type":"no_placeholder_images"}` (or `"element":"hero"`) — no slot placeholder marker, low-entropy fill or crossed-box pattern. Reads the frame (the marker alone needs none). |
+| `image_focal_visible` | `{"type":"image_focal_visible","element":"hero","focal":{"x":0.3,"y":0.2,"width":0.4,"height":0.5}}` — the focal region (natural-image fractions) survives object-fit/position. Reads media facts, not pixels. |
+| `transparent_image_legible` | `{"type":"transparent_image_legible","element":"logo","min_ratio":3}` — edge and stroke pixels reach `min_ratio` WCAG contrast against the surround on this frame's theme. Reads the frame. |
+| `salience_order` | `{"type":"salience_order","cta_id":"cta-signup"}` — the CTA is the most salient interactive or media element. Reads the frame. |
+| `image_sharpness_at_least` | `{"type":"image_sharpness_at_least","element":"hero","min_sharpness":50}` — variance of the Laplacian at the rendered scale. Reads the frame. |
+| `image_blockiness_within` | `{"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}` — compression blockiness (~1.0 is clean). Reads the frame. |
+
+Every threshold on an image assertion is the CALLER's (a slot spec or the
+visual system); an omitted one answers `outcome: "unknown"`, never a pass.
+`no_near_duplicate_images` and `no_placeholder_images` are page-wide and
+answer `unknown` whenever an image on the page is unreadable. An image is
+unreadable — never silently skipped — when, for example (the full rules are
+`image::unreadable` and `image::locate` in rust-vision-core):
+
+- the producer reports it `occluded`, `off-screen`, or not visible for a
+  reason vision-core does not interpret;
+- it is `visible: false` with no `visibility_reason` — which today is every
+  off-screen image from a producer that does not send the reason;
+- it lies wholly inside the element its `occluded_by` names;
+- it is an `img`/`picture`/`video`/`canvas` with no `object_fit`, or a
+  `contain` / `none` / `scale-down` fit that cannot be placed without
+  `natural_px`;
+- it has no bbox, or lies wholly outside the frame.
+
+An image that paints nothing (zero-area, or reported `hidden` / `no-layout`)
+is left out instead, and CSS backgrounds are left out of the page-wide checks
+with a disclosed count (a slot placeholder marker on one still fails).
 
 ### Example: audit the page for the kinds of bugs Phase 6 was designed to catch
 
@@ -371,16 +428,18 @@ Response:
 is on the wire for every result and every finding, always. `null` means *this
 verdict was DEDUCED, not estimated* — an exact geometric or textual comparison,
 with nothing to be uncertain about. A NUMBER appears only where an operand was
-itself estimated: `contains_text`'s OCR fallback, and `color`'s pixel-sampled
-contrast arm. So `null` and *absent* say different things, and only a producer
-predating the field omits the key. Do not strip it and do not treat it as
-missing data.
+itself estimated: `contains_text`'s OCR fallback, `color`'s pixel-sampled
+contrast arm, and the image assertions that read the frame (a pixel read from
+a composited frame is an estimate of the image under it). So `null` and
+*absent* say different things, and only a producer predating the field omits
+the key. Do not strip it and do not treat it as missing data.
 
 **`assert` carries `coverage` too, and you must read it here for the same
-reason you read it on `analyze`.** Every assertion in the DSL evaluates from
-the snapshot, so `allPassed: true` over a snapshot with `withGeometry: 0` is a
-vacuous pass: `no_clipping` skips every element that carries no `bbox` and then
-returns a **genuine** `passed` over the emptiness it was left holding.
+reason you read it on `analyze`.** Every assertion in the DSL reads the
+snapshot (the image assertions too, to find the image's box), so
+`allPassed: true` over a snapshot with `withGeometry: 0` is a vacuous pass:
+`no_clipping` skips every element that carries no `bbox` and then returns a
+**genuine** `passed` over the emptiness it was left holding.
 
 Each result also carries `outcome` — `"passed"`, `"failed"` or `"unknown"` —
 and it is worth reading, but it does NOT catch that case. `outcome: "unknown"`
@@ -435,7 +494,7 @@ After landing UI changes, run the full audit:
 
 ```bash
 # PROJECT FIRST — same reason as above. Read the --stats line on stderr:
-# `0 with geometry` / `0 with stacking order` are UNKNOWN, not a clean page.
+# `0 with geometry` is UNKNOWN, not a clean page.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
      -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
