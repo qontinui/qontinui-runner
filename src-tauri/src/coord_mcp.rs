@@ -10147,7 +10147,7 @@ fn probe_stdio_shim_and_store() -> StdioShimGate {
     }
     let interpreters: Vec<std::path::PathBuf> = STDIO_SHIM_INTERPRETERS
         .iter()
-        .filter_map(|name| crate::automation_stack::which(name))
+        .filter_map(|name| crate::process_helpers::which(name))
         .collect();
     let gate = probe_stdio_shim(
         resolve_stdio_shim_path(),
@@ -16579,7 +16579,7 @@ mod tests {
         std::fs::write(&trivially_ok, "import sys\nsys.exit(0)\n").unwrap();
         let Some(python) = STDIO_SHIM_INTERPRETERS
             .iter()
-            .filter_map(|name| crate::automation_stack::which(name))
+            .filter_map(|name| crate::process_helpers::which(name))
             .find(|py| {
                 run_stdio_shim_selftest(py, &trivially_ok, std::time::Duration::from_secs(10))
                     .is_ok()

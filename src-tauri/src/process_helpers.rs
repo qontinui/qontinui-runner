@@ -114,6 +114,268 @@ pub fn tokio_cmd_no_window() -> tokio::process::Command {
     tokio_no_window("cmd.exe")
 }
 
+/// First executable named `program` on the inherited `PATH`.
+///
+/// The inherited PATH is the point: the runner shells out with bare program
+/// names, so what matters is what the RUNNER's environment resolves — not what
+/// a login shell would. On Windows a bare `program` is tried first, then
+/// `program.exe` / `.cmd` / `.bat` / `.com`, per PATH entry.
+pub fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(program);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat", "com"] {
+                let c = dir.join(format!("{program}.{ext}"));
+                if is_executable(&c) {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Git for Windows' real binary for a `<prefix>\cmd\git.exe` LAUNCHER path:
+/// `<prefix>\mingw64\bin\git.exe`, spelled with the launcher path's own
+/// separator. `None` for any path that is not a `cmd\git.exe`.
+///
+/// Pure string work — no filesystem — so a test can pin the mapping over
+/// literal paths on every platform. Both separators are split explicitly for
+/// the reason [`program_is_git`] gives: on Linux `\` is an ordinary character,
+/// and a mapping decided by `Path` there could not be tested where it matters.
+/// Case-insensitive because Windows paths are.
+fn launcherless_git_path(launcher: &str) -> Option<String> {
+    let (rest, file) = launcher.rsplit_once(['/', '\\'])?;
+    if !file.eq_ignore_ascii_case("git.exe") {
+        return None;
+    }
+    let (prefix, dir) = rest.rsplit_once(['/', '\\'])?;
+    if !dir.eq_ignore_ascii_case("cmd") {
+        return None;
+    }
+    // The separator between `cmd` and `git.exe` — the one `rest` stopped at.
+    let sep = launcher.get(rest.len()..)?.chars().next()?;
+    Some(format!("{prefix}{sep}mingw64{sep}bin{sep}git.exe"))
+}
+
+/// How [`no_window_git_local`] runs git: the program, plus the part of the
+/// launcher's environment the real binary still needs.
+#[derive(Debug, Clone, PartialEq)]
+struct LocalGit {
+    program: std::ffi::OsString,
+    /// Set on every command, as the launcher sets them: `PATH` with
+    /// `<prefix>\mingw64\bin`, `<prefix>\usr\bin` (where it exists) and
+    /// `<HOME>\bin` (where a HOME resolves) prepended, and `MSYSTEM=MINGW64`
+    /// whatever the runner inherited. Empty when the mapping declined.
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+impl LocalGit {
+    /// A bare `"git"`, exactly what [`no_window`] callers run.
+    fn bare() -> Self {
+        Self {
+            program: "git".into(),
+            env: Vec::new(),
+        }
+    }
+
+    fn command(&self) -> std::process::Command {
+        let mut cmd = no_window(&self.program);
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+}
+
+/// The program [`no_window_git_local`] runs: on Windows, Git for Windows' real
+/// `mingw64\bin\git.exe` when PATH resolves the `cmd\git.exe` launcher and that
+/// file exists; otherwise (and on every other platform) a bare `"git"`, exactly
+/// what [`no_window`] callers run today.
+///
+/// Why: the launcher is a separate process that sets up `PATH`/`MSYSTEM` and
+/// then spawns the real binary, so every git the runner starts through it costs
+/// one extra process creation on Windows. LOCAL read-only git (`status`,
+/// `rev-parse`, `merge-base`, `worktree list`, …) can skip that process, but
+/// NOT the environment it sets up: a `status` that runs a `filter.*` command
+/// (Git for Windows' system config ships `filter.lfs.process`), an fsmonitor
+/// hook, or any configured command containing a space starts `sh.exe`, which
+/// lives in `usr\bin`. When `MSYSTEM` is UNSET the real binary puts its own
+/// `mingw64\bin` and `usr\bin` on PATH and finds `sh`; when `MSYSTEM` is
+/// already SET — a runner started from a Git Bash / MSYS shell inherits
+/// `MSYSTEM=MINGW64` — it trusts PATH, and under the runner's PATH
+/// (`<prefix>\cmd` only) it cannot find `sh` and CRASHES (access violation
+/// 0xC0000005, exit 139 under bash). Measured on spaceship 2026-10-24 with Git
+/// for Windows 2.53: unset + `<prefix>\cmd` PATH answered, set + the same PATH
+/// crashed, set + `mingw64\bin;usr\bin` prepended answered. So
+/// [`no_window_git_local`] gives the child the environment the launcher gives
+/// it: the same PATH dirs in the same order (`mingw64\bin`, `usr\bin`,
+/// `<HOME>\bin`, so a `git-lfs` installed under `~\bin` still resolves) and
+/// `MSYSTEM=MINGW64`, which the launcher sets even over an inherited
+/// `UCRT64`. Network and tree-mutating git (fetch, pull, switch, merge) keep
+/// the launcher via plain `no_window("git")`. Plan
+/// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// D4 / Phase 6.
+///
+/// The launcher is located through PATH only (`git.exe`, not `git.cmd`). That
+/// is NOT the order `Command::new("git")` searches on Windows — the runner's
+/// own exe dir and System32 come before PATH there — so a `git.exe` sitting in
+/// one of those would be what `no_window("git")` runs while this mapping
+/// follows PATH. No Git for Windows install puts git there.
+///
+/// Resolved ONCE per process: the runner's PATH does not change under it, and a
+/// `which` per spawn would re-stat every PATH entry on the hot path this
+/// exists to make cheaper.
+pub fn local_git_program() -> std::ffi::OsString {
+    local_git().program.clone()
+}
+
+fn local_git() -> &'static LocalGit {
+    static LOCAL_GIT: std::sync::OnceLock<LocalGit> = std::sync::OnceLock::new();
+    LOCAL_GIT.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let home = launcher_home(
+                std::env::var_os("HOME"),
+                std::env::var_os("HOMEDRIVE"),
+                std::env::var_os("HOMEPATH"),
+                std::env::var_os("USERPROFILE"),
+            );
+            resolve_local_git(
+                which("git.exe").as_deref(),
+                std::env::var_os("PATH").as_deref(),
+                home.as_deref(),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            LocalGit::bare()
+        }
+    })
+}
+
+/// The HOME whose `bin` Git for Windows' launcher puts on PATH: `HOME` when
+/// set, else `HOMEDRIVE`+`HOMEPATH` when that directory exists, else
+/// `USERPROFILE` — the order the launcher resolves an unset HOME in.
+///
+/// One deliberate difference: the launcher keeps an EMPTY `HOME` as set and
+/// so puts a bare `\bin` (the current drive's root) on PATH; this treats an
+/// empty `HOME` as unset and falls through, because a drive-root `bin` is
+/// never where a user's tools live.
+fn launcher_home(
+    home: Option<std::ffi::OsString>,
+    homedrive: Option<std::ffi::OsString>,
+    homepath: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty());
+    if let Some(h) = set(home) {
+        return Some(h.into());
+    }
+    if let (Some(drive), Some(path)) = (set(homedrive), set(homepath)) {
+        let mut joined = drive;
+        joined.push(path);
+        let joined = std::path::PathBuf::from(joined);
+        if joined.is_dir() {
+            return Some(joined);
+        }
+    }
+    set(userprofile).map(Into::into)
+}
+
+/// [`LocalGit`] for the `git.exe` PATH resolved (`found`), given the PATH the
+/// runner inherited and the launcher's HOME ([`launcher_home`]). Every decline
+/// is a bare `"git"` and says why once, at debug.
+fn resolve_local_git(
+    found: Option<&std::path::Path>,
+    inherited_path: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> LocalGit {
+    let decline = |why: String| {
+        tracing::debug!("local read-only git keeps the launcher: {why}");
+        LocalGit::bare()
+    };
+    let Some(found) = found else {
+        return decline("no git.exe on PATH".into());
+    };
+    let Some(found_str) = found.to_str() else {
+        return decline(format!("{found:?} is not UTF-8"));
+    };
+    let Some(real) = launcherless_git_path(found_str) else {
+        return decline(format!(
+            "{found_str} is not a Git for Windows cmd\\git.exe launcher"
+        ));
+    };
+    let real = std::path::PathBuf::from(real);
+    if !real.is_file() {
+        return decline(format!("{} does not exist", real.display()));
+    }
+    let Some(mingw_bin) = real.parent() else {
+        return decline(format!("{} has no parent", real.display()));
+    };
+    let Some(prefix) = mingw_bin.parent().and_then(std::path::Path::parent) else {
+        return decline(format!("{} has no install prefix", real.display()));
+    };
+    // `usr\bin` holds `sh.exe`; MinGit-BusyBox has none (its shell is in
+    // `mingw64\bin`), so it is prepended only where it exists.
+    let mut dirs = vec![mingw_bin.to_path_buf()];
+    let usr_bin = prefix.join("usr").join("bin");
+    if usr_bin.is_dir() {
+        dirs.push(usr_bin);
+    }
+    // The launcher adds `<HOME>\bin` whether or not it exists.
+    if let Some(home) = home {
+        dirs.push(home.join("bin"));
+    }
+    let inherited = inherited_path
+        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Ok(path) = std::env::join_paths(dirs.into_iter().chain(inherited)) else {
+        return decline("the child PATH could not be joined".into());
+    };
+    let env = vec![("PATH".into(), path), ("MSYSTEM".into(), "MINGW64".into())];
+    tracing::debug!(
+        "local read-only git runs without the launcher: {}",
+        real.display()
+    );
+    LocalGit {
+        program: real.into_os_string(),
+        env,
+    }
+}
+
+/// [`no_window`] for LOCAL, READ-ONLY git — the launcher-less
+/// [`local_git_program`], with the launcher's PATH dirs and `MSYSTEM`, so a
+/// filter or hook can still start `sh`. The
+/// repository-local env scrub and the prompt-proof posture still apply:
+/// [`program_is_git`] matches the resolved `…\mingw64\bin\git.exe` by its
+/// stem. Never use it for a command that talks to a remote or mutates the
+/// tree; those keep `no_window("git")`.
+pub fn no_window_git_local() -> std::process::Command {
+    local_git().command()
+}
+
 /// Reap a child's whole PROCESS TREE when this guard drops — the thing
 /// [`std::process::Child::kill`] does NOT do.
 ///
@@ -3205,6 +3467,374 @@ mod raw_git_guard {
 }
 
 #[cfg(test)]
+mod local_git_tests {
+    use super::*;
+
+    /// The launcher → real-binary mapping, over literal paths, on every
+    /// platform: only a `cmd\git.exe` maps, the separator is preserved, case
+    /// does not matter, and anything else is `None` (the caller then runs a
+    /// bare `"git"`).
+    #[test]
+    fn launcherless_git_path_maps_only_the_cmd_launcher() {
+        let mapped = launcherless_git_path(r"C:\Program Files\Git\cmd\git.exe");
+        assert_eq!(
+            mapped.as_deref(),
+            Some(r"C:\Program Files\Git\mingw64\bin\git.exe")
+        );
+        // The mapped program must still be git to the chokepoint, or the scrub
+        // and the prompt-proof posture would silently stop applying to it.
+        assert!(program_is_git(std::ffi::OsStr::new(
+            mapped.as_deref().unwrap()
+        )));
+        assert_eq!(
+            launcherless_git_path(r"D:\tools\PortableGit\CMD\GIT.EXE").as_deref(),
+            Some(r"D:\tools\PortableGit\mingw64\bin\git.exe")
+        );
+        assert_eq!(
+            launcherless_git_path("C:/Program Files/Git/cmd/git.exe").as_deref(),
+            Some("C:/Program Files/Git/mingw64/bin/git.exe")
+        );
+        for not_a_launcher in [
+            r"C:\Program Files\Git\mingw64\bin\git.exe",
+            r"C:\Program Files\Git\bin\git.exe",
+            r"C:\Program Files\Git\cmd\gitk.exe",
+            r"C:\Program Files\Git\cmd\git-lfs.exe",
+            "/usr/bin/git",
+            "git",
+            "git.exe",
+            r"cmd\git.exe",
+            "",
+        ] {
+            assert_eq!(
+                launcherless_git_path(not_a_launcher),
+                None,
+                "{not_a_launcher:?} must not map"
+            );
+        }
+    }
+
+    /// Every decline is a bare `"git"` with no env of its own — what
+    /// `no_window("git")` callers ran before — decided before any filesystem
+    /// read, so it holds on every platform.
+    #[test]
+    fn resolve_local_git_declines_to_a_bare_git() {
+        let path = std::ffi::OsStr::new("/usr/bin");
+        for found in [
+            None,
+            Some(std::path::Path::new("/usr/bin/git")),
+            Some(std::path::Path::new(
+                r"C:\Program Files\Git\mingw64\bin\git.exe",
+            )),
+            Some(std::path::Path::new(r"C:\Program Files\Git\bin\git.exe")),
+        ] {
+            assert_eq!(
+                resolve_local_git(found, Some(path), None),
+                LocalGit::bare(),
+                "{found:?} must decline"
+            );
+        }
+    }
+
+    /// The local program is still git as far as the chokepoint's posture is
+    /// concerned, so the scrub and the prompt-proof env apply to it.
+    #[test]
+    fn no_window_git_local_keeps_the_git_posture() {
+        let cmd = no_window_git_local();
+        assert!(program_is_git(cmd.get_program()));
+        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, val)| key == k.as_str()
+                        && val == Some(std::ffi::OsStr::new(v.as_str()))),
+                "{k} missing from the launcher-less git"
+            );
+        }
+    }
+
+    /// The Git for Windows `(<prefix>\cmd\git.exe, <prefix>\mingw64\bin\git.exe)`
+    /// pair for the git this process resolves, whichever of the two PATH found:
+    /// a runner launched from Windows resolves the `cmd` launcher, while a test
+    /// run from Git Bash resolves `mingw64\bin` directly and has no `cmd` entry
+    /// on PATH at all — so the launcher is derived from the real binary there,
+    /// or the parity test below would compare `git` with itself.
+    #[cfg(windows)]
+    fn git_for_windows_pair() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let found = which("git.exe")?;
+        let launcher = if launcherless_git_path(found.to_str()?).is_some() {
+            found
+        } else {
+            // `<prefix>\mingw64\bin\git.exe` → `<prefix>\cmd\git.exe`.
+            let bin = found.parent()?;
+            let mingw = bin.parent()?;
+            if !bin.file_name()?.eq_ignore_ascii_case("bin")
+                || !mingw.file_name()?.eq_ignore_ascii_case("mingw64")
+            {
+                return None;
+            }
+            mingw.parent()?.join("cmd").join("git.exe")
+        };
+        let real = std::path::PathBuf::from(launcherless_git_path(launcher.to_str()?)?);
+        (launcher.is_file() && real.is_file()).then_some((launcher, real))
+    }
+
+    /// The PATH a runner started from Windows has: the launcher's own `cmd`
+    /// dir and the system dirs — no `mingw64\bin`, no `usr\bin`, so no `sh`.
+    #[cfg(windows)]
+    fn runner_shaped_path(launcher: &std::path::Path) -> std::ffi::OsString {
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let system_root = std::path::PathBuf::from(system_root);
+        std::env::join_paths([
+            launcher.parent().expect("launcher dir").to_path_buf(),
+            system_root.join("System32"),
+            system_root,
+        ])
+        .expect("join PATH")
+    }
+
+    /// The mapping under a runner-shaped PATH: the real binary, with the
+    /// launcher's `mingw64\bin`, `usr\bin` (where it exists) and `<HOME>\bin`
+    /// prepended to the inherited PATH in that order, and `MSYSTEM=MINGW64`.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_local_git_carries_the_launchers_path() {
+        let (cmd_git, real_git) =
+            git_for_windows_pair().expect("no Git for Windows cmd/mingw64 layout resolves here");
+        let runner_path = runner_shaped_path(&cmd_git);
+        let home = std::path::Path::new(r"C:\no-such-home");
+        let local = resolve_local_git(Some(&cmd_git), Some(&runner_path), Some(home));
+        assert_eq!(std::path::Path::new(&local.program), real_git.as_path());
+        let env = |name: &str| {
+            local
+                .env
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        let path = env("PATH").expect("PATH set");
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        let mingw_bin = real_git.parent().unwrap();
+        let prefix = mingw_bin.parent().unwrap().parent().unwrap();
+        assert_eq!(dirs.first().map(|d| d.as_path()), Some(mingw_bin));
+        let usr_bin = prefix.join("usr").join("bin");
+        let mut next = 1;
+        if usr_bin.is_dir() {
+            assert_eq!(dirs.get(next), Some(&usr_bin));
+            next += 1;
+        }
+        // The launcher adds `<HOME>\bin` whether or not it exists.
+        assert_eq!(dirs.get(next), Some(&home.join("bin")));
+        assert_eq!(
+            &dirs[next + 1..],
+            std::env::split_paths(&runner_path)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "the inherited PATH must follow the prepended dirs, unchanged"
+        );
+        // Always MINGW64, as the launcher sets it over any inherited value.
+        assert_eq!(
+            env("MSYSTEM").as_deref(),
+            Some(std::ffi::OsStr::new("MINGW64"))
+        );
+        // No HOME resolved: no `<HOME>\bin`, the inherited PATH follows.
+        let no_home = resolve_local_git(Some(&cmd_git), Some(&runner_path), None);
+        let no_home_path = no_home
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("PATH set");
+        assert_eq!(std::env::split_paths(&no_home_path).count(), dirs.len() - 1);
+    }
+
+    /// The launcher's HOME order: `HOME`, then `HOMEDRIVE`+`HOMEPATH` when
+    /// that directory exists, then `USERPROFILE`. An empty value is treated as
+    /// unset here — a deliberate difference from the launcher, which keeps an
+    /// empty `HOME` (see [`launcher_home`]).
+    #[test]
+    fn launcher_home_follows_the_launchers_order() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let dir = tempfile::tempdir().unwrap();
+        let (drive, rest) = {
+            let chars: Vec<char> = dir.path().to_str().unwrap().chars().collect();
+            // Split anywhere: the launcher concatenates the two verbatim.
+            let cut = chars.len() / 2;
+            (
+                chars[..cut].iter().collect::<String>(),
+                chars[cut..].iter().collect::<String>(),
+            )
+        };
+        assert_eq!(
+            launcher_home(os("/h"), os(&drive), os(&rest), os("/u")),
+            Some(std::path::PathBuf::from("/h"))
+        );
+        assert_eq!(
+            launcher_home(None, os(&drive), os(&rest), os("/u")),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            launcher_home(os(""), os("/no-such"), os("/dir"), os("/u")),
+            Some(std::path::PathBuf::from("/u")),
+            "an empty HOME is treated as unset (unlike the launcher); a missing \
+             HOMEDRIVE+HOMEPATH dir falls through"
+        );
+        assert_eq!(launcher_home(None, None, None, None), None);
+    }
+
+    /// Parity gate (D4): `status --porcelain` and `rev-parse HEAD` on a fixture
+    /// answer byte-identically through Git for Windows' `cmd\git.exe` launcher
+    /// and through the launcher-less [`LocalGit`] production builds, both under
+    /// a RUNNER-shaped PATH with `HOME` removed — the environment the runner
+    /// actually gives them.
+    ///
+    /// The fixture has teeth: a `.bin` file under a `filter.probe.clean` command
+    /// containing a space (`required`, so a filter that cannot run is fatal) is
+    /// made stat-dirty before every `status`, so `status` must start `sh` to
+    /// re-hash it — the path that crashes a bare launcher-less git when
+    /// `MSYSTEM` is already set (exit 139 under bash, reproduced 2026-10-24;
+    /// `filter.lfs.process` from Git for Windows' own system config takes the
+    /// same path). Production always runs with `MSYSTEM=MINGW64` — the crash
+    /// shape — so its arm is the one that would crash without the PATH dirs.
+    /// The test asserts that a bare `mingw64\bin\git.exe` under the same PATH
+    /// with `MSYSTEM` set does NOT reproduce the launcher's answer, so a
+    /// fixture that stops exercising `sh` fails here instead of passing
+    /// vacuously. Every spawn is time-bounded: the teeth arm crashes git on
+    /// purpose, and a registered just-in-time debugger could otherwise hold it
+    /// open.
+    #[cfg(windows)]
+    #[test]
+    fn launcherless_git_matches_the_launcher_on_local_reads() {
+        let (cmd_git, real_git) = git_for_windows_pair().expect(
+            "no Git for Windows cmd\\git.exe / mingw64\\bin\\git.exe pair resolves here, so \
+             this parity gate would compare nothing; it needs a Git for Windows install",
+        );
+        let runner_path = runner_shaped_path(&cmd_git);
+        let local = resolve_local_git(Some(&cmd_git), Some(&runner_path), None);
+        assert_eq!(std::path::Path::new(&local.program), real_git.as_path());
+        let bounded = |cmd: std::process::Command| {
+            output_with_timeout(cmd, std::time::Duration::from_secs(60))
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+        let through_launcher = || {
+            let mut cmd = no_window(&cmd_git);
+            cmd.env("PATH", &runner_path).env_remove("HOME");
+            cmd
+        };
+        let setup = |args: &[&str]| {
+            let mut cmd = through_launcher();
+            cmd.arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c"])
+                .arg("commit.gpgsign=false")
+                .args(args);
+            let out = bounded(cmd).expect("spawn git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        setup(&["init", "-q"]);
+        setup(&["config", "filter.probe.clean", "cat -- %f"]);
+        setup(&["config", "filter.probe.required", "true"]);
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=probe\n").unwrap();
+        std::fs::write(repo.join("data.bin"), "payload\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        setup(&["add", "."]);
+        setup(&["commit", "-q", "-m", "fixture"]);
+        // A modified tracked file and an untracked one, so `status` has
+        // something to say besides the filtered file.
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "x\n").unwrap();
+
+        // Move `data.bin`'s mtime past whatever the index recorded, so the next
+        // `status` cannot trust the stat data and must run the clean filter.
+        let mut bumps = 0u64;
+        let mut stat_dirty = || {
+            bumps += 1;
+            let when = std::time::SystemTime::now() + std::time::Duration::from_secs(10 * bumps);
+            std::fs::File::options()
+                .write(true)
+                .open(repo.join("data.bin"))
+                .and_then(|f| f.set_modified(when))
+                .expect("bump data.bin mtime");
+        };
+        let run_bounded = |mut cmd: std::process::Command, args: &[&str]| {
+            cmd.arg("-C").arg(&repo).args(args);
+            bounded(cmd)
+        };
+        let run = |cmd: std::process::Command, args: &[&str]| {
+            run_bounded(cmd, args).expect("spawn (or timed out)")
+        };
+        let stdout_of = |out: std::process::Output, who: &str, args: &[&str]| {
+            assert!(out.status.success(), "{who} {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        for args in [&["status", "--porcelain"][..], &["rev-parse", "HEAD"][..]] {
+            stat_dirty();
+            let launcher = stdout_of(run(through_launcher(), args), "launcher", args);
+            assert!(!launcher.is_empty(), "{args:?} printed nothing");
+
+            stat_dirty();
+            let mut launcherless = local.command();
+            launcherless.env_remove("HOME");
+            let launcherless = stdout_of(run(launcherless, args), "launcher-less", args);
+            assert_eq!(
+                launcher, launcherless,
+                "{args:?}: {cmd_git:?} and {real_git:?} (production env) disagree"
+            );
+
+            // The process-global constructors agree too. NOTE: this reaches
+            // the real LocalGit only when this test process's PATH resolves
+            // `cmd\git.exe` first; under Git Bash (and CI's `shell: bash`)
+            // `which("git.exe")` finds `mingw64\bin\git.exe`, the mapping
+            // declines, and both sides are a bare `git`. The arms above are
+            // the ones that always exercise LocalGit.
+            stat_dirty();
+            let a = stdout_of(run(no_window("git"), args), "no_window(git)", args);
+            stat_dirty();
+            let b = stdout_of(
+                run(no_window_git_local(), args),
+                "no_window_git_local",
+                args,
+            );
+            assert_eq!(
+                a, b,
+                "{args:?}: no_window(\"git\") and no_window_git_local disagree"
+            );
+
+            if args[0] == "status" {
+                // Teeth: with MSYSTEM set and without the launcher's PATH the
+                // same read must break. (With MSYSTEM unset the real binary
+                // puts its own dirs on PATH and answers, so it is not used.)
+                stat_dirty();
+                let mut bare = no_window(&real_git);
+                bare.env("PATH", &runner_path)
+                    .env_remove("HOME")
+                    .env("MSYSTEM", "MINGW64");
+                // A timeout is a non-reproduction too; any OTHER spawn error
+                // means nothing ran, which must not pass as teeth.
+                let bare = run_bounded(bare, args);
+                if let Err(e) = &bare {
+                    assert_eq!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut,
+                        "the teeth spawn failed without running: {e}"
+                    );
+                }
+                let reproduced = bare.as_ref().is_ok_and(|out| {
+                    out.status.success() && String::from_utf8_lossy(&out.stdout) == launcher
+                });
+                assert!(
+                    !reproduced,
+                    "a bare {real_git:?} under a runner-shaped PATH with MSYSTEM set reproduced \
+                     the launcher's status, so this fixture no longer exercises sh and cannot see a \
+                     launcher-less git that lacks the launcher's PATH: {bare:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod prompt_proof_tests {
     use super::*;
 
@@ -3322,6 +3952,8 @@ mod prompt_proof_tests {
             "git",
             "/usr/bin/git",
             r"C:\Program Files\Git\cmd\git.exe",
+            // What `no_window_git_local` runs on Windows.
+            r"C:\Program Files\Git\mingw64\bin\git.exe",
             "GIT.EXE",
         ] {
             assert_repo_local_scrubbed(&env_of(&no_window(program)), program);
