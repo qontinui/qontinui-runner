@@ -5690,9 +5690,16 @@ mod tests {
             .into_iter()
             .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
             .collect();
-        assert_eq!(rows.len(), 2, "the first finish and the re-sent one: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the first finish and the re-sent one: {rows:?}"
+        );
         let last = rows.last().unwrap();
-        assert_eq!(last.payload["finished_at"], again, "the re-sent row carries the NEW stamp");
+        assert_eq!(
+            last.payload["finished_at"], again,
+            "the re-sent row carries the NEW stamp"
+        );
         let outcome = push_record(&coord.inner, last).await;
         assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
 
@@ -5701,7 +5708,10 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let g = rec.lock().await;
         let (id, body) = g.patches.last().expect("the re-sent finish was PATCHed");
-        assert_eq!(*id, coord_row, "addressed to the session's coord row by PATH");
+        assert_eq!(
+            *id, coord_row,
+            "addressed to the session's coord row by PATH"
+        );
         assert_eq!(body["progress"]["session_status"], "finished");
         assert_eq!(
             body["progress"]["last_progress_at"],

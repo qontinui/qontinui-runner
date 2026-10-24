@@ -2256,7 +2256,13 @@ mod tests {
         // 1 -> 10 (terminal z) -> 11 (claude, resolved, no `since` served)
         // 1 -> 12 (claude, claimed by nothing)
         let snap = snap_with(
-            &[(1, &[5, 8, 10, 12]), (5, &[6]), (6, &[7]), (8, &[9]), (10, &[11])],
+            &[
+                (1, &[5, 8, 10, 12]),
+                (5, &[6]),
+                (6, &[7]),
+                (8, &[9]),
+                (10, &[11]),
+            ],
             &[],
             &[
                 (6, "claude"),
