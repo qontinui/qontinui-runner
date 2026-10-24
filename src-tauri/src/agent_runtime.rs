@@ -30,8 +30,9 @@
 //! 4. Append each line to a per-agent log file AND POST to
 //!    `/agents/:agent_id/log` (Phase 5 endpoint).
 //! 5. Heartbeat the claim every 30s via `/claims/heartbeat`.
-//! 6. On subprocess exit, POST `spawn-failed` (non-zero) or
-//!    `spawn-complete` (clean exit). Restart up to 3× on crash.
+//! 6. `spawn-complete` once the child has started; on subprocess exit, POST
+//!    `spawn-failed` (non-zero, stopped, blocked) or `spawn-exited` (clean
+//!    exit, see [`terminal_report`]). Restart up to 3× on crash.
 //!
 //! ## Identity
 //!
@@ -9025,6 +9026,10 @@ async fn run_agent_subprocess(
     // briefing gates its memory clause on. Assigned on every path through the
     // block, so no seeded default can mask a branch that forgets to set it.
     let coord_mcp;
+    // The refreshing per-agent token slot, kept past the block so the
+    // clean-exit report can present the agent's OWN credential (see
+    // [`exit_report_credential`]).
+    let agent_token_slot;
     {
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
             token: credential.token.clone(),
@@ -9037,6 +9042,7 @@ async fn run_agent_subprocess(
             ..Default::default()
         }));
         crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
+        agent_token_slot = slot.clone();
         // This `match` already discriminates the two per-session outcomes the
         // briefing needs, so it settles `coord_mcp` too rather than leaving the
         // spawn below to re-derive it (plan
@@ -9121,6 +9127,9 @@ async fn run_agent_subprocess(
     // every arm that had a child; a trust-gate refusal never started one, and
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
+    // Set by both operator-stop breaks; [`terminal_report`] reads it so a stop
+    // keeps its `spawn-failed` report whatever the last attempt's exit code was.
+    let mut stop_requested = false;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -9140,6 +9149,7 @@ async fn run_agent_subprocess(
         // bail without (re)spawning.
         if stop.is_cancelled() {
             final_reason = Some("stopped by operator before (re)spawn".to_string());
+            stop_requested = true;
             break;
         }
         // Pin this attempt's Claude session id so coord can be told which
@@ -9213,6 +9223,7 @@ async fn run_agent_subprocess(
                         }
                         final_reason =
                             Some("stopped by operator (events.agent.stop_requested)".to_string());
+                        stop_requested = true;
                         break;
                     }
                 };
@@ -9275,10 +9286,28 @@ async fn run_agent_subprocess(
 
     hb_task.abort();
 
-    if final_exit_code == Some(0) {
-        // Clean exit was already reported via spawn-complete; nothing
-        // more to send. The runner can release the claim explicitly via
-        // a follow-up POST if desired.
+    if let Some(body) = clean_exit_report(
+        final_exit_code,
+        stop_requested,
+        final_phase,
+        restarts,
+        primary_push_ref.as_deref(),
+    ) {
+        // A clean exit is REPORTED, not left silent: `spawn-complete` only
+        // said the child started, so without this coord cannot tell a fixer
+        // that finished from one that is still running (plan
+        // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+        // Phase 4). The token read is a local RwLock, and the POST itself is
+        // spawned, so the report never delays or fails this loop.
+        let credential = {
+            let slot = agent_token_slot.read().await;
+            exit_report_credential(
+                &slot.token,
+                slot.is_rejected(),
+                slot.ttl_secs(chrono::Utc::now().timestamp()) <= 0,
+            )
+        };
+        tokio::spawn(report_spawn_exited(payload.agent_id, body, credential));
         return Ok(());
     }
 
@@ -10390,6 +10419,303 @@ fn continuation_dispatch_allocation(
         .filter(|id| *id != own_agent_id)
 }
 
+/// Which terminal lifecycle POST the subprocess loop sends once it stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReport {
+    /// `POST /agents/:id/spawn-exited` — the child exited 0 on its own.
+    SpawnExited,
+    /// `POST /agents/:id/spawn-failed` in the loop's recorded phase — a
+    /// non-zero exit, a pump or spawn failure, a trust-gate block, or an
+    /// operator stop.
+    SpawnFailed,
+}
+
+/// The terminal-report decision of the agent subprocess loop, kept pure so
+/// every arm is unit-tested.
+///
+/// Only a clean exit (code 0) that was neither stopped nor blocked reports
+/// `spawn-exited`; every other ending keeps the `spawn-failed` report it has
+/// always sent. A stop or a block is checked first so that neither can ever be
+/// reported as a clean exit, even if a later change let an exit code of 0
+/// coexist with either.
+fn terminal_report(
+    final_exit_code: Option<i64>,
+    stop_requested: bool,
+    final_phase: SpawnPhase,
+) -> TerminalReport {
+    if stop_requested || final_phase == SpawnPhase::Blocked {
+        return TerminalReport::SpawnFailed;
+    }
+    if final_exit_code == Some(0) {
+        TerminalReport::SpawnExited
+    } else {
+        TerminalReport::SpawnFailed
+    }
+}
+
+/// The `spawn-exited` body the subprocess loop sends, or `None` when it must
+/// fall through to its unchanged `spawn-failed` report.
+///
+/// The whole decide-and-build step of the clean-exit arm, kept pure so the call
+/// site is covered: the loop only spawns what this returns.
+fn clean_exit_report(
+    final_exit_code: Option<i64>,
+    stop_requested: bool,
+    final_phase: SpawnPhase,
+    restarts: u32,
+    push_ref: Option<&str>,
+) -> Option<SpawnExitedBody> {
+    if terminal_report(final_exit_code, stop_requested, final_phase) != TerminalReport::SpawnExited
+    {
+        return None;
+    }
+    Some(SpawnExitedBody {
+        exit_code: 0,
+        restarts,
+        push_ref: push_ref.map(str::to_string),
+    })
+}
+
+/// Body of `POST /agents/:id/spawn-exited`. `push_ref` is omitted, not sent as
+/// `null`, when the spawn carried none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SpawnExitedBody {
+    exit_code: i64,
+    restarts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_ref: Option<String>,
+}
+
+/// The credential a `spawn-exited` report presents.
+///
+/// `Debug` is hand-written so a JWT never reaches a log line.
+#[derive(Clone, PartialEq, Eq)]
+enum ExitReportCredential {
+    /// The agent's own coord JWT. coord's reporter check
+    /// (`credential_speaks_for_allocation`) accepts it when the JWT's
+    /// `device_id` is one of the allocation's devices — which holds for the
+    /// device this runner launched the agent on, whichever tenant binding is
+    /// this device's default.
+    Agent(String),
+    /// The default binding's device JWT — verified only when that binding is
+    /// one of the allocation's paired devices.
+    Device,
+}
+
+impl std::fmt::Debug for ExitReportCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent(_) => f.write_str("Agent(<redacted>)"),
+            Self::Device => f.write_str("Device"),
+        }
+    }
+}
+
+/// Prefer the agent's own token; fall back to the device token when the agent
+/// token is empty, latched rejected by coord, or past the slot's expiry.
+///
+/// The red-main evidence reader ignores an exit row whose reporter is not
+/// verified, so on a device whose DEFAULT binding is not the allocation's
+/// paired device, a device-token report would leave the exit looking silent.
+/// A token coord has rejected, or one past expiry, would fail the reporter
+/// check outright, so the device token is the better of two imperfect choices.
+/// `expired` comes from the slot's bookkeeping `exp`, which in a release build
+/// is the JWT's own; a debug-build compression of it only moves the choice to
+/// the device token, never to a dead bearer.
+fn exit_report_credential(
+    agent_token: &str,
+    rejected: bool,
+    expired: bool,
+) -> ExitReportCredential {
+    let token = agent_token.trim();
+    if token.is_empty() || rejected || expired {
+        ExitReportCredential::Device
+    } else {
+        ExitReportCredential::Agent(token.to_string())
+    }
+}
+
+/// What one `spawn-exited` response means for the reporter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitReportResponse {
+    Delivered,
+    /// A transient refusal coord marked `retryable: true`: retry once.
+    RetryOnce,
+    /// `404`/`405` before any `spawn-exited` was delivered by this process: a
+    /// coord predating the route. Logged once at info.
+    RouteAbsent,
+    /// `404` after a delivery in this process proved the route exists: the
+    /// agent is unknown to coord. Logged at warn.
+    UnknownAgent,
+    Failed,
+}
+
+/// Classify a `spawn-exited` response. `route_seen` is whether this process has
+/// already had one delivered, which is what separates an absent route from an
+/// unknown agent — both answer `404`.
+fn classify_exit_report_response(
+    status: u16,
+    retryable: bool,
+    route_seen: bool,
+) -> ExitReportResponse {
+    match status {
+        200..=299 => ExitReportResponse::Delivered,
+        503 if retryable => ExitReportResponse::RetryOnce,
+        404 if route_seen => ExitReportResponse::UnknownAgent,
+        404 | 405 => ExitReportResponse::RouteAbsent,
+        _ => ExitReportResponse::Failed,
+    }
+}
+
+/// The delay before the single retry of a `retryable` 503.
+const SPAWN_EXITED_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// Set once the first `404`/`405` from a coord without the `spawn-exited`
+/// route has been logged, so an older coord costs one info line per process.
+static SPAWN_EXITED_ROUTE_ABSENT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Set once coord has accepted a `spawn-exited` in this process, so a later
+/// `404` reads as an unknown agent rather than an absent route.
+static SPAWN_EXITED_ROUTE_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// One `spawn-exited` request, carrying `credential`.
+fn spawn_exited_request(
+    client: &reqwest::Client,
+    url: &str,
+    credential: &ExitReportCredential,
+) -> reqwest::RequestBuilder {
+    match credential {
+        ExitReportCredential::Agent(token) => {
+            // coord-auth-exempt(agent-jwt): presents the per-agent coord JWT of
+            // the agent whose exit this reports. coord's reporter check
+            // (`credential_speaks_for_allocation`) accepts it when its
+            // `device_id` is one of the allocation's devices, as this launching
+            // device is; the default binding's device JWT matches only when that
+            // binding is the allocation's device.
+            client.post(url).bearer_auth(token)
+        }
+        ExitReportCredential::Device => {
+            // coord-tenant-scope(session-noop): agent_id sits in the path; coord
+            // resolves and persists the tenant from agent_id server-side, and
+            // verifies the reporter as spawn-failed does; nothing to thread
+            // from here. Terminal.
+            crate::auth::attach_device_auth(client.post(url))
+        }
+    }
+}
+
+/// Tell coord that `agent_id`'s child exited cleanly (code 0).
+///
+/// Same client and 5 s timeout as [`report_spawn_complete`], best-effort: the
+/// agent loop has already finished, so an undelivered report costs coord's
+/// visibility, never work. A `503` coord marks `retryable` is retried once
+/// after [`SPAWN_EXITED_RETRY_DELAY`]. A `404`/`405` from a coord that predates
+/// the route is logged once at info and dropped; a `404` after this process
+/// has had a report delivered means coord does not know the agent, and is
+/// logged at warn.
+async fn report_spawn_exited(
+    agent_id: uuid::Uuid,
+    body: SpawnExitedBody,
+    credential: ExitReportCredential,
+) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-exited");
+    let credential_kind = match credential {
+        ExitReportCredential::Agent(_) => "agent",
+        ExitReportCredential::Device => "device",
+    };
+    for attempt in 0..2u8 {
+        let resp = match spawn_exited_request(&client, &url, &credential)
+            .timeout(Duration::from_secs(5))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("agent_runtime: spawn-exited POST agent_id={agent_id} failed: {e:#}");
+                return;
+            }
+        };
+        let status = resp.status();
+        let reply: Option<serde_json::Value> = if status.is_success() || status.as_u16() == 503 {
+            resp.json::<serde_json::Value>().await.ok()
+        } else {
+            None
+        };
+        let retryable = reply
+            .as_ref()
+            .and_then(|v| v.get("retryable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let route_seen = SPAWN_EXITED_ROUTE_SEEN.load(Ordering::Relaxed);
+        match classify_exit_report_response(status.as_u16(), retryable, route_seen) {
+            ExitReportResponse::Delivered => {
+                SPAWN_EXITED_ROUTE_SEEN.store(true, Ordering::Relaxed);
+                let verified = reply
+                    .as_ref()
+                    .and_then(|v| v.get("reporter_device_verified"))
+                    .and_then(serde_json::Value::as_bool);
+                if verified == Some(false) {
+                    warn!(
+                        "agent_runtime: spawn-exited for agent_id={agent_id} was recorded \
+                         reporter_device_verified=false (credential={credential_kind}) — \
+                         coord's red-main evidence ignores unverified rows, so this clean \
+                         exit may still read as silent"
+                    );
+                } else {
+                    info!(
+                        "agent_runtime: spawn-exited posted agent_id={agent_id} restarts={} \
+                         credential={credential_kind} reporter_device_verified={}",
+                        body.restarts,
+                        verified.map_or("unknown", |v| if v { "true" } else { "false" })
+                    );
+                }
+                return;
+            }
+            ExitReportResponse::RetryOnce if attempt == 0 => {
+                info!(
+                    "agent_runtime: spawn-exited agent_id={agent_id} got a retryable 503; \
+                     retrying once in {}s",
+                    SPAWN_EXITED_RETRY_DELAY.as_secs()
+                );
+                tokio::time::sleep(SPAWN_EXITED_RETRY_DELAY).await;
+            }
+            ExitReportResponse::RouteAbsent => {
+                if !SPAWN_EXITED_ROUTE_ABSENT_LOGGED.swap(true, Ordering::Relaxed) {
+                    info!(
+                        "agent_runtime: coord answered {status} to spawn-exited for \
+                         agent_id={agent_id} — a coord predating the route, or an unknown \
+                         agent; clean exits may not be reported to it (logged once)"
+                    );
+                }
+                return;
+            }
+            ExitReportResponse::UnknownAgent => {
+                warn!(
+                    "agent_runtime: coord answered 404 to spawn-exited for agent_id={agent_id} \
+                     although the route answered earlier in this process — coord does not \
+                     know this agent"
+                );
+                return;
+            }
+            ExitReportResponse::RetryOnce | ExitReportResponse::Failed => {
+                warn!(
+                    "agent_runtime: spawn-exited POST agent_id={agent_id} returned {status} \
+                     (attempt {})",
+                    attempt + 1
+                );
+                return;
+            }
+        }
+    }
+}
+
 async fn report_spawn_complete(
     agent_id: uuid::Uuid,
     pid: Option<i64>,
@@ -10786,6 +11112,198 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_report_clean_exit_posts_spawn_exited() {
+        assert_eq!(
+            terminal_report(Some(0), false, SpawnPhase::Exited),
+            TerminalReport::SpawnExited
+        );
+    }
+
+    #[test]
+    fn terminal_report_non_zero_exit_posts_spawn_failed() {
+        for code in [1, 2, 137, -1] {
+            assert_eq!(
+                terminal_report(Some(code), false, SpawnPhase::Exited),
+                TerminalReport::SpawnFailed,
+                "exit code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_report_no_exit_code_posts_spawn_failed() {
+        // A pump or spawn failure records no exit code.
+        assert_eq!(
+            terminal_report(None, false, SpawnPhase::Exited),
+            TerminalReport::SpawnFailed
+        );
+    }
+
+    #[test]
+    fn terminal_report_stop_requested_posts_spawn_failed() {
+        // Unchanged: a stop is reported as spawn-failed whatever the last
+        // attempt's exit code, including none and an earlier 0.
+        for code in [None, Some(0), Some(1)] {
+            assert_eq!(
+                terminal_report(code, true, SpawnPhase::Exited),
+                TerminalReport::SpawnFailed,
+                "exit code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_report_blocked_posts_spawn_failed() {
+        for code in [None, Some(0)] {
+            assert_eq!(
+                terminal_report(code, false, SpawnPhase::Blocked),
+                TerminalReport::SpawnFailed,
+                "exit code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_exit_report_builds_the_body_only_for_a_clean_exit() {
+        assert_eq!(
+            clean_exit_report(
+                Some(0),
+                false,
+                SpawnPhase::Exited,
+                2,
+                Some("refs/heads/agent/x")
+            ),
+            Some(SpawnExitedBody {
+                exit_code: 0,
+                restarts: 2,
+                push_ref: Some("refs/heads/agent/x".to_string()),
+            })
+        );
+        assert_eq!(
+            clean_exit_report(Some(0), false, SpawnPhase::Exited, 0, None),
+            Some(SpawnExitedBody {
+                exit_code: 0,
+                restarts: 0,
+                push_ref: None,
+            })
+        );
+        // Every other ending falls through to spawn-failed (unchanged).
+        assert_eq!(
+            clean_exit_report(Some(1), false, SpawnPhase::Exited, 3, None),
+            None
+        );
+        assert_eq!(
+            clean_exit_report(None, false, SpawnPhase::Exited, 1, None),
+            None
+        );
+        assert_eq!(
+            clean_exit_report(Some(0), true, SpawnPhase::Exited, 0, None),
+            None
+        );
+        assert_eq!(
+            clean_exit_report(None, false, SpawnPhase::Blocked, 0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn exit_report_credential_prefers_a_healthy_agent_token() {
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", false, false),
+            ExitReportCredential::Agent("agent.jwt.tok".to_string())
+        );
+        // Empty, rejected or expired -> the device token.
+        assert_eq!(
+            exit_report_credential("", false, false),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("   ", false, false),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", true, false),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", false, true),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", true, true),
+            ExitReportCredential::Device
+        );
+    }
+
+    #[test]
+    fn exit_report_credential_debug_never_prints_the_token() {
+        let shown = format!(
+            "{:?}",
+            ExitReportCredential::Agent("eyJhbGciOi.secret.sig".to_string())
+        );
+        assert_eq!(shown, "Agent(<redacted>)");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(format!("{:?}", ExitReportCredential::Device), "Device");
+    }
+
+    #[test]
+    fn classify_exit_report_response_covers_every_arm() {
+        use ExitReportResponse as R;
+        assert_eq!(
+            classify_exit_report_response(200, false, false),
+            R::Delivered
+        );
+        assert_eq!(
+            classify_exit_report_response(201, false, true),
+            R::Delivered
+        );
+        assert_eq!(
+            classify_exit_report_response(503, true, false),
+            R::RetryOnce
+        );
+        assert_eq!(classify_exit_report_response(503, false, false), R::Failed);
+        assert_eq!(
+            classify_exit_report_response(404, false, false),
+            R::RouteAbsent
+        );
+        assert_eq!(
+            classify_exit_report_response(405, false, false),
+            R::RouteAbsent
+        );
+        assert_eq!(
+            classify_exit_report_response(404, false, true),
+            R::UnknownAgent
+        );
+        assert_eq!(
+            classify_exit_report_response(405, false, true),
+            R::RouteAbsent
+        );
+        assert_eq!(classify_exit_report_response(500, false, false), R::Failed);
+        assert_eq!(classify_exit_report_response(401, false, false), R::Failed);
+    }
+
+    #[test]
+    fn spawn_exited_body_shape_omits_unknown_push_ref() {
+        let without = serde_json::to_value(SpawnExitedBody {
+            exit_code: 0,
+            restarts: 2,
+            push_ref: None,
+        })
+        .unwrap();
+        assert_eq!(without, serde_json::json!({"exit_code": 0, "restarts": 2}));
+        let with = serde_json::to_value(SpawnExitedBody {
+            exit_code: 0,
+            restarts: 0,
+            push_ref: Some("refs/heads/agent/x".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            with,
+            serde_json::json!({"exit_code": 0, "restarts": 0, "push_ref": "refs/heads/agent/x"})
+        );
+    }
+
     #[test]
     fn append_sibling_notes_lists_each_note_and_leaves_empty_alone() {
         assert_eq!(super::append_sibling_notes("CTX".to_string(), &[]), "CTX");
