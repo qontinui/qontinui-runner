@@ -587,8 +587,7 @@ fn run_git_bounded(
 /// Run `cmd` to completion, capped at `timeout`.
 ///
 /// `std::process::Command::output()` has no timeout — this is the bounded
-/// stand-in used everywhere the shutdown path shells out (`git` here, the
-/// orphaned-AI `taskkill` loop in `main.rs`). Returns:
+/// stand-in used where the shutdown path shells out (`git` here). Returns:
 ///
 /// - `Ok(Some(output))` — the child exited inside the budget;
 /// - `Ok(None)` — the budget expired; the child was killed and abandoned;
@@ -597,7 +596,7 @@ fn run_git_bounded(
 /// stdout/stderr are piped and read only AFTER the child has exited, so a child
 /// that writes more than the OS pipe buffer holds would block on its own write
 /// and be reported as a timeout rather than a success. That is acceptable for
-/// every caller here — a stash sha, a bare update-ref, a taskkill line — and it
+/// every caller here — a stash sha, a bare update-ref — and it
 /// is the price of not spawning two reader threads per subprocess on a
 /// shutdown path. Do NOT reuse this for a command with large output.
 pub(crate) fn output_with_timeout(

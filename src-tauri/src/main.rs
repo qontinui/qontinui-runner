@@ -307,6 +307,10 @@ mod tiered_info;
 mod timeout_config;
 mod trace_api;
 mod tracing_layers;
+// In-process process-TREE kill (no `taskkill` spawn) for the runner's Windows
+// kill paths — plan 2026-10-19-served-corpus-probe-budget-excludes-process-creation.
+#[cfg(windows)]
+mod tree_kill;
 mod trigger_system;
 mod tunnel;
 mod ui_bridge_evaluate;
@@ -424,7 +428,7 @@ mod zombie_sweep;
 ///   SHUTDOWN_JOIN_BUDGET    3 s   bridges + ADB reverses + extraction executor
 /// + EXIT_DRAIN_BUDGET       8 s   drain: turn-flush + WIP refs + coord claims
 /// + TERMINAL_CLOSE_BUDGET   5 s   TerminalManager::close_all (O(terminals))
-/// + AI_KILL_BUDGET          4 s   orphaned-AI taskkill loop (O(live agents))
+/// + AI_KILL_BUDGET          4 s   orphaned-AI tree-kill loop (O(live agents))
 /// + MISC_SECS               2 s   ci_node cancel, close_all_sessions, shutdown
 ///                                 marker, port breadcrumb, and the grace given
 ///                                 to the four async cleanup tasks
@@ -458,11 +462,11 @@ mod shutdown_budget {
     const EXIT_DRAIN_SECS: u64 = 8;
 
     /// `TerminalManager::close_all`. Previously UNCAPPED: per terminal it is a
-    /// `taskkill /F /T` plus two 2 s thread joins plus a recursive
+    /// process-tree kill plus two 2 s thread joins plus a recursive
     /// `remove_dir_all`, i.e. ≈ N × 4 s.
     const TERMINAL_CLOSE_SECS: u64 = 5;
 
-    /// The orphaned-AI-process `taskkill` loop. Previously UNCAPPED and serial,
+    /// The orphaned-AI-process tree-kill loop. Previously UNCAPPED and serial,
     /// with roughly one entry per live agent.
     const AI_KILL_SECS: u64 = 4;
 
@@ -491,9 +495,9 @@ mod shutdown_budget {
     /// anchored to worker completion and is a component of `MISC_SECS`.
     pub const ASYNC_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
-    /// Per-subprocess cap for a shutdown `taskkill`. A `taskkill` against a
-    /// process tree that is itself wedged can otherwise block forever on
-    /// `.output()`.
+    /// Per-kill cap for one shutdown tree kill (the walk's pass budget). The
+    /// name predates the in-process kill, when each kill was a `taskkill`
+    /// subprocess that could otherwise block forever on `.output()`.
     pub const TASKKILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Floor under [`TASKKILL_TIMEOUT`] once the budget is nearly spent.
@@ -1801,7 +1805,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     health_monitor::start_health_monitor();
 
     // Initialize Windows Job Object so spawned AI processes are auto-killed
-    // if the runner crashes (safety net for the explicit taskkill in shutdown).
+    // if the runner crashes (safety net for the explicit tree kill in shutdown).
     #[cfg(windows)]
     qontinui_runner_win32::init_job_object();
 
