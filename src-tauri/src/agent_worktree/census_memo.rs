@@ -63,19 +63,42 @@ impl WalkMemo {
         self.trunks.insert(key, t.clone());
         t
     }
+
+    /// Record `trunk` — resolved by the caller — for `dir`'s common dir,
+    /// REPLACING anything already held. The walk seeds each repository right
+    /// after that repository's own `fetch_trunk`, and that reading is the fresh
+    /// one; a row of the same repository reached earlier in the walk may have
+    /// memoised a pre-fetch commit, which must not survive the seed.
+    pub fn seed(&mut self, dir: &Path, trunk: Option<Trunk>) {
+        self.resolutions += 1;
+        if let Some(key) = qontinui_runner_lib::git_layout::common_dir_key(dir) {
+            self.trunks.insert(key, trunk);
+        }
+    }
 }
 
-/// Upper bound on [`LandedMemo`] entries. The fleet's largest box carries
-/// ~2,000 worktrees; 8,192 holds every row of several walks. When full the
-/// memo is cleared rather than evicted entry by entry — a cold walk costs what
-/// today's every walk costs, and nothing is ever answered wrongly.
+/// Upper bound on [`LandedMemo`] answers across all repositories. Each
+/// repository holds answers for its CURRENT trunk commit only (see
+/// [`LandedMemo`]), so live entries are bounded by the worktree count — the
+/// fleet's largest box carries ~2,000 — and this cap is a backstop: when it is
+/// reached the memo is cleared, a cold walk costs what every walk cost before
+/// the memo, and nothing is ever answered wrongly.
 pub(super) const LANDED_MEMO_CAP: usize = 8_192;
 
-type LandedKey = (PathBuf, String, String);
+/// One repository's answers: the trunk commit they were measured against, and
+/// `HEAD oid -> landed` for that trunk.
+struct RepoAnswers {
+    trunk: String,
+    by_head: HashMap<String, bool>,
+}
 
-/// Process-global memo of measured `landed_in_main` answers.
+/// Process-global memo of measured `landed_in_main` answers, keyed by git
+/// common dir. Storing an answer for a NEW trunk commit drops that
+/// repository's answers for the old one: once origin's trunk moves they are
+/// never looked up again, and keeping them would only grow the memo until the
+/// cap cleared everything (a fully cold walk on exactly the busiest repos).
 pub(super) struct LandedMemo {
-    map: Mutex<HashMap<LandedKey, bool>>,
+    map: Mutex<HashMap<PathBuf, RepoAnswers>>,
 }
 
 impl LandedMemo {
@@ -92,24 +115,42 @@ impl LandedMemo {
 
     pub fn get(&self, common: &Path, head: &str, trunk: &str) -> Option<bool> {
         let map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&(common.to_path_buf(), head.to_string(), trunk.to_string()))
-            .copied()
+        let repo = map.get(common)?;
+        if repo.trunk != trunk {
+            return None;
+        }
+        repo.by_head.get(head).copied()
     }
 
     pub fn put(&self, common: &Path, head: &str, trunk: &str, landed: bool) {
         let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        if map.len() >= LANDED_MEMO_CAP {
+        let total: usize = map.values().map(|r| r.by_head.len()).sum();
+        if total >= LANDED_MEMO_CAP {
             map.clear();
         }
-        map.insert(
-            (common.to_path_buf(), head.to_string(), trunk.to_string()),
-            landed,
-        );
+        let repo = map
+            .entry(common.to_path_buf())
+            .or_insert_with(|| RepoAnswers {
+                trunk: trunk.to_string(),
+                by_head: HashMap::new(),
+            });
+        if repo.trunk != trunk {
+            // The trunk moved: every answer held is for a commit no row will
+            // be compared against again.
+            repo.trunk = trunk.to_string();
+            repo.by_head.clear();
+        }
+        repo.by_head.insert(head.to_string(), landed);
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.map.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|r| r.by_head.len())
+            .sum()
     }
 }
 
@@ -163,6 +204,31 @@ mod tests {
     }
 
     #[test]
+    fn a_seed_replaces_a_trunk_memoised_earlier_in_the_walk() {
+        let t = tempfile::tempdir().unwrap();
+        let (primary, a, _b) = linked_pair(t.path());
+        let mut memo = WalkMemo::default();
+        let mut stale = |_: &Path| {
+            Some(Trunk {
+                name: "origin/main".to_string(),
+                oid: Some("old".to_string()),
+            })
+        };
+        let _ = memo.trunk_for(&a, &mut stale);
+        memo.seed(
+            &primary,
+            Some(Trunk {
+                name: "origin/main".to_string(),
+                oid: Some("new".to_string()),
+            }),
+        );
+        let got = memo.trunk_for(&a, &mut |_: &Path| -> Option<Trunk> {
+            panic!("must be served from the seed")
+        });
+        assert_eq!(got.and_then(|t| t.oid).as_deref(), Some("new"));
+    }
+
+    #[test]
     fn a_dir_with_no_readable_git_dir_is_resolved_every_time() {
         let t = tempfile::tempdir().unwrap();
         let mut calls = 0usize;
@@ -200,10 +266,36 @@ mod tests {
         assert_eq!(m.get(c, "h1", "t2"), None, "a moved trunk is a miss");
         assert_eq!(m.get(c, "h2", "t1"), None, "a moved HEAD is a miss");
         assert_eq!(m.get(Path::new("/d"), "h1", "t1"), None, "another repo");
+        // The cap is a backstop over every repository's answers, all on the
+        // same trunk so nothing is dropped for a trunk move.
+        let d = Path::new("/d");
         for i in 0..LANDED_MEMO_CAP {
-            m.put(c, &format!("x{i}"), "t", false);
+            m.put(d, &format!("x{i}"), "t1", false);
         }
         assert!(m.len() <= LANDED_MEMO_CAP);
         assert_eq!(m.get(c, "h1", "t1"), None, "cleared when full");
+    }
+
+    #[test]
+    fn a_moved_trunk_drops_that_repos_old_answers_only() {
+        let m = LandedMemo::new();
+        let (c, d) = (Path::new("/c"), Path::new("/d"));
+        m.put(c, "h1", "t1", true);
+        m.put(c, "h2", "t1", false);
+        m.put(d, "h1", "t1", true);
+        assert_eq!(m.len(), 3);
+        m.put(c, "h1", "t2", true);
+        assert_eq!(m.get(c, "h1", "t2"), Some(true));
+        assert_eq!(
+            m.get(c, "h2", "t1"),
+            None,
+            "answers for the old trunk are gone"
+        );
+        assert_eq!(
+            m.get(d, "h1", "t1"),
+            Some(true),
+            "another repo is untouched"
+        );
+        assert_eq!(m.len(), 2, "growth is bounded by live keys");
     }
 }
