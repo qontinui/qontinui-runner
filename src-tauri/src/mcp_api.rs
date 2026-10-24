@@ -13945,12 +13945,18 @@ pub fn create_router(
 /// hint pointing at the two self-describing endpoints (`/ui-bridge/_routes` for
 /// the route manifest, `/ui-bridge/commands` for invokable commands) so a caller
 /// that fat-fingered a route can find the real one without grepping the source.
-/// Non-`/ui-bridge/` paths keep the bare message unchanged.
+/// When the path names a route the UI Bridge deliberately deleted, the message
+/// first says so and names the replacement (table:
+/// `mcp::ui_bridge::removed_routes::REMOVED_UI_BRIDGE_ROUTES`), then keeps the
+/// discovery hint. Non-`/ui-bridge/` paths keep the bare message unchanged.
 fn not_found_message(method: &axum::http::Method, path: &str) -> String {
     let base = format!("No route for {} {}", method, path);
     if path.starts_with("/ui-bridge/") {
+        let removed = crate::mcp::ui_bridge::removed_routes::removed_route_replacement(path)
+            .map(|replacement| format!(" — this route was removed; use {replacement}"))
+            .unwrap_or_default();
         format!(
-            "{base} — discover routes at GET /ui-bridge/_routes, \
+            "{base}{removed} — discover routes at GET /ui-bridge/_routes, \
              invokable commands at GET /ui-bridge/commands"
         )
     } else {
@@ -22502,6 +22508,86 @@ mod not_found_message_tests {
     fn non_ui_bridge_path_is_unchanged() {
         let msg = not_found_message(&Method::POST, "/api/v1/whatever");
         assert_eq!(msg, "No route for POST /api/v1/whatever");
+    }
+
+    /// An unknown path that was never a route keeps the plain discovery hint
+    /// and does not claim a removal.
+    #[test]
+    fn unknown_ui_bridge_path_does_not_claim_removal() {
+        let msg = not_found_message(&Method::POST, "/ui-bridge/control/screenshots");
+        assert_eq!(
+            msg,
+            "No route for POST /ui-bridge/control/screenshots — discover routes at \
+             GET /ui-bridge/_routes, invokable commands at GET /ui-bridge/commands"
+        );
+    }
+
+    /// Every deliberately removed route's 404 says it was removed, names the
+    /// replacement capture route and where its bytes live, and still carries
+    /// the discovery hint after it.
+    #[test]
+    fn removed_ui_bridge_route_names_its_replacement() {
+        use crate::mcp::ui_bridge::removed_routes::REMOVED_UI_BRIDGE_ROUTES;
+        // Guards an emptied table, which would make the loop below vacuous. A
+        // count floor went stale the first time an entry was dropped.
+        assert!(!REMOVED_UI_BRIDGE_ROUTES.is_empty());
+        for (removed, _) in REMOVED_UI_BRIDGE_ROUTES {
+            let path = match removed.strip_suffix('*') {
+                Some(prefix) => format!("{prefix}audit/accessibility"),
+                None => (*removed).to_string(),
+            };
+            let msg = not_found_message(&Method::POST, &path);
+            assert!(
+                msg.starts_with(&format!(
+                    "No route for POST {path} — this route was removed; use "
+                )),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.contains("POST /ui-bridge/vision/capture"),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.contains("GET /ui-bridge/vision/cache/{sha256}"),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.ends_with(
+                    "— discover routes at GET /ui-bridge/_routes, \
+                     invokable commands at GET /ui-bridge/commands"
+                ),
+                "{path}: {msg}"
+            );
+        }
+    }
+
+    /// Route level: a removed route still answers 404 / `NOT_FOUND` through
+    /// the real fallback handler — only the message text changed.
+    #[tokio::test]
+    async fn removed_route_404_keeps_status_and_code() {
+        use axum::{body::Body, http::Request, Router};
+        use tower::ServiceExt;
+        let resp = Router::new()
+            .fallback(super::not_found_handler)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ui-bridge/control/screenshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "NOT_FOUND");
+        let error = v["error"].as_str().unwrap();
+        assert!(error.starts_with("No route for POST /ui-bridge/control/screenshot"));
+        assert!(error.contains("POST /ui-bridge/vision/capture"), "{error}");
     }
 }
 
