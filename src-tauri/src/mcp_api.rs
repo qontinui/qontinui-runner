@@ -2622,6 +2622,15 @@ async fn health(
         // only populates where the fleet resource sample publishes, and `null`
         // there means the 256/400 floor by design, not a fault.
         "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
+        // Plan 2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-
+        // creation-latency, Phase 4: kernel pool, kernel Token/Process objects,
+        // handles, live processes, boot instant, the top pool tags and the OS
+        // spawn-probe latency, as the `os-health` thread last read them. Served
+        // on EVERY instance (a temp runner included), read from the cell and
+        // never blocking on a fresh read. `readings: null` before the first
+        // tick is UNKNOWN, never healthy; a `null` reading named in
+        // `notApplicable` does not exist on this OS. Phase 5 adds `verdict`.
+        "osHealth": crate::os_health::health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was
@@ -20701,6 +20710,12 @@ mod coord_provision_session_gate_tests {
             region.contains(
                 "\"threadCeilings\": crate::resource_guard::thread_ceilings_health_json()"
             ),
+            "{region}"
+        );
+        // Plan 2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-
+        // creation-latency, Phase 4: the os-health readings, from the cell.
+        assert!(
+            region.contains("\"osHealth\": crate::os_health::health_json()"),
             "{region}"
         );
     }
