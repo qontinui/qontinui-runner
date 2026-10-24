@@ -158,12 +158,13 @@ pub struct ConfigEnvelope {
 // (`publish_pg_pool`) so the lib-side `db_schema` collector can use it. Until
 // published, `collect_db_schema` returns `None` (section omitted).
 
-static PG_POOL: OnceLock<deadpool_postgres::Pool> = OnceLock::new();
+static PG_POOL: OnceLock<crate::pg_circuit::GuardedPool> = OnceLock::new();
 
 /// Publish the live PG pool for the `db_schema` collector. Called once by the
-/// binary at boot (`main.rs` fleet-publishers block). Idempotent — a second
-/// call is ignored.
-pub fn publish_pg_pool(pool: deadpool_postgres::Pool) {
+/// binary at boot (`main.rs` fleet-publishers block) with a clone of the boot
+/// pool, which shares that pool's circuit breaker. Idempotent — a second call
+/// is ignored.
+pub fn publish_pg_pool(pool: crate::pg_circuit::GuardedPool) {
     let _ = PG_POOL.set(pool);
 }
 
@@ -196,13 +197,17 @@ pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
         .max_size(2)
         .build()
         .map_err(|e| format!("failed to build PG pool: {e}"))?;
-    publish_pg_pool(pool);
+    // Guarded like every runner pool: the breaker fails fast after a connect
+    // failure and bounds each reconnect trial itself, since this pool carries
+    // no timeouts. A CLI has no background runtime, so a due caller runs the
+    // trial inline.
+    publish_pg_pool(crate::pg_circuit::GuardedPool::new(pool));
     Ok(())
 }
 
-/// Get a clone of the published PG pool, if any. `deadpool_postgres::Pool` is an
-/// `Arc` internally, so cloning is cheap and shares the live pool.
-pub(crate) fn pg_pool() -> Option<deadpool_postgres::Pool> {
+/// Get a clone of the published PG pool, if any. Cloning is cheap and shares
+/// the live pool and its breaker.
+pub(crate) fn pg_pool() -> Option<crate::pg_circuit::GuardedPool> {
     PG_POOL.get().cloned()
 }
 

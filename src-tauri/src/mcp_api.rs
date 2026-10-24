@@ -14220,17 +14220,15 @@ pub async fn start_server(
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
 
-    // D3 (self-healing degraded mode): if the runner booted degraded (PG
-    // unreachable + QONTINUI_ALLOW_NO_DB), start a background probe that
-    // reconnects + provisions and lifts the pg_guard 503 gate when PG returns —
-    // no restart needed for a transient outage. No-op on a normal boot.
-    if !crate::database::pg::pg_available() {
-        if let Some(pg) = crate::database::pg::PgDb::try_global() {
-            tracing::warn!(
-                "Runner booted DEGRADED (no PG); starting background PG reconnect probe"
-            );
-            pg.spawn_reconnect_probe();
+    // The PG circuit breaker's prober needs a process-lived runtime: this one.
+    // On a degraded boot (breaker Open, `cause=boot`) the prober starts now and
+    // reconnects + provisions, lifting the pg_guard 503 when PG returns; on a
+    // normal boot it starts on the first runtime trip.
+    if let Some(pg) = crate::database::pg::PgDb::try_global() {
+        if !crate::database::pg::pg_available() {
+            tracing::warn!("Runner booted DEGRADED (no PG); starting the PG breaker's prober");
         }
+        pg.start_background(tokio::runtime::Handle::current());
     }
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
