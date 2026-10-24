@@ -10244,10 +10244,7 @@ mod egress_tests {
         use crate::egress::test_support::{fake_bound_tenants, pin_for};
         let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
         let _bound = fake_bound_tenants(vec![tenant]);
-        let _flow_pins: Vec<_> = Flow::ALL
-            .into_iter()
-            .map(|f| pin(f, Level::Off))
-            .collect();
+        let _flow_pins: Vec<_> = Flow::ALL.into_iter().map(|f| pin(f, Level::Off)).collect();
         let _tenant_pins: Vec<_> = Flow::ALL
             .into_iter()
             .map(|f| pin_for(f, tenant, Level::Off))
