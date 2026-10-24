@@ -26,7 +26,12 @@
 //! load and read as a false `no_change`. Such an edge is HELD:
 //! - [`HoldRule::UntilChanged`] (navigate): closes on the first snapshot
 //!   [`outcome_of`] would NOT call `no_change` — a different node key OR a
-//!   different affordance digest;
+//!   different affordance digest. With NO snapshot before the action there is
+//!   nothing to compare against, and the first snapshot after it may still
+//!   show the page being left; so that snapshot becomes the hold's BASELINE
+//!   rather than its destination, and the edge closes on the first later
+//!   in-window snapshot that differs from the baseline — or, when none does,
+//!   as `to_node_unobserved` (unknown, never a guessed destination);
 //! - [`HoldRule::UntilNextSnapshot`] (refresh, which legitimately lands on the
 //!   same page): closes on the first snapshot TAKEN after the hold began;
 //! - either way, a snapshot taken before the hold began is never evidence of
@@ -417,6 +422,10 @@ struct PendingEdge {
     provenance: Provenance,
     opened_at: Instant,
     hold: Option<Hold>,
+    /// A held navigate with no from-digest: the first in-window snapshot,
+    /// which may still show the page being left. Later snapshots are compared
+    /// against it (D4).
+    baseline: Option<Observed>,
 }
 
 impl PendingEdge {
@@ -451,18 +460,32 @@ impl PendingEdge {
         }
         match hold.rule {
             HoldRule::UntilNextSnapshot => true,
-            // With no snapshot before the action, `from_digest` is `None` and
-            // `outcome_of` never answers `no_change`: the first snapshot taken
-            // after the hold began closes it as `changed`. Nothing is known of
-            // the page the navigation left, so any page seen after it counts.
+            // Compared against the page before the action — or, with no
+            // snapshot before it, against the BASELINE (the first in-window
+            // snapshot, which may still show the page being left). With
+            // neither, this snapshot is the baseline, never the destination.
             HoldRule::UntilChanged => {
-                outcome_of(
-                    &self.from_node,
-                    self.from_digest.as_deref(),
-                    Some(observed),
-                    None,
-                ) != EdgeOutcome::NoChange
+                let (from, digest) = match (&self.from_digest, &self.baseline) {
+                    (Some(d), _) => (&self.from_node, d.as_str()),
+                    (None, Some(b)) => (&b.node, b.digest.as_str()),
+                    (None, None) => return false,
+                };
+                outcome_of(from, Some(digest), Some(observed), None) != EdgeOutcome::NoChange
             }
+        }
+    }
+
+    /// Keep `observed` as the BASELINE of a held navigate that has no
+    /// from-digest and no baseline yet, when it was taken inside the window.
+    fn adopt_baseline(&mut self, observed: &Observed, taken_at: Instant) {
+        let Some(hold) = self.hold else { return };
+        if hold.rule == HoldRule::UntilChanged
+            && self.from_digest.is_none()
+            && self.baseline.is_none()
+            && taken_at >= hold.began
+            && taken_at < hold.deadline
+        {
+            self.baseline = Some(observed.clone());
         }
     }
 
@@ -543,6 +566,7 @@ impl Cursors {
             provenance,
             opened_at: now,
             hold,
+            baseline: None,
         });
         displaced
     }
@@ -579,7 +603,8 @@ impl Cursors {
             Some(p) if p.ttl_expired(now) => Some(p.close(key, None)),
             Some(p) if p.closes_on(&observed, taken_at) => Some(p.close(key, Some(&observed))),
             Some(p) if p.is_stale(now) => Some(p.close(key, None)),
-            Some(held) => {
+            Some(mut held) => {
+                held.adopt_baseline(&observed, taken_at);
                 cursor.pending = Some(held);
                 None
             }
@@ -1128,8 +1153,59 @@ mod tests {
         assert_eq!(edge.outcome, EdgeOutcome::ToNodeUnobserved);
     }
 
+    /// No snapshot before the navigate: the first snapshot after it may still
+    /// be the page being LEFT, so it is the baseline, not the destination.
+    /// The edge closes on the first later in-window snapshot that differs
+    /// from it, with that snapshot as the destination.
     #[test]
-    fn a_held_navigate_with_no_prior_snapshot_closes_on_the_first_snapshot_after_it() {
+    fn a_held_navigate_with_no_prior_snapshot_closes_on_the_first_change_after_it() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        for ms in [100, 400] {
+            let t = now + Duration::from_millis(ms);
+            assert!(
+                c.observe_taken(
+                    &key(),
+                    seen("old", &["1"], "d0"),
+                    AffordanceIndex::default(),
+                    t,
+                    t
+                )
+                .is_none(),
+                "{ms} ms: the page being left must not close the navigate"
+            );
+        }
+        let t = now + Duration::from_millis(900);
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("new", &["2"], "d1"),
+                AffordanceIndex::default(),
+                t,
+                t,
+            )
+            .expect("a snapshot that differs from the baseline closes it");
+        assert_eq!(edge.outcome, EdgeOutcome::Changed);
+        assert_eq!(edge.to_node, Some(node("new", &["2"])));
+        assert_eq!(
+            edge.from_node,
+            unknown_node(),
+            "nothing is claimed about the page left"
+        );
+    }
+
+    /// ...and when nothing ever differs from the baseline, the destination is
+    /// UNKNOWN: `to_node_unobserved`, never the old page dressed as `changed`.
+    #[test]
+    fn a_held_navigate_with_no_prior_snapshot_and_no_change_is_unobserved() {
         let now = t0();
         let mut c = Cursors::default();
         c.open_held(
@@ -1141,16 +1217,19 @@ mod tests {
             Some(HoldRule::UntilChanged),
         );
         let t = now + Duration::from_millis(100);
-        let edge = c
+        assert!(c
             .observe_taken(
                 &key(),
-                seen("a", &["1"], "d"),
+                seen("old", &["1"], "d0"),
                 AffordanceIndex::default(),
                 t,
-                t,
+                t
             )
-            .expect("no from-digest: nothing can read as no_change");
-        assert_eq!(edge.outcome, EdgeOutcome::Changed);
+            .is_none());
+        let swept = c.sweep(now + HOLD_WINDOW + HOLD_GRACE);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].outcome, EdgeOutcome::ToNodeUnobserved);
+        assert!(swept[0].to_node.is_none());
     }
 
     #[test]
