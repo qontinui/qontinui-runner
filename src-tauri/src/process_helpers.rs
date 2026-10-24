@@ -394,12 +394,12 @@ impl Drop for ChildTreeGuard {
 /// ends (a `cmd /c` shim, a corepack/volta background update check, a git
 /// credential helper). A join there blocks forever *on the success path*,
 /// inside a blocking-pool thread — the very leak this module exists to close.
-const COMPLETED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const COMPLETED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the timeout path waits for the readers after the tree has been
 /// killed. Purely thread hygiene — the output is discarded on that path — and
 /// bounded for the same reason as [`COMPLETED_DRAIN_GRACE`].
-const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Hard cap on how many bytes ONE pipe will buffer on the caller's behalf.
 ///
@@ -606,7 +606,7 @@ impl<T: std::io::Read + std::os::windows::io::AsRawHandle + Send + 'static> Wait
 ///   by at most one poll no matter what still holds the write ends.
 /// - **Honesty** — a buffer that is missing bytes says so, so the caller can
 ///   refuse to present a partial read as a complete one.
-struct PipeDrain {
+pub(crate) struct PipeDrain {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -721,6 +721,15 @@ impl PipeDrain {
         }
     }
 
+    /// Start draining both of `child`'s captured streams — the stdout drain
+    /// first, then the stderr one — exactly as [`run_with_timeout`] does.
+    pub(crate) fn for_child(child: &mut std::process::Child) -> (Self, Self) {
+        (
+            Self::spawn(child.stdout.take()),
+            Self::spawn(child.stderr.take()),
+        )
+    }
+
     fn is_done(&self) -> bool {
         self.done.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -733,7 +742,7 @@ impl PipeDrain {
         self.reader_unavailable
     }
 
-    fn snapshot(&self) -> Vec<u8> {
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
         self.buf.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
@@ -750,7 +759,7 @@ impl Drop for PipeDrain {
 
 /// Wait — on a HARD clock — for both readers to reach EOF. Returns whether
 /// they did. Never a `join()`: see [`COMPLETED_DRAIN_GRACE`].
-fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> bool {
+pub(crate) fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> bool {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + grace;
     let mut poll = Duration::from_millis(1);
@@ -764,6 +773,23 @@ fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> b
         }
         std::thread::sleep(poll.min(deadline - now));
         poll = (poll * 2).min(Duration::from_millis(25));
+    }
+}
+
+/// Which [`Truncation`] (if any) two drained streams carry, ordered strongest
+/// claim first because more than one can be true at once and the caller only
+/// gets to hear one: "nobody read this stream at all" beats "we read it and
+/// threw bytes away", which beats "we stopped waiting for the rest".
+pub(crate) fn truncation_of(a: &PipeDrain, b: &PipeDrain, drained: bool) -> Option<Truncation> {
+    if a.reader_unavailable() || b.reader_unavailable() {
+        // The strongest claim of all: a stream nobody read.
+        Some(Truncation::ReaderUnavailable)
+    } else if a.was_truncated() || b.was_truncated() {
+        Some(Truncation::ByteCap)
+    } else if drained {
+        None
+    } else {
+        Some(Truncation::DrainGraceExpired)
     }
 }
 
@@ -854,8 +880,11 @@ pub struct TimedRun {
 // not become a permanent zombie. Explicitly NOT `mem::forget` on a pipe:
 // auto-fresh runs every 300s, which is thousands of leaked fds a week.
 
-/// Children that were left running past their budget, kept ONLY so their exit
-/// can be reaped. Never signalled, never read from.
+/// Children this module will not wait on, kept ONLY so their exit can be
+/// reaped: those [`start_detached`] left running past their budget (never
+/// signalled), and those [`crate::process_deadline`] killed but did not see
+/// exit inside its grace, or that started after their caller had given up
+/// (signalled once, by that module, before being parked). Never read from.
 static DETACHED_CHILDREN: std::sync::Mutex<Vec<std::process::Child>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -887,6 +916,18 @@ pub fn pending_detached_children() -> usize {
         .lock()
         .map(|g| g.len())
         .unwrap_or_else(|poisoned| poisoned.into_inner().len())
+}
+
+/// Park a child this module will no longer wait on, so its eventual exit is
+/// reaped by [`reap_detached_children`] instead of leaving a zombie. Used by
+/// [`crate::process_deadline`] for a child it killed but did not see exit
+/// inside its grace, and for a child whose spawn returned after its caller had
+/// already given up on it.
+pub(crate) fn park_detached(child: std::process::Child) {
+    DETACHED_CHILDREN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(child);
 }
 
 /// What happened to a child started with [`start_detached`].
@@ -1215,21 +1256,7 @@ fn run_bounded(
                 let drained = wait_for_drain(&stdout_reader, &stderr_reader, COMPLETED_DRAIN_GRACE);
                 let stdout = stdout_reader.snapshot();
                 let stderr = stderr_reader.snapshot();
-                // Ordered strongest claim first, because more than one can
-                // be true at once and the caller only gets to hear one:
-                // "nobody read this stream at all" beats "we read it and threw
-                // bytes away", which beats "we stopped waiting for the rest".
-                let truncation =
-                    if stdout_reader.reader_unavailable() || stderr_reader.reader_unavailable() {
-                        // The strongest claim of all: a stream nobody read.
-                        Some(Truncation::ReaderUnavailable)
-                    } else if stdout_reader.was_truncated() || stderr_reader.was_truncated() {
-                        Some(Truncation::ByteCap)
-                    } else if drained {
-                        None
-                    } else {
-                        Some(Truncation::DrainGraceExpired)
-                    };
+                let truncation = truncation_of(&stdout_reader, &stderr_reader, drained);
                 if let Some(reason) = truncation {
                     // WARN, not debug: this is the difference between "here is
                     // the output" and "here is SOME of the output", and a
@@ -1299,7 +1326,7 @@ fn run_bounded(
 /// forgetting to scrub. A caller that wants more context passes its OWN label
 /// to [`output_with_timeout_labeled`] or [`run_probe`] — text it authored,
 /// which therefore cannot contain a secret it did not choose to put there.
-fn program_label(cmd: &std::process::Command) -> String {
+pub(crate) fn program_label(cmd: &std::process::Command) -> String {
     let program = cmd.get_program();
     std::path::Path::new(program)
         .file_name()
@@ -1594,6 +1621,22 @@ fn run_probe_inner(
         }
     }
 }
+
+/// Serialises the tests that read, or disturb, this module's process-global
+/// gauges: [`live_pipe_readers`] and the detached-child ledger
+/// ([`pending_detached_children`]).
+///
+/// `cargo test` runs tests on parallel threads. The completed-path test
+/// DELIBERATELY leaves two readers alive for its grandchild's lifetime (that
+/// is the documented trade-off), which would otherwise read as a leak in the
+/// timeout-path test; and [`crate::process_deadline`]'s tests park and reap
+/// children in the same ledger the detached-child tests count. Every test that
+/// parks children, holds readers past its own return, or counts either, holds
+/// this lock. (A bounded run's entry sweep, `reap_detached_children`, may still
+/// reap from an unlocked test; that removes only children that have exited,
+/// which a locked test never leaves in the ledger.)
+#[cfg(test)]
+pub(crate) static GAUGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod timeout_tests {
@@ -1971,15 +2014,8 @@ mod timeout_tests {
 
     // ── Surviving-grandchild regression (2026-08-30 review, CRITICAL 3) ──────
 
-    /// Serialises the two reader-thread-gauge tests.
-    ///
-    /// [`live_pipe_readers`] is process-global and `cargo test` runs these in
-    /// parallel threads. The completed-path test DELIBERATELY leaves two
-    /// readers alive for its grandchild's lifetime (that is the documented
-    /// trade-off), which would otherwise read as a leak in the timeout-path
-    /// test. Every other test in this module holds readers for well under a
-    /// second, so the lock only has to keep these two apart.
-    static GAUGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `GAUGE_TESTS` (module level, just above `mod timeout_tests`) serialises
+    // the tests that read or disturb the process-global gauges.
 
     /// Poll — bounded — for the module's live reader-thread gauge to fall back
     /// to `target`. Returns the final reading either way, so the assertion can
