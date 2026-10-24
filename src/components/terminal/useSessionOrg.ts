@@ -26,7 +26,7 @@
  *
  * ## One client per webview
  *
- * Like `useLiveClaudeSessionNames`, one ref-counted client serves every mount,
+ * Like `useLiveClaudeSessions`, one ref-counted client serves every mount,
  * so two surfaces never disagree and the event is subscribed once.
  *
  * ## Wiring API (for the Session Manager)

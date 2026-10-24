@@ -913,13 +913,14 @@ async fn get_sessions_restore_health(
 /// A degraded PR ledger does NOT degrade the listing — identity is answerable
 /// without it — it degrades each session's `prs.status` with its own reason.
 ///
-/// Read-only: it stats the disk and touches no registry state, so probing it is
-/// always safe.
+/// Also carries `branches` — one bounded, cached `git rev-parse` per distinct
+/// working dir (see `commands::session_info_list`).
+///
+/// Read-only: it stats the disk, reads git, and touches no registry state, so
+/// probing it is always safe.
 async fn get_sessions_info(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<crate::commands::session_info::SessionsInfoResponse>> {
-    use crate::commands::session_info::{build_session_info, SessionsInfoResponse, STATUS_OK};
-    use crate::session::reconcile::DiskTranscriptIndex;
+) -> Json<ApiResponse<crate::commands::session_info_list::SessionsInfoListResponse>> {
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
 
@@ -927,33 +928,11 @@ async fn get_sessions_info(
         .app_handle
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let Some(store) = store else {
-        warn!(
-            "control/sessions/info: lifecycle store not in Tauri state — \
-             reporting unavailable WITH a reason (never a bare empty list)"
-        );
-        return Json(ApiResponse::success(SessionsInfoResponse::unavailable(
-            "lifecycle_store_unavailable",
-        )));
-    };
-    // Discovered ONCE for the whole listing, not per session.
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let probe = DiskTranscriptIndex::discover();
-    let mut records = store.open_records();
-    records.sort_by(|a, b| {
-        a.terminal_id
-            .cmp(&b.terminal_id)
-            .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
-    });
-    let mut sessions = Vec::with_capacity(records.len());
-    for rec in &records {
-        sessions.push(build_session_info(rec, &config_dirs, &probe).await);
-    }
-    Json(ApiResponse::success(SessionsInfoResponse {
-        status: STATUS_OK.to_string(),
-        reason: None,
-        sessions,
-    }))
+    // The SAME body the `session_info_list` Tauri command runs, so the raw and
+    // rendered read paths cannot drift (D5).
+    Json(ApiResponse::success(
+        crate::commands::session_info_list::list_sessions_info(store, None).await,
+    ))
 }
 
 /// `GET /control/sessions/restore-census`. The pre-restart census (latched at

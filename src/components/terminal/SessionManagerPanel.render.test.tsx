@@ -25,6 +25,7 @@ vi.mock("./PastSessionsView", () => ({ PastSessionsView: () => null }));
 
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { sessionCardCloseElementId } from "./SessionCard";
+import { SESSION_ORG_CONTROLS } from "./sessionOrgControls";
 import {
   SESSION_ACTIVITIES,
   injectedStatus,
@@ -93,7 +94,7 @@ function managerOver(
   sessions: UnifiedSession[],
   close: {
     closableTabId?: (s: UnifiedSession) => string | null;
-    closeSession?: (s: UnifiedSession) => void;
+    closeSessions?: (s: readonly UnifiedSession[]) => Promise<unknown>;
   } = {},
   extra: { unidentifiedCount?: number | null } = {},
 ): UseSessionManagerReturn {
@@ -121,16 +122,18 @@ function managerOver(
     openSession: noop,
     copySessionId: noop,
     closableTabId: close.closableTabId ?? (() => null),
-    closeSession: close.closeSession ?? noop,
+    closeSessions: close.closeSessions ?? (() => Promise.resolve([])),
+    forceCloseSessions: () => [],
+    moveSessionsToPage: () => Promise.resolve([]),
     selectedIds: new Set<string>(),
     toggleSelect: noop,
     selectAllVisible: noop,
     clearSelection: noop,
     bulkResume: noop,
-    pinnedIds: new Set<string>(),
-    togglePin: noop,
-    sessionLabels: {},
-    setSessionLabel: noop,
+    allSessions: sessions,
+    org: { phase: "loading" },
+    applyOrg: () => Promise.resolve(),
+    sessionKeyOf: (s: UnifiedSession) => s.sessionId,
     allAccounts: [],
     savedConfigDirs: [],
     activityCounts: Object.fromEntries(
@@ -220,15 +223,18 @@ describe("SessionManagerPanel — two-axis status on every card", () => {
 });
 
 describe("SessionManagerPanel — closing a session from its row", () => {
-  it("a row with a live tab offers a close button (UI Bridge id), which closes that session", () => {
-    const rows = [runningTabRow("tab-a", "shell-a"), runningTabRow("tab-b", "shell-b")];
-    const closeSession = vi.fn();
+  it("a row with a live tab offers a close button (UI Bridge id), which asks first, then closes that session", () => {
+    const rows = [
+      runningTabRow("tab-a", "shell-a", "hidden-here", "idle-at-prompt"),
+      runningTabRow("tab-b", "shell-b"),
+    ];
+    const closeSessions = vi.fn(() => Promise.resolve([]));
     function Page() {
       return SessionManagerPanel({
         manager: managerOver(rows, {
           // Only tab-a still has a live tab in this window.
           closableTabId: (s) => (s.zoneTabId === "tab-a" ? "tab-a" : null),
-          closeSession,
+          closeSessions,
         }),
         selectedSessionId: null,
         onScreenTabId: "tab-b",
@@ -244,7 +250,14 @@ describe("SessionManagerPanel — closing a session from its row", () => {
       container.querySelector(`[data-ui-bridge-id='${sessionCardCloseElementId("tab-b")}']`),
     ).toBeNull();
     act(() => close!.click());
-    expect(closeSession).toHaveBeenCalledTimes(1);
-    expect(closeSession.mock.calls[0][0].zoneTabId).toBe("tab-a");
+    // D7: the click opens the confirmation; nothing is closed yet.
+    expect(closeSessions).not.toHaveBeenCalled();
+    const confirm = container.querySelector(
+      `[data-ui-bridge-id='${SESSION_ORG_CONTROLS.closeConfirm.id}']`,
+    ) as HTMLElement | null;
+    expect(confirm).not.toBeNull();
+    act(() => confirm!.click());
+    expect(closeSessions).toHaveBeenCalledTimes(1);
+    expect((closeSessions.mock.calls[0] as unknown[][])[0]).toEqual([rows[0]]);
   });
 });
