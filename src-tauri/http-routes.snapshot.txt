@@ -1030,12 +1030,9 @@ POST /agent-worktrees/edit-sibling edit_sibling_handler
 POST /agent-worktrees/reclaim reclaim_handler
 POST /ai/generate-api-request generate_api_request_handler
 POST /ai/generate-context generate_context_handler
-POST /ai/generate-macro generate_macro_handler
 POST /ai/generate-prompt generate_prompt_handler
-POST /ai/generate-prompt-snippet generate_prompt_snippet_handler
 POST /ai/generate-shell-command generate_shell_command_handler
 POST /ai/generate-test generate_test_handler
-POST /ai/suggest-check-groups suggest_check_groups_handler
 POST /ai/suggest-exploration-strategy suggest_exploration_strategy_handler
 POST /api-request/import-curl import_curl_command
 POST /api-request/import-to-library import_curl_to_library
