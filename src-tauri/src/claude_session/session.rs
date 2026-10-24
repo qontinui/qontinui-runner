@@ -1993,9 +1993,11 @@ impl ClaudeSession {
 
     /// Auto-restart the session on another account after a rate-limit exit.
     ///
-    /// Reads conversation history from the DB output_log, rotates the account,
+    /// Rotates the account, reads conversation history from the DB output_log,
     /// spawns a new ClaudeSession with a replay prompt, and re-registers it
-    /// in the SessionManager.
+    /// in the SessionManager. Every path that gives up says why, in the
+    /// session's own output, after the "Switching account and restarting
+    /// session..." line the caller already emitted.
     fn auto_restart_on_rate_limit(
         app_handle: &tauri::AppHandle,
         session_id: &str,
@@ -2005,14 +2007,27 @@ impl ClaudeSession {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
+        // Every abandon path below says why, in the session's own output.
+        let not_restarted = |why: String| {
+            warn!("Session {}: not restarted: {}", session_id, why);
+            if let Some(ctx) = session_ctx {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(
+                        app_handle,
+                        &format!("The session was not restarted: {}", why),
+                        "status",
+                        None,
+                        Some(ctx),
+                    );
+                }));
+            }
+        };
+
         // 1. Rotate to another account. The account IS rate-limited whether or
         //    not this session restarts, and for a CLI session this call is the
         //    only thing that puts it in cooldown, so it runs first.
         if !rotate_account_on_rate_limit() {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
-            );
+            not_restarted("no alternative account is available".into());
             return;
         }
 
@@ -2028,34 +2043,24 @@ impl ClaudeSession {
             session_id, label
         );
 
-        // 2. Read conversation history from DB. A session is never restarted
-        //    WITHOUT its history: when it cannot be read the restart is
-        //    abandoned, and the user is told why.
-        let not_restarted = |why: String| {
-            warn!("Session {}: not restarted: {}", session_id, why);
-            if let Some(ctx) = session_ctx {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(
-                        app_handle,
-                        &format!(
-                            "The account was switched, but the session was not restarted: {}",
-                            why
-                        ),
-                        "status",
-                        None,
-                        Some(ctx),
-                    );
-                }));
-            }
-        };
+        // 2. Read conversation history from DB. On an outage (no PG, or a
+        //    DATABASE_UNAVAILABLE error) the restart is abandoned rather than
+        //    run without the history, and the user is told why. (A non-outage
+        //    read error still reads as no history; see build_replay_from_history.)
         let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
             Ok(replay) => replay,
             Err(BuildReplayErr::NoPg) => {
-                not_restarted("no database connection to read its conversation history".into());
+                not_restarted(
+                    "the account was switched, but there is no database connection to read \
+                     its conversation history"
+                        .into(),
+                );
                 return;
             }
             Err(BuildReplayErr::Unreadable(e)) => {
-                not_restarted(format!("its conversation history could not be read ({e})"));
+                not_restarted(format!(
+                    "the account was switched, but its conversation history could not be read ({e})"
+                ));
                 return;
             }
         };
@@ -2065,7 +2070,7 @@ impl ClaudeSession {
         {
             Some(sm) => sm.inner().clone(),
             None => {
-                warn!("SessionManager not available for auto-restart");
+                not_restarted("the session manager is not available".into());
                 return;
             }
         };

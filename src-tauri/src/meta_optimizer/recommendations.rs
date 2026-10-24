@@ -34,23 +34,14 @@ pub fn compute_content_hash(
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
 ///
-/// Fails SAFE: an unreadable state reads as "duplicate" (logged at `warn!`),
-/// so a database outage — or any other read failure — never lets a duplicate
-/// recommendation through.
-pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
-    let read = tokio::task::block_in_place(|| {
+/// The read's error is KEPT: an unreadable state is neither "duplicate" nor
+/// "new", so the caller (`parser::save_parsed_recommendations`) fails the save
+/// rather than skip a recommendation (which would report "0 created") or
+/// insert a possible duplicate.
+pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> Result<bool, String> {
+    tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
-    });
-    match read {
-        Ok(duplicate) => duplicate,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "recommendation duplicate check unreadable; treating it as a duplicate (fail safe)"
-            );
-            true
-        }
-    }
+    })
 }
 
 // ── JSON payloads expected inside `recommended_value` ────────────────
@@ -977,11 +968,10 @@ pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
 mod fail_safe_tests {
     use super::*;
 
-    /// An unreadable dedup check reads as a duplicate, so a PG outage never
-    /// lets a duplicate recommendation through.
+    /// An unreadable dedup check is an error, never "not a duplicate".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_duplicate_check_fails_safe_on_an_unreadable_database() {
+    async fn an_unreadable_duplicate_check_is_an_error() {
         let pg = crate::database::pg::PgDb::new_noop_for_test();
-        assert!(is_content_duplicate(&pg, "hash"));
+        assert!(is_content_duplicate(&pg, "hash").is_err());
     }
 }

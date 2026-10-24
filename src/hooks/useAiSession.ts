@@ -199,14 +199,13 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
               if (taskRunIdRef.current !== savedId) return;
               // A DB outage still returns the live in-memory output: show it,
               // and say the persisted history could not be read.
-              const { log } = aiOutputOf(outputResponse);
+              const { log, historyUnavailable } = aiOutputOf(outputResponse);
               if (log) {
                 setMessages(parseOutputLog(log));
               }
               if (!outputResponse.success) {
-                setLastReadError(
-                  `history read failed: ${outputResponse.message ?? "unknown error"}`,
-                );
+                const fallback = historyUnavailable ? "database unavailable" : "unknown error";
+                setLastReadError(`history read failed: ${outputResponse.message ?? fallback}`);
                 setReadStatus("failed");
               }
             })
