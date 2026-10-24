@@ -877,11 +877,14 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
 /// `true` when a new walk was started, `false` when one was already running.
 /// Never awaits the walk — the caller must stay bounded.
 pub(super) fn spawn_census_rebuild() -> bool {
+    // An explicit refresh asks for fresh numbers, so no memoised size may
+    // answer it — cleared BEFORE the active-walk check, because a refresh that
+    // joins a walk already running is answered by that walk's snapshot. Rows
+    // that walk had already sized keep the sizes it gave them.
+    super::census_size_memo::clear();
     if census_build_active() {
         return false;
     }
-    // An explicit refresh asks for fresh numbers: no memoised size answers it.
-    super::census_size_memo::clear();
     tokio::spawn(async {
         if let Err(e) = build_and_publish().await {
             warn!("worktree_census: on-demand refresh failed: {e}");
