@@ -2,7 +2,7 @@
 # land-evidence.sh — did this branch's "unlanded" work actually LAND?
 #
 # Plan 2026-09-13-nightly-return-to-main-sweep, Phase 3a. Finding a911a385:
-# qontinui-dev-notes sat on `followup/pr1260-landing-state-update` (eed39fc2)
+# a plans repository sat on `followup/pr1260-landing-state-update` (eed39fc2)
 # and the classifier said UNIQUE_WIP forever. The commit HAD landed — PR #511,
 # merged as c7df1d44 after a rebase WITH conflict resolution (patch-id changed)
 # and later upstream edits to the same lines (content arm failed too). Deciding
