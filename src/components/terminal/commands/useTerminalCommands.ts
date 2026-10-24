@@ -52,6 +52,7 @@ import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import type { CommandResponse } from "../types";
+import type { CloseRoute } from "../pendingCloseReducer";
 import {
   extractLiveSessions,
   groupByAccount,
@@ -344,17 +345,25 @@ function countCardRows(spec: ResultCardSpec): number {
 /**
  * `/close`'s report for the one session it closed.
  *
- * `closeTerminal` is still `(id: string) => void`, and it is left that way on
- * purpose: it is called from a dozen places across `ZoneGrid`,
- * `TerminalTabBar`, the hover actions and the restart path, and widening it
- * would put a return value nobody reads on all of them. What made `/close`
- * dishonest was never the void return — it was that the handler did not check
- * whether the id named anything. It does now (`unknown-tab`, `no-target`,
- * `zone N has no session`), so by the time this is reached the target has been
- * OBSERVED to exist in `tabs`, and `affected: 1` is derived from that
- * observation rather than from the call having returned.
+ * The handler checks the id names an open tab before acting (`unknown-tab`,
+ * `no-target`, `zone N has no session`), so by the time this is reached the
+ * target has been OBSERVED to exist in `tabs`, and `affected: 1` is derived
+ * from that observation rather than from the call having returned.
+ *
+ * `route` is what `closeTerminal` did. A `defer`red close has NOT killed the
+ * PTY yet — it is killed when the 10 s Undo window expires — so it is reported
+ * as pending ("closing", with the undo window in the detail) rather than as a
+ * kill that has not happened. A Conductor worker's view is only HIDDEN (the
+ * worker keeps running; the hidden-workers chip brings it back), so it is
+ * reported as hidden, not closed.
  */
-function closedOne(tabId: string): EffectReport {
+function closedOne(tabId: string, route: CloseRoute | undefined): EffectReport {
+  if (route === "defer") {
+    return effect("closing", "session", 1, { detail: `${tabId} (undo 10 s)` });
+  }
+  if (route === "hide-worker") {
+    return effect("hid", "session", 1, { detail: `${tabId} (worker keeps running)` });
+  }
   return effect("closed", "session", 1, { detail: tabId });
 }
 
@@ -952,30 +961,30 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   // ── 7. /close ─────────────────────────────────────────────────────────
   // `destructive: true` is live TODAY through `rank.ts::safeToReroute` — no
   // Tier-2 pattern may reroute a literal slash for another command into it.
-  // It will additionally gate the Phase 4 executor's confirm modal, though
-  // per plan §5(3) single-target close is expected to use Undo instead of a
-  // confirm, which is what `undoable: true` is for.
+  // Per plan §5(3) a single-target close uses Undo instead of a confirm: the
+  // manager's `closeTerminal` owns it (the tab leaves its zone at once, the
+  // PTY is killed only after the 10 s Undo toast expires — see
+  // `pendingCloseReducer.ts`), so this command gets it by calling the default
+  // close rather than by declaring anything.
   useCommandAction({
     id: "terminal.close",
     slash: "/close",
     label: "Close session",
-    // Kills a live PTY. `undoable` restores the ZONE assignment, not the
-    // process or its scrollback.
+    // Kills a live PTY — after the 10 s Undo window, during which Undo puts
+    // the session back in its zone with the process untouched.
     destructive: true,
     description:
       "Close a session by tab id (preferred when known) or 1-based zone index. " +
       "Without args, closes the currently focused session.",
     paramSchema: SCHEMA.close,
-    undoable: true,
     patterns: [/^close(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      // D4 — a tab id that names no live session used to render `✓`.
-      // `closeTerminal` is a total no-op for an unknown id (its
-      // `prev.filter(t => t.id !== id)` removes nothing, and the Rust
-      // rejection is swallowed by `.catch(() => {})`), and because tabId
-      // takes precedence the zone the operator ALSO named was discarded —
-      // so `/close 2 --tabId=bogus` reported success having closed
-      // nothing at all. Membership is checked before acting, and the
+      // D4 — a tab id that names no live session used to render `✓`:
+      // closing an unknown id changes nothing (there is no tab to remove,
+      // and the backend's rejection of the close is swallowed), and because
+      // tabId takes precedence the zone the operator ALSO named was
+      // discarded — so `/close 2 --tabId=bogus` reported success having
+      // closed nothing at all. Membership is checked before acting, and the
       // error names the id, in the voice of `/focus bogus`.
       const tabIdRead = resolveText(args, "tabId");
       if ("ok" in tabIdRead) return tabIdRead;
@@ -984,8 +993,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         if (!tabs.some((t) => t.id === explicitTabId)) {
           return fail("unknown-tab", `"${explicitTabId}" is not an open tab id`);
         }
-        closeTerminal(explicitTabId);
-        return ok(closedOne(explicitTabId));
+        return ok(closedOne(explicitTabId, closeTerminal(explicitTabId)));
       }
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
@@ -996,8 +1004,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (zone.kind === "out-of-range") {
         if (zone.supplied) return fail("out-of-range");
         if (!activeId) return fail("no-target", "no session to close");
-        closeTerminal(activeId);
-        return ok(closedOne(activeId));
+        return ok(closedOne(activeId, closeTerminal(activeId)));
       }
       // A named-but-EMPTY zone must say so rather than closing whatever
       // happens to be active — closing the wrong session is the one
@@ -1009,8 +1016,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           zone.supplied ? `zone ${zone.index + 1} has no session` : "no session to close",
         );
       }
-      closeTerminal(tabId);
-      return ok(closedOne(tabId));
+      return ok(closedOne(tabId, closeTerminal(tabId)));
     },
   });
 

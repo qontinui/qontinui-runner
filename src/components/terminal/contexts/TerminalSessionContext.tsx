@@ -75,6 +75,7 @@ import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
+import { mayRestoreIntoZone } from "../pendingCloseReducer";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
@@ -305,6 +306,37 @@ const PageSessionScope = memo(function PageSessionScope({
     return keys;
   }, [tabs]);
   const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
+
+  // Closing a tab is undoable for a while (`pendingCloseReducer.ts`), and the
+  // undo must put the tab back in the ZONE it held — which only this scope
+  // knows, since the zone layout sits on top of the manager's tab list. The
+  // zone is read at close time, from the committed assignments.
+  const { closeTerminal: managerCloseTerminal } = terminalManager;
+  const { assignTabToZone } = zoneLayout;
+  const zoneAssignmentsRef = useRef(zoneLayout.assignments);
+  useEffect(() => {
+    zoneAssignmentsRef.current = zoneLayout.assignments;
+  }, [zoneLayout.assignments]);
+  const closeTerminalInZone = useCallback<typeof managerCloseTerminal>(
+    (id, options = {}) => {
+      const zone = Object.entries(zoneAssignmentsRef.current).find(([, tabId]) => tabId === id);
+      const zoneIndex = zone ? Number(zone[0]) : null;
+      // Undo reclaims the zone only if it is still empty
+      // (`mayRestoreIntoZone`); otherwise the layout's auto-assign places the
+      // restored tab — in an empty zone if there is one, else unzoned (the
+      // "N more" chip), never by displacing another session.
+      const restoreZone = () => {
+        if (zoneIndex === null) return;
+        const occupant = zoneAssignmentsRef.current[zoneIndex] ?? null;
+        if (mayRestoreIntoZone(occupant)) assignTabToZone(zoneIndex, id);
+      };
+      return managerCloseTerminal(id, {
+        ...options,
+        restoreZone: options.restoreZone ?? (zoneIndex === null ? undefined : restoreZone),
+      });
+    },
+    [managerCloseTerminal, assignTabToZone],
+  );
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of
@@ -895,6 +927,7 @@ const PageSessionScope = memo(function PageSessionScope({
       // window-scoped versions so this window renders/creates only its tabs.
       tabs,
       createTerminal: createTerminalForWindow,
+      closeTerminal: closeTerminalInZone,
       pageId,
       zoneLayout,
       terminalRefs,
@@ -929,6 +962,7 @@ const PageSessionScope = memo(function PageSessionScope({
       terminalManager,
       tabs,
       createTerminalForWindow,
+      closeTerminalInZone,
       pageId,
       zoneLayout,
       labelsAndTags,
