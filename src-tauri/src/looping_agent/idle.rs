@@ -67,7 +67,7 @@ pub const PROMPT_MARKER: char = '❯';
 /// `grid_busy`, so none ever reached wind-down.
 static TURN_DONE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^\s*[✻✶✳✽✢∗] \p{L}+ for \d+[hms](?: \d+[hms])*(?: · done \d{1,2}:\d{2}(?: ?[AaPp][Mm])?)?\s*$",
+        r"^\s*[✻✶✳✽✢∗] \p{L}+ for \d+[hms](?: \d+[hms])*(?: · done (?:\p{L}+ )?\d{1,2}:\d{2}(?: ?[AaPp][Mm])?)?\s*$",
     )
     .expect("TURN_DONE_LINE is a valid regex")
 });
@@ -79,11 +79,20 @@ static CLEAR_HINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/clear to save [0-9.]+[kmb]? tokens").expect("CLEAR_HINT is a valid regex")
 });
 
-/// Key hints a Claude Code dialog prints under its choices (lowercased).
-/// Unlike `do you want` / `allow`, these do not turn up in an ordinary
-/// finished turn, so near the bottom of the screen they mean a dialog is
-/// showing. `terminal::graceful_exit` refuses on the same list.
-pub const DIALOG_CHROME: &[&str] = &["enter to confirm", "esc to cancel"];
+/// Key hints a Claude Code dialog or picker prints under its choices
+/// (lowercased). Unlike `do you want` / `allow`, these do not turn up in an
+/// ordinary finished turn, so near the bottom of the screen they mean a
+/// dialog is showing. `terminal::graceful_exit` refuses on the same list.
+pub const DIALOG_CHROME: &[&str] = &[
+    "enter to confirm",
+    "enter to select",
+    "enter to view",
+    "esc to cancel",
+    "esc to close",
+    "esc to exit",
+    "esc to go back",
+    "to navigate",
+];
 
 /// How far above the last `❯` row a dialog is looked for. A dialog sits at the
 /// bottom of the screen; text further up is transcript, where a quoted dialog
@@ -102,9 +111,28 @@ fn is_numbered_choice(after_marker: &str) -> bool {
     digits > 0 && chars.next() == Some('.') && chars.next() == Some(' ')
 }
 
-/// Whether `line` is the turn-complete summary ([`TURN_DONE_LINE`]).
-fn is_turn_done_line(line: &str) -> bool {
-    TURN_DONE_LINE.is_match(line)
+/// What may follow the turn-complete summary on the next row: Claude Code's
+/// idle hints and status, and a `⎿` hook-output row (lowercased prefixes).
+/// Measured on live panes 2026-10-24; a blank row and a box edge are accepted
+/// too.
+const AFTER_TURN_DONE: &[&str] = &["new task?", "✔ update installed", "⎿"];
+
+/// Whether `lines[row]` is the turn-complete summary ([`TURN_DONE_LINE`]).
+///
+/// In a narrow pane the summary wraps, and a tail that must veto
+/// (`· 2 background agents still running`, or `AM · 1 shell still running`
+/// when the wrap falls inside the time) lands on the next row, where it
+/// carries no glyph and the row above it still matches. So the summary is
+/// exempt only when the next row is one known to follow it: anything else
+/// may be its continuation, and keeps the veto.
+fn is_turn_done_line(lines: &[String], row: usize) -> bool {
+    let next_is_known = lines.get(row + 1).is_none_or(|next| {
+        let next = next.trim().to_lowercase();
+        next.is_empty()
+            || next.starts_with(|c: char| "─━╭│▔".contains(c))
+            || AFTER_TURN_DONE.iter().any(|p| next.starts_with(p))
+    });
+    next_is_known && lines.get(row).is_some_and(|l| TURN_DONE_LINE.is_match(l))
 }
 
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for
@@ -138,8 +166,8 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 
     // (2) spinner glyphs (excluding bare `·`) ⇒ busy, outside the
     // turn-complete summary.
-    for line in lines {
-        if is_turn_done_line(line) {
+    for (row, line) in lines.iter().enumerate() {
+        if is_turn_done_line(lines, row) {
             continue;
         }
         for ch in line.chars() {
@@ -293,6 +321,7 @@ mod tests {
             "✻ Sautéed for 5m 13s · done 8:54 PM",
             "✻ Crunched for 1h 2m 3s",
             "✻ Brewed for 18m 1s · done 21:08",
+            "✻ Cooked for 9s · done Tuesday 9:26 PM",
         ] {
             let grid = lines(&[
                 "SAFE TO CLOSE.",
@@ -305,6 +334,13 @@ mod tests {
             ]);
             assert!(snapshot_looks_idle(&grid, 4), "must be idle with: {done}");
         }
+        // A resumed session: hook output under the summary.
+        let grid = lines(&[
+            "✻ Brewed for 12h 38m 54s · done Wednesday 6:10 PM",
+            "  ⎿  SessionStart:resume says: Served-command drift",
+            "❯ ",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 2));
         // The hint truncated to the pane's width.
         let grid = lines(&[
             "✻ Cooked for 7m 8s · done 8:56 PM",
@@ -331,6 +367,31 @@ mod tests {
                 "must be busy with line: {busy}"
             );
         }
+        // A tail wrapped onto the next row in a narrow pane still vetoes.
+        for wrapped in [
+            [
+                "✻ Cogitated for 1m 41s · done 5:09 AM",
+                "· 2 background agents still running",
+            ],
+            [
+                "✻ Cogitated for 1m 41s · done 5:09",
+                "AM · 1 shell still running",
+            ],
+        ] {
+            let grid = lines(&[wrapped[0], wrapped[1], "❯ "]);
+            assert!(
+                !snapshot_looks_idle(&grid, 2),
+                "must be busy with wrapped tail: {wrapped:?}"
+            );
+        }
+        // The working line's own `tokens ·` still vetoes once the hint is
+        // masked out of the screen.
+        let grid = lines(&[
+            "  new task? /clear to save 1.2k tokens",
+            "  ↓ 3.4k tokens · 12s",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 2));
         // The hint is masked, not the whole line: an indicator beside it still
         // vetoes.
         let grid = lines(&[
@@ -361,6 +422,15 @@ mod tests {
         assert!(!snapshot_looks_idle(
             &lines(&["❯ ", "Enter to confirm · Esc to cancel"]),
             0
+        ));
+        // A picker with no numbers is refused by its key hints.
+        assert!(!snapshot_looks_idle(
+            &lines(&[
+                "✻ Worked for 3s · done 5:09 AM",
+                "❯ fix the tests (2h ago)",
+                "  ↑↓ to navigate · Enter to select · Esc to go back",
+            ]),
+            1
         ));
         // A dialog above a plain input prompt is still a dialog showing.
         assert!(!snapshot_looks_idle(
