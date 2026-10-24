@@ -185,6 +185,11 @@ pub(crate) struct ReadGaps {
 }
 
 impl ReadGaps {
+    /// Whether the read has any gap at all.
+    pub(crate) fn any(&self) -> bool {
+        self.edges_truncated || self.frontier_truncated || self.rows_unparseable > 0
+    }
+
     fn of(read: &LedgerRead) -> Self {
         Self {
             edges_truncated: read.edges_truncated,
@@ -316,12 +321,35 @@ pub(crate) struct AnswerCtx<'a> {
     pub evaluated_at: DateTime<Utc>,
 }
 
-/// The one rule (module doc): positive → measured; negative → unknown when
-/// `unsettled_because` or a read gap names a code, else absent.
+/// How far a positive answer may be trusted when the read or the frontier
+/// has gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Positive {
+    /// A positive is WITNESSED by observed edges or present rows (a path, a
+    /// reached node, an edge): a gap elsewhere cannot make it false, so it is
+    /// `measured`, degraded by the gaps in `coverage.unmeasured`.
+    Witnessed,
+    /// A per-node LISTING whose membership is itself a claim about what is
+    /// NOT there (a dead end: no exit; prior knowledge: no affordance
+    /// arrival; frontier: what is still open). Any read gap — an exit edge
+    /// beyond the read bound, an unread frontier row, an unparseable row — can
+    /// make a listed node false, so the listing is `unknown` whenever the read
+    /// has a gap, with the listing in `provenance.source.result`.
+    Listing,
+    /// A [`Positive::Listing`] that is ALSO void while the shared settle gate
+    /// is open (`unsettled_because(&coverage, true)` names a code): every
+    /// listed node is an inference over the whole graph.
+    SettledListing,
+}
+
+/// The one rule (module doc): positive → measured, subject to `kind`;
+/// negative → unknown when `unsettled_because` or a read gap names a code,
+/// else absent.
 fn answer<T: Serialize>(
     ctx: &AnswerCtx<'_>,
     result: &T,
     positive: bool,
+    kind: Positive,
     frontier: &JourneySearchFrontier,
     coverage: &JourneyCoverage,
     subject_observed: bool,
@@ -352,6 +380,17 @@ fn answer<T: Serialize>(
     }
     let result_value = serde_json::to_value(result).unwrap_or(Value::Null);
 
+    // A listing over a gappy read, or a settled-listing over an open gate,
+    // is never measured: it falls through to the negative path, which names
+    // the gate's code or the first gap's and never answers `absent` (the
+    // unmeasured list is non-empty in both cases).
+    let gate_open = frontier.unsettled_because(coverage, true).is_some();
+    let positive = positive
+        && match kind {
+            Positive::Witnessed => true,
+            Positive::Listing => !ctx.gaps.any(),
+            Positive::SettledListing => !ctx.gaps.any() && !gate_open,
+        };
     if positive {
         let prov = prov.with_source(source_of(ctx.query, ctx.app_id, None));
         return finish(Observation::measured(result_value, prov), Some(coverage));
@@ -436,14 +475,30 @@ pub(crate) fn answer_unavailable(
 pub(crate) fn answer_graph(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
     let whole = frontier(graph, None).frontier;
     let positive = graph.coverage.edges_observed > 0;
-    answer(ctx, graph, positive, &whole, &graph.coverage, true)
+    answer(
+        ctx,
+        graph,
+        positive,
+        Positive::Witnessed,
+        &whole,
+        &graph.coverage,
+        true,
+    )
 }
 
 /// `reachable?from=`: measured iff the start reaches some OTHER node.
 pub(crate) fn answer_reachable(ctx: &AnswerCtx<'_>, graph: &JourneyGraph, from: &str) -> Value {
     let r = reachable_from(graph, from);
     let positive = r.reachable.iter().any(|n| n.node_key != r.from_key);
-    answer(ctx, &r, positive, &r.frontier, &r.coverage, r.from_observed)
+    answer(
+        ctx,
+        &r,
+        positive,
+        Positive::Witnessed,
+        &r.frontier,
+        &r.coverage,
+        r.from_observed,
+    )
 }
 
 /// `steps?from=&to=`: measured iff a path was observed.
@@ -456,21 +511,49 @@ pub(crate) fn answer_steps(
     let s = steps_to(graph, from, to);
     let positive = s.steps.is_some();
     let subject = s.from_observed && s.to_observed;
-    answer(ctx, &s, positive, &s.frontier, &s.coverage, subject)
+    answer(
+        ctx,
+        &s,
+        positive,
+        Positive::Witnessed,
+        &s.frontier,
+        &s.coverage,
+        subject,
+    )
 }
 
-/// `dead-ends`: measured iff at least one dead end was found.
+/// `dead-ends`: measured iff at least one dead end was found over a read with
+/// no gap ([`Positive::Listing`]).
 pub(crate) fn answer_dead_ends(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
     let d = dead_ends(graph);
     let positive = !d.dead_ends.is_empty();
-    answer(ctx, &d, positive, &d.frontier, &d.coverage, true)
+    answer(
+        ctx,
+        &d,
+        positive,
+        Positive::Listing,
+        &d.frontier,
+        &d.coverage,
+        true,
+    )
 }
 
-/// `prior-knowledge`: measured iff at least one node needs prior knowledge.
+/// `prior-knowledge`: measured iff at least one node needs prior knowledge,
+/// the read has no gap, AND the shared settle gate is closed
+/// ([`Positive::SettledListing`]) — "no affordance arrives here" is a claim
+/// about the whole graph, so any unexplored part can falsify it.
 pub(crate) fn answer_prior_knowledge(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
     let p = requires_prior_knowledge(graph);
     let positive = !p.nodes.is_empty();
-    answer(ctx, &p, positive, &p.frontier, &p.coverage, true)
+    answer(
+        ctx,
+        &p,
+        positive,
+        Positive::SettledListing,
+        &p.frontier,
+        &p.coverage,
+        true,
+    )
 }
 
 /// `frontier?node=`: the shared `frontier()` read — measured iff an open,
@@ -484,7 +567,15 @@ pub(crate) fn answer_frontier(
 ) -> Value {
     let f = frontier(graph, node);
     let positive = !f.entries.is_empty();
-    answer(ctx, &f, positive, &f.frontier, &f.coverage, f.node_observed)
+    answer(
+        ctx,
+        &f,
+        positive,
+        Positive::Listing,
+        &f.frontier,
+        &f.coverage,
+        f.node_observed,
+    )
 }
 
 fn keeps(filter: &JourneyFilter, edge: &JourneyEdgeObservation) -> bool {

@@ -431,3 +431,72 @@ fn edge_timing_for_an_unobserved_edge_is_unknown() {
     assert_eq!(code(&v), "no_observations");
     assert_eq!(v["provenance"]["source"]["result"]["edgesFilteredOut"], 1);
 }
+
+// -- Review fixes: a listing is never measured over a gap -------------------
+
+fn gappy(query: &'static str) -> AnswerCtx<'static> {
+    AnswerCtx {
+        gaps: ReadGaps {
+            edges_truncated: true,
+            ..ReadGaps::default()
+        },
+        ..ctx(query)
+    }
+}
+
+#[test]
+fn a_truncated_read_never_lists_a_dead_end_as_measured() {
+    // A -> B and nothing open: B is a dead end over a COMPLETE read...
+    let edges = vec![edge(1, "a", Some("b"), "affordance", "changed", "fp-a1")];
+    let g = build_graph(&edges, &[], &writing(), &JourneyFilter::default());
+    let v = answer_dead_ends(&ctx("dead-ends"), &g);
+    assert_eq!(status(&v), "measured", "{v:#}");
+    // ...but B's exit could be one of the edges beyond the read bound, and
+    // its frontier row already deleted: over a truncated read it is unknown,
+    // with the listing kept in the source.
+    let v = answer_dead_ends(&gappy("dead-ends"), &g);
+    assert_eq!(status(&v), "unknown", "{v:#}");
+    assert_eq!(code(&v), "input_missing");
+    assert!(
+        !v["provenance"]["source"]["result"]["deadEnds"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the listing is kept for the reader: {v:#}"
+    );
+    let p = answer_prior_knowledge(&gappy("prior-knowledge"), &g);
+    assert_ne!(status(&p), "measured", "{p:#}");
+    let unparseable = AnswerCtx {
+        gaps: ReadGaps {
+            rows_unparseable: 2,
+            ..ReadGaps::default()
+        },
+        ..ctx("dead-ends")
+    };
+    let v = answer_dead_ends(&unparseable, &g);
+    assert_eq!(code(&v), "producer_failed", "{v:#}");
+}
+
+#[test]
+fn prior_knowledge_is_measured_only_behind_a_closed_settle_gate() {
+    // C arrives only by a typed URL; A -> B is an affordance edge.
+    let edges = vec![
+        edge(1, "a", Some("b"), "affordance", "changed", "fp-a1"),
+        edge(2, "x", Some("c"), "push", "changed", "fp-x1"),
+    ];
+    // An open frontier anywhere keeps the gate open: unknown, never measured.
+    let g = build_graph(
+        &edges,
+        &[frontier("b", "fp-open")],
+        &writing(),
+        &JourneyFilter::default(),
+    );
+    let gate = requires_prior_knowledge(&g)
+        .frontier
+        .unsettled_because(&g.coverage, true);
+    assert!(gate.is_some(), "fixture must leave the gate open");
+    let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+    assert_eq!(status(&v), "unknown", "{v:#}");
+    assert_eq!(code(&v), gate.unwrap());
+    assert!(v["provenance"]["source"]["result"]["nodes"].is_array());
+}
