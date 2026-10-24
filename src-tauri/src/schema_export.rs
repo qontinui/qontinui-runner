@@ -912,6 +912,35 @@ pub fn export_all_schemas() -> Value {
     );
     add!("ChangeTimeline", qontinui_vision_core::ChangeTimeline);
     add!("EdgeTiming", qontinui_vision_core::EdgeTiming);
+    // Types more than one of the answers above reference. Each is top-level so
+    // the TypeScript pass imports ONE declaration instead of inlining a
+    // structural copy per file (compile_typescript.mjs refuses a fork). The
+    // nine envelope types are registered exactly as qontinui-runner#2118
+    // (the Observation-envelope plan) registers them — `Observation<Value>`,
+    // since a binding cannot be generic — and are already pending-registration
+    // bindings in qontinui-schemas; whichever PR lands second drops its copy.
+    // (+15) ──
+    add!("JourneyCoverage", qj::JourneyCoverage);
+    add!("JourneySearchFrontier", qj::JourneySearchFrontier);
+    add!("JourneySearchFrontierNode", qj::JourneySearchFrontierNode);
+    add!("JourneyGraphEdge", qj::JourneyGraphEdge);
+    add!("DetectedAnimation", qontinui_vision_core::DetectedAnimation);
+    add!(
+        "MetricDistribution",
+        qontinui_vision_core::MetricDistribution
+    );
+    {
+        use qontinui_vision_core::observation as qob;
+        add!("Observation", qob::Observation<serde_json::Value>);
+        add!("ObservationStatus", qob::ObservationStatus);
+        add!("UnknownCode", qob::UnknownCode);
+        add!("UnknownInfo", qob::UnknownInfo);
+        add!("Provenance", qob::Provenance);
+        add!("Producer", qob::Producer);
+        add!("ObservationCoverage", qob::ObservationCoverage);
+        add!("UnmeasuredDimension", qob::UnmeasuredDimension);
+        add!("CacheProvenance", qob::CacheProvenance);
+    }
     // ── qontinui-types: page (plan
     // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
     // qontinui-schemas#186). The bounded-read wire contract every list
@@ -1019,8 +1048,12 @@ mod tests {
         // JourneyEdgeTimingAnswer, ChangeTimeline, EdgeTiming — plan
         // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
         // Phases 2 and 4) = 581.
-        // The codegen's "Processing N top-level types" line should read 581 here.
-        assert_eq!(obj.len(), 581, "Expected 581 schema entries");
+        // + the 15 types those answers share (JourneyCoverage,
+        // JourneySearchFrontier, JourneySearchFrontierNode, JourneyGraphEdge,
+        // DetectedAnimation, MetricDistribution, and the 9 Observation-envelope
+        // types) so the TS pass declares each once = 596.
+        // The codegen's "Processing N top-level types" line should read 596 here.
+        assert_eq!(obj.len(), 596, "Expected 596 schema entries");
         for journey in [
             "JourneyNode",
             "JourneyTrigger",

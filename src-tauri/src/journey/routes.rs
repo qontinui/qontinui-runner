@@ -26,7 +26,8 @@
 //!   `JourneySearchFrontier::unsettled_because` names a code (ledger not
 //!   writing, subject never observed, open frontier, unobserved departures)
 //!   or the read itself has a gap (a truncated or unparseable read); only
-//!   otherwise is it `absent`, with `JourneySearchFrontier::unmeasured(&coverage)` in
+//!   otherwise is it `absent`, with
+//!   `JourneySearchFrontier::unmeasured(&coverage, subject_observed)` in
 //!   `provenance.coverage.unmeasured` — so the shared constructor itself
 //!   refuses `absent` over an open frontier. Settledness is never re-derived
 //!   here;
@@ -329,7 +330,7 @@ fn answer<T: Serialize>(
     // state, an empty ledger, open frontier, unmeasured departures — so the
     // envelope's own `absent` guard refuses a negative over any of them.
     let mut unmeasured: Vec<UnmeasuredDimension> = frontier
-        .unmeasured(coverage)
+        .unmeasured(coverage, subject_observed)
         .into_iter()
         .map(|(dim, count, code)| UnmeasuredDimension::new(dim, count, unknown_code(code)))
         .collect();

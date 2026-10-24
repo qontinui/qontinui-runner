@@ -32,6 +32,7 @@ pub(crate) fn edge(
     outcome: &str,
     fp: &str,
 ) -> JourneyEdgeObservation {
+    let affordance = nav == "affordance";
     serde_json::from_value(json!({
         "id": format!("00000000-0000-4000-8000-{id:012}"),
         "observedAt": format!("2026-10-01T10:{:02}:00.000000Z", id % 60),
@@ -45,11 +46,13 @@ pub(crate) fn edge(
         "toNode": to.map(node),
         "trigger": {
             "actionType": "click",
-            "targetFingerprint": fp,
-            "targetRole": "button",
+            // A navigation names no affordance (the contract refuses one).
+            "targetFingerprint": if affordance { Some(fp) } else { None },
+            "targetRole": if affordance { Some("button") } else { None },
             "declaredEffect": null,
             "navigationTrigger": nav,
-            "chokePoint": "element_action"
+            // A non-affordance trigger is a navigation, never an element action.
+            "chokePoint": if affordance { "element_action" } else { "navigation" }
         },
         "outcome": outcome,
     }))
