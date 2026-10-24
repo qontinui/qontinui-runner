@@ -4101,7 +4101,10 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 )]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let dot_git = repo_path.join(".git");
-    if !dot_git.exists() {
+    // A pruned worktree's dangling `.git` file still `exists()`; git can open
+    // no repository there, so the `rev-parse HEAD` below would only fail into
+    // the same `None` — one wasted git (3 processes on Windows) per cycle.
+    if !dot_git.exists() || qontinui_runner_lib::git_layout::git_provably_absent(repo_path) {
         return None;
     }
 
@@ -4537,7 +4540,10 @@ fn apply_pull_verdict_blocking(
                          whose ref sync ran within the fetch interval with outcome {} — \
                          not repeated",
                         prior.dir.display(),
-                        prior.outcome.as_deref().unwrap_or("UNKNOWN (still running)")
+                        prior
+                            .outcome
+                            .as_deref()
+                            .unwrap_or("UNKNOWN (still running)")
                     ),
                     git_op: None,
                 };
@@ -5227,6 +5233,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         return Ok(());
     }
+    // One generation for every fetch and ref sync this cycle attempts, so a
+    // repository is fetched once per cycle even when the cycle outlasts the
+    // fetch interval (`tree_fetch`).
+    let fetch_cycle = Some(tree_fetch::begin_cycle());
     // Phase 3 unified-devices rename: the on-disk file is still
     // `~/.qontinui/machine.json` (legacy filename, kept for tooling
     // back-compat) but the in-memory `DeviceFile` struct now exposes
@@ -5356,7 +5366,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // Keyed by git COMMON dir, and only for a directory git can open:
         // a husk is never fetched, and linked worktrees share their
         // primary's fetch (`tree_fetch`).
-        if tree_fetch::fetch_target(&path, std::time::Instant::now()).is_some() {
+        if tree_fetch::fetch_target(&path, std::time::Instant::now(), fetch_cycle).is_some() {
             let fetch_path = path.clone();
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
@@ -5501,33 +5511,45 @@ pub fn spawn_tree_publisher() {
             // Rebuilt with the loop on a supervised restart, so a restart
             // starts with no streak — a fresh loop has no episode to back off
             // from.
-            let mut shed = crate::resource_guard::BackgroundShed::new(
-                "tree_publisher",
-                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
-            );
-            loop {
-                // The heartbeat ticks whether or not the cycle is shed: a
-                // deliberately idle loop is a live loop, and the supervisor must
-                // not rebuild it for yielding.
-                hb.tick();
-                shed_gated_cycle(
-                    &mut shed,
-                    &crate::resource_guard::background_work_verdict(),
-                    "fleet::tree_publisher",
-                    publish_tree_state,
-                )
-                .await;
-                // Paced from the END of the cycle, not on a fixed tick. A
-                // cycle longer than the interval (measured on spaceship
-                // 2026-10-23: hundreds of `qontinui-*` dirs at ~10 git calls
-                // each) restarted at once under the old `Skip` tick, so its git
-                // spawn rate was bounded only by process creation and a cheaper
-                // cycle was merely a shorter one. Plan
-                // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` D1.
-                tokio::time::sleep(Duration::from_secs(secs)).await;
-            }
+            let mut cycle = PublisherCycle {
+                hb,
+                shed: crate::resource_guard::BackgroundShed::new(
+                    "tree_publisher",
+                    crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+                ),
+            };
+            // Paced from the END of each cycle (`paced_loop`), not on a fixed
+            // tick: a cycle longer than the interval restarted at once under
+            // the old `Skip` tick, so its git spawn rate was bounded only by
+            // process creation.
+            crate::paced_loop::run_paced(Duration::from_secs(secs), None, &mut cycle).await;
         },
     );
+}
+
+/// One tree-publisher cycle: tick the supervisor heartbeat, then run the
+/// shed-gated publish.
+struct PublisherCycle {
+    hb: crate::worker_supervisor::Heartbeat,
+    // Rebuilt with the loop on a supervised restart, so a restart starts with
+    // no streak — a fresh loop has no episode to back off from.
+    shed: crate::resource_guard::BackgroundShed,
+}
+
+impl crate::paced_loop::PacedCycle for PublisherCycle {
+    async fn run(&mut self) {
+        // The heartbeat ticks whether or not the cycle is shed: a deliberately
+        // idle loop is a live loop, and the supervisor must not rebuild it for
+        // yielding.
+        self.hb.tick();
+        shed_gated_cycle(
+            &mut self.shed,
+            &crate::resource_guard::background_work_verdict(),
+            "fleet::tree_publisher",
+            publish_tree_state,
+        )
+        .await;
+    }
 }
 
 /// One periodic tick of a fleet background loop, gated at its HEAD on the
@@ -5825,7 +5847,8 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
     let is_behind = {
         let repo = repo_path.clone();
         spawn_blocking_tracked(move || {
-            if tree_fetch::fetch_target(&repo, std::time::Instant::now()).is_some() {
+            // Outside the publisher's cycle: the interval alone gates it.
+            if tree_fetch::fetch_target(&repo, std::time::Instant::now(), None).is_some() {
                 fetch_remote_refs_blocking(&repo);
             }
             check_if_behind(&repo)

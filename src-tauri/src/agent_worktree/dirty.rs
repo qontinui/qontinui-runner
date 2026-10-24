@@ -363,6 +363,8 @@ pub(crate) fn probe_reclaim_dirty_with(
     label: &str,
 ) -> DirtyVerdict {
     let git_presence = probe_git_presence(path);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     let outcome = crate::process_helpers::run_probe(cmd, timeout, label);
     let verdict = verdict_from_outcome(&outcome, git_presence);
     warn_if_unknown(path, git_presence, verdict, label);
