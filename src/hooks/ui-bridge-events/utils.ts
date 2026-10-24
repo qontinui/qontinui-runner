@@ -122,17 +122,23 @@ export function pongEventPayload(windowLabel: string): {
  * not evidence that the main window is alive.
  */
 export async function httpSendPong(source: PongSource, windowLabel: string): Promise<boolean> {
+  // Bounded: a request to a stalled API runtime (or one parked in the accept
+  // backlog) would otherwise neither resolve nor reject, so the caller's
+  // fallback never runs and one hung fetch piles up per ping. An
+  // AbortController + timer rather than `AbortSignal.timeout`, which older
+  // WebKit webviews lack — there it would throw and fail every pong.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PONG_HTTP_TIMEOUT_MS);
   try {
     const resp = await fetch(pongUrl(getApiPort(), source, windowLabel), {
       method: "POST",
-      // Bounded: a request to a stalled API runtime (or one parked in the
-      // accept backlog) would otherwise neither resolve nor reject, so the
-      // caller's fallback never runs and one hung fetch piles up per ping.
-      signal: AbortSignal.timeout(PONG_HTTP_TIMEOUT_MS),
+      signal: controller.signal,
     });
     return resp.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -173,8 +179,8 @@ function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<
  * by the API's own runtime (`mcp-api-rt`), so it lands regardless (plan
  * 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns).
  * The emit is kept as the fallback for an HTTP failure — including an HTTP
- * leg that does not settle within `httpTimeoutMs` (a stalled API runtime); it
- * is not awaited past its own settlement and cannot delay the HTTP leg.
+ * leg that does not settle within `httpTimeoutMs` (a stalled API runtime) —
+ * and is bounded by the same timeout; it cannot delay the HTTP leg.
  *
  * `http` and `emit` are injectable for tests.
  */
@@ -190,12 +196,17 @@ export async function answerPing(
   if (await settleWithin(http("event", windowLabel), httpTimeoutMs, false)) {
     return "http";
   }
-  try {
-    await emit(pongEventPayload(windowLabel));
-    return "event";
-  } catch {
-    return "failed";
-  }
+  // The fallback is bounded too: while both legs are stalled, an unbounded
+  // emit would leave one pending handler behind per ping.
+  // (`Promise.resolve().then` so a synchronous throw is a failed leg too.)
+  const emitted = await settleWithin(
+    Promise.resolve()
+      .then(() => emit(pongEventPayload(windowLabel)))
+      .then(() => true),
+    httpTimeoutMs,
+    false,
+  );
+  return emitted ? "event" : "failed";
 }
 
 /**

@@ -5626,7 +5626,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(started) => info!(?started, "ui-bridge-ping thread"),
                 Err(e) => error!(
                     error = %e,
-                    "the ui-bridge-ping thread did not start — the native-UI verdict will read                      ping_not_emitted (UNKNOWN), not wedged"
+                    "the ui-bridge-ping thread did not start — the native-UI verdict will read ping_not_emitted (UNKNOWN), not wedged"
                 ),
             }
 

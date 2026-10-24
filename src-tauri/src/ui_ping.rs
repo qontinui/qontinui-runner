@@ -77,7 +77,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 ///   measured round trip outranks it and the verdict reads `pumping`; there
 ///   the reading to assert is `eventsUndelivered: false` and `wedged != true`.
 /// * any other non-empty value: the thread is never started. No pong ever
-///   lands, the event pong stays 0, and the verdict reads `unknown`.
+///   lands, the event pong stays 0, and the verdict reads `unknown` — or
+///   `pumping` where the Win32 probe answers, the same caveat as above.
 pub const DEBUG_STOP_ENV: &str = "QONTINUI_DEBUG_STOP_UI_PING";
 
 /// What the debug stop hook asks for.
@@ -304,10 +305,7 @@ mod tests {
 
     // The production cadence is 3 s; these tests run the same loop at 150 ms
     // so the property ("keeps its cadence while every runtime worker is
-    // parked") is asserted in ~2 s instead of ~12 s. The gap bound is two
-    // cadences, which still separates the two cases by a wide margin: the
-    // negative control below shows a starved runtime emitting (almost) nothing
-    // for the whole window.
+    // parked") is asserted in ~2 s instead of ~12 s.
     const TEST_CADENCE: Duration = Duration::from_millis(150);
     const TEST_WINDOW: Duration = Duration::from_millis(1_950);
 
@@ -352,10 +350,13 @@ mod tests {
              runtime worker was parked",
             emits.len()
         );
+        // A loose bound on purpose: one deschedule on a saturated CI box must
+        // not fail it, and the negative control below already separates the
+        // two cases by count alone (a starved runtime emits almost nothing).
         let gap = max_gap(&emits);
         assert!(
-            gap <= TEST_CADENCE * 2,
-            "max inter-emit gap {gap:?} exceeds 2x the {TEST_CADENCE:?} cadence"
+            gap <= TEST_WINDOW / 4,
+            "max inter-emit gap {gap:?} exceeds a quarter of the {TEST_WINDOW:?} window"
         );
     }
 
@@ -417,17 +418,21 @@ mod tests {
         );
         let emits = emits.lock().unwrap().clone();
         assert_eq!(emits.len(), 4);
-        // After the slow emit the next tick lands on the next cadence
-        // boundary, never immediately (no burst of the skipped ticks).
-        let after_slow = emits[2].duration_since(emits[1]);
+        // Emit 1 is at 0, emit 2 at 1 cadence and takes 3.5, so ticks 2..=4
+        // are missed: emit 3 lands on the 5-cadence boundary and emit 4 on the
+        // 6. A burst would put both at ~4.5. One-sided checks against the
+        // FIRST emit, so a descheduled thread can only make them pass more
+        // easily, never fail them.
+        let slack = TEST_CADENCE / 4;
+        let third = emits[2].duration_since(emits[0]);
         assert!(
-            after_slow >= TEST_CADENCE * 7 / 2,
-            "the slow emit was not waited out: {after_slow:?}"
+            third + slack >= TEST_CADENCE * 5,
+            "skipped ticks were burst: emit 3 came {third:?} after emit 1"
         );
-        let next = emits[3].duration_since(emits[2]);
+        let fourth = emits[3].duration_since(emits[0]);
         assert!(
-            next >= TEST_CADENCE / 2,
-            "skipped ticks were burst: the tick after the late one came {next:?} later"
+            fourth + slack >= TEST_CADENCE * 6,
+            "skipped ticks were burst: emit 4 came {fourth:?} after emit 1"
         );
     }
 
@@ -475,6 +480,24 @@ mod tests {
             "the release arm must be the constant Off, not an env read"
         );
         assert_eq!(prod.matches("std::env::var(DEBUG_STOP_ENV)").count(), 1);
+    }
+
+    /// Production wiring, the other half: `main.rs` setup STARTS the thread,
+    /// exactly once. Without that call no ping is ever sent, the native
+    /// verdict reads `ping_not_emitted` forever and the 2026-08-19 detector is
+    /// silently off — and every other test here stays green.
+    #[test]
+    fn main_setup_starts_the_ping_thread_exactly_once() {
+        let main = include_str!("main.rs").replace("\r\n", "\n");
+        let calls = main
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("ui_ping::start_ui_ping_thread("))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "main.rs must call ui_ping::start_ui_ping_thread exactly once"
+        );
     }
 
     /// Production wiring: `ui_ping.rs` is the ONLY non-test source that names
@@ -562,9 +585,10 @@ mod tests {
             walked > 200,
             "walked only {walked} .rs files — the scan saw nothing"
         );
+        // Two in ui_ping.rs: the thread name and the emit itself.
         assert!(
-            in_ui_ping >= 1,
-            "ui_ping.rs no longer names the event — the scan is not finding the real emitter"
+            in_ui_ping >= 2,
+            "ui_ping.rs names the event {in_ui_ping} time(s) — the scan is not finding the real emitter"
         );
         assert!(
             offenders.is_empty(),

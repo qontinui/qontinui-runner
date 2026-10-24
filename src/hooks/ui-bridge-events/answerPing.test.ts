@@ -50,6 +50,12 @@ describe("answerPing", () => {
     await expect(answerPing("main", emit, http)).resolves.toBe("event");
   });
 
+  it("reports failed when both legs hang, instead of leaving the handler pending", async () => {
+    const neverHttp = vi.fn(() => new Promise<boolean>(() => {}));
+    const neverEmit = vi.fn(() => new Promise<void>(() => {}));
+    await expect(answerPing("main", neverEmit, neverHttp, 20)).resolves.toBe("failed");
+  });
+
   it("reports failed when both legs fail", async () => {
     const http = vi.fn().mockResolvedValue(false);
     const emit = vi.fn().mockRejectedValue(new Error("ipc down"));
