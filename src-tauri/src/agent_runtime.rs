@@ -4329,6 +4329,9 @@ pub(crate) async fn post_runner_restart_unreported(
         consuming_device_id,
         ContinuationOutcome::WorkUnreported,
         Some(detail.clone()),
+        // A runner-restart report is the runner's own voice about a session
+        // that is gone; like the in-process fallback it names no session.
+        None,
     )
     .await
     {
