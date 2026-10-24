@@ -2371,8 +2371,11 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         }
         // D2: the same body carries this device's drain state. An absent or
         // unparseable object folds to `Unknown`, never to clear.
+        // The device's dispatch role rides in the same `drain` object; an
+        // absent one keeps today's behaviour.
         Ok(HeartbeatOutcome::Registered {
             drain: crate::coord_drain_state::parse_register_response(&body),
+            dispatch_role: crate::coord_drain_state::parse_register_role(&body),
         })
     } else {
         let body = resp.text().await.unwrap_or_default();
