@@ -312,6 +312,13 @@ pub fn is_current_carrier(path: &Path) -> bool {
 /// D7). Decided ONCE, at spawn, from what the spawn actually carried; a pane
 /// adopted from a holder or mirrored from another machine was spawned by
 /// someone else and reads [`PermissionRequestHook::Absent`].
+///
+/// `Registered` says the HOOK is registered, not that the pad will answer
+/// `allow`: a terminal spawned for a tenant other than the dial's, or one
+/// whose grant was evicted from the bounded registry
+/// (`permission_accept::MAX_TERMINAL_GRANTS`), still raises its dialogs. A
+/// consumer that types into a pane on the strength of this field must still
+/// read the pane's own screen first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionRequestHook {
     /// Spawned with a carrier THIS build wrote ([`is_current_carrier`]).
