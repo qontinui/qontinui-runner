@@ -58,7 +58,7 @@ Cascade — stops at the first LIVE door:
 | L1 | Own cwd's `.mcp.json`, re-read fresh | A re-provision from the same workdir+terminal rewrites this file in place; the FILE holds the current key while the session still holds its startup snapshot (the client reads `.mcp.json` ONCE) |
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
-| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), sent `{"tenantId": "<the session's tenant>"}` when that is known (see "The session's tenant" below), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
+| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), sent `{"args": {"tenantId": "<the session's tenant>"}}` when that is known — the tenant goes INSIDE `args`, because the runner's `InvokeRequestBody` reads only `args` and drops a top-level key (see "The session's tenant" below), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
 | L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file (plus the session's `tenant_id` when known), then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
 | L6 | **The WEB host** — `GET $QONTINUI_WEB_HTTP_URL/api/v1/plan-library?kind=plan&limit=1` (default `https://api.qontinui.io`), first anonymously (is a program answering?), then with a **`user_id`-bearing device JWT** from `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` — the same two static sources as L4 sources 1-2, shape-tested and sent; the host's `401` is the freshness gate, exactly as at L4 (no local `exp` decode). Emits **typed faults on the credential axis** (`WEB_HOST_NO_USER_JWT`, `WEB_HOST_JWT_UNAUTHORIZED`) and a host-level one only for a transport failure (`WEB_HOST_UNREACHABLE`) | It is a **different program on a different host**: plan-library and memory live there, behind `get_audit_actor_user`, which wants a `user_id` claim the agent-minted tokens (L5, `/agents/allocate`) never carry. Measured 2026-09-06: the same device JWT `coord.qontinui.io` answered `200` to also answered `200`/`422` here — one credential, two hosts, two capabilities — and this file named `api.qontinui.io` nowhere. A `LIVE` here is `PARTIAL`: it proves the host axis, not a coord door |
 
@@ -95,10 +95,10 @@ falls through to the next source. Only the runner mint's 401 ends L4.
 derives the workspace root from the cwd's `git rev-parse --git-common-dir`, so
 `bash <path-to-this-skill-dir>/coord-revive.sh` answers for the directory you
 run it *from*, whichever checkout's skill dir that path names. What the
-script's own location decides is only where it finds the six helpers it needs
-from the config repo's `scripts/` — `lib/envelope.sh`, the `lib/native-path.sh`
-that sources beside it, `lib/guard-decision-log.sh`, `coord-acting-bearer.sh`,
-`coord-provision-nonce.sh` and `drain-closeout-spool.sh` — and since #814 /
+script's own location decides is only where it finds the helpers it needs
+from the config repo's `scripts/`. (The list is check #64's
+roster, starting with `lib/envelope.sh`;
+it is not restated here because a copy of it has gone stale before.) Since #814 /
 #845 that lookup is ONE resolver (`__resolve_fleet_script` in
 `.claude/skills/coord-revive/coord-revive.sh`) that works from any checkout: the
 original three fixed rungs first (`$HERE/../../../scripts/`, the same with
@@ -156,7 +156,7 @@ grep -c '__resolve_fleet_script' <path-to-this-skill-dir>/coord-revive.sh
 
 Never restart the runner to refresh a copy (served policy `production-and-cost`
 `runner-lifecycle`). The recovery is the third fixed rung, which every copy
-ever shipped carries — set the variable and all four helpers resolve through
+ever shipped carries — set the variable and all the rostered helpers resolve through
 it. The same variable is also L2's sweep-root override (see "Worktree-safe"
 below), so it must be the directory the checkouts sit in — the workspace root,
 not the config repo and not a worktree container:
@@ -177,14 +177,14 @@ before probing a single door (coord finding
 `92219d86-db0b-42c8-9e4d-d2cf7b2d2666`, plan
 `2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without`).
 
-That is what `_scripts/` is. The six helpers are rendered into this skill's own
+That is what `_scripts/` is. The rostered helpers are rendered into this skill's own
 directory, one level down so the resolver's relative argument is reused
 unchanged (`_scripts/lib/envelope.sh`), and they therefore travel in the
 mechanism that already carries `SKILL.md` and `coord-revive.sh` — the runner
 walks the skill directory recursively and provisions each file at its own
 relative path. `pr-status.sh` carries the resolver block byte for byte and
-reaches this render through the sibling candidate, so the bundle ships six
-files and not twelve.
+reaches this render through the sibling candidate, so the bundle ships each
+helper once, not twice.
 
 Three properties of it, stated so the render is not over-read:
 
@@ -312,6 +312,42 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
 The PowerShell twin is `scripts/coord-read.ps1 call` / `tools`, over the same
 own-config rule (`Get-CoordOwnProxyConfig`), for pi, Codex and CI.
 
+### Every call DECLARES its transport rung — and `observe` counts a mirror read
+
+The fleet's first-rung metric cannot tell the rungs apart by watching them, so
+each call says which one carried it (plan
+`2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`). The
+header names and values are qontinui-runner `coord_transport_rung.rs`'s closed
+vocabulary, pinned by the config repo's lint check #89:
+
+- **`call` / `tools` always send `x-qontinui-transport: loopback_proxy`** and
+  `x-qontinui-reporter: coord-revive` — they ride only this session's own
+  nonce, so the rung is fixed by construction.
+- **Every cascade probe sends `x-qontinui-reporter-step: probe`**, with the rung
+  the door IS (`loopback_proxy` for a loopback URL, `remote_mcp` for coord's
+  `/mcp`). A probe is not a coord read, and coord's fold excludes it once
+  that plan's Phase 3 coord half lands (the `reporter_step IS DISTINCT FROM
+  'probe'` filter). The filter is read-time, so once deployed it excludes
+  every probe row, older ones included; the change that added this tagging is
+  merge-ordered after it.
+- **A LIVE `VERDICT:` is followed by a `DECLARE:` line** — the headers a
+  verified re-issue over that door carries: its rung (`loopback_proxy` for
+  L1/L2 and the L4 nonce mint, `remote_mcp` for the L3/L4 bearers on `/mcp`,
+  `bootstrap_credential` for L5), and `x-qontinui-transport-attempted` naming
+  the rungs this run was refused by, in order. A bearer spent on the
+  hand-written `${COORD_HTTP_URL}/coord/...` REST routes instead of `/mcp`
+  declares `http_agent_door`: the door actually used decides. Not printed for
+  the web host (not a coord door) or under `--floor-claim`.
+- **`coord-revive.sh observe <steering_cache|file_mirror> <reporter>`** records
+  that a read was served from a local mirror, which reaches no server and so is
+  otherwise uncountable: one side-effect-free `tools/list` over this session's
+  own nonce declaring the mirror rung (exit `0`), or — when that door does not
+  carry it — one JSON line in `~/.qontinui/logs/coord-rung-unreported.jsonl`
+  (exit `2`; `$QONTINUI_RUNG_UNREPORTED_LOG` overrides). Both arguments are
+  checked against closed lists before anything is sent (exit `4`). `/policy`
+  Steps 4c and 5 call it; `coord-read.ps1`'s steering-cache fallback calls the
+  PowerShell twin, `Send-CoordMirrorRungObservation`.
+
 ### The floor claim — `--floor-claim`, and why a session never writes "unavailable" itself
 
 `bash coord-revive.sh --floor-claim` runs the SAME cascade and changes only what
@@ -380,8 +416,8 @@ carrying these changes can no longer be asked for "a" credential without saying
 whose:
 
 - **The runner's nonce mint (L4 source 3).** On a runner build carrying the P2/P3
-  change, `POST /coord-mcp/provision-session` takes an optional `tenant_id` and
-  pins the minted nonce to it; the script passes it through
+  change, `POST /coord-mcp/provision-session` takes an optional `tenant` (the runner's field name; it
+  has no `tenant_id`, and ignores one) and pins the minted nonce to it; the script passes it through
   `coord-provision-nonce.sh --tenant` when that helper's `--capabilities` line
   lists `tenant`. A runner build without that change **ignores** the field and mints for the machine's tenant with a plain `200`,
   so a nonce minted for a known tenant is never called LIVE on the mint's word:
@@ -389,17 +425,30 @@ whose:
   top-level `tenant_id` (the tenant whose credential the proxy forwarded) must
   name the tenant asked for. A mismatch is `NONCE_MINT_WRONG_TENANT`; an answer
   that names no tenant is `NONCE_MINT_UNVERIFIED_TENANT`; neither is LIVE, and the
-  cascade moves on. P2's refusals are typed: `400 COORD_MCP_PROVISION_INVALID_TENANT`
-  → `NONCE_MINT_TENANT_INVALID`, `422 COORD_MCP_PROVISION_TENANT_NOT_PAIRED` →
-  `NONCE_MINT_TENANT_NOT_PAIRED`, `503 COORD_MCP_PROVISION_TENANT_UNKNOWN` →
-  `NONCE_MINT_TENANT_UNKNOWN` — none of them is `MINT_REFUSED`, which stays the
+  cascade moves on. P2's refusals are typed: `403 COORD_MCP_PROVISION_TENANT_NOT_PAIRED` →
+  `NONCE_MINT_TENANT_NOT_PAIRED`, `403 COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER`
+  → `NONCE_MINT_TENANT_WORKDIR_DECLARES_OTHER`, `503
+  COORD_MCP_PROVISION_CREDENTIAL_STORE_UNREADABLE` → `NONCE_MINT_TENANT_UNKNOWN`
+  (a non-UUID tenant is none of these: the runner rejects the body as
+  `400 …INVALID_BODY`, an ordinary `MINT_REFUSED`) — none of them is `MINT_REFUSED`, which stays the
   opt-in/handshake verdict. With no tenant known the body is `{cwd}`; the acting
   tenant is still read back, so the LIVE names it (`TENANT:` line) or says it is
   UNKNOWN.
 - **The runner door.** On a runner build carrying the P2/P3 change,
   `get_coord_device_token` takes an optional tenant —
-  `{"tenantId": "<uuid>"}` over `/ui-bridge/invoke` (`tenant_id` is accepted as an
-  alias), `tenantId` over Tauri IPC. **With a tenant** it answers THAT tenant's
+  `{"args": {"tenantId": "<uuid>"}}` over `/ui-bridge/invoke` (`tenant_id` is
+  accepted as an alias inside `args`), `tenantId` over Tauri IPC. **The envelope
+  is load-bearing:** the invoke route's request body (`InvokeRequestBody`) has ONE
+  field, `args`, defaulted to `{}`, and silently drops every top-level key — so
+  `{"tenantId": "<uuid>"}` at the top level is a TENANT-LESS call (a second `409
+  tenant_required` on a multi-slot runner, the default slot on a one-slot one;
+  a runner carrying that plan's Phase 7 refuses it instead, with `400
+  get_coord_device_token:tenant_misplaced` naming the envelope).
+  This script sent exactly that until plan
+  `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+  Phase 3, and its test stub read the top-level key, so the suite was green
+  against the defect; `tenant-arg-test.sh` now models the real contract and a
+  mutant restoring the top-level body reddens it. **With a tenant** it answers THAT tenant's
   device JWT — its own slot, or the default slot only when that tenant is the
   default binding — and `null` for a tenant this runner is not paired for; it
   never substitutes another tenant's token. **Without one**, a runner holding
@@ -410,7 +459,12 @@ whose:
   `get_access_token_for_websocket` is unchanged and takes no tenant. A build
   without the change ignores the argument and answers its default slot; the
   script catches that by the token's own claim (below). A named tenant answered
-  `null` is `RUNNER_MINT_TENANT_NOT_PAIRED`, never `RUNNER_SIGNED_OUT`. On a
+  `null` is `RUNNER_MINT_TENANT_NOT_PAIRED`, never `RUNNER_SIGNED_OUT` — and an
+  EXPIRED credential is no longer that `null`: a build carrying plan
+  `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+  answers HTTP `401` `DEVICE_TOKEN_EXPIRED: …` on both names and on the tenant
+  arm, which the script reports as `RUNNER_MINT_EXPIRED` (an older build's
+  expired-JWT success is decoded and reported the same way). On a
   tenant-less call both names read the legacy `access_token` slot. A source read
   of that slot's writers (2026-09-17: `pair::persist_pairing`, `pair::reconcile`,
   the device-JWT refresher's pair / self-refresh / machine-key paths) finds only
@@ -462,12 +516,28 @@ the coord row stamp, which for a tenant-less spawn is the default the registry
 chose, not a tenant the session named. Sending it would turn that build's working
 default-slot answer into a `WRONG_TENANT` refusal and buy nothing.
 
-**Every LIVE from a runner mint or the bootstrap credential names the tenant it
-established** (the L1/L2 proxy doors and L3 are unchanged). The nonce mint prints a
-`TENANT:` line with the acting tenant `coord_query_identity` reported (or
-UNKNOWN and why), the invoke mint adds a `PARTIAL: tenant established:` line
-with the token's claim, and L5 prints a `TENANT:` line with the minted token's
-claim.
+**Every LIVE from a bearer door names the tenant it acts for, by slug AND id**
+(the L1/L2 proxy doors are unchanged). L3's acting bearer and L6's web-host
+token are named from the token's own `tenant_id` claim alone — neither is spent
+on a coord identity read — so their slug reads `slug UNKNOWN` unless an earlier
+read in the run named it; they print the same `TENANT:` and `TENANT DIFFERS`
+lines. The nonce
+mint prints a `TENANT:` line with the acting tenant `coord_query_identity`
+reported (or UNKNOWN and why). The bearer doors — the static `$COORD_DEVICE_JWT`
+and `~/.qontinui/coord-device-jwt`, the invoke mint, and L5 — ask
+`coord_query_identity` over the bearer itself (read-only) and print
+`TENANT: acting tenant <slug> (<uuid>) (<basis>); expected <slug> (<uuid>) from <source>; <what was sent>`,
+the slugs coming from that answer's `tenant_slug` and `device_tenant_bindings`;
+when the identity read fails the token's own claim is used and the slug reads
+`slug UNKNOWN`, never a guess. The invoke mint also keeps its
+`PARTIAL: tenant established:` line, now with the slug. When the acting tenant is
+not the session's expected one (resolved as below), the next line is
+
+    TENANT DIFFERS from expected <slug> (<uuid>): this door acts as <slug> (<uuid>), …
+
+which is how a STATIC token for another tenant — which no mint check reaches —
+becomes visible: every tenant-scoped read or write over that door answers about
+the tenant it names, not the session's.
 
 Omitting it is exactly today's call, so a single-tenant device, an older runner
 and an older coord all keep working. **A runner that ignores the argument is
@@ -476,7 +546,7 @@ caught, not trusted:** when a tenant was asked for, the minted token's own
 without ever sending the token — a pre-P3 build answers its default slot, which
 would otherwise probe LIVE for the wrong tenant. The refusals are typed (see the
 verdict table): `NONCE_MINT_WRONG_TENANT`, `NONCE_MINT_UNVERIFIED_TENANT`,
-`NONCE_MINT_TENANT_INVALID`, `NONCE_MINT_TENANT_NOT_PAIRED`,
+`NONCE_MINT_TENANT_NOT_PAIRED`, `NONCE_MINT_TENANT_WORKDIR_DECLARES_OTHER`,
 `NONCE_MINT_TENANT_UNKNOWN`, `RUNNER_MINT_TENANT_REQUIRED`,
 `RUNNER_MINT_TENANT_INVALID`, `RUNNER_MINT_TENANT_NOT_PAIRED`,
 `RUNNER_MINT_WRONG_TENANT`, `BOOTSTRAP_TENANT_AMBIGUOUS`,
@@ -681,12 +751,13 @@ client's mask):
 | `INVOKE_MINT_ROUTE_ABSENT` (stderr line, not a final verdict) | L4 mint: the in-process invoke door answered the allowlist **400** (or 404) for that command name — this runner build does not carry that entry. Emitted once per command tried | The verb moves to the next command name, then falls back to the WebView eval mint on its own. An allowlist entry lives in the **binary**, so a runner start picks up only a build that has it; never restart a running runner over it |
 | `RUNNER_TIER_TOO_LOW` | L4 mint: the runner is **Tier 0/1** (`Local` / `LocalProvider`), where the Qontinui account commands do not exist at all | Change the runner's tier (Settings → Account), or use another door. The runner is **not** signed out and signing in will not help |
 | `RUNNER_TIER_UNKNOWN` | L4 mint: the runner could not resolve its own tier — a corrupt or unreadable `settings.json`. Its account state is unchanged | Repair `settings.json`. A sign-in CTA here is the exact mistake the runner's own `NO-DOWNGRADE (C4)` comment records |
-| `NONCE_MINT_WRONG_TENANT` | L4 source 3: a nonce minted for a known tenant answers, and `coord_query_identity` over it names a DIFFERENT tenant — a runner build predating the provision-session `tenant_id` field minted for the machine's tenant | NOT used; the cascade moves on. Use a runner build carrying P2; never restart a running runner over it |
+| `NONCE_MINT_WRONG_TENANT` | L4 source 3: a nonce minted for a known tenant answers, and `coord_query_identity` over it names a DIFFERENT tenant — a runner build predating the provision-session `tenant` field minted for the machine's tenant | NOT used; the cascade moves on. Use a runner build carrying P2; never restart a running runner over it |
 | `NONCE_MINT_UNVERIFIED_TENANT` | L4 source 3: the minted nonce answered, but its acting tenant could not be read back (the line names why) | Not reported LIVE — an unverified tenant on a multi-tenant device is exactly the silent wrong-tenant write. Another door, or re-run |
-| `NONCE_MINT_TENANT_INVALID` / `_NOT_PAIRED` / `_UNKNOWN` | L4 source 3: the runner refused the tenant sent — `400 COORD_MCP_PROVISION_INVALID_TENANT`, `422 …TENANT_NOT_PAIRED`, `503 …TENANT_UNKNOWN`. Nothing was minted | INVALID: fix `$QONTINUI_TENANT_ID` / the census value. NOT_PAIRED: pair this device for that tenant, or name the tenant the session acts for. UNKNOWN: the runner's credential store was unreadable — not "unpaired"; re-run and read the runner log |
+| `NONCE_MINT_TENANT_NOT_PAIRED` / `_WORKDIR_DECLARES_OTHER` / `_UNKNOWN` | L4 source 3: the runner refused the tenant sent — `403 …TENANT_NOT_PAIRED`, `403 …TENANT_WORKDIR_DECLARES_OTHER` (this directory's own `.mcp.json` declares a coord-mcp for another tenant), `503 …CREDENTIAL_STORE_UNREADABLE`. Nothing was minted | NOT_PAIRED: pair this device for that tenant, or name the tenant the session acts for. WORKDIR_DECLARES_OTHER: a workdir fault, not a pairing one — run from a directory whose `.mcp.json` is not for another tenant, or name the tenant it declares. UNKNOWN: the runner's credential store was unreadable — not "unpaired"; re-run and read the runner log |
 | `RUNNER_MINT_TENANT_REQUIRED` | L4 mint: the runner holds credentials for **more than one tenant** and refused a tenant-less `get_coord_device_token` (`409 get_coord_device_token:tenant_required`); the line also says why no tenant was sent | NOT a sign-in problem. Set `$QONTINUI_TENANT_ID` to the tenant this session acts for, or run in a runner terminal whose session census names it. Never "fix" it by asking the default-slot websocket door — that is the wrong-tenant write the refusal exists to stop |
 | `RUNNER_MINT_TENANT_NOT_PAIRED` | L4 mint: `get_coord_device_token` was asked for a named tenant and answered `null` — this runner holds no usable credential for THAT tenant (it may hold others) | NOT signed out. Pair this device for that tenant, or name the tenant the session actually acts for |
 | `RUNNER_MINT_TENANT_INVALID` | L4 mint: the runner rejected the tenant sent as malformed (`get_coord_device_token:tenant_invalid`) | A LOCAL input fault — check `$QONTINUI_TENANT_ID` / the census value it names |
+| `RUNNER_MINT_EXPIRED` | L4 mint: the runner answered with its typed **expired-credential** refusal — HTTP `401`, `success:false`, an error carrying the stable prefix `DEVICE_TOKEN_EXPIRED:` (on either command name, and on the named-tenant arm, where an expired-but-paired runner used to answer `null`). A runner build predating that answer returns the expired JWT as a success instead; the rung decodes its `exp` and reports the same verdict **without sending it** | **The runner's coord credential has expired — sign in to the runner.** It is still paired, so this is **never** "pair this device", and **never** a reason to retry the mint (both command names read the same credential). A terminal fall-through: the cascade moves on to the next rung (L5 needs no runner credential at all) |
 | `RUNNER_MINT_WRONG_TENANT` | L4 mint: a tenant was asked for and the token that came back claims a different one (or none) — a runner build predating the `tenantId` argument answered its default slot | The token is NOT sent. Use L5, or a runner build carrying P3; never restart a running runner over it |
 | `RUNNER_SIGNED_OUT` | L4 mint, on a tenant-less call: it answered and genuinely holds no token — a non-JWT-shaped value, its own `Not authenticated` error, or a 2xx `null` from `get_coord_device_token` asked for no tenant, which is that command's documented "this device is unpaired" result rather than a fault (a `null` for a NAMED tenant is `RUNNER_MINT_TENANT_NOT_PAIRED`) | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
 | `ENV_UNSET` / `FILE_ABSENT` | L4: that static credential source is simply not present — a statement of **absence**, not a fault | Nothing to do unless you meant to provide one; the cascade moves to the next source |
@@ -1095,8 +1166,9 @@ verdict the coord-mcp corpus already tracks as F1.
 Additional typed verdicts: `HTTP_200_NOT_MCP` (HTTP 200 without a JSON-RPC
 result — a broken door, never LIVE), `UNREACHABLE` / `HTTP_<code>`
 (unclassified), and L3-specific causes `NO_TOKEN` / `MINT_FAILED` /
-`HELPER_NOT_FOUND` / `HELPER_DEPS_MISSING` (mapped from
-`coord-acting-bearer.sh`'s exit codes). Every non-LIVE verdict carries curl's
+`PRESENTER_NOT_ADMITTED` (exit 4: coord refused the presenter; L5 mints its
+own bootstrap credential) / `HELPER_NOT_FOUND` / `HELPER_DEPS_MISSING`
+(mapped from `coord-acting-bearer.sh`'s exit codes). Every non-LIVE verdict carries curl's
 own one-line explanation as `[curl: …]`.
 
 **LOCAL faults are named as local and never dressed up as a coord verdict** —
@@ -1422,10 +1494,10 @@ before you name a cause.
 > concluding: `knowledge-base/qontinui-specific/debugging-logs.md` owns the
 > dev-logs dir resolution.
 
-One flat JSON object per line (`coord_mcp.rs::rotation_log_line_with`,
-`:1163-1191`): `ts` (RFC3339, UTC), `event`, `workdir`, `key_prefix` (the first
-**8** chars — `ROTATION_KEY_PREFIX_LEN`, `:1130`), `cause`, `runner_id`, `pid`,
-plus per-event extras. The emitter is `log_rotation_event_with` (`:1272-1299`),
+One flat JSON object per line (`rotation_log_line_with`, in the runner's
+`coord_mcp` module): `ts` (RFC3339, UTC), `event`, `workdir`, `key_prefix` (the first
+**8** chars — `ROTATION_KEY_PREFIX_LEN`), `cause`, `runner_id`, `pid`,
+plus per-event extras. The emitter is `log_rotation_event_with`,
 one `write_all` per line so lines never interleave.
 
 **Event kinds.** The emitter can produce `mint`, `evict`, `grace`, `adopt`,
@@ -1443,7 +1515,7 @@ jq -r .event ~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl \
 **The join that answers "why did MY key 401".** A `reject` row's `workdir`,
 `principal` and `terminal_id` are **usually** the literal string `"unknown"` —
 but **not always, and do not skip the field when it is populated.**
-`reject_attribution_for_nonce` (`:1513-1561`) checks the **live map first** and
+`reject_attribution_for_nonce` checks the **live map first** and
 returns the real `workdir` / `principal` / `terminal_id` on a hit; on a
 grace-map hit it can still name `principal: "device"`. It falls back to
 `"unknown"` only when the nonce matched neither — which is the ordinary case
@@ -1452,7 +1524,8 @@ for the failure this section is about, and was 265 of 265 reject rows in one
 the code. A populated `workdir` on a reject row is the single most useful
 attribution field there is; read it before reaching for the join.
 
-When it IS `"unknown"`, the source states the intended route at `:1570-1573`:
+When it IS `"unknown"`, the source states the intended route in
+`log_proxy_nonce_rejected`'s doc comment:
 **join on `key_prefix`.** An `evict` line and a later `reject` line carrying
 the same prefix are the same key, and the `evict` line supplies the workdir
 this one — in its own words — *"usually cannot"*.
@@ -1490,13 +1563,13 @@ This document said, in several places, that *"the one-slot workdir key
 rotated"*. That is **imprecise for the device path**, and the imprecision
 pointed readers at the wrong remedy.
 
-- `PROXY_NONCES` (`coord_mcp.rs:925`) is a `HashMap<String, NonceBinding>`
-  keyed **by nonce**, not one slot per workdir.
-- Eviction is scoped by `(workdir, terminal_id)` **and** class
-  (`:3372-3383`); an *ephemeral* mint evicts nothing at all, and two terminals
-  sharing a cwd each keep their own key.
-- The source says so outright at `:3290-3295`: **"Two live nonces for one
-  workdir is a sanctioned state."**
+- The `PROXY_NONCES` static in the runner's `coord_mcp` module is a
+  `HashMap<String, NonceBinding>` keyed **by nonce**, not one slot per workdir.
+- Eviction is scoped by `(workdir, terminal_id)` **and** class (the eviction
+  rule in `mint_and_register_nonce`'s doc comment); an *ephemeral* mint evicts
+  nothing at all, and two terminals sharing a cwd each keep their own key.
+- That same doc comment says so outright: **"Two live persistent nonces for
+  one workdir is therefore a sanctioned state."**
 - Device bindings are **persisted** across a restart (default ON).
 
 Why it mattered: "the one slot rotated" reads as *"re-provision to get a fresh
@@ -1505,12 +1578,16 @@ peer. For the failure below it is the wrong move.
 
 ### The failure this framing hid: evicted + RESTART
 
-An evicted key is graced for `DEVICE_EVICTED_NONCE_GRACE_TTL` (6 h,
-`:1065-1066`), but **grace is process-local and forgotten across a restart** by
-design — `GRACED_NONCES`' own doc comment (`:1073-1078`) says it "never reaches
-disk", delegating cross-restart continuity to the adopt-on-disk path. That path
-structurally cannot take this case: it adopts what is *on disk*, and an evicted
-key is by construction the one no longer there. Measured 2026-09-01: a key
+An evicted key is graced for `DEVICE_EVICTED_NONCE_GRACE_TTL` (6 h), but on a
+runner build predating qontinui-runner `e919bf7c0` (2026-09-02) **grace is
+process-local and forgotten across a restart** — `GRACED_NONCES` never reached
+disk there, delegating cross-restart continuity to the adopt-on-disk path. That
+path structurally cannot take this case: it adopts what is *on disk*, and an
+evicted key is by construction the one no longer there. From `e919bf7c0` on,
+the graced set rides the persisted nonce store with its remaining window
+(`graced_nonce_snapshot` → `restore_proxy_nonces_from`), so what follows is the
+failure of the older builds; settle which one a box runs with
+`merge-base --is-ancestor e919bf7c0 <gitSha>` against `/health`. Measured 2026-09-01: a key
 graced for 21600 s at 21:49 began 401ing at 22:19 — thirty minutes into a
 six-hour grace, seven minutes after a restart.
 
@@ -1584,6 +1661,23 @@ evict a live peer and will not unlatch your client. Use
   up to three `PROBE_TIMEOUT`s. A sweep that ran out on `TIMEOUT`s gets no
   exemption, because a hang says nothing about the credential.
   `$COORD_REVIVE_NO_BOOTSTRAP` still wins.
+
+  **Every run that reaches L5 prints one gate line first**, on stderr:
+  `L5: gate -> budget elapsed=<N>s mono=<S.CC>s budget=<N>s spent=<yes|no>`.
+  `elapsed=` is bash's `$SECONDS` (a wall clock), `mono=` is `/proc/uptime`
+  (`UNAVAILABLE` where that file is unreadable, e.g. macOS), and `spent=` is the
+  one budget evaluation the gate itself acted on — the exemption and the skip
+  read that same answer, so the line cannot disagree with what L5 did. Two
+  clocks that disagree mean the wall clock stepped during the sweep. It is a
+  witness, not a door verdict: it never enters the failure list.
+
+  **The budget runs on the monotonic clock where one exists.** `$SECONDS` is
+  NOT monotonic — bash derives it from the wall clock, and a backward step
+  during the L1 retry sleep was measured (2026-10-21) to leave real time spent
+  and the budget unspent. The budget therefore judges `/proc/uptime` elapsed
+  (measured on Linux; WSL2 is the same kernel; MSYS2/Git Bash emulates the file and is expected,
+  not measured, to be step-free) and falls back to `$SECONDS` only where that is
+  unreadable. `COORD_REVIVE_UPTIME_FILE` overrides the path for tests only.
 - **The correlated case is short-circuited, and that is the real fix — the budget
   is only the backstop.** Every canonical door on this fleet now resolves to the
   **same runner port**, so a device-JWT refresh makes all ~12 answer
