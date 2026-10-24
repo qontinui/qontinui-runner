@@ -35,12 +35,18 @@
 //! - **Freshness.** An answer older than [`ANSWER_FRESHNESS_SECS`] (no 2xx
 //!   since — the device credential went dark and every poll 401s) reads as
 //!   UNANSWERED: fail safe to the dialog.
-//! - **This runner spawned the terminal.** Only a terminal holding a
-//!   [`TerminalGrant`] — minted at spawn by `TerminalSession::spawn`, whose
-//!   nonce rides the child env as [`NONCE_ENV`] — can be answered. The `allow`
-//!   answer ECHOES that nonce and the hook requires the exact echo, so a
-//!   process squatting the loopback port while the runner is down (which never
-//!   sees the nonce: the hook does not send it) cannot answer a prompt.
+//! - **This runner spawned the terminal, and the hook proves it.** Only a
+//!   terminal holding a [`TerminalGrant`] — minted at spawn by
+//!   `TerminalSession::spawn` — can be answered. A grant is TWO secrets in the
+//!   child env: the request key ([`REQUEST_KEY_ENV`], derived one-way from the
+//!   nonce by [`request_key_for`]) which the hook SENDS in
+//!   [`REQUEST_KEY_HEADER`], and the nonce ([`NONCE_ENV`]) which it never
+//!   sends. The pad answers `allow` only when the presented request key is the
+//!   terminal's, and only then ECHOES the nonce; the hook requires the exact
+//!   echo. So a process squatting the loopback port while the runner is down
+//!   learns only the request key, from which it cannot produce the nonce, and
+//!   a loopback caller that does not hold the request key can never harvest a
+//!   nonce (or inflate the accept count) by posting a well-formed payload.
 //! - **Same tenant.** The dial is polled under the runner's DEFAULT device
 //!   credential, so it is that tenant's dial. A terminal spawned for a
 //!   DIFFERENT tenant (an explicit spawn tenant) is answered `none`; a terminal
@@ -94,6 +100,42 @@ pub const ANSWER_FRESHNESS_SECS: i64 = 600;
 /// `claude_permission_request_hook.sh`, which NEVER sends it — it only checks
 /// the pad's echo.
 pub const NONCE_ENV: &str = "QONTINUI_PERMREQ_NONCE";
+
+/// The child-env variable carrying a terminal's REQUEST key
+/// ([`request_key_for`] of its nonce). The hook sends it in
+/// [`REQUEST_KEY_HEADER`]; the pad answers `allow` only for the right one.
+pub const REQUEST_KEY_ENV: &str = "QONTINUI_PERMREQ_KEY";
+
+/// The request header the hook carries the request key in (lowercase, as
+/// `http::HeaderMap` stores names).
+pub const REQUEST_KEY_HEADER: &str = "x-qontinui-permreq-key";
+
+/// A terminal's request key: the lowercase hex SHA-256 of a fixed label and
+/// its nonce. One-way, so whoever receives the request key (a process
+/// squatting the pad's port receives it in the request) cannot produce the
+/// nonce the hook checks the answer against. PURE.
+pub fn request_key_for(nonce: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"qontinui-permreq-request-key\0");
+    h.update(nonce.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Whether `presented` is `grant`'s request key, compared without an early
+/// exit on the first differing byte. PURE.
+fn request_key_matches(grant: &TerminalGrant, presented: Option<&str>) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let expected = request_key_for(&grant.nonce);
+    presented.len() == expected.len()
+        && presented
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
 
 /// How many terminal grants the registry holds; at the bound the oldest is
 /// evicted (that terminal's prompts then fail closed to the dialog).
@@ -174,7 +216,11 @@ pub fn answer_is_fresh(
 ) -> bool {
     dial.answered
         && dial.answered_at.is_some_and(|at| {
-            now.signed_duration_since(at) <= chrono::Duration::seconds(ANSWER_FRESHNESS_SECS)
+            // A NEGATIVE age (the wall clock stepped back past the answer) is
+            // not evidence of freshness: it reads stale, fail safe.
+            let age = now.signed_duration_since(at);
+            age >= chrono::Duration::zero()
+                && age <= chrono::Duration::seconds(ANSWER_FRESHNESS_SECS)
         })
 }
 
@@ -275,11 +321,13 @@ impl PadDecision {
 }
 
 /// The pad's decision, PURE over the dial snapshot, the clock, the terminal's
-/// grant and the payload. See the module docs for the three pad bars.
+/// grant, the request key the hook presented and the payload. See the module
+/// docs for the three pad bars.
 pub fn decide_with(
     dial: &PermissionAutoAcceptDial,
     now: chrono::DateTime<chrono::Utc>,
     grant: Option<&TerminalGrant>,
+    presented_key: Option<&str>,
     payload: &Value,
 ) -> PadDecision {
     let fresh = answer_is_fresh(dial, now);
@@ -293,6 +341,9 @@ pub fn decide_with(
     let Some(grant) = grant else {
         return PadDecision::none("terminal was not spawned by this runner process");
     };
+    if !request_key_matches(grant, presented_key) {
+        return PadDecision::none("request key does not match the terminal's grant");
+    }
     if let Some(spawn_tenant) = grant.spawn_tenant {
         if dial.tenant != Some(spawn_tenant) {
             return PadDecision::none("terminal's spawn tenant is not the dial's tenant");
@@ -305,15 +356,17 @@ pub fn decide_with(
     }
 }
 
-/// The pad's decision for one raw hook body on `terminal_id`, against the dial
-/// and the grants as they stand now. Lenient: an empty or non-JSON body is
+/// The pad's decision for one raw hook body on `terminal_id`, presented with
+/// `presented_key` (the [`REQUEST_KEY_HEADER`] value), against the dial and
+/// the grants as they stand now. Lenient: an empty or non-JSON body is
 /// [`AcceptVerdict::None`].
-pub fn decide(terminal_id: &str, body: &[u8]) -> PadDecision {
+pub fn decide(terminal_id: &str, presented_key: Option<&str>, body: &[u8]) -> PadDecision {
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     decide_with(
         &permission_auto_accept_dial(),
         chrono::Utc::now(),
         terminal_grant(terminal_id).as_ref(),
+        presented_key,
         &payload,
     )
 }
@@ -570,12 +623,20 @@ mod tests {
         pin.set("on");
         let term = "t-pa-garbage";
         register_terminal_grant(term, "a1".repeat(16), None);
+        let key = request_key_for(&"a1".repeat(16));
         let garbage: [&[u8]; 5] = [b"", b"not json", b"{", b"[]", b"null"];
         for body in garbage {
-            assert_eq!(decide(term, body).verdict, AcceptVerdict::None, "{body:?}");
+            assert_eq!(
+                decide(term, Some(&key), body).verdict,
+                AcceptVerdict::None,
+                "{body:?}"
+            );
         }
         let good = payload("Bash", Some("default")).to_string();
-        assert_eq!(decide(term, good.as_bytes()).verdict, AcceptVerdict::Allow);
+        assert_eq!(
+            decide(term, Some(&key), good.as_bytes()).verdict,
+            AcceptVerdict::Allow
+        );
         forget_terminal_grant(term, &"a1".repeat(16));
     }
 
@@ -589,7 +650,8 @@ mod tests {
         let nonce = new_nonce();
         register_terminal_grant(term, nonce.clone(), None);
         let body = payload("Bash", Some("default")).to_string();
-        let verdict = || decide(term, body.as_bytes()).verdict;
+        let key = request_key_for(&nonce);
+        let verdict = || decide(term, Some(&key), body.as_bytes()).verdict;
 
         assert_eq!(verdict(), AcceptVerdict::None, "cold start");
         // A failed poll answers nothing.
@@ -631,11 +693,29 @@ mod tests {
             answered_at: Some(now - chrono::Duration::seconds(ago_secs)),
             ..dial("on", None)
         };
-        let within = decide_with(&at(ANSWER_FRESHNESS_SECS - 30), now, Some(&g), &p);
+        let within = decide_with(
+            &at(ANSWER_FRESHNESS_SECS - 30),
+            now,
+            Some(&g),
+            Some(&request_key_for("n1")),
+            &p,
+        );
         assert_eq!(within.verdict, AcceptVerdict::Allow);
-        let edge = decide_with(&at(ANSWER_FRESHNESS_SECS), now, Some(&g), &p);
+        let edge = decide_with(
+            &at(ANSWER_FRESHNESS_SECS),
+            now,
+            Some(&g),
+            Some(&request_key_for("n1")),
+            &p,
+        );
         assert_eq!(edge.verdict, AcceptVerdict::Allow, "the bound is inclusive");
-        let stale = decide_with(&at(ANSWER_FRESHNESS_SECS + 1), now, Some(&g), &p);
+        let stale = decide_with(
+            &at(ANSWER_FRESHNESS_SECS + 1),
+            now,
+            Some(&g),
+            Some(&request_key_for("n1")),
+            &p,
+        );
         assert_eq!(stale.verdict, AcceptVerdict::None);
         assert_eq!(stale.reason, "dial answer is stale");
         assert_eq!(stale.nonce, None);
@@ -661,23 +741,46 @@ mod tests {
         let p = payload("Bash", Some("default"));
         let (a, b) = (uuid::Uuid::from_u128(0xA1), uuid::Uuid::from_u128(0xB2));
 
-        let same = decide_with(&dial("on", Some(a)), now, Some(&grant("n", Some(a))), &p);
+        let same = decide_with(
+            &dial("on", Some(a)),
+            now,
+            Some(&grant("n", Some(a))),
+            Some(&request_key_for("n")),
+            &p,
+        );
         assert_eq!(same.verdict, AcceptVerdict::Allow, "same tenant");
-        let other = decide_with(&dial("on", Some(a)), now, Some(&grant("n", Some(b))), &p);
+        let other = decide_with(
+            &dial("on", Some(a)),
+            now,
+            Some(&grant("n", Some(b))),
+            Some(&request_key_for("n")),
+            &p,
+        );
         assert_eq!(other.verdict, AcceptVerdict::None, "another tenant");
         assert_eq!(
             other.reason,
             "terminal's spawn tenant is not the dial's tenant"
         );
-        let unknown = decide_with(&dial("on", None), now, Some(&grant("n", Some(b))), &p);
+        let unknown = decide_with(
+            &dial("on", None),
+            now,
+            Some(&grant("n", Some(b))),
+            Some(&request_key_for("n")),
+            &p,
+        );
         assert_eq!(
             unknown.verdict,
             AcceptVerdict::None,
             "a dial whose tenant is unknown cannot be shown to be B's"
         );
         for dial_tenant in [Some(a), None] {
-            let none_recorded =
-                decide_with(&dial("on", dial_tenant), now, Some(&grant("n", None)), &p);
+            let none_recorded = decide_with(
+                &dial("on", dial_tenant),
+                now,
+                Some(&grant("n", None)),
+                Some(&request_key_for("n")),
+                &p,
+            );
             assert_eq!(
                 none_recorded.verdict,
                 AcceptVerdict::Allow,
@@ -692,14 +795,82 @@ mod tests {
     fn an_allow_echoes_the_terminals_nonce_and_an_unknown_terminal_gets_none() {
         let now = chrono::Utc::now();
         let p = payload("Bash", Some("default"));
-        let known = decide_with(&dial("on", None), now, Some(&grant("feedface", None)), &p);
+        let known = decide_with(
+            &dial("on", None),
+            now,
+            Some(&grant("feedface", None)),
+            Some(&request_key_for("feedface")),
+            &p,
+        );
         assert_eq!(known.verdict, AcceptVerdict::Allow);
         assert_eq!(known.nonce.as_deref(), Some("feedface"));
-        let unknown = decide_with(&dial("on", None), now, None, &p);
+        let unknown = decide_with(&dial("on", None), now, None, None, &p);
         assert_eq!(unknown.verdict, AcceptVerdict::None);
         assert_eq!(unknown.nonce, None);
-        let off = decide_with(&dial("off", None), now, Some(&grant("feedface", None)), &p);
+        let off = decide_with(
+            &dial("off", None),
+            now,
+            Some(&grant("feedface", None)),
+            Some(&request_key_for("feedface")),
+            &p,
+        );
         assert_eq!(off.nonce, None, "a none never carries the nonce");
+    }
+
+    /// The hook proves which terminal it is with the REQUEST key; without the
+    /// right one the pad answers `none` and never echoes the nonce, so a
+    /// loopback caller cannot harvest a nonce (or inflate the accept count),
+    /// and the request key a port squatter receives is not the nonce.
+    #[test]
+    fn an_allow_needs_the_terminals_request_key_and_the_key_is_not_the_nonce() {
+        let now = chrono::Utc::now();
+        let p = payload("Bash", Some("default"));
+        let g = grant("cafebabecafebabe", None);
+        let right = request_key_for("cafebabecafebabe");
+        assert_ne!(right, "cafebabecafebabe");
+        assert!(!right.contains("cafebabecafebabe"));
+        assert_eq!(right.len(), 64);
+        assert_eq!(right, request_key_for("cafebabecafebabe"), "deterministic");
+        assert_ne!(right, request_key_for("cafebabecafebabf"));
+
+        let ok = decide_with(&dial("on", None), now, Some(&g), Some(&right), &p);
+        assert_eq!(ok.verdict, AcceptVerdict::Allow);
+        assert_eq!(ok.nonce.as_deref(), Some("cafebabecafebabe"));
+
+        let wrong_key = request_key_for("0000000000000000");
+        let truncated = right[..63].to_string();
+        let the_nonce_itself = "cafebabecafebabe".to_string();
+        for presented in [
+            None,
+            Some(""),
+            Some(wrong_key.as_str()),
+            Some(truncated.as_str()),
+            Some(the_nonce_itself.as_str()),
+        ] {
+            let d = decide_with(&dial("on", None), now, Some(&g), presented, &p);
+            assert_eq!(d.verdict, AcceptVerdict::None, "{presented:?}");
+            assert_eq!(d.nonce, None, "{presented:?}: no echo without the key");
+            assert_eq!(d.reason, "request key does not match the terminal's grant");
+        }
+    }
+
+    /// A wall clock that stepped BACK past the answer time is not freshness.
+    #[test]
+    fn an_answer_dated_in_the_future_is_not_fresh() {
+        let now = chrono::Utc::now();
+        let future = PermissionAutoAcceptDial {
+            answered_at: Some(now + chrono::Duration::seconds(5)),
+            ..dial("on", None)
+        };
+        assert!(!answer_is_fresh(&future, now));
+        let d = decide_with(
+            &future,
+            now,
+            Some(&grant("n", None)),
+            Some(&request_key_for("n")),
+            &payload("Bash", Some("default")),
+        );
+        assert_eq!(d.verdict, AcceptVerdict::None);
     }
 
     #[test]
@@ -761,16 +932,17 @@ mod tests {
         let nonce = new_nonce();
         register_terminal_grant(term, nonce.clone(), None);
         let body = payload("Bash", Some("default")).to_string();
+        let key = request_key_for(&nonce);
         for scope in [Some("none"), Some("tenant"), None] {
             pin.set_with_scope("on", scope);
             assert_eq!(
-                decide(term, body.as_bytes()).verdict,
+                decide(term, Some(&key), body.as_bytes()).verdict,
                 AcceptVerdict::Allow,
                 "{scope:?}"
             );
             pin.set_with_scope("off", scope);
             assert_eq!(
-                decide(term, body.as_bytes()).verdict,
+                decide(term, Some(&key), body.as_bytes()).verdict,
                 AcceptVerdict::None,
                 "{scope:?}"
             );
