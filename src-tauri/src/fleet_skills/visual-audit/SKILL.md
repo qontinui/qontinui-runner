@@ -104,11 +104,19 @@ honestly-empty `Checked`.
 
 The `--stats` line still prints, and is still useful for seeing *why* a verdict
 came out the way it did before you send anything — but it is **no longer the
-defence**. It reports the same counters the server now computes for itself:
+defence**. Its element, geometry, text and interactive counts are the ones the
+server now computes for itself (`SnapshotCoverage`). The occluder, media and
+visibility-detail counts are local to the projector:
 
 ```
-projected 118/118 elements: 118 with geometry, 40 with text, 78 interactive, 2 with a hit-tested occluder, 6 with media
+projected 118/118 elements: 118 with geometry, 40 with text, 78 interactive, 2 with a hit-tested occluder, 6 with media, 3 with visibility detail
 ```
+
+`with visibility detail` counts elements carrying `visibility_reason` or
+`occluded_pct`. A bridge predating the SDK's occlusion sweep (ui-bridge
+`4284cd2`) emits neither. On a page with hidden or covered images, a `0` there
+means the image analyzer cannot tell an image that paints nothing from one
+painted under an overlay.
 
 > **`Degraded` is green on purpose, and this is worth understanding.** No
 > snapshot from this projector carries stacking order: it never emits
