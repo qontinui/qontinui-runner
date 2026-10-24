@@ -831,8 +831,11 @@ else
     # backslash and double quote (Step 5 passes the /name result through here
     # too), which would otherwise end the string early.
     title="$(printf '%s' "$slug" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    # 2>/dev/null goes BEFORE >>: redirections apply left to right, so a failed
+    # >> would print the shell's own open error (e.g. "Permission denied")
+    # before stderr was muted.
     if printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s","uuid":"%s","timestamp":"%s"}\n' \
-         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" >> "$sf" 2>/dev/null; then
+         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" 2>/dev/null >> "$sf"; then
       echo "session labeled: $slug"
     else
       echo "label not written: append to $sf failed (searched $searched)"
