@@ -51,6 +51,7 @@
 //! agents (non-browser), which the default `RoutePolicy::EnforceDoors` admits
 //! (plan Phase 2, resolved vet note).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -588,12 +589,9 @@ pub(crate) fn answer_frontier(
     )
 }
 
-fn keeps(filter: &JourneyFilter, edge: &JourneyEdgeObservation) -> bool {
-    if let Some(since) = filter.since {
-        match parse_ts(Some(&edge.observed_at)) {
-            Some(at) if at >= since => {}
-            _ => return false,
-        }
+fn keeps(filter: &JourneyFilter, edge: &JourneyEdgeObservation, at: DateTime<Utc>) -> bool {
+    if filter.since.is_some_and(|since| at < since) {
+        return false;
     }
     if let Some(v) = &filter.app_version {
         if edge.app_version.as_deref() != Some(v.as_str()) {
@@ -608,8 +606,15 @@ fn keeps(filter: &JourneyFilter, edge: &JourneyEdgeObservation) -> bool {
 
 /// `edge-timing?from=&to=`: the distribution of one edge's timelines. Edge
 /// identity is the node keys (`JourneyNode::key()`), never jsonb equality.
-/// Measured iff at least one live observation of the edge passed the filter;
-/// rows without a timeline count toward `n` and are reported as unmeasured.
+///
+/// Each row of the pair is handled exactly as `build_graph` handles an edge,
+/// in the same order: withdrawn → excluded and counted; failing `validate()`
+/// or carrying a non-RFC 3339 `observedAt` → REJECTED and counted (an
+/// unmeasured `rows_rejected` dimension, never a sample and never "filtered
+/// out"); then the filter. Samples pool every trigger and outcome of the pair
+/// (see [`JourneyEdgeTimingAnswer`]). Measured iff at least one sample
+/// survives; rows without a timeline count toward `n` and are reported as
+/// unmeasured.
 pub(crate) fn answer_edge_timing(
     ctx: &AnswerCtx<'_>,
     rows: &[TimedEdge],
@@ -621,7 +626,10 @@ pub(crate) fn answer_edge_timing(
     let mut samples = Vec::new();
     let mut filtered_out = 0u64;
     let mut invalidated = 0u64;
+    let mut rejected = 0u64;
     let mut unparseable = 0u64;
+    let mut by_outcome: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_trigger: BTreeMap<String, u64> = BTreeMap::new();
     for r in rows {
         let e = &r.edge;
         let same_edge =
@@ -633,17 +641,26 @@ pub(crate) fn answer_edge_timing(
             invalidated += 1;
             continue;
         }
-        if !keeps(filter, e) {
+        let observed_at = match (e.validate(), parse_ts(Some(&e.observed_at))) {
+            (Ok(()), Some(at)) => at,
+            _ => {
+                rejected += 1;
+                continue;
+            }
+        };
+        if !keeps(filter, e, observed_at) {
             filtered_out += 1;
             continue;
         }
-        let Some(observed_at) = parse_ts(Some(&e.observed_at)) else {
-            unparseable += 1;
-            continue;
-        };
         if r.timeline_unparseable {
             unparseable += 1;
         }
+        *by_outcome
+            .entry(e.outcome.as_str().to_string())
+            .or_insert(0) += 1;
+        *by_trigger
+            .entry(e.trigger.navigation_trigger.as_str().to_string())
+            .or_insert(0) += 1;
         samples.push(EdgeTimingSample {
             observation_id: e.id.clone(),
             observed_at,
@@ -661,11 +678,21 @@ pub(crate) fn answer_edge_timing(
         filter_echo: filter.clone(),
         edges_filtered_out: filtered_out,
         edges_invalidated: invalidated,
+        rows_rejected: rejected,
+        samples_by_outcome: by_outcome,
+        samples_by_trigger: by_trigger,
         timelines_unparseable: unparseable,
         timing,
         ledger: ledger.clone(),
     };
     let mut unmeasured = ctx.gaps.dimensions();
+    if rejected > 0 {
+        unmeasured.push(UnmeasuredDimension::new(
+            "rows_rejected",
+            rejected,
+            UnknownCode::ProducerFailed,
+        ));
+    }
     if without > 0 {
         unmeasured.push(UnmeasuredDimension::new(
             "timeline",
@@ -680,11 +707,11 @@ pub(crate) fn answer_edge_timing(
             UnknownCode::ProducerFailed,
         ));
     }
-    let ledger_code = match ledger.state {
-        qontinui_types::journey::LedgerState::Writing => None,
-        qontinui_types::journey::LedgerState::SchemaAbsent => Some(UnknownCode::LedgerSchemaAbsent),
-        qontinui_types::journey::LedgerState::WriteFailing => Some(UnknownCode::LedgerWriteFailing),
-    };
+    // The shared mapping of a ledger state to its UnknownCode.
+    let ledger_code = build_graph(&[], &[], ledger, filter)
+        .coverage
+        .ledger_unknown_code()
+        .map(unknown_code);
     if let Some(code) = ledger_code {
         unmeasured.push(UnmeasuredDimension::new("ledger", 1, code));
     }
@@ -708,13 +735,25 @@ pub(crate) fn answer_edge_timing(
         return finish(Observation::measured(value, prov), None);
     }
     let prov = prov.with_source(source_of(ctx.query, ctx.app_id, Some(value)));
-    let code = ledger_code
-        .or_else(|| ctx.gaps.dimensions().first().map(|d| d.code))
-        .unwrap_or(UnknownCode::NoObservations);
-    let detail = format!(
-        "edge-timing: no live observation of {from:?} -> {to:?} under this filter \
-         ({filtered_out} filtered out, {invalidated} withdrawn)"
-    );
+    let first = prov.coverage.unmeasured.first().cloned();
+    let (code, detail) = match (ledger_code, first) {
+        (Some(code), _) => (
+            code,
+            detail_for(
+                ctx.query,
+                code,
+                prov.coverage.unmeasured.iter().find(|d| d.code == code),
+            ),
+        ),
+        (None, Some(d)) => (d.code, detail_for(ctx.query, d.code, Some(&d))),
+        (None, None) => (
+            UnknownCode::NoObservations,
+            format!(
+                "edge-timing: no live observation of {from:?} -> {to:?} under this filter \
+                 ({filtered_out} filtered out, {invalidated} withdrawn)"
+            ),
+        ),
+    };
     finish(Observation::<Value>::unknown(code, detail, prov), None)
 }
 

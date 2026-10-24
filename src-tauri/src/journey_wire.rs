@@ -5,12 +5,23 @@
 //! it for the generated bindings and cannot reach the runner bin's
 //! `journey` module; the bin's `journey::routes` builds it.
 
+use std::collections::BTreeMap;
+
 use qontinui_types::journey::{JourneyFilter, JourneyLedgerHealth};
 use qontinui_vision_core::EdgeTiming;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The answer value of `GET /apps/{app_id}/journey/edge-timing`.
+///
+/// **Samples POOL every trigger and outcome of the `(from, to)` pair**:
+/// affordance clicks and typed URLs alike, and `changed`, `settle_timeout`
+/// and `error` closes alike. Keeping only `affordance` + `changed` would drop
+/// exactly the slow and failing interactions (a `settle_timeout` close is the
+/// slowest sample there is) and bias every percentile fast. The pooled
+/// composition is reported in `samplesByOutcome` / `samplesByTrigger`, so a
+/// reader who wants one slice can see whether the pool is dominated by
+/// another.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
@@ -25,6 +36,15 @@ pub struct JourneyEdgeTimingAnswer {
     pub edges_filtered_out: u64,
     /// Withdrawn observations of this edge, excluded.
     pub edges_invalidated: u64,
+    /// Observations of this edge left out as contract violations (a row that
+    /// fails `validate()` or whose `observedAt` is not RFC 3339) — the same
+    /// rows the graph routes list as `rejected`; never samples, never
+    /// "filtered out".
+    pub rows_rejected: u64,
+    /// Samples per edge outcome (wire string), pooled into `timing`.
+    pub samples_by_outcome: BTreeMap<String, u64>,
+    /// Samples per navigation trigger (wire string), pooled into `timing`.
+    pub samples_by_trigger: BTreeMap<String, u64>,
     /// Observations whose stored timeline did not parse (counted in `timing`
     /// as without a timeline).
     pub timelines_unparseable: u64,

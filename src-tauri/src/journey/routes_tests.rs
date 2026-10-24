@@ -566,3 +566,63 @@ fn a_truncated_read_detail_names_the_read_bound() {
         "{v:#}"
     );
 }
+
+// -- Review fixes: edge-timing handles bad rows as the graph does -----------
+
+#[test]
+fn edge_timing_rejects_contract_violations_rather_than_sampling_or_filtering() {
+    let mut bad_time = timed(2, "a", "b", Some(200));
+    bad_time.edge.observed_at = "yesterday".into();
+    // `no_change` between different keys fails validate().
+    let invalid = TimedEdge {
+        edge: edge(3, "a", Some("b"), "affordance", "no_change", "fp"),
+        timeline: None,
+        timeline_unparseable: false,
+    };
+    assert!(invalid.edge.validate().is_err(), "fixture must be invalid");
+    let rows = vec![timed(1, "a", "b", Some(100)), bad_time, invalid];
+    // A `since` filter must not swallow the unparseable timestamp either.
+    let filter = JourneyFilter {
+        since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+        ..JourneyFilter::default()
+    };
+    let v = answer_edge_timing(
+        &ctx("edge-timing"),
+        &rows,
+        &key("a"),
+        &key("b"),
+        &filter,
+        &writing(),
+    );
+    assert_eq!(status(&v), "measured", "{v:#}");
+    assert_eq!(v["value"]["timing"]["n"], 1);
+    assert_eq!(v["value"]["rowsRejected"], 2);
+    assert_eq!(v["value"]["edgesFilteredOut"], 0);
+    assert_eq!(v["value"]["samplesByOutcome"]["changed"], 1);
+    assert_eq!(v["value"]["samplesByTrigger"]["affordance"], 1);
+    let dims = v["provenance"]["coverage"]["unmeasured"]
+        .as_array()
+        .unwrap();
+    assert!(
+        dims.iter()
+            .any(|d| d["dimension"] == "rows_rejected" && d["count"] == 2),
+        "{dims:?}"
+    );
+}
+
+#[test]
+fn edge_timing_uses_the_shared_ledger_code() {
+    let failing = JourneyLedgerHealth {
+        state: LedgerState::WriteFailing,
+        detail: "x".into(),
+    };
+    let v = answer_edge_timing(
+        &ctx("edge-timing"),
+        &[],
+        &key("a"),
+        &key("b"),
+        &JourneyFilter::default(),
+        &failing,
+    );
+    assert_eq!(code(&v), "ledger_write_failing");
+}
