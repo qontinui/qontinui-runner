@@ -10,7 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, trace};
+
+mod project_index;
+pub use project_index::{select_pairs, PairSelection, ProjectsIndex};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -729,9 +732,18 @@ pub fn list_sessions(
     let project_dir = project_dir(config_dir, project_path, None);
 
     if !project_dir.exists() {
-        debug!(
+        // TRACE, not DEBUG: periodic callers (the session reconciler, the
+        // latest-session fallback) still reach this per probed pair, and at a
+        // DEBUG filter one line per miss flooded the runner log (measured
+        // 2026-10-18 at 9-11 GB/day, plan
+        // `2026-10-19-runner-transcript-scan-stats-and-logs-every-missing-project-dir`).
+        // The all-projects listing no longer probes absent pairs at
+        // all (`ProjectsIndex` / `select_pairs`); it logs one aggregate line
+        // per scan instead.
+        trace!(
             "No project directory found at {:?} (encoded from '{}')",
-            project_dir, project_path
+            project_dir,
+            project_path
         );
         return Ok(Vec::new());
     }
@@ -3105,13 +3117,13 @@ mod tests {
     /// One JSONL record with a single user message — enough for `list_sessions`
     /// to consider the session non-empty (`message_count == 1`) and produce a
     /// real `TranscriptSession`. Workflow-marker free.
-    fn minimal_user_jsonl() -> &'static str {
+    pub(super) fn minimal_user_jsonl() -> &'static str {
         r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#
     }
 
     /// Write a synthetic JSONL session at `<config_dir>/projects/<encoded>/<id>.jsonl`
     /// and force its mtime via `filetime::set_file_mtime`. Returns the file path.
-    fn write_session_with_mtime(
+    pub(super) fn write_session_with_mtime(
         config_dir: &Path,
         project_path: &str,
         session_id: &str,
@@ -3136,7 +3148,7 @@ mod tests {
     /// it; if a stale entry lingers under our tempdir's prefix, `list_sessions`
     /// can return a cached `TranscriptSession` whose `last_modified` doesn't
     /// match the freshly-set fixture mtime.
-    fn clear_cache_under(prefix: &Path) {
+    pub(super) fn clear_cache_under(prefix: &Path) {
         let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.retain(|p, _| !p.starts_with(prefix));
     }
