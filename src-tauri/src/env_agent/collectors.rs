@@ -4022,44 +4022,9 @@ fn git_hooks_dir(repo: &Path, home: Option<&Path>) -> Option<PathBuf> {
     git_hooks_dir_from(repo, &git_dir, &common_dir, home)
 }
 
-/// `<repo>`'s git dir and git COMMON dir, read from disk the way git does:
-/// `.git` as a directory, or a `gitdir:` file (a linked worktree) whose git
-/// dir may carry a `commondir` pointer. `None` when `<repo>/.git` is neither.
-fn git_dir_and_common_dir(repo: &Path) -> Option<(PathBuf, PathBuf)> {
-    let dot_git = repo.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let target = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-            .trim();
-        if target.is_empty() {
-            return None;
-        }
-        let target = Path::new(target);
-        if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            repo.join(target)
-        }
-    };
-    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(text) => {
-            let t = text.trim();
-            if t.is_empty() {
-                git_dir.clone()
-            } else if Path::new(t).is_absolute() {
-                PathBuf::from(t)
-            } else {
-                git_dir.join(t)
-            }
-        }
-        Err(_) => git_dir.clone(),
-    };
-    Some((git_dir, common_dir))
-}
+// `<repo>`'s git dir and git COMMON dir — the one shared reader,
+// `crate::git_layout::git_dir_and_common_dir`.
+use crate::git_layout::git_dir_and_common_dir;
 
 /// The body of [`git_hooks_dir`] once the two git dirs are known.
 fn git_hooks_dir_from(

@@ -2181,11 +2181,11 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
 /// it did before this existed. The census walk is measured in hours and the
 /// tick is [`DEFAULT_CENSUS_INTERVAL_SECS`] (300s), so one fetch per repo is
 /// noise against the walk it precedes.
-fn fetch_trunk(canonical: &Path) {
+fn fetch_trunk(canonical: &Path, trunk: Option<&str>) {
     let Some(dir) = canonical.to_str() else {
         return;
     };
-    let Some(trunk) = resolve_trunk_ref(canonical) else {
+    let Some(trunk) = trunk else {
         // No resolvable trunk — nothing to refresh, and inventing a
         // refspec here would be the guess `resolve_trunk_ref` refuses.
         return;
@@ -2252,17 +2252,26 @@ fn fetch_trunk(canonical: &Path) {
 ///
 /// Squash merges are deliberately NOT covered (the patch-id changes) —
 /// coord handles those via the PR `close_cause='merged'` signal.
+#[cfg(test)]
 fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     // Require a resolvable trunk; without it we can't answer.
     let trunk = resolve_trunk_ref(worktree)?;
+    compute_landed_against(worktree, "HEAD", &trunk)
+}
 
+/// [`compute_landed_in_main`] for the revisions `head` and `trunk` — a ref name
+/// (`HEAD`, `origin/main`) or a commit id. The walk passes the commit ids it
+/// keys its [`super::census_memo::LandedMemo`] on, so the answer it stores is
+/// the answer FOR that key, even if HEAD or the trunk moves between the reads.
+fn compute_landed_against(worktree: &Path, head: &str, trunk: &str) -> Option<bool> {
+    let trunk = trunk.to_string();
     let wt = worktree.to_str()?;
 
     // (1) Ancestry test — exit 0 means HEAD is an ancestor of the trunk.
     // A spawn failure OR a timeout is an honest unknown: we must not report
     // "not landed" for a question we could not ask.
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", wt, "merge-base", "--is-ancestor", "HEAD", &trunk]);
+    cmd.args(["-C", wt, "merge-base", "--is-ancestor", head, &trunk]);
     // `run_probe_QUIET`: `--is-ancestor` answers with its EXIT CODE, so exit 1
     // ("not an ancestor") is this probe's ordinary negative answer and the
     // documented path into the patch-id test below — not a fault. The loud
@@ -2286,7 +2295,7 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     // (2) Patch-id test via `git cherry`. Lines starting `-` are commits
     // whose patch-id already exists on the upstream; `+` lines are
     // genuinely-unlanded. ALL lines must be `-` (and there must be ≥1).
-    let cherry = git_capture(worktree, &["cherry", &trunk, "HEAD"])?;
+    let cherry = git_capture(worktree, &["cherry", &trunk, head])?;
     let mut saw_line = false;
     for line in cherry.lines() {
         let line = line.trim();
@@ -2342,9 +2351,17 @@ pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
 /// `origin/main...HEAD` range — so on a `master`-trunk repo it silently
 /// degraded to the bare branch name with no ahead/behind, feeding the
 /// operator a wrong-but-plausible advisory.
+#[cfg(test)]
 fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
+    compute_canonical_base_divergence_against(canonical, resolve_trunk_ref(canonical))
+}
+
+/// [`compute_canonical_base_divergence`] against an already-resolved trunk.
+fn compute_canonical_base_divergence_against(
+    canonical: &Path,
+    trunk: Option<String>,
+) -> Option<String> {
     let branch = compute_canonical_branch(canonical)?;
-    let trunk = resolve_trunk_ref(canonical);
     // On the trunk branch itself there is no divergence to report.
     if let Some(t) = trunk.as_deref() {
         if t.strip_prefix("origin/") == Some(branch.as_str()) {
@@ -2364,18 +2381,120 @@ fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
     }
 }
 
-/// Build the census row for a single worktree dir.
+/// Ξ_Worktree P7.3 — the canonical checkout's three facts. Per REPO, not per
+/// worktree: every row of a repo carries the same values and coord reads one
+/// row per repo, so the walk computes them ONCE per repo
+/// ([`canonical_facts_for_repo`]) and hands them to every row. Until plan
+/// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// each row recomputed them — 5 git calls on the canonical checkout per row,
+/// measured at 9.45 processes/s on spaceship.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CanonicalFacts {
+    pub current_branch: Option<String>,
+    pub is_dirty: Option<bool>,
+    pub base_divergence: Option<String>,
+}
+
+/// The walk's trunk resolver: the trunk ref NAME ([`resolve_trunk_ref`]) and
+/// the commit it points at, read once per git common dir per walk.
+fn resolve_walk_trunk(dir: &Path) -> Option<super::census_memo::Trunk> {
+    let name = resolve_trunk_ref(dir)?;
+    let oid =
+        git_capture(dir, &["rev-parse", "--verify", "--quiet", &name]).filter(|s| !s.is_empty());
+    Some(super::census_memo::Trunk { name, oid })
+}
+
+/// [`CanonicalFacts`] for `repo`, from the same canonical-path resolver the
+/// per-row code used ([`default_canonical_path`]); a missing or unresolvable
+/// canonical yields all three `None`, which coord reads as unsafe.
+fn canonical_facts_for_repo(repo: &str, memo: &mut super::census_memo::WalkMemo) -> CanonicalFacts {
+    let Some(canonical) = default_canonical_path(repo).ok() else {
+        return CanonicalFacts::default();
+    };
+    let trunk = memo
+        .trunk_for(&canonical, &mut resolve_walk_trunk)
+        .map(|t| t.name);
+    CanonicalFacts {
+        current_branch: compute_canonical_branch(&canonical),
+        is_dirty: compute_canonical_is_dirty(&canonical),
+        base_divergence: compute_canonical_base_divergence_against(&canonical, trunk),
+    }
+}
+
+/// `landed_in_main` for one row, through the walk's trunk memo and the
+/// cross-walk [`super::census_memo::LandedMemo`].
+fn landed_for_row(
+    worktree: &Path,
+    head_sha: Option<&str>,
+    memo: &mut super::census_memo::WalkMemo,
+) -> Option<bool> {
+    let trunk = memo.trunk_for(worktree, &mut resolve_walk_trunk)?;
+    let common = qontinui_runner_lib::git_layout::common_dir_key(worktree);
+    let key = match (common, head_sha, trunk.oid.as_deref()) {
+        (Some(c), Some(h), Some(t)) => Some((c, h.to_string(), t.to_string())),
+        _ => None,
+    };
+    let landed = super::census_memo::LandedMemo::global();
+    if let Some((c, h, t)) = &key {
+        if let Some(hit) = landed.get(c, h, t) {
+            return Some(hit);
+        }
+    }
+    // Probe the KEYED commits, so a stored answer can never belong to
+    // different commits than its key; without a full key, the live refs.
+    let answer = match &key {
+        Some((_, h, t)) => compute_landed_against(worktree, h, t)?,
+        None => compute_landed_against(worktree, "HEAD", &trunk.name)?,
+    };
+    if let Some((c, h, t)) = &key {
+        landed.put(c, h, t, answer);
+    }
+    Some(answer)
+}
+
+/// Build the census row for a single worktree dir, computing its repo's
+/// canonical facts itself. The walk uses [`capture_worktree_in`], which is
+/// handed them; this form keeps one-row callers (tests) self-contained.
+#[cfg(test)]
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
-    let branch =
-        git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
-    let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
+    let mut memo = super::census_memo::WalkMemo::default();
+    let canonical = canonical_facts_for_repo(repo, &mut memo);
+    capture_worktree_in(repo, worktree, &canonical, &mut memo)
+}
+
+/// Build the census row for a single worktree dir.
+fn capture_worktree_in(
+    repo: &str,
+    worktree: &Path,
+    canonical: &CanonicalFacts,
+    memo: &mut super::census_memo::WalkMemo,
+) -> WorktreeCensus {
+    // A dir where git provably finds no repository answers every git probe
+    // below with a failure, so ask none of them (their answers are `None` by
+    // construction). The dirty probe makes the same check itself and returns
+    // the verdict a failed probe would have produced.
+    let git_absent = qontinui_runner_lib::git_layout::git_provably_absent(worktree);
+    let branch = if git_absent {
+        None
+    } else {
+        git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty())
+    };
+    let head_sha = if git_absent {
+        None
+    } else {
+        git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())
+    };
 
     // ONE spawn for two facts. `%ct%n%B` puts the committer epoch on the
     // first line and the full commit body after it, so reading the
     // `Session-Id:` trailer costs NOTHING on a walk that already takes 33
     // minutes -- the alternative (a second `git log`) would have added
     // ~1,250 process spawns per census.
-    let head_log = git_capture(worktree, &["log", "-1", "--format=%ct%n%B"]);
+    let head_log = if git_absent {
+        None
+    } else {
+        git_capture(worktree, &["log", "-1", "--format=%ct%n%B"])
+    };
     let (head_epoch_raw, head_body) = match head_log.as_deref() {
         Some(s) => match s.split_once('\n') {
             Some((ct, body)) => (Some(ct), body),
@@ -2466,7 +2585,11 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
     // None when undeterminable (unresolvable trunk, git failure).
-    let landed_in_main = compute_landed_in_main(worktree);
+    let landed_in_main = if git_absent {
+        None
+    } else {
+        landed_for_row(worktree, head_sha.as_deref(), memo)
+    };
 
     // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
     // (NOT the reclaim executor's `probe_building`, which also counts recent
@@ -2475,17 +2598,11 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`.
     let building = Some(super::reclaim::probe_building_for_census(worktree));
 
-    // Ξ_Worktree P7.3 — canonical-checkout state (per-REPO, not per-worktree;
-    // it's fine that every worktree row of a repo carries the same values —
-    // coord reads one row per repo). Resolve the canonical path for this
-    // repo; a missing/unresolvable canonical → all three facts are None
-    // (`.and_then` off the canonical Option), which coord reads as unsafe.
-    let canonical = super::canonical_paths::default_canonical_path(repo).ok();
-    let canonical_current_branch = canonical.as_deref().and_then(compute_canonical_branch);
-    let canonical_is_dirty = canonical.as_deref().and_then(compute_canonical_is_dirty);
-    let canonical_base_divergence = canonical
-        .as_deref()
-        .and_then(compute_canonical_base_divergence);
+    // Ξ_Worktree P7.3 — canonical-checkout state, computed once per repo by
+    // the walk ([`canonical_facts_for_repo`]) and carried on every row.
+    let canonical_current_branch = canonical.current_branch.clone();
+    let canonical_is_dirty = canonical.is_dirty;
+    let canonical_base_divergence = canonical.base_divergence.clone();
 
     WorktreeCensus {
         repo: repo.to_string(),
@@ -2531,6 +2648,29 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 /// captured (the chunked-emission feed — a row costs ~2s of git spawns, so
 /// push-per-row is what lets chunks flow DURING the walk).
 fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus)) {
+    enumerate_worktrees_seamed(
+        root,
+        &mut canonical_facts_for_repo,
+        &mut capture_worktree_in,
+        on_row,
+    );
+}
+
+/// The per-row computation [`enumerate_worktrees_seamed`] calls.
+type CaptureRow<'a> = dyn FnMut(&str, &Path, &CanonicalFacts, &mut super::census_memo::WalkMemo) -> WorktreeCensus
+    + 'a;
+
+/// [`enumerate_worktrees_with`] with the per-repo and per-row computations
+/// injected, so a test can count how often each runs over a real layout.
+fn enumerate_worktrees_seamed(
+    root: &Path,
+    canonical_facts: &mut dyn FnMut(&str, &mut super::census_memo::WalkMemo) -> CanonicalFacts,
+    capture: &mut CaptureRow<'_>,
+    on_row: &mut dyn FnMut(WorktreeCensus),
+) -> super::census_memo::WalkMemo {
+    // One memo per walk: trunk refs can move between walks (a fetch, a
+    // `remote set-head`), and each repo's rows follow its own `fetch_trunk`.
+    let mut memo = super::census_memo::WalkMemo::default();
     // Discover the governed repos: every top-level `qontinui-*` dir with
     // a `.git` (matches fleet::tree_publisher's notion of a governed
     // repo, but here it's the canonical checkout we anchor the worktree
@@ -2570,7 +2710,20 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
         // fresh for EVERY worktree of the repo below. Best-effort: on
         // failure the walk proceeds against the staler trunk, exactly as it
         // did before this call existed.
-        fetch_trunk(canonical);
+        // The trunk NAME is resolved once for the refspec; its commit is read
+        // AFTER the fetch, by the memo, so every row of this repo compares
+        // against the refreshed trunk.
+        let trunk = resolve_trunk_ref(canonical);
+        fetch_trunk(canonical, trunk.as_deref());
+        // Seed the memo for this repo's common dir with the name just
+        // resolved, so the walk does not resolve it a second time.
+        let _ = memo.trunk_for(canonical, &mut |dir: &Path| {
+            let name = trunk.clone()?;
+            let oid = git_capture(dir, &["rev-parse", "--verify", "--quiet", &name])
+                .filter(|s| !s.is_empty());
+            Some(super::census_memo::Trunk { name, oid })
+        });
+        let facts = canonical_facts(repo, &mut memo);
 
         let mut candidates: Vec<PathBuf> = Vec::new();
         candidates.extend(git_registered_worktrees(canonical));
@@ -2587,9 +2740,10 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
             if !seen.insert(key) {
                 continue;
             }
-            on_row(capture_worktree(repo, &wt));
+            on_row(capture(repo, &wt, &facts, &mut memo));
         }
     }
+    memo
 }
 
 // ---------------------------------------------------------------------------
@@ -3102,10 +3256,10 @@ pub fn spawn_volume_publisher() {
 /// Spawn the periodic census task on the ambient tokio runtime.
 ///
 /// Interval read from `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS` (default
-/// 300s, floored at 30s). `MissedTickBehavior::Skip` matches
-/// `fleet::spawn_heartbeat` / `fleet::spawn_tree_publisher` — a system
-/// suspend skips catch-up rather than blasting back-to-back ticks.
-/// Failures `warn!` and retry on the next tick; the loop never panics.
+/// 300s, floored at 30s), measured from the END of each walk
+/// ([`paced_census_loop`]), so a walk longer than the interval can never run
+/// back to back. Failures `warn!` and retry on the next cycle; the loop never
+/// panics.
 ///
 /// Each tick runs [`build_and_publish`], which streams the census to coord in
 /// bounded chunks DURING the walk — there is no separate whole-walk POST any
@@ -3139,22 +3293,59 @@ pub fn spawn_census() {
     );
 
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut shed = crate::resource_guard::BackgroundShed::new(
-            "worktree_census",
-            crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
-        );
-        loop {
-            tick.tick().await;
-            census_cycle(
-                &mut shed,
-                &crate::resource_guard::background_work_verdict(),
-                build_and_publish,
-            )
-            .await;
-        }
+        let mut tick = PeriodicCensus {
+            shed: crate::resource_guard::BackgroundShed::new(
+                "worktree_census",
+                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+            ),
+        };
+        paced_census_loop(Duration::from_secs(secs), None, &mut tick).await;
     });
+}
+
+/// One unit of work [`paced_census_loop`] repeats.
+trait PacedCycle {
+    fn run(&mut self) -> impl std::future::Future<Output = ()> + Send + '_;
+}
+
+/// The production cycle: the shed-gated census walk.
+struct PeriodicCensus {
+    shed: crate::resource_guard::BackgroundShed,
+}
+
+impl PacedCycle for PeriodicCensus {
+    async fn run(&mut self) {
+        let verdict = crate::resource_guard::background_work_verdict();
+        census_cycle(&mut self.shed, &verdict, build_and_publish).await;
+    }
+}
+
+/// The census cadence: run `cycle`, then wait one full `interval` measured
+/// from the moment the cycle ENDED, and repeat (`max_cycles` bounds it for a
+/// test; production passes `None`).
+///
+/// It used to be a fixed `interval` tick with `MissedTickBehavior::Skip`. A
+/// walk longer than the interval (measured 2026-10-23 on spaceship: 1,920
+/// rows in 3,152 s against a 300 s tick) then restarted on the next tick
+/// boundary, so the walk ran back to back and its git spawn RATE was bounded
+/// only by how fast processes start — making each row cheaper would only have
+/// made the walk restart sooner. Pacing from the end makes the gap a full
+/// interval whatever the walk costs, so a cheaper row is a lower rate.
+/// Plan `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` D1.
+async fn paced_census_loop<C: PacedCycle>(
+    interval: Duration,
+    max_cycles: Option<usize>,
+    cycle: &mut C,
+) {
+    let mut ran = 0usize;
+    loop {
+        cycle.run().await;
+        ran += 1;
+        if max_cycles.is_some_and(|m| ran >= m) {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// One periodic census tick: consult the background-work verdict at the HEAD
@@ -5422,5 +5613,243 @@ mod tests {",
             "coord deserializes is_dirty as a plain bool; null would fail the \
              whole census body"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-
+    // fetch-into-empty-dirs, Phase 1: per-repo facts once per repo per walk,
+    // the trunk once per common dir, no git where git provably fails.
+    // -----------------------------------------------------------------
+
+    /// A real canonical checkout `<root>/qontinui-probe` (with an
+    /// `origin/main` at HEAD) plus two linked worktrees of it, one of them a
+    /// `-wt-` sibling. Returns the canonical path and the two worktree paths.
+    fn walk_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let canonical = root.join("qontinui-probe");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let wt_a = root.join("qontinui-probe-wt-a");
+        let wt_b = root.join("elsewhere-b");
+        {
+            let git = trunk_fixture(&canonical);
+            let head = git_capture(&canonical, &["rev-parse", "HEAD"]).unwrap();
+            git(&["update-ref", "refs/remotes/origin/main", &head]);
+            git(&["worktree", "add", "-q", "-b", "a", wt_a.to_str().unwrap()]);
+            git(&["worktree", "add", "-q", "-b", "b", wt_b.to_str().unwrap()]);
+        }
+        (canonical, wt_a, wt_b)
+    }
+
+    #[test]
+    fn canonical_facts_are_computed_once_per_repo_per_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_canonical, _a, _b) = walk_fixture(tmp.path());
+
+        let mut facts_calls = 0usize;
+        let mut rows = 0usize;
+        let mut facts = |_: &str, _: &mut super::super::census_memo::WalkMemo| {
+            facts_calls += 1;
+            CanonicalFacts {
+                current_branch: Some("main".to_string()),
+                is_dirty: Some(false),
+                base_divergence: None,
+            }
+        };
+        let mut seen_branch: Vec<Option<String>> = Vec::new();
+        let mut capture =
+            |repo: &str,
+             wt: &Path,
+             f: &CanonicalFacts,
+             memo: &mut super::super::census_memo::WalkMemo| {
+                capture_worktree_in(repo, wt, f, memo)
+            };
+        let memo = enumerate_worktrees_seamed(tmp.path(), &mut facts, &mut capture, &mut |row| {
+            rows += 1;
+            seen_branch.push(row.canonical_current_branch.clone());
+        });
+
+        // canonical + two linked worktrees = 3 rows, ONE canonical-facts call.
+        assert_eq!(rows, 3, "every worktree of the repo is still a row");
+        assert_eq!(
+            facts_calls, 1,
+            "canonical facts must be computed once per repo"
+        );
+        // Every row carries the repo's facts.
+        assert!(seen_branch.iter().all(|b| b.as_deref() == Some("main")));
+        // The trunk is resolved once for the repo's common dir: the walk's own
+        // seed after `fetch_trunk`, and every row served from the memo.
+        assert_eq!(memo.resolutions, 1, "trunk resolved once per common dir");
+    }
+
+    #[test]
+    fn the_walk_still_answers_landed_in_main_per_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_canonical, wt_a, _b) = walk_fixture(tmp.path());
+        // An unlanded commit on worktree `a` only.
+        std::fs::write(wt_a.join("new.txt"), b"z").unwrap();
+        for args in [
+            &["add", "new.txt"][..],
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "c2",
+            ][..],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&wt_a)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        let mut landed: std::collections::HashMap<String, Option<bool>> =
+            std::collections::HashMap::new();
+        let mut facts =
+            |_: &str, _: &mut super::super::census_memo::WalkMemo| CanonicalFacts::default();
+        let mut capture =
+            |repo: &str,
+             wt: &Path,
+             f: &CanonicalFacts,
+             memo: &mut super::super::census_memo::WalkMemo| {
+                capture_worktree_in(repo, wt, f, memo)
+            };
+        let _ = enumerate_worktrees_seamed(tmp.path(), &mut facts, &mut capture, &mut |row| {
+            let name = Path::new(&row.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            landed.insert(name, row.landed_in_main);
+        });
+        assert_eq!(landed.get("qontinui-probe"), Some(&Some(true)));
+        assert_eq!(landed.get("elsewhere-b"), Some(&Some(true)));
+        assert_eq!(
+            landed.get("qontinui-probe-wt-a"),
+            Some(&Some(false)),
+            "a shared trunk must not leak one row's answer into another"
+        );
+    }
+
+    #[test]
+    fn the_landed_memo_answers_without_asking_git() {
+        // Plant an answer git would contradict; a hit proves the memo is read.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let git = trunk_fixture(path);
+        let base = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+        std::fs::write(path.join("b.txt"), b"y").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(compute_landed_in_main(path), Some(false), "premise");
+
+        let common = qontinui_runner_lib::git_layout::common_dir_key(path).unwrap();
+        super::super::census_memo::LandedMemo::global().put(&common, &head, &base, true);
+        let mut memo = super::super::census_memo::WalkMemo::default();
+        assert_eq!(landed_for_row(path, Some(&head), &mut memo), Some(true));
+    }
+
+    #[test]
+    fn a_measured_landed_answer_is_memoised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let git = trunk_fixture(path);
+        let base = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+        let common = qontinui_runner_lib::git_layout::common_dir_key(path).unwrap();
+        let landed = super::super::census_memo::LandedMemo::global();
+        assert_eq!(landed.get(&common, &base, &base), None);
+        let mut memo = super::super::census_memo::WalkMemo::default();
+        assert_eq!(landed_for_row(path, Some(&base), &mut memo), Some(true));
+        assert_eq!(landed.get(&common, &base, &base), Some(true));
+    }
+
+    #[test]
+    fn a_dangling_gitdir_row_spawns_no_git_and_reads_unknown_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("pruned");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", tmp.path().join("gone").display()),
+        )
+        .unwrap();
+        let mut memo = super::super::census_memo::WalkMemo::default();
+        let row = capture_worktree_in("qontinui-probe", &wt, &CanonicalFacts::default(), &mut memo);
+        assert_eq!(row.branch, None);
+        assert_eq!(row.head_sha, None);
+        assert_eq!(row.landed_in_main, None);
+        // The verdict a failed `git status` gets on a tree that HAS a `.git`:
+        // UNKNOWN, published as the fail-closed `true`.
+        assert!(row.is_dirty);
+        assert!(!row.is_dirty_known);
+        // No trunk was resolved for it — not even one call.
+        assert_eq!(memo.resolutions, 0);
+    }
+
+    #[test]
+    fn a_live_tree_is_unaffected_by_the_absent_shortcut() {
+        // Negative twin: a real repo still gets every probe.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let git = trunk_fixture(path);
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        let mut memo = super::super::census_memo::WalkMemo::default();
+        let row = capture_worktree_in(
+            "qontinui-probe",
+            path,
+            &CanonicalFacts::default(),
+            &mut memo,
+        );
+        assert_eq!(row.head_sha.as_deref(), Some(head.as_str()));
+        assert!(row.branch.is_some());
+        assert_eq!(row.landed_in_main, Some(true));
+        assert!(row.is_dirty_known);
+    }
+
+    struct CountingCycle {
+        starts: Vec<tokio::time::Instant>,
+        work: Duration,
+    }
+
+    impl PacedCycle for CountingCycle {
+        async fn run(&mut self) {
+            self.starts.push(tokio::time::Instant::now());
+            tokio::time::sleep(self.work).await;
+        }
+    }
+
+    #[test]
+    fn the_census_waits_a_full_interval_after_each_walk_ends() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A walk (10 min) far longer than the interval (5 min) — the
+            // measured shape. A fixed tick would restart it at once.
+            let mut c = CountingCycle {
+                starts: Vec::new(),
+                work: Duration::from_secs(600),
+            };
+            paced_census_loop(Duration::from_secs(300), Some(3), &mut c).await;
+            assert_eq!(c.starts.len(), 3);
+            for w in c.starts.windows(2) {
+                assert_eq!(
+                    w[1] - w[0],
+                    Duration::from_secs(900),
+                    "next walk starts one interval after the previous one ENDED"
+                );
+            }
+        });
     }
 }
