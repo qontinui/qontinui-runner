@@ -1782,13 +1782,19 @@ impl TerminalSession {
         }
         // Permission auto-accept (plan
         // `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`):
-        // a per-spawn secret the carrier's PermissionRequest hook requires the
-        // runner's pad to ECHO before it answers a dialog. Set AFTER the
-        // caller's env so neither a caller nor an inherited copy (a runner
-        // started inside a runner session) can plant a known value. Recorded
-        // as this terminal's grant once the child is up, below.
+        // two per-spawn secrets for the carrier's PermissionRequest hook: the
+        // request key it SENDS to the runner's pad, and the nonce the pad must
+        // ECHO before the hook answers a dialog (the key is derived one-way
+        // from the nonce, so whoever receives a request cannot forge the echo).
+        // Set AFTER the caller's env so neither a caller nor an inherited copy
+        // (a runner started inside a runner session) can plant a known value.
+        // Recorded as this terminal's grant once the child is up, below.
         let permreq_nonce = crate::session::permission_accept::new_nonce();
         cmd.env(crate::session::permission_accept::NONCE_ENV, &permreq_nonce);
+        cmd.env(
+            crate::session::permission_accept::REQUEST_KEY_ENV,
+            crate::session::permission_accept::request_key_for(&permreq_nonce),
+        );
 
         // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
         // placed into the PTY env — the caller pin wins, else the credential-

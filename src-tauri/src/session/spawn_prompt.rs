@@ -1981,10 +1981,15 @@ mod script_tests {
     /// requires the pad's exact echo.
     const PR_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
-    const PR_SEAM: [(&str, &str); 3] = [
+    /// The per-spawn request key the hook SENDS (the runner derives it from
+    /// the nonce; the hook only checks its shape).
+    const PR_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    const PR_SEAM: [(&str, &str); 4] = [
         ("QONTINUI_RUNNER_API_PORT", "9876"),
         ("QONTINUI_TERMINAL_ID", "term-1"),
         ("QONTINUI_PERMREQ_NONCE", PR_NONCE),
+        ("QONTINUI_PERMREQ_KEY", PR_KEY),
     ];
 
     /// The pad's allow answer for `PR_NONCE`'s terminal, as a fake-curl tail.
@@ -2052,6 +2057,15 @@ mod script_tests {
                 allow.curl_args
             );
         }
+        // The request key rides a header; the nonce never leaves.
+        assert!(
+            allow
+                .curl_args
+                .iter()
+                .any(|a| a == &format!("X-Qontinui-Permreq-Key: {PR_KEY}")),
+            "{:?}",
+            allow.curl_args
+        );
         let at = |f: &str| allow.curl_args.iter().position(|a| a == f).unwrap();
         assert_eq!(allow.curl_args[at("--connect-timeout") + 1], "1");
         assert_eq!(allow.curl_args[at("--max-time") + 1], "1");
@@ -2064,6 +2078,7 @@ mod script_tests {
                 ("QONTINUI_INSTALL_INTERCEPT_PORT", "9999"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 ("QONTINUI_PERMREQ_NONCE", PR_NONCE),
+                ("QONTINUI_PERMREQ_KEY", PR_KEY),
             ],
             fake_curl(&tail),
         );
@@ -2107,44 +2122,71 @@ mod script_tests {
     fn the_permission_request_hook_is_silent_without_its_seam() {
         let tail = allow_tail(PR_NONCE);
         let n = ("QONTINUI_PERMREQ_NONCE", PR_NONCE);
+        let k = ("QONTINUI_PERMREQ_KEY", PR_KEY);
         for envs in [
-            vec![("QONTINUI_TERMINAL_ID", "term-1"), n],
-            vec![("QONTINUI_RUNNER_API_PORT", "9876"), n],
+            vec![("QONTINUI_TERMINAL_ID", "term-1"), n, k],
+            vec![("QONTINUI_RUNNER_API_PORT", "9876"), n, k],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "98x6"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 n,
+                k,
             ],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "../x"),
                 n,
+                k,
             ],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "a/b"),
                 n,
+                k,
             ],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", ".."),
                 n,
+                k,
             ],
             // No nonce, a non-hex nonce, a too-short nonce: nothing to check
             // an echo against, so curl is never even called.
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
+                k,
             ],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 ("QONTINUI_PERMREQ_NONCE", "0123456789abcdef0123456789abcdeZ"),
+                k,
             ],
             vec![
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 ("QONTINUI_PERMREQ_NONCE", "abc123"),
+                k,
+            ],
+            // No key, a non-hex key (it would be a header line), a too-short
+            // key: the pad could never answer allow, so curl is never called.
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", "abababababababab\r\nX-Evil: 1"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", "abc123"),
             ],
         ] {
             let run = run_pr_hook(&envs, fake_curl(&tail));
@@ -2174,6 +2216,7 @@ mod script_tests {
                 ("QONTINUI_RUNNER_API_PORT", port.to_string()),
                 ("QONTINUI_TERMINAL_ID", "term-1".to_string()),
                 ("QONTINUI_PERMREQ_NONCE", PR_NONCE.to_string()),
+                ("QONTINUI_PERMREQ_KEY", PR_KEY.to_string()),
             ]
         };
 
@@ -2286,6 +2329,11 @@ mod script_tests {
         );
         assert_eq!(body, PR_PAYLOAD, "the payload is forwarded verbatim");
         assert!(!head.contains(PR_NONCE), "the nonce is never sent: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("x-qontinui-permreq-key: {PR_KEY}")),
+            "the request key is sent: {head}"
+        );
         assert!(!head.to_ascii_lowercase().contains("expect:"), "{head}");
 
         // A squatter answering allow with no (or a guessed) nonce: nothing.

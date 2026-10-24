@@ -1657,9 +1657,12 @@ async fn operator_touch_notification(
 /// logged by its capture class key alone, never the command or its arguments.
 ///
 /// An `allow` is answered only for a terminal THIS runner process spawned, and
-/// it ECHOES that terminal's per-spawn nonce (`"nonce"`), which the hook
-/// requires next to `"decision":"allow"` — so whatever squats the loopback port
-/// while the runner is down cannot answer a prompt. `"decision_reason"` is a
+/// only when the request carries that terminal's request key in
+/// `X-Qontinui-Permreq-Key`; it then ECHOES the terminal's per-spawn nonce
+/// (`"nonce"`), which the hook requires next to `"decision":"allow"`. The key
+/// is derived one-way from the nonce, so whatever squats the loopback port
+/// while the runner is down cannot answer a prompt, and a caller without the
+/// key can neither harvest a nonce nor move the accept count. `"decision_reason"` is a
 /// fixed label saying why (never payload content).
 ///
 /// The body limit is raised to [`PERMISSION_REQUEST_BODY_LIMIT`] on this route:
@@ -1688,8 +1691,11 @@ async fn permission_request(
     // 1. Record the capture — before, and independently of, the decision.
     let outcome = crate::session::permission_prompt_capture::observe_permission_request(&id, &body);
     let class = outcome.class();
-    // 2. Decide.
-    let decision = permission_accept::decide(&id, &body);
+    // 2. Decide. The hook proves which terminal it is with the request key.
+    let presented_key = headers
+        .get(permission_accept::REQUEST_KEY_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let decision = permission_accept::decide(&id, presented_key, &body);
     if decision.verdict == AcceptVerdict::Allow {
         permission_accept::record_accept();
         // The class key is the ONLY thing logged about the prompt; the id is
@@ -2894,6 +2900,28 @@ mod permission_prompt_capture_route_tests {
         assert_eq!(class_count(&class.dossier_slug), before + 1);
     }
 
+    /// POST `body` carrying `key` in the hook's request-key header.
+    async fn post_keyed(
+        app: Router,
+        uri: &str,
+        body: String,
+        key: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(crate::session::permission_accept::REQUEST_KEY_HEADER, key)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
     async fn send(
         app: Router,
         method: &str,
@@ -3102,13 +3130,38 @@ mod permission_prompt_capture_route_tests {
             crate::session::permission_accept::register_terminal_grant(term, nonce.clone(), None);
         }
 
+        let key = crate::session::permission_accept::request_key_for(&nonce);
+
         pin.set("on");
-        let before_count = class_count(&class.dossier_slug);
+        // Without the terminal's request key the SAME prompt is recorded but
+        // answered none: no nonce is echoed and nothing is counted.
         let before_accepts = accept_count();
         let (status, body) = post_json(
             permission_request_app(),
             "/sessions/term-decide-on/permission-request",
             payload.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decision"], "none", "keyless: {body}");
+        assert!(body.get("nonce").is_none(), "keyless: {body}");
+        assert_eq!(
+            body["decision_reason"],
+            "request key does not match the terminal's grant"
+        );
+        assert_eq!(
+            accept_count(),
+            before_accepts,
+            "a keyless post is not counted"
+        );
+
+        let before_count = class_count(&class.dossier_slug);
+        let before_accepts = accept_count();
+        let (status, body) = post_keyed(
+            permission_request_app(),
+            "/sessions/term-decide-on/permission-request",
+            payload.to_string(),
+            &key,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -3121,10 +3174,11 @@ mod permission_prompt_capture_route_tests {
 
         pin.set("off");
         let before_accepts = accept_count();
-        let (status, body) = post_json(
+        let (status, body) = post_keyed(
             permission_request_app(),
             "/sessions/term-decide-off/permission-request",
             payload.to_string(),
+            &key,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -3135,10 +3189,11 @@ mod permission_prompt_capture_route_tests {
         assert_eq!(accept_count(), before_accepts, "a none is not counted");
 
         pin.set_unanswered();
-        let (_, body) = post_json(
+        let (_, body) = post_keyed(
             permission_request_app(),
             "/sessions/term-decide-cold/permission-request",
             payload.to_string(),
+            &key,
         )
         .await;
         assert_eq!(body["decision"], "none", "unanswered is none: {body}");
@@ -3159,7 +3214,7 @@ mod permission_prompt_capture_route_tests {
             .find("observe_permission_request(&id, &body)")
             .expect("the pad records the capture");
         let decide_at = handler
-            .find("permission_accept::decide(&id, &body)")
+            .find("permission_accept::decide(&id, presented_key, &body)")
             .expect("the pad decides");
         assert!(capture_at < decide_at, "the capture is recorded FIRST");
         for term in ["term-decide-on", "term-decide-off", "term-decide-cold"] {
@@ -3253,7 +3308,11 @@ mod permission_prompt_capture_route_tests {
                 .env("PATH", std::env::var("PATH").unwrap_or_default())
                 .env("QONTINUI_RUNNER_API_PORT", port.to_string())
                 .env("QONTINUI_TERMINAL_ID", term)
-                .env(crate::session::permission_accept::NONCE_ENV, &nonce);
+                .env(crate::session::permission_accept::NONCE_ENV, &nonce)
+                .env(
+                    crate::session::permission_accept::REQUEST_KEY_ENV,
+                    crate::session::permission_accept::request_key_for(&nonce),
+                );
             let out = tokio::task::spawn_blocking(move || {
                 crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(30))
             })
@@ -3283,11 +3342,20 @@ mod permission_prompt_capture_route_tests {
     async fn the_pad_answers_none_on_garbage_and_on_a_browser_origin() {
         let pin = crate::mcp::fleet_policy_poller::pin_permission_auto_accept_for_test();
         pin.set("on");
+        // Both terminals hold a grant and every post carries the right key, so
+        // ONLY the payload can make these `none` (without a grant the grant
+        // check alone would answer none, and the D3 cases would prove nothing).
+        let nonce = crate::session::permission_accept::new_nonce();
+        let key = crate::session::permission_accept::request_key_for(&nonce);
+        for term in ["term-decide-garbage", "term-decide-never"] {
+            crate::session::permission_accept::register_terminal_grant(term, nonce.clone(), None);
+        }
         for body in ["", "not json", "{}", "[]", "{\"hook_event_name\":\"Stop\"}"] {
-            let (status, json) = post_json(
+            let (status, json) = post_keyed(
                 permission_request_app(),
                 "/sessions/term-decide-garbage/permission-request",
                 body.to_string(),
+                &key,
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body:?} -> {json}");
@@ -3306,19 +3374,43 @@ mod permission_prompt_capture_route_tests {
         assert_eq!(json["recorded"], false, "{json}");
 
         // The never-answered classes travel through the pad too.
+        let mut absent_mode = decision_payload("Bash", "default");
+        absent_mode
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_mode");
         for payload in [
             decision_payload("AskUserQuestion", "default"),
             decision_payload("ExitPlanMode", "plan"),
             decision_payload("Bash", "plan"),
             decision_payload("Bash", "dontAsk"),
+            absent_mode,
         ] {
-            let (_, json) = post_json(
+            let (_, json) = post_keyed(
                 permission_request_app(),
                 "/sessions/term-decide-never/permission-request",
                 payload.to_string(),
+                &key,
             )
             .await;
             assert_eq!(json["decision"], "none", "{payload} -> {json}");
+            assert_eq!(
+                json["decision_reason"], "verdict none",
+                "{payload} -> {json}"
+            );
+        }
+        // The control: the same terminal, key and dial answer an ordinary
+        // prompt allow, so the `none`s above came from the payload alone.
+        let (_, json) = post_keyed(
+            permission_request_app(),
+            "/sessions/term-decide-never/permission-request",
+            decision_payload("Qzx7NeverControlTool", "default").to_string(),
+            &key,
+        )
+        .await;
+        assert_eq!(json["decision"], "allow", "control: {json}");
+        for term in ["term-decide-garbage", "term-decide-never"] {
+            crate::session::permission_accept::forget_terminal_grant(term, &nonce);
         }
     }
 

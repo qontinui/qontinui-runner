@@ -307,11 +307,12 @@ fn control_response_for(request_id: &str, subtype: &str, denies: bool) -> Outgoi
 /// In bypass permissions mode we approve everything, unless the tenant's
 /// permission auto-accept dial is answered `off` — see [`control_response_for`].
 ///
-/// **The deny arm is INERT on today's launch arguments.** Claude Code sends a
-/// `can_use_tool` control request only to a session started with
-/// `--permission-prompt-tool stdio`, and no runner launch path passes that
-/// flag (these sessions run in `bypassPermissions`), so no `can_use_tool`
-/// reaches this function today. The arm exists so the tenant switch holds the
+/// **The deny arm is believed INERT on today's launch arguments.** As far as
+/// the Claude Agent SDK's permission flow is understood here (not measured
+/// against a live Claude Code by this change), a `can_use_tool` control
+/// request is sent to a session started with `--permission-prompt-tool stdio`,
+/// and no runner launch path passes that flag (these sessions run in
+/// `bypassPermissions`), so no `can_use_tool` is expected here today. The arm exists so the tenant switch holds the
 /// day a launch path does pass it. Its wire shape (`behavior: "deny"` +
 /// `message`, beside the `allowed` mirror) follows the runner's existing allow
 /// envelope and Claude Code's documented permission result; it is NOT pinned
