@@ -3525,6 +3525,19 @@ where
 /// the backend and gated by `relay_path_policy` — as a browser page, and
 /// refuse it (plan `2026-09-17-runner-loopback-api-accepts-any-origin`, F4).
 /// The self-call is a NonBrowser request and must look like one.
+///
+/// `cookie` and `authorization` are the END USER's ambient credentials to the
+/// web backend — the browser's session cookie (carrying `access_token`, a
+/// Cognito bearer) and the user's bearer. The runner trusts its own relay
+/// channel, never the end user's credentials, and neither it nor anything on
+/// its box that reads its logs may receive a replayable web credential. The web
+/// backend already drops them (qontinui-web `device_bridge_ws.py`
+/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS`); this is defense in depth against an
+/// older backend still forwarding them. No runner handler reads either header
+/// from a relayed caller: the routes that read `Authorization` want a session
+/// proxy nonce and none of them is on `RELAY_ALLOWED`, and no route reads a
+/// cookie at all (plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`,
+/// F5 / Phase 5).
 const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3532,6 +3545,8 @@ const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "content-length",
     "origin",
     "sec-fetch-site",
+    "cookie",
+    "authorization",
 ];
 
 /// Hop-by-hop / framing response headers that must NOT be echoed back over
@@ -7104,6 +7119,53 @@ mod tests {
             parsed["sec_fetch_site"],
             Value::Null,
             "sec-fetch-site must not reach it either"
+        );
+        assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
+    }
+
+    /// Plan `2026-09-17-retire-the-runner-origin-guard-dev-grace` Phase 5
+    /// acceptance test 3: a relayed frame carrying the browser's ambient
+    /// credentials (`cookie`, `authorization`) must reach the loopback
+    /// self-call with neither, while an ordinary header still passes — so the
+    /// test cannot go green by stripping every header.
+    #[tokio::test]
+    async fn relay_strips_ambient_cookie_and_authorization() {
+        async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let body = json!({
+                "cookie": headers.get("cookie").and_then(|v| v.to_str().ok()),
+                "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
+                "x_test": headers.get("x-test").and_then(|v| v.to_str().ok()),
+            })
+            .to_string();
+            (AxumStatus::OK, [("content-type", "application/json")], body)
+        }
+        // `/status` is RELAY_ALLOWED (see the GET round trip above).
+        let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-ambient-cred",
+            "method": "GET",
+            "path": "/status",
+            "headers": {
+                "Cookie": "access_token=x",
+                "Authorization": "Bearer y",
+                "x-test": "kept"
+            },
+            "body_b64": ""
+        });
+        let reply = relay_http_to_base(&base, &env).await;
+        assert_eq!(reply["status"], 200);
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["cookie"],
+            Value::Null,
+            "cookie must not reach the loopback call"
+        );
+        assert_eq!(
+            parsed["authorization"],
+            Value::Null,
+            "authorization must not reach the loopback call"
         );
         assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
