@@ -823,6 +823,7 @@ mod tests {
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
+                    ping: crate::ui_error::PingAsk::NONE,
                 }),
                 no_ping_evidence(),
             ),
@@ -943,6 +944,15 @@ mod tests {
             pong_age_ms: 2_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 400_000,
+            // Pings sent and unanswered for longer than the window, still
+            // being sent — the "asked and nobody answered" reading
+            // `events_undelivered` requires since the 2026-10-19 ui-wedge plan.
+            ping: crate::ui_error::PingAsk {
+                last_ok: 1_700_000_398_000,
+                last_ok_age_ms: 2_000,
+                first_unanswered: 1_700_000_001_000,
+                first_unanswered_age_ms: 399_000,
+            },
         });
         let payload = HeartbeatPayload {
             hostname: "test-host".to_string(),
@@ -1011,6 +1021,7 @@ mod tests {
             pong_age_ms: 600_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 600_000,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         // The 2026-09-01 storm, as it stands on the wire: emits failing right
         // now, a death verdict suppressed 49 times.
@@ -1047,6 +1058,7 @@ mod tests {
             pong_age_ms: 0,
             last_event_pong: 0,
             event_pong_age_ms: 0,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
             .expect("serializes");
@@ -1083,6 +1095,7 @@ mod tests {
             pong_age_ms: 600_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 600_000,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         const NOW: u64 = 1_800_000_000_000;
         let ping = crate::ui_error::classify_ping_delivery_report(
@@ -1126,6 +1139,7 @@ mod tests {
             pong_age_ms: 0,
             last_event_pong: 0,
             event_pong_age_ms: 0,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
             .expect("serializes");
@@ -1168,6 +1182,7 @@ mod tests {
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
+                    ping: crate::ui_error::PingAsk::NONE,
                 }),
                 no_ping_evidence(),
             ),
