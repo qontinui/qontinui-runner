@@ -59,14 +59,23 @@ struct Entry {
     bytes: u64,
 }
 
-fn memo() -> &'static Mutex<HashMap<PathBuf, Entry>> {
-    static M: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(HashMap::new()))
+/// The memo's storage. Production uses the one process-global instance
+/// ([`memo`]); a test builds its own, so a `clear` in one test can never
+/// empty another's entries.
+type Memo = Mutex<HashMap<PathBuf, Entry>>;
+
+fn memo() -> &'static Memo {
+    static M: OnceLock<Memo> = OnceLock::new();
+    M.get_or_init(Memo::default)
 }
 
 /// Forget every memoised size — an explicit refresh asked for fresh numbers.
 pub(super) fn clear() {
-    memo().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    clear_in(memo());
+}
+
+fn clear_in(m: &Memo) {
+    m.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
 /// The byte total for `dir`: the memoised one when it was measured within the
@@ -75,10 +84,11 @@ pub(super) fn clear() {
 /// as 0, as before, and never memoised.
 pub(super) fn bytes_or_measure(dir: &Path, measure: impl FnOnce() -> Option<u64>) -> u64 {
     let dir_mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
-    bytes_or_measure_at(dir, Instant::now(), dir_mtime, ttl(), measure)
+    bytes_or_measure_in(memo(), dir, Instant::now(), dir_mtime, ttl(), measure)
 }
 
-fn bytes_or_measure_at(
+fn bytes_or_measure_in(
+    m: &Memo,
     dir: &Path,
     now: Instant,
     dir_mtime: Option<SystemTime>,
@@ -89,7 +99,7 @@ fn bytes_or_measure_at(
         return measure().unwrap_or(0);
     }
     {
-        let map = memo().lock().unwrap_or_else(|p| p.into_inner());
+        let map = m.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(e) = map.get(dir) {
             // An unknown mtime never matches: no shared answer it cannot justify.
             let unchanged = dir_mtime.is_some() && e.dir_mtime == dir_mtime;
@@ -101,7 +111,7 @@ fn bytes_or_measure_at(
     let Some(bytes) = measure() else {
         return 0;
     };
-    let mut map = memo().lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = m.lock().unwrap_or_else(|p| p.into_inner());
     if map.len() >= SIZE_MEMO_CAP {
         map.clear();
     }
@@ -120,13 +130,6 @@ fn bytes_or_measure_at(
 mod tests {
     use super::*;
 
-    /// `clear()` empties the one process-global memo, so the tests here run
-    /// one at a time: a parallel `clear()` would empty another test's entry.
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
     fn unique(tag: &str) -> PathBuf {
         PathBuf::from(format!(
             "/census-size-memo-test/{tag}/{}/{:?}",
@@ -141,16 +144,16 @@ mod tests {
 
     #[test]
     fn a_fresh_entry_is_served_without_measuring() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("fresh");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(100)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(100)),
             100
         );
         let mut called = false;
-        let got = bytes_or_measure_at(&d, t0 + Duration::from_secs(10), mtime(1), ttl, || {
+        let got = bytes_or_measure_in(&m, &d, t0 + Duration::from_secs(10), mtime(1), ttl, || {
             called = true;
             Some(999)
         });
@@ -160,88 +163,109 @@ mod tests {
 
     #[test]
     fn an_expired_entry_is_measured_again() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("expired");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(60);
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(100)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(100)),
             100
         );
         let t1 = t0 + Duration::from_secs(61);
         assert_eq!(
-            bytes_or_measure_at(&d, t1, mtime(1), ttl, || Some(250)),
+            bytes_or_measure_in(&m, &d, t1, mtime(1), ttl, || Some(250)),
             250
         );
         let t2 = t0 + Duration::from_secs(62);
-        assert_eq!(bytes_or_measure_at(&d, t2, mtime(1), ttl, || Some(7)), 250);
+        assert_eq!(
+            bytes_or_measure_in(&m, &d, t2, mtime(1), ttl, || Some(7)),
+            250
+        );
     }
 
     #[test]
     fn a_changed_directory_is_measured_again_inside_the_ttl() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("changed");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(100)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(100)),
             100
         );
         // A child added or removed (a clean + rebuild) moved the dir's mtime.
-        assert_eq!(bytes_or_measure_at(&d, t0, mtime(2), ttl, || Some(5)), 5);
+        assert_eq!(
+            bytes_or_measure_in(&m, &d, t0, mtime(2), ttl, || Some(5)),
+            5
+        );
         // An unknown mtime never matches a memoised one.
-        assert_eq!(bytes_or_measure_at(&d, t0, None, ttl, || Some(6)), 6);
-        assert_eq!(bytes_or_measure_at(&d, t0, None, ttl, || Some(8)), 8);
+        assert_eq!(bytes_or_measure_in(&m, &d, t0, None, ttl, || Some(6)), 6);
+        assert_eq!(bytes_or_measure_in(&m, &d, t0, None, ttl, || Some(8)), 8);
     }
 
     #[test]
     fn an_unmeasured_size_is_reported_as_zero_and_never_memoised() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("unmeasured");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
-        assert_eq!(bytes_or_measure_at(&d, t0, mtime(1), ttl, || None), 0);
-        assert_eq!(bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(42)), 42);
+        assert_eq!(bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || None), 0);
+        assert_eq!(
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(42)),
+            42
+        );
     }
 
     #[test]
     fn clear_forgets_every_memoised_size() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("clear");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(100)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(100)),
             100
         );
-        clear();
-        assert_eq!(bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(3)), 3);
+        clear_in(&m);
+        assert_eq!(
+            bytes_or_measure_in(&m, &d, t0, mtime(1), ttl, || Some(3)),
+            3
+        );
     }
 
     #[test]
     fn a_zero_ttl_disables_the_memo() {
-        let _serial = serial();
+        let m = Memo::default();
         let d = unique("zero");
         let t0 = Instant::now();
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), Duration::ZERO, || Some(1)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), Duration::ZERO, || Some(1)),
             1
         );
         assert_eq!(
-            bytes_or_measure_at(&d, t0, mtime(1), Duration::ZERO, || Some(2)),
+            bytes_or_measure_in(&m, &d, t0, mtime(1), Duration::ZERO, || Some(2)),
             2
         );
     }
 
     #[test]
     fn entries_are_per_path() {
-        let _serial = serial();
+        let m = Memo::default();
         let a = unique("a");
         let b = unique("b");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
-        assert_eq!(bytes_or_measure_at(&a, t0, mtime(1), ttl, || Some(10)), 10);
-        assert_eq!(bytes_or_measure_at(&b, t0, mtime(1), ttl, || Some(20)), 20);
-        assert_eq!(bytes_or_measure_at(&a, t0, mtime(1), ttl, || Some(0)), 10);
+        assert_eq!(
+            bytes_or_measure_in(&m, &a, t0, mtime(1), ttl, || Some(10)),
+            10
+        );
+        assert_eq!(
+            bytes_or_measure_in(&m, &b, t0, mtime(1), ttl, || Some(20)),
+            20
+        );
+        assert_eq!(
+            bytes_or_measure_in(&m, &a, t0, mtime(1), ttl, || Some(0)),
+            10
+        );
     }
 }
