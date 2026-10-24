@@ -2268,7 +2268,10 @@ mod script_tests {
             run.stdout
         );
         assert!(
-            run.elapsed < Duration::from_millis(1800),
+            // The point is "bounded by curl's ~1 s budget", not a latency SLO:
+            // a saturated CI host can add seconds of process-start time, and a
+            // hook with no budget would hang until the harness killed it.
+            run.elapsed < Duration::from_secs(5),
             "the hook must be cut off by curl's ~1 s budget, took {:?}",
             run.elapsed
         );

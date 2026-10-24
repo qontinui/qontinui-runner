@@ -599,13 +599,17 @@ mod tests {
         );
     }
 
-    /// A fresh, answered dial at `level`, asked under `tenant`.
+    /// A fresh, answered dial at `level`, asked under `tenant`. It was answered
+    /// one second ago, never "now": a test takes its own `now` BEFORE building
+    /// the dial, and an answer dated after the clock it is read against is
+    /// stale by design (`answer_is_fresh`), so a dial stamped "now" would read
+    /// as dated in the future.
     fn dial(level: &str, tenant: Option<uuid::Uuid>) -> PermissionAutoAcceptDial {
         PermissionAutoAcceptDial {
             answered: true,
             level: level.to_string(),
             resolved_scope: Some("tenant".to_string()),
-            answered_at: Some(chrono::Utc::now()),
+            answered_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
             tenant,
         }
     }
