@@ -83,8 +83,28 @@ esac
 case "$key" in
   "" | *[!0-9a-f]*) exit 0 ;;
 esac
-[ "${#key}" -ge 16 ] || exit 0
+# The runner's key is always 64 hex characters (a SHA-256); anything else
+# could only ever be answered `none`.
+[ "${#key}" -eq 64 ] || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
+
+# The request key goes in a header read from a private file, never on curl's
+# argv: another local user can read a process's command line, not its
+# environment. Created with bash builtins only (no mktemp): mode 0600 under
+# `umask 077`, and EXCLUSIVELY under `noclobber` (bash opens it O_EXCL, so a
+# planted file or symlink at the name makes this exit silently instead of
+# writing through it). Removed on every exit path once it exists.
+umask 077
+hdr="${TMPDIR:-/tmp}/qontinui-permreq-$$-${RANDOM}${RANDOM}"
+set -o noclobber
+{ printf 'X-Qontinui-Permreq-Key: %s\n' "$key" >"$hdr"; } 2>/dev/null || exit 0
+set +o noclobber
+trap 'rm -f "$hdr" 2>/dev/null' EXIT
+hdr_arg="$hdr"
+# A native Windows curl.exe cannot open an MSYS path; hand it a native one.
+if command -v cygpath >/dev/null 2>&1; then
+  hdr_arg="$(cygpath -m "$hdr" 2>/dev/null)" || exit 0
+fi
 
 # `-T -` streams stdin as the request body DURING the transfer, so the read is
 # inside `--max-time`; `--data-binary @-` would slurp all of stdin before the
@@ -93,7 +113,7 @@ command -v curl >/dev/null 2>&1 || exit 0
 # a loopback call elsewhere. stdin is the hook's own, inherited by curl.
 resp="$(curl -fsS --noproxy '*' --connect-timeout 1 --max-time 1 \
   -X POST -H 'Content-Type: application/json' -H 'Expect:' \
-  -H "X-Qontinui-Permreq-Key: ${key}" -T - \
+  -H "@${hdr_arg}" -T - \
   "http://127.0.0.1:${port}/sessions/${term}/permission-request" 2>/dev/null)" || exit 0
 
 # Match the KEY and the VALUE together, so a body that merely contains the
