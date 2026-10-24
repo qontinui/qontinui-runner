@@ -57,8 +57,8 @@
 //!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s four reads —
 //!   the spec list, the spec graph and the snapshot are listed below, while
 //!   the fourth, `useRunnerApps`'s `GET /apps`, is on no entry, so this arm
-//!   answers it 403 (qontinui-runner#2178 proposes one) — and the co-pilot
-//!   planner's `POST prompt-home/plan` (`lib/co-pilot/planClient.ts`).
+//!   answers it 403 — and the co-pilot planner's `POST prompt-home/plan`
+//!   (`lib/co-pilot/planClient.ts`).
 //!   The console's UI Bridge dashboard (`/admin/coord/ui-bridge`, plan
 //!   `2026-10-23-console-presentation-spaces` Phase 6) reuses those hooks and
 //!   makes four relay calls of its own from
@@ -71,9 +71,10 @@
 //!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`), the two
 //!   entries listed for it; and `fetchRunnerVisibility`
 //!   (`POST /ui-bridge/control/visibility`, the occlusion sweep), which this
-//!   arm REFUSES on purpose. Phase 6 adds no entry for the sweep, the
-//!   dashboard renders the 403 as a labelled UNKNOWN, and
-//!   `the_dashboard_reads_open_nothing_beside_them` pins the refusal.
+//!   arm also answers 403. The dashboard renders that 403 as a labelled
+//!   UNKNOWN, and `the_dashboard_reads_open_nothing_beside_them` pins the
+//!   refusal. The "Two web calls" paragraph below says why `GET /apps` and
+//!   the sweep are refused.
 //!
 //! Nothing else in the workspace sends an `http_request` frame.
 //!
@@ -86,9 +87,32 @@
 //! this module's own registration tripwire, and refusing a 404 with a 403
 //! changes nothing a client can observe. Add the entry WITH the route.
 //!
-//! Two web calls to routes the runner DOES register are refused as well, and
-//! the bullet above says why each one is: `GET /apps` and
-//! `POST /ui-bridge/control/visibility`.
+//! Two web calls to routes the runner DOES register are refused as well, each
+//! for a reason of its own:
+//!
+//! * `GET /apps` (`useRunnerApps`) answers with whole `App` records
+//!   (`qontinui_types::apps::App`): each registered app's `repo_root` and
+//!   `ui_bridge_url`, and its `build_command` and `start_command`. Phase 6
+//!   was briefed to add the two dashboard entries above, and the plan's app
+//!   registry is the web's own `/api/v1/fleet/apps`, which needs no relay. So
+//!   opening `GET /apps` was not Phase 6's decision to make.
+//!   qontinui-runner#2178 (plan `2026-10-12-digital-twin-runner-panels-end-to-end`)
+//!   proposes the entry, together with its reasoning about that exposure.
+//! * `POST /ui-bridge/control/visibility` (`fetchRunnerVisibility`, the
+//!   occlusion sweep) was also outside Phase 6's brief, and it is not ready to
+//!   list. Its report quotes webview text, as page health's findings do: each
+//!   occlusion entry carries the covered element's label and text
+//!   (`screenshots::occlusion_entry`). Before it can be listed, it needs the
+//!   two things page health's entry came with. The first is an end-to-end
+//!   review of `screenshots::ui_bridge_visibility_handler` that establishes
+//!   it is read-only and bounded. The second is an arm in
+//!   `backend_relay::http_request_egress_refusal` that gives it the
+//!   snapshot's and page health's gate (terminal stream, strictest bound
+//!   tenant, refuse). The sweep is also the only route that serves
+//!   `occlusionDataObserved`: page health's report has no occlusion field. So
+//!   until this entry lands, the occlusion row that the plan's Phase 6 asks
+//!   the dashboard for reads UNKNOWN on every runner.
+//!
 //! `the_web_calls_the_docs_name_as_refused_stay_refused` pins both refusals,
 //! so an entry that opens either one fails that test until this paragraph and
 //! the bullet above are updated with it.
@@ -868,13 +892,14 @@ pub(crate) mod tests {
     }
 
     /// The module docs name two web calls to REGISTERED routes that this arm
-    /// refuses on purpose: `useRunnerApps`'s `GET /apps`, and the dashboard's
-    /// occlusion sweep, `POST /ui-bridge/control/visibility`. This pins both,
-    /// so the prose cannot outlive the fact it states. An entry that opens
-    /// either one turns it red, including an entry a rebase carries in
+    /// refuses, and say why: `useRunnerApps`'s `GET /apps`, and the
+    /// dashboard's occlusion sweep, `POST /ui-bridge/control/visibility`. This
+    /// pins both, so the prose cannot outlive the fact it states. An entry that
+    /// opens either one turns it red, including an entry a rebase carries in
     /// (qontinui-runner#2178 proposes one for `GET /apps`). Whoever adds such an
     /// entry updates the docs' qontinui-web bullet and their "Two web calls"
-    /// paragraph together with this list.
+    /// paragraph together with this list. For the sweep, that paragraph also
+    /// names the review and the egress arm its entry needs first.
     #[test]
     fn the_web_calls_the_docs_name_as_refused_stay_refused() {
         for (method, path) in [("GET", "/apps"), ("POST", "/ui-bridge/control/visibility")] {
