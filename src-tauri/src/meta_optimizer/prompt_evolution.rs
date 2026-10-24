@@ -441,6 +441,7 @@ mod fail_safe_tests {
         );
     }
 
+    /// The cooldown guard, likewise: unreadable reads as in cooldown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_cooldown_guard_fails_safe_on_an_unreadable_database() {
         let pg = crate::database::pg::PgDb::new_noop_for_test();

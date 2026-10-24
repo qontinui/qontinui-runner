@@ -188,25 +188,33 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         if (state && state !== "not_found" && state !== "closed") {
           // Session is alive in SessionManager — restore normally
           setTaskRunId(savedId);
+          taskRunIdRef.current = savedId; // Sync ref immediately (the reply below is guarded on it)
           setSessionState(state as AiSessionState);
 
           // Load message history from DB
           invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
             .then((outputResponse) => {
+              // A late reply for a session that is no longer observed (the user
+              // switched) settles nothing.
+              if (taskRunIdRef.current !== savedId) return;
               // A DB outage still returns the live in-memory output: show it,
               // and say the persisted history could not be read.
-              const { log, historyUnavailable } = aiOutputOf(outputResponse);
+              const { log } = aiOutputOf(outputResponse);
               if (log) {
                 setMessages(parseOutputLog(log));
               }
-              if (historyUnavailable) {
+              if (!outputResponse.success) {
                 setLastReadError(
-                  `history read failed: ${outputResponse.message ?? "database unavailable"}`,
+                  `history read failed: ${outputResponse.message ?? "unknown error"}`,
                 );
                 setReadStatus("failed");
               }
             })
-            .catch(() => {});
+            .catch((e) => {
+              if (taskRunIdRef.current !== savedId) return;
+              setLastReadError(`history read failed: ${describeThrown(e, "unknown error")}`);
+              setReadStatus("failed");
+            });
           return;
         }
 

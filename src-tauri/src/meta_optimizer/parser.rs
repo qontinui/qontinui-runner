@@ -451,12 +451,20 @@ fn is_duplicate_recommendation(
     if super::recommendations::is_content_duplicate(pg_db, &hash) {
         return true;
     }
-    // Fallback: title match for rejected recs (rejected can't be re-created with same title)
-    tokio::task::block_in_place(|| {
+    // Fallback: title match for rejected recs (rejected can't be re-created with same title).
+    // Fails SAFE like the content-hash check: unreadable reads as a duplicate.
+    match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(pg_db.count_rejected_by_title(title))
-    })
-    .map(|c| c > 0)
-    .unwrap_or(false)
+    }) {
+        Ok(c) => c > 0,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "rejected-title check unreadable; treating it as a duplicate (fail safe)"
+            );
+            true
+        }
+    }
 }
 
 // ── Save orchestrator ───────────────────────────────────────────────────
@@ -1313,6 +1321,30 @@ confidence: 0.9
         let content = kv.get("prompt_content").unwrap();
         assert!(content.contains("Line one of prompt."));
         assert!(content.contains("Line two of prompt."));
+    }
+
+    /// Entered where the population enters (`save_parsed_recommendations`):
+    /// against a database that fails every call, a parsed recommendation is
+    /// skipped as a duplicate (the dedup checks fail safe) instead of being
+    /// written — so an outage cannot let a duplicate through, and the save
+    /// reports 0 created rather than an insert error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_dedup_check_skips_the_recommendation() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let output = r#"Analysis complete.
+[PROMPT_RECOMMENDATION]
+agent_type: spec_analyst
+variant_name: clarity_focused_v2
+confidence: 0.8
+rationale: Historical data shows improved spec quality
+prompt_content: |
+  You are a specification analyst.
+[/PROMPT_RECOMMENDATION]
+"#;
+        assert_eq!(
+            save_parsed_recommendations(&pg, "pipeline_prompt", None, output),
+            Ok(0)
+        );
     }
 
     #[test]
