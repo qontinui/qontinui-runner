@@ -2350,6 +2350,82 @@ pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
     default_binding_tenant_in(&base)
 }
 
+/// The SET of tenants this device is bound to, per `paired_user.json`, with an
+/// unreadable store kept distinct from an empty set (plan
+/// `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`
+/// Phase 2). The display-only twin of [`BindingTenantRead`] for the whole set:
+/// it decides nothing about credentials, it only lets a surface say "1 of 4
+/// bound" — or say it cannot.
+///
+/// `pair::read_paired_binding_tenant_ids` answers the same question but
+/// collapses an unreadable file to `[]`, and `pair` is lib-only besides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingSetRead {
+    /// The file was read and states these bindings, in file order (each the
+    /// entry's `tenant_id`, trimmed). Empty ONLY when the file is genuinely
+    /// absent — an unpaired device, measured.
+    Measured(Vec<String>),
+    /// Nothing was established; the reason says why: `no_storage_dir`,
+    /// `paired_user_unreadable`, `paired_user_unparseable`, `bindings_unstated`,
+    /// `bindings_blank_tenant_id`.
+    Unknown(&'static str),
+}
+
+/// Read the device's bound tenant set — see [`BindingSetRead`].
+pub(crate) fn binding_set_probe() -> BindingSetRead {
+    let Some(base) = qontinui_runner_lib::instance_env::secure_storage_dir() else {
+        return BindingSetRead::Unknown("no_storage_dir");
+    };
+    binding_set_in(&base)
+}
+
+/// Pure-over-a-path core of [`binding_set_probe`], with the same NotFound /
+/// other-error split as [`default_binding_tenant_in`].
+pub(crate) fn binding_set_in(base: &std::path::Path) -> BindingSetRead {
+    let bytes = match std::fs::read(base.join("paired_user.json")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return BindingSetRead::Measured(Vec::new())
+        }
+        Err(_) => return BindingSetRead::Unknown("paired_user_unreadable"),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => binding_set_from_value(&value),
+        Err(_) => BindingSetRead::Unknown("paired_user_unparseable"),
+    }
+}
+
+/// The parse half of [`binding_set_probe`]. It does not re-implement the shape
+/// rules: [`measured_binding_count_from_value`] decides whether the file states
+/// a set at all, and this only lifts the ids out of the shape it accepted — so
+/// a MEASURED set's length can never disagree with [`MeasuredBindingCount`].
+///
+/// The one place this reader is stricter: an entry whose `tenant_id` trims to
+/// empty. The count accepts it (any string), but a blank id names no tenant, so
+/// rather than list it, or drop it and report a set one shorter than the count,
+/// the set is `Unknown("bindings_blank_tenant_id")`. Display-only; the count
+/// and every decision made from it are unchanged.
+pub(crate) fn binding_set_from_value(value: &serde_json::Value) -> BindingSetRead {
+    let tenant_of = |e: &serde_json::Value| {
+        e.get("tenant_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+    };
+    match measured_binding_count_from_value(value) {
+        MeasuredBindingCount::Unknown => BindingSetRead::Unknown("bindings_unstated"),
+        MeasuredBindingCount::Measured(_) => {
+            let ids: Vec<String> = match value.get("bindings").and_then(|b| b.as_array()) {
+                Some(arr) => arr.iter().filter_map(tenant_of).collect(),
+                None => tenant_of(value).into_iter().collect(),
+            };
+            if ids.iter().any(|id| id.is_empty()) {
+                return BindingSetRead::Unknown("bindings_blank_tenant_id");
+            }
+            BindingSetRead::Measured(ids)
+        }
+    }
+}
+
 /// Pure-over-a-path core of [`default_binding_tenant_probe`], so the
 /// absent-vs-unreadable distinction is testable against a real tempdir with no
 /// process-global env mutation.
@@ -5848,5 +5924,136 @@ mod device_jwt_tests {
             mgr.cognito_token_needs_refresh(),
             "an already-expired token must report stale"
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_set_tests {
+    use super::{
+        binding_set_from_value, binding_set_in, measured_binding_count_from_value, BindingSetRead,
+        MeasuredBindingCount,
+    };
+    use serde_json::json;
+
+    const A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const D: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+    #[test]
+    fn an_absent_pairing_file_is_the_measured_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(binding_set_in(dir.path()), BindingSetRead::Measured(vec![]));
+    }
+
+    #[test]
+    fn an_unreadable_pairing_file_is_unknown_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // A DIRECTORY where the file should be: the read fails with an error
+        // that is not NotFound.
+        std::fs::create_dir(dir.path().join("paired_user.json")).unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Unknown("paired_user_unreadable")
+        );
+    }
+
+    #[test]
+    fn an_unparseable_pairing_file_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("paired_user.json"), b"{not json").unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Unknown("paired_user_unparseable")
+        );
+    }
+
+    #[test]
+    fn four_v2_bindings_read_as_four_ids_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = json!({
+            "default_tenant_id": B,
+            "bindings": [{"tenant_id": A}, {"tenant_id": B}, {"tenant_id": C}, {"tenant_id": format!(" {D} ")}],
+        });
+        std::fs::write(dir.path().join("paired_user.json"), v.to_string()).unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Measured(vec![A.into(), B.into(), C.into(), D.into()])
+        );
+    }
+
+    #[test]
+    fn the_legacy_v1_shape_is_one_binding() {
+        assert_eq!(
+            binding_set_from_value(&json!({"tenant_id": A})),
+            BindingSetRead::Measured(vec![A.into()])
+        );
+    }
+
+    #[test]
+    fn a_shape_that_states_no_set_is_unknown() {
+        for v in [
+            json!({"bindings": []}),
+            json!({"bindings": "x"}),
+            json!({"bindings": [{}]}),
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": 7}]}),
+            json!({"user_id": "u"}),
+        ] {
+            assert_eq!(
+                binding_set_from_value(&v),
+                BindingSetRead::Unknown("bindings_unstated"),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_tenant_id_makes_the_set_unknown_rather_than_shorter_or_blank() {
+        for v in [
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": "  "}]}),
+            json!({"bindings": [{"tenant_id": ""}]}),
+            json!({"tenant_id": " "}),
+        ] {
+            // The count still measures it (unchanged, decision-bearing)...
+            assert!(
+                matches!(
+                    measured_binding_count_from_value(&v),
+                    MeasuredBindingCount::Measured(_)
+                ),
+                "{v}"
+            );
+            // ...the display set refuses to list a blank or under-count.
+            assert_eq!(
+                binding_set_from_value(&v),
+                BindingSetRead::Unknown("bindings_blank_tenant_id"),
+                "{v}"
+            );
+        }
+    }
+
+    /// The set can never disagree with the strict count: same Measured/Unknown
+    /// verdict, and the same length.
+    #[test]
+    fn the_set_agrees_with_the_measured_binding_count_on_every_shape() {
+        for v in [
+            json!({"bindings": [{"tenant_id": A}]}),
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": B}]}),
+            json!({"bindings": [], "tenant_id": A}),
+            json!({"tenant_id": A}),
+            json!({"tenant_id": 7}),
+            json!({"bindings": [7]}),
+            json!({}),
+        ] {
+            match (
+                measured_binding_count_from_value(&v),
+                binding_set_from_value(&v),
+            ) {
+                (MeasuredBindingCount::Measured(n), BindingSetRead::Measured(ids)) => {
+                    assert_eq!(ids.len(), n, "{v}")
+                }
+                (MeasuredBindingCount::Unknown, BindingSetRead::Unknown(_)) => {}
+                (m, s) => panic!("{v}: count {m:?} vs set {s:?}"),
+            }
+        }
     }
 }
