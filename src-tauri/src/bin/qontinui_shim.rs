@@ -1087,20 +1087,46 @@ fn resolve_real_waiting(
         },
     );
     if found.is_none() {
+        let path_var = env::var_os("PATH").unwrap_or_default();
         let _ = writeln!(
             std::io::stderr(),
-            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; falling back \
-             to PATH dispatch. PATH searched (excluding {}): {}",
-            wait.as_secs(),
-            own_dirs
-                .iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            env::var("PATH").unwrap_or_default()
+            "{}",
+            unresolved_message(name, own_dirs, wait, &path_var)
         );
     }
     found
+}
+
+/// The give-up line [`resolve_real_waiting`] prints. When what IS on `PATH` is
+/// npm's placeholder stub it says so, because "not found" alone would hide
+/// that the reinstall's postinstall never replaced the stub.
+fn unresolved_message(
+    name: &str,
+    own_dirs: &[PathBuf],
+    wait: Duration,
+    path_var: &OsStr,
+) -> String {
+    let excluded = own_dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let searched = path_var.to_string_lossy();
+    match scan_path_in(name, own_dirs, path_var, Want::Placeholder) {
+        Some(stub) => format!(
+            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; only the npm \
+             placeholder stub is there ({}), which the reinstall has not replaced. Falling back \
+             to PATH dispatch. PATH searched (excluding {excluded}): \
+             {searched}",
+            wait.as_secs(),
+            stub.display()
+        ),
+        None => format!(
+            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; falling back \
+             to PATH dispatch. PATH searched (excluding {excluded}): {searched}",
+            wait.as_secs()
+        ),
+    }
 }
 
 /// Parse [`RESOLVE_WAIT_ENV`]: whole seconds, `0` disables; absent or garbled
@@ -1147,6 +1173,20 @@ where
 /// that blocked merges on 2026-07-11). The binary's callers pass the live env
 /// `PATH` via `resolve_real`.
 fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option<PathBuf> {
+    scan_path_in(name, own_dirs, path_var, Want::Real)
+}
+
+/// Which kind of candidate [`scan_path_in`] returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// The real tool: anything that is not npm's placeholder stub.
+    Real,
+    /// npm's placeholder stub itself (only for the give-up message).
+    Placeholder,
+}
+
+/// First candidate of kind `want` on `path_var`, skipping `own_dirs`.
+fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
@@ -1158,8 +1198,15 @@ fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
             let cand = dir.join(&cand_name);
-            if cand.is_file() && !is_npm_placeholder(&cand) {
-                return Some(cand);
+            if !cand.is_file() {
+                continue;
+            }
+            match (is_npm_placeholder(&cand), want) {
+                (false, Want::Real) | (true, Want::Placeholder) => return Some(cand),
+                // A real tool ahead of any stub: dispatch would reach it, so
+                // there is no stub to report.
+                (false, Want::Placeholder) => return None,
+                (true, Want::Real) => {}
             }
         }
     }
@@ -1638,12 +1685,30 @@ mod tests {
         let path = bin.display().to_string();
         assert!(is_npm_placeholder(&stub));
         assert_eq!(resolve_real_in("claude", &[], OsStr::new(&path)), None);
+        let msg = unresolved_message("claude", &[], Duration::from_secs(3), OsStr::new(&path));
+        assert!(
+            msg.contains("after waiting 3s; only the npm placeholder stub is there")
+                && msg.contains(&stub.display().to_string()),
+            "the give-up line must name the stub rather than say only 'not found': {msg}"
+        );
 
         std::fs::write(&stub, b"\x7fELF\x02\x01\x01 native code").unwrap();
         assert!(!is_npm_placeholder(&stub));
         assert_eq!(
             resolve_real_in("claude", &[], OsStr::new(&path)),
             Some(stub.clone())
+        );
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let msg = unresolved_message(
+            "claude",
+            &[],
+            Duration::from_secs(3),
+            OsStr::new(&empty.display().to_string()),
+        );
+        assert!(
+            !msg.contains("placeholder"),
+            "no stub, no stub wording: {msg}"
         );
         assert!(
             !is_npm_placeholder(&tmp.path().join("absent")),

@@ -64,10 +64,12 @@ is_npm_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
-# and is not npm's placeholder stub.
+# Scan PATH, skipping SHIM_DIR, for the first candidate of one kind:
+# `scan_path real` wants a tool that is NOT npm's placeholder stub,
+# `scan_path placeholder` wants the stub itself (only for the give-up message).
 # ---------------------------------------------------------------------------
-resolve_real() {
+scan_path() {
+  local want="$1"
   local IFS=':'
   local dir cand
   for dir in $PATH; do
@@ -77,7 +79,13 @@ resolve_real() {
     esac
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
-        is_npm_placeholder "$cand" && continue
+        if is_npm_placeholder "$cand"; then
+          [ "$want" = placeholder ] || continue
+        else
+          # A real tool ahead of any stub: dispatch would reach it, so there
+          # is no stub to report.
+          [ "$want" = real ] || return 1
+        fi
         printf '%s' "$cand"
         return 0
       fi
@@ -85,6 +93,10 @@ resolve_real() {
   done
   return 1
 }
+
+# Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
+# and is not npm's placeholder stub.
+resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
 # Bounded wait on a MISS. A package manager reinstalling the tool (Claude Code's
@@ -124,7 +136,15 @@ resolve_real_waiting() {
 
 # The last-resort fall-through is about to dispatch by NAME — say plainly what
 # was searched, so a `not found` that follows is diagnosable from the pane.
+# When what IS on PATH is npm's placeholder stub, say so: "not found" alone
+# would hide that the reinstall's postinstall never replaced it.
 report_unresolved() {
+  local stub
+  if stub="$(scan_path placeholder)"; then
+    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding %s): %s\n' \
+      "$TOOL" "$(resolve_wait_secs)" "$stub" "$SHIM_DIR" "$PATH" >&2
+    return 0
+  fi
   printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
     "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
 }
