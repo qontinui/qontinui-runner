@@ -931,13 +931,8 @@ pub fn local_worktree_shape(dir: &Path, roots: &[(String, PathBuf)]) -> LocalWor
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 pub fn primary_checkout_from_gitdir(raw: &str) -> Option<PathBuf> {
-    let line = raw
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-        .trim();
-    if line.is_empty() {
-        return None;
-    }
+    // The shared `.git`-pointer parser: the FIRST line, trimmed, blank refused.
+    let line = qontinui_runner_lib::git_layout::gitdir_value(raw)?;
     let norm = line.replace('\\', "/");
     // Case-insensitive on the marker: the path segments are git's own, so
     // `.git/worktrees` is stable, but the drive-letter case is not and a
