@@ -125,8 +125,10 @@ export async function httpSendPong(source: PongSource, windowLabel: string): Pro
   // Bounded: a request to a stalled API runtime (or one parked in the accept
   // backlog) would otherwise neither resolve nor reject, so the caller's
   // fallback never runs and one hung fetch piles up per ping. An
-  // AbortController + timer rather than `AbortSignal.timeout`, which older
-  // WebKit webviews lack — there it would throw and fail every pong.
+  // AbortController + timer needs nothing newer than AbortController itself;
+  // `AbortSignal.timeout` is newer (Chromium 103, Safari 16 per MDN's
+  // compatibility table), and where it is missing the call would throw and
+  // fail every pong.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PONG_HTTP_TIMEOUT_MS);
   try {
@@ -193,12 +195,19 @@ export async function answerPing(
   // The HTTP leg is bounded here as well as inside `httpSendPong`, so an
   // injected or future transport that never settles still reaches the
   // fallback: a stalled API runtime must not swallow the pong either.
-  if (await settleWithin(http("event", windowLabel), httpTimeoutMs, false)) {
+  // (`Promise.resolve().then` on both legs, so a synchronous throw is a failed
+  // leg rather than a rejected `answerPing`.)
+  const httpLanded = await settleWithin(
+    Promise.resolve().then(() => http("event", windowLabel)),
+    httpTimeoutMs,
+    false,
+  );
+  if (httpLanded) {
     return "http";
   }
   // The fallback is bounded too: while both legs are stalled, an unbounded
-  // emit would leave one pending handler behind per ping.
-  // (`Promise.resolve().then` so a synchronous throw is a failed leg too.)
+  // wait would leave one pending handler behind per ping. The bound frees this
+  // handler only; the underlying IPC emit stays pending until `app-rt` drains.
   const emitted = await settleWithin(
     Promise.resolve()
       .then(() => emit(pongEventPayload(windowLabel)))
