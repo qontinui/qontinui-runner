@@ -1379,43 +1379,6 @@ pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Recursive byte size of `dir`, summing real file sizes. SKIPS any
-/// directory that is a reparse point (junction): it contributes 0 and is
-/// never traversed. The top-level `dir` is assumed already checked by
-/// the caller (we never even call this for a junctioned top-level dir),
-/// but nested junctions inside the tree are also skipped defensively so
-/// a junction buried under a real dir can't cause a 165 GB traversal.
-fn dir_size_skipping_junctions(dir: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let read = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        // symlink_metadata: never follow a link/junction.
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            // A symlink (file or dir) — skip, do not follow.
-            continue;
-        }
-        if file_type.is_dir() {
-            if is_junction(&path) {
-                // Reparse point — never traverse.
-                continue;
-            }
-            total = total.saturating_add(dir_size_skipping_junctions(&path));
-        } else if file_type.is_file() {
-            total = total.saturating_add(meta.len());
-        }
-    }
-    total
-}
-
 /// Measure one candidate dir (`node_modules` / `target`):
 /// `(present, is_junction, bytes)`. A junction reports
 /// `(true, true, 0)` and is never walked.
@@ -1426,7 +1389,34 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     if is_junction(dir) {
         return (true, true, 0);
     }
-    (true, false, dir_size_skipping_junctions(dir))
+    // `present` and `is_junction` above are read live every time (one stat
+    // each), so a removal or a junction swap shows at once; only the byte total
+    // — a full walk of a `node_modules` or `target` — is memoised, because the
+    // census walk is now paced from its end and would otherwise size the same
+    // trees several times as often as before (plan
+    // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
+    let bytes = super::census_size_memo::bytes_or_measure(dir, || {
+        super::orphan_target_reaper::measure_dir_size(dir)
+            .map(|m| m.bytes)
+            .unwrap_or(0)
+    });
+    (true, false, bytes)
+}
+
+/// [`is_junction`]'s test applied to metadata already in hand — a directory
+/// RECORD (`DirEntry::metadata`), which on Windows carries the attributes
+/// without opening the entry: `FILE_ATTRIBUTE_REPARSE_POINT` there, a symlink
+/// elsewhere.
+pub(crate) fn metadata_is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// Pick the build `target` dir to MEASURE for a worktree, keyed on the
@@ -3734,8 +3724,23 @@ mod tests {",
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
         std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
-        let total = dir_size_skipping_junctions(dir.path());
+        let total = super::super::orphan_target_reaper::measure_dir_size(dir.path())
+            .unwrap()
+            .bytes;
         assert_eq!(total, 350, "should sum nested real files");
+    }
+
+    #[test]
+    fn a_memoised_size_never_hides_a_removed_dir() {
+        // Only the BYTE total is memoised: presence is read live, so a tree
+        // that was sized and then removed reads absent at once.
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42));
+        std::fs::remove_dir_all(&nm).unwrap();
+        assert_eq!(measure_dir(&nm), (false, false, 0));
     }
 
     #[test]

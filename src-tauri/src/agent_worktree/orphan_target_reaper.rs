@@ -622,7 +622,10 @@ fn has_cargo_marker(dir: &Path) -> bool {
 
 /// A cargo target root is a non-junction dir carrying a cargo marker
 /// ([`has_cargo_marker`]). `symlink_metadata` (via `is_junction`) so we never
-/// follow into a junctioned dir.
+/// follow into a junctioned dir. The walk tests the reparse bit from the entry's
+/// directory record and calls [`has_cargo_marker`] directly, so only tests use
+/// this whole-path form.
+#[cfg(test)]
 fn is_target_root(dir: &Path) -> bool {
     if is_junction(dir) {
         return false;
@@ -935,7 +938,13 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
             }
         };
         let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
+        // The directory RECORD, not the file: `DirEntry::metadata` never
+        // follows a link (it is `lstat` on Unix) and on Windows is read from
+        // the `FindNextFile` record with no further system call. The
+        // `symlink_metadata(path)` + `is_junction(path)` it replaces opened
+        // every entry of a ~180k-directory walk twice, every 15 minutes (plan
+        // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
+        let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => {
                 e.entry_errors += 1;
@@ -943,7 +952,7 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
             }
         };
         let ft = meta.file_type();
-        if ft.is_symlink() || is_junction(&path) {
+        if ft.is_symlink() || super::census::metadata_is_reparse_point(&meta) {
             // Never followed — a junctioned target root would double-count the
             // tree behind it — but never silent either. Counted only when it
             // resolves to a DIRECTORY (`is_dir` follows the link, unlike the
@@ -967,13 +976,16 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
         e.dirs_visited += 1;
 
         // A target root terminates the branch — we never walk inside one.
-        if is_target_root(&path) {
+        // The entry is already proven not to be a reparse point (above), so
+        // only the cargo marker is left to read: `is_target_root` would
+        // re-open the entry to ask `is_junction` again.
+        if has_cargo_marker(&path) {
             e.candidates.push(Candidate {
                 path,
                 class: ctx.class(),
                 repo_root: ctx.repo_root(),
                 enclosing_git_unreadable: ctx.git_unreadable(),
-                // Free: `meta` is the `symlink_metadata` this loop already took.
+                // Free: `meta` is the directory record this loop already read.
                 owner: owner_of(&meta),
             });
             continue;
@@ -1172,8 +1184,10 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
             m.unreadable_dirs += 1;
             continue;
         };
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
+        // The directory record, not the file (see `walk`): this sizes every
+        // file of every candidate target — ~100 GB per reaper cycle on the box
+        // that motivated it — and used to open each one.
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(_) => {
                 m.unreadable_dirs += 1;
@@ -1181,13 +1195,11 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
             }
         };
         let ft = meta.file_type();
-        if ft.is_symlink() {
+        if ft.is_symlink() || super::census::metadata_is_reparse_point(&meta) {
             continue;
         }
         if ft.is_dir() {
-            if is_junction(&path) {
-                continue;
-            }
+            let path = entry.path();
             match measure_dir_size(&path) {
                 Some(child) => {
                     m.bytes = m.bytes.saturating_add(child.bytes);
@@ -5346,5 +5358,94 @@ mod tests {",
              `inode_pressure_fires_while_the_byte_axis_reads_healthy`.\n\
              --- fixture stderr ---\n{stderr}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-
+    // fetch-into-empty-dirs, Phase 3: the walkers read the directory record.
+    // The bytes and candidates are identical by construction, so a behaviour
+    // test cannot fail on a revert — these pin the SOURCE instead (mutation:
+    // restore one `symlink_metadata(&path)` and they go red).
+    // -----------------------------------------------------------------
+
+    /// The body of `fn <name>(` in this file's production half.
+    fn prod_fn_body(name: &str) -> String {
+        const SRC: &str = include_str!("orphan_target_reaper.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let start = prod
+            .split_once(&format!("fn {name}("))
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| panic!("fn {name} must exist; move this pin if it is renamed"));
+        start
+            .split_once("\n}\n")
+            .map(|(b, _)| b.to_string())
+            .unwrap_or_else(|| start.to_string())
+    }
+
+    #[test]
+    fn the_enumeration_walk_reads_directory_records_not_files() {
+        let body = prod_fn_body("walk");
+        assert!(
+            body.contains("entry.metadata()"),
+            "the walk must read each entry's directory record"
+        );
+        for opened in [
+            "symlink_metadata(&path)",
+            "is_junction(&path)",
+            "is_target_root(&path)",
+        ] {
+            assert!(
+                !body.contains(opened),
+                "`{opened}` re-opens every entry of a ~180k-directory walk; read the record instead"
+            );
+        }
+    }
+
+    #[test]
+    fn the_size_walk_reads_directory_records_not_files() {
+        let body = prod_fn_body("measure_dir_size");
+        assert!(body.contains("entry.metadata()"));
+        for opened in ["symlink_metadata(&path)", "is_junction(&path)"] {
+            assert!(
+                !body.contains(opened),
+                "`{opened}` opens every file of every candidate target it sizes"
+            );
+        }
+    }
+
+    #[test]
+    fn sizing_counts_files_and_skips_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::write(root.join("sub").join("b.bin"), vec![0u8; 250]).unwrap();
+        std::fs::write(root.join("sub").join("deep").join("c.bin"), vec![0u8; 7]).unwrap();
+        // A link to a sizeable tree outside: must contribute 0.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("big.bin"), vec![0u8; 5000]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(root.join("link"))
+                .arg(outside.path())
+                .output();
+        }
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(
+            m.bytes, 357,
+            "100 + 250 + 7; the linked tree is never counted"
+        );
+        assert_eq!(m.unreadable_dirs, 0);
     }
 }
