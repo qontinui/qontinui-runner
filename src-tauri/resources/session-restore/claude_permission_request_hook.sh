@@ -13,41 +13,47 @@
 #   { "hook_event_name": "PermissionRequest", "tool_name": "...",
 #     "tool_input": {...}, "permission_mode": "...", ... }
 #
-# The script is a DUMB CURL: every decision lives in the runner. It POSTs the
-# payload to
+# The script is a DUMB CURL: every decision lives in the runner. curl streams
+# the payload from stdin to
 #   POST http://127.0.0.1:{port}/sessions/{terminal id}/permission-request
 # which records the prompt, reads the tenant's `permission_auto_accept` dial,
 # and answers `{"decision": "allow" | "none", ...}`. This script then prints
 #   {"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}
-# ONLY when the answer says `"decision": "allow"`, and NOTHING otherwise —
-# printing nothing is Claude Code's "no decision": the dialog shows as it
-# always has.
+# ONLY when the answer says `"decision": "allow"` AND echoes this terminal's
+# nonce exactly — and NOTHING otherwise. Printing nothing is Claude Code's "no
+# decision": the dialog shows as it always has.
+#
+# The nonce (QONTINUI_PERMREQ_NONCE) is a per-spawn secret the runner put in
+# this session's env. It is NEVER sent: only the runner that spawned the
+# session knows it, so a process squatting the loopback port while the runner
+# is down cannot make this script answer a prompt.
 #
 # FAIL-CLOSED-TO-THE-DIALOG INVARIANTS (a broken runner must never answer a
 # prompt, and must never break a session):
-#   - missing port / terminal id / curl                -> exit 0, no output
-#   - curl error / timeout / non-2xx / any other body  -> exit 0, no output
-#   - the whole round trip is bounded at ~1 s (`--connect-timeout 1
-#     --max-time 1`): the dialog renders while this runs, and an allow inside
-#     that budget dismisses it with no keystroke (Phase 0, T11)
-#   - no JSON parser is required: the answer is matched with a bash regex
+#   - missing port / terminal id / nonce / curl         -> exit 0, no output
+#   - curl error / timeout / non-2xx / any other body   -> exit 0, no output
+#   - an allow without the exact nonce echo             -> exit 0, no output
+#   - ONE bound for the whole exchange: curl reads the payload from stdin
+#     itself, inside its own `--max-time 1`, so reading a large payload (a
+#     `Write` carrying file content) and the round trip share the ~1 s budget
+#     (`--connect-timeout 1 --max-time 1`; process start-up comes on top). The
+#     dialog renders while this runs, and an allow inside that budget
+#     dismisses it with no keystroke (Phase 0, T11).
+#   - no JSON parser is required: the answer is matched with bash regexes
 #
 # Env (injected by the runner at PTY spawn — the identity seam):
 #   QONTINUI_RUNNER_API_PORT         the runner's loopback API port
 #   QONTINUI_INSTALL_INTERCEPT_PORT  fallback port (same server by default)
 #   QONTINUI_TERMINAL_ID             the per-PTY terminal id — the pad's key
+#   QONTINUI_PERMREQ_NONCE           the per-spawn nonce the allow must echo
 #
 # A `claude` started by hand outside the runner has no QONTINUI_TERMINAL_ID,
 # so this exits silently there (D5).
 set -u
 
-# Drain stdin with a BUILTIN (no `cat`: process creation is slow on the
-# fleet's Windows/MSYS boxes). `-t 1` bounds an event that attaches no stdin.
-payload=""
-IFS= read -r -t 1 -d '' payload || true
-
 port="${QONTINUI_RUNNER_API_PORT:-${QONTINUI_INSTALL_INTERCEPT_PORT:-}}"
 term="${QONTINUI_TERMINAL_ID:-}"
+nonce="${QONTINUI_PERMREQ_NONCE:-}"
 [ -z "$port" ] && exit 0
 # A port is digits; anything else would re-point the request.
 case "$port" in
@@ -59,16 +65,28 @@ esac
 case "$term" in
   "" | "." | ".." | *..* | */.* | *[!A-Za-z0-9._-]*) exit 0 ;;
 esac
+# The nonce is lowercase hex (it is matched inside a regex below) and long
+# enough not to be guessed.
+case "$nonce" in
+  "" | *[!0-9a-f]*) exit 0 ;;
+esac
+[ "${#nonce}" -ge 16 ] || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 
-resp="$(printf '%s' "$payload" | curl -fsS --connect-timeout 1 --max-time 1 \
-  -X POST "http://127.0.0.1:${port}/sessions/${term}/permission-request" \
-  -H 'Content-Type: application/json' \
-  --data-binary @- 2>/dev/null)" || exit 0
+# `-T -` streams stdin as the request body DURING the transfer, so the read is
+# inside `--max-time`; `--data-binary @-` would slurp all of stdin before the
+# clock starts. `-X POST` overrides `-T`'s PUT; `Expect:` suppresses the
+# 100-continue round trip; `--noproxy '*'` keeps a proxy env var from routing
+# a loopback call elsewhere. stdin is the hook's own, inherited by curl.
+resp="$(curl -fsS --noproxy '*' --connect-timeout 1 --max-time 1 \
+  -X POST -H 'Content-Type: application/json' -H 'Expect:' -T - \
+  "http://127.0.0.1:${port}/sessions/${term}/permission-request" 2>/dev/null)" || exit 0
 
 # Match the KEY and the VALUE together, so a body that merely contains the
-# word "allow" somewhere else can never answer a prompt.
-if [[ $resp =~ \"decision\"[[:space:]]*:[[:space:]]*\"allow\" ]]; then
+# word "allow" somewhere else can never answer a prompt — and require the
+# exact nonce echo beside it.
+if [[ $resp =~ \"decision\"[[:space:]]*:[[:space:]]*\"allow\" ]] &&
+  [[ $resp =~ \"nonce\"[[:space:]]*:[[:space:]]*\"${nonce}\" ]]; then
   printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
 fi
 exit 0
