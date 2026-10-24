@@ -1211,7 +1211,8 @@ impl AiCoordRegistrar {
         }
     }
 
-    /// Drop `session_id`'s recorded tenant decision (both halves).
+    /// Drop `session_id`'s per-row state: its tenant decision (`tenants` /
+    /// `undecided`) and its adopted mark (`adopted`).
     fn evict_tenant(&self, session_id: Uuid) {
         // Through a poisoned lock, as the insert side writes: a skipped
         // removal would leave a stale mark for a later row under this id.
