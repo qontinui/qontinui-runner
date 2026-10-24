@@ -611,7 +611,7 @@ async fn resume_one(
     // spawn that fails below loses nothing.
     if store.release_gate_identity(
         &cand.id,
-        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+        crate::session::tracking_health::process_generation(),
     ) {
         info!(id = %cand.id, "resume_door: released the closed row's settled gate identity");
     }
@@ -874,7 +874,9 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 

@@ -836,15 +836,92 @@ pub struct TerminalSessionRecord {
     /// [`Self::gate_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_consuming_device_id: Option<String>,
-    /// Unix millis of the boot of the runner process that bound
-    /// [`Self::gate_id`] to this record (the spawn, or a boot restore that
-    /// re-registered the resumed session). Compared against the CURRENT
-    /// process's boot instant to tell a continuation orphaned by a prior
-    /// process generation (no in-process producer can report it) from one this
-    /// process owns (its exit hook / reaper will). Deliberately NOT `opened_at`,
-    /// which `record_open` preserves across a restore. Sticky.
+    /// The [`crate::session::tracking_health::process_generation`] of the
+    /// runner process that bound [`Self::gate_id`] to this record (the spawn,
+    /// or a boot restore that re-registered the resumed session). Compared for
+    /// EQUALITY against the current process's generation to tell a
+    /// continuation orphaned by a prior process (no in-process producer can
+    /// report it) from one this process owns (its exit hook / reaper will).
+    /// Sticky.
+    ///
+    /// ## Legacy rows
+    ///
+    /// A row written by a build that stamped the boot's wall-clock millis
+    /// (`gateBoundBootMs`) carries no generation. It was bound by an older
+    /// process by construction, so it loads as the sentinel
+    /// [`LEGACY_BOOT_MS_GENERATION_PREFIX`]`<ms>` — a value no
+    /// `process_generation()` (a v4 UUID) can ever equal, i.e. "a prior
+    /// generation". The mapping happens once, at deserialization
+    /// ([`deserialize_gate_bound_generation`]); the legacy key is never written
+    /// back. A row with neither key stays `None` (UNKNOWN).
+    #[serde(
+        default,
+        alias = "gateBoundBootMs",
+        deserialize_with = "deserialize_gate_bound_generation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gate_bound_generation: Option<String>,
+    /// The [`crate::session::tracking_health::process_generation`] of the
+    /// runner process whose boot restore last re-materialized this record —
+    /// stamped by BOTH restore-marker writers
+    /// ([`SessionLifecycleStore::mark_restore_pending`] and
+    /// [`SessionLifecycleStore::mark_restored_from_boot`]).
+    ///
+    /// This, not `restored_from_boot_at`, is what "restored by THIS boot"
+    /// means everywhere (gate adoption, the restore census, the session
+    /// ledger): an identity compared for equality survives a backwards
+    /// wall-clock step across a reboot, an instant ordered with `>=` does not.
+    /// `restored_from_boot_at` stays as a display timestamp. Sticky. `None` =
+    /// never restored, or restored by a build that predates the field (which
+    /// is necessarily a prior generation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate_bound_boot_ms: Option<i64>,
+    pub restored_in_generation: Option<String>,
+    /// The [`crate::session::tracking_health::process_generation`] of the
+    /// runner process that already POSTED a runner-side `work_unreported` for
+    /// [`Self::gate_id`] (plan
+    /// `2026-10-07-a-resumed-gate-continuation-loses-its-reporter-on-…` D3).
+    ///
+    /// Makes every runner-side report at-most-once per generation across its
+    /// three producers: the poll's stale failed-restore report
+    /// ([`stale_failed_restore_report`]), the close observer's D2 report
+    /// ([`runner_restart_unreported_report`]), and the D4 skip-alive watcher
+    /// that reports when a still-running host finally exits. Each one claims
+    /// the post with [`SessionLifecycleStore::claim_gate_report`] before
+    /// sending it, and each one skips a gate already claimed this generation.
+    ///
+    /// Sticky in [`SessionLifecycleStore::record_open`]: the restore
+    /// re-record and the session-open hook carry `None` and must not un-claim
+    /// a report — a stale-failed record that the operator then retries keeps
+    /// its stamp, so its later close does not post a second outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_reported_generation: Option<String>,
+}
+
+/// Prefix of the generation a legacy `gateBoundBootMs` row loads as. Never
+/// equal to a real [`crate::session::tracking_health::process_generation`].
+pub const LEGACY_BOOT_MS_GENERATION_PREFIX: &str = "legacy-boot-ms:";
+
+/// Deserialize [`TerminalSessionRecord::gate_bound_generation`] from either
+/// its own key (a string) or the legacy `gateBoundBootMs` key (an integer),
+/// mapping the latter to a prior-generation sentinel.
+fn deserialize_gate_bound_generation<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum GenerationOrLegacyBootMs {
+        Generation(String),
+        LegacyBootMs(i64),
+    }
+    Ok(
+        Option::<GenerationOrLegacyBootMs>::deserialize(d)?.map(|v| match v {
+            GenerationOrLegacyBootMs::Generation(g) => g,
+            GenerationOrLegacyBootMs::LegacyBootMs(ms) => {
+                format!("{LEGACY_BOOT_MS_GENERATION_PREFIX}{ms}")
+            }
+        }),
+    )
 }
 
 /// Close reasons after which a record is FINAL — never resumed by a boot
@@ -877,16 +954,27 @@ pub struct RunnerRestartUnreported {
 /// - the record is closed with a reason in [`NON_RESTORABLE_CLOSE_REASONS`];
 /// - it carries a full, parseable gate identity (gate id + consuming device);
 /// - the gate was bound by a prior process generation
-///   (`gate_bound_boot_ms < current_boot_ms`). A missing stamp is NOT read as
-///   "prior": a record that cannot say when its gate was bound is UNKNOWN, and
-///   a post would race this process's own exit hook.
+///   (`gate_bound_generation` is `Some(g)` with `g != current_generation`).
+///   A missing stamp is NOT read as "prior": a record that cannot say which
+///   process bound its gate is UNKNOWN, and a post would race this process's
+///   own exit hook. Equality, never order — see
+///   [`crate::session::tracking_health::process_generation`];
+/// - no runner-side report was already claimed for the gate by THIS
+///   generation (`gate_reported_generation != Some(current_generation)`, plan
+///   2026-10-07 D3) — the poll's stale failed-restore report may have sent
+///   one while the record was still open.
 ///
 /// The detail uses the exit-class grammar proposed by runner#1902, class first,
 /// so that once coord#2729 lands it classifies the loss as `crashed` and
 /// re-delivers it (both PRs are still open).
+///
+/// `crashed` is right only when no process still hosts the session. The close
+/// observer checks that before posting (plan 2026-10-07 D4,
+/// [`crate::session::gate_host_watch`]); a live host defers the report to its
+/// exit, as `exit=unknown`.
 pub fn runner_restart_unreported_report(
     rec: &TerminalSessionRecord,
-    current_boot_ms: i64,
+    current_generation: &str,
 ) -> Option<RunnerRestartUnreported> {
     if rec.state != "closed" {
         return None;
@@ -895,21 +983,103 @@ pub fn runner_restart_unreported_report(
     if !NON_RESTORABLE_CLOSE_REASONS.contains(&close) {
         return None;
     }
-    let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
-    let consuming_device_id =
-        uuid::Uuid::parse_str(rec.gate_consuming_device_id.as_deref()?.trim()).ok()?;
-    if rec.gate_bound_boot_ms? >= current_boot_ms {
-        return None;
-    }
+    let (gate_id, consuming_device_id) = prior_generation_gate(rec, current_generation)?;
     let after_s = (rec.last_seen_at - rec.opened_at).max(0) / 1000;
-    let detail = format!(
-        "exit=crashed code=none after={after_s}s terminal={} reason=runner_restart close={close}",
-        rec.terminal_id
-    );
     Some(RunnerRestartUnreported {
         gate_id,
         consuming_device_id,
-        detail,
+        detail: runner_restart_detail("crashed", after_s, &rec.terminal_id, close),
+    })
+}
+
+/// The gate identity of a record whose continuation no producer in THIS
+/// process can report: a full, parseable gate identity, bound by a PRIOR
+/// generation, and not already reported by this one. Shared by every
+/// runner-side `work_unreported` decision so they cannot drift apart.
+fn prior_generation_gate(
+    rec: &TerminalSessionRecord,
+    current_generation: &str,
+) -> Option<(uuid::Uuid, uuid::Uuid)> {
+    let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
+    let consuming_device_id =
+        uuid::Uuid::parse_str(rec.gate_consuming_device_id.as_deref()?.trim()).ok()?;
+    if rec.gate_bound_generation.as_deref()? == current_generation {
+        return None;
+    }
+    if rec.gate_reported_generation.as_deref() == Some(current_generation) {
+        return None;
+    }
+    Some((gate_id, consuming_device_id))
+}
+
+/// The one spelling of a runner-restart `work_unreported` detail, in the
+/// runner#1902 exit-class grammar (class first). `close` may carry a `+`
+/// suffix naming the path that reported it (`no-terminal+skip-alive-exit`).
+pub fn runner_restart_detail(exit: &str, after_s: i64, terminal_id: &str, close: &str) -> String {
+    format!(
+        "exit={exit} code=none after={after_s}s terminal={terminal_id} reason=runner_restart close={close}"
+    )
+}
+
+/// The close tag of the stale failed-restore report (plan 2026-10-07 D3).
+pub const CLOSE_RESUME_FAILED_STALE: &str = "resume-failed-stale";
+
+/// Pure decision for the liveness poll (plan 2026-10-07 D3, Why §3 Gap B):
+/// should this still-OPEN record be reported `work_unreported` because its
+/// boot-restore resume failed and nobody retried it?
+///
+/// `classify` Skips a record holding `restore_pending_at` forever (unless a
+/// Claude is confidently alive in it), so such a record never closes and the
+/// D2 close observer never sees it — its gate stayed `spawned` until coord's
+/// backstop. `Some` only when ALL hold:
+/// - the restore marker was set by THIS process (`restored_in_generation ==
+///   current_generation`) — a marker carried over from an earlier process
+///   is waiting for this process's own restore, not stale;
+/// - the record is open and its restore marker is older than
+///   [`RESTORE_PENDING_TTL_MS`] (the same staleness rule
+///   [`describe_restore_status`] renders as "verification timed out");
+/// - no Claude is present in its terminal this tick (`claude_present`);
+/// - [`prior_generation_gate`] holds: a prior-generation gate this process
+///   has not already reported.
+///
+/// `exit=unknown`, not `crashed`: nothing observed the agent die, the resume
+/// simply never verified. The record stays OPEN, so the operator's Retry
+/// still works — a late success is then refused by coord (one `work_*` per
+/// continuation), which the plan accepts.
+pub fn stale_failed_restore_report(
+    rec: &TerminalSessionRecord,
+    claude_present: bool,
+    current_generation: &str,
+    now_ms: i64,
+) -> Option<RunnerRestartUnreported> {
+    if rec.state != "open" || claude_present {
+        return None;
+    }
+    // Only a resume THIS process attempted can have gone stale under it.
+    // `restore_pending_at` is sticky across restarts, so a marker an earlier
+    // process left is already past the TTL on this process's first tick —
+    // before its own boot restore (possibly withheld by a drain for hours)
+    // has run. Reporting then would make that restore's own success
+    // unrecordable. `mark_restore_pending` re-stamps both the marker and
+    // `restored_in_generation`, so the TTL measures this process's attempt.
+    if rec.restored_in_generation.as_deref() != Some(current_generation) {
+        return None;
+    }
+    let marker = rec.restore_pending_at?;
+    if now_ms.saturating_sub(marker) <= RESTORE_PENDING_TTL_MS {
+        return None;
+    }
+    let (gate_id, consuming_device_id) = prior_generation_gate(rec, current_generation)?;
+    let after_s = (rec.last_seen_at - rec.opened_at).max(0) / 1000;
+    Some(RunnerRestartUnreported {
+        gate_id,
+        consuming_device_id,
+        detail: runner_restart_detail(
+            "unknown",
+            after_s,
+            &rec.terminal_id,
+            CLOSE_RESUME_FAILED_STALE,
+        ),
     })
 }
 
@@ -921,23 +1091,26 @@ pub fn runner_restart_unreported_report(
 pub fn runner_restart_report_on_close(
     store: &std::sync::Weak<SessionLifecycleStore>,
     claude_session_id: &str,
-    current_boot_ms: i64,
+    current_generation: &str,
 ) -> Option<RunnerRestartUnreported> {
     let rec = store.upgrade()?.get(claude_session_id)?;
-    runner_restart_unreported_report(&rec, current_boot_ms)
+    runner_restart_unreported_report(&rec, current_generation)
 }
 
 /// `true` when a closed record carries a gate whose outcome something other
 /// than this record already owns. Either this process bound it, so its exit
 /// hook or reaper reports it, or D2's decision holds, so the close observer
-/// reported it or the process that bound it owned it. See
+/// reported it or the process that bound it owned it, or a runner-side report
+/// was already claimed for it (`gate_reported_generation`, plan 2026-10-07
+/// D3). Generation EQUALITY, never a clock order. See
 /// [`SessionLifecycleStore::release_gate_identity`].
-fn gate_outcome_is_owned(rec: &TerminalSessionRecord, current_boot_ms: i64) -> bool {
+fn gate_outcome_is_owned(rec: &TerminalSessionRecord, current_generation: &str) -> bool {
     if rec.gate_id.is_none() {
         return false;
     }
-    rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms)
-        || runner_restart_unreported_report(rec, current_boot_ms).is_some()
+    rec.gate_bound_generation.as_deref() == Some(current_generation)
+        || rec.gate_reported_generation.is_some()
+        || runner_restart_unreported_report(rec, current_generation).is_some()
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -1703,8 +1876,14 @@ impl SessionLifecycleStore {
             if rec.gate_consuming_device_id.is_some() {
                 entry.gate_consuming_device_id = rec.gate_consuming_device_id;
             }
-            if rec.gate_bound_boot_ms.is_some() {
-                entry.gate_bound_boot_ms = rec.gate_bound_boot_ms;
+            if rec.gate_bound_generation.is_some() {
+                entry.gate_bound_generation = rec.gate_bound_generation;
+            }
+            if rec.restored_in_generation.is_some() {
+                entry.restored_in_generation = rec.restored_in_generation;
+            }
+            if rec.gate_reported_generation.is_some() {
+                entry.gate_reported_generation = rec.gate_reported_generation;
             }
             // W-B: set ONCE — the default a session was spawned under never
             // changes, so a re-record can fill an absent value but never replace
@@ -2287,6 +2466,8 @@ impl SessionLifecycleStore {
             Some(rec) => {
                 rec.restore_pending_at = Some(now);
                 rec.restored_from_boot_at = Some(now);
+                rec.restored_in_generation =
+                    Some(crate::session::tracking_health::process_generation().to_string());
                 rec.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
                 rec.clone()
             }
@@ -2301,7 +2482,8 @@ impl SessionLifecycleStore {
     }
 
     /// Drop a CLOSED record's gate identity (`gate_id`,
-    /// `gate_consuming_device_id`, `gate_bound_boot_ms`) before an operator
+    /// `gate_consuming_device_id`, `gate_bound_generation`,
+    /// `gate_reported_generation`) before an operator
     /// resume reopens it, but ONLY when the gate's outcome is already owned
     /// elsewhere.
     ///
@@ -2311,17 +2493,23 @@ impl SessionLifecycleStore {
     /// already settled.
     ///
     /// The gate is released only in two cases:
-    /// - it was bound by THIS process (`gate_bound_boot_ms >= current_boot_ms`),
-    ///   because this process's exit hook or reaper owns the outcome;
+    /// - it was bound by THIS process (`gate_bound_generation ==
+    ///   current_generation`), because this process's exit hook or reaper
+    ///   owns the outcome;
+    /// - a runner-side report was already claimed for it
+    ///   (`gate_reported_generation` is set);
     /// - [`runner_restart_unreported_report`] says `Some` for the closed row.
-    ///   That means either the close observer reported it, or the earlier
-    ///   process that bound it owned it. The observer's post is
+    ///   That means either the close observer reported it (or deferred the
+    ///   post to a plan-2026-10-07 D4 live-host watcher, which still posts
+    ///   from its in-memory copy after this release — see
+    ///   [`Self::claim_gate_report`]), or the earlier process that bound it
+    ///   owned it. The observer's post is
     ///   fire-and-forget, so releasing also gives up the accidental retry
     ///   that a duplicate report would have been. That covers a dropped
     ///   observer POST, and an earlier process that crashed between its own
     ///   close and its exit-hook report. That trade-off is accepted.
     ///
-    /// Every other gate is kept, and a missing boot stamp keeps it too. The
+    /// Every other gate is kept, and a missing generation stamp keeps it too. The
     /// usual case is a prior-generation `poll-dead` close, which nothing has
     /// reported yet. Keeping it lets D2 report it when the reopened row next
     /// closes non-restorably. Because only an already-owned gate is ever
@@ -2330,7 +2518,7 @@ impl SessionLifecycleStore {
     /// Returns `true` only when it removed something. An open, absent or
     /// gate-less record, or one whose gate is still unreported, is left
     /// untouched and nothing is written.
-    pub fn release_gate_identity(&self, claude_session_id: &str, current_boot_ms: i64) -> bool {
+    pub fn release_gate_identity(&self, claude_session_id: &str, current_generation: &str) -> bool {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
@@ -2339,10 +2527,13 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec) if rec.state == "closed" && gate_outcome_is_owned(rec, current_boot_ms) => {
+            Some(rec)
+                if rec.state == "closed" && gate_outcome_is_owned(rec, current_generation) =>
+            {
                 rec.gate_id = None;
                 rec.gate_consuming_device_id = None;
-                rec.gate_bound_boot_ms = None;
+                rec.gate_bound_generation = None;
+                rec.gate_reported_generation = None;
                 rec.clone()
             }
             _ => return false,
@@ -2579,6 +2770,86 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed),
             }],
         );
+    }
+
+    /// Claim THIS generation's one runner-side `work_unreported` report for
+    /// the record's gate: stamp `gate_reported_generation = current_generation`
+    /// and persist. Returns `true` when this call made the claim, `false` when
+    /// the record no longer owes `gate_id` a report — absent, already claimed
+    /// by this generation, re-adopted by it (`gate_bound_generation ==
+    /// current`, so its own exit hook reports), or now carrying a different
+    /// gate. The caller must then NOT post. Decided under the same lock as the
+    /// stamp. Works on open and closed records alike (the D4 watcher claims
+    /// after the record closed, possibly hours later). Plan 2026-10-07 D3/D4.
+    ///
+    /// One exception returns `true` WITHOUT a stamp: a row whose gate identity
+    /// was RELEASED (`gate_id` now `None`) by
+    /// [`Self::release_gate_identity`] while a D4 watcher held the deferred
+    /// report. The release counted that report as owned, so the watcher's
+    /// in-memory copy is the only holder left and must still post; there is
+    /// no gate on the row to stamp, and nothing else can report it.
+    pub fn claim_gate_report(
+        &self,
+        claude_session_id: &str,
+        current_generation: &str,
+        gate_id: &uuid::Uuid,
+    ) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on claim_gate_report");
+                return false;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.gate_id.is_none() => return true,
+            Some(rec)
+                if prior_generation_gate(rec, current_generation).map(|(g, _)| g)
+                    == Some(*gate_id) =>
+            {
+                rec.gate_reported_generation = Some(current_generation.to_string());
+                rec.clone()
+            }
+            _ => return false,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
+    }
+
+    /// The poll's D3 step (plan 2026-10-07): decide
+    /// [`stale_failed_restore_report`] for one open record and, when it says
+    /// report, claim the post ([`Self::claim_gate_report`]) under the same
+    /// lock so two ticks can never both return `Some`. The record stays open.
+    pub fn report_stale_failed_restore(
+        &self,
+        claude_session_id: &str,
+        claude_present: bool,
+        current_generation: &str,
+        now_ms: i64,
+    ) -> Option<RunnerRestartUnreported> {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on report_stale_failed_restore");
+                return None;
+            }
+        };
+        let rec = m.get_mut(claude_session_id)?;
+        let report = stale_failed_restore_report(rec, claude_present, current_generation, now_ms)?;
+        rec.gate_reported_generation = Some(current_generation.to_string());
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        Some(report)
     }
 
     /// Clear a session's restore-pending marker (resume handshake verified —
@@ -2891,13 +3162,14 @@ impl SessionLifecycleStore {
     /// its resume must be able to say so, and a retry re-stamps its own attempt
     /// time. Absent record → debug-logged no-op (never creates a row).
     ///
-    /// ALWAYS re-stamps `restored_from_boot_at`, even when the tier is
-    /// unchanged. The timestamp is the restore census's only way to tell a
-    /// restore that happened THIS boot from a sticky stamp left by a previous
-    /// one (`restored_from_boot_at` survives restarts by design), so skipping
-    /// the write on a repeat tier would make a genuinely-restored session read
-    /// as `missing` on every boot after its first. The cost is one WAL append
-    /// per restore pass per record, which is bounded and rare.
+    /// ALWAYS re-stamps `restored_in_generation` (and the display timestamp
+    /// `restored_from_boot_at`), even when the tier is unchanged. The
+    /// generation is the restore census's only way to tell a restore that
+    /// happened THIS boot from a sticky stamp left by a previous one (both
+    /// markers survive restarts by design), so skipping the write on a repeat
+    /// tier would make a genuinely-restored session read as `missing` on every
+    /// boot after its first. The cost is one WAL append per restore pass per
+    /// record, which is bounded and rare.
     pub fn mark_restored_from_boot(&self, claude_session_id: &str, tier: &str) {
         let now = Utc::now().timestamp_millis();
         let changed = {
@@ -2916,6 +3188,8 @@ impl SessionLifecycleStore {
                 return;
             };
             rec.restored_from_boot_at = Some(now);
+            rec.restored_in_generation =
+                Some(crate::session::tracking_health::process_generation().to_string());
             rec.restore_tier = Some(tier.to_string());
             let changed = rec.clone();
             self.persist(
@@ -2935,10 +3209,11 @@ impl SessionLifecycleStore {
 
     /// Adopt a gate continuation resumed by THIS process generation's boot
     /// restore (plan `2026-10-03-…` D3): when the OPEN record for
-    /// `claude_session_id` carries a gate identity bound by a PRIOR generation
-    /// (`gate_bound_boot_ms < current_boot_ms`, or no stamp at all) AND this
-    /// boot's restore pass marked it, re-stamp
-    /// `gate_bound_boot_ms = current_boot_ms` and return
+    /// `claude_session_id` carries a gate identity NOT bound by this generation
+    /// (`gate_bound_generation != Some(current_generation)`, including no stamp
+    /// at all) AND this generation's restore pass marked it
+    /// (`restored_in_generation == Some(current_generation)`), re-stamp
+    /// `gate_bound_generation = current_generation` and return
     /// `(terminal_id, gate_id, consuming_device_id)` so the caller can
     /// re-register the terminal as a live continuation.
     ///
@@ -2947,12 +3222,13 @@ impl SessionLifecycleStore {
     /// (Past Sessions, shell integration) re-records it through the same doors,
     /// and adopting that would re-register a continuation for a gate that was
     /// resolved long ago and hold a cap slot for it. The boot-restore drain
-    /// stamps `restored_from_boot_at` via
+    /// stamps `restored_in_generation` via
     /// [`Self::mark_restore_pending`] BEFORE it types the resume, i.e. before
     /// either re-record door can fire, and the stamp is sticky — unlike
     /// `restore_pending_at`, which the verified branch clears in a race with
-    /// the re-assert. So the predicate is `restored_from_boot_at >=
-    /// current_boot_ms`.
+    /// the re-assert. So the predicate is `restored_in_generation ==
+    /// Some(current_generation)` — equality, never a clock order (plan
+    /// `2026-10-07-a-resumed-gate-continuation-…` D1).
     ///
     /// `None` — and no write — for a record that is closed, absent, carries no
     /// gate, was not restored by this boot, was restored `terminal-only` (no
@@ -2961,7 +3237,7 @@ impl SessionLifecycleStore {
     pub fn adopt_restored_gate(
         &self,
         claude_session_id: &str,
-        current_boot_ms: i64,
+        current_generation: &str,
     ) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
         let (changed, adopted) = {
             let mut m = match self.map.lock() {
@@ -2975,10 +3251,7 @@ impl SessionLifecycleStore {
             if rec.state != "open" || rec.terminal_id.trim().is_empty() {
                 return None;
             }
-            if rec
-                .restored_from_boot_at
-                .is_none_or(|t| t < current_boot_ms)
-            {
+            if rec.restored_in_generation.as_deref() != Some(current_generation) {
                 return None;
             }
             // A terminal-only restore brought back no conversation and types
@@ -2994,14 +3267,14 @@ impl SessionLifecycleStore {
                 return None;
             }
             let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
-            if rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms) {
+            if rec.gate_bound_generation.as_deref() == Some(current_generation) {
                 return None;
             }
             let consuming_device_id = rec
                 .gate_consuming_device_id
                 .as_deref()
                 .and_then(|d| uuid::Uuid::parse_str(d.trim()).ok());
-            rec.gate_bound_boot_ms = Some(current_boot_ms);
+            rec.gate_bound_generation = Some(current_generation.to_string());
             let changed = rec.clone();
             self.persist(
                 m,
@@ -4576,6 +4849,20 @@ pub fn hold_for_withheld_boot_restore(action: PollAction, held: bool) -> PollAct
     }
 }
 
+/// May the liveness poll's `Skip` arm consult
+/// [`SessionLifecycleStore::report_stale_failed_restore`] for this record this
+/// tick (plan 2026-10-07 D3)? Only for a restore-pending record, only on a
+/// determinate snapshot (an indeterminate one makes `claude_present == false`
+/// prove nothing), and never while its boot restore is withheld (`held`): that
+/// record is waiting for its restore, not failed by one.
+pub fn may_report_stale_failed_restore(
+    restore_pending: bool,
+    snapshot_ok: bool,
+    held: bool,
+) -> bool {
+    restore_pending && snapshot_ok && !held
+}
+
 // ---------------------------------------------------------------------------
 // Liveness-poll decision core (pure)
 // ---------------------------------------------------------------------------
@@ -4865,7 +5152,9 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         adopted_from: None,
         gate_id: None,
         gate_consuming_device_id: None,
-        gate_bound_boot_ms: None,
+        gate_bound_generation: None,
+        restored_in_generation: None,
+        gate_reported_generation: None,
     }
 }
 
@@ -5091,7 +5380,9 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -8941,7 +9232,9 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -9950,11 +10243,22 @@ mod gate_continuation_tests {
         serde_json::from_str(OLD_ROW).expect("old row deserializes")
     }
 
-    fn gate_row(boot: i64) -> TerminalSessionRecord {
+    /// A generation no real process can have (not a v4 UUID).
+    const PRIOR: &str = "gen-prior";
+    /// Another made-up generation, standing for "a process that is not PRIOR".
+    const OTHER: &str = "gen-other";
+
+    /// THIS test process's generation — what `mark_restore_pending` /
+    /// `mark_restored_from_boot` stamp.
+    fn cur() -> &'static str {
+        crate::session::tracking_health::process_generation()
+    }
+
+    fn gate_row(generation: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             gate_id: Some(GATE.to_string()),
             gate_consuming_device_id: Some(DEVICE.to_string()),
-            gate_bound_boot_ms: Some(boot),
+            gate_bound_generation: Some(generation.to_string()),
             ..old_row()
         }
     }
@@ -9972,50 +10276,71 @@ mod gate_continuation_tests {
         (dir, s)
     }
 
+    /// `OLD_ROW` plus a gate identity and the given extra JSON fields — a row
+    /// as a given build wrote it to disk.
+    fn row_json(extra: serde_json::Value) -> TerminalSessionRecord {
+        let mut v: serde_json::Value = serde_json::from_str(OLD_ROW).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert("gateId".into(), GATE.into());
+        obj.insert("gateConsumingDeviceId".into(), DEVICE.into());
+        for (k, val) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), val.clone());
+        }
+        serde_json::from_value(v).expect("row deserializes")
+    }
+
     // (a)
     #[test]
     fn old_row_without_gate_fields_deserializes_to_none() {
         let rec = old_row();
         assert_eq!(rec.gate_id, None);
         assert_eq!(rec.gate_consuming_device_id, None);
-        assert_eq!(rec.gate_bound_boot_ms, None);
+        assert_eq!(rec.gate_bound_generation, None);
+        assert_eq!(rec.restored_in_generation, None);
         // And an absent field is not serialized, so the on-disk shape of a
         // non-gate record is unchanged.
         let json = serde_json::to_string(&rec).unwrap();
         assert!(!json.contains("gateId"), "{json}");
+        assert!(!json.contains("Generation"), "{json}");
     }
 
     // (b)
     #[test]
     fn gate_fields_round_trip_and_survive_a_gateless_re_record() {
         let (dir, s) = store();
-        s.record_open(gate_row(5_000));
-        // The session-open hook / restore re-record: same csid, no gate.
+        let mut rec = gate_row(PRIOR);
+        rec.restored_in_generation = Some(OTHER.to_string());
+        s.record_open(rec);
+        // The session-open hook / restore re-record: same csid, no gate and
+        // no generation stamps.
         let mut again = old_row();
         again.terminal_id = "new-terminal".to_string();
+        assert_eq!(again.gate_bound_generation, None);
+        assert_eq!(again.restored_in_generation, None);
         s.record_open(again);
         let got = s.get(&old_row().claude_session_id).unwrap();
         assert_eq!(got.gate_id.as_deref(), Some(GATE));
         assert_eq!(got.gate_consuming_device_id.as_deref(), Some(DEVICE));
-        assert_eq!(got.gate_bound_boot_ms, Some(5_000));
+        assert_eq!(got.gate_bound_generation.as_deref(), Some(PRIOR));
+        assert_eq!(got.restored_in_generation.as_deref(), Some(OTHER));
         assert_eq!(got.terminal_id, "new-terminal");
 
-        // Durable: a reopened store (a restart) still has all three.
+        // Durable: a reopened store (a restart) still has them all.
         drop(s);
         let reopened =
             SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let got = reopened.get(&old_row().claude_session_id).unwrap();
         assert_eq!(got.gate_id.as_deref(), Some(GATE));
         assert_eq!(got.gate_consuming_device_id.as_deref(), Some(DEVICE));
-        assert_eq!(got.gate_bound_boot_ms, Some(5_000));
+        assert_eq!(got.gate_bound_generation.as_deref(), Some(PRIOR));
+        assert_eq!(got.restored_in_generation.as_deref(), Some(OTHER));
     }
 
     // (c)
     #[test]
     fn prior_generation_no_terminal_close_with_a_gate_reports_once() {
-        let boot = 10_000;
-        let rec = closed(gate_row(boot - 1), "no-terminal");
-        let report = runner_restart_unreported_report(&rec, boot).expect("must report");
+        let rec = closed(gate_row(PRIOR), "no-terminal");
+        let report = runner_restart_unreported_report(&rec, OTHER).expect("must report");
         assert_eq!(report.gate_id.to_string(), GATE);
         assert_eq!(report.consuming_device_id.to_string(), DEVICE);
 
@@ -10031,72 +10356,157 @@ mod gate_continuation_tests {
             let weak = Arc::downgrade(&s);
             // The SAME function main.rs's close observer calls.
             s.attach_close_observer(move |csid| {
-                if let Some(r) = runner_restart_report_on_close(&weak, csid, boot) {
+                if let Some(r) = runner_restart_report_on_close(&weak, csid, OTHER) {
                     fired.lock().unwrap().push(r);
                 }
             });
         }
-        s.record_open(gate_row(boot - 1));
+        s.record_open(gate_row(PRIOR));
         let csid = old_row().claude_session_id;
         s.record_close(&csid, "no-terminal");
         s.record_close(&csid, "no-terminal");
         assert_eq!(fired.lock().unwrap().len(), 1, "posted exactly once");
     }
 
+    // Plan 2026-10-07 D1 test (a): the generation is an IDENTITY. A gate bound
+    // under generation A is reported by process B and never by A — whatever
+    // any wall-clock value on the record says.
+    #[test]
+    fn generation_is_compared_for_equality_not_by_any_clock() {
+        const A: &str = "11111111-1111-4111-8111-111111111111";
+        const B: &str = "22222222-2222-4222-8222-222222222222";
+        for (opened_at, last_seen_at) in [(0, 0), (i64::MAX / 2, i64::MAX / 2), (5, 1)] {
+            let mut rec = closed(gate_row(A), "no-terminal");
+            rec.opened_at = opened_at;
+            rec.last_seen_at = last_seen_at;
+            rec.restored_from_boot_at = Some(i64::MAX);
+            assert!(
+                runner_restart_unreported_report(&rec, B).is_some(),
+                "process B must report A's orphan (opened_at={opened_at})"
+            );
+            assert_eq!(
+                runner_restart_unreported_report(&rec, A),
+                None,
+                "process A owns its own continuation (opened_at={opened_at})"
+            );
+        }
+        // A backwards clock step across the reboot: the legacy stamp reads
+        // LATER than any "now" this process could compute. The old `>=`
+        // order skipped it; an identity cannot.
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        let legacy = closed(
+            row_json(serde_json::json!({ "gateBoundBootMs": future })),
+            "no-terminal",
+        );
+        assert!(runner_restart_unreported_report(&legacy, cur()).is_some());
+        assert!(runner_restart_unreported_report(&legacy, B).is_some());
+    }
+
+    // Plan 2026-10-07 D1 test (b): legacy migration at load.
+    #[test]
+    fn legacy_boot_ms_row_loads_as_prior_generation_and_unstamped_stays_unknown() {
+        let legacy = row_json(serde_json::json!({ "gateBoundBootMs": 1_000 }));
+        assert_eq!(
+            legacy.gate_bound_generation.as_deref(),
+            Some("legacy-boot-ms:1000")
+        );
+        assert!(legacy
+            .gate_bound_generation
+            .as_deref()
+            .unwrap()
+            .starts_with(LEGACY_BOOT_MS_GENERATION_PREFIX));
+        assert!(
+            runner_restart_unreported_report(&closed(legacy.clone(), "no-terminal"), cur())
+                .is_some()
+        );
+        // The legacy key is never written back: the row re-serializes under
+        // the new key only, and round-trips to the same sentinel.
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("gateBoundBootMs"), "{json}");
+        let again: TerminalSessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.gate_bound_generation, legacy.gate_bound_generation);
+
+        // Through the store's own load path (a restart over an old file).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let mut map = serde_json::Map::new();
+        map.insert(
+            legacy.claude_session_id.clone(),
+            serde_json::to_value(row_json(serde_json::json!({}))).unwrap(),
+        );
+        let mut raw = serde_json::Value::Object(map);
+        raw[&legacy.claude_session_id]["gateBoundBootMs"] = 1_000.into();
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let s = SessionLifecycleStore::open(&path).unwrap();
+        let loaded = s.get(&legacy.claude_session_id).expect("legacy row loads");
+        assert_eq!(
+            loaded.gate_bound_generation.as_deref(),
+            Some("legacy-boot-ms:1000")
+        );
+
+        // A row with neither key is UNKNOWN: no post.
+        let neither = row_json(serde_json::json!({}));
+        assert_eq!(neither.gate_bound_generation, None);
+        assert_eq!(
+            runner_restart_unreported_report(&closed(neither, "no-terminal"), cur()),
+            None
+        );
+    }
+
     // (d)
     #[test]
     fn decision_refuses_every_wrong_arm() {
-        let boot = 10_000;
+        let now = OTHER;
         // This generation bound the gate (a fresh spawn, or a restore that
         // re-stamped it) — the in-process producers own its death.
         assert_eq!(
-            runner_restart_unreported_report(&closed(gate_row(boot), "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(gate_row(now), "no-terminal"), now),
             None
         );
         // A record restored THIS generation keeps its preserved `opened_at`
-        // from before the crash; only the re-stamped boot instant says it is
+        // from before the crash; only the re-stamped generation says it is
         // ours, and the decision must key on that.
-        let mut restored = gate_row(boot);
+        let mut restored = gate_row(now);
         restored.opened_at = 1;
         assert_eq!(
-            runner_restart_unreported_report(&closed(restored, "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(restored, "no-terminal"), now),
             None
         );
         // A restorable close.
         assert_eq!(
-            runner_restart_unreported_report(&closed(gate_row(boot - 1), "poll-dead"), boot),
+            runner_restart_unreported_report(&closed(gate_row(PRIOR), "poll-dead"), now),
             None
         );
         // No gate at all.
         assert_eq!(
-            runner_restart_unreported_report(&closed(old_row(), "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(old_row(), "no-terminal"), now),
             None
         );
         // A work-unit DAG dispatch: `reportable_gate_id` is `None`, so the
         // spawn hint carries no gate identity and nothing is recorded.
-        let mut unit = gate_row(boot - 1);
+        let mut unit = gate_row(PRIOR);
         unit.gate_id = None;
         unit.gate_consuming_device_id = None;
         assert_eq!(
-            runner_restart_unreported_report(&closed(unit, "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(unit, "no-terminal"), now),
             None
         );
         // Half an identity, or no generation stamp: UNKNOWN, never a post.
-        let mut half = gate_row(boot - 1);
+        let mut half = gate_row(PRIOR);
         half.gate_consuming_device_id = None;
         assert_eq!(
-            runner_restart_unreported_report(&closed(half, "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(half, "no-terminal"), now),
             None
         );
-        let mut unstamped = gate_row(boot - 1);
-        unstamped.gate_bound_boot_ms = None;
+        let mut unstamped = gate_row(PRIOR);
+        unstamped.gate_bound_generation = None;
         assert_eq!(
-            runner_restart_unreported_report(&closed(unstamped, "no-terminal"), boot),
+            runner_restart_unreported_report(&closed(unstamped, "no-terminal"), now),
             None
         );
         // Still open.
         assert_eq!(
-            runner_restart_unreported_report(&gate_row(boot - 1), boot),
+            runner_restart_unreported_report(&gate_row(PRIOR), now),
             None
         );
     }
@@ -10104,8 +10514,10 @@ mod gate_continuation_tests {
     // (e)
     #[test]
     fn detail_is_class_first_in_the_1902_grammar() {
-        let rec = closed(gate_row(1), "never-started");
-        let detail = runner_restart_unreported_report(&rec, 2).unwrap().detail;
+        let rec = closed(gate_row(PRIOR), "never-started");
+        let detail = runner_restart_unreported_report(&rec, OTHER)
+            .unwrap()
+            .detail;
         assert!(detail.starts_with("exit=crashed "), "{detail}");
         let keys: Vec<&str> = detail
             .split(' ')
@@ -10124,34 +10536,69 @@ mod gate_continuation_tests {
     }
 
     // (f), store half: a restored record is re-stamped to this generation.
+    // Plan 2026-10-07 D1 test (d): adopts only when `restored_in_generation`
+    // is the current generation; idempotent on a second call.
     #[test]
     fn adopt_restored_gate_restamps_once_and_only_for_a_prior_generation() {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
-        s.record_open(gate_row(100));
-        // Not restored by this boot yet → not adopted.
-        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
-        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
-        // This boot's restore pass marks it.
+        s.record_open(gate_row(PRIOR));
+        // Not restored by this generation yet → not adopted.
+        assert_eq!(s.adopt_restored_gate(&csid, cur()), None);
+        assert_eq!(
+            s.get(&csid).unwrap().gate_bound_generation.as_deref(),
+            Some(PRIOR)
+        );
+        // This generation's restore pass marks it.
         s.mark_restore_pending(&csid);
+        assert_eq!(
+            s.get(&csid).unwrap().restored_in_generation.as_deref(),
+            Some(cur())
+        );
+        // A DIFFERENT process (the marker is not its own) does not adopt it.
+        assert_eq!(s.adopt_restored_gate(&csid, OTHER), None);
         let adopted = s
-            .adopt_restored_gate(&csid, 200)
+            .adopt_restored_gate(&csid, cur())
             .expect("prior generation adopts");
         assert_eq!(adopted.0, old_row().terminal_id);
         assert_eq!(adopted.1.to_string(), GATE);
         assert_eq!(adopted.2.map(|d| d.to_string()).as_deref(), Some(DEVICE));
-        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(200));
+        assert_eq!(
+            s.get(&csid).unwrap().gate_bound_generation.as_deref(),
+            Some(cur())
+        );
         // Idempotent: already this generation's.
-        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        assert_eq!(s.adopt_restored_gate(&csid, cur()), None);
         // No gate → nothing.
         let mut plain = old_row();
         plain.claude_session_id = "plain".to_string();
         s.record_open(plain);
         s.mark_restore_pending("plain");
-        assert_eq!(s.adopt_restored_gate("plain", 200), None);
+        assert_eq!(s.adopt_restored_gate("plain", cur()), None);
         // Closed → nothing.
         s.record_close(&csid, "no-terminal");
-        assert_eq!(s.adopt_restored_gate(&csid, 300), None);
+        assert_eq!(s.adopt_restored_gate(&csid, cur()), None);
+    }
+
+    /// A restore marker from a PRIOR generation never adopts, however late its
+    /// display timestamp reads — and a current-generation marker adopts even
+    /// when the timestamp reads as ancient (a clock step).
+    #[test]
+    fn adoption_keys_on_restored_in_generation_not_the_restore_timestamp() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        let mut rec = gate_row(PRIOR);
+        rec.restored_from_boot_at = Some(i64::MAX);
+        rec.restored_in_generation = Some(OTHER.to_string());
+        s.record_open(rec);
+        assert_eq!(s.adopt_restored_gate(&csid, cur()), None);
+        let mut rec = s.get(&csid).unwrap();
+        rec.restored_from_boot_at = Some(0);
+        rec.restored_in_generation = Some(cur().to_string());
+        // `record_open` keeps a sticky stored value only when the incoming is
+        // None; Some overwrites.
+        s.record_open(rec);
+        assert!(s.adopt_restored_gate(&csid, cur()).is_some());
     }
 
     /// The resume door's reopen is not a continuation. `release_gate_identity`
@@ -10163,21 +10610,22 @@ mod gate_continuation_tests {
     fn release_gate_identity_drops_only_an_owned_gate() {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
-        // A prior-generation gate (bound at boot 100; this boot is 200).
-        s.record_open(gate_row(100));
+        // A prior-generation gate (bound by PRIOR; this process is cur()).
+        s.record_open(gate_row(PRIOR));
         s.mark_restore_pending(&csid);
         // Open: a live continuation keeps its gate.
-        assert!(!s.release_gate_identity(&csid, 200));
+        assert!(!s.release_gate_identity(&csid, cur()));
         // Closed non-restorably: D2 reported it, so it is released.
         s.record_close(&csid, "no-terminal");
-        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_some());
-        assert!(s.release_gate_identity(&csid, 200));
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), cur()).is_some());
+        assert!(s.release_gate_identity(&csid, cur()));
         let after = s.get(&csid).unwrap();
         assert_eq!(after.gate_id, None);
         assert_eq!(after.gate_consuming_device_id, None);
-        assert_eq!(after.gate_bound_boot_ms, None);
-        assert!(!s.release_gate_identity(&csid, 200));
-        assert!(!s.release_gate_identity("absent", 200));
+        assert_eq!(after.gate_bound_generation, None);
+        assert_eq!(after.gate_reported_generation, None);
+        assert!(!s.release_gate_identity(&csid, cur()));
+        assert!(!s.release_gate_identity("absent", cur()));
         // The door's gate-less reopen. It sets no new restore marker, and
         // production's follow-on adoption step is skipped here because the
         // row's demoted `terminal-only` tier refuses it anyway. The sticky
@@ -10187,14 +10635,14 @@ mod gate_continuation_tests {
         assert_eq!(s.get(&csid).unwrap().gate_id, None);
         // And its next non-restorable close reports nothing a second time.
         s.record_close(&csid, "no-terminal");
-        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_none());
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), cur()).is_none());
 
         // A prior-generation `poll-dead` gate is UNREPORTED: kept.
-        let mut pd = gate_row(100);
+        let mut pd = gate_row(PRIOR);
         pd.claude_session_id = "pd".to_string();
         s.record_open(pd);
         s.record_close("pd", "poll-dead");
-        assert!(!s.release_gate_identity("pd", 200));
+        assert!(!s.release_gate_identity("pd", cur()));
         assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
         // ...and after the door's gate-less reopen, D2 still reports it on the
         // next non-restorable close.
@@ -10203,24 +10651,36 @@ mod gate_continuation_tests {
         s.record_open(reopen);
         assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
         s.record_close("pd", "no-terminal");
-        assert!(runner_restart_unreported_report(&s.get("pd").unwrap(), 200).is_some());
+        assert!(runner_restart_unreported_report(&s.get("pd").unwrap(), cur()).is_some());
 
         // A gate bound by THIS process is owned by its exit hook: released
         // whatever the close reason.
-        let mut own = gate_row(200);
+        let mut own = gate_row(cur());
         own.claude_session_id = "own".to_string();
         s.record_open(own);
         s.record_close("own", "poll-dead");
-        assert!(s.release_gate_identity("own", 200));
+        assert!(s.release_gate_identity("own", cur()));
         assert_eq!(s.get("own").unwrap().gate_id, None);
 
-        // A missing boot stamp is UNKNOWN: kept.
-        let mut unstamped = gate_row(100);
+        // A missing generation stamp is UNKNOWN: kept.
+        let mut unstamped = gate_row(PRIOR);
         unstamped.claude_session_id = "unstamped".to_string();
-        unstamped.gate_bound_boot_ms = None;
+        unstamped.gate_bound_generation = None;
         s.record_open(unstamped);
         s.record_close("unstamped", "no-terminal");
-        assert!(!s.release_gate_identity("unstamped", 200));
+        assert!(!s.release_gate_identity("unstamped", cur()));
+
+        // A gate whose report a runner-side producer already claimed (the
+        // poll's stale failed-restore report, or the D4 watcher) is owned:
+        // released, even though D2 would no longer say `Some` for it.
+        let mut claimed = gate_row(PRIOR);
+        claimed.claude_session_id = "claimed".to_string();
+        s.record_open(claimed);
+        assert!(s.claim_gate_report("claimed", cur(), &gate()));
+        s.record_close("claimed", "poll-dead");
+        assert!(runner_restart_unreported_report(&s.get("claimed").unwrap(), cur()).is_none());
+        assert!(s.release_gate_identity("claimed", cur()));
+        assert_eq!(s.get("claimed").unwrap().gate_id, None);
     }
 
     /// Review of the rebase, item 2: a terminal-only restore of a gate record
@@ -10231,13 +10691,20 @@ mod gate_continuation_tests {
     fn a_terminal_only_restore_is_not_adopted_and_still_reports() {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
-        s.record_open(gate_row(100));
+        s.record_open(gate_row(PRIOR));
         s.mark_restored_from_boot(&csid, RESTORE_TIER_TERMINAL_ONLY);
-        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
-        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
+        assert_eq!(
+            s.get(&csid).unwrap().restored_in_generation.as_deref(),
+            Some(cur())
+        );
+        assert_eq!(s.adopt_restored_gate(&csid, cur()), None);
+        assert_eq!(
+            s.get(&csid).unwrap().gate_bound_generation.as_deref(),
+            Some(PRIOR)
+        );
         s.record_close(&csid, "terminal-only-idle");
         let rec = s.get(&csid).unwrap();
-        assert!(runner_restart_unreported_report(&rec, 200).is_some());
+        assert!(runner_restart_unreported_report(&rec, cur()).is_some());
     }
 
     /// The real resume sequence: `mark_restore_pending` stamps `failed` before
@@ -10247,13 +10714,13 @@ mod gate_continuation_tests {
     fn a_pending_resume_tier_failed_still_adopts() {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
-        s.record_open(gate_row(100));
+        s.record_open(gate_row(PRIOR));
         s.mark_restore_pending(&csid);
         assert_eq!(
             s.get(&csid).unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_FAILED)
         );
-        assert!(s.adopt_restored_gate(&csid, 200).is_some());
+        assert!(s.adopt_restored_gate(&csid, cur()).is_some());
     }
 
     // (g)
@@ -10273,5 +10740,212 @@ mod gate_continuation_tests {
         );
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
+    }
+
+    // ── Plan 2026-10-07 Phase 2 (D3): a failed-tier gate restore that nobody
+    // retried is reported once its marker is stale. ──
+
+    /// A prior-generation gate record whose boot-restore resume was attempted
+    /// (failed tier, marker stamped now) and never verified. Returns the
+    /// marker's instant.
+    fn failed_restore(s: &SessionLifecycleStore, generation: &str) -> i64 {
+        s.record_open(gate_row(generation));
+        let csid = old_row().claude_session_id;
+        s.mark_restore_pending(&csid);
+        let rec = s.get(&csid).unwrap();
+        assert_eq!(rec.restore_tier.as_deref(), Some(RESTORE_TIER_FAILED));
+        rec.restore_pending_at.expect("marker stamped")
+    }
+
+    // (e)
+    #[test]
+    fn a_stale_failed_restore_of_a_prior_generation_gate_reports_exactly_once() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        let marker = failed_restore(&s, PRIOR);
+        let stale = marker + RESTORE_PENDING_TTL_MS + 1;
+
+        let report = s
+            .report_stale_failed_restore(&csid, false, cur(), stale)
+            .expect("a stale failed restore of a prior-generation gate reports");
+        assert_eq!(report.gate_id.to_string(), GATE);
+        assert_eq!(report.consuming_device_id.to_string(), DEVICE);
+        assert_eq!(
+            report.detail,
+            "exit=unknown code=none after=60s terminal=3f08601c-8fc8-4b1d-835d-c65bab42b85c \
+             reason=runner_restart close=resume-failed-stale"
+        );
+        // The record stays OPEN (a late Retry still works) and is claimed.
+        let rec = s.get(&csid).unwrap();
+        assert_eq!(rec.state, "open");
+        assert!(rec.restore_pending_at.is_some());
+        assert_eq!(rec.gate_reported_generation.as_deref(), Some(cur()));
+
+        // A second poll tick posts nothing.
+        assert_eq!(
+            s.report_stale_failed_restore(&csid, false, cur(), stale + 45_000),
+            None
+        );
+
+        // Durable and sticky: a restart's reopen keeps the claim, and a
+        // gateless re-record (the session-open hook) does not blank it.
+        let mut again = old_row();
+        again.terminal_id = "retried-terminal".to_string();
+        s.record_open(again);
+        assert_eq!(
+            s.get(&csid).unwrap().gate_reported_generation.as_deref(),
+            Some(cur())
+        );
+
+        // The D2 close observer skips a gate this generation already reported.
+        s.record_close(&csid, "no-terminal");
+        assert_eq!(
+            runner_restart_unreported_report(&s.get(&csid).unwrap(), cur()),
+            None
+        );
+        // ...but a LATER process generation is not bound by this one's claim.
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), OTHER).is_some());
+    }
+
+    #[test]
+    fn the_poll_consults_the_stale_failed_report_only_when_determinate_and_unheld() {
+        assert!(may_report_stale_failed_restore(true, true, false));
+        assert!(
+            !may_report_stale_failed_restore(false, true, false),
+            "no marker"
+        );
+        assert!(
+            !may_report_stale_failed_restore(true, false, false),
+            "indeterminate snapshot"
+        );
+        assert!(
+            !may_report_stale_failed_restore(true, true, true),
+            "boot restore withheld"
+        );
+    }
+
+    // A marker an EARLIER process left is not this process's failed resume:
+    // it is waiting for this process's own boot restore (which may be
+    // withheld by a drain), however old its timestamp reads.
+    #[test]
+    fn a_carried_over_restore_marker_is_not_reported_as_stale() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        // Marked restore-pending by the process whose generation is `cur()`...
+        let marker = failed_restore(&s, PRIOR);
+        let ancient = marker + 100 * RESTORE_PENDING_TTL_MS;
+        // ...and observed by a LATER process (`OTHER`) that has not yet
+        // attempted its own restore. The gate is prior-generation to it,
+        // the marker is far past the TTL — and still nothing is posted.
+        assert_eq!(
+            s.report_stale_failed_restore(&csid, false, OTHER, ancient),
+            None
+        );
+        assert_eq!(s.get(&csid).unwrap().gate_reported_generation, None);
+        // The process that DID attempt it reports once the TTL passes.
+        assert!(s
+            .report_stale_failed_restore(&csid, false, cur(), ancient)
+            .is_some());
+    }
+
+    // (f)
+    #[test]
+    fn a_young_marker_or_a_current_generation_gate_reports_nothing() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        let marker = failed_restore(&s, PRIOR);
+        // Younger than (or exactly at) the TTL: the resume may still verify.
+        assert_eq!(
+            s.report_stale_failed_restore(&csid, false, cur(), marker),
+            None
+        );
+        assert_eq!(
+            s.report_stale_failed_restore(&csid, false, cur(), marker + RESTORE_PENDING_TTL_MS),
+            None
+        );
+        // A Claude is present in the terminal: not a failed resume.
+        let stale = marker + RESTORE_PENDING_TTL_MS + 1;
+        assert_eq!(
+            s.report_stale_failed_restore(&csid, true, cur(), stale),
+            None
+        );
+        assert_eq!(s.get(&csid).unwrap().gate_reported_generation, None);
+
+        // A gate bound by THIS generation: its in-process producers own it.
+        let (_dir2, s2) = store();
+        let marker2 = failed_restore(&s2, cur());
+        assert_eq!(
+            s2.report_stale_failed_restore(
+                &csid,
+                false,
+                cur(),
+                marker2 + RESTORE_PENDING_TTL_MS + 1
+            ),
+            None
+        );
+
+        // No marker at all (a live, verified session): nothing.
+        let (_dir3, s3) = store();
+        s3.record_open(gate_row(PRIOR));
+        assert_eq!(
+            s3.report_stale_failed_restore(&csid, false, cur(), i64::MAX),
+            None
+        );
+
+        // A gate with no generation stamp is UNKNOWN, never "prior".
+        let mut unstamped = gate_row(PRIOR);
+        unstamped.gate_bound_generation = None;
+        unstamped.state = "open".to_string();
+        unstamped.restore_pending_at = Some(0);
+        assert_eq!(
+            stale_failed_restore_report(&unstamped, false, cur(), i64::MAX),
+            None
+        );
+        // A closed record is the D2 close observer's, not the poll's.
+        let mut shut = closed(gate_row(PRIOR), "no-terminal");
+        shut.restore_pending_at = Some(0);
+        assert_eq!(
+            stale_failed_restore_report(&shut, false, cur(), i64::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_gate_report_is_once_per_generation() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(PRIOR));
+        assert!(
+            !s.claim_gate_report(&csid, cur(), &uuid::Uuid::nil()),
+            "another gate"
+        );
+        assert!(s.claim_gate_report(&csid, cur(), &gate()));
+        assert!(!s.claim_gate_report(&csid, cur(), &gate()));
+        assert!(s.claim_gate_report(&csid, OTHER, &gate()));
+        assert!(!s.claim_gate_report("absent", cur(), &gate()));
+
+        // A row this generation re-adopted (bound to `cur()`) owes no runner
+        // report: its own exit hook reports it.
+        let (_dir2, s2) = store();
+        s2.record_open(gate_row(cur()));
+        assert!(!s2.claim_gate_report(&csid, cur(), &gate()));
+        // A row whose gate was RELEASED while a D4 watcher held the deferred
+        // report: the watcher still posts (nothing else holds it), unstamped.
+        let (_dir4, s4) = store();
+        s4.record_open(gate_row(PRIOR));
+        s4.record_close(&csid, "no-terminal");
+        assert!(s4.release_gate_identity(&csid, cur()));
+        assert!(s4.claim_gate_report(&csid, cur(), &gate()));
+        assert_eq!(s4.get(&csid).unwrap().gate_reported_generation, None);
+        // An unstamped (UNKNOWN) row owes no runner report either.
+        let mut unstamped = gate_row(PRIOR);
+        unstamped.gate_bound_generation = None;
+        let (_dir3, s3) = store();
+        s3.record_open(unstamped);
+        assert!(!s3.claim_gate_report(&csid, cur(), &gate()));
+    }
+
+    fn gate() -> uuid::Uuid {
+        uuid::Uuid::parse_str(GATE).unwrap()
     }
 }

@@ -62,6 +62,7 @@ import { callRegistry, textArg, useTerminalCommands } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
+import { buildRetryResumeArgs, fetchRecordsByClaudeSessionId } from "./resumeRecordLookup";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -1051,28 +1052,43 @@ function TerminalPageInner({
   // handshake the OPEN record is re-asserted under this live terminal id
   // (item 3 — the restore no longer re-asserts before verification, so the
   // verified branch owns it).
+  //
+  // The tab carries no gate identity, so the durable record is read first
+  // (plan 2026-10-07 D2): a gate continuation retried by hand must still be
+  // able to report its own work outcome, exactly as the drain's resume can.
+  // The verified re-assert then adopts it through `terminal_session_record_open`.
   const handleRetryResume = useCallback(
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab?.claudeSessionId) return;
+      const claudeSessionId = tab.claudeSessionId;
+      const configDir = tab.claudeConfigDir;
       updateTab(tabId, { resumeFailed: false, isReconnecting: true });
-      void runVerifiedResume({
-        terminalRefs: terminalRefs.current,
+      // Re-assert payload for the verified branch — no origin, so the backend
+      // preserves the record's existing origin. Built at click time, from the
+      // assignments the operator is looking at.
+      const recordOpen = buildSessionOpenArgs({
+        assignments: assignmentsRef.current,
+        tabs: tabsRef.current,
         tabId,
-        claudeSessionId: tab.claudeSessionId,
-        configDir: tab.claudeConfigDir,
-        updateTab,
-        // Re-assert payload for the verified branch — no origin, so the
-        // backend preserves the record's existing origin.
-        recordOpen: buildSessionOpenArgs({
-          assignments: assignmentsRef.current,
-          tabs: tabsRef.current,
-          tabId,
-          claudeSessionId: tab.claudeSessionId,
-          configDir: tab.claudeConfigDir,
-          pageId,
-        }),
+        claudeSessionId,
+        configDir,
+        pageId,
       });
+      void (async () => {
+        const records = await fetchRecordsByClaudeSessionId();
+        await runVerifiedResume({
+          terminalRefs: terminalRefs.current,
+          updateTab,
+          ...buildRetryResumeArgs({
+            tabId,
+            claudeSessionId,
+            configDir,
+            record: records.get(claudeSessionId),
+            recordOpen,
+          }),
+        });
+      })();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [updateTab, pageId],

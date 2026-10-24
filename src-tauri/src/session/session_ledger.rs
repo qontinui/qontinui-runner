@@ -648,9 +648,10 @@ pub fn diff(
     }
 
     // An input we could not read must not be laundered into a confident miss
-    // count. `observed_back` skips the sticky-restore-stamp arm when this boot
-    // never latched a census, so a session that came back and was then closed
-    // lands in `missing` — through no fault of the rebuild.
+    // count. A caller that cannot read the sticky restore stamps passes
+    // `restore_stamps_available = false`, and then a session that came back
+    // and was then closed lands in `missing` — through no fault of the
+    // rebuild.
     let verdict = if !restore_stamps_available && !missing.is_empty() {
         VERDICT_UNKNOWN
     } else if prior.sessions.is_empty() {
@@ -709,32 +710,31 @@ pub fn diff(
 }
 
 /// Every session id observed BACK this boot: open in the registry now, plus
-/// anything carrying a restore stamp from this boot.
+/// anything carrying a restore stamp from this process `generation`
+/// ([`crate::session::tracking_health::process_generation`] in production).
 ///
 /// The union matters — a session that came back and was then closed by the
 /// operator DID come back, and counting only `open` rows would report a
 /// `missing` the rebuild is not guilty of. That is the same reasoning
 /// [`crate::session::restore_census::observe_restored`] spells out for reading
 /// all records rather than only open ones.
-pub fn observed_back(store: &SessionLifecycleStore, boot_at_ms: Option<i64>) -> Vec<String> {
+pub fn observed_back(store: &SessionLifecycleStore, generation: &str) -> Vec<String> {
     let mut ids: Vec<String> = store
         .open_records()
         .into_iter()
         .map(|r| r.claude_session_id)
         .collect();
-    // `restored_from_boot_at` is STICKY across restarts by design, so a stamp
-    // older than THIS boot belongs to a previous one. Without a boot instant
-    // to compare against, the closed-record arm is SKIPPED entirely rather
-    // than admitted with a `0` floor — a `0` would count every historical
-    // restore stamp as "came back", which is the wrong-in-the-operator's-favour
-    // direction and exactly the vacuous-`match` failure the census's R3 names.
-    if let Some(boot_at_ms) = boot_at_ms {
-        for r in store.all_records() {
-            if r.restored_from_boot_at.is_some_and(|at| at >= boot_at_ms)
-                && !ids.iter().any(|i| i == &r.claude_session_id)
-            {
-                ids.push(r.claude_session_id);
-            }
+    // The restore markers are STICKY across restarts by design, so a stamp
+    // from any other generation belongs to a previous boot. Equality on
+    // `restored_in_generation`, never an order on the `restored_from_boot_at`
+    // display timestamp: a backwards wall-clock step across the reboot would
+    // otherwise drop every closed restored session into `missing` (plan
+    // `2026-10-07-a-resumed-gate-continuation-…` D1).
+    for r in store.all_records() {
+        if r.restored_in_generation.as_deref() == Some(generation)
+            && !ids.iter().any(|i| i == &r.claude_session_id)
+        {
+            ids.push(r.claude_session_id);
         }
     }
     ids.sort();
@@ -1055,5 +1055,43 @@ mod tests {
     #[test]
     fn a_missing_ledger_file_is_none_not_an_error() {
         assert!(load_from(Path::new("D:/definitely/not/here/ledger.json")).is_none());
+    }
+
+    /// Plan 2026-10-07 D1 test (d2), ledger half: a closed record counts as
+    /// "came back" only when it was restored in THIS generation — whatever
+    /// its `restored_from_boot_at` display timestamp says.
+    #[test]
+    fn observed_back_keys_on_the_generation_not_the_timestamp() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
+        let rec = |id: &str, at: Option<i64>, generation: Option<&str>| -> TerminalSessionRecord {
+            let mut r: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+                "claudeSessionId": id,
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": format!("term-{id}"),
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+            }))
+            .unwrap();
+            r.restored_from_boot_at = at;
+            r.restored_in_generation = generation.map(str::to_string);
+            r
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("this-gen", Some(0), Some("gen-this")));
+        store.record_open(rec("prior-gen", Some(i64::MAX), Some("gen-prior")));
+        store.record_open(rec("pre-field", Some(i64::MAX), None));
+        store.record_open(rec("still-open", None, None));
+        for id in ["this-gen", "prior-gen", "pre-field"] {
+            store.record_close(id, "pty-exit");
+        }
+        assert_eq!(
+            observed_back(&store, "gen-this"),
+            vec!["still-open".to_string(), "this-gen".to_string()]
+        );
     }
 }
