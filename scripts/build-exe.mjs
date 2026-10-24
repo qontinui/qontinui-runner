@@ -62,8 +62,6 @@ console.log(announcement(profile));
 const warning = debugOptInWarning(profile, source);
 if (warning) console.warn(warning);
 
-run("pnpm", ["run", "build"], process.env);
-
 function hostTriple() {
   const r = spawnSync("rustc", ["-vV"], { encoding: "utf8" });
   const m = r.status === 0 ? r.stdout.match(/^host:\s*(\S+)$/m) : null;
@@ -73,6 +71,12 @@ function hostTriple() {
   }
   return m[1];
 }
+
+// Read before building: the binaries are checked against it afterwards, and a
+// failure here must not cost a whole (possibly ~20-minute) cargo build first.
+const triple = hostTriple();
+
+run("pnpm", ["run", "build"], process.env);
 
 // Cargo from src-tauri, NOT the repo root: cargo reads `.cargo/config.toml`
 // from its CWD upward, and the runner's lives at src-tauri/.cargo/config.toml
@@ -103,7 +107,6 @@ if (cargo.status !== 0) process.exit(cargo.status ?? 1);
 
 // Every bin must be a real native executable for the host, in this profile's
 // output dir. A missing, empty or foreign file fails the build by name.
-const triple = hostTriple();
 const wanted = ["qontinui-runner", ...PRIMARY_BINS];
 const built = executablesFromCargoJson(cargo.stdout, wanted);
 const problems = [];

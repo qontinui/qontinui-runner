@@ -129,7 +129,8 @@ lto = false
 # runner crate at opt-level 2; bound 60% of 128 GB); 4.1 GB of output. The
 # terminal transport benches (src/terminal/transport_cost.rs) ran 21-35x
 # faster per byte on repaint corpora and 4-8x on the typing corpus, with the
-# redaction hop 59-66x faster per frame.
+# redaction hop 59-66x faster per frame on repaint corpora (6.2x on typing).
+# The full table is in the plan's "Phase 1 result" section.
 [profile.release-checked]
 inherits = "release"
 debug-assertions = true
