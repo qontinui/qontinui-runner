@@ -2005,7 +2005,25 @@ impl ClaudeSession {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account
+        // 1. Read conversation history from DB — BEFORE rotating, so a read
+        //    that fails leaves the account where it was rather than switching
+        //    accounts for a restart that then does not happen.
+        let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
+            Ok(replay) => replay,
+            Err(BuildReplayErr::NoPg) => {
+                warn!("No PG connection for reading conversation history");
+                return;
+            }
+            Err(BuildReplayErr::Unreadable(e)) => {
+                warn!(
+                    "Conversation history unreadable ({}); not restarting without it",
+                    e
+                );
+                return;
+            }
+        };
+
+        // 2. Rotate to another account
         if !rotate_account_on_rate_limit() {
             warn!(
                 "Session {}: no alternative account available for restart",
@@ -2025,22 +2043,6 @@ impl ClaudeSession {
             "Session {}: restarting on account '{}' after rate-limit",
             session_id, label
         );
-
-        // 2. Read conversation history from DB
-        let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
-            Ok(replay) => replay,
-            Err(BuildReplayErr::NoPg) => {
-                warn!("No PG connection for reading conversation history");
-                return;
-            }
-            Err(BuildReplayErr::Unreadable(e)) => {
-                warn!(
-                    "Conversation history unreadable ({}); not restarting without it",
-                    e
-                );
-                return;
-            }
-        };
 
         // 3. Spawn new session
         let sm = match app_handle.try_state::<Arc<crate::claude_session::manager::SessionManager>>()

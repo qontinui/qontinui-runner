@@ -815,9 +815,9 @@ impl LoopController {
                     }),
                     Err(_) => None,
                 };
-            // Set when an original setting could not be read, or an override
-            // could not be written: the run then executes as a plain baseline,
-            // never as a partial canary.
+            // Set when the overrides could not be loaded, an original setting
+            // could not be read, or an override could not be written: the run
+            // then executes as a plain baseline, never as a partial canary.
             let mut abandon_canary = false;
 
             // Apply config overrides for canary runs
@@ -861,7 +861,11 @@ impl LoopController {
                         }
                     }
                     Err(e) => {
-                        warn!("CANARY: Failed to load config overrides: {}", e);
+                        warn!(
+                            "CANARY: Failed to load config overrides, running as baseline: {}",
+                            e
+                        );
+                        abandon_canary = true;
                     }
                 }
             }

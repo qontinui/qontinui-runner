@@ -193,10 +193,17 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
           // Load message history from DB
           invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
             .then((outputResponse) => {
-              // A DB outage still returns the live in-memory output.
-              const { log } = aiOutputOf(outputResponse);
+              // A DB outage still returns the live in-memory output: show it,
+              // and say the persisted history could not be read.
+              const { log, historyUnavailable } = aiOutputOf(outputResponse);
               if (log) {
                 setMessages(parseOutputLog(log));
+              }
+              if (historyUnavailable) {
+                setLastReadError(
+                  `history read failed: ${outputResponse.message ?? "database unavailable"}`,
+                );
+                setReadStatus("failed");
               }
             })
             .catch(() => {});

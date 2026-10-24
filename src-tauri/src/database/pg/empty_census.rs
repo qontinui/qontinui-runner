@@ -19,8 +19,9 @@
 //! aware, since rustfmt splits the chain one call per line — or the same read
 //! made from sync code through a bridge, `block_on(<receiver>.<method>(<args>))
 //! .<fallback>` (any `…block_on(`, optionally around an `async { … .await }`
-//! block, and inside any `block_in_place(|| …)` / `catch_unwind(…)` wrapper
-//! whose closers come before the fallback), where:
+//! block, with the closers of any wrapping calls or blocks — a
+//! `block_in_place(|| …)`, a `catch_unwind(…)` — and rustfmt's trailing comma
+//! before the fallback), where:
 //!
 //! - the call start matches [`CALL_START`]; `<args>` is paren-balanced (string
 //!   literals skipped), and what follows the closing paren matches
@@ -46,9 +47,10 @@
 //! `*pg*` receivers 23 — 12 of them the `pg_db()` accessor and 11 other
 //! aliases — self 5, db 1; PgDb::global() / PgDb::try_global() 0), 26 after.
 //! Bridged spelling (added in review; `catch_unwind` panic arms that map to
-//! `Err` excluded): 21 sites before, 16 after (5 converted: the replay-history
-//! read, the stage-name and reflection-prefix workflow lookups, and the
-//! comparison benchmark lookup). The 42 after are exactly [`ALLOWLIST`].
+//! `Err` excluded): 22 sites before, 14 after (8 converted: the replay-history
+//! read, the stage-name and two reflection-prefix workflow lookups, the
+//! comparison benchmark lookup, and the three meta-optimizer guards, which
+//! now fail safe with a `warn!`). The 40 after are exactly [`ALLOWLIST`].
 //!
 //! Allowlist entries are keyed by file + the site's whitespace-stripped text
 //! (from the receiver through the fallback head), never by line number, and
@@ -94,10 +96,11 @@ const BRIDGED_HEAD: &str =
     r"block_on\(\s*(?:async\s+(?:move\s+)?\{\s*)?(?:[A-Za-z_][A-Za-z0-9_]*(?:\(\))?\s*\.\s*)*$";
 
 /// What must follow a BRIDGED call's closing paren before the fallback head:
-/// an optional `.await` (inside the async block), then the closers of the
-/// block, the `block_on(` and any wrapping `block_in_place(|| …)` /
-/// `catch_unwind(…)` — at least one `)`.
-const BRIDGED_TAIL: &str = r"^(?:\s*\.await)?\s*;?[\s)}]*\)\s*\.\s*";
+/// an optional `.await` (inside the async block), the trailing `,` rustfmt adds
+/// when it splits the bridged argument across lines, then closers — at least
+/// one `)` — of ANY wrapping calls and blocks (the `block_on(`, an async block,
+/// a `block_in_place(|| …)`, a `catch_unwind(…)`, …).
+const BRIDGED_TAIL: &str = r"^(?:\s*\.await)?\s*[;,]?[\s,)}]*\)\s*\.\s*";
 
 /// A closure fallback whose body is an `Err(..)` yields an error, not a value.
 const ERR_BODY: &str = r"^\s*\{?\s*Err\(";
@@ -329,20 +332,6 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         file: "meta_optimizer/prompt_evolution.rs",
-        site: r#"pg_db.has_active_evolution(agent_type).await})}).unwrap_or("#,
-        count: 1,
-        reason:
-            "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as an active evolution, so \
-                 no second rewrite is created",
-    },
-    Allowed {
-        file: "meta_optimizer/prompt_evolution.rs",
-        site: r#"pg_db.is_in_evolution_cooldown(agent_type,&cutoff).await})}).unwrap_or("#,
-        count: 1,
-        reason: "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as in cooldown",
-    },
-    Allowed {
-        file: "meta_optimizer/prompt_evolution.rs",
         site: r#"pg_db.count_consecutive_rejections(agent_type).await})}).unwrap_or("#,
         count: 1,
         reason: "bridged: feeds the cooldown length and the evolution row's counter; both guard \
@@ -358,19 +347,18 @@ const ALLOWLIST: &[Allowed] = &[
                  does not block on it",
     },
     Allowed {
+        file: "meta_optimizer/trigger.rs",
+        site: r#"pg_db.count_optimizer_runs_by_type(optimizer_type.as_str()),)}).unwrap_or("#,
+        count: 1,
+        reason: "bridged: a style-rotation index only; an unreadable count picks style 0, \
+                 which is a valid style",
+    },
+    Allowed {
         file: "meta_optimizer/prompt_extractor.rs",
         site: r#"pg.get_active_prompt(&agent_type))}).ok()"#,
         count: 1,
         reason: "bridged: falls back to the documented default prompt for the agent type (a real \
                  value)",
-    },
-    Allowed {
-        file: "meta_optimizer/recommendations.rs",
-        site: r#"pg_db.is_content_duplicate(content_hash))}).unwrap_or("#,
-        count: 1,
-        reason:
-            "bridged: fails SAFE (`unwrap_or(true)`): unreadable reads as a duplicate, so nothing \
-                 is inserted",
     },
     Allowed {
         file: "step_executor/handlers/save_workflow_artifact.rs",
@@ -494,13 +482,35 @@ fn close_paren(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// The census patterns, compiled once for the whole walk.
+struct Patterns {
+    start: Regex,
+    direct: Regex,
+    bridged: Regex,
+    bridged_head: Regex,
+    err_body: Regex,
+}
+
+fn patterns() -> &'static Patterns {
+    static PATTERNS: std::sync::OnceLock<Patterns> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| Patterns {
+        start: Regex::new(CALL_START).expect("CALL_START"),
+        direct: Regex::new(&format!("{DIRECT_TAIL}{FALLBACK_HEADS}")).expect("DIRECT_TAIL"),
+        bridged: Regex::new(&format!("{BRIDGED_TAIL}{FALLBACK_HEADS}")).expect("BRIDGED_TAIL"),
+        bridged_head: Regex::new(BRIDGED_HEAD).expect("BRIDGED_HEAD"),
+        err_body: Regex::new(ERR_BODY).expect("ERR_BODY"),
+    })
+}
+
 /// The census sites in one file.
 fn census_sites(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<Site> {
-    let start = Regex::new(CALL_START).expect("CALL_START");
-    let direct = Regex::new(&format!("{DIRECT_TAIL}{FALLBACK_HEADS}")).expect("DIRECT_TAIL");
-    let bridged = Regex::new(&format!("{BRIDGED_TAIL}{FALLBACK_HEADS}")).expect("BRIDGED_TAIL");
-    let bridged_head = Regex::new(BRIDGED_HEAD).expect("BRIDGED_HEAD");
-    let err_body = Regex::new(ERR_BODY).expect("ERR_BODY");
+    let Patterns {
+        start,
+        direct,
+        bridged,
+        bridged_head,
+        err_body,
+    } = patterns();
     let bytes = text.as_bytes();
     let mut sites = Vec::new();
     // Overlapping candidates: resume at each match's METHOD name, so in
@@ -654,6 +664,8 @@ fn pg_error_to_empty_census_sees_a_bridged_site_and_skips_an_err_arm() {
         // an async block inside the bridge.
         "block_in_place(|| Handle::current().block_on(async { pg_db.m(t).await }))\n.unwrap_or(false)",
         "h.block_on(async move { pg.m(&id).await }).unwrap_or_else(|_| Vec::new())",
+        // rustfmt's split argument, with its trailing comma.
+        "Handle::current().block_on(\n    deps.app_state\n        .pg_db\n        .m(x),\n)\n})\n.unwrap_or(0)",
     ];
     for src in hits {
         assert_eq!(census_sites("a.rs", src, &methods).len(), 1, "{src}");

@@ -34,13 +34,23 @@ pub fn compute_content_hash(
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
 ///
-/// Fails SAFE: an unreadable state reads as "duplicate", so a database outage
-/// never lets a duplicate recommendation through.
+/// Fails SAFE: an unreadable state reads as "duplicate" (logged at `warn!`),
+/// so a database outage — or any other read failure — never lets a duplicate
+/// recommendation through.
 pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
-    tokio::task::block_in_place(|| {
+    let read = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
-    })
-    .unwrap_or(true)
+    });
+    match read {
+        Ok(duplicate) => duplicate,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "recommendation duplicate check unreadable; treating it as a duplicate (fail safe)"
+            );
+            true
+        }
+    }
 }
 
 // ── JSON payloads expected inside `recommended_value` ────────────────
