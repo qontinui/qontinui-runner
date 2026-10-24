@@ -988,11 +988,12 @@ fn upstream_failure(
 /// answering at all, which is a different thing from it answering "no".
 ///
 /// Names the base URL dialled AND which of `api_config`'s rungs produced it
-/// (`env:…` / `persisted:…` / `build_default:…`), so a 502 says which knob is
-/// pointing at a dead backend rather than only that one is. (Measured
-/// 2026-09-05: a runner whose `settings.json` persisted the debug default
-/// `http://127.0.0.1:8000` answered 502 here, and nothing said the value was
-/// the persisted rung outranking the release default.)
+/// (`env:…` / `profile:…` / `persisted:…` / `build_default…`), so a 502 says
+/// which knob is pointing at a dead backend rather than only that one is.
+/// (Measured 2026-09-05: a runner whose `settings.json` persisted the old debug
+/// default `http://127.0.0.1:8000` answered 502 here, and nothing said the
+/// value was the persisted rung outranking the build default. Such a
+/// machine-local persisted value is now refused in every build.)
 fn transport_failure(what: &str, e: reqwest::Error) -> (StatusCode, Json<ApiResponse<()>>) {
     let (base, arm) = crate::api_config::get_api_base_url_with_source();
     (
