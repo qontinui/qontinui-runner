@@ -17,10 +17,10 @@
 #                          (default 5432), whatever port the host published.
 #                          Works the same on Linux and Docker Desktop.
 #   otherwise, Linux       `--network host`; URLs are used as given.
-#   otherwise (macOS/Win)  the default bridge network, with localhost /
-#                          127.0.0.1 in the URL rewritten to
-#                          host.docker.internal (Docker Desktop has no usable
-#                          host networking).
+#   otherwise (macOS/Win)  the default bridge network, with a loopback host
+#                          (localhost, 127.0.0.1, [::1], 0.0.0.0) in the URL
+#                          rewritten to host.docker.internal (Docker Desktop
+#                          has no usable host networking).
 # Callers pass the URL as the HOST sees it; atlas_container_url rewrites it.
 # PGPASSWORD, when set, is forwarded to the containers, so a URL need not
 # carry the password.
@@ -74,9 +74,13 @@ atlas_network() {
 
 # Rewrite a host-side postgres URL ($1) into the address a helper container on
 # atlas_network sees. Anything that is not a postgres URL passes through.
+#
+# The userinfo group is greedy up to the LAST `@` before the path, so a raw
+# `@` in a password does not end up in the host. A bracketed IPv6 literal
+# ([::1]) is one host.
 atlas_container_url() {
   local url="$1" net re scheme userinfo host port rest
-  re='^(postgres(ql)?://)([^@/]*@)?([^/:?]+)(:[0-9]+)?([/?].*)?$'
+  re='^(postgres(ql)?://)([^/?]*@)?(\[[0-9A-Fa-f:.]+\]|[^]/:?@[]+)(:[0-9]+)?([/?].*)?$'
   if ! [[ "$url" =~ $re ]]; then
     printf '%s\n' "$url"
     return
@@ -93,7 +97,9 @@ atlas_container_url() {
       port=":${ATLAS_PG_CONTAINER_PORT:-5432}"
       ;;
     "")
-      case "$host" in localhost | 127.0.0.1) host="host.docker.internal" ;; esac
+      case "$host" in
+        localhost | 127.0.0.1 | '[::1]' | 0.0.0.0) host="host.docker.internal" ;;
+      esac
       ;;
   esac
   printf '%s%s%s%s%s\n' "$scheme" "$userinfo" "$host" "$port" "$rest"
@@ -159,12 +165,25 @@ atlas_normalize_url() {
   printf '%s\n' "$url"
 }
 
-# The same server and credentials as $1, database $2.
+# The same server and credentials as $1, database $2. The authority is
+# everything between `://` and the first `/`, so a URL with no database path
+# (postgres://u@h:5433?sslmode=disable) gains one instead of losing its host.
+# Returns 1 (message on stderr) for anything it cannot derive from; it runs
+# inside $(...), where atlas_fail would only end the subshell.
 atlas_url_with_db() {
-  local url="$1" db="$2" base query=""
+  local url="$1" db="$2" base query="" rest authority
   base="${url%%\?*}"
   case "$url" in *\?*) query="?${url#*\?}" ;; esac
-  printf '%s/%s%s\n' "${base%/*}" "$db" "$query"
+  rest="${base#*://}"
+  authority="${rest%%/*}"
+  case "$base" in
+    *://*) ;;
+    *)
+      echo "::error::not a URL, so no database URL can be derived from it" >&2
+      return 1
+      ;;
+  esac
+  printf '%s://%s/%s%s\n' "${base%%://*}" "$authority" "$db" "$query"
 }
 
 # Create a throwaway dev database beside the database at $1, drop its public
@@ -174,8 +193,16 @@ atlas_provision_dev_db() {
   atlas_dev_db_name="atlas_dev_$$_${RANDOM}"
   atlas_psql "$atlas_dev_admin_url" -qc "CREATE DATABASE \"$atlas_dev_db_name\"" >/dev/null \
     || atlas_fail "could not create the Atlas dev database on the target's server"
-  ATLAS_DEV_URL="$(atlas_url_with_db "$atlas_dev_admin_url" "$atlas_dev_db_name")"
+  ATLAS_DEV_URL="$(atlas_url_with_db "$atlas_dev_admin_url" "$atlas_dev_db_name")" \
+    || atlas_fail "could not derive the Atlas dev database URL from the target URL"
   export ATLAS_DEV_URL
+  # Refuse up front unless the derived URL really lands in the throwaway
+  # database: the next statement is a DROP ... CASCADE.
+  local landed
+  landed="$(atlas_psql "$ATLAS_DEV_URL" -tAc "SELECT current_database()")" \
+    || atlas_fail "could not connect to the Atlas dev database"
+  [ "$landed" = "$atlas_dev_db_name" ] \
+    || atlas_fail "refusing to drop public: the dev URL reached database '$landed', not '$atlas_dev_db_name'"
   atlas_psql "$ATLAS_DEV_URL" -qc "DROP SCHEMA public CASCADE" >/dev/null \
     || atlas_fail "could not drop the public schema of the Atlas dev database"
 }
