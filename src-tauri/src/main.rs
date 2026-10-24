@@ -827,7 +827,6 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
                 .expect("degraded PG pool construction failed"),
         );
         crate::database::pg::PgDb::set_global(pg.clone());
-        crate::database::pg::set_pg_available(false);
         // Overwrites whatever `store_handle` recorded: on the connect-failure
         // path below the cluster may well be up, but this process has no
         // usable database, and `/health` must say so.
@@ -844,7 +843,6 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
                     info!("Connected to embedded PostgreSQL (standalone mode)");
                     let pg = Arc::new(pg);
                     crate::database::pg::PgDb::set_global(pg.clone());
-                    crate::database::pg::set_pg_available(true);
                     pg
                 }
                 Err(conn_err) => degrade(
@@ -1001,7 +999,6 @@ fn select_db_arm(
                     .expect("degraded PG pool construction must not fail on a static DSN"),
             );
             crate::database::pg::PgDb::set_global(pg.clone());
-            crate::database::pg::set_pg_available(false);
             crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
             return pg;
         }
@@ -1022,7 +1019,6 @@ fn select_db_arm(
             info!("PostgreSQL connected successfully");
             let pg = Arc::new(pg);
             crate::database::pg::PgDb::set_global(pg.clone());
-            crate::database::pg::set_pg_available(true);
             crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::External);
             pg
         }
@@ -1047,7 +1043,6 @@ fn select_db_arm(
                     Ok(pg) => {
                         let pg = Arc::new(pg);
                         crate::database::pg::PgDb::set_global(pg.clone());
-                        crate::database::pg::set_pg_available(false);
                         crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
                         pg
                     }
