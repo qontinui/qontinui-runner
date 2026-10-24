@@ -215,12 +215,45 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 // Handlers
 // ============================================================================
 
+/// One row of `GET /terminals`: the shared-schema [`TerminalInfo`] flattened,
+/// plus the runner-local `permissionRequestHook` (`"registered"` | `"absent"`,
+/// plan `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// D7). The extra key rides BESIDE the schema type, exactly as
+/// `RemoteTerminalInfo` does, because `TerminalInfo` is the cross-repo wire
+/// schema; every reader of the old keys keeps working unchanged.
+///
+/// The field NAME is a contract: `qontinui-claude-config`'s
+/// `/triage-sessions` reads it to decide whether a non-bypass session can be
+/// typed into without answering a dialog.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalListEntry {
+    #[serde(flatten)]
+    pub info: crate::terminal::types::TerminalInfo,
+    pub permission_request_hook: &'static str,
+}
+
+/// Build the listing rows. PURE.
+pub(crate) fn terminal_list_entries(
+    rows: Vec<(
+        crate::terminal::types::TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )>,
+) -> Vec<TerminalListEntry> {
+    rows.into_iter()
+        .map(|(info, hook)| TerminalListEntry {
+            info,
+            permission_request_hook: hook.as_str(),
+        })
+        .collect()
+}
+
 /// List all terminal sessions.
 pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_manager.list();
+    let terminals = terminal_list_entries(terminal_manager.list_with_permission_request_hooks());
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
@@ -1153,6 +1186,62 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
+    /// camelCase `permissionRequestHook` — the contract
+    /// `qontinui-claude-config` reads.
+    #[test]
+    fn terminal_list_rows_carry_permission_request_hook_beside_the_schema_keys() {
+        use crate::session::claude_hook::PermissionRequestHook;
+        let info = |id: &str, created_at: u64| crate::terminal::types::TerminalInfo {
+            id: id.to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let rows = terminal_list_entries(vec![
+            (info("t-reg", 1), PermissionRequestHook::Registered),
+            (info("t-abs", 2), PermissionRequestHook::Absent),
+        ]);
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["permissionRequestHook"], "registered");
+        assert_eq!(v[1]["permissionRequestHook"], "absent");
+        // The shared schema's own keys are flattened in, unchanged.
+        let plain = serde_json::to_value(info("t-reg", 1)).unwrap();
+        for (key, value) in plain.as_object().unwrap() {
+            assert_eq!(&v[0][key], value, "{key}");
+        }
+        assert_eq!(
+            v[0].as_object().unwrap().len(),
+            plain.as_object().unwrap().len() + 1,
+            "exactly one key added"
+        );
+    }
+
+    /// The handler serves the rows from the hook-aware listing, not the bare
+    /// `list()` (which a rename could silently revert to).
+    #[test]
+    fn the_list_handler_serves_the_hook_aware_rows() {
+        let src = include_str!("terminals.rs");
+        let body = src
+            .split_once("pub async fn list_terminals_handler(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains("list_with_permission_request_hooks()"),
+            "{body}"
+        );
+    }
 
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —

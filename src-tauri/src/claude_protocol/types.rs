@@ -334,6 +334,32 @@ impl OutgoingControlResponse {
             request_id: request_id.to_string(),
         }
     }
+
+    /// Refuse a `can_use_tool` request with `message` — Claude Code's deny
+    /// permission result (`behavior: "deny"` + `message`), beside the
+    /// `allowed: false` mirror of [`Self::allow_tool`]'s `allowed: true` so a
+    /// reader of either spelling sees a refusal. Used when the tenant's
+    /// `permission_auto_accept` dial is answered `off` (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D5): no human can answer a headless request, so it is refused rather
+    /// than left waiting.
+    pub fn deny_tool(request_id: &str, message: &str) -> Self {
+        let mut data = serde_json::Map::new();
+        data.insert("allowed".to_string(), serde_json::Value::Bool(false));
+        data.insert(
+            "behavior".to_string(),
+            serde_json::Value::String("deny".to_string()),
+        );
+        data.insert(
+            "message".to_string(),
+            serde_json::Value::String(message.to_string()),
+        );
+        Self {
+            msg_type: "control_response".to_string(),
+            response: OutgoingControlResponsePayload { data },
+            request_id: request_id.to_string(),
+        }
+    }
 }
 
 // ============================================================================

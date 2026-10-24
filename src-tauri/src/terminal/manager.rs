@@ -1011,7 +1011,26 @@ impl TerminalManager {
     }
 
     /// List all terminal sessions with their info, sorted by creation time.
+    /// Derived from [`Self::list_with_permission_request_hooks`], so the two
+    /// listings cannot disagree on membership or order.
     pub fn list(&self) -> Vec<TerminalInfo> {
+        self.list_with_permission_request_hooks()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    /// [`Self::list`] with each terminal's `permissionRequestHook` beside its
+    /// info, same order — for `GET /terminals` (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7). Beside, not inside: `TerminalInfo` is the cross-repo wire schema and
+    /// gains no runner-local field.
+    pub fn list_with_permission_request_hooks(
+        &self,
+    ) -> Vec<(
+        TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )> {
         let sessions = match self.sessions.lock() {
             Ok(s) => s,
             Err(e) => {
@@ -1020,9 +1039,12 @@ impl TerminalManager {
             }
         };
 
-        let mut infos: Vec<TerminalInfo> = sessions.values().map(|s| s.info()).collect();
-        infos.sort_by_key(|info| info.created_at);
-        infos
+        let mut rows: Vec<_> = sessions
+            .values()
+            .map(|s| (s.info(), s.permission_request_hook()))
+            .collect();
+        rows.sort_by_key(|(info, _)| info.created_at);
+        rows
     }
 
     /// Get the number of active sessions, with a poisoned lock rendered as `0`.

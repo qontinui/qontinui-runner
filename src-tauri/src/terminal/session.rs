@@ -1415,6 +1415,10 @@ struct IdentitySeamOutcome {
     /// bounded [`crate::served_corpus::probe`] so the zero-I/O briefing render
     /// right after the seam can carry its `[served-corpus: …]` header line.
     served: crate::served_corpus::ServedCorpus,
+    /// The `--settings` carrier the seam materialized and exported as
+    /// `QONTINUI_CLAUDE_HOOK_SETTINGS`, or `None` when materialization failed.
+    /// Feeds [`TerminalSession::permission_request_hook`] for the shim path.
+    hook_carrier: Option<std::path::PathBuf>,
 }
 
 /// What the waiter thread knows when a pane's process exits, handed to the
@@ -1559,6 +1563,19 @@ pub struct TerminalSession {
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
     /// such field, so it travels beside it like `sessionIdsByTerminal`).
     spawn_name: std::sync::OnceLock<String>,
+    /// Whether this terminal was handed a carrier that registers the
+    /// `PermissionRequest` hook (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7), served beside `TerminalInfo` on `GET /terminals` as
+    /// `permissionRequestHook`. Set once, by [`Self::spawn`]; unset (an adopted
+    /// holder pane, a remote mirror, a test fixture) reads `absent`.
+    permission_request_hook:
+        std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
+    /// The per-spawn nonce this terminal's child carries as
+    /// `QONTINUI_PERMREQ_NONCE`, once [`Self::spawn`] registered it as the
+    /// terminal's grant (`session::permission_accept`). `Drop` forgets the
+    /// grant only while it is still this nonce's.
+    permission_request_nonce: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1718,6 +1735,10 @@ impl TerminalSession {
         // IS the shell is kept: only a shell pane gets a composed spawn-prompt
         // file below — a direct exec's argv already settled its own carrier.
         let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
+        // The argv's own `--settings`, if any, is half of what this terminal
+        // reports as `permissionRequestHook` (plan 2026-10-23 D7); the seam's
+        // carrier below is the other half. Kept before `command` is consumed.
+        let spawn_argv: Vec<String> = command.clone().unwrap_or_default();
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1759,6 +1780,21 @@ impl TerminalSession {
                 cmd.env(k, v);
             }
         }
+        // Permission auto-accept (plan
+        // `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`):
+        // two per-spawn secrets for the carrier's PermissionRequest hook: the
+        // request key it SENDS to the runner's pad, and the nonce the pad must
+        // ECHO before the hook answers a dialog (the key is derived one-way
+        // from the nonce, so whoever receives a request cannot forge the echo).
+        // Set AFTER the caller's env so neither a caller nor an inherited copy
+        // (a runner started inside a runner session) can plant a known value.
+        // Recorded as this terminal's grant once the child is up, below.
+        let permreq_nonce = crate::session::permission_accept::new_nonce();
+        cmd.env(crate::session::permission_accept::NONCE_ENV, &permreq_nonce);
+        cmd.env(
+            crate::session::permission_accept::REQUEST_KEY_ENV,
+            crate::session::permission_accept::request_key_for(&permreq_nonce),
+        );
 
         // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
         // placed into the PTY env — the caller pin wins, else the credential-
@@ -1813,6 +1849,10 @@ impl TerminalSession {
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
+        let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
+            Some(&spawn_argv),
+            seam.hook_carrier.as_deref(),
+        );
 
         // ---- The canonical runner-context briefing --------------------------
         // Rendered HERE, immediately after the identity seam, and NOT in
@@ -1892,7 +1932,7 @@ impl TerminalSession {
             )?,
         };
 
-        Self::spawn_with_io(
+        let session = Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1903,7 +1943,13 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )
+        )?;
+        // Only THIS path records it: an adopted holder pane or a remote mirror
+        // is built by `spawn_with_io` alone and reads `absent` — and holds no
+        // grant, so the pad never answers its prompts.
+        session.set_permission_request_hook(permission_request_hook);
+        session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        Ok(session)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].
@@ -2530,6 +2576,8 @@ impl TerminalSession {
             grid,
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -3345,7 +3393,7 @@ impl TerminalSession {
                 .entered();
         let hook_result = crate::session::claude_hook::materialize(&hook_dir);
         drop(hook_span);
-        match hook_result {
+        match &hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -3514,6 +3562,7 @@ impl TerminalSession {
             pinned_session_id: pinned,
             coord_mcp,
             served,
+            hook_carrier: hook_result,
         })
     }
 
@@ -4483,6 +4532,36 @@ impl TerminalSession {
         self.spawn_name.get().cloned()
     }
 
+    /// Record what [`Self::spawn`] handed this terminal (first write wins).
+    pub fn set_permission_request_hook(
+        &self,
+        hook: crate::session::claude_hook::PermissionRequestHook,
+    ) {
+        let _ = self.permission_request_hook.set(hook);
+    }
+
+    /// Register this terminal's permission auto-accept grant: the nonce its
+    /// child env carries and the tenant it was spawned for (`None` when the
+    /// caller named none). First write wins.
+    fn record_permission_request_grant(&self, nonce: String, spawn_tenant: Option<uuid::Uuid>) {
+        if self.permission_request_nonce.set(nonce.clone()).is_ok() {
+            crate::session::permission_accept::register_terminal_grant(
+                &self.id,
+                nonce,
+                spawn_tenant,
+            );
+        }
+    }
+
+    /// `GET /terminals` `permissionRequestHook`: `Absent` unless
+    /// [`Self::spawn`] recorded a current carrier.
+    pub fn permission_request_hook(&self) -> crate::session::claude_hook::PermissionRequestHook {
+        self.permission_request_hook
+            .get()
+            .copied()
+            .unwrap_or(crate::session::claude_hook::PermissionRequestHook::Absent)
+    }
+
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
@@ -5195,6 +5274,9 @@ impl Drop for TerminalSession {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
         }
+        if let Some(nonce) = self.permission_request_nonce.get() {
+            crate::session::permission_accept::forget_terminal_grant(&self.id, nonce);
+        }
     }
 }
 
@@ -5684,6 +5766,8 @@ pub(crate) mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),

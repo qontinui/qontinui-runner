@@ -72,6 +72,8 @@ pub mod operator_touch; // Operator-touch idempotency-key + payload builder, sha
 pub mod output_pipe;
 pub mod pane_store;
 pub mod past_sessions;
+pub mod permission_accept; // The ONE decision on whether the runner pad answers a PermissionRequest dialog, behind the permission_auto_accept dial (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch, Phase 2)
+pub mod permission_prompt_capture; // Classify every permission prompt the Notification intake hears into a per-class hourly aggregator (plan 2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote, Phase 2)
 pub mod provider_adapter;
 pub mod reconcile;
 pub mod redact;
