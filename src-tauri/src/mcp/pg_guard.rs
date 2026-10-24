@@ -251,20 +251,9 @@ pub fn route_requires_db(path: &str) -> bool {
 /// degraded boot, a refused connect, or a connect that merely TIMED OUT (which
 /// is not evidence the database is down, so it never says "unreachable").
 fn unavailable_message(path: &str, facts: Option<&DbUnavailable>) -> String {
-    use qontinui_runner_lib::pg_circuit::{CauseClass, CAUSE_BOOT};
-    let reason = match facts {
-        Some(f) if f.cause == CAUSE_BOOT => "this runner booted without its database (a \
-             configured PostgreSQL was unreachable, or the bundled cluster did not start)"
-            .to_string(),
-        Some(f) if f.cause_class == CauseClass::ConnectRefused => {
-            "PostgreSQL is unreachable (a connect was refused)".to_string()
-        }
-        Some(f) if f.cause_class == CauseClass::ConnectTimeout => match f.connect_timeout {
-            Some(t) => format!("PostgreSQL did not answer within {} ms", t.as_millis()),
-            None => "PostgreSQL did not answer in time".to_string(),
-        },
-        _ => "PostgreSQL is not available".to_string(),
-    };
+    let reason = facts
+        .map(DbUnavailable::reason)
+        .unwrap_or_else(|| "PostgreSQL is not available".to_string());
     format!("database unavailable — {reason}; route {path} requires the database")
 }
 

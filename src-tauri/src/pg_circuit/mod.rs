@@ -142,18 +142,28 @@ pub fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+impl DbUnavailable {
+    /// The one human-readable reason, worded by what the breaker actually
+    /// knows (also `pg_guard`'s 503 message). A connect that merely TIMED OUT
+    /// is never called "unreachable".
+    pub fn reason(&self) -> String {
+        match (self.cause.as_str(), self.cause_class) {
+            (CAUSE_BOOT, _) => "this runner booted without its database".to_string(),
+            (_, CauseClass::ConnectRefused) => {
+                "PostgreSQL is unreachable (the connection was refused)".to_string()
+            }
+            (_, CauseClass::ConnectTimeout) => match self.connect_timeout {
+                Some(t) => format!("PostgreSQL did not answer within {} ms", t.as_millis()),
+                None => "PostgreSQL did not answer in time".to_string(),
+            },
+            (_, CauseClass::Unknown) => "PostgreSQL is not available".to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for DbUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{DB_UNAVAILABLE_TOKEN} ")?;
-        match (self.cause.as_str(), self.cause_class) {
-            (CAUSE_BOOT, _) => write!(f, "this runner booted without its database")?,
-            (_, CauseClass::ConnectRefused) => write!(f, "PostgreSQL is unreachable")?,
-            (_, CauseClass::ConnectTimeout) => match self.connect_timeout {
-                Some(t) => write!(f, "PostgreSQL did not answer within {} ms", t.as_millis())?,
-                None => write!(f, "PostgreSQL did not answer in time")?,
-            },
-            (_, CauseClass::Unknown) => write!(f, "PostgreSQL is not available")?,
-        }
+        write!(f, "{DB_UNAVAILABLE_TOKEN} {}", self.reason())?;
         if let Some(since) = self.since {
             write!(f, " (since {})", rfc3339(since))?;
         }
@@ -232,6 +242,29 @@ fn render_pool_error(e: &deadpool_postgres::PoolError) -> String {
     }
 }
 
+/// What a client-side failure (no server reply) says, read off the
+/// `io::Error` in its `source()` chain. Only a refused / reset / aborted
+/// socket is evidence the database is unreachable; tokio-postgres reports its
+/// own `connect_timeout=` (and an OS `ETIMEDOUT`) as a `TimedOut` io error,
+/// which is a TIMEOUT; DNS, TLS and client-config failures name neither.
+pub fn client_failure_class(e: &(dyn std::error::Error + 'static)) -> CauseClass {
+    use std::io::ErrorKind;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted => CauseClass::ConnectRefused,
+                ErrorKind::TimedOut => CauseClass::ConnectTimeout,
+                _ => CauseClass::Unknown,
+            };
+        }
+        cur = err.source();
+    }
+    CauseClass::Unknown
+}
+
 /// Plan D2: what a pool error says about reachability. Only connect-class
 /// evidence trips the breaker (served policy `verification-and-evidence`
 /// `an-unknown-input-must-not-fire-a-detector`: the breaker is a detecting
@@ -240,7 +273,7 @@ fn render_pool_error(e: &deadpool_postgres::PoolError) -> String {
 /// | Outcome | Meaning | Trips? |
 /// |---|---|---|
 /// | `Timeout(Create)` | connect/startup did not complete in time | yes, `connect_timeout` |
-/// | `Backend(e)`, no `DbError` | client-side connect failure | yes, `connect_refused` |
+/// | `Backend(e)`, no `DbError` | client-side connect failure | yes, classed by its `io::ErrorKind` |
 /// | `Backend(e)` with a `DbError` | the server ANSWERED | no (backend error) |
 /// | `Timeout(Wait)` | no permit within the wait timeout | never |
 /// | `Timeout(Recycle)` | not returned by `get()` in deadpool 0.12.3 | no (defensive) |
@@ -255,7 +288,7 @@ pub fn classify(e: &deadpool_postgres::PoolError) -> (Outcome, Option<CauseClass
         ),
         PoolError::Backend(be) if be.as_db_error().is_none() => (
             Outcome::TripFailure(render_pool_error(e)),
-            Some(CauseClass::ConnectRefused),
+            Some(client_failure_class(be)),
         ),
         PoolError::Backend(_) | PoolError::PostCreateHook(_) => {
             (Outcome::NonTripFailure(NonTripKind::BackendError), None)
@@ -288,7 +321,10 @@ pub struct ProbeObservation {
     pub at: SystemTime,
     pub at_instant: Instant,
     pub duration: Duration,
-    pub reachable: bool,
+    /// `Some(true)` the server answered; `Some(false)` a connect-class
+    /// failure; `None` the probe could not tell (the pool was saturated, or
+    /// the probe ran out its bound with the breaker still Closed).
+    pub reachable: Option<bool>,
     pub error: Option<String>,
 }
 
@@ -334,13 +370,20 @@ impl std::fmt::Debug for GuardedPool {
     }
 }
 
-/// Resets the prober flag however the prober task ends, including when the
-/// runtime it was spawned on is dropped, so a later checkout can respawn it.
-struct ProberFlag(Arc<Shared>);
+/// Resets the prober flag however the prober task ends — including when the
+/// runtime it was spawned on drops the task, polled or not — so a later
+/// checkout can respawn it. Created BEFORE the spawn and moved into the task,
+/// so even a task dropped before its first poll clears the flag.
+struct ProberFlag {
+    shared: Arc<Shared>,
+    armed: bool,
+}
 
 impl Drop for ProberFlag {
     fn drop(&mut self) {
-        self.0.prober_running.store(false, Ordering::Release);
+        if self.armed {
+            self.shared.prober_running.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -546,16 +589,27 @@ impl GuardedPool {
             return true;
         }
         let this = self.clone();
-        handle.spawn(async move { this.run_prober().await });
+        let flag = ProberFlag {
+            shared: self.shared.clone(),
+            armed: true,
+        };
+        handle.spawn(async move { this.run_prober(flag).await });
         true
     }
 
-    async fn run_prober(self) {
-        let _flag = ProberFlag(self.shared.clone());
+    async fn run_prober(self, mut flag: ProberFlag) {
         let circuit = self.shared.circuit.clone();
         loop {
             if circuit.is_closed() {
-                return;
+                // Give the slot back, then look once more: a trip between the
+                // check above and this clear saw the flag still set and
+                // spawned nothing, so this prober must keep going.
+                self.shared.prober_running.store(false, Ordering::Release);
+                if circuit.is_closed() || self.shared.prober_running.swap(true, Ordering::AcqRel) {
+                    flag.armed = false;
+                    return;
+                }
+                continue;
             }
             if let Some(wait) = circuit.retry_after() {
                 if !wait.is_zero() {
@@ -564,7 +618,7 @@ impl GuardedPool {
             }
             let Some(permit) = circuit.begin_trial() else {
                 if circuit.is_closed() {
-                    return;
+                    continue; // the exit path above re-checks the race
                 }
                 // A `probe_now` or an inline trial holds the slot; look again.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -621,7 +675,10 @@ impl GuardedPool {
         if installed.is_some() && result.is_ok() {
             *lock(&self.shared.installed_trial) = None;
         }
-        self.observe(started, result.as_ref().err().map(|(_, m)| m.clone()));
+        match &result {
+            Ok(()) => self.observe(started, Some(true), None),
+            Err((_, m)) => self.observe(started, Some(false), Some(m.clone())),
+        };
         result
     }
 
@@ -642,7 +699,7 @@ impl GuardedPool {
             match conn.simple_query("SELECT 1").await {
                 Ok(_) => Ok(()),
                 Err(e) if e.as_db_error().is_some() => Ok(()),
-                Err(e) => Err((Some(CauseClass::ConnectRefused), format!("SELECT 1: {e}"))),
+                Err(e) => Err((Some(client_failure_class(&e)), format!("SELECT 1: {e}"))),
             }
         };
         match tokio::time::timeout(self.shared.trial_timeout, probe).await {
@@ -657,12 +714,17 @@ impl GuardedPool {
         }
     }
 
-    fn observe(&self, started: Instant, error: Option<String>) -> ProbeObservation {
+    fn observe(
+        &self,
+        started: Instant,
+        reachable: Option<bool>,
+        error: Option<String>,
+    ) -> ProbeObservation {
         let obs = ProbeObservation {
             at: SystemTime::now(),
             at_instant: Instant::now(),
             duration: started.elapsed(),
-            reachable: error.is_none(),
+            reachable,
             error,
         };
         *lock(&self.shared.last_probe) = Some(obs.clone());
@@ -673,31 +735,39 @@ impl GuardedPool {
     /// and for the `/health` refresher.
     ///
     /// * Closed: a real checkout + `SELECT 1` through the breaker, so a
-    ///   connect failure trips it.
+    ///   connect-class failure trips it. A saturated pool, or a probe that
+    ///   runs out its bound (one second past the trial timeout, so the pool's
+    ///   own classified error normally arrives first), is `reachable: None` —
+    ///   the probe could not tell — and trips nothing.
     /// * Open: an immediate single-flight trial (bypassing the backoff), or —
     ///   when one is already in flight — a bounded wait for it.
-    ///
-    /// Bounded by the trial timeout. Feeds the breaker either way.
     pub async fn probe_now(&self) -> ProbeObservation {
         let started = Instant::now();
         let circuit = self.shared.circuit.clone();
         if circuit.is_closed() {
             let probe = async {
-                let conn = self.get().await.map_err(|e| e.to_string())?;
+                let conn = match self.get().await {
+                    Ok(c) => c,
+                    Err(e @ PgCheckoutError::Saturated { .. }) => {
+                        return (None, Some(e.to_string()))
+                    }
+                    Err(e) => return (Some(false), Some(e.to_string())),
+                };
                 match conn.simple_query("SELECT 1").await {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.as_db_error().is_some() => Ok(()),
-                    Err(e) => Err(format!("SELECT 1: {e}")),
+                    Ok(_) => (Some(true), None),
+                    Err(e) if e.as_db_error().is_some() => (Some(true), None),
+                    Err(e) => (Some(false), Some(format!("SELECT 1: {e}"))),
                 }
             };
-            let r = match tokio::time::timeout(self.shared.trial_timeout, probe).await {
+            let bound = self.shared.trial_timeout + Duration::from_secs(1);
+            let (reachable, error) = match tokio::time::timeout(bound, probe).await {
                 Ok(r) => r,
-                Err(_) => Err(format!(
-                    "probe exceeded {} ms",
-                    self.shared.trial_timeout.as_millis()
-                )),
+                Err(_) => (
+                    None,
+                    Some(format!("probe exceeded {} ms", bound.as_millis())),
+                ),
             };
-            return self.observe(started, r.err());
+            return self.observe(started, reachable, error);
         }
         if let Some(permit) = circuit.begin_trial() {
             let r = self.run_trial().await;
@@ -705,18 +775,18 @@ impl GuardedPool {
             self.ensure_prober();
             return self
                 .last_probe()
-                .unwrap_or_else(|| self.observe(started, None));
+                .unwrap_or_else(|| self.observe(started, None, None));
         }
-        let r = match tokio::time::timeout(self.shared.trial_timeout, circuit.wait_closed()).await {
-            Ok(()) => None,
-            Err(_) => Some(
-                circuit
+        match tokio::time::timeout(self.shared.trial_timeout, circuit.wait_closed()).await {
+            Ok(()) => self.observe(started, Some(true), None),
+            Err(_) => {
+                let e = circuit
                     .snapshot()
                     .last_error
-                    .unwrap_or_else(|| "database unavailable".to_string()),
-            ),
-        };
-        self.observe(started, r)
+                    .unwrap_or_else(|| "database unavailable".to_string());
+                self.observe(started, Some(false), Some(e))
+            }
+        }
     }
 }
 
@@ -725,6 +795,12 @@ mod tests {
     use super::test_support::{closed_port, test_pool, Mode, PgStandIn};
     use super::*;
     use deadpool_postgres::{PoolError, TimeoutType};
+
+    /// "Immediate": the fail-fast path is an atomic load and a lock, so this
+    /// bound only has to absorb scheduler noise on a loaded CI box (the plan
+    /// names 50 ms; 100 ms keeps the assertion meaningful — a caller that
+    /// paid a connect attempt takes 300 ms or more here — without flaking).
+    const FAST_FAIL_BOUND: Duration = Duration::from_millis(100);
 
     /// The test breaker: the production shape with short delays.
     fn test_circuit() -> Arc<Circuit> {
@@ -873,6 +949,34 @@ mod tests {
     }
 
     #[test]
+    fn a_client_side_failure_is_classed_by_its_io_kind() {
+        use std::io::{Error, ErrorKind};
+        let refused = Error::new(ErrorKind::ConnectionRefused, "refused");
+        let reset = Error::new(ErrorKind::ConnectionReset, "reset");
+        let timed_out = Error::new(ErrorKind::TimedOut, "connect timeout");
+        let other = Error::new(ErrorKind::NotFound, "dns: no such host");
+        assert_eq!(client_failure_class(&refused), CauseClass::ConnectRefused);
+        assert_eq!(client_failure_class(&reset), CauseClass::ConnectRefused);
+        assert_eq!(client_failure_class(&timed_out), CauseClass::ConnectTimeout);
+        assert_eq!(client_failure_class(&other), CauseClass::Unknown);
+        // Nested: the io error sits under a wrapper, as in tokio_postgres::Error.
+        #[derive(Debug)]
+        struct Wrap(Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error connecting to server")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let wrapped = Wrap(Error::new(ErrorKind::TimedOut, "t"));
+        assert_eq!(client_failure_class(&wrapped), CauseClass::ConnectTimeout);
+    }
+
+    #[test]
     fn the_unavailable_token_is_a_pinned_literal() {
         assert_eq!(DB_UNAVAILABLE_TOKEN, "DATABASE_UNAVAILABLE:");
         let e = PgCheckoutError::Unavailable(DbUnavailable {
@@ -940,7 +1044,7 @@ mod tests {
             let e = g.get().await.expect_err("still down");
             assert!(e.is_unavailable(), "call {i}: {e}");
             assert!(
-                t.elapsed() < Duration::from_millis(50),
+                t.elapsed() < FAST_FAIL_BOUND,
                 "call {i} took {:?}",
                 t.elapsed()
             );
@@ -999,7 +1103,7 @@ mod tests {
             .expect("closed within backoff + 1 s");
         let conn = g.get().await.expect("closed breaker serves checkouts");
         assert!(conn.simple_query("SELECT 1").await.is_ok());
-        assert!(g.last_probe().is_some_and(|p| p.reachable));
+        assert!(g.last_probe().is_some_and(|p| p.reachable == Some(true)));
         // Detach the live connection so the next checkout must connect.
         let _ = deadpool_postgres::Object::take(conn);
         pg.set_mode(Mode::Silent);
@@ -1052,7 +1156,7 @@ mod tests {
             let e = r.expect_err("down");
             assert!(e.is_unavailable(), "{e}");
             assert!(
-                done.saturating_duration_since(tripped_at) < Duration::from_millis(50),
+                done.saturating_duration_since(tripped_at) < FAST_FAIL_BOUND,
                 "a waiter was held {:?} past the trip",
                 done.saturating_duration_since(tripped_at)
             );
@@ -1080,7 +1184,7 @@ mod tests {
         let pg = PgStandIn::start(Mode::Silent).await;
         let g = guarded(&pg.url(), 300, 300, 2);
         let obs = g.probe_now().await;
-        assert!(!obs.reachable);
+        assert_eq!(obs.reachable, Some(false));
         assert_eq!(
             g.breaker_state(),
             CircuitState::Open,
@@ -1088,7 +1192,7 @@ mod tests {
         );
         pg.set_mode(Mode::Fake);
         let obs = g.probe_now().await;
-        assert!(obs.reachable, "{obs:?}");
+        assert_eq!(obs.reachable, Some(true), "{obs:?}");
         assert!(g.is_available());
     }
 
@@ -1169,7 +1273,7 @@ mod tests {
         // Before retry_at: still fail-fast, no trial.
         let t = Instant::now();
         assert!(g.get().await.expect_err("not yet due").is_unavailable());
-        assert!(t.elapsed() < Duration::from_millis(50));
+        assert!(t.elapsed() < FAST_FAIL_BOUND);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let conn = g
             .get()

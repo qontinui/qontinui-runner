@@ -37,6 +37,8 @@ pub mod generation;
 pub mod generation_artifacts;
 pub mod generation_feedback;
 pub mod graph_ops;
+/// `/health`'s cached database block (plan 2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout Phase 5).
+pub mod health;
 pub mod hooks;
 pub mod instances;
 pub mod knowledge;
@@ -121,6 +123,18 @@ static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
 /// it before boot completes does not spuriously 503. One atomic load.
 pub fn pg_available() -> bool {
     GLOBAL_PG_DB.get().is_none_or(|pg| pg.pool.is_available())
+}
+
+/// `false` only while the runner has had NO usable database since boot (a
+/// degraded boot whose breaker has not yet closed). One-shot boot work gates
+/// on this rather than on [`pg_available`], so a single runtime blip at the
+/// wrong moment does not silently skip it for the life of the process.
+pub fn pg_available_since_boot() -> bool {
+    GLOBAL_PG_DB.get().is_none_or(|pg| {
+        pg.pool.is_available()
+            || pg.pool.breaker_snapshot().cause.as_deref()
+                != Some(qontinui_runner_lib::pg_circuit::CAUSE_BOOT)
+    })
 }
 
 /// The global pool's breaker facts while it is open (`None` while Closed or
@@ -1210,7 +1224,7 @@ impl PgDb {
         // already self-heals two blocks up is the same class of self-heal.
         //
         // Runs here rather than in `main.rs` so the degraded-boot reconnect path
-        // (`spawn_reconnect_probe` → `verify_and_provision`) gets it too. Never
+        // (the degraded-boot prober trial → `verify_and_provision`) gets it too. Never
         // fatal: `ensure_self_registered` logs and returns on every failure.
         //
         // `conn` is released first — `ensure_self_registered` checks out its own

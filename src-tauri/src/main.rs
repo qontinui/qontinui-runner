@@ -1896,10 +1896,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
         let pg = select_db_arm(&rt, &profile);
 
-        // Gated on `pg_available()` rather than on the arm: before P4
-        // `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
-        // so an embedded-arm runner silently never ran it. Keep it here.
-        if crate::database::pg::pg_available() {
+        // Gated on `pg_available_since_boot()` rather than on the arm: before
+        // P4 `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
+        // so an embedded-arm runner silently never ran it. Keep it here. (Not
+        // `pg_available()`: that is the PG breaker's live state, and one
+        // runtime blip at this moment must not skip one-shot boot work.)
+        if crate::database::pg::pg_available_since_boot() {
             // spec-multi-app Stream F.1: register dev apps (runner, web,
             // supervisor) on startup so the multi-tenant Spec API has entries
             // to serve. Gated on `QONTINUI_DEV_BOOTSTRAP=1` so production
@@ -5776,7 +5778,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // per instance, so a temp runner resumes its own runs and never
             // the primary's (they share one embedded PG cluster). Plan
             // `2026-09-23-conductor-e2e-phase1-defects`, Phase 2.
-            if crate::database::pg::pg_available() {
+            if crate::database::pg::pg_available_since_boot() {
                 let resume_state: Arc<commands::AppState> =
                     app.state::<Arc<commands::AppState>>().inner().clone();
                 let resume_handle = app.handle().clone();

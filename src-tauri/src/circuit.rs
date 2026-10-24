@@ -187,8 +187,8 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock that only moves when told to. Test support, public so the bin
-/// crate's tests can use it too.
+/// A clock that only moves when told to (test support).
+#[cfg(test)]
 #[derive(Debug)]
 pub struct ManualClock {
     base: Instant,
@@ -196,6 +196,7 @@ pub struct ManualClock {
     offset: Mutex<Duration>,
 }
 
+#[cfg(test)]
 impl Default for ManualClock {
     fn default() -> Self {
         Self {
@@ -206,6 +207,7 @@ impl Default for ManualClock {
     }
 }
 
+#[cfg(test)]
 impl ManualClock {
     pub fn advance(&self, by: Duration) {
         let mut o = self.offset.lock().unwrap_or_else(|p| p.into_inner());
@@ -213,6 +215,7 @@ impl ManualClock {
     }
 }
 
+#[cfg(test)]
 impl Clock for ManualClock {
     fn now(&self) -> Instant {
         self.base + *self.offset.lock().unwrap_or_else(|p| p.into_inner())
@@ -244,7 +247,8 @@ struct Inner {
 
 /// A trial slot from [`Circuit::begin_trial`]. Report its result with
 /// [`Circuit::finish_trial`]; dropping it unreported releases the slot and
-/// leaves the breaker as it was (a cancelled trial is not evidence).
+/// returns a HalfOpen breaker to Open with its schedule unchanged (a
+/// cancelled trial is not evidence either way).
 #[must_use = "report the trial with Circuit::finish_trial"]
 pub struct TrialPermit {
     circuit: Arc<Circuit>,
@@ -256,6 +260,9 @@ impl Drop for TrialPermit {
         if !self.reported {
             let mut g = self.circuit.lock();
             g.trial_in_flight = false;
+            if g.state == CircuitState::HalfOpen {
+                self.circuit.set_state(&mut g, CircuitState::Open);
+            }
         }
     }
 }
@@ -406,6 +413,13 @@ impl Circuit {
         let now = self.clock.now();
         if let Outcome::NonTripFailure(kind) = &outcome {
             self.count_non_trip(&mut g, *kind);
+        }
+        // In background mode a HalfOpen breaker belongs to its trial: only
+        // `finish_trial` may move it. A late outcome from a call admitted
+        // before the trip must not re-open it under the trial's feet (which
+        // would break single-flight and discard the trial's verdict).
+        if self.config.probe_mode == ProbeMode::Background && g.state == CircuitState::HalfOpen {
+            return;
         }
         match (g.state, outcome) {
             (CircuitState::Closed, Outcome::Success) => g.consecutive_failures = 0,
@@ -754,6 +768,34 @@ mod tests {
                 .expect("every waiter is woken")
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_dropped_trial_returns_the_breaker_to_open() {
+        let (c, _) = manual(pg_config());
+        c.record(Outcome::TripFailure("refused".into()));
+        let p = c.begin_trial().unwrap();
+        assert_eq!(c.state(), CircuitState::HalfOpen);
+        drop(p);
+        assert_eq!(c.state(), CircuitState::Open);
+        assert!(c.begin_trial().is_some());
+    }
+
+    #[test]
+    fn a_late_outcome_cannot_move_a_background_trial() {
+        let (c, _) = manual(pg_config());
+        c.record(Outcome::TripFailure("refused".into()));
+        let p = c.begin_trial().unwrap();
+        // A call admitted before the trip reports late.
+        c.record(Outcome::TripFailure("late".into()));
+        assert_eq!(c.state(), CircuitState::HalfOpen, "the trial still owns it");
+        assert!(c.begin_trial().is_none(), "still single-flight");
+        c.finish_trial(p, Ok(()));
+        assert_eq!(
+            c.state(),
+            CircuitState::Closed,
+            "the trial's verdict stands"
+        );
     }
 
     #[test]
