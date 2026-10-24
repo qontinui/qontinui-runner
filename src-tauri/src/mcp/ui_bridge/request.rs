@@ -617,6 +617,7 @@ pub(super) async fn gather_ui_error_signals(
         pong_age_ms: last_pong_age_ms,
         last_event_pong: crate::ui_error::last_event_pong(),
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+        ping: crate::ui_error::ping_ask_now(),
     });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error.is_some(),

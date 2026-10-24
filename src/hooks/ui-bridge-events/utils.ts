@@ -133,6 +133,40 @@ export async function httpSendPong(source: PongSource, windowLabel: string): Pro
 }
 
 /**
+ * Answer one `ui-bridge-ping`: HTTP FIRST, the Tauri event only as fallback.
+ *
+ * Reaching the ping listener at all proves the native event loop delivered
+ * the ping, so the answer carries "event" provenance on either leg. The order
+ * matters because the two legs run on different Rust runtimes. A Tauri
+ * `emit` from JS is an async Tauri command, which Tauri runs on its async
+ * runtime — the runner's `app-rt`. When `app-rt`'s workers are all parked
+ * (synchronous process creation, spaceship 2026-10-18/19) that promise
+ * neither resolves nor rejects, the event pong never lands, and the runner
+ * reads a pumping UI as wedged. `POST /ui-bridge/pong?source=event` is served
+ * by the API's own runtime (`mcp-api-rt`), so it lands regardless (plan
+ * 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns).
+ * The emit is kept as the fallback for an HTTP failure; it is not awaited
+ * past its own settlement and cannot delay the HTTP leg.
+ *
+ * `http` and `emit` are injectable for tests.
+ */
+export async function answerPing(
+  windowLabel: string,
+  emit: (payload: ReturnType<typeof pongEventPayload>) => Promise<void>,
+  http: (source: PongSource, windowLabel: string) => Promise<boolean> = httpSendPong,
+): Promise<"http" | "event" | "failed"> {
+  if (await http("event", windowLabel)) {
+    return "http";
+  }
+  try {
+    await emit(pongEventPayload(windowLabel));
+    return "event";
+  } catch {
+    return "failed";
+  }
+}
+
+/**
  * Map task run status strings from the runner to SDK-compatible workflow status values.
  */
 export function mapTaskRunStatus(status: string): string {

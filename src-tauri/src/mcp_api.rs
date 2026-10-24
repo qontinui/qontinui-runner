@@ -2211,6 +2211,9 @@ async fn health(
         pong_age_ms,
         last_event_pong: crate::ui_error::last_event_pong(),
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+        // Against the same clock reading the `pingDelivery` verdict beside it
+        // was classified with.
+        ping: crate::ui_error::ping_ask_at(ping_now_ms),
     });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
@@ -2455,6 +2458,11 @@ async fn health(
             "pingEmitFailures": ping_emit_failures,
             "lastPingEmitOk": last_ping_emit_ok,
             "lastPingEmitFail": last_ping_emit_fail,
+            // The `ui-bridge-ping` OS thread's own liveness (`ui_ping.rs`):
+            // wall-clock ms of its last tick, 0 = it never ran. A ping thread
+            // that died reads as an aging stamp here, and the native verdict
+            // above then reads `ping_not_emitted` rather than wedged.
+            "pingThreadTickMs": crate::ui_ping::ping_thread_tick_ms(),
             "pingDelivery": ping_delivery.as_str(),
             "falseDeathSuppressed": false_death_suppressed,
             // Descriptor pressure — the RECEIVE side (plan 2026-09-09 pong
@@ -12321,45 +12329,10 @@ pub fn create_router(
         });
     }
 
-    // Start UI Bridge ping task (every 3s)
-    {
-        let handle = app_handle.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                // The `Result` is CHECKED, not discarded. This emit is the
-                // unfiltered broadcast (`handle.emit`, not `emit_to`), so it
-                // posts to every live window handle — and on Windows a single
-                // destroyed pop-out makes it fail with
-                // `ERROR_INVALID_WINDOW_HANDLE (0x80070578)`. It failed 119,012
-                // times on the operator box on 2026-09-01 while `let _ =`
-                // swallowed every one of them, and `ui_dead_now` — whose only
-                // evidence is a pong that this ping is supposed to elicit —
-                // called the UI dead 49 times as a result.
-                //
-                // Recording both arms is what lets `ui_error::ping_delivery_now`
-                // tell "the UI did not answer" from "we never asked".
-                match handle.emit(
-                    "ui-bridge-ping",
-                    serde_json::json!({ "timestamp": chrono::Utc::now().timestamp_millis() }),
-                ) {
-                    Ok(()) => crate::ui_error::record_ping_emit_ok(),
-                    Err(e) => {
-                        crate::ui_error::record_ping_emit_failure();
-                        // Deliberately `debug!`: a storm is 20/minute and the
-                        // COUNTER on `/health` is the surface meant to carry
-                        // it. One line per failure at `warn!` would be the
-                        // 119,012-line log this plan is cleaning up.
-                        tracing::debug!(
-                            error = %e,
-                            "ui-bridge-ping emit failed — the frontend was not asked for a pong"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // The `ui-bridge-ping` emitter is NOT started here any more: it runs on its
+    // own OS thread, started from `main.rs` setup beside the heartbeat
+    // (`ui_ping.rs`). A `tokio::spawn` here landed on `app-rt`, which is what
+    // let a starved runtime stop the ping.
 
     // Resume interrupted unified workflows on startup
     let state_for_resume = api_state.clone();
