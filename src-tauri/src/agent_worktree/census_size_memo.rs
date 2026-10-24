@@ -120,6 +120,13 @@ fn bytes_or_measure_at(
 mod tests {
     use super::*;
 
+    /// `clear()` empties the one process-global memo, so the tests here run
+    /// one at a time: a parallel `clear()` would empty another test's entry.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn unique(tag: &str) -> PathBuf {
         PathBuf::from(format!(
             "/census-size-memo-test/{tag}/{}/{:?}",
@@ -134,6 +141,7 @@ mod tests {
 
     #[test]
     fn a_fresh_entry_is_served_without_measuring() {
+        let _serial = serial();
         let d = unique("fresh");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
@@ -152,6 +160,7 @@ mod tests {
 
     #[test]
     fn an_expired_entry_is_measured_again() {
+        let _serial = serial();
         let d = unique("expired");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(60);
@@ -170,6 +179,7 @@ mod tests {
 
     #[test]
     fn a_changed_directory_is_measured_again_inside_the_ttl() {
+        let _serial = serial();
         let d = unique("changed");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
@@ -186,6 +196,7 @@ mod tests {
 
     #[test]
     fn an_unmeasured_size_is_reported_as_zero_and_never_memoised() {
+        let _serial = serial();
         let d = unique("unmeasured");
         let t0 = Instant::now();
         let ttl = Duration::from_secs(1800);
@@ -194,7 +205,22 @@ mod tests {
     }
 
     #[test]
+    fn clear_forgets_every_memoised_size() {
+        let _serial = serial();
+        let d = unique("clear");
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(1800);
+        assert_eq!(
+            bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(100)),
+            100
+        );
+        clear();
+        assert_eq!(bytes_or_measure_at(&d, t0, mtime(1), ttl, || Some(3)), 3);
+    }
+
+    #[test]
     fn a_zero_ttl_disables_the_memo() {
+        let _serial = serial();
         let d = unique("zero");
         let t0 = Instant::now();
         assert_eq!(
@@ -209,6 +235,7 @@ mod tests {
 
     #[test]
     fn entries_are_per_path() {
+        let _serial = serial();
         let a = unique("a");
         let b = unique("b");
         let t0 = Instant::now();

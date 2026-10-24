@@ -5372,14 +5372,16 @@ mod tests {",
     // Plan 2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-
     // fetch-into-empty-dirs, Phase 3: the walkers read the directory record.
     // The candidates are the same by construction and the bytes differ only
-    // for a file open for writing, so a behaviour test cannot fail on a
-    // revert — these pin the SOURCE instead (mutation: restore a per-entry
+    // where a directory record lags the file, so a behaviour test cannot fail
+    // on a revert — these pin the SOURCE instead (mutation: restore a per-entry
     // `symlink_metadata(` or `is_junction(` call and they go red).
     // -----------------------------------------------------------------
 
     /// The CODE of `fn <name>(` in this file's production half, with `//`
     /// comments stripped so prose naming the old calls neither trips nor
-    /// satisfies a pin.
+    /// satisfies a pin. Only `//` comments: a `/* */` comment, or a `//`
+    /// inside a string literal, is not handled — neither occurs in these
+    /// bodies today.
     fn prod_fn_code(name: &str) -> String {
         const SRC: &str = include_str!("orphan_target_reaper.rs");
         let prod = SRC
