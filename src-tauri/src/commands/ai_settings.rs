@@ -1415,7 +1415,7 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
             } else {
                 let status_code = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                Some(format!("API error ({}): {}", status_code, body))
+                Some(format!("{PROBE_HTTP_REFUSAL_PREFIX}{status_code}): {body}"))
             };
 
             let (expected, delta, elapsed_frac, remaining_days) =
@@ -1484,7 +1484,27 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
 /// for selection — close enough to the cap that it won't reliably serve a
 /// request. A backstop alongside the server `status` / probe-error signals in
 /// [`probe_result_exhausted`].
-const EXHAUSTION_UTILIZATION: f64 = 0.99;
+pub(crate) const EXHAUSTION_UTILIZATION: f64 = 0.99;
+
+/// How the header probe's `error` starts when the API ANSWERED with a non-2xx
+/// status. Its rate-limit headers were still read in that case — an account at
+/// its cap is refused (429) with `7d-status: rejected` and the window numbers
+/// attached — unlike a transport failure, which carries no numbers at all.
+const PROBE_HTTP_REFUSAL_PREFIX: &str = "API error (";
+
+/// Whether `info`'s window numbers (`utilization`, `status`,
+/// `session_utilization`, `model_limits`) were actually read: the probe
+/// succeeded, or the header probe was refused with its headers attached. A
+/// transport or credential failure forces `utilization` to 1.0 and reads
+/// nothing, so its numbers mean nothing.
+pub(crate) fn probe_read_window_numbers(info: &AccountUsageInfo) -> bool {
+    match info.error.as_deref() {
+        None => true,
+        Some(e) => {
+            info.source.as_deref() == Some("probe") && e.starts_with(PROBE_HTTP_REFUSAL_PREFIX)
+        }
+    }
+}
 
 /// Whether a probe result means the account **won't serve a request right
 /// now**. True when the probe call itself failed (the probe hits the same

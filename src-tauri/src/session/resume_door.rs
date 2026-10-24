@@ -619,6 +619,8 @@ async fn resume_one(
                     model_transcript,
                     config_dir: &cand.config_dir,
                     title: cand.title.clone(),
+                    // No name to carry: the CLI derives one, as before.
+                    name: None,
                     page_id: cand.page_id.clone(),
                     zone_index: cand.zone_index,
                     work_unit_slug: None,

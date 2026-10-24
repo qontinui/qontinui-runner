@@ -49,13 +49,20 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// hint costs one
 /// (rate-limited) usage probe downstream, while a missed hint strands a session
 /// on a dead account.
+///
+/// The first [`WINDOW_PATTERN_COUNT`] entries NAME a window, and the migration
+/// handler falls back on the label to tell a weekly limit from a 5-hour one
+/// when the probe cannot say ([`super::account_migration::classify_limit_window`]).
+/// Among those, the one painted LAST on screen wins
+/// ([`normalized_indicates_usage_limit`]): a resumed session can repaint an old
+/// banner above a fresh one, and the fresh one is the limit in force.
 const USAGE_LIMIT_PATTERNS: &[&str] = &[
-    "usage limit reached",
-    "5-hour limit reached",
     "weekly limit reached",
+    "5-hour limit reached",
+    "session limit reached",
+    "usage limit reached",
     "hit your usage limit",
     "out of extra usage",
-    "session limit reached",
     // Generic catch-alls LAST (specific patterns above win the label). The
     // CLI's phrasing shifts across releases ("Opus weekly limit reached",
     // "limit reached ∙ resets 3am", "You're out of usage until…") — a missed
@@ -71,12 +78,20 @@ const HINT_DEBOUNCE: Duration = Duration::from_secs(300);
 
 // ── Pattern matching ────────────────────────────────────────────────────────
 
-/// First matching usage-limit pattern in ALREADY-normalized screen text, if any.
+/// How many leading [`USAGE_LIMIT_PATTERNS`] name a window.
+const WINDOW_PATTERN_COUNT: usize = 3;
+
+/// The usage-limit pattern ALREADY-normalized screen text shows, if any: the
+/// window-naming phrase painted last (lowest on screen), else the first
+/// generic pattern that matches.
 fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
-    USAGE_LIMIT_PATTERNS
+    let (window, generic) = USAGE_LIMIT_PATTERNS.split_at(WINDOW_PATTERN_COUNT);
+    window
         .iter()
-        .find(|p| normalized.contains(*p))
-        .copied()
+        .filter_map(|p| normalized.rfind(*p).map(|at| (at, *p)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, p)| p)
+        .or_else(|| generic.iter().find(|p| normalized.contains(*p)).copied())
 }
 
 /// First matching usage-limit pattern in a raw (un-normalized) screen/window.
@@ -240,6 +255,40 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("Weekly limit reached — resets Thursday"),
             Some("weekly limit reached")
+        );
+    }
+
+    #[test]
+    fn a_window_naming_phrase_outranks_a_generic_one() {
+        // A stale 5-hour line beside a fresh weekly banner reads as weekly.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "5-hour limit reached ∙ resets 3am\nClaude usage limit reached\nWeekly limit reached"
+            ),
+            Some("weekly limit reached")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("Claude usage limit reached · 5-hour limit reached"),
+            Some("5-hour limit reached")
+        );
+        // A repainted old weekly banner above a fresh 5-hour one reads as 5-hour.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "Weekly limit reached\n…\n5-hour limit reached ∙ resets 3am"
+            ),
+            Some("5-hour limit reached")
+        );
+    }
+
+    #[test]
+    fn the_window_pattern_count_covers_exactly_the_window_phrases() {
+        assert_eq!(
+            &USAGE_LIMIT_PATTERNS[..WINDOW_PATTERN_COUNT],
+            &[
+                "weekly limit reached",
+                "5-hour limit reached",
+                "session limit reached"
+            ]
         );
     }
 

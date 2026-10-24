@@ -295,7 +295,11 @@ pub fn read_live_sessions(
 /// When several files name the same id (22 of 80 did on the operator's box),
 /// an OPERATOR-named row wins over a `nameSource: "derived"` one — a `/rename`
 /// is the string the operator actually sees, and letting an auto-name preempt
-/// it is the precedence bug this module's doc comment warns about.
+/// it is the precedence bug this module's doc comment warns about. Within one
+/// class the most recently UPDATED row wins: a crashed process's file stops
+/// updating, so an older `/rename` left behind by it never outranks the name
+/// the live process carries (directory order, which used to decide, is
+/// arbitrary).
 pub fn find_live_session_by_id(
     config_dirs: &[std::path::PathBuf],
     session_id: &str,
@@ -322,9 +326,16 @@ pub fn find_live_session_by_id(
             let operator_named = session.name_source.as_deref() != Some("derived");
             let wins = match &best {
                 None => true,
-                // Only an operator-named row displaces an already-held one, and
-                // only when what it displaces is a derived auto-name.
-                Some(prev) => operator_named && prev.name_source.as_deref() == Some("derived"),
+                Some(prev) => {
+                    let prev_operator_named = prev.name_source.as_deref() != Some("derived");
+                    match (operator_named, prev_operator_named) {
+                        // An operator name displaces a derived auto-name.
+                        (true, false) => true,
+                        (false, true) => false,
+                        // Same class: the fresher row.
+                        _ => session.updated_at > prev.updated_at,
+                    }
+                }
             };
             if wins {
                 best = Some(session);
@@ -475,6 +486,35 @@ mod tests {
         );
         // A config dir with no sessions dir is normal, not an error.
         assert!(find_live_session_by_id(&[root.join(".claude-nothing")], "dup").is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_live_session_by_id_prefers_the_freshest_row_of_a_class() {
+        let root = tmpdir("find-by-id-fresh");
+        let acct = root.join(".claude-paktis");
+        let sessions = acct.join("sessions");
+        // A crashed process left its `/rename` behind; the live one was renamed
+        // since. Both operator-named: the one still updating wins.
+        fs::write(
+            sessions.join("21.json"),
+            r#"{"pid":21,"sessionId":"s","name":"foo","cwd":"/x","updatedAt":100}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("22.json"),
+            r#"{"pid":22,"sessionId":"s","name":"bar","cwd":"/x","updatedAt":200}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("23.json"),
+            r#"{"pid":23,"sessionId":"s","name":"auto-1a","nameSource":"derived","cwd":"/x","updatedAt":300}"#,
+        )
+        .unwrap();
+
+        let found = find_live_session_by_id(&[acct.clone()], "s").expect("id is present");
+        assert_eq!(found.name, "bar");
 
         let _ = fs::remove_dir_all(&root);
     }
