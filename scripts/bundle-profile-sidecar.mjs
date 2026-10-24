@@ -47,22 +47,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { nativeExecutableProblem } from "./lib/native-exe.mjs";
+// The roster lives in ONE place, shared with build-exe.mjs (the primary's
+// build); a build.rs test pins its SIDECAR_BINS to tauri.conf.json.
+import { SIDECAR_BINS, SIDECAR_PACKAGES } from "./lib/sidecars.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const runnerRoot = resolve(scriptDir, "..");
 const srcTauri = join(runnerRoot, "src-tauri");
-
-// Keep in sync with `tauri.conf.json` `bundle.externalBin` and
-// `src-tauri/build.rs` `EXTERNAL_BIN_SIDECARS` (a build.rs test pins the
-// latter to tauri.conf.json).
-const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr", "qontinui-pty-holder"];
-
-// The cargo PACKAGES those bins live in. `qontinui-pty-holder` (plan
-// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2:
-// the per-pane PTY holder the runner spawns from beside its own exe) is a bin
-// of `crates/pty-holder`, not of this crate, so the build selects both
-// packages; cargo applies the `--bin` filters across every selected package.
-const SIDECAR_PACKAGES = ["qontinui-runner", "qontinui-pty-holder"];
 
 function fail(msg) {
   console.error(`\n[bundle-profile-sidecar] ERROR: ${msg}\n`);
