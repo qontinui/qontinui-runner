@@ -115,16 +115,21 @@ If Control endpoints return `"Frontend did not become ready"` errors, the SDK ha
 You can also use these endpoints directly — they work without the SDK:
 
 ```bash
-# Native window capture — works even when SDK/React is completely dead (Runner only)
-curl -s "http://127.0.0.1:9876/ui-bridge/control/annotated-screenshot?runner=true"
-# Returns: {"success":true,"data":{"screenshot":"<base64 PNG>","width":...,"height":...}}
+# Native window capture — works even when SDK/React is completely dead (Runner only).
+# A whole-window capture reads the runner window itself (captureBackend
+# "Webview2CapturePreview" or "MonitorCrop"), so it needs no SDK.
+# envelope-ok: a by-hand diagnostic; the reader takes data.sha256 off the printed answer into the cache fetch below
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/capture -H "Content-Type: application/json" -d '{}'
+# Returns: {"success":true,"data":{"sha256":"<64 hex>","width":...,"height":...,"format":"jpeg",...}}
+# Fetch the image bytes by that sha256:
+curl -s -o runner-window.jpg "http://127.0.0.1:9876/ui-bridge/vision/cache/<sha256>"
 
 # Health endpoint includes diagnosticScreenshot when ready:false for >30s
 curl -s http://127.0.0.1:9876/ui-bridge/health
 # Check data.diagnosticScreenshot.screenshot if present
 ```
 
-Decode the base64 PNG to visually inspect the error. This is essential for diagnosing webview-level issues (ERR_CONNECTION_REFUSED, blank pages) that the SDK can never report.
+Open the captured image (or decode the health `diagnosticScreenshot` base64 PNG) to visually inspect the error. This is essential for diagnosing webview-level issues (ERR_CONNECTION_REFUSED, blank pages) that the SDK can never report.
 
 ## Quick primitive selector
 
@@ -245,6 +250,17 @@ curl -s -X POST $BASE/control/page/refresh
 # same path an OS X-click takes). `window.close()` via /control/page/evaluate
 # is a no-op for top-level webviews, so drop to this for close-handler tests.
 curl -s -X POST $BASE/control/page/close-request
+
+# A RESTART that keeps PTY-holder panes alive (runner only): the teardown
+# DETACHES every holder-backed terminal pane instead of killing it, so the next
+# runner adopts it with its process still running. In-process panes still die.
+# Without the field (or with any other value) the close kills every pane, as
+# the X button does. Main window only: `handoff` with a non-main `label` is a
+# 400; a runner with no main window (headless) answers 409 with context code
+# HANDOFF_REQUIRES_MAIN_WINDOW — use force-close there, which takes the same
+# field.
+curl -s -X POST $BASE/control/page/close-request -H "Content-Type: application/json" -d '{"handoff": "holders"}'
+curl -s -X POST $BASE/control/page/force-close -H "X-Qontinui-Force-Close: 1" -d '{"handoff": "holders", "reason": "restart"}'
 ```
 
 ### Console Errors
