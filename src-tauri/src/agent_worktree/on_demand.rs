@@ -450,6 +450,13 @@ pub struct SurveyItem {
     /// Junction reparse points that must be unlinked BEFORE any recursive
     /// delete (INV-W4). Rendered so the operator sees they are links.
     pub junctioned_paths: Vec<String>,
+    /// HEAD the cached census saw for this worktree. Not part of the wire;
+    /// it is the echoed incarnation the on-demand removal re-checks live.
+    #[serde(skip)]
+    pub census_head_sha: Option<String>,
+    /// Birth time the cached census recorded (see `reclaim::dir_birth_time`).
+    #[serde(skip)]
+    pub census_dir_created_at: Option<String>,
     /// coord's own reason string for the instruction (e.g.
     /// `worktree:lifecycle:pr_merged`) — provenance for a reapable item.
     pub coord_reason: Option<String>,
@@ -1358,6 +1365,8 @@ fn build_survey_items(
                 landed_in_main: a.census.landed_in_main,
                 attributable_bytes: a.census.attributable_bytes,
                 junctioned_paths: a.junctioned_paths,
+                census_head_sha: a.census.head_sha.clone(),
+                census_dir_created_at: a.census.dir_created_at.clone(),
                 coord_reason: a.coord_reason,
                 session_label: a.attribution.session_label,
                 session_id: a.attribution.session_id,
@@ -1706,7 +1715,26 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
             is_dirty: false,
             junctioned_paths: item.junctioned_paths.clone(),
             retention: None,
+            observed_at: None,
+            // The cached census row this survey item came from is the
+            // incarnation the operator judged; the guard re-reads both live. A
+            // census that could not read a value leaves `None`, which skips
+            // that comparison (compat fail-open; only a value that WAS
+            // recorded and now differs, or is unreadable, refuses).
+            head_sha: item.census_head_sha.clone(),
+            dir_created_at: item.census_dir_created_at.clone(),
         };
+        // Incarnation guard — the same shared helper as `execute_pull` and the
+        // backstop.
+        if reclaim::check_instruction_incarnation(&path, &instr).is_err() {
+            outcome.skipped.push(SkippedItem {
+                id: item.id.clone(),
+                worktree_path: item.worktree_path.clone(),
+                reason: "incarnation_mismatch",
+                detail: "directory is not the incarnation the census judged".to_string(),
+            });
+            continue;
+        }
         let steps: Vec<ReclaimStep> = reclaim::plan_reclaim(
             &instr, /* remove_armed */ true, /* root_exists */ true,
         );
@@ -2433,6 +2461,8 @@ mod tests {
             landed_in_main: None,
             attributable_bytes: 0,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: None,
             session_label: "unattributed".to_string(),
             session_id: None,
@@ -2474,6 +2504,7 @@ mod tests {
             build_target_dir: None,
             build_slot: None,
             last_access_mtime: None,
+            dir_created_at: None,
             attributable_bytes: 4096,
             landed_in_main: Some(true),
             building,
@@ -2523,6 +2554,9 @@ mod tests {
             is_dirty: false,
             junctioned_paths: vec!["node_modules".to_string()],
             retention: None,
+            observed_at: None,
+            head_sha: None,
+            dir_created_at: None,
         }
     }
 
@@ -3120,6 +3154,8 @@ mod tests {
             landed_in_main: Some(true),
             attributable_bytes: 4096,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
             ..unattributed_item_fields()
         };
@@ -3129,6 +3165,88 @@ mod tests {
         assert_eq!(outcome.skipped.len(), 1);
         assert_eq!(outcome.skipped[0].reason, "absent");
         assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
+    }
+
+    /// Build a clean, aged, git-initialised target and a survey item for it.
+    fn incarnation_fixture(
+        head: Option<&str>,
+        born: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf, SurveyItem) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("qontinui-runner");
+        std::fs::create_dir_all(&target).unwrap();
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .arg(&target)
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git init: {out:?}");
+        // One commit, so HEAD is READABLE and a bogus census head exercises
+        // the MISMATCH arm rather than the unreadable arm.
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+            .arg("-C")
+            .arg(&target)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git commit: {out:?}");
+        filetime::set_file_mtime(
+            &target,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+        let wt = target.to_string_lossy().to_string();
+        let item = SurveyItem {
+            id: norm_path(&wt),
+            worktree_path: wt,
+            repo: "qontinui-runner".to_string(),
+            branch: None,
+            status: "reapable",
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: Some(true),
+            attributable_bytes: 4096,
+            junctioned_paths: Vec::new(),
+            census_head_sha: head.map(str::to_string),
+            census_dir_created_at: born.map(str::to_string),
+            coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+            ..unattributed_item_fields()
+        };
+        (dir, target, item)
+    }
+
+    #[test]
+    fn removal_refuses_a_census_head_that_no_longer_matches() {
+        let (_d, target, item) =
+            incarnation_fixture(Some("0000000000000000000000000000000000000000"), None);
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "incarnation_mismatch");
+        assert!(target.exists(), "the target must not be touched");
+    }
+
+    #[test]
+    fn removal_refuses_a_census_birth_time_that_no_longer_matches() {
+        let (_d, target, item) = incarnation_fixture(None, Some("2000-01-01T00:00:00+00:00"));
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "incarnation_mismatch");
+        assert!(target.exists(), "the target must not be touched");
     }
 
     /// The allocation-sibling guard on the on-demand path: a target that
@@ -3179,6 +3297,8 @@ mod tests {
             landed_in_main: Some(true),
             attributable_bytes: 4096,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
             ..unattributed_item_fields()
         };
