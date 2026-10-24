@@ -128,7 +128,7 @@ Do this first, regardless of which transport ends up carrying it.
 | A metric crossing a threshold | `metric_threshold` | `{metric, labels, op, value, window_secs?}` — name `labels` explicitly |
 | A time window / burn-in elapsing | `time_elapsed` | `{since (default now), duration_secs}` |
 | **A vetted plan that is ready, dispatchable work** | `unit_ready` | `{work_unit_id, ready_status}` — auto-clears when the unit reaches `ready_status` + sibling gates cleared; **NOT** `operator_approval` |
-| A schema/alembic reaching head | `migration_at_head` | `{schema}` — live schema observer |
+| The WHOLE alembic chain applied to the serving database (database-wide) | `migration_at_head` | `{schema: "coord"}` — reads coord's PERSISTED schema observation, not a live probe. `schema` is a constant guard (any value but `"coord"` sits `Open` forever), and a gate registered before coord's observation reflects the new chain head is born cleared (canonical: `_gate-registration` → the SCHEMA-change traps; *What "born cleared" means*). For ONE table/column, use `schema_object_exists` below |
 | A specific **schema object** (table or column) existing on the database coord itself is connected to | `schema_object_exists` | `{schema, object, column?}` — `information_schema` tables/columns only; no `constraint`/`index` arity (a name there silently probes a nonexistent table and sits `Open` forever), a **view** reachable via the table arm. found → `Cleared`; definitive empty → `Open`; failed read → `Indeterminate{reason}`, stored as the `open` tag — read `verdict_reason`, not the tag. `schema` is not pinned to one value; name it. |
 | Infra drift / active-negation clearing | `infra_drift_clear` | `{}` — live infra observer |
 | A repo file / workflow / migration file existing | `file_exists` — **usable again.** The 2026-08-05 fleet-wide 403 was root-caused and FIXED by coord `e6f486b8` (2026-08-15), which is deployed; a live re-probe on 2026-08-31 registered `201` and cleared. Residual: that probe was one PUBLIC repo — re-probe before relying on it against a private one. | `{repo, path, on_ref?}` — file contents/presence |
@@ -834,11 +834,30 @@ write:
 $jwt = ''; $mintSource = ''
 # Two names for one access_token slot: get_coord_device_token first (no tier
 # gate; `data: null` means this device is unpaired), then the older spelling.
+# THE TENANT this session acts for: $QONTINUI_TENANT_ID, else the runner session
+# census row for $QONTINUI_TERMINAL_ID (coord-revive.sh resolve_session_tenant's
+# rule). It rides ONLY in the runner's real envelope, {"args":{"tenantId":...}} -
+# a top-level key is dropped, which on a multi-slot runner is a 409
+# tenant_required. With a tenant named, the older name and the eval mint (the
+# DEFAULT slot, which cannot be asked for one) are never consulted, and the
+# token's tenant_id claim is checked below.
+$tenant = $env:QONTINUI_TENANT_ID
+if (-not $tenant -and $env:QONTINUI_TERMINAL_ID) {
+  try {
+    $census = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/control/sessions/info' -TimeoutSec 10
+    $row = @($census.data.sessions) | Where-Object { $_.identity.terminalId -eq $env:QONTINUI_TERMINAL_ID } | Select-Object -First 1  # envelope-ok: a predicate search over the census rows; no row leaves $tenant unset, never a default
+    if ($row -and $row.tenancy.row.tenantId) { $tenant = [string]$row.tenancy.row.tenantId }
+    elseif ($row -and $row.tenancy.credential.status -eq 'resolved') { $tenant = [string]$row.tenancy.credential.tenantId }
+  } catch { }
+}
+if ($tenant -and $tenant -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') { throw "QONTINUI_TENANT_ID '$tenant' is not a uuid - refusing to mint rather than ignore it" }
+$mintBody = if ($tenant) { '{"args":{"tenantId":"' + $tenant.ToLower() + '"}}' } else { '{}' }
 $absentNames = 0
 foreach ($route in 'ui-bridge/invoke/get_coord_device_token', 'ui-bridge/invoke/get_access_token_for_websocket') {
+  if ($tenant -and $route -like '*websocket') { break }   # the default slot cannot be asked for a tenant
   try {
     $r = Invoke-RestMethod -Uri "http://127.0.0.1:9876/$route" `
-         -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+         -Method Post -ContentType 'application/json' -Body $mintBody -TimeoutSec 20
     $jwt = [string]$r.data; $mintSource = 'runner-invoke'  # envelope-ok: PowerShell has no envelope arm; the invoke door answers data as the bare token
     break
   } catch {
@@ -877,11 +896,24 @@ if ($absentNames -eq 2) {
   $mintSource = 'runner-eval'
 }
 $jwt = $jwt.Trim()
+if (-not $jwt -and $tenant) {
+  # Named, so neither default-slot door was asked: say which of the two it was.
+  if ($absentNames -ge 1) { throw "this runner build has no get_coord_device_token entry - the only door that can be ASKED for tenant $tenant; export a COORD_DEVICE_JWT that claims it (never restart a running runner over this)" }
+  throw "the runner holds no token for tenant $tenant (get_coord_device_token answered null) - not a sign-in problem"
+}
 # Shape-check before trusting it: a SIGNED-OUT runner answers 200 with an empty
 # or non-token value, and sending that as a bearer turns a missing credential
 # into a 401 the caller then has to decode. Reaching this with an EMPTY $jwt now
 # means the runner really did answer without a token, not that the read missed.
 if ($jwt.Split('.').Count -ne 3) { throw 'runner returned a non-JWT (signed out?)' }
+# CLAIM CHECK: a token for ANOTHER tenant is discarded, never sent - its claim
+# is named, the token never is. (No tenant resolved: unchanged, and on a runner
+# holding several slots the tenant-less ask above already threw its 409.)
+if ($tenant) {
+  $p = $jwt.Split('.')[1].Replace('-', '+').Replace('_', '/'); switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
+  $claim = ''; try { $claim = [string]([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).tenant_id } catch { }
+  if ($claim -ne $tenant.ToLower()) { $jwt = ''; throw "the runner minted a token claiming tenant '$claim', not this session's $tenant - DISCARDED, never sent" }
+}
 # This session's own id beside the bearer, so coord stamps the gate with the
 # session that registered it - the same validate-then-fall-through rule as the
 # bash `caller_session_line` (plan
@@ -1632,8 +1664,12 @@ success.
   on a coord-orchestrated repo carries one; so does
   `continuation_dropped_born_cleared:`, which drops only the continuation and
   leaves a healthy gate (on ANY predicate kind — it branches on the verdict, not
-  the predicate); and so does `deploy_order_predicate_weaker:`, which says a
-  `pr_merged` gate whose `phase_name` declares deploy intent clears EARLIER
+  the predicate); so does `registered_as_record_not_watch:`, which says a gate
+  registered with no continuation was already satisfied at the door (a record,
+  not a watch — the ordinary shape of a `unit_ready` gate whose predicate is
+  already true when `/vet-plan` registers it); and so does
+  `deploy_order_predicate_weaker:`, which says a `pr_merged` gate whose `phase_name`
+  declares deploy intent clears EARLIER
   than the condition it describes — the gate itself is fine (see the
   deploy-order row in A1). That last one fires on the same predicate kind as
   the orchestrated-repo steer, so the two co-occur and a healthy gate comes
