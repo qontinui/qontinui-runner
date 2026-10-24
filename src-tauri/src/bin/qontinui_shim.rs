@@ -1624,7 +1624,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
         let stub = bin.join(exe);
         std::fs::write(
             &stub,
