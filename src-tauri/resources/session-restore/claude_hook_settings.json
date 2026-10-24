@@ -33,6 +33,17 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
