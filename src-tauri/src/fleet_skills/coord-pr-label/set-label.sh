@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # coord-pr-label — set a coord:* label on a PR via gh + record in coord.pr_labels.
 #
-# Phase 2 D2.6 of the PR Merge Orchestrator
-# (qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md).
+# Phase 2 D2.6 of the PR Merge Orchestrator (Qontinui's design plan
+# 2026-05-21-pr-merge-orchestrator-design, held in the maintainers' corpus).
 #
 # Validates the label against the `coord:*` namespace, adds the label over
 # the REST issues-labels route (`gh api -X POST repos/<o>/<r>/issues/<n>/labels`
@@ -65,8 +65,14 @@ Examples:
       --label "coord:upstream-of=qontinui/qontinui-schemas#42"
   set-label.sh --repo qontinui/qontinui-coord --pr 75 --label coord:merge-strategy=squash
 
-No label holds a PR. To hold one, convert it to draft:
-  gh pr ready --undo 75 --repo qontinui/qontinui-coord
+No label holds a PR. To hold one, place a coord hold once coord serves it
+(coord's own tools/list offers coord_set_pr_hold -- a runner proxy may filter
+it from your session's list; then use coord's door or the HTTP twin
+POST /coord/repos/<owner>/<repo>/pull-requests/<n>/hold; both are PLANNED and
+exist only once coord ships the hold):
+  coord_set_pr_hold {"repo":"qontinui/qontinui-coord","pr_number":75,"held":true,"reason":"<why>"}
+Until then convert the PR to draft (gh pr ready --undo <n>) -- that works on
+public repos, and on private repos until the GitHub Free downgrade takes effect.
 EOF
 }
 
@@ -114,15 +120,18 @@ case "$_coord_url_lc" in ws://*|wss://*) COORD_URL="" ;; esac
 COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
-# Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
-# Keeping the two in sync is a Phase 2 D2.6 requirement; the doc at
-# qontinui-dev-notes/docs/coord/pr-merge-labels.md is the spec.
+# Mirrors qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs::validate_label.
+# Keeping the two in sync is a Phase 2 D2.6 requirement; coord's
+# validate_label is the spec, and this mirror follows it.
 #
 # Last reconciled against coord `origin/main` @ da36d08d (2026-08-22), which
 # closed four drifts this mirror had accumulated. Cite the REF, not a local
 # checkout, when you re-sync: the arms below are ordered as coord orders them,
 # because order is load-bearing (a bespoke arm must precede the generic
 # `parameterised labels need "=value"` fallthrough, or it never fires).
+# The `clears-red` REFUSAL mirrors coord's provenance-gate refusal of that key,
+# as authored for plan 2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-
+# latency Phase 5; re-check it against coord main once that lands.
 
 # Mirrors `labels_routes.rs::repo_segments_well_formed` -- a `<owner>/<repo>`
 # value must have BOTH segments non-empty. Without this the skill green-lit
@@ -212,7 +221,7 @@ validate_label() {
   # RETIRED_HOLD_LABEL_ERR; retired 2026-06-20, nothing consumes the rows).
   case "$rest" in
     operator-review|version-bump|version-bump=*)
-      echo "error: $label: retired label — labels no longer hold PRs; convert the PR to draft, or register a coord gate with a MergePr continuation" >&2
+      echo "error: $label: retired label — labels no longer hold PRs; place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}; to release it on a condition, give the hold a gate_id) once coord serves it, else convert the PR to draft (gh pr ready --undo), which works on public repos and on private repos until the GitHub Free downgrade" >&2
       return 1
       ;;
   esac
@@ -226,7 +235,7 @@ validate_label() {
   # shape: a PR "held" by `coord:blocked` auto-merged once green.)
   case "$rest" in
     blocked|experimental)
-      echo "error: $label: retired hold label — coord treats it as inert and the PR still auto-merges once green. To hold a PR, convert it to draft: gh pr ready --undo <n> --repo <owner/repo>" >&2
+      echo "error: $label: retired hold label — coord treats it as inert and the PR still auto-merges once green. To hold a PR, place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}) once coord serves it, else convert the PR to draft (gh pr ready --undo), which works on public repos and on private repos until the GitHub Free downgrade" >&2
       return 1
       ;;
   esac
@@ -241,7 +250,22 @@ validate_label() {
   # unhelpful errors for one cause, and neither naming the fix.
   case "$rest" in
     priority|priority=*)
-      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`) — a skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github'" >&2
+      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`), and any holder of repo write — agent or operator — may set it on its own authority. A skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github' (provenance, not authority). Read it back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. The label moves the queue only while COORD_MERGE_PRIORITY=on is deployed: read priority_reason on the queued row (coord_query_train_health -> candidates_in_flight) — 'label' = honoured; label_expired / label_ignored_multi_repo / label_not_github / aged / red_main_fix = this label did not count; 'none' = lane off or label not yet mirrored" >&2
+      return 1
+      ;;
+  esac
+
+  # The DECLARED cross-repo red-main-fix edge -- the same provenance gate as
+  # `coord:priority`, mirrored from coord's refusal: coord honours
+  # `coord:clears-red=[<owner>/]<repo>` ONLY from a GitHub-applied label
+  # (source='github', set by a holder of repo write), and its own label door
+  # refuses the key. A skill-set row would be inert, so refuse here too and
+  # name the route that works (plan
+  # 2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-latency Phase 5).
+  # The bare flag is caught too, so every spelling gets the one useful error.
+  case "$rest" in
+    clears-red|clears-red=*)
+      echo "error: coord:clears-red must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'\`) — a skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github'" >&2
       return 1
       ;;
   esac
@@ -884,14 +908,29 @@ BEARER_SRC="$(ctc_stage_for_tenant "$READ_TENANT")"
 case "$BEARER_SRC" in
   rejected*) readback_unknown "no credential for tenant $READ_TENANT could be staged (${BEARER_SRC#rejected})" ;;
 esac
-: > "$TMPD/readback.json"
-RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
-  --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
-  -H "@$(curl_path "$TMPD/bearer.hdr")" \
-  --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
-  "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+# rb_read -> RB_CODE; the read-back GET under the staged bearer.
+rb_read() {
+  : > "$TMPD/readback.json"
+  RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+    -H "@$(curl_path "$TMPD/bearer.hdr")" \
+    --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
+    "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+  RB_CODE="${RB_CODE:-000}"
+}
+rb_read
+# Coord refused the local runner's token: forget it (the library then refuses
+# the runner rung for this tenant) and re-stage ONCE, which reaches the mint --
+# the same retry the library's own walkers make.
+if [ "$RB_CODE" = 401 ] && [[ "$BEARER_SRC" == runner* ]]; then
+  ctc_drop_runner_token "$READ_TENANT" "coord answered 401 to the local runner's token for tenant $READ_TENANT"
+  RB_SRC2="$(ctc_stage_for_tenant "$READ_TENANT")"
+  case "$RB_SRC2" in
+    rejected*) BEARER_SRC="runner(401)→$RB_SRC2" ;;
+    *) BEARER_SRC="runner(401)→$RB_SRC2"; rb_read ;;
+  esac
+fi
 rm -f "$TMPD/bearer.hdr"
-RB_CODE="${RB_CODE:-000}"
 RB_BODY="$(cat "$TMPD/readback.json" 2>/dev/null || true)"
 RB_SNIP="$(printf '%s' "$RB_BODY" | head -c 300)"
 
