@@ -154,47 +154,11 @@ pub fn wip_state_is_honest_clean(state: Option<&str>) -> bool {
 // $GIT_DIR resolution — one file read, no subprocess
 // ---------------------------------------------------------------------------
 
-/// Resolve a worktree's `$GIT_DIR`.
-///
-/// * `.git` is a **directory** ⇒ a primary checkout, and the directory IS what
-///   `git rev-parse --git-dir` would print, so the spawn is not taken.
-/// * `.git` is a **file** ⇒ a linked worktree; read its single
-///   `gitdir: <path>` line. git normally writes an absolute path but a
-///   relative one is legal, so an unrooted value is resolved against the
-///   worktree.
-///
-/// `None` when `.git` is absent or the file does not carry a `gitdir:` line.
-pub fn git_dir_for(worktree: &Path) -> Option<PathBuf> {
-    let dot_git = worktree.join(".git");
-    let meta = std::fs::metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return Some(dot_git);
-    }
-    // Bounded read: this is a one-line pointer file, and an unbounded read of
-    // a path an attacker could replace with a FIFO would hang the census.
-    let raw = read_bounded(&dot_git, 4096)?;
-    parse_gitdir_line(&raw, worktree)
-}
-
-/// Pure half of [`git_dir_for`] — parse a `.git` FILE's contents.
-pub fn parse_gitdir_line(raw: &str, worktree: &Path) -> Option<PathBuf> {
-    let line = raw.lines().next()?.trim_end_matches('\r').trim();
-    let rest = line.strip_prefix("gitdir:")?.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(rest);
-    // `is_absolute` is false for `C:/x` on POSIX builds and for `/x` on
-    // Windows, so spell both shapes rather than trusting the platform rule.
-    let looks_absolute = p.is_absolute()
-        || rest.starts_with('/')
-        || rest.starts_with('\\')
-        || rest
-            .as_bytes()
-            .get(1)
-            .is_some_and(|c| *c == b':' && rest.as_bytes()[0].is_ascii_alphabetic());
-    Some(if looks_absolute { p } else { worktree.join(p) })
-}
+// Resolve a worktree's `$GIT_DIR` — one bounded file read, no subprocess.
+// The reader and its pure parser live in the lib's `git_layout` (plan
+// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+// Phase 1), the one copy every `.git`-pointer reader in the runner now shares.
+pub use qontinui_runner_lib::git_layout::{git_dir_for, parse_gitdir_line};
 
 /// Read at most `max` bytes of a small file. Returns `None` on any IO error
 /// AND when the file is larger than `max` — a custody record that has grown
