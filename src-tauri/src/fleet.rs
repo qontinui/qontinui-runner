@@ -1443,6 +1443,19 @@ fn git_out(args: &[&str]) -> std::io::Result<std::process::Output> {
     crate::process_helpers::output_with_timeout(cmd, FLEET_GIT_LOCAL_TIMEOUT)
 }
 
+/// [`git_out`] for LOCAL, READ-ONLY git (`rev-parse`, `symbolic-ref`,
+/// `status`, `log`, `rev-list`, `ls-files`), run launcher-less through
+/// [`crate::process_helpers::no_window_git_local`] — one process fewer per call
+/// on Windows. [`git_out`] keeps the launcher because
+/// [`apply_restore_default_blocking`] runs tree-mutating, hook-running commands
+/// through it (`switch`, `merge --ff-only`, `branch -D`) that need its PATH for
+/// `sh`; a remote stays on [`git_out_net`].
+fn git_out_local_read(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = crate::process_helpers::no_window_git_local();
+    cmd.args(args);
+    crate::process_helpers::output_with_timeout(cmd, FLEET_GIT_LOCAL_TIMEOUT)
+}
+
 /// [`git_out`] for commands that talk to a remote — [`FLEET_GIT_NETWORK_TIMEOUT`].
 fn git_out_net(args: &[&str]) -> std::io::Result<std::process::Output> {
     let mut cmd = crate::process_helpers::no_window("git");
@@ -4092,9 +4105,9 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 }
 
 /// Capture the state of a single primary git tree at `repo_path`. Returns
-/// `None` when the directory isn't a git repo (no `.git/` dir). All
-/// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
-/// PATH-resolved git — same as the rest of the runner.
+/// `None` when the directory isn't a git repo (no `.git/` dir). Every `git`
+/// call here is a local read, so it runs through [`git_out_local_read`]: the
+/// operator's PATH-resolved git, minus Git for Windows' `cmd\git.exe` launcher.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -4111,7 +4124,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let repo_name = repo_path.file_name()?.to_string_lossy().to_string();
 
     // HEAD SHA
-    let head_sha = git_out(&["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
+    let head_sha = git_out_local_read(&["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
         .ok()
         .and_then(|o| {
             if o.status.success() {
@@ -4136,15 +4149,16 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // `?` instead: publish NO tree state for this repo this tick rather than a
     // fabricated one. That is exactly what the `git status` probe immediately
     // below has always done, and the publisher re-runs on the next tick.
-    let symbolic_ref = git_out(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
-        .map_err(|e| {
-            warn!(
-                "fleet: symbolic-ref for {} did not answer ({e}) — skipping this repo's \
+    let symbolic_ref =
+        git_out_local_read(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
+            .map_err(|e| {
+                warn!(
+                    "fleet: symbolic-ref for {} did not answer ({e}) — skipping this repo's \
                  tree-state this tick rather than publishing a guessed branch",
-                repo_path.display()
-            );
-        })
-        .ok()?;
+                    repo_path.display()
+                );
+            })
+            .ok()?;
     // Now always KNOWN: the `?` above returned when the probe did not answer,
     // so we only reach here with git's own verdict. The payload field stays
     // `Option<bool>` (its `None` means "old runner / undeterminable" to coord)
@@ -4159,7 +4173,8 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     };
 
     // Dirty status — `git status --porcelain=v1` is one line per change.
-    let status_out = git_out(&["-C", repo_path.to_str()?, "status", "--porcelain=v1"]).ok()?;
+    let status_out =
+        git_out_local_read(&["-C", repo_path.to_str()?, "status", "--porcelain=v1"]).ok()?;
     if !status_out.status.success() {
         return None;
     }
@@ -4205,7 +4220,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             .max()
     } else {
         // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
-        git_out(&["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
+        git_out_local_read(&["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
             .ok()
             .and_then(|o| {
                 if o.status.success() {
@@ -4241,7 +4256,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     } else {
         format!("origin/{branch}")
     };
-    let behind_count: Option<i32> = git_out(&[
+    let behind_count: Option<i32> = git_out_local_read(&[
         "-C",
         repo_path.to_str()?,
         "rev-list",
@@ -4264,7 +4279,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // line per untracked file. The orphan-untracked-file signal that
     // catches sub-agent worktree builds spilling scratch into the
     // primary tree.
-    let untracked_count: Option<i32> = git_out(&[
+    let untracked_count: Option<i32> = git_out_local_read(&[
         "-C",
         repo_path.to_str()?,
         "ls-files",
@@ -4292,7 +4307,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // same posture as `behind_count` above. This used to be an inlined
     // duplicate of `resolve_default_branch`; both now share one resolver,
     // resolved once above.
-    let local_ahead: Option<i32> = git_out(&[
+    let local_ahead: Option<i32> = git_out_local_read(&[
         "-C",
         repo_path.to_str()?,
         "rev-list",
@@ -4326,7 +4341,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // an error.
     let behind_default_count: Option<i32> =
         match behind_default_compare_branch(&branch, &default_branch) {
-            Some(cmp) => git_out(&[
+            Some(cmp) => git_out_local_read(&[
                 "-C",
                 repo_path.to_str()?,
                 "rev-list",
@@ -4600,12 +4615,13 @@ fn apply_pull_verdict_blocking(
             // §5 apply-time safety re-check: branch + clean-tree can change
             // between the decision and now. Re-verify we are STILL on the
             // default branch and the tree is STILL clean before pulling.
-            let cur_branch = git_out(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            let cur_branch =
+                git_out_local_read(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             let on_default = cur_branch.as_deref() == Some(default_branch.as_str());
-            let clean = git_out(&["-C", repo_str, "status", "--porcelain=v1"])
+            let clean = git_out_local_read(&["-C", repo_str, "status", "--porcelain=v1"])
                 .ok()
                 .map(|o| o.status.success() && o.stdout.is_empty())
                 .unwrap_or(false);
@@ -4630,7 +4646,7 @@ fn apply_pull_verdict_blocking(
             ]);
             match out {
                 Ok(o) if o.status.success() => {
-                    let new_sha = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
+                    let new_sha = git_out_local_read(&["-C", repo_str, "rev-parse", "HEAD"])
                         .ok()
                         .filter(|x| x.status.success())
                         .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string());
@@ -4734,7 +4750,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (2) Still on the parked branch coord decided about.
-    let cur_branch = git_out(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
+    let cur_branch = git_out_local_read(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -4749,7 +4765,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (3) Still porcelain-clean (includes untracked).
-    let clean = git_out(&["-C", repo_str, "status", "--porcelain=v1"])
+    let clean = git_out_local_read(&["-C", repo_str, "status", "--porcelain=v1"])
         .ok()
         .map(|o| o.status.success() && o.stdout.is_empty())
         .unwrap_or(false);
@@ -4762,7 +4778,7 @@ fn apply_restore_default_blocking(
     }
     // (4) Local HEAD still equals the merged PR's head SHA — the zero-work-loss
     //     proof. A new local commit since the verdict fails this and aborts.
-    let head = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
+    let head = git_out_local_read(&["-C", repo_str, "rev-parse", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -4866,7 +4882,7 @@ fn apply_restore_default_blocking(
                 .unwrap_or_else(|e| format!("spawn failed: {e}"))
         )
     };
-    let new_head = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
+    let new_head = git_out_local_read(&["-C", repo_str, "rev-parse", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

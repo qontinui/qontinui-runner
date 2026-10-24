@@ -2084,7 +2084,7 @@ fn git_registered_worktrees(canonical: &Path) -> Vec<PathBuf> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = crate::process_helpers::no_window_git_local();
     cmd.args(["-C", canonical_str, "worktree", "list", "--porcelain"]);
     #[cfg(test)]
     crate::agent_worktree::census::spawn_log::record(&cmd);
@@ -2180,7 +2180,7 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     let wt = worktree.to_str()?;
     let mut full: Vec<&str> = vec!["-C", wt];
     full.extend_from_slice(args);
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = crate::process_helpers::no_window_git_local();
     cmd.args(&full);
     #[cfg(test)]
     crate::agent_worktree::census::spawn_log::record(&cmd);
@@ -2312,7 +2312,7 @@ fn compute_landed_against(worktree: &Path, head: &str, trunk: &str) -> Option<bo
     // (1) Ancestry test — exit 0 means HEAD is an ancestor of the trunk.
     // A spawn failure OR a timeout is an honest unknown: we must not report
     // "not landed" for a question we could not ask.
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = crate::process_helpers::no_window_git_local();
     cmd.args(["-C", wt, "merge-base", "--is-ancestor", head, &trunk]);
     #[cfg(test)]
     crate::agent_worktree::census::spawn_log::record(&cmd);

@@ -56,26 +56,12 @@ fn resolve_binary_path(config: &RestateSettings, app_data_dir: &Path) -> Option<
     }
 
     // 3. System PATH
-    if let Ok(path) = which_binary(RESTATE_BINARY_NAME) {
+    if let Some(path) = crate::process_helpers::which(RESTATE_BINARY_NAME) {
         info!("Using system Restate binary: {}", path.display());
         return Some(path);
     }
 
     None
-}
-
-/// Look up a binary on the system PATH.
-fn which_binary(name: &str) -> Result<PathBuf, String> {
-    // Simple PATH lookup without the `which` crate
-    let path_var = std::env::var("PATH").map_err(|e| format!("PATH not set: {}", e))?;
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    for dir in path_var.split(separator) {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(format!("Binary '{}' not found on PATH", name))
 }
 
 /// Get the platform-specific target triple for Restate binary downloads.

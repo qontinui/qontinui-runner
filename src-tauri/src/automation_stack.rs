@@ -49,6 +49,11 @@ use std::time::Duration;
 
 use tracing::debug;
 
+// PATH lookup on the INHERITED PATH (lib-owned, shared with `restate::lifecycle`
+// and `coord_mcp`): `window_manager` and the recorder shell out with a bare
+// program name, so what matters is what the RUNNER's environment resolves.
+use crate::process_helpers::which;
+
 /// How often the AT-SPI bus probe re-runs.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const ATSPI_CHECK_INTERVAL: Duration = Duration::from_secs(300);
@@ -143,51 +148,6 @@ impl Capability {
             "checkedAt": self.checked_at_ms,
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// PATH resolution
-// ---------------------------------------------------------------------------
-
-/// First executable named `program` on the inherited `PATH`.
-///
-/// The inherited PATH is the point: `window_manager` and the recorder shell out
-/// with a bare program name, so what matters is what the RUNNER's environment
-/// resolves — not what a login shell would.
-pub(crate) fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(program);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            for ext in ["exe", "cmd", "bat", "com"] {
-                let c = dir.join(format!("{program}.{ext}"));
-                if is_executable(&c) {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &std::path::Path) -> bool {
-    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Capability entry for a PATH-resolved binary.

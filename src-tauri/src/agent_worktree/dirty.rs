@@ -348,7 +348,7 @@ pub(crate) fn probe_reclaim_dirty(
         warn_if_unknown(path, git_presence, verdict, label);
         return verdict;
     }
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = crate::process_helpers::no_window_git_local();
     cmd.args(["-C", path_str, "status", "--porcelain"]);
     probe_reclaim_dirty_with(path, cmd, timeout, label)
 }

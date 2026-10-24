@@ -85,9 +85,11 @@ fn git_capture(git: Command, repo: &Path, args: &[&str]) -> Option<String> {
 /// The `git` every production resolution starts from: the fleet's
 /// [`crate::process_helpers::no_window`] posture, already scrubbed of the
 /// repository-local environment — and [`git_capture`] scrubs again, after
-/// whatever a seam test's command carries.
+/// whatever a seam test's command carries. Launcher-less
+/// ([`crate::process_helpers::no_window_git_local`]): every subcommand here is
+/// a local read ([`TRUNK_GIT_SUBCOMMANDS`]).
 fn host_git() -> Command {
-    crate::process_helpers::no_window("git")
+    crate::process_helpers::no_window_git_local()
 }
 
 /// Resolve the repo's trunk remote-tracking ref for `repo` — e.g.
