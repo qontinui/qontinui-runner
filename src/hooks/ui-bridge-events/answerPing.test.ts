@@ -37,6 +37,19 @@ describe("answerPing", () => {
     expect(emit.mock.calls[0][0]).toMatchObject({ label: "terminal-1" });
   });
 
+  it("falls back to the Tauri event when the HTTP leg never settles (a stalled API runtime)", async () => {
+    const neverSettles = vi.fn(() => new Promise<boolean>(() => {}));
+    const emit = vi.fn().mockResolvedValue(undefined);
+    await expect(answerPing("main", emit, neverSettles, 20)).resolves.toBe("event");
+    expect(emit).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats an HTTP leg that rejects as failed and falls back", async () => {
+    const http = vi.fn().mockRejectedValue(new Error("network"));
+    const emit = vi.fn().mockResolvedValue(undefined);
+    await expect(answerPing("main", emit, http)).resolves.toBe("event");
+  });
+
   it("reports failed when both legs fail", async () => {
     const http = vi.fn().mockResolvedValue(false);
     const emit = vi.fn().mockRejectedValue(new Error("ipc down"));
