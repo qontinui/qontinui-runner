@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::DispatchError;
+use super::app_dispatch::{AppDispatcher, ArmPayloads, DispatchError};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -302,7 +302,7 @@ fn dispatch_err_message(err: &DispatchError) -> String {
 /// dispatch was attempted but failed — HTTP fallback is *not* safe in that
 /// case because the wrapper has taken ownership of the app.
 ///
-/// Now a thin shim over `AppDispatcher::dispatch`. Eight in-file callers
+/// Now a thin shim over `AppDispatcher::dispatch_websocket`. Eight in-file callers
 /// still rely on the tri-state shape (they synthesize derived responses
 /// from `getControlSnapshot` for WS apps before falling through to the
 /// dedicated HTTP endpoint).
@@ -327,14 +327,27 @@ async fn try_ws_dispatch(
         return Ok(None);
     }
 
-    // For the WS arm, `dispatch` ignores http_method/http_path entirely —
-    // pass placeholders so the call type-checks.
-    match state
-        .app_dispatcher
-        .dispatch(&app_id, action, Method::GET, "/", payload)
-        .await
-    {
+    ws_only_outcome(
+        &app_id,
+        state
+            .app_dispatcher
+            .dispatch_websocket(&app_id, action, payload)
+            .await,
+    )
+}
+
+/// A WebSocket-only dispatch's result in [`try_ws_dispatch`]'s tri-state. A
+/// registration that turned HTTP since the caller's read is refused
+/// (`NotWebsocket`) rather than sent down the HTTP arm, and reads as "not
+/// WebSocket" — the caller falls through to the HTTP endpoint, as it would had
+/// its read seen HTTP.
+fn ws_only_outcome(
+    app_id: &str,
+    result: Result<serde_json::Value, DispatchError>,
+) -> Result<Option<serde_json::Value>, String> {
+    match result {
         Ok(value) => Ok(Some(value)),
+        Err(DispatchError::NotWebsocket(_)) => Ok(None),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
@@ -376,24 +389,9 @@ async fn dispatch_app_request_typed(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, DispatchError> {
-    // The legacy split fed `ws_payload` to the WS arm and `http_body` to
-    // the HTTP arm. Most call sites pass identical bodies; when they
-    // differ, prefer `http_body` for the HTTP path to mirror legacy
-    // behavior. `dispatch_active` chooses the transport, so we pick the
-    // correct payload up-front.
-    let payload = {
-        let guard = state.sdk_connection.lock().await;
-        let app_id = guard.active_connection().map(|c| c.app_info.app_id.clone());
-        drop(guard);
-        match app_id {
-            Some(id) => match state.app_registry.get_live(&id).await.map(|e| e.transport) {
-                Some(AppTransport::Websocket) => ws_payload,
-                _ => http_body.unwrap_or(serde_json::Value::Null),
-            },
-            None => http_body.unwrap_or(serde_json::Value::Null),
-        }
-    };
-
+    // `ws_payload` goes to the WS arm and `http_body` (or `null`) to the HTTP
+    // arm. `dispatch_active` picks the body from the same registry read that
+    // picks the arm (`ArmPayloads`), so the two cannot disagree.
     state
         .app_dispatcher
         .dispatch_active(
@@ -401,9 +399,24 @@ async fn dispatch_app_request_typed(
             action,
             http_method,
             http_path,
-            payload,
+            split_arm_payloads(ws_payload, http_body),
         )
         .await
+}
+
+/// The per-arm bodies of a caller that builds its WebSocket frame payload and
+/// its HTTP request body separately — the `(ws_payload, http_body)` shape of
+/// [`dispatch_app_request`] and [`dispatch_app_request_by_id`]. `http_body:
+/// None` sends no body on the HTTP arm (`null`). One function for both, so the
+/// pairing cannot drift between them.
+fn split_arm_payloads(
+    ws_payload: serde_json::Value,
+    http_body: Option<serde_json::Value>,
+) -> ArmPayloads {
+    ArmPayloads::PerArm {
+        websocket: ws_payload,
+        http: http_body.unwrap_or(serde_json::Value::Null),
+    }
 }
 
 /// Send an HTTP request to the connected SDK app.
@@ -430,23 +443,6 @@ pub async fn sdk_request(
         .map_err(dispatch_err_to_string)
 }
 
-/// Pick the right payload for a per-app-id dispatch based on the registered
-/// transport. Extracted so unit tests can verify the WS-vs-HTTP decision
-/// without building a full `ApiState`.
-async fn select_app_payload(
-    registry: &super::app_registry::AppRegistry,
-    app_id: &str,
-    ws_payload: serde_json::Value,
-    http_body: Option<serde_json::Value>,
-) -> serde_json::Value {
-    // `get_live`: this picks the payload SHAPE by transport, and must agree
-    // with what `dispatch` (which reads `get_live`) will actually do.
-    match registry.get_live(app_id).await.map(|e| e.transport) {
-        Some(AppTransport::Websocket) => ws_payload,
-        _ => http_body.unwrap_or(serde_json::Value::Null),
-    }
-}
-
 /// Dispatch directly to a specific registered app by `app_id`, bypassing the
 /// active-SDK-connection probe.
 ///
@@ -454,8 +450,8 @@ async fn select_app_payload(
 /// drive a wrapper without first making it the active SDK connection — the
 /// per-app-id half of Item A of the wrapper-framework Phase 1.5 plan. Picks
 /// the right payload (`ws_payload` for WS-transport apps, `http_body` for
-/// HTTP-transport apps) based on the registry's transport entry, then
-/// delegates to `AppDispatcher::dispatch`.
+/// HTTP-transport apps) from the same registry read `AppDispatcher::dispatch`
+/// routes on ([`ArmPayloads`]).
 ///
 /// `http_body` falls back to `serde_json::Value::Null` when `None` to match
 /// the existing convention in `dispatch_app_request`.
@@ -468,10 +464,10 @@ pub async fn dispatch_app_request_by_id(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let payload = select_app_payload(&state.app_registry, app_id, ws_payload, http_body).await;
+    let payloads = split_arm_payloads(ws_payload, http_body);
     state
         .app_dispatcher
-        .dispatch(app_id, action, http_method, http_path, payload)
+        .dispatch(app_id, action, http_method, http_path, payloads)
         .await
         .map_err(dispatch_err_to_string)
 }
@@ -3386,6 +3382,133 @@ async fn handle_page_scroll_dispatch(
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
+}
+
+// ============================================================================
+// In-situ asset override — a dev control (plan
+// 2026-10-13-image-generation-and-visual-judgment, Phase 18). The SDK app
+// enforces the dev-controls gate itself: an app that has not opted in answers
+// `capability_unavailable_in_build`. Validation and the wait-budget fits (an
+// apply's `decodeTimeoutMs`, a restore's `verifyTimeoutMs`) are shared with
+// the direct route (`ui_bridge/media_override.rs`). Not a journey
+// action (`journey/route_coverage.rs` R20): it rewrites what the page renders
+// for a capture, then is undone.
+// ============================================================================
+
+/// The `/sdk/` media-override bodies, over what a test can construct: the
+/// dispatcher and the SDK connection the axum handlers read out of `ApiState`.
+/// Validation, the ceiling check and the per-arm fill (`sdk_*_bodies`) run
+/// HERE, before anything is dispatched, so a test entering through these
+/// functions observes them.
+pub(crate) async fn sdk_media_override_apply(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    // The WS arm is engine-direct and gets an absent decode wait filled; the
+    // HTTP arm's app server fits it to its own relay budget (see
+    // `media_override::WaitFill`).
+    match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
+        Ok(payloads) => {
+            sdk_media_override_dispatch(
+                dispatcher,
+                sdk_connection,
+                "mediaOverride",
+                Method::POST,
+                payloads,
+            )
+            .await
+        }
+        Err(e) => serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
+    }
+}
+
+/// [`sdk_media_override_apply`] for `DELETE`: restore one override or all.
+pub(crate) async fn sdk_media_override_restore(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    // Bound `verifyTimeoutMs` to this transport: without it the SDK waits up to
+    // the override's own `decodeTimeoutMs`, which an override applied elsewhere
+    // (the injected runtime allows 60 s) can set past 30 s. The WS arm fills an
+    // absent one; the HTTP arm's app server fits it to its own relay budget.
+    match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
+        Ok(payloads) => {
+            sdk_media_override_dispatch(
+                dispatcher,
+                sdk_connection,
+                "mediaOverrideRestore",
+                Method::DELETE,
+                payloads,
+            )
+            .await
+        }
+        Err(e) => serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
+    }
+}
+
+/// [`sdk_media_override_apply`] for `GET`: the overrides still active.
+pub(crate) async fn sdk_media_override_list(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+) -> serde_json::Value {
+    sdk_media_override_dispatch(
+        dispatcher,
+        sdk_connection,
+        "mediaOverrideList",
+        Method::GET,
+        // As before the extraction: an empty object on the WS arm, no body on
+        // the HTTP arm's GET.
+        split_arm_payloads(serde_json::json!({}), None),
+    )
+    .await
+}
+
+async fn sdk_media_override_dispatch(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    action: &str,
+    method: Method,
+    payloads: ArmPayloads,
+) -> serde_json::Value {
+    match dispatcher
+        .dispatch_active(
+            sdk_connection,
+            action,
+            method,
+            "/control/media/override",
+            payloads,
+        )
+        .await
+    {
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/media/override — Swap one image slot in place in the SDK app
+async fn handle_media_override(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(sdk_media_override_apply(&state.app_dispatcher, &state.sdk_connection, body).await)
+}
+
+/// DELETE /ui-bridge/sdk/control/media/override — Restore one media override or all, verified
+async fn handle_media_override_restore(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let body = body
+        .map(|Json(b)| b)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Json(sdk_media_override_restore(&state.app_dispatcher, &state.sdk_connection, body).await)
+}
+
+/// GET /ui-bridge/sdk/control/media/override — List the media overrides still active
+async fn handle_media_override_list(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    Json(sdk_media_override_list(&state.app_dispatcher, &state.sdk_connection).await)
 }
 
 /// GET /ui-bridge/sdk/debug/metrics — Debug metrics
@@ -7292,6 +7415,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/page/scroll",
             post(handle_page_scroll),
         )
+        // In-situ asset override (dev control; Phase 18)
+        .route(
+            "/ui-bridge/sdk/control/media/override",
+            post(handle_media_override)
+                .delete(handle_media_override_restore)
+                .get(handle_media_override_list),
+        )
         // Viewport
         .route(
             "/ui-bridge/sdk/control/viewport",
@@ -8186,109 +8316,53 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Per-app-id payload selection (Item A — `?app_id=` query param)
+    // `(ws_payload, http_body)` → per-arm bodies (`dispatch_app_request`,
+    // `dispatch_app_request_by_id`). Which arm a registered app takes is
+    // `app_dispatch`'s `dispatch_sends_each_arm_its_own_body`.
     // ------------------------------------------------------------------
 
-    use crate::mcp::app_discovery::DiscoveredApp;
-    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::app_registry::AppTransport;
 
-    fn sample_discovered(app_id: &str) -> DiscoveredApp {
-        DiscoveredApp {
-            app_id: app_id.to_string(),
-            app_name: "T".into(),
-            app_type: "web".into(),
-            framework: None,
-            url: "http://127.0.0.1:0".into(),
-            port: 0,
-            base_path: "".into(),
-            version: None,
-            capabilities: vec![],
-            element_count: None,
-            component_count: None,
-            discovered_at: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn select_app_payload_ws_transport_uses_ws_payload() {
-        let registry = AppRegistry::new();
-        registry
-            .upsert(
-                sample_discovered("wapp"),
-                None,
-                AppTransport::Websocket,
-                Some(1),
-                None,
-            )
-            .await;
-
+    #[test]
+    fn split_arm_payloads_sends_ws_payload_to_websocket_and_http_body_to_http() {
         let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
         let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "wapp",
-            ws_payload.clone(),
-            Some(http_body.clone()),
-        )
-        .await;
+        let arms = split_arm_payloads(ws_payload.clone(), Some(http_body.clone()));
         assert_eq!(
-            chosen, ws_payload,
+            arms.clone().for_transport(AppTransport::Websocket),
+            ws_payload,
             "WS-transport apps must receive ws_payload"
         );
-    }
-
-    #[tokio::test]
-    async fn select_app_payload_http_transport_uses_http_body() {
-        let registry = AppRegistry::new();
-        registry
-            .upsert(
-                sample_discovered("happ"),
-                None,
-                AppTransport::Http,
-                None,
-                None,
-            )
-            .await;
-
-        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
-        let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "happ",
-            ws_payload.clone(),
-            Some(http_body.clone()),
-        )
-        .await;
         assert_eq!(
-            chosen, http_body,
+            arms.for_transport(AppTransport::Http),
+            http_body,
             "HTTP-transport apps must receive http_body"
         );
     }
 
-    #[tokio::test]
-    async fn select_app_payload_missing_app_falls_back_to_http_body_or_null() {
-        let registry = AppRegistry::new();
+    #[test]
+    fn split_arm_payloads_sends_null_on_http_when_there_is_no_http_body() {
+        let ws_payload = serde_json::json!({"never": "on http"});
+        let arms = split_arm_payloads(ws_payload.clone(), None);
+        assert_eq!(
+            arms.clone().for_transport(AppTransport::Http),
+            serde_json::Value::Null
+        );
+        assert_eq!(arms.for_transport(AppTransport::Websocket), ws_payload);
+    }
 
-        // Caller passed Some(http_body) — use it.
-        let http_body = serde_json::json!({"raw": "body"});
-        let chosen = select_app_payload(
-            &registry,
-            "nope",
-            serde_json::json!({"never": "used"}),
-            Some(http_body.clone()),
-        )
-        .await;
-        assert_eq!(chosen, http_body);
-
-        // Caller passed None — fall back to Null (matches dispatch_app_request).
-        let chosen = select_app_payload(
-            &registry,
-            "nope",
-            serde_json::json!({"never": "used"}),
-            None,
-        )
-        .await;
-        assert_eq!(chosen, serde_json::Value::Null);
+    #[test]
+    fn a_websocket_dispatch_to_an_app_no_longer_websocket_reads_as_not_websocket() {
+        use super::super::app_dispatch::DispatchError;
+        assert_eq!(
+            ws_only_outcome("w", Err(DispatchError::NotWebsocket("w".into()))),
+            Ok(None)
+        );
+        assert_eq!(
+            ws_only_outcome("w", Ok(serde_json::json!(1))),
+            Ok(Some(serde_json::json!(1)))
+        );
+        assert!(ws_only_outcome("w", Err(DispatchError::NotRegistered("w".into()))).is_err());
     }
 
     // ------------------------------------------------------------------
@@ -8593,6 +8667,10 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .unwrap_or_default();
+        // Every async fn, whatever its visibility, starts a chunk of its own.
+        let production = production
+            .replace("\npub(crate) async fn ", "\nasync fn ")
+            .replace("\npub async fn ", "\nasync fn ");
         let mut exempt_seen = Vec::new();
         for chunk in production.split("\nasync fn ").skip(1) {
             let name = chunk.split('(').next().unwrap_or_default();
@@ -8603,6 +8681,7 @@ mod tests {
                 "dispatch_active(",
                 "sdk_request(",
                 "try_ws_dispatch(",
+                "sdk_media_override_",
             ]
             .iter()
             .any(|d| chunk.contains(d));
@@ -9314,5 +9393,162 @@ mod connect_bearer_scope_tests {
             leaked.is_empty(),
             "the operator bearer went out over plaintext http after an https -> http redirect: {leaked:?}"
         );
+    }
+}
+
+/// The `/sdk/` media override, entered through its handler bodies with a real
+/// [`AppDispatcher`]: an HTTP-registered app that echoes what it is sent, and a
+/// WebSocket-registered one whose frame is read off the socket.
+#[cfg(test)]
+mod media_override_dispatch_tests {
+    use super::{
+        sdk_media_override_apply, sdk_media_override_list, sdk_media_override_restore,
+        SdkConnectionManager,
+    };
+    use crate::mcp::app_dispatch::test_support::{
+        json_echo_app, manager_with_active, next_frame, responsive_active, sample_app,
+    };
+    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::command_relay::CommandRelay;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    type Target = (Arc<AppDispatcher>, Arc<Mutex<SdkConnectionManager>>);
+
+    /// The active app is HTTP-registered and echoes `{success, got: <body>}`.
+    async fn http_app() -> Target {
+        let registry = AppRegistry::new();
+        let url = json_echo_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(WsConnectionManager::new());
+        (
+            AppDispatcher::new(registry, relay),
+            responsive_active("happ", &url).await,
+        )
+    }
+
+    /// The payload of the frame a WebSocket-registered active app is sent by
+    /// `call`, which is then abandoned (nothing answers it).
+    async fn websocket_frame<F>(call: F) -> Value
+    where
+        F: FnOnce(Target) -> tokio::task::JoinHandle<Value>,
+    {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let pending = call((
+            AppDispatcher::new(registry, relay),
+            manager_with_active("wapp", "ws-app://wapp", ""),
+        ));
+        let frame: Value = serde_json::from_str(&next_frame(&mut outbound_rx).await).unwrap();
+        pending.abort();
+        frame["payload"].clone()
+    }
+
+    fn refused_before_dispatch(out: &Value, needle: &str) {
+        assert_eq!(out["code"], json!("INVALID_REQUEST"), "{out}");
+        assert!(
+            out["error"].as_str().unwrap_or("").contains(needle),
+            "{out}"
+        );
+        assert!(
+            out.get("got").is_none(),
+            "the app must not have been sent it: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_refuses_an_invalid_body_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_apply(&d, &c, json!({"slotId": "a"})).await;
+        refused_before_dispatch(&out, "one of src, srcset, sources or backgroundImage");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_refuses_an_over_budget_wait_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let body = json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 28_001});
+        let out = sdk_media_override_apply(&d, &c, body).await;
+        refused_before_dispatch(&out, "30000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_sends_an_http_app_no_wait_and_a_websocket_app_the_filled_wait() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_apply(&d, &c, json!({"slotId": "a", "src": "x"})).await;
+        assert_eq!(out["got"], json!({"slotId": "a", "src": "x"}), "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move {
+                sdk_media_override_apply(&d, &c, json!({"slotId": "a", "src": "x"})).await
+            })
+        })
+        .await;
+        assert_eq!(
+            frame,
+            json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 10_000})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sdk_restore_refuses_an_invalid_body_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_restore(&d, &c, json!({"overrideId": ""})).await;
+        refused_before_dispatch(&out, "overrideId must be a non-empty string");
+        let out = sdk_media_override_restore(&d, &c, json!({"verifyTimeoutMs": 28_001})).await;
+        refused_before_dispatch(&out, "30000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_restore_sends_an_http_app_no_wait_and_a_websocket_app_the_filled_wait() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_restore(&d, &c, json!({"overrideId": "mo-1"})).await;
+        assert_eq!(out["got"], json!({"overrideId": "mo-1"}), "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move { sdk_media_override_restore(&d, &c, json!({})).await })
+        })
+        .await;
+        assert_eq!(frame, json!({"verifyTimeoutMs": 28_000}));
+    }
+
+    #[tokio::test]
+    async fn the_sdk_list_asks_the_active_app_for_its_overrides() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_list(&d, &c).await;
+        // The app answered (a failed dispatch has no `got` either, so `Null`
+        // alone would not tell the two apart) ...
+        assert_eq!(out["success"], json!(true), "{out}");
+        assert!(out.get("got").is_some(), "{out}");
+        // ... and the HTTP arm's GET carried no body.
+        assert_eq!(out["got"], Value::Null, "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move { sdk_media_override_list(&d, &c).await })
+        })
+        .await;
+        assert_eq!(frame, json!({}));
     }
 }

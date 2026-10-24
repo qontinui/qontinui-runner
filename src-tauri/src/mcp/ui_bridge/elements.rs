@@ -30,7 +30,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::envelope::UiBridgeJson;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
@@ -2297,15 +2297,23 @@ pub(crate) async fn try_ws_dispatch_for_app(
         return None;
     }
     debug!(
-        "[ui-bridge/elements] {} via WS → app_id='{}' (path={})",
-        action, app_id, http_path
+        "[ui-bridge/elements] {} via WS → app_id='{}' (http equivalent: {} {})",
+        action, app_id, http_method, http_path
     );
-    Some(
-        dispatcher
-            .dispatch(app_id, action, http_method, http_path, payload)
-            .await
-            .map_err(|e| e.to_user_message()),
-    )
+    ws_route_outcome(dispatcher.dispatch_websocket(app_id, action, payload).await)
+}
+
+/// A WebSocket-only dispatch's result in [`try_ws_dispatch_for_app`]'s terms.
+/// A registration that turned HTTP since the caller's read is refused
+/// (`NotWebsocket`) rather than sent down the HTTP arm, and reads as "no WS
+/// entry" — the caller falls through, as it would had its read seen HTTP.
+fn ws_route_outcome(
+    result: Result<serde_json::Value, DispatchError>,
+) -> Option<Result<serde_json::Value, String>> {
+    match result {
+        Err(DispatchError::NotWebsocket(_)) => None,
+        result => Some(result.map_err(|e| e.to_user_message())),
+    }
 }
 
 /// Iterate every live WS-transport app and ask each for its components list.
@@ -2323,14 +2331,10 @@ async fn ws_collect_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => {
@@ -2347,6 +2351,13 @@ async fn ws_collect_components(
                     // Single-component object — push as-is.
                     out.push(value);
                 }
+            }
+            // Expected, not a failure: the app turned HTTP mid fan-out.
+            Err(DispatchError::NotWebsocket(_)) => {
+                debug!(
+                    "[ui-bridge/elements] getComponents skipped '{}': no longer WS-registered",
+                    app_id
+                );
             }
             Err(e) => {
                 warn!(
@@ -2559,15 +2570,10 @@ pub async fn ui_bridge_execute_component_action_handler(
     Path((id, action_id)): Path<(String, String)>,
     request: UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Which app the action lands on: a WS wrapper registered under the
-    // component id owns it (see `component_action_dispatch`); otherwise the
-    // runner's own webview does. Read before dispatch, from the same registry
-    // lookup the dispatch makes.
-    let app_id = match state.app_registry.get_live(&id).await {
-        Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
-        _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
-    };
-    let result = component_action_dispatch(
+    // Which app the action landed on — a WS wrapper registered under the
+    // component id, else the runner's own webview — as the dispatch itself
+    // routed it, not from a second registry read that could disagree.
+    let (app_id, result) = component_action_dispatch(
         State(Arc::clone(&state)),
         Path((id.clone(), action_id.clone())),
         request,
@@ -2589,13 +2595,17 @@ pub async fn ui_bridge_execute_component_action_handler(
     result
 }
 
+type ComponentActionResult =
+    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+
 /// The body of [`ui_bridge_execute_component_action_handler`], split out so
-/// the journey capture sees every exit in one place.
+/// the journey capture sees every exit in one place. Returns the app the
+/// action was routed to beside its result.
 async fn component_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> (String, ComponentActionResult) {
     info!(
         "UI Bridge API: Executing action {} on component {}",
         action_id, id
@@ -2623,12 +2633,25 @@ async fn component_action_dispatch(
     )
     .await
     {
-        return match ws_outcome {
+        let result = match ws_outcome {
             Ok(value) => Ok(Json(ApiResponse::success(value))),
             Err(e) => Err(ws_dispatch_error_response(e)),
         };
+        return (id, result);
     }
+    (
+        crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+        component_action_ipc(&state, &id, &action_id, payload).await,
+    )
+}
 
+/// [`component_action_dispatch`]'s IPC arm: the runner's own webview.
+async fn component_action_ipc(
+    state: &Arc<ApiState>,
+    id: &str,
+    action_id: &str,
+    payload: serde_json::Value,
+) -> ComponentActionResult {
     // Iter-3 item 4 — detect "component not found" / "action not found"
     // inner-failure shapes BEFORE wrap_ipc_result flattens them to the
     // default INTERNAL_ERROR envelope. The frontend's
@@ -2639,7 +2662,7 @@ async fn component_action_dispatch(
     // `ELEMENT_NOT_FOUND` taxonomy entry (the closest available — the
     // canonical schema has no `UB-COMPONENT-NOT-AVAILABLE` yet) instead
     // of being misclassified as a transport-level INTERNAL_ERROR.
-    let ipc_result = ui_bridge_request_sync(&state, "execute_component_action", payload).await;
+    let ipc_result = ui_bridge_request_sync(state, "execute_component_action", payload).await;
     if let Ok(ref data) = ipc_result {
         if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -2651,7 +2674,7 @@ async fn component_action_dispatch(
                 && (error_msg.to_lowercase().contains("not found")
                     || error_msg.to_lowercase().contains("unknown"));
             if is_component_missing {
-                let detail = UiBridgeError::element_not_found(&id);
+                let detail = UiBridgeError::element_not_found(id);
                 let message = format!("Component not found: {}", id);
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -5522,15 +5545,24 @@ mod components_envelope_tests {
 // ============================================================================
 #[cfg(test)]
 mod ws_dispatch_selection_tests {
-    use super::{try_ws_dispatch_for_app, ws_collect_components};
+    use super::{try_ws_dispatch_for_app, ws_collect_components, ws_route_outcome};
     use crate::mcp::app_discovery::DiscoveredApp;
-    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
     use crate::mcp::app_registry::{AppRegistry, AppTransport};
     use crate::mcp::command_relay::{CommandRelay, CommandResponse};
     use crate::mcp::ws_relay::WsConnectionManager;
     use reqwest::Method;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn a_route_that_is_no_longer_websocket_falls_through() {
+        let flipped = ws_route_outcome(Err(DispatchError::NotWebsocket("w".into())));
+        assert_eq!(flipped, None);
+        let failed = ws_route_outcome(Err(DispatchError::NotRegistered("w".into())));
+        assert!(matches!(failed, Some(Err(_))), "{failed:?}");
+        assert_eq!(ws_route_outcome(Ok(json!(1))), Some(Ok(json!(1))));
+    }
 
     /// m8: a dispatch REFRESHES the row it dispatches to.
     ///

@@ -1322,7 +1322,14 @@ export default function App() {
           release on startup. Renders nothing; fail-open. */}
       <AutoUpdateChecker />
       <UIBridgeProvider
-        features={{ renderLog: true, control: true, debug: true }}
+        // devControls: the page-altering dev controls (the media override,
+        // /ui-bridge/control/media/override) answer only when
+        // import.meta.env.DEV, i.e. under a Vite dev server. Every runner —
+        // published, dev and temp alike — is an exe-mode build, so here they
+        // always refuse. Not a security boundary: they add nothing beyond the
+        // existing page_evaluate/eval surface (plan
+        // 2026-10-13-image-generation-and-visual-judgment, Phase 18).
+        features={{ renderLog: true, control: true, debug: true, devControls: import.meta.env.DEV }}
         browserCaptureConfig={{
           // Capture errors/warnings only. The runner's error-monitor consumes
           // console errors, resource errors, WS disconnects, and React error
