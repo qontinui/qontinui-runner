@@ -786,13 +786,14 @@ async fn embedding_service_health() -> serde_json::Value {
 /// that bought freshness by charging every poll ~2 s while the database was
 /// down).
 ///
-/// Returns `None` when no PG is configured (the global `PgDb` was never set),
-/// else whether the database answered.
+/// Returns `None` when no PG is configured (the global `PgDb` was never set)
+/// OR the probe could not tell (a saturated pool, a probe that ran out its
+/// bound), else whether the database answered. Gating consumers pass only on
+/// `Some(true)`, so `None` withholds exactly as `Some(false)` does, while
+/// `derive_schema_health` labels it "unknown" rather than "false".
 pub(crate) async fn pg_liveness_probe() -> Option<bool> {
     let pg = crate::database::pg::PgDb::try_global()?;
-    // A probe that could not tell (saturated pool, ran out its bound) is NOT
-    // reachable for a gating consumer: the conservative arm.
-    Some(pg.pool().probe_now().await.reachable == Some(true))
+    pg.pool().probe_now().await.reachable
 }
 
 /// Fixed, minimal set of relations the runner cannot work without. `schema_ok`

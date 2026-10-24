@@ -5786,6 +5786,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Same settle delay the scheduler takes: let the MCP API
                     // bind before workers that report through it are spawned.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    // One-shot: a runtime PG blip at this moment would make
+                    // every resume read fail fast and the runs would never be
+                    // resumed. Give the breaker a bounded chance to close.
+                    if !resume_state
+                        .pg_db
+                        .pool()
+                        .wait_available(tokio::time::Duration::from_secs(30))
+                        .await
+                    {
+                        tracing::warn!(
+                            "conductor restart-resume: PostgreSQL unavailable for 30 s after boot; \
+                             owned runs are NOT resumed this process"
+                        );
+                        return;
+                    }
                     orchestration_loop::loop_engine::resume_owned_runs(
                         resume_state.orchestration_loops.clone(),
                         resume_handle,

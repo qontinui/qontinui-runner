@@ -74,10 +74,23 @@ impl PgStandIn {
             let mut parked: Vec<TcpStream> = Vec::new();
             let mut served = tokio::task::JoinSet::new();
             loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    // A listener that cannot accept will not recover; stop
-                    // rather than spin.
-                    break;
+                while served.try_join_next().is_some() {}
+                let sock = match listener.accept().await {
+                    Ok((sock, _)) => sock,
+                    // A client that aborted before the accept (the tests
+                    // cancel connects all the time) is not a listener fault.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue
+                    }
+                    // Anything else will not recover; stop rather than spin.
+                    Err(_) => break,
                 };
                 a.fetch_add(1, Ordering::SeqCst);
                 match Mode::from_u8(m.load(Ordering::SeqCst)) {

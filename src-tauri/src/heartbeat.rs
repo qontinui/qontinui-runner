@@ -420,6 +420,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 crate::mcp::backend_relay::web_integration_status_for(&app_state).await;
             let relay = HeartbeatRelay::from(&relay_status);
             let relay_connected = relay.connected;
+            let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
             let base_status =
                 crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                     has_ui_error: ui_error_snapshot.is_some(),
@@ -427,8 +428,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     ui_dead: Some(ui_dead),
                     native_ui_wedged: native_ui.wedged,
                     embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
-                    pg_reachable: crate::database::pg::health::status_pg_reachable(),
-                    pg_schema_ok: crate::database::pg::health::status_pg_schema_ok(),
+                    pg_reachable,
+                    pg_schema_ok,
                     relay_connected,
                     ..Default::default()
                 });

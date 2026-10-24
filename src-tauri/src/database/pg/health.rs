@@ -12,7 +12,9 @@
 //!   `SELECT 1` and the schema probe every 5 s while the breaker is Closed —
 //!   through the guarded pool, so a failure trips the breaker;
 //! * the breaker's prober, whose trials are the observations while it is Open
-//!   (at most 15 s + one ≤ 5 s trial apart);
+//!   (at most 15 s + one ≤ 5 s default trial apart; the degraded-boot
+//!   provisioning trial may run longer, and the snapshot then reads `stale`,
+//!   which is the honest answer while it runs);
 //! * an explicit age bound: an observation older than [`STALE_AFTER`] renders
 //!   `reachable: null` with `stale: true`, never the last value (served policy
 //!   `verification-and-evidence` `unknown-must-not-render-as-a-default`).
@@ -22,7 +24,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use qontinui_runner_lib::circuit::{CircuitSnapshot, CircuitState};
 use qontinui_runner_lib::pg_circuit::{rfc3339, CauseClass, ProbeObservation};
@@ -209,16 +213,14 @@ pub fn database_health_json(s: &PgHealthSnapshot, now: Instant) -> serde_json::V
     })
 }
 
-/// `HealthInputs.pg_reachable` for the sinks that do no PG I/O of their own
-/// (the operations heartbeat, the web-backend heartbeat relay, the UI-Bridge
-/// signal gatherer). Age-bounded: stale or never observed is `None`.
-pub fn status_pg_reachable() -> Option<bool> {
-    pg_health_snapshot().status_reachable(Instant::now())
-}
-
-/// `HealthInputs.pg_schema_ok` for the same sinks.
-pub fn status_pg_schema_ok() -> Option<bool> {
-    pg_health_snapshot().schema(Instant::now()).0
+/// `(HealthInputs.pg_reachable, HealthInputs.pg_schema_ok)` for the sinks
+/// that do no PG I/O of their own (the operations heartbeat, the web-backend
+/// heartbeat relay, the UI-Bridge signal gatherer), from ONE snapshot at one
+/// instant. Age-bounded: stale or never observed is `None`.
+pub fn status_pg_inputs() -> (Option<bool>, Option<bool>) {
+    let s = pg_health_snapshot();
+    let now = Instant::now();
+    (s.status_reachable(now), s.schema(now).0)
 }
 
 fn store_schema(schema_ok: Option<bool>, schema_detail: Option<String>) {
@@ -309,9 +311,9 @@ mod tests {
             true,
             CauseClass::ConnectRefused,
         );
-        let t = Instant::now();
+        // No timing assertion: the function does no I/O by construction, and
+        // the source-region test below proves the handler awaits no probe.
         let j = database_health_json(&s, now);
-        assert!(t.elapsed() < Duration::from_millis(5), "{:?}", t.elapsed());
         assert_eq!(j["reachable"], false);
         assert_eq!(j["breaker"]["state"], "open");
         assert_eq!(j["breaker"]["causeClass"], "connect_refused");
@@ -384,6 +386,8 @@ mod tests {
         assert_eq!(s.status_reachable(now), None);
     }
 
+    /// Holds for the DEFAULT trial only; see the module doc for the
+    /// provisioning trial.
     #[test]
     fn the_prober_cap_stays_below_the_staleness_bound() {
         assert!(qontinui_runner_lib::pg_circuit::PROBER_BACKOFF_CAP < STALE_AFTER);
@@ -453,12 +457,12 @@ mod tests {
             ),
         ] {
             assert!(
-                src.contains("pg_reachable: crate::database::pg::health::status_pg_reachable()"),
-                "{name} must feed pg_reachable from the cached snapshot"
+                src.contains("crate::database::pg::health::status_pg_inputs()"),
+                "{name} must read the cached PG snapshot"
             );
             assert!(
-                src.contains("pg_schema_ok: crate::database::pg::health::status_pg_schema_ok()"),
-                "{name} must feed pg_schema_ok from the cached snapshot"
+                src.contains("pg_reachable,") && src.contains("pg_schema_ok,"),
+                "{name} must feed both PG inputs"
             );
         }
     }
