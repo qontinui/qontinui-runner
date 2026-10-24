@@ -39,7 +39,23 @@ import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
-import { buildCreatePlainTerminalAction } from "@/components/terminal/createPlainTerminalAction";
+import {
+  assertComponentActionEffectConsistency,
+  componentSignatureId,
+  normalizeDeclaredComponentSignature,
+  type ActionParams,
+  type EffectSignature,
+  type SemanticSnapshot,
+} from "@qontinui/ui-bridge";
+
+import {
+  buildCreatePlainTerminalAction,
+  CREATE_PLAIN_TERMINAL_ACTION_ID,
+} from "@/components/terminal/createPlainTerminalAction";
+import { buildTerminalLaunchMenuActions } from "@/components/terminal/terminalLaunchMenuActions";
+import * as pageSignatures from "@/components/terminal/terminalPageSignatures";
+import type { ZoneViewFacts } from "@/components/terminal/terminalPageSignatures";
+import * as pickerSignatures from "@/components/terminal/zonePickerSignatures";
 
 const SRC_ROOT = resolve(__dirname, "../..");
 
@@ -70,6 +86,8 @@ interface FoundAction {
   action: string;
   /** `undefined` when the registration declares no `effect`. */
   effect: string | undefined;
+  /** The `signature:` initializer as written, or `undefined` when none is declared. */
+  signature: ts.Expression | undefined;
   where: string;
 }
 
@@ -217,6 +235,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: `<unreadable actions factory: ${actionsNode.getText().slice(0, 60)}>`,
               effect: undefined,
+              signature: undefined,
               where,
             });
           }
@@ -239,6 +258,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
                 component: componentId,
                 action: `<unreadable element: ${el.getText().slice(0, 60)}>`,
                 effect: undefined,
+                signature: undefined,
                 where,
               });
               continue;
@@ -248,6 +268,7 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
               component: componentId,
               action: literalText(objectProperty(literal, "id")) ?? "<unreadable id>",
               effect: literalText(objectProperty(literal, "effect")) ?? undefined,
+              signature: objectProperty(literal, "signature"),
               where,
             });
           }
@@ -311,5 +332,230 @@ describe("component-action effect coverage", () => {
     const action = buildCreatePlainTerminalAction(async () => "tab-1");
     expect(action.effect).toBe("write");
     expect(VALID_EFFECTS.has(action.effect)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Effect-calculus signatures on the terminal page's four components
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary`,
+// Phase 2. `predict` on an action with no `signature` answers UNCLASSIFIED, so
+// every action on these four components must declare one. The set is read from
+// the walk, never pinned as a count: a sibling PR adding an action here must
+// add its signature or go red.
+//
+// The signature each action carries is resolved FROM THE WALK — the
+// `signature:` initializer written at that registration — not from a table
+// kept beside this test. A signature wired to the wrong action names itself
+// after a different action, which is what the id check below catches.
+
+/** The four component ids whose every action must declare a `signature`. */
+const SIGNATURE_COMPONENTS = [
+  "terminal-page",
+  "terminal-launch-menu",
+  "zone-layout-picker",
+  "zone-profile-picker",
+] as const;
+
+/** Non-vacuity floor: the actions those four registered on 2026-10-22. */
+const MIN_SIGNATURE_ACTIONS = 22;
+
+/**
+ * The walk reports an action id written as an identifier by the identifier's
+ * NAME (it is for reporting). The one such id on these components resolves
+ * here, so ids compare against the runtime ones.
+ */
+const ID_CONSTANTS: Record<string, string> = { CREATE_PLAIN_TERMINAL_ACTION_ID };
+
+/** Every export a registration may name in its `signature:` initializer. */
+const SIGNATURE_EXPORTS: Record<string, unknown> = { ...pageSignatures, ...pickerSignatures };
+
+/** Zone-view facts with a maximized zone and labelled tiled zones. */
+const STUB_ZONE_FACTS: ZoneViewFacts = {
+  maximizedZone: 1,
+  zoneCount: 4,
+  labelledZonesWhenTiled: 2,
+};
+
+/**
+ * Stand-ins for a factory's NON-literal arguments (render-time values the
+ * walk cannot evaluate). A literal argument is always passed as written, so
+ * `zoneViewSignature("restore", …)` resolves as the restore signature.
+ */
+const STUB_ARGS: Record<string, unknown[]> = {
+  zoneViewSignature: [undefined, STUB_ZONE_FACTS],
+  popOutPageSignature: ["default", 1],
+  selectLayoutSignature: [1],
+  loadProfileSignature: [{}, 0],
+  workModeSignature: [() => "grid"],
+};
+
+/**
+ * Evaluate a `signature:` initializer the way the registration does: an
+ * identifier names an export; a call invokes the exported factory with its
+ * literal arguments and stubs for the rest. Anything else is unresolvable,
+ * which the test reports rather than skips.
+ */
+function resolveSignature(init: ts.Expression): EffectSignature | string {
+  if (ts.isIdentifier(init)) {
+    const value = SIGNATURE_EXPORTS[init.text];
+    return value ? (value as EffectSignature) : `unknown signature export ${init.text}`;
+  }
+  if (ts.isCallExpression(init) && ts.isIdentifier(init.expression)) {
+    const name = init.expression.text;
+    const factory = SIGNATURE_EXPORTS[name];
+    if (typeof factory !== "function") return `unknown signature factory ${name}`;
+    const stubs = STUB_ARGS[name];
+    if (!stubs) return `no STUB_ARGS for signature factory ${name}`;
+    const args = init.arguments.map((arg, i) =>
+      ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) ? arg.text : stubs[i],
+    );
+    return (factory as (...a: unknown[]) => EffectSignature)(...args);
+  }
+  return `unresolvable signature initializer ${init.getText()}`;
+}
+
+function snapshotOf(ids: string[]): SemanticSnapshot {
+  return { elements: ids.map((id) => ({ id })) } as unknown as SemanticSnapshot;
+}
+
+/** Pre-snapshots that exercise every branch the conditional `predicts` take. */
+const PRE_SNAPSHOTS: SemanticSnapshot[] = [
+  snapshotOf([]),
+  snapshotOf(["terminal-input-t1", "terminal-input-t2", "terminal-zone-header-0"]),
+];
+
+/** Param bags covering the conditional `predicts` (and the empty bag). */
+const PARAM_BAGS: Record<string, unknown>[] = [
+  {},
+  { zoneIndex: 0 },
+  { zoneIndex: 1 },
+  { layoutId: "single" },
+  { terminalId: "t1", windowLabel: "term-1" },
+  { terminalId: "t9", windowLabel: "main" },
+  { name: "p" },
+  { pageId: "other" },
+];
+
+describe("component-action signature coverage (terminal page)", () => {
+  const { actions } = collect();
+  const scoped = actions
+    .filter((a) => (SIGNATURE_COMPONENTS as readonly string[]).includes(a.component))
+    .map((a) => ({ ...a, action: ID_CONSTANTS[a.action] ?? a.action }));
+
+  /** `<componentId>.<actionId>` → the signature its registration resolves to. */
+  const resolved = new Map<string, EffectSignature | string>(
+    scoped.map((a) => [
+      `${a.component}.${a.action}`,
+      a.signature ? resolveSignature(a.signature) : "no `signature` declared",
+    ]),
+  );
+  const signatureOf = (a: { component: string; action: string }): EffectSignature | undefined => {
+    const r = resolved.get(`${a.component}.${a.action}`);
+    return typeof r === "string" ? undefined : r;
+  };
+
+  it("found all four components and at least the 22 actions they registered (non-vacuity floor)", () => {
+    expect([...new Set(scoped.map((a) => a.component))].sort()).toEqual(
+      [...SIGNATURE_COMPONENTS].sort(),
+    );
+    expect(scoped.length).toBeGreaterThanOrEqual(MIN_SIGNATURE_ACTIONS);
+  });
+
+  it("every action on the four components declares a `signature`", () => {
+    const missing = scoped
+      .filter((a) => a.signature === undefined)
+      .map((a) => `${a.component}.${a.action} (${a.where})`);
+    expect(
+      missing,
+      `${missing.length} action(s) declare no \`signature\`, so \`predict\` answers ` +
+        "UNCLASSIFIED for them. Declare one in terminalPageSignatures.ts / " +
+        "zonePickerSignatures.ts and add it at the registration.",
+    ).toEqual([]);
+  });
+
+  it("each registration's signature resolves and names ITS OWN <componentId>.<actionId>", () => {
+    const wrong: string[] = [];
+    for (const a of scoped) {
+      const key = `${a.component}.${a.action}`;
+      const r = resolved.get(key);
+      if (typeof r === "string" || r === undefined) {
+        wrong.push(`${key}: ${r ?? "unresolved"}`);
+        continue;
+      }
+      const normalized = normalizeDeclaredComponentSignature(r, a.component, a.action);
+      if (normalized?.id !== componentSignatureId(a.component, a.action)) {
+        wrong.push(`${key} carries signature "${normalized?.id}" (${a.where})`);
+      }
+      if (normalized?.provenance !== "declared") wrong.push(`${key}: provenance not declared`);
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  it("factory-built actions carry their signature at RUNTIME, not only in source", () => {
+    const launch = buildTerminalLaunchMenuActions({
+      callRegistry: async () => [] as never,
+      launchAiSession: async () => [],
+    });
+    for (const a of launch) {
+      expect(a.signature?.id).toBe(componentSignatureId("terminal-launch-menu", a.id));
+    }
+    const plain = buildCreatePlainTerminalAction(async () => "tab-1");
+    expect(plain.signature?.id).toBe(componentSignatureId("terminal-page", plain.id));
+  });
+
+  it("every signature agrees with its declared `effect` (the SDK's authoring lint)", () => {
+    const messages: string[] = [];
+    for (const a of scoped) {
+      const sig = signatureOf(a);
+      if (!sig) continue;
+      for (const pre of PRE_SNAPSHOTS) {
+        for (const bag of PARAM_BAGS) {
+          const params: ActionParams = { action: a.action, params: bag };
+          messages.push(
+            ...assertComponentActionEffectConsistency(
+              a.effect as "read" | "write" | "destructive" | undefined,
+              sig,
+              params,
+              pre,
+              a.component,
+              a.action,
+            ),
+          );
+        }
+      }
+    }
+    expect([...new Set(messages)]).toEqual([]);
+  });
+
+  it("query actions (list-* / get-*) predict an explicit empty delta, idempotent", () => {
+    const queries = scoped.filter((a) => /^(list|get)-/.test(a.action));
+    expect(queries.length).toBeGreaterThanOrEqual(5);
+    for (const a of queries) {
+      const sig = signatureOf(a);
+      expect(a.effect).toBe("read");
+      expect(sig?.reversibility).toBe("idempotent");
+      for (const pre of PRE_SNAPSHOTS) {
+        expect(sig?.predicts({ action: a.action, params: {} }, pre)).toEqual({
+          errorsAppear: "none",
+        });
+      }
+    }
+  });
+
+  it("every destructive action is one-way, including the two the plan names", () => {
+    const destructive = scoped.filter((x) => x.effect === "destructive");
+    expect(destructive.length).toBeGreaterThanOrEqual(2);
+    for (const a of destructive) {
+      expect(signatureOf(a)?.reversibility, a.action).toBe("one-way");
+    }
+    for (const key of [
+      "terminal-page.close-empty-terminal-windows",
+      "zone-profile-picker.delete-profile",
+    ]) {
+      const r = resolved.get(key);
+      expect(typeof r === "string" ? r : r?.reversibility, key).toBe("one-way");
+    }
   });
 });

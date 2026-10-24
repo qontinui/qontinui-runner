@@ -17,6 +17,12 @@ import {
 } from "./zoneProfileStorage";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { textArg } from "./commands";
+import {
+  DELETE_PROFILE_SIGNATURE,
+  LIST_PROFILES_SIGNATURE,
+  SAVE_PROFILE_SIGNATURE,
+  loadProfileSignature,
+} from "./zonePickerSignatures";
 
 interface ZoneProfilePickerProps {
   currentLayoutId: string;
@@ -31,7 +37,8 @@ interface ZoneProfilePickerProps {
   pageId?: string;
   /** Whether terminal initialization (reconnection) has completed */
   initialized?: boolean;
-  onLoadProfile: (profile: ZoneProfile) => void;
+  /** May be async; `load-profile` awaits it so verification sees the spawned tabs. */
+  onLoadProfile: (profile: ZoneProfile) => void | Promise<void>;
 }
 
 const MAX_PROFILES = 10;
@@ -194,14 +201,17 @@ export function ZoneProfilePicker({
     pageId,
   ]);
 
+  // Returns the apply so the `load-profile` action can await it: the profile's
+  // terminal spawns must land before the effect verifier's post-snapshot.
   const handleLoad = useCallback(
-    (name: string) => {
+    async (name: string) => {
       const profile = profiles[name];
       if (profile) {
-        onLoadProfile(profile);
+        const applying = onLoadProfile(profile);
         setActiveProfileName(name);
         saveActiveProfileToDb(name, pageId);
         setOpen(false);
+        await applying;
       }
     },
     [profiles, onLoadProfile, pageId],
@@ -247,10 +257,11 @@ export function ZoneProfilePicker({
         // them. Dim 1: the arrangement it overwrites was never saved anywhere. Dim 3: it
         // widens or narrows auto-approval silently, which is the worst quadrant.
         effect: "destructive",
+        signature: loadProfileSignature(profiles, tabs?.length ?? 0),
         // `{name: {}}` used to reach the "Profile not found" sentence as
         // `Profile not found: "[object Object]"` — an operator-facing message
         // quoting a stringified object back as though it had been typed.
-        handler: guardedHandler("load-profile", PROFILE_NAME_SCHEMA, (args) => {
+        handler: guardedHandler("load-profile", PROFILE_NAME_SCHEMA, async (args) => {
           const name = textArg(args, "name");
           if (!name) throw new Error("load-profile requires { name: string }");
           const profile = profiles[name];
@@ -258,7 +269,7 @@ export function ZoneProfilePicker({
             throw new Error(
               `Profile not found: "${name}". Available: ${Object.keys(profiles).join(", ") || "none"}`,
             );
-          handleLoad(name);
+          await handleLoad(name);
         }),
       },
       {
@@ -282,6 +293,7 @@ export function ZoneProfilePicker({
         // confirmation and no copy of what it replaced (dim 1 + dim 3), and it also makes
         // the profile active — see the description above, which used to omit that.
         effect: "destructive",
+        signature: SAVE_PROFILE_SIGNATURE,
         // THE SHARPEST ONE ON THIS PAGE. `{name: {}}` is truthy, so it passed
         // `if (!name)`, became the COMPUTED KEY `"[object Object]"` in the
         // saved map, and was then handed to React as a child: two `setting_set`
@@ -331,6 +343,7 @@ export function ZoneProfilePicker({
         // `destructive` — removes a saved profile from the page's persisted settings.
         // There is no undo and no recycle bin.
         effect: "destructive",
+        signature: DELETE_PROFILE_SIGNATURE,
         // Same stringify-into-the-message defect as `load-profile`.
         handler: guardedHandler("delete-profile", PROFILE_NAME_SCHEMA, (args) => {
           const name = textArg(args, "name");
@@ -344,6 +357,7 @@ export function ZoneProfilePicker({
         label: "List Profiles",
         // `read` — returns the profile names and the active one. A query.
         effect: "read",
+        signature: LIST_PROFILES_SIGNATURE,
         handler: () => ({
           profiles: profileNames,
           active: activeProfileName,
@@ -449,7 +463,10 @@ export function ZoneProfilePicker({
                         name === activeProfileName ? "bg-[#7aa2f7]/5" : ""
                       }`}
                     >
-                      <button onClick={() => handleLoad(name)} className="flex-1 min-w-0 text-left">
+                      <button
+                        onClick={() => void handleLoad(name)}
+                        className="flex-1 min-w-0 text-left"
+                      >
                         <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
                         <div className="text-[9px] text-[#565f89]">
                           {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""}

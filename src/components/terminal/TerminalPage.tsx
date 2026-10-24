@@ -61,6 +61,22 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, textArg, useTerminalCommands } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
+import {
+  CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE,
+  CREATE_TERMINAL_SIGNATURE,
+  GET_TERMINAL_WORK_MODE_SIGNATURE,
+  GET_ZONE_VIEW_STATE_SIGNATURE,
+  LIST_RUNNER_WINDOWS_SIGNATURE,
+  LIST_TERMINALS_SIGNATURE,
+  MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
+  OPEN_TERMINAL_WINDOW_SIGNATURE,
+  POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
+  workModeSignature,
+  countTerminalTabs,
+  popOutPageSignature,
+  zoneViewSignature,
+} from "./terminalPageSignatures";
+import { useZoneViewFacts } from "./useZoneViewFacts";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
@@ -278,6 +294,8 @@ function TerminalPageInner({
     session.workflowGen.setShowSidebar,
   ]);
 
+  const zoneViewFacts = useZoneViewFacts();
+
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
   useUIComponent({
@@ -298,6 +316,7 @@ function TerminalPageInner({
         // it. A shell that runs nothing has no blast radius of its own; closing the tab
         // undoes it. Contrast `terminal-launch-menu.create-with-command` below.
         effect: "write",
+        signature: CREATE_TERMINAL_SIGNATURE,
         handler: async () => {
           // Operator-initiated (through the UI Bridge): shown in tmux mode,
           // like every terminal the operator creates. No-op in grid mode.
@@ -328,6 +347,7 @@ function TerminalPageInner({
         // PTY-liveness signal the cheatsheet promises.
         // `read` — returns the mounted tabs. A query.
         effect: "read",
+        signature: LIST_TERMINALS_SIGNATURE,
         handler: () =>
           tabs.map((t) => ({
             id: t.id,
@@ -345,6 +365,7 @@ function TerminalPageInner({
         // `write` — opens an empty pop-out OS window. Nothing is in it yet, so closing it
         // is a full undo.
         effect: "write",
+        signature: OPEN_TERMINAL_WINDOW_SIGNATURE,
         handler: async () => invoke("open_terminal_window", { placement: null }),
       },
       {
@@ -355,6 +376,7 @@ function TerminalPageInner({
         // `write` — opens a window and MOVES the live tab into it. The PTY survives the
         // move and `move-terminal-to-window` reverses it, so dim 1 loses nothing.
         effect: "write",
+        signature: POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
         handler: async () => {
           if (!activeId) throw new Error("no active terminal to pop out");
           const rec = await invoke<{ label: string }>("open_terminal_window", {
@@ -376,6 +398,7 @@ function TerminalPageInner({
         // `write` — detaches a whole page (its terminals and zone layout) into a window.
         // Same reasoning as above at page granularity: the sessions are moved, not ended.
         effect: "write",
+        signature: popOutPageSignature(pageId, countTerminalTabs(tabs)),
         // `{pageId: {}}` is TRUTHY, so it sailed past `target || pageId` and
         // reached `popOutPage` as an object — an unvalidated argument reaching
         // an effect, one rung less sharp than the PTY only because the effect
@@ -394,6 +417,7 @@ function TerminalPageInner({
         paramSchema: MOVE_TERMINAL_SCHEMA,
         // `write` — reassigns one tab's host window. Directly reversible.
         effect: "write",
+        signature: MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
         // `{terminalId: {}}` is truthy too, so a non-string sessionId used to
         // reach the `assign_session_to_window` Tauri command and the refusal
         // came from serde, in Rust's words.
@@ -429,6 +453,7 @@ function TerminalPageInner({
         // `read` — display state only: `maximizedZone` is plain `useState` in
         // useZoneLayout, never persisted, and restore-zone undoes it without trace.
         effect: "read",
+        signature: zoneViewSignature("maximize", zoneViewFacts),
         // Guarded like its siblings: `planMaximizeZone` validates the VALUE,
         // and the guard refuses a non-object bag and an undeclared key, which
         // the old cast dropped in silence.
@@ -452,6 +477,7 @@ function TerminalPageInner({
           "Leave the maximized view and return to the tiled layout. No params. Returns { maximizedZone: null, previousMaximizedZone, zoneCount, changed } — `changed: false` means nothing was maximized.",
         // `read` — the inverse view toggle; same in-memory `maximizedZone`.
         effect: "read",
+        signature: zoneViewSignature("restore", zoneViewFacts),
         handler: async () => {
           const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
           setMaximizedZone(null);
@@ -466,6 +492,7 @@ function TerminalPageInner({
         paramSchema: ZONE_INDEX_SCHEMA,
         // `read` — maximize-zone or restore-zone by the keyboard rule; display state.
         effect: "read",
+        signature: zoneViewSignature("toggle", zoneViewFacts),
         // The ref is read when the ACTION is invoked, never during render:
         // `guardedHandler` only stores `run`. The compiler cannot see through
         // the call, so it reports the closure as a render-time ref read.
@@ -486,6 +513,7 @@ function TerminalPageInner({
           "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
         // `read` — a query.
         effect: "read",
+        signature: GET_ZONE_VIEW_STATE_SIGNATURE,
         handler: () => ({
           maximizedZone: zoneMaximizeRef.current.maximizedZone,
           zoneCount: zoneMaximizeRef.current.zoneCount,
@@ -507,6 +535,10 @@ function TerminalPageInner({
         // and survive reload, unlike the in-memory maximize state; the inverse
         // request restores the grid the operator left (`gridSnapshot`).
         effect: "write",
+        // Like the handler, the signature reads the ref only when `predict`
+        // runs, never during render.
+        // eslint-disable-next-line react-hooks/refs
+        signature: workModeSignature(() => workModeRef.current.workMode),
         // The ref is read when the ACTION is invoked, never during render:
         // `guardedHandler` only stores `run`. The compiler cannot see through
         // the call, so it reports the closure as a render-time ref read.
@@ -534,6 +566,7 @@ function TerminalPageInner({
           "Return { mode, shownTabId, sidebarOpen } — the read that lets a caller assert the work mode without inferring it from a DOM snapshot. The CommandBar's `terminal.work-mode-toggle` element shows the same mode by name.",
         // `read` — a query.
         effect: "read",
+        signature: GET_TERMINAL_WORK_MODE_SIGNATURE,
         handler: () => ({
           mode: workModeRef.current.workMode,
           shownTabId: workModeRef.current.shownTabId,
@@ -547,6 +580,7 @@ function TerminalPageInner({
           "Return this runner process's own windows [{ label, kind, title }] (main + pop-outs).",
         // `read` — returns this process's windows. A query.
         effect: "read",
+        signature: LIST_RUNNER_WINDOWS_SIGNATURE,
         handler: async () => invoke("list_runner_windows"),
       },
       // P2 (orphan sweep) — operator-initiated cleanup of empty pop-out windows
@@ -563,6 +597,7 @@ function TerminalPageInner({
         // not reconstructible. Dim 2: those windows may belong to another session's work.
         // Dim 3: it sweeps silently, and "empty" is the backend's judgement, not yours.
         effect: "destructive",
+        signature: CLOSE_EMPTY_TERMINAL_WINDOWS_SIGNATURE,
         handler: async () => invoke("close_empty_terminal_windows"),
       },
     ],
