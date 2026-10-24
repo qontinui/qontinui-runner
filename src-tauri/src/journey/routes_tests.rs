@@ -500,3 +500,69 @@ fn prior_knowledge_is_measured_only_behind_a_closed_settle_gate() {
     assert_eq!(code(&v), gate.unwrap());
     assert!(v["provenance"]["source"]["result"]["nodes"].is_array());
 }
+
+// -- Review fixes: the detail names the dimension; filters never claim the bound
+
+#[test]
+fn a_run_kind_query_over_a_small_ledger_does_not_claim_the_read_bound() {
+    let mut explorer = edge(2, "b", Some("c"), "affordance", "changed", "fp-b1");
+    explorer.run_kind = RunKind::Explorer;
+    let rows = vec![
+        serde_json::to_value(edge(1, "a", Some("b"), "affordance", "changed", "fp-a1")).unwrap(),
+        serde_json::to_value(explorer).unwrap(),
+    ];
+    // The bounded read of a two-row ledger, exactly as `read_ledger` splits it.
+    let (rows, truncated) =
+        crate::journey::read::split_bound(rows, crate::journey::read::EDGE_READ_LIMIT);
+    let (edges, bad) = crate::journey::read::parse_rows::<JourneyEdgeObservation>(rows);
+    let read = LedgerRead {
+        edges,
+        frontier: Vec::new(),
+        edges_truncated: truncated,
+        frontier_truncated: false,
+        rows_unparseable: bad,
+    };
+    let filter = JourneyFilter {
+        run_kind: Some(RunKind::AgentAction),
+        ..JourneyFilter::default()
+    };
+    let g = build_graph(&read.edges, &read.frontier, &writing(), &filter);
+    let c = AnswerCtx {
+        gaps: ReadGaps::of(&read),
+        ..ctx("steps")
+    };
+    // From B, the only departure is the explorer edge the filter removed.
+    let v = answer_steps(&c, &g, &key("b"), &key("a"));
+    assert_eq!(status(&v), "unknown", "{v:#}");
+    let body = v.to_string();
+    assert!(
+        !body.contains("read bound") && !body.contains("edges_beyond_read_bound"),
+        "a filter is not a truncated read: {v:#}"
+    );
+    let detail = v["unknown"]["detail"].as_str().unwrap();
+    let dims: Vec<&str> = v["provenance"]["coverage"]["unmeasured"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["dimension"].as_str().unwrap())
+        .collect();
+    let named = dims
+        .iter()
+        .find(|d| detail.contains(**d))
+        .unwrap_or_else(|| panic!("detail {detail:?} names none of {dims:?}"));
+    assert_ne!(*named, "edges_beyond_read_bound");
+}
+
+#[test]
+fn a_truncated_read_detail_names_the_read_bound() {
+    let edges = vec![edge(1, "a", Some("b"), "affordance", "changed", "fp-a1")];
+    let g = build_graph(&edges, &[], &writing(), &JourneyFilter::default());
+    let v = answer_steps(&gappy("steps"), &g, &key("b"), &key("a"));
+    assert!(
+        v["unknown"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("read bound"),
+        "{v:#}"
+    );
+}

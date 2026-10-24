@@ -16,9 +16,11 @@
 //!   one SQL constant. A row that does not deserialize is COUNTED
 //!   ([`LedgerRead::rows_unparseable`]), never silently dropped.
 //!
-//! Filtering (`since` / `appVersion` / `runKind`) is NOT pushed into SQL: the
-//! shared `build_graph` applies it and counts what it filtered out, which a
-//! `WHERE` clause would hide.
+//! `since` IS pushed into SQL (`$3`), so `?since=` narrows the bounded read
+//! itself — the way out of a truncated read. `build_graph` re-applies it (a
+//! no-op there) and so cannot count the rows SQL never returned:
+//! `edgesFilteredOut` counts only the `appVersion` / `runKind` filters, which
+//! stay in Rust so their exclusions are counted.
 
 use std::time::Duration;
 
@@ -88,6 +90,7 @@ pub(crate) const EDGE_READ_SQL: &str = concat!(
     edge_object_sql!(),
     "\n  FROM project.journey_edge_observations e\n",
     " WHERE e.app_id = $1\n",
+    "   AND ($3::timestamptz IS NULL OR e.observed_at >= $3::timestamptz)\n",
     " ORDER BY e.observed_at DESC, e.id DESC\n",
     " LIMIT $2"
 );
@@ -98,6 +101,7 @@ pub(crate) const EDGE_TIMELINE_READ_SQL: &str = concat!(
     edge_object_sql!(),
     ", e.timeline\n  FROM project.journey_edge_observations e\n",
     " WHERE e.app_id = $1\n",
+    "   AND ($3::timestamptz IS NULL OR e.observed_at >= $3::timestamptz)\n",
     " ORDER BY e.observed_at DESC, e.id DESC\n",
     " LIMIT $2"
 );
@@ -223,14 +227,18 @@ async fn bounded<T>(
     }
 }
 
-/// One app's edges and frontier, bounded.
-pub(crate) async fn read_ledger(pg: &PgDb, app_id: &str) -> Result<LedgerRead, LedgerUnavailable> {
+/// One app's edges (at or after `since`, when set) and frontier, bounded.
+pub(crate) async fn read_ledger(
+    pg: &PgDb,
+    app_id: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<LedgerRead, LedgerUnavailable> {
     let conn = readable_connection(pg).await?;
     let edge_bound = EDGE_READ_LIMIT + 1;
     let frontier_bound = FRONTIER_READ_LIMIT + 1;
     let edge_rows = bounded(
         "journey edge read",
-        conn.query(EDGE_READ_SQL, &[&app_id, &edge_bound]),
+        conn.query(EDGE_READ_SQL, &[&app_id, &edge_bound, &since]),
     )
     .await?;
     let frontier_rows = bounded(
@@ -284,12 +292,13 @@ pub(crate) fn parse_timeline(raw: Option<serde_json::Value>) -> (Option<ChangeTi
 pub(crate) async fn read_timed_edges(
     pg: &PgDb,
     app_id: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(Vec<TimedEdge>, bool, u64), LedgerUnavailable> {
     let conn = readable_connection(pg).await?;
     let bound = EDGE_READ_LIMIT + 1;
     let rows = bounded(
         "journey edge-timing read",
-        conn.query(EDGE_TIMELINE_READ_SQL, &[&app_id, &bound]),
+        conn.query(EDGE_TIMELINE_READ_SQL, &[&app_id, &bound, &since]),
     )
     .await?;
     let (rows, truncated) = split_bound(rows, EDGE_READ_LIMIT);
@@ -384,6 +393,10 @@ mod tests {
     fn reads_are_bounded_scoped_and_newest_first() {
         for sql in [EDGE_READ_SQL, EDGE_TIMELINE_READ_SQL] {
             assert!(sql.contains("WHERE e.app_id = $1"), "{sql}");
+            assert!(
+                sql.contains("AND ($3::timestamptz IS NULL OR e.observed_at >= $3::timestamptz)"),
+                "?since= must narrow the bounded read itself: {sql}"
+            );
             assert!(sql.contains("ORDER BY e.observed_at DESC, e.id DESC"));
             assert!(sql.ends_with("LIMIT $2"));
         }

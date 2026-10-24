@@ -277,39 +277,48 @@ fn source_of(query: &str, app_id: &str, result: Option<Value>) -> Map<String, Va
     m
 }
 
-fn detail_for(code: UnknownCode, query: &str, frontier: &JourneySearchFrontier) -> String {
-    match code {
-        UnknownCode::FrontierOpen => format!(
-            "{query}: the searched part of the graph has {} open frontier entr{} (affordances \
-             seen and never activated); the negative cannot be settled until they are explored — \
-             they are listed in provenance.source.result.frontier",
-            frontier.open_entries,
-            if frontier.open_entries == 1 {
-                "y"
-            } else {
-                "ies"
+/// The unknown detail, derived from the unmeasured DIMENSION that carries the
+/// code — a code alone (`input_missing`) has many causes; the dimension names
+/// the one that applied.
+fn detail_for(query: &str, code: UnknownCode, dim: Option<&UnmeasuredDimension>) -> String {
+    let Some(d) = dim else {
+        return format!("{query}: not settled ({code})");
+    };
+    let n = d.count;
+    let name = d.dimension.as_str();
+    match name {
+        "ledger" => match code {
+            UnknownCode::LedgerSchemaAbsent => {
+                format!("{query}: the journey tables do not exist in this database")
             }
+            _ => format!(
+                "{query}: the journey ledger is not being written, so a negative over it could \
+                 describe a stale graph as a finished one (see provenance.coverage.ledger)"
+            ),
+        },
+        "no_observations" => format!(
+            "{query}: the ledger holds no edge under this filter, so nothing can be answered"
         ),
-        UnknownCode::ToNodeUnobserved => format!(
-            "{query}: {} departure(s) in the searched part never had their destination observed",
-            frontier.unobserved_departures
-        ),
-        UnknownCode::NoObservations => format!(
-            "{query}: the ledger holds no observation this question can be answered from (an \
-             empty ledger under this filter, or a node it has never seen)"
-        ),
-        UnknownCode::LedgerSchemaAbsent => {
-            format!("{query}: the journey tables do not exist in this database")
+        "subject_unobserved" => {
+            format!("{query}: the node asked about was never observed in the ledger")
         }
-        UnknownCode::LedgerWriteFailing => format!(
-            "{query}: the journey ledger is not being written, so a negative over it could \
-             describe a stale graph as a finished one (see provenance.coverage.ledger)"
+        "frontier" => format!(
+            "{query}: {n} open frontier entr{} (affordances seen and never activated) in the \
+             searched part; they are listed in provenance.source.result",
+            if n == 1 { "y" } else { "ies" }
         ),
-        UnknownCode::InputMissing => format!(
-            "{query}: the read bound was reached ({EDGE_READ_LIMIT} edges); older edges were \
-             not read, so a negative cannot be settled — narrow with ?since="
+        "rows_unparseable" => {
+            format!("{query}: {n} ledger row(s) did not parse, so what they record is unknown")
+        }
+        _ if name.starts_with("edges_beyond_read_bound") => format!(
+            "{query}: the read bound was reached ({EDGE_READ_LIMIT} edges, newest first); \
+             older edges were not read — narrow the read with ?since="
         ),
-        other => format!("{query}: not settled ({other})"),
+        _ if name.starts_with("frontier_beyond_read_bound") => format!(
+            "{query}: the frontier read bound was reached ({FRONTIER_READ_LIMIT} rows); \
+             unread rows are open frontier"
+        ),
+        _ => format!("{query}: {n} {name} not measured ({code})"),
     }
 }
 
@@ -401,7 +410,8 @@ fn answer<T: Serialize>(
         .map(unknown_code)
         .or_else(|| prov.coverage.unmeasured.first().map(|d| d.code));
     if let Some(code) = code {
-        let detail = detail_for(code, ctx.query, frontier);
+        let dim = prov.coverage.unmeasured.iter().find(|d| d.code == code);
+        let detail = detail_for(ctx.query, code, dim);
         return finish(
             Observation::<Value>::unknown(code, detail, prov),
             Some(coverage),
@@ -749,7 +759,7 @@ async fn graph_route(
         Err(e) => return e.into_response(),
     };
     let ledger = live_ledger(&state, &app_id).await;
-    let body = match read_ledger(&state.app_state.pg_db, &app_id).await {
+    let body = match read_ledger(&state.app_state.pg_db, &app_id, filter.since).await {
         Err(why) => answer_unavailable(query, &app_id, &filter, &ledger, &why, now()),
         Ok(read) => {
             let graph = build_graph(&read.edges, &read.frontier, &ledger, &filter);
@@ -904,7 +914,7 @@ pub async fn get_journey_edge_timing(
         Err(e) => return e.into_response(),
     };
     let ledger = live_ledger(&state, &app_id).await;
-    let body = match read_timed_edges(&state.app_state.pg_db, &app_id).await {
+    let body = match read_timed_edges(&state.app_state.pg_db, &app_id, filter.since).await {
         Err(why) => answer_unavailable("edge-timing", &app_id, &filter, &ledger, &why, now()),
         Ok((rows, truncated, bad)) => {
             let ctx = AnswerCtx {
