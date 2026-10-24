@@ -14,6 +14,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_machine_configs::{
@@ -398,7 +399,11 @@ pub async fn get_available_transitions(
                     // Use the most recent config that has transitions
                     let pg = app_state.pg_db.clone();
                     let db_transitions = async move {
-                        let configs = pg.list_sm_configs().await.ok()?;
+                        // An outage is a 503, never "No state machine loaded".
+                        let configs = pg
+                            .list_sm_configs()
+                            .await
+                            .or_unless_unavailable(Vec::new())?;
                         for config in configs.iter() {
                             if let Ok(Some(full)) = pg.get_sm_config_full(&config.id).await {
                                 if !full.transitions.is_empty() {
@@ -415,13 +420,14 @@ pub async fn get_available_transitions(
                                             })
                                         })
                                         .collect();
-                                    return Some(transitions);
+                                    return Ok(Some(transitions));
                                 }
                             }
                         }
-                        None
+                        Ok::<_, String>(None)
                     }
-                    .await;
+                    .await
+                    .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
                     if let Some(transitions) = db_transitions {
                         return Ok(Json(ApiResponse::success(

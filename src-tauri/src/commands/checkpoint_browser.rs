@@ -7,6 +7,7 @@
 //! real-time operations like replay.
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::CreateTaskRunInput;
 use crate::error::AppError;
 use crate::orchestrator::checkpoint::{
@@ -525,8 +526,8 @@ async fn replay_from_checkpoint_impl(
         .pg_db()
         .get_task_run(&checkpoint.task_id)
         .await
-        .ok()
-        .flatten()
+        .or_unless_unavailable(None)
+        .map_err(AppError::Raw)?
         .and_then(|tr| tr.prompt);
 
     let replay_prompt = format!(

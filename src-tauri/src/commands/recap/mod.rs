@@ -23,6 +23,7 @@ use tauri::State;
 use tracing::{info, warn};
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 
 // Migrated to StorageCompartment (Workstream C).
 
@@ -53,24 +54,30 @@ pub async fn get_task_run_recap(
     };
 
     // Get automation records
-    let automations = state
+    let automations = match state
         .pg_db()
         .get_task_run_automations(&task_run_id)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!("Failed to get automations for {}: {}", task_run_id, e);
             Vec::new()
-        });
+        }) {
+        Ok(v) => v,
+        Err(e) => return Ok(RecapResponse::err(e)),
+    };
 
     // Get events (limited for performance)
-    let events = state
+    let events = match state
         .pg_db()
         .get_task_run_events(&task_run_id, None, Some(500))
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!("Failed to get events for {}: {}", task_run_id, e);
             Vec::new()
-        });
+        }) {
+        Ok(v) => v,
+        Err(e) => return Ok(RecapResponse::err(e)),
+    };
 
     info!(
         "get_task_run_recap: task_run_id='{}', events_count={}, automations_count={}",
@@ -80,43 +87,52 @@ pub async fn get_task_run_recap(
     );
 
     // Get orchestrator verification results for this task run (criterion-based)
-    let verification_results = state
+    let verification_results = match state
         .pg_db()
         .get_latest_verification_results(&task_run_id)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!(
                 "Failed to get verification results for {}: {}",
                 task_run_id, e
             );
             None
-        });
+        }) {
+        Ok(v) => v,
+        Err(e) => return Ok(RecapResponse::err(e)),
+    };
 
     // Get workflow verification phase results (step-based, from execute_verification_steps)
-    let workflow_verification_results = state
+    let workflow_verification_results = match state
         .pg_db()
         .get_all_verification_phase_results(&task_run_id)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!(
                 "Failed to get workflow verification phase results for {}: {}",
                 task_run_id, e
             );
             Vec::new()
-        });
+        }) {
+        Ok(v) => v,
+        Err(e) => return Ok(RecapResponse::err(e)),
+    };
 
     // Get workflow step checkpoints (from unified workflow executor)
-    let step_checkpoints = state
+    let step_checkpoints = match state
         .pg_db()
         .get_all_workflow_step_checkpoints(&task_run_id)
         .await
-        .unwrap_or_else(|e| {
+        .or_else_unless_unavailable(|e| {
             warn!(
                 "Failed to get workflow step checkpoints for {}: {}",
                 task_run_id, e
             );
             Vec::new()
-        });
+        }) {
+        Ok(v) => v,
+        Err(e) => return Ok(RecapResponse::err(e)),
+    };
 
     info!(
         "get_task_run_recap: step_checkpoints_count={}",

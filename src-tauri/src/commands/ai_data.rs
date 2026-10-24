@@ -4,6 +4,7 @@
 //! allowing the frontend to display it in the same format.
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 use crate::database::TaskRun;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -1520,7 +1521,7 @@ pub async fn get_task_run_migrated_logs_summary(
         .pg_db()
         .get_task_run_events(&task_run_id, None, None)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     // Count events by type
     let mut events_by_type = std::collections::HashMap::new();
@@ -1533,14 +1534,14 @@ pub async fn get_task_run_migrated_logs_summary(
         .pg_db()
         .get_task_run_screenshots(&task_run_id, None)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     // Get Playwright results
     let playwright_results = state
         .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     Ok(AiDataResponse::ok(TaskRunMigratedLogsSummary {
         task_run_id,

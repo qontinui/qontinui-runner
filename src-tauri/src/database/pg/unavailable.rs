@@ -8,6 +8,11 @@
 //! (`qontinui_runner_lib::pg_circuit::is_db_unavailable`) is handed back
 //! unchanged. The caller then propagates it (`?`, a 503) or skips its tick.
 //!
+//! Known gap: the very first failing query of an outage (the one whose
+//! connect failure trips the breaker), and a connection lost mid-query, are
+//! formatted by `pg_err` without the token, so that one call still takes the
+//! old fallback; every call after the trip carries the token.
+//!
 //! The bare fallbacks over a PG read are ratcheted by
 //! [`super::empty_census`]; these spellings are the sanctioned replacement.
 

@@ -7,6 +7,7 @@ use regex::Regex;
 use tracing::{info, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::database::pg::UnlessUnavailable;
 use crate::orchestrator::{DeterministicVerifier, WorkerSignal, WorkerSignalExt};
 
 // ============================================================================
@@ -363,12 +364,29 @@ pub async fn run_workflow_verification_for_task(
     use crate::step_executor::StepExecutor;
 
     // Get the task run to extract verification steps, config_id, and session count
-    let task_run = app_state
+    // An outage is not "no verification steps": falling back to the basic
+    // build checks could pass a task whose real steps never ran.
+    let task_run = match app_state
         .pg_db
         .get_task_run(db_task_id)
         .await
-        .ok()
-        .flatten();
+        .or_unless_unavailable(None)
+    {
+        Ok(task_run) => task_run,
+        Err(e) => {
+            warn!(
+                "WORKFLOW-VERIFICATION: task {}: steps unreadable: {}",
+                db_task_id, e
+            );
+            return DeterministicVerificationResult {
+                all_passed: false,
+                checks_run: vec!["workflow verification steps".to_string()],
+                critical_failures: vec![e],
+                non_critical_failures: Vec::new(),
+                raw_output: String::new(),
+            };
+        }
+    };
 
     let config_id = task_run.as_ref().and_then(|t| t.config_id.clone());
     let session_num = task_run.as_ref().map(|t| t.sessions_count as i32);

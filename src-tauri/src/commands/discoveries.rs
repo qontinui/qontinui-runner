@@ -3,6 +3,7 @@
 //! These commands expose discovery functionality to the frontend and MCP API.
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 use crate::discoveries::{
     self, sync_discoveries_batch, DiscoveryPayload, DiscoveryToSync, PendingDiscovery, SyncStatus,
 };
@@ -184,7 +185,11 @@ pub async fn sync_discoveries(
             errors.push(format!("{}: {}", sr.id, err_msg));
         }
     }
-    let remaining_status = state.pg_db().get_sync_status().await.unwrap_or_default();
+    let remaining_status = state
+        .pg_db()
+        .get_sync_status()
+        .await
+        .default_unless_unavailable()?;
     let remaining = remaining_status["pending_count"].as_u64().unwrap_or(0) as u32;
 
     let response = SyncResultResponse {

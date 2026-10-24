@@ -6,6 +6,7 @@
 //! The step output types match the TypeScript definitions in `src/types/step-output.ts`.
 
 use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::UnlessUnavailable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -410,7 +411,7 @@ pub async fn collect_step_outputs(
         .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     for result in playwright_results {
         // Filter by step types if specified

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::CreateTaskRunInput;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::str_utils::truncate_str;
@@ -744,8 +745,8 @@ pub async fn import_unified_workflow(
         .pg_db
         .get_unified_workflow(&workflow.id)
         .await
-        .ok()
-        .flatten();
+        .or_unless_unavailable(None)
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
     match strategy {
         "keep" => {

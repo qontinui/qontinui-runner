@@ -4908,10 +4908,13 @@ async fn handle_chat_generate_workflow(api_state: &Arc<ApiState>, data: &Value) 
         .default_unless_unavailable()
     {
         Ok(output_log) => output_log,
-        // An outage is not "no conversation history".
+        // An outage is not "no conversation history". Same frame type the
+        // client waits for, so its spinner resolves.
         Err(e) => {
             return Some(serde_json::json!({
-                "type": "error",
+                "type": "chat_workflow_generated",
+                "task_run_id": task_run_id,
+                "success": false,
                 "code": "DATABASE_UNAVAILABLE",
                 "error": e
             }))
@@ -5031,10 +5034,12 @@ async fn handle_chat_get_output(api_state: &Arc<ApiState>, data: &Value) -> Opti
         .default_unless_unavailable()
     {
         Ok(output) => output,
-        // An outage is not an empty output log.
+        // An outage is not an empty output log. The task_run_id routes the
+        // frame to the chat socket (devices_ws forwards none without it).
         Err(e) => {
             return Some(serde_json::json!({
                 "type": "error",
+                "task_run_id": task_run_id,
                 "code": "DATABASE_UNAVAILABLE",
                 "error": e
             }))

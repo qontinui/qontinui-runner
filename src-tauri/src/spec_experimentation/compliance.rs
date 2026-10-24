@@ -570,7 +570,11 @@ pub async fn auto_extract_spec_compliance(pg: &PgDb, task_run_id: &str) {
         Ok(is_spec) => is_spec,
         Err(e) => {
             // An outage is not "not spec-generated": skip, do not decide.
-            tracing::debug!("spec compliance auto-extract skipped for {}: {}", trid, e);
+            tracing::warn!(
+                "spec compliance auto-extract skipped for task run {}: {}",
+                trid,
+                e
+            );
             return;
         }
     };

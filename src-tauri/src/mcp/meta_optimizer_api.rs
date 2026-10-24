@@ -1250,8 +1250,8 @@ pub async fn get_canaries_handler(
             .pg_db
             .get_recommendation_metadata(&c.recommendation_id)
             .await
-            .ok()
-            .flatten();
+            .or_unless_unavailable(None)
+            .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
         let (title, agent, rec_type) = rec_info.unwrap_or((None, None, None));
 

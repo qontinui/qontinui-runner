@@ -825,8 +825,21 @@ impl LoopController {
                 ) {
                     Ok(overrides) => {
                         for (key, value) in overrides {
-                            let original =
-                                self.app_state.pg_db.get_setting(&key).await.ok().flatten();
+                            // An outage is not "no original value": never apply an
+                            // override that could not be restored.
+                            let original = match self
+                                .app_state
+                                .pg_db
+                                .get_setting(&key)
+                                .await
+                                .or_unless_unavailable(None)
+                            {
+                                Ok(original) => original,
+                                Err(e) => {
+                                    warn!("CANARY: skipping config override {}: {}", key, e);
+                                    continue;
+                                }
+                            };
                             canary_config_originals.push((key.clone(), original));
                             let set_result = self.app_state.pg_db.set_setting(&key, &value).await;
                             if let Err(e) = set_result {

@@ -215,7 +215,7 @@ export function TriggersTab({ className = "" }: TriggersTabProps) {
                 }`}
               />
               <span>
-                {status.total_triggers === null || status.enabled_triggers === null
+                {status.total_triggers == null || status.enabled_triggers == null
                   ? "trigger count unknown"
                   : `${status.enabled_triggers}/${status.total_triggers} enabled`}
               </span>

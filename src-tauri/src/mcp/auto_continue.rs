@@ -27,6 +27,22 @@ pub struct SetAutoContinueRequest {
 pub struct WorkflowAutoContinueResponse {
     enabled: bool,
     workflow_name: Option<String>,
+    /// Set when the running-workflow read failed: `workflow_name` is then
+    /// UNKNOWN, not "no running workflow".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_name_error: Option<String>,
+}
+
+/// The running workflow's name, plus the read error when the database could
+/// not be read (so a `null` name never stands in for "unknown").
+async fn running_workflow_name() -> (Option<String>, Option<String>) {
+    let Some(pg) = crate::database::pg::PgDb::try_global() else {
+        return (None, None);
+    };
+    match pg.get_running_task_runs(None).await {
+        Ok(tasks) => (tasks.first().map(|t| t.task_name.clone()), None),
+        Err(e) => (None, Some(e)),
+    }
 }
 
 /// Get the auto-continue AI workflow setting
@@ -69,18 +85,12 @@ pub async fn get_workflow_auto_continue() -> Json<ApiResponse<WorkflowAutoContin
     let enabled = settings::get_auto_continue_ai_workflow();
 
     // Check if there are any running tasks (PG)
-    let workflow_name = if let Some(pg) = crate::database::pg::PgDb::try_global() {
-        pg.get_running_task_runs(None)
-            .await
-            .ok()
-            .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
-    } else {
-        None
-    };
+    let (workflow_name, workflow_name_error) = running_workflow_name().await;
 
     Json(ApiResponse::success(WorkflowAutoContinueResponse {
         enabled,
         workflow_name,
+        workflow_name_error,
     }))
 }
 
@@ -95,18 +105,12 @@ pub async fn set_workflow_auto_continue(
             info!("Auto-continue setting updated to: {}", body.enabled);
 
             // Get the active workflow name if any (PG)
-            let workflow_name = if let Some(pg) = crate::database::pg::PgDb::try_global() {
-                pg.get_running_task_runs(None)
-                    .await
-                    .ok()
-                    .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
-            } else {
-                None
-            };
+            let (workflow_name, workflow_name_error) = running_workflow_name().await;
 
             Json(ApiResponse::success(WorkflowAutoContinueResponse {
                 enabled: body.enabled,
                 workflow_name,
+                workflow_name_error,
             }))
         }
         Err(e) => Json(ApiResponse {

@@ -20,18 +20,22 @@
 //!
 //! - the call start matches [`CALL_START`]; `<args>` is paren-balanced (string
 //!   literals skipped), and what follows the closing paren matches
-//!   [`FALLBACK`] (`unwrap_or_default()`, `unwrap_or_else(|…|`, `unwrap_or(`);
+//!   [`FALLBACK`] (`unwrap_or_default()`, `unwrap_or_else(|…|`,
+//!   `unwrap_or_else(path)`, `unwrap_or(`, `ok()`);
 //! - `<method>` is a `pub async fn` declared under `src/database/pg/` (the
 //!   `PgDb` method layer);
 //! - `<receiver>` is `db`, `PgDb::global()`, `PgDb::try_global()`, any
-//!   identifier containing `pg` (`pg_db`, `pg`, `pg_clone`, `cra_pg_db`, …;
+//!   identifier or zero-argument accessor call whose name contains `pg`
+//!   (`pg_db`, `pg`, `pg_clone`, `cra_pg_db`, `state.pg_db()`, …;
 //!   `state.app_state.pg_db.x()` matches at `pg_db`), or `self` inside
-//!   `src/database/pg/` itself.
+//!   `src/database/pg/` itself. Candidate starts may overlap (the scan resumes
+//!   at each match's method name), so `state.pg_db().x()` is seen at `pg_db()`.
 //!
 //! The walk is `src-tauri/src/**/*.rs` (`clorinde` excluded, this file
-//! excluded because it spells the needles). Census at Phase 6: 70 sites before
-//! (pg_db 33, pg 21, other `*pg*` aliases 10, self 5, db 1; PgDb::global() /
-//! PgDb::try_global() 0), 18 after — exactly [`ALLOWLIST`].
+//! excluded because it spells the needles). Census at Phase 6, base
+//! `6043840b2`: 108 sites before (pg_db 47, pg 32, other `*pg*` receivers 23
+//! of which 11 the `pg_db()` accessor, self 5, db 1; PgDb::global() /
+//! PgDb::try_global() 0), 26 after — exactly [`ALLOWLIST`].
 //!
 //! Allowlist entries are keyed by file + the site's whitespace-stripped text
 //! (from the receiver through the fallback head), never by line number, and
@@ -39,6 +43,16 @@
 //! when a site is not covered (a new instance) and when an entry covers more
 //! sites than exist (a stale entry): lower or delete the entry when a site is
 //! fixed; never raise it.
+//!
+//! # Known limits
+//!
+//! The scan is textual, not a parse. Char literals (`')'`), raw strings and
+//! comments inside a call's arguments can unbalance the paren match and hide
+//! a site; a fallback reached through an intermediate adapter
+//! (`.await.map(f).unwrap_or_default()`), an `if let Ok(..)` / `match` arm, or
+//! a receiver whose name does not contain `pg` (a `conn`, a renamed binding)
+//! is not matched. Two sites with identical text in one file share one
+//! allowlist entry and are told apart only by its count.
 //!
 //! Declared `#[cfg(test)]` in `database/pg/mod.rs`.
 
@@ -48,11 +62,11 @@ use std::path::PathBuf;
 use regex::Regex;
 
 /// The receiver + method + open paren of a candidate PG call.
-const CALL_START: &str = r"\b(PgDb::global\(\)|PgDb::try_global\(\)|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([a-z_][a-z0-9_]*)\s*(?:::<[^>]*>\s*)?\(";
+/// The receiver is an identifier, optionally a zero-argument accessor call.
+const CALL_START: &str = r"\b(PgDb::global\(\)|PgDb::try_global\(\)|[A-Za-z_][A-Za-z0-9_]*(?:\(\))?)\s*\.\s*([a-z_][a-z0-9_]*)\s*(?:::<[^>]*>\s*)?\(";
 
 /// What must follow the call's closing paren for it to be a census site.
-const FALLBACK: &str =
-    r"^\s*\.await\s*\.\s*(unwrap_or_default\(\)|unwrap_or_else\(\s*\|[^|]*\||unwrap_or\()";
+const FALLBACK: &str = r"^\s*\.await\s*\.\s*(unwrap_or_default\(\)|unwrap_or_else\(\s*\|[^|]*\||unwrap_or\(|ok\(\)|unwrap_or_else\(\s*[A-Za-z_][A-Za-z0-9_:]*\s*\))";
 
 /// Declares the `PgDb` method names (the method layer lives in `database/pg/`).
 const PG_METHOD: &str = r"pub(?:\(crate\))?\s+async\s+fn\s+([a-z_0-9]+)";
@@ -171,6 +185,51 @@ const ALLOWLIST: &[Allowed] = &[
         count: 1,
         reason: "hardener prompt rules with a documented built-in fallback",
     },
+    Allowed {
+        file: "graphql/subscription.rs",
+        site: r"pg_db.get_task_run(&trid).await.ok()",
+        count: 1,
+        reason: "subscription poll: an unreadable status is not terminal, so polling continues \
+                 (TTL-bounded); nothing acts on the None",
+    },
+    Allowed {
+        file: "mcp/unified_workflows.rs",
+        site: r"pg_db.get_unified_workflow(&id).await.ok()",
+        count: 2,
+        reason: "update/delete feedback-tracking lookup that only logs; the update/delete itself \
+                 reports its own database error",
+    },
+    Allowed {
+        file: "unified_workflow_executor/multi_agent_pipeline_loop.rs",
+        site: r"pg_db.get_active_prompt(agent_type).await.ok()",
+        count: 1,
+        reason: "prompt-registry variant with the documented default-prompt fallback",
+    },
+    Allowed {
+        file: "unified_workflow_executor/task_lifecycle.rs",
+        site: r"pg2.get_workflow_name_for_task_run(&exec_id2).await.ok()",
+        count: 1,
+        reason: "best-effort convergence snapshot: skipped on any failure, nothing acts on the \
+                 absence (the store would fail on the same outage)",
+    },
+    Allowed {
+        file: "unified_workflow_executor/phases/mod.rs",
+        site: r"pg_db.get_universal_fixes_by_text(&query_text,5).await.ok()",
+        count: 1,
+        reason: "universal-fix prompt enrichment; a missing section degrades the prompt only",
+    },
+    Allowed {
+        file: "unified_workflow_executor/phases/mod.rs",
+        site: r"pg_db.get_universal_fixes(5).await.ok()",
+        count: 1,
+        reason: "universal-fix prompt enrichment; a missing section degrades the prompt only",
+    },
+    Allowed {
+        file: "unified_workflow_executor/phases/mod.rs",
+        site: r"pg.get_impact_analysis(&wf_c,&fp_c).await.ok()",
+        count: 1,
+        reason: "impact-radius prompt enrichment; a missing line degrades the prompt only",
+    },
 ];
 
 /// `src-tauri/src` holds ~1600 `.rs` files; a walker that lost the tree must
@@ -281,8 +340,13 @@ fn census_sites(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<Site> 
     let fallback = Regex::new(FALLBACK).expect("FALLBACK");
     let bytes = text.as_bytes();
     let mut sites = Vec::new();
-    for caps in start.captures_iter(text) {
+    // Overlapping candidates: resume at each match's METHOD name, so in
+    // `state.pg_db().x()` the non-PG `state.pg_db(` candidate does not hide
+    // the `pg_db().x(` one.
+    let mut pos = 0;
+    while let Some(caps) = start.captures_at(text, pos) {
         let whole = caps.get(0).expect("match");
+        pos = caps.get(2).expect("method group").start();
         if !methods.contains(&caps[2]) || !receiver_in_scope(&caps[1], rel) {
             continue;
         }
@@ -403,10 +467,23 @@ fn pg_error_to_empty_census_matches_every_fallback_and_skips_the_outage_aware_fo
         "pg_clone.m().await.unwrap_or_else(|e| { warn!(\"{e}\"); vec![] })",
         "pg.m().await.unwrap_or_else(|_| x)",
         "db.m().await.unwrap_or_default()",
+        "pg.m().await.ok()",
+        "pg.m().await.unwrap_or_else(Vec::new)",
+        "state.pg_db().m().await.unwrap_or_default()",
     ];
     for src in hits {
         assert_eq!(census_sites("a.rs", src, &methods).len(), 1, "{src}");
     }
+    // An accessor receiver is keyed at the accessor, not at its owner.
+    assert_eq!(
+        census_sites(
+            "a.rs",
+            "state\n    .pg_db()\n    .m(&id)\n    .await\n    .unwrap_or_default()",
+            &methods
+        )[0]
+        .key,
+        "pg_db().m(&id).await.unwrap_or_default()"
+    );
     let misses = [
         "pg.m().await.default_unless_unavailable()?",
         "pg.m().await.or_unless_unavailable(0)?",

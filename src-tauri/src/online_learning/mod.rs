@@ -30,6 +30,7 @@ pub mod signal_extractor;
 pub mod strategy_bank;
 pub mod strategy_evolution;
 
+use crate::database::pg::UnlessUnavailable;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 
@@ -141,7 +142,21 @@ pub async fn run_post_completion(
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // Skip meta-optimizer/fixer/reflection runs
-    let task_run_record = pg.get_task_run(task_run_id).await.ok().flatten();
+    let task_run_record = match pg
+        .get_task_run(task_run_id)
+        .await
+        .or_unless_unavailable(None)
+    {
+        Ok(record) => record,
+        Err(e) => {
+            // An outage is not "not a meta-optimizer run": skip, do not learn.
+            warn!(
+                "Online learning skipped for task run {}: {}",
+                task_run_id, e
+            );
+            return;
+        }
+    };
     if let Some(ref tr) = task_run_record {
         if tr.is_meta_optimizer || tr.is_fixer || tr.is_reflection {
             return;

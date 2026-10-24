@@ -264,7 +264,7 @@ pub async fn resume_interrupted_workflows(
                 Ok(is_restate) => is_restate,
                 Err(e) => {
                     // An outage is not "not Restate-managed": leave it alone.
-                    tracing::debug!("startup resume skipped {}: {}", task_run.id, e);
+                    tracing::warn!("startup resume skipped task run {}: {}", task_run.id, e);
                     continue;
                 }
             };

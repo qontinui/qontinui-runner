@@ -8,6 +8,7 @@
 //! 2. `is_meta_optimizer` column check on source task run
 //! 3. `is_fixer` / `is_reflection` / `is_follow_up` column checks on source
 
+use crate::database::pg::UnlessUnavailable;
 use tauri::Emitter;
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
@@ -242,9 +243,13 @@ pub fn check_and_launch_optimizers(
         let trid = source_task_run_id.clone();
         tokio::spawn(async move {
             // Resolve workflow name from the source task run
-            let workflow_name = match pg.get_task_run(&trid).await.ok().flatten() {
-                Some(tr) => tr.workflow_name,
-                None => None,
+            let workflow_name = match pg.get_task_run(&trid).await.or_unless_unavailable(None) {
+                Ok(Some(tr)) => tr.workflow_name,
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("Pattern distiller: skipped for source run {}: {}", trid, e);
+                    return;
+                }
             };
             let Some(wf) = workflow_name else {
                 debug!(

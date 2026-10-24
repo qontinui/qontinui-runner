@@ -13,6 +13,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::types::*;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::memory::consolidation::{ConsolidationConfig, ConsolidationStats};
@@ -220,7 +221,11 @@ async fn health_handler(
         )
     })?;
 
-    let last_consolidation = pg.get_last_consolidation_time().await.ok().flatten();
+    let last_consolidation = pg
+        .get_last_consolidation_time()
+        .await
+        .or_unless_unavailable(None)
+        .map_err(crate::mcp::pg_guard::db_unavailable_error)?;
 
     Ok(Json(ApiResponse {
         success: true,

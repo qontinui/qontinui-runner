@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::database::pg::UnlessUnavailable;
 use crate::database::TaskRun;
 use crate::mcp::types::ApiState;
 use crate::unified_workflow_executor::extract_workflow_id_from_task_id;
@@ -110,8 +111,8 @@ pub async fn get_workflow_state(
             .pg_db
             .get_unified_workflow_by_name(workflow_name)
             .await
-            .ok()
-            .flatten()
+            .or_unless_unavailable(None)
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
     } else {
         None
     };
@@ -132,8 +133,8 @@ pub async fn get_workflow_state(
             .pg_db
             .get_latest_verification_plan(&id)
             .await
-            .ok()
-            .flatten()
+            .or_unless_unavailable(None)
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?
             .is_some();
 
     if let Some(ws) = explicit_state {

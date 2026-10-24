@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
 use crate::claude_session::state::SessionState;
+use crate::database::pg::UnlessUnavailable;
 // Migrated to StorageCompartment (Workstream C) — 5 handlers.
 // `generate_workflow_from_session` is multi-State on Storage + Health: typed
 // access for `pg_db` / `doctor_handle`, plus `health.app_state()` escape hatch
@@ -799,7 +800,7 @@ pub async fn get_ai_output(
         .pg_db()
         .get_task_output(&task_run_id)
         .await
-        .unwrap_or_default();
+        .default_unless_unavailable()?;
 
     // If there's a live session, append any unpersisted AI output.
     // The accumulated_output contains all AI text from the current session.

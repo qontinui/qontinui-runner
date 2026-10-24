@@ -512,19 +512,31 @@ async fn webhook_ingestion(
 }
 
 /// Get overall trigger system status.
-async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<ApiResponse<TriggerSystemStatus>> {
+async fn get_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<TriggerSystemStatus>> {
     match crate::trigger_system::get_trigger_service().await {
         Some(service) => {
             let status = service.get_status().await;
             Json(ApiResponse::success(status))
         }
-        None => Json(ApiResponse::success(TriggerSystemStatus {
-            running: false,
-            total_triggers: None,
-            enabled_triggers: None,
-            active_watchers: 0,
-            active_executions: 0,
-            dropped_events: 0,
-        })),
+        None => {
+            // No service, but the counts are still the database's: read them,
+            // and serve `null` only when that read fails.
+            let (total_triggers, enabled_triggers) =
+                match state.app_state.pg_db.get_trigger_stats().await {
+                    Ok((total, enabled)) => (Some(total), Some(enabled)),
+                    Err(e) => {
+                        tracing::debug!("trigger status: counts unknown: {}", e);
+                        (None, None)
+                    }
+                };
+            Json(ApiResponse::success(TriggerSystemStatus {
+                running: false,
+                total_triggers,
+                enabled_triggers,
+                active_watchers: 0,
+                active_executions: 0,
+                dropped_events: 0,
+            }))
+        }
     }
 }
