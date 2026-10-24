@@ -1,112 +1,93 @@
 /**
  * Unit tests for `computeStatusCounts` — the pure bucketing behind the
- * Terminal-page StatusStrip pills.
+ * Terminal-page StatusStrip pills, over the two-axis status (plan
+ * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+ * Phase 1).
  *
  * Regression target: the strip used to count EVERY on-disk transcript
  * (`allSessions.length`), inflating the operator's real "3 sessions / 2 idle"
- * to "18 sessions / 14 idle" (and a fresh runner to "438 / 436"). The fix
- * drops `dormant` historical transcripts and orphaned (tab-less) `frozen`
- * transcripts, counting only the live / actively-managed set.
+ * to "18 sessions / 14 idle" (and a fresh runner to "438 / 436"). A transcript
+ * whose process is gone is now dropped by its LOCATION (`Not running`), and a
+ * row that could not be placed (`Unknown`) is counted, never dropped.
  */
 
 import { describe, it, expect } from "vitest";
-import { computeStatusCounts, type StatusCountsInput } from "./useSessionManager";
+import { computeStatusCounts } from "./sessionCounts";
+import type { SessionActivity, SessionLocation } from "./sessionStatusModel";
 
-// Small builder so each case reads as a list of (status, orphaned) tuples.
-function s(liveStatus: StatusCountsInput["liveStatus"], isOrphaned = false): StatusCountsInput {
-  return { liveStatus, isOrphaned };
+function s(location: SessionLocation, activity: SessionActivity) {
+  return { status: { location, activity } };
 }
 
 describe("computeStatusCounts", () => {
-  it("excludes a dormant session from the total and from idle", () => {
-    const counts = computeStatusCounts([s("dormant")]);
-    expect(counts.claudeSessionCount).toBe(0);
-    expect(counts.idleCount).toBe(0);
-    expect(counts.workingCount).toBe(0);
-  });
-
-  it("excludes an orphaned (tab-less) frozen transcript", () => {
-    const counts = computeStatusCounts([s("frozen", /* isOrphaned */ true)]);
-    expect(counts.claudeSessionCount).toBe(0);
-    expect(counts.idleCount).toBe(0);
-  });
-
-  it("counts a tab-backed (non-orphan) frozen session as idle", () => {
-    const counts = computeStatusCounts([s("frozen", /* isOrphaned */ false)]);
-    expect(counts.idleCount).toBe(1);
-    expect(counts.claudeSessionCount).toBe(1);
-    expect(counts.workingCount).toBe(0);
-  });
-
-  it("counts active-in-zone and active-external as working", () => {
-    const counts = computeStatusCounts([s("active-in-zone"), s("active-external")]);
-    expect(counts.workingCount).toBe(2);
-    expect(counts.idleCount).toBe(0);
-    expect(counts.claudeSessionCount).toBe(2);
-  });
-
-  it("carries the active-external share of working separately", () => {
-    // The strip headlines the page-scoped working count, so the external share
-    // must be recoverable from the counts rather than folded in (UI-4).
-    const counts = computeStatusCounts([
-      s("active-in-zone"),
-      s("active-external"),
-      s("active-external"),
-    ]);
-    expect(counts.workingCount).toBe(3);
-    expect(counts.externalWorkingCount).toBe(2);
-  });
-
-  it("counts needs-input toward need-input and the total", () => {
-    const counts = computeStatusCounts([s("needs-input")]);
-    // needs-input survives the dormant/orphan filter → contributes to the total
-    expect(counts.claudeSessionCount).toBe(1);
-    expect(counts.workingCount).toBe(0);
-    expect(counts.idleCount).toBe(0);
-  });
-
-  it("counts error and completed in their own buckets and the total", () => {
-    const counts = computeStatusCounts([s("error"), s("completed")]);
-    expect(counts.errorCount).toBe(1);
-    expect(counts.completedCount).toBe(1);
-    expect(counts.claudeSessionCount).toBe(2);
-  });
-
-  it("operator's exact scenario: 1 working + 2 idle + N historical ⇒ total=3", () => {
-    const sessions: StatusCountsInput[] = [
-      // 1 genuinely working session
-      s("active-in-zone"),
-      // 2 idle = tab-backed (non-orphan) frozen sessions still open here
-      s("frozen", /* isOrphaned */ false),
-      s("frozen", /* isOrphaned */ false),
-      // N historical noise that must NOT inflate the strip:
-      // dormant never-reopened transcripts ...
-      s("dormant"),
-      s("dormant"),
-      s("dormant"),
-      // ... and orphaned (tab-less) frozen historical transcripts.
-      s("frozen", /* isOrphaned */ true),
-      s("frozen", /* isOrphaned */ true),
-    ];
-    const counts = computeStatusCounts(sessions);
-    expect(counts.claudeSessionCount).toBe(3);
-    expect(counts.workingCount).toBe(1);
-    expect(counts.idleCount).toBe(2);
-    // 0 needs-input in this scenario; total must reconcile with the pills.
-    expect(counts.workingCount + counts.idleCount + counts.completedCount + counts.errorCount).toBe(
-      counts.claudeSessionCount,
-    );
-  });
-
-  it("returns all-zero for an empty session list", () => {
-    const counts = computeStatusCounts([]);
+  it("excludes a not-running session from the total and every bucket", () => {
+    const counts = computeStatusCounts([s("not-running", "exited"), s("not-running", "finished")]);
     expect(counts).toEqual({
       claudeSessionCount: 0,
       workingCount: 0,
-      externalWorkingCount: 0,
+      outsideWorkingCount: 0,
       idleCount: 0,
       completedCount: 0,
       errorCount: 0,
+      unknownCount: 0,
     });
+  });
+
+  it("counts a session whose location is Unknown — could-not-tell is not gone", () => {
+    const counts = computeStatusCounts([s("unknown", "unknown")]);
+    expect(counts.claudeSessionCount).toBe(1);
+    expect(counts.unknownCount).toBe(1);
+  });
+
+  it("counts working and waiting-on-lock as working, and carries the outside share", () => {
+    const counts = computeStatusCounts([
+      s("on-screen", "working"),
+      s("hidden-here", "waiting-on-lock"),
+      s("outside-runner", "working"),
+    ]);
+    expect(counts.workingCount).toBe(3);
+    expect(counts.outsideWorkingCount).toBe(1);
+  });
+
+  it("counts idle-at-prompt and no-output-mid-tool as idle", () => {
+    const counts = computeStatusCounts([
+      s("hidden-here", "idle-at-prompt"),
+      s("on-screen", "no-output-mid-tool"),
+    ]);
+    expect(counts.idleCount).toBe(2);
+  });
+
+  it("counts needs-you in the total only (its own pill reports it)", () => {
+    const counts = computeStatusCounts([s("hidden-here", "needs-you")]);
+    expect(counts.claudeSessionCount).toBe(1);
+    expect(counts.workingCount + counts.idleCount + counts.unknownCount).toBe(0);
+  });
+
+  it("counts finished / exited as completed and exited-error as error", () => {
+    const counts = computeStatusCounts([
+      s("on-screen", "finished"),
+      s("hidden-here", "exited"),
+      s("hidden-here", "exited-error"),
+    ]);
+    expect(counts.completedCount).toBe(2);
+    expect(counts.errorCount).toBe(1);
+    expect(counts.claudeSessionCount).toBe(3);
+  });
+
+  it("operator's scenario: 1 working + 2 idle + 200 historical ⇒ total 3", () => {
+    const historical = Array.from({ length: 200 }, () => s("not-running", "exited"));
+    const counts = computeStatusCounts([
+      s("on-screen", "working"),
+      s("hidden-here", "idle-at-prompt"),
+      s("hidden-here", "no-output-mid-tool"),
+      ...historical,
+    ]);
+    expect(counts.claudeSessionCount).toBe(3);
+    expect(counts.workingCount).toBe(1);
+    expect(counts.idleCount).toBe(2);
+  });
+
+  it("returns all-zero for an empty session list", () => {
+    expect(computeStatusCounts([]).claudeSessionCount).toBe(0);
   });
 });

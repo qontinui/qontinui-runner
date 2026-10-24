@@ -515,7 +515,7 @@ fn bfs_descendants_from(
     out
 }
 
-fn collect_descendants_from_snapshot(
+pub(crate) fn collect_descendants_from_snapshot(
     root: u32,
     snapshot: &ProcessSnapshot,
 ) -> Vec<PidWithSpawnedAt> {
