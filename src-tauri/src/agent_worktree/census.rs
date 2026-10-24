@@ -880,6 +880,8 @@ pub(super) fn spawn_census_rebuild() -> bool {
     if census_build_active() {
         return false;
     }
+    // An explicit refresh asks for fresh numbers: no memoised size answers it.
+    super::census_size_memo::clear();
     tokio::spawn(async {
         if let Err(e) = build_and_publish().await {
             warn!("worktree_census: on-demand refresh failed: {e}");
@@ -1396,9 +1398,7 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     // trees several times as often as before (plan
     // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
     let bytes = super::census_size_memo::bytes_or_measure(dir, || {
-        super::orphan_target_reaper::measure_dir_size(dir)
-            .map(|m| m.bytes)
-            .unwrap_or(0)
+        super::orphan_target_reaper::measure_dir_size(dir).map(|m| m.bytes)
     });
     (true, false, bytes)
 }
@@ -3741,6 +3741,53 @@ mod tests {",
         assert_eq!(measure_dir(&nm), (true, false, 42));
         std::fs::remove_dir_all(&nm).unwrap();
         assert_eq!(measure_dir(&nm), (false, false, 0));
+    }
+
+    #[test]
+    fn a_rebuilt_dir_is_sized_again_not_served_from_the_memo() {
+        // Sized, removed, recreated with different contents inside the TTL
+        // (a `cargo clean` + rebuild): the dir's own mtime moved, so the memo
+        // must not answer with the old total.
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("target");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("old.bin"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 42));
+        std::fs::remove_dir_all(&t).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("new.bin"), vec![0u8; 9]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 9));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sized_dir_swapped_for_a_junction_reads_as_a_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42));
+        std::fs::remove_dir_all(&nm).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("big.bin"), vec![0u8; 5000]).unwrap();
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&nm)
+            .arg(&elsewhere)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: mklink /J unavailable on this host");
+            return;
+        }
+        assert_eq!(
+            measure_dir(&nm),
+            (true, true, 0),
+            "the junction is read live"
+        );
     }
 
     #[test]
