@@ -2223,7 +2223,7 @@ mod script_tests {
     /// The REAL curl, so the ~1 s budget is curl's own, not a fake's: a dead
     /// runner (connection refused) and a hung one (accepts, never answers)
     /// both print nothing, and the hung one is cut off by `--max-time 1` —
-    /// well inside 2x the budget. Then a real loopback answer of `allow` with
+    /// well inside five seconds. Then a real loopback answer of `allow` with
     /// the right nonce prints the envelope (the request shape against an
     /// actual HTTP exchange, curl's chunked body decoded), and the same answer
     /// from a squatter that cannot know the nonce prints nothing.
