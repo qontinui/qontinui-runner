@@ -1078,7 +1078,8 @@ fn resolve_real_waiting(
                 let _ = writeln!(
                     std::io::stderr(),
                     "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up \
-                     to {}s for it to reappear (a package-manager reinstall briefly removes it)",
+                     to {}s for it to reappear (a package-manager reinstall briefly removes it, or \
+                     leaves the npm placeholder stub in its place)",
                     wait.as_secs()
                 );
             }
@@ -1157,12 +1158,47 @@ fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
             let cand = dir.join(&cand_name);
-            if cand.is_file() {
+            if cand.is_file() && !is_npm_placeholder(&cand) {
                 return Some(cand);
             }
         }
     }
     None
+}
+
+/// The message npm's placeholder `bin/claude.exe` prints, matched in its first
+/// [`PLACEHOLDER_PROBE_BYTES`].
+const NPM_PLACEHOLDER_MARKER: &[u8] = b"native binary not installed";
+const PLACEHOLDER_PROBE_BYTES: u64 = 256;
+
+/// Is `path` npm's PLACEHOLDER stub rather than the real tool?
+///
+/// `@anthropic-ai/claude-code` ships `bin/claude.exe` as a ~500-byte shell
+/// script that only prints "claude native binary not installed" and exits 1;
+/// its postinstall then links the native binary over it. So a reinstall has a
+/// second window, after npm re-links `bin/claude` but before postinstall runs,
+/// in which the tool is PRESENT but is the stub — and execing it there failed a
+/// peer pane's launch on 2026-10-21. Treating the stub as a miss lets the
+/// bounded wait in [`resolve_real_waiting`] cover both windows. A native binary
+/// starts with its ELF/PE/Mach-O magic, so the marker never matches one; an
+/// unreadable file is NOT a placeholder (fail-open to the old behaviour).
+/// Scope: npm on Linux/macOS, where `bin/claude` links straight to the
+/// placeholder. On Windows npm's cmd-shim wrapper (`claude.cmd`) is what PATH
+/// resolves, so the stub behind it is not seen and that window stays open.
+fn is_npm_placeholder(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(PLACEHOLDER_PROBE_BYTES as usize);
+    if file
+        .take(PLACEHOLDER_PROBE_BYTES)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    head.windows(NPM_PLACEHOLDER_MARKER.len())
+        .any(|w| w == NPM_PLACEHOLDER_MARKER)
 }
 
 /// Candidate filenames to probe for the real tool, in resolution-preference
@@ -1577,6 +1613,37 @@ mod tests {
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
             "must resolve the real tool OUTSIDE the shim dir"
+        );
+    }
+
+    /// The 2026-10-21 shape: mid-reinstall, `claude` is present but is npm's
+    /// placeholder stub. It must read as a miss, and the real binary once
+    /// postinstall has linked it over the stub must read as a hit.
+    #[test]
+    fn resolve_real_treats_the_npm_placeholder_as_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let stub = bin.join(exe);
+        std::fs::write(
+            &stub,
+            b"echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        let path = bin.display().to_string();
+        assert!(is_npm_placeholder(&stub));
+        assert_eq!(resolve_real_in("claude", &[], OsStr::new(&path)), None);
+
+        std::fs::write(&stub, b"\x7fELF\x02\x01\x01 native code").unwrap();
+        assert!(!is_npm_placeholder(&stub));
+        assert_eq!(
+            resolve_real_in("claude", &[], OsStr::new(&path)),
+            Some(stub.clone())
+        );
+        assert!(
+            !is_npm_placeholder(&tmp.path().join("absent")),
+            "a file that cannot be opened is not a placeholder"
         );
     }
 

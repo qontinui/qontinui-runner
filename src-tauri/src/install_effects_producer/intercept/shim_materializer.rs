@@ -2547,6 +2547,45 @@ mod resolve_wait_tests {
         );
     }
 
+    /// The 2026-10-21 shape: npm has re-linked `bin/claude` but postinstall has
+    /// not yet replaced the placeholder stub. The shim must wait the stub out
+    /// rather than exec it.
+    #[test]
+    fn identity_shim_waits_out_the_npm_placeholder_stub() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let marker = tmp.path().join("ran");
+        let real = real_dir.join("claude");
+        write_exe(
+            &real,
+            "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        );
+        let cmd = identity_cmd(&shim_dir, &real_dir, "10");
+
+        let postinstall = {
+            let body = fake_claude_body(&marker);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                write_exe(&real, &body);
+            })
+        };
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        postinstall.join().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "shim failed: {stderr}");
+        assert!(marker.exists(), "the real claude never ran: {stderr}");
+        assert!(
+            !stderr.contains("native binary not installed"),
+            "the stub must not have run: {stderr}"
+        );
+    }
+
     #[test]
     fn identity_shim_names_the_tool_and_path_when_it_gives_up() {
         if system_claude_present() {
