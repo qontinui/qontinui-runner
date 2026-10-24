@@ -16,13 +16,16 @@ use std::sync::{Mutex, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::{reporting, CiDispatchPayload};
+use qontinui_ci_exec::dispatch::{dispatch_id_is_safe, repo_slug_is_safe, DispatchPayload};
+use qontinui_ci_exec::host_sizing::{self, HostCapacity};
+
+use super::reporting;
 use crate::settings::CiNodeSettings;
 
 /// Pure admission verdict. `Reject` carries the operator-readable reason
 /// that lands in the result summary.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Admission {
+pub(crate) enum AdmissionDecision {
     Proceed,
     Defer,
     Reject(String),
@@ -300,22 +303,22 @@ pub(crate) fn admission_decision(
     repo: &str,
     running_count: usize,
     headroom: Headroom,
-) -> Admission {
+) -> AdmissionDecision {
     if !settings.enabled {
-        return Admission::Reject("ci_node is disabled on this device".to_string());
+        return AdmissionDecision::Reject("ci_node is disabled on this device".to_string());
     }
     if !repo_allowed(&settings.repo_allowlist, repo) {
-        return Admission::Reject(format!(
+        return AdmissionDecision::Reject(format!(
             "repo {repo:?} is not in this device's ci_node.repo_allowlist"
         ));
     }
     if running_count >= max_concurrent.max(1) as usize {
-        return Admission::Defer;
+        return AdmissionDecision::Defer;
     }
     if headroom_defers(headroom) {
-        return Admission::Defer;
+        return AdmissionDecision::Defer;
     }
-    Admission::Proceed
+    AdmissionDecision::Proceed
 }
 
 /// `true` when live headroom says "not one more build right now".
@@ -609,7 +612,7 @@ struct CiState {
     /// dispatch_id → cancel token for the running build.
     running: HashMap<String, CancellationToken>,
     /// Deferred (at-cap, or below headroom) dispatches, FIFO.
-    queued: VecDeque<CiDispatchPayload>,
+    queued: VecDeque<DispatchPayload>,
     /// A [`spawn_headroom_waker`] task is in flight. At most one, ever —
     /// otherwise a box that stays under the headroom threshold would accrue one
     /// sleeping task per redelivered dispatch.
@@ -637,7 +640,7 @@ pub(crate) fn occupancy() -> (usize, usize) {
 
 /// Coord base for reporting on a payload (payload-pinned URL first, profile
 /// fallback).
-fn report_base(payload: &CiDispatchPayload) -> Option<String> {
+fn report_base(payload: &DispatchPayload) -> Option<String> {
     let pinned = payload.coord_http_url.trim();
     if !pinned.is_empty() {
         return Some(pinned.trim_end_matches('/').to_string());
@@ -645,7 +648,7 @@ fn report_base(payload: &CiDispatchPayload) -> Option<String> {
     qontinui_runner_lib::profiles::connected_coord_base()
 }
 
-fn reject(payload: &CiDispatchPayload, reason: String) {
+fn reject(payload: &DispatchPayload, reason: String) {
     warn!(
         "ci_node: rejecting dispatch {} for {}: {reason}",
         payload.dispatch_id, payload.repo
@@ -655,18 +658,32 @@ fn reject(payload: &CiDispatchPayload, reason: String) {
     }
 }
 
-/// Entry point from the WS subscription for `build_requested`.
-pub(crate) fn submit(payload: CiDispatchPayload) {
+/// This device's admission, as the executor crate's dispatch seam: the
+/// subscription routes coord's `build_requested` / `build_cancelled` events
+/// through [`qontinui_ci_exec::dispatch::route`] into [`submit`] / [`cancel`].
+pub(crate) struct NodeAdmission;
+
+impl qontinui_ci_exec::dispatch::Admission for NodeAdmission {
+    fn submit(&self, payload: DispatchPayload) {
+        submit(payload);
+    }
+    fn cancel(&self, dispatch_id: &str) {
+        cancel(dispatch_id);
+    }
+}
+
+/// Admit one `build_requested` dispatch (via [`NodeAdmission`]).
+pub(crate) fn submit(payload: DispatchPayload) {
     // Identifier safety FIRST: an unsafe dispatch_id can't even be reported
     // (it rides the result URL path), so it is dropped with a log only.
-    if !super::dispatch_id_is_safe(&payload.dispatch_id) {
+    if !dispatch_id_is_safe(&payload.dispatch_id) {
         warn!(
             "ci_node: dropping dispatch with unsafe dispatch_id (len={})",
             payload.dispatch_id.len()
         );
         return;
     }
-    if !super::repo_slug_is_safe(&payload.repo) {
+    if !repo_slug_is_safe(&payload.repo) {
         reject(&payload, format!("unsafe repo slug {:?}", payload.repo));
         return;
     }
@@ -680,7 +697,7 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     // `max_concurrent_builds` resolves to the host suggestion, which probes the
     // host. `admission_decision`, the under-lock re-check and the executor's
     // host share all use this one number.
-    let host = super::host_sizing::probe();
+    let host = host_sizing::probe();
     let max_concurrent = settings.effective_max_concurrent_builds_for(host);
     let decision = {
         let state = ci_state().lock().unwrap();
@@ -708,8 +725,8 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     };
 
     match decision {
-        Admission::Reject(reason) => reject(&payload, reason),
-        Admission::Defer => {
+        AdmissionDecision::Reject(reason) => reject(&payload, reason),
+        AdmissionDecision::Defer => {
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
             let (depth, needs_waker) = {
                 let mut state = ci_state().lock().unwrap();
@@ -734,7 +751,7 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
                 spawn_headroom_waker();
             }
         }
-        Admission::Proceed => start_build(payload, settings, host, max_concurrent),
+        AdmissionDecision::Proceed => start_build(payload, settings, host, max_concurrent),
     }
 }
 
@@ -782,9 +799,9 @@ fn spawn_headroom_waker() {
 /// admitted against; they are threaded through so the re-check and the
 /// executor's per-dispatch host share use the same N.
 fn start_build(
-    payload: CiDispatchPayload,
+    payload: DispatchPayload,
     settings: CiNodeSettings,
-    host: super::host_sizing::HostCapacity,
+    host: HostCapacity,
     max_concurrent: u32,
 ) {
     let Some(root) = crate::agent_runtime::qontinui_root_dir() else {
@@ -870,7 +887,7 @@ fn start_build(
         dispatch_id, payload.repo, payload.head_sha, payload.check_name
     );
     tokio::spawn(async move {
-        super::executor::run_dispatch(payload, root, token, host, max_concurrent).await;
+        super::host::run(payload, token, host, max_concurrent).await;
         on_build_finished(&dispatch_id);
     });
 }
@@ -893,7 +910,7 @@ fn on_build_finished(dispatch_id: &str) {
     }
 }
 
-/// Entry point from the WS subscription for `build_cancelled`.
+/// Cancel one dispatch on `build_cancelled` (via [`NodeAdmission`]).
 pub(crate) fn cancel(dispatch_id: &str) {
     let (was_running, dequeued) = {
         let mut state = ci_state().lock().unwrap();
@@ -902,7 +919,7 @@ pub(crate) fn cancel(dispatch_id: &str) {
             (true, None)
         } else {
             let before = state.queued.len();
-            let mut removed: Option<CiDispatchPayload> = None;
+            let mut removed: Option<DispatchPayload> = None;
             state.queued.retain(|p| {
                 if p.dispatch_id == dispatch_id {
                     removed = Some(p.clone());
@@ -987,11 +1004,10 @@ mod tests {
 
     /// A fixed host (48 cores / 368 GiB, suggestion 12) for resolving an unset
     /// capacity without probing the machine the tests run on.
-    const TEST_HOST: super::super::host_sizing::HostCapacity =
-        super::super::host_sizing::HostCapacity {
-            mem_bytes: Some(368 * GIB),
-            cpus: 48,
-        };
+    const TEST_HOST: HostCapacity = HostCapacity {
+        mem_bytes: Some(368 * GIB),
+        cpus: 48,
+    };
 
     /// The capacity `submit` would resolve for `s` — here against [`TEST_HOST`].
     fn cap_of(s: &CiNodeSettings) -> u32 {
@@ -1008,11 +1024,11 @@ mod tests {
         assert_eq!(cap, 12);
         assert!(matches!(
             admission_decision(&s, cap, "qontinui/qontinui-runner", 11, blind()),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         ));
         assert!(matches!(
             admission_decision(&s, cap, "qontinui/qontinui-runner", 12, blind()),
-            Admission::Defer
+            AdmissionDecision::Defer
         ));
     }
 
@@ -1028,7 +1044,7 @@ mod tests {
         let s = settings(false, &["qontinui-runner"], 1);
         assert!(matches!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Reject(r) if r.contains("disabled")
+            AdmissionDecision::Reject(r) if r.contains("disabled")
         ));
     }
 
@@ -1037,13 +1053,13 @@ mod tests {
         let s = settings(true, &["qontinui-runner"], 1);
         assert!(matches!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-coord", 0, blind()),
-            Admission::Reject(r) if r.contains("repo_allowlist")
+            AdmissionDecision::Reject(r) if r.contains("repo_allowlist")
         ));
         // Empty allowlist = nothing runnable, even enabled.
         let s = settings(true, &[], 1);
         assert!(matches!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Reject(_)
+            AdmissionDecision::Reject(_)
         ));
     }
 
@@ -1052,19 +1068,19 @@ mod tests {
         let s = settings(true, &["qontinui-runner"], 1);
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 1, blind()),
-            Admission::Defer
+            AdmissionDecision::Defer
         );
         // Below cap proceeds.
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
         // cap=0 is treated as 1 (a nonsensical hand-edit must not brick
         // admission into permanent deferral at running=0).
         let s0 = settings(true, &["qontinui-runner"], 0);
         assert_eq!(
             admission_decision(&s0, cap_of(&s0), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
     }
 
@@ -1085,7 +1101,7 @@ mod tests {
         };
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, calm),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
 
         let pressed = Headroom {
@@ -1094,7 +1110,7 @@ mod tests {
         };
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, pressed),
-            Admission::Defer,
+            AdmissionDecision::Defer,
             "swap at the ceiling ratio must defer even though the box is far \
              below its concurrency cap and mem/commit look healthy"
         );
@@ -1114,7 +1130,7 @@ mod tests {
         };
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, squeezed),
-            Admission::Defer
+            AdmissionDecision::Defer
         );
         assert!(
             DEFER_FREE_COMMIT_GB > MIN_FREE_COMMIT_GB,
@@ -1133,7 +1149,7 @@ mod tests {
                     ..squeezed
                 }
             ),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
     }
 
@@ -1158,7 +1174,7 @@ mod tests {
                         running,
                         starved
                     ),
-                    Admission::Reject(_)
+                    AdmissionDecision::Reject(_)
                 ),
                 "headroom is a DEFER lever; coord prefers, the node decides, and \
                  a transient reading must never re-home work (running={running})"
@@ -1166,7 +1182,7 @@ mod tests {
         }
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, starved),
-            Admission::Defer
+            AdmissionDecision::Defer
         );
     }
 
@@ -1176,7 +1192,7 @@ mod tests {
         // Nothing readable at all — the pre-headroom behaviour, exactly.
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Proceed,
+            AdmissionDecision::Proceed,
             "a telemetry gap must never brick the lane"
         );
         // Half-blind boxes still use the half they can read, and a swap
@@ -1191,7 +1207,7 @@ mod tests {
         assert_eq!(no_swap.swap_used_ratio(), None);
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, no_swap),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
         // A used-without-total reading is not a ratio.
         assert_eq!(
@@ -1260,7 +1276,7 @@ mod tests {
         };
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, incident),
-            Admission::Defer,
+            AdmissionDecision::Defer,
             "a box at 99.3% of its task ceiling must stop taking CI work even \
              though every memory instrument on it reads healthy — that \
              independence is the entire justification for a third axis"
@@ -1278,7 +1294,7 @@ mod tests {
                     ..incident
                 }
             ),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
     }
 
@@ -1299,7 +1315,7 @@ mod tests {
             assert!(
                 !matches!(
                     admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", running, pinned),
-                    Admission::Reject(_)
+                    AdmissionDecision::Reject(_)
                 ),
                 "saturation is a DEFER lever; a rejecting node re-homes work \
                  that would have run fine once the leak was reaped \
@@ -1348,7 +1364,7 @@ mod tests {
         assert!(!headroom_defers(blind()));
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, blind()),
-            Admission::Proceed
+            AdmissionDecision::Proceed
         );
         // A half pair cannot even be constructed, so it cannot reach here: the
         // publisher's type rejects it, which is why this arm needs no divisor
@@ -1392,7 +1408,7 @@ mod tests {
         };
         assert_eq!(
             admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", 0, guarded),
-            Admission::Defer,
+            AdmissionDecision::Defer,
             "below the session floor, the lane with somewhere else to go steps back"
         );
         assert_eq!(
@@ -1406,7 +1422,7 @@ mod tests {
                     ..guarded
                 }
             ),
-            Admission::Proceed,
+            AdmissionDecision::Proceed,
             "at the raised threshold the box is admitting work again"
         );
         assert_eq!(
@@ -1420,7 +1436,7 @@ mod tests {
                     ..guarded
                 }
             ),
-            Admission::Proceed,
+            AdmissionDecision::Proceed,
             "identical reading, no session floor — so the defer above came from \
              the session term and nothing else"
         );
@@ -1431,7 +1447,7 @@ mod tests {
         for running in [0usize, 1, 9] {
             assert!(!matches!(
                 admission_decision(&s, cap_of(&s), "qontinui/qontinui-runner", running, guarded),
-                Admission::Reject(_)
+                AdmissionDecision::Reject(_)
             ));
         }
     }
@@ -1459,7 +1475,7 @@ mod tests {
                     ..Headroom::default()
                 }
             ),
-            Admission::Proceed,
+            AdmissionDecision::Proceed,
             "an owner who turned the guard off has not authorised a CI floor \
              inferred from the switch they turned off"
         );
@@ -1494,7 +1510,7 @@ mod tests {
                     ..Headroom::default()
                 }
             ),
-            Admission::Defer
+            AdmissionDecision::Defer
         );
     }
 
@@ -1541,7 +1557,7 @@ mod tests {
                     ..Headroom::default()
                 }
             ),
-            Admission::Proceed,
+            AdmissionDecision::Proceed,
             "a floor no box can reach must not brick this node's admission"
         );
     }

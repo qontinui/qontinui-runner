@@ -869,7 +869,7 @@ fn build_budget_request(
     resources: Resources,
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
-    host: crate::ci_node::host_sizing::HostCapacity,
+    host: qontinui_ci_exec::host_sizing::HostCapacity,
 ) -> DeviceBudgetRequest {
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
@@ -965,7 +965,7 @@ pub async fn publish_budget(
         resources,
         disk_reserved_gb,
         &ci,
-        crate::ci_node::host_sizing::probe(),
+        qontinui_ci_exec::host_sizing::probe(),
     );
 
     // Cache the payload regardless of whether the POST succeeds — this is
@@ -1582,7 +1582,7 @@ fn host_capabilities() -> Vec<String> {
 /// read.
 ///
 /// Reuses the shipped, once-per-process `resource_guard::host_capacity` probe
-/// (`ci_node::host_sizing::probe` behind a `OnceLock`) rather than adding a
+/// (`qontinui_ci_exec::host_sizing::probe` behind a `OnceLock`) rather than adding a
 /// third sysinfo reader, so the heartbeat's tiers and the resource guard judge
 /// the same `MemTotal`. Total memory does not change under a live process, so
 /// the process-lifetime cache costs nothing a TTL would buy back.
@@ -6513,8 +6513,8 @@ mod tests {",
 
     /// A fixed host for the budget tests: 48 cores / 368 GiB (merytshost), so
     /// the unset-capacity suggestion is a known 12.
-    fn test_host() -> crate::ci_node::host_sizing::HostCapacity {
-        crate::ci_node::host_sizing::HostCapacity {
+    fn test_host() -> qontinui_ci_exec::host_sizing::HostCapacity {
+        qontinui_ci_exec::host_sizing::HostCapacity {
             mem_bytes: Some(368 * 1024 * 1024 * 1024),
             cpus: 48,
         }

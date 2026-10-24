@@ -6623,6 +6623,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "qontinui-ci-exec"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "flate2",
+ "hex",
+ "libc",
+ "rand 0.9.4",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "sysinfo",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 1.0.7+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "zip 9.0.4",
+]
+
+[[package]]
 name = "qontinui-code-graph"
 version = "0.1.0"
 dependencies = [
@@ -6708,7 +6733,6 @@ dependencies = [
  "dirs 6.0.0",
  "erased-serde",
  "filetime",
- "flate2",
  "futures",
  "futures-util",
  "git2",
@@ -6740,6 +6764,7 @@ dependencies = [
  "portable-pty",
  "postgresql_embedded",
  "proc-macro2",
+ "qontinui-ci-exec",
  "qontinui-code-graph",
  "qontinui-db",
  "qontinui-pty-holder",
