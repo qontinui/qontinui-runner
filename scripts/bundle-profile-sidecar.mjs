@@ -46,6 +46,7 @@ import { copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { executablesFromCargoJson } from "./lib/build-profile.mjs";
 import { nativeExecutableProblem } from "./lib/native-exe.mjs";
 // The roster lives in ONE place, shared with build-exe.mjs (the primary's
 // build); a build.rs test pins its SIDECAR_BINS to tauri.conf.json.
@@ -113,25 +114,8 @@ try {
 
 // 3. Extract each executable path from the last matching compiler-artifact
 //    message — the authoritative locations cargo actually wrote them to.
-const builtExes = new Map(); // bin name -> executable path
-for (const line of stdout.split("\n")) {
-  const s = line.trim();
-  if (!s.startsWith("{")) continue;
-  let msg;
-  try {
-    msg = JSON.parse(s);
-  } catch {
-    continue;
-  }
-  if (
-    msg.reason === "compiler-artifact" &&
-    msg.target &&
-    SIDECAR_BINS.includes(msg.target.name) &&
-    msg.executable
-  ) {
-    builtExes.set(msg.target.name, msg.executable);
-  }
-}
+//    The same parser build:exe uses (scripts/lib/build-profile.mjs).
+const builtExes = executablesFromCargoJson(stdout, SIDECAR_BINS); // bin name -> executable path
 
 // 4. Copy each to the triple-suffixed path Tauri's externalBin resolver expects.
 const binariesDir = join(srcTauri, "binaries");

@@ -24,10 +24,18 @@ export const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr", "qontinui-pty-ho
 // cargo applies the `--bin` filters across every selected package.
 export const SIDECAR_PACKAGES = ["qontinui-runner", "qontinui-pty-holder"];
 
-// Bins the PRIMARY needs beside its exe that are not bundle externalBins:
-// `qontinui-shim` is materialized onto session PATHs from
-// `current_exe().parent()` (install_effects_producer/intercept/shim_materializer.rs).
-export const PRIMARY_EXTRA_BINS = ["qontinui-shim"];
+// Bins the PRIMARY needs beside its exe that are not bundle externalBins, each
+// resolved from `current_exe().parent()`:
+//   - `qontinui-shim` is materialized onto session PATHs
+//     (install_effects_producer/intercept/shim_materializer.rs);
+//   - `qontinui-git-credential` is the git credential helper installed on
+//     interactive terminal creation (`terminal_create`) and on agent-worktree
+//     setup (credential_helper.rs); when it is absent the
+//     helper is skipped with only a debug line;
+//   - `wrappers_mcp` is the wrappers MCP launcher (wrappers/launcher.rs); when
+//     it is absent the launcher falls back to a target*/release/ scan, else
+//     DevBuildMissing.
+export const PRIMARY_EXTRA_BINS = ["qontinui-shim", "qontinui-git-credential", "wrappers_mcp"];
 
 // Everything build:exe builds beside qontinui-runner.
 export const PRIMARY_BINS = [...SIDECAR_BINS, ...PRIMARY_EXTRA_BINS];

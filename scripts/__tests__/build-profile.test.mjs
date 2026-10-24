@@ -45,6 +45,8 @@ test("cargo's dev profile writes to debug/; others to their own name", () => {
   assert.equal(profileDir("dev"), "debug");
   assert.equal(profileDir("release-checked"), "release-checked");
   assert.equal(profileDir("release"), "release");
+  assert.equal(profileDir("test"), "debug");
+  assert.equal(profileDir("bench"), "release");
 });
 
 test("the announcement names the profile and its knobs", () => {
@@ -82,10 +84,17 @@ test("the cargo invocation builds the runner and every sidecar in one profile", 
   ]);
 });
 
-test("the primary roster is the bundle sidecars plus the shim", () => {
+test("the primary roster is the bundle sidecars plus every bin the runner resolves beside its exe", () => {
   assert.deepEqual(SIDECAR_BINS, ["qontinui_profile", "qontinui-pr", "qontinui-pty-holder"]);
   assert.deepEqual(SIDECAR_PACKAGES, ["qontinui-runner", "qontinui-pty-holder"]);
-  assert.deepEqual(PRIMARY_BINS, ["qontinui_profile", "qontinui-pr", "qontinui-pty-holder", "qontinui-shim"]);
+  assert.deepEqual(PRIMARY_BINS, [
+    "qontinui_profile",
+    "qontinui-pr",
+    "qontinui-pty-holder",
+    "qontinui-shim",
+    "qontinui-git-credential",
+    "wrappers_mcp",
+  ]);
 });
 
 test("artifact paths come from cargo's JSON, last message wins, others ignored", () => {
