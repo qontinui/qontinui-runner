@@ -2962,6 +2962,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::clipboard::share_file_to_mobile,
             commands::clipboard::share_to_mobile,
             commands::clipboard::clipboard_write_text,
+            commands::clipboard::clipboard_read_text,
             commands::cloud_sync_settings::get_cloud_sync_settings,
             commands::cloud_sync_settings::save_cloud_sync_settings,
             commands::cloud_sync_settings::get_session_metadata_sync_settings,
