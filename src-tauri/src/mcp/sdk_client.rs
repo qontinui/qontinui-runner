@@ -4493,13 +4493,14 @@ async fn handle_ct_execute_with_diff(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let active_app = active_app_identity(&state).await;
+    let (ws_payload, http_body) = execute_with_diff_forward(&body);
     let response = match dispatch_app_request(
         &state,
         "executeWithDiff",
-        body.clone(),
+        ws_payload,
         Method::POST,
         "/ai/execute-with-diff",
-        Some(body.clone()),
+        Some(http_body),
     )
     .await
     {
@@ -4527,6 +4528,16 @@ async fn handle_ct_execute_with_diff(
         );
     }
     Json(response)
+}
+
+/// What `handle_ct_execute_with_diff` forwards to the SDK: the WS payload and
+/// the HTTP body, each the caller's body WHOLE. `ActionWithDiffRequest` keeps
+/// growing (`timeline`, default-on since plan 2026-09-20 Phase 4, so a
+/// `timeline: false` opt-out must survive; `timelineInterval`; `expectStates`
+/// with `withinMs`), and a hop that rebuilt the body field by field would
+/// drop whichever this runner had not heard of yet.
+fn execute_with_diff_forward(body: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    (body.clone(), body.clone())
 }
 
 /// Read an `execute_with_diff` result's `actionSuccess`, at the top level (the
@@ -8789,18 +8800,44 @@ mod tests {
         }
     }
 
-    /// The request is forwarded whole: the four Phase 4 request fields reach
-    /// the SDK. Pinned on the source because the handler is async I/O.
-    #[test]
-    fn execute_with_diff_forwards_the_request_body_whole() {
-        let src = include_str!("sdk_client.rs");
-        let body = src
-            .split("\nasync fn handle_ct_execute_with_diff(")
-            .nth(1)
-            .and_then(|rest| rest.split("\nasync fn ").next())
-            .expect("handle_ct_execute_with_diff present");
-        assert!(body.contains("body.clone(),\n        Method::POST,"));
-        assert!(body.contains("Some(body.clone()),"));
+    /// The four Phase 4 request fields reach the SDK on BOTH transports: the
+    /// handler's own forward, through the real transport selection.
+    #[tokio::test]
+    async fn execute_with_diff_forwards_the_phase_4_request_fields_on_both_transports() {
+        let body = serde_json::json!({
+            "elementAction": { "elementId": "save", "action": "click" },
+            "timeline": false,
+            "timelineInterval": 25,
+            "expectStates": ["saved-toast"],
+            "withinMs": 2000,
+        });
+        let registry = AppRegistry::new();
+        registry
+            .upsert(
+                sample_discovered("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        registry
+            .upsert(
+                sample_discovered("happ"),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        for app in ["wapp", "happ"] {
+            let (ws, http) = execute_with_diff_forward(&body);
+            let sent = select_app_payload(&registry, app, ws, Some(http)).await;
+            for field in ["timeline", "timelineInterval", "expectStates", "withinMs"] {
+                assert_eq!(sent[field], body[field], "{app}: {field} was not forwarded");
+            }
+            assert_eq!(sent, body, "{app}: the body is forwarded whole");
+        }
     }
 }
 
