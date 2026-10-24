@@ -796,11 +796,17 @@ pub async fn get_ai_output(
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    let db_output = app_state
+    // An outage is reported (success:false with the error) but never hides a
+    // live session's in-memory output, which is still returned below.
+    let (db_output, db_error) = match app_state
         .pg_db()
         .get_task_output(&task_run_id)
         .await
-        .default_unless_unavailable()?;
+        .default_unless_unavailable()
+    {
+        Ok(output) => (output, None),
+        Err(e) => (String::new(), Some(e)),
+    };
 
     // If there's a live session, append any unpersisted AI output.
     // The accumulated_output contains all AI text from the current session.
@@ -849,6 +855,18 @@ pub async fn get_ai_output(
                 }
             }
         }
+    }
+
+    if let Some(e) = db_error {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some(e),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "output_log": combined_output,
+                "db_output_unavailable": true,
+            })),
+        });
     }
 
     Ok(CommandResponse {

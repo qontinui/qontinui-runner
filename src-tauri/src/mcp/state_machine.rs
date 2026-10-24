@@ -405,7 +405,13 @@ pub async fn get_available_transitions(
                             .await
                             .or_unless_unavailable(Vec::new())?;
                         for config in configs.iter() {
-                            if let Ok(Some(full)) = pg.get_sm_config_full(&config.id).await {
+                            // Another failure skips this config as before; an
+                            // outage propagates (503).
+                            if let Some(full) = pg
+                                .get_sm_config_full(&config.id)
+                                .await
+                                .or_unless_unavailable(None)?
+                            {
                                 if !full.transitions.is_empty() {
                                     let transitions: Vec<serde_json::Value> = full
                                         .transitions
@@ -1228,7 +1234,14 @@ pub async fn get_current_state_machine(
 
     // Return the most recently updated config that has states/transitions
     for config in configs.iter() {
-        if let Ok(Some(full)) = pg_db(&state).get_sm_config_full(&config.id).await {
+        // Another failure skips this config as before; an outage is a 503,
+        // never "No compiled state machine found".
+        if let Some(full) = pg_db(&state)
+            .get_sm_config_full(&config.id)
+            .await
+            .or_unless_unavailable(None)
+            .map_err(crate::mcp::pg_guard::db_unavailable_error)?
+        {
             if !full.states.is_empty() || !full.transitions.is_empty() {
                 return Ok(Json(ApiResponse::success(full)));
             }

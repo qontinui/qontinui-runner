@@ -797,7 +797,7 @@ impl LoopController {
         // =====================================================================
         let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
         {
-            let active_canary: Option<(String, String)> =
+            let mut active_canary: Option<(String, String)> =
                 match crate::meta_optimizer::canary::get_active_canaries(&self.app_state.pg_db) {
                     Ok(canaries) => canaries.into_iter().find_map(|c| {
                         if crate::meta_optimizer::canary::should_apply_canary(
@@ -815,7 +815,9 @@ impl LoopController {
                     }),
                     Err(_) => None,
                 };
-            let is_canary_run = active_canary.is_some();
+            // Set when an original setting could not be read: the run then
+            // executes as a plain baseline, never as a partial canary.
+            let mut abandon_canary = false;
 
             // Apply config overrides for canary runs
             if let Some((_, ref rec_id)) = active_canary {
@@ -836,8 +838,12 @@ impl LoopController {
                             {
                                 Ok(original) => original,
                                 Err(e) => {
-                                    warn!("CANARY: skipping config override {}: {}", key, e);
-                                    continue;
+                                    warn!(
+                                        "CANARY: original of {} unreadable, running as baseline: {}",
+                                        key, e
+                                    );
+                                    abandon_canary = true;
+                                    break;
                                 }
                             };
                             canary_config_originals.push((key.clone(), original));
@@ -854,6 +860,14 @@ impl LoopController {
                     }
                 }
             }
+
+            if abandon_canary {
+                // Undo the overrides already applied, and record no canary run.
+                Self::restore_canary_config(&canary_config_originals);
+                canary_config_originals.clear();
+                active_canary = None;
+            }
+            let is_canary_run = active_canary.is_some();
 
             // Store canary state on config so loop paths can access it
             config.active_canary = active_canary;

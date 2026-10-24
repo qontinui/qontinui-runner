@@ -191,12 +191,13 @@ const DB_BACKED_EXACT: &[&str] = &[
     "/ui-bridge/control/workflow/*/status",
 ];
 
-/// DB-FREE routes that fall UNDER a [`DB_BACKED_PREFIXES`] entry and must keep
+/// Routes (DB-free, or degrading on their own) that fall UNDER a
+/// [`DB_BACKED_PREFIXES`] entry and must keep
 /// working in degraded mode. Checked FIRST; a match here means "never 503".
 /// `*` matches one path-param segment.
 const DB_EXEMPT: &[&str] = &[
     "/findings/summary",           // under /findings (misc; returns empty)
-    "/triggers/status",            // under /triggers
+    "/triggers/status",            // under /triggers; reads PG but degrades to null itself
     "/tests/execute-suite",        // under /tests
     "/mcp/memory/tool-descriptor", // under /mcp/memory
     "/scheduler/tasks/*/run",      // under /scheduler/tasks

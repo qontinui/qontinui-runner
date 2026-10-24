@@ -131,7 +131,12 @@ pub struct SyncResultResponse {
     pub sent: u32,
     pub failed: u32,
     pub errors: Vec<String>,
-    pub remaining: u32,
+    /// `None` when the post-push status read failed: unknown, never 0. The
+    /// push result above stands either way.
+    pub remaining: Option<u32>,
+    /// Why `remaining` is unknown (the status read's error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_note: Option<String>,
 }
 
 /// Trigger sync of pending discoveries to qontinui-web.
@@ -185,22 +190,31 @@ pub async fn sync_discoveries(
             errors.push(format!("{}: {}", sr.id, err_msg));
         }
     }
-    let remaining_status = state
+    // A failed status read after a successful push must not discard the push
+    // result: `remaining` becomes unknown instead.
+    let (remaining, remaining_note) = match state
         .pg_db()
         .get_sync_status()
         .await
-        .default_unless_unavailable()?;
-    let remaining = remaining_status["pending_count"].as_u64().unwrap_or(0) as u32;
+        .default_unless_unavailable()
+    {
+        Ok(status) => (
+            Some(status["pending_count"].as_u64().unwrap_or(0) as u32),
+            None,
+        ),
+        Err(e) => (None, Some(e)),
+    };
 
     let response = SyncResultResponse {
         sent,
         failed,
         errors,
         remaining,
+        remaining_note,
     };
 
     info!(
-        "Sync complete: {} sent, {} failed, {} remaining",
+        "Sync complete: {} sent, {} failed, {:?} remaining",
         response.sent, response.failed, response.remaining
     );
 

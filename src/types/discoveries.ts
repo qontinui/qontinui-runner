@@ -103,7 +103,10 @@ export interface SyncResult {
   sent: number;
   failed: number;
   errors: string[];
-  remaining: number;
+  /** `null` when the post-push status read failed: unknown, never 0. */
+  remaining: number | null;
+  /** Why `remaining` is unknown. */
+  remaining_note?: string;
 }
 
 // Helper functions

@@ -37,7 +37,7 @@ pub struct WorkflowAutoContinueResponse {
 /// not be read (so a `null` name never stands in for "unknown").
 async fn running_workflow_name() -> (Option<String>, Option<String>) {
     let Some(pg) = crate::database::pg::PgDb::try_global() else {
-        return (None, None);
+        return (None, Some("database not initialised".to_string()));
     };
     match pg.get_running_task_runs(None).await {
         Ok(tasks) => (tasks.first().map(|t| t.task_name.clone()), None),

@@ -411,7 +411,8 @@ pub async fn collect_step_outputs(
         .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
-        .default_unless_unavailable()?;
+        .default_unless_unavailable()
+        .map_err(|e| format!("Failed to get Playwright results: {}", e))?;
 
     for result in playwright_results {
         // Filter by step types if specified
