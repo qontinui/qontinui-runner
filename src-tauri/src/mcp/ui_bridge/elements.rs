@@ -2308,10 +2308,79 @@ pub(crate) async fn try_ws_dispatch_for_app(
     )
 }
 
+/// Whose components a `GET /ui-bridge/control/components` read returns.
+///
+/// A LOCAL read returns two sources, merged: the runner's own webview
+/// registry, and the `getComponents` reply of every live WebSocket-transport
+/// registered app (a wrapper). A read that came over the backend relay's
+/// `http_request` arm returns the runner's own registry only, for two reasons:
+///
+/// - **Time.** [`ws_collect_components`] asks each live wrapper in turn, and
+///   each dispatch may wait the command relay's full 30 s. The relay awaits
+///   every `http_request` inline on its WebSocket read loop, and that loop
+///   has to answer the server's PING inside 20 s. So a registrant that never
+///   answers can park that loop past the PING window, and the server then
+///   drops the device's whole relay. Any browser page can be such a
+///   registrant: `GET /ui-bridge/ws` is on the origin guard's
+///   `FOREIGN_ROUTES`, reachable from every origin. Without the fan-out, a
+///   relayed read is bounded by the UI Bridge IPC layer alone, as the relayed
+///   snapshot is.
+/// - **Content.** A wrapper's reply is whatever its author's handler returns,
+///   from a page under an arbitrary origin. It is appended unvalidated, and
+///   nothing in the merged list says which app sent it. Over the relay it
+///   would reach a remote caller as if it were the runner's own registry.
+///
+/// The relay's marker is [`relay_path_policy::RELAYED_REQUEST_HEADER`]. It
+/// only narrows the read, so a local caller that sends it gets the runner-only
+/// list and loses nothing it could not have by leaving it out.
+///
+/// [`relay_path_policy::RELAYED_REQUEST_HEADER`]: crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComponentSources {
+    /// A local read: the runner's own registry, then every live wrapper's.
+    RunnerAndWrappers,
+    /// A relayed read: the runner's own registry, and no wrapper is asked.
+    RunnerOnly,
+}
+
+impl ComponentSources {
+    /// The sources a request is answered from, decided by whether the relay
+    /// forwarded it.
+    pub(crate) fn for_request(headers: &HeaderMap) -> Self {
+        if crate::mcp::relay_path_policy::is_relayed_request(headers) {
+            Self::RunnerOnly
+        } else {
+            Self::RunnerAndWrappers
+        }
+    }
+
+    /// What the response's `data.wrapperComponents` says about the wrappers'
+    /// half, so a reader can tell "none registered" from "not asked".
+    fn wrapper_disclosure(self) -> &'static str {
+        match self {
+            Self::RunnerAndWrappers => "included",
+            Self::RunnerOnly => "withheld",
+        }
+    }
+}
+
+/// The wrappers' half of a component read. For a relayed read it is empty and
+/// no wrapper is dispatched to, so none can hold the read.
+pub(crate) async fn ws_components_for(
+    sources: ComponentSources,
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+) -> Vec<serde_json::Value> {
+    match sources {
+        ComponentSources::RunnerAndWrappers => ws_collect_components(registry, dispatcher).await,
+        ComponentSources::RunnerOnly => Vec::new(),
+    }
+}
+
 /// Iterate every live WS-transport app and ask each for its components list.
 /// Errors from any individual app are logged but not propagated, so a single
 /// flaky wrapper cannot abort the merged response. Used by the LIST endpoint
-/// only.
+/// only, through [`ws_components_for`].
 async fn ws_collect_components(
     registry: &AppRegistry,
     dispatcher: &AppDispatcher,
@@ -2372,31 +2441,50 @@ fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiRespons
 
 /// Get all registered components.
 ///
-/// Phase A1 merge behavior: returns the IPC component list (runner-internal
-/// React components) concatenated with the components reported by every live
-/// WebSocket-transport registered app (wrappers). IPC entries come first;
-/// per-wrapper errors during the WS fan-out are logged but never abort the
-/// merged response, so a flaky wrapper degrades gracefully. Both bare-array
-/// and `{data: [...]}` / `{components: [...]}` shapes from wrappers are
-/// accepted and unwrapped.
+/// Phase A1 merge behavior: a local read returns the IPC component list
+/// (runner-internal React components) concatenated with the components
+/// reported by every live WebSocket-transport registered app (wrappers). IPC
+/// entries come first; per-wrapper errors during the WS fan-out are logged but
+/// never abort the merged response, so a flaky wrapper degrades gracefully.
+/// Both bare-array and `{data: [...]}` / `{components: [...]}` shapes from
+/// wrappers are accepted and unwrapped.
 ///
-/// F2 (Direction B) envelope shape:
-/// - `data` is `{components: [...]}` (object-shaped, matches every other
-///   rich endpoint convention and aligns with the SDK relay).
-/// - A **deprecated** top-level `components` field mirrors the array so
-///   pre-Direction-B callers keep working. Slated for removal one release
-///   after Direction B lands — read from `data.components` instead.
+/// A read the backend relay forwarded returns the IPC list alone, and asks no
+/// wrapper; [`ComponentSources`] says why.
+///
+/// F2 (Direction B) envelope shape: `data` is `{components: [...],
+/// wrapperComponents}` (object-shaped, matches every other rich endpoint
+/// convention and aligns with the SDK relay); see [`components_envelope`].
 pub async fn ui_bridge_get_components_handler(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting all components");
+    let sources = ComponentSources::for_request(&headers);
+    info!("UI Bridge API: Getting all components ({sources:?})");
+    components_read(
+        sources,
+        &state.app_registry,
+        &state.app_dispatcher,
+        ui_bridge_request_sync(&state, "get_components", serde_json::json!({})),
+    )
+    .await
+}
 
+/// [`ui_bridge_get_components_handler`] past its extractors. `ipc` is the read
+/// of the runner's own registry. It runs alongside the wrappers' half that
+/// `sources` selects, and the two are merged. Split out so a test can drive
+/// the whole read (source selection, fan-out, merge and envelope) against a
+/// registry and dispatcher of its own, which an `ApiState` cannot be built
+/// around.
+pub(crate) async fn components_read(
+    sources: ComponentSources,
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+    ipc: impl std::future::Future<Output = Result<serde_json::Value, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
     // Fan out to WS-transport wrappers in parallel with the IPC call.
-    let registry = state.app_registry.clone();
-    let dispatcher = state.app_dispatcher.clone();
-    let ws_future = async move { ws_collect_components(&registry, &dispatcher).await };
-    let ipc_future = ui_bridge_request_sync(&state, "get_components", serde_json::json!({}));
-    let (ipc_result, mut ws_components) = tokio::join!(ipc_future, ws_future);
+    let (ipc_result, mut ws_components) =
+        tokio::join!(ipc, ws_components_for(sources, registry, dispatcher));
 
     // Surface IPC transport errors normally — but if IPC is broken AND we
     // do have WS components, prefer to return the WS list rather than 5xx,
@@ -2449,20 +2537,34 @@ pub async fn ui_bridge_get_components_handler(
     };
 
     merged.append(&mut ws_components);
-    let components_array = serde_json::Value::Array(merged);
-    // F2 (Direction B): emit `{success, data:{components:[...]}}` — the
-    // canonical wrapper-SDK envelope shape.
-    //
-    // Loop B Item B: the previous emission also carried a top-level
-    // `components` field as a deprecated back-compat mirror, but it
-    // duplicated `data.components` byte-for-byte and confused callers
-    // about which key was authoritative. The mirror has been dropped;
-    // `data.components` is the single source of truth and the regression
-    // test `components_envelope_omits_top_level_mirror` locks it in.
-    Ok(Json(serde_json::json!({
+    Ok(Json(components_envelope(merged, sources)))
+}
+
+/// The component read's body: `{success, data: {components, wrapperComponents}}`.
+///
+/// F2 (Direction B): `{success, data:{components:[...]}}` is the canonical
+/// wrapper-SDK envelope shape. `data.wrapperComponents` is `"included"` when
+/// the live wrappers were asked and `"withheld"` when they were not (a
+/// relayed read, [`ComponentSources`]). Without it, a list with no wrapper
+/// entries could mean either "none is registered" or "none was asked".
+///
+/// Loop B Item B: the previous emission also carried a top-level
+/// `components` field as a deprecated back-compat mirror, but it duplicated
+/// `data.components` byte-for-byte and confused callers about which key was
+/// authoritative. The mirror has been dropped; `data.components` is the
+/// single source of truth and the regression test
+/// `components_envelope_omits_top_level_mirror` locks it in.
+pub(crate) fn components_envelope(
+    components: Vec<serde_json::Value>,
+    sources: ComponentSources,
+) -> serde_json::Value {
+    serde_json::json!({
         "success": true,
-        "data": { "components": components_array },
-    })))
+        "data": {
+            "components": components,
+            "wrapperComponents": sources.wrapper_disclosure(),
+        },
+    })
 }
 
 /// Get a specific component by ID.
@@ -5420,7 +5522,8 @@ mod type_into_tests {
 
 /// F2 — direct `/ui-bridge/control/components` envelope shape (Direction B).
 /// Verifies the response carries `data.components` AS THE ONLY components
-/// field. Pure unit test against the literal shape the handler emits; an
+/// field, beside the `data.wrapperComponents` disclosure. Pure unit tests of
+/// [`components_envelope`], the function the handler's read ends in; an
 /// axum-router-level integration test would need a fully constructed
 /// `ApiState`.
 ///
@@ -5431,17 +5534,27 @@ mod type_into_tests {
 /// review.
 #[cfg(test)]
 mod components_envelope_tests {
+    use super::{components_envelope, ComponentSources};
     use serde_json::json;
 
-    /// Mirrors the literal at the bottom of `ui_bridge_get_components_handler`.
-    /// Update in lock-step if the handler's `Ok(Json(serde_json::json!(...)))`
-    /// payload changes.
     fn components_response(components: Vec<serde_json::Value>) -> serde_json::Value {
-        let components_array = serde_json::Value::Array(components);
-        json!({
-            "success": true,
-            "data": { "components": components_array },
-        })
+        components_envelope(components, ComponentSources::RunnerAndWrappers)
+    }
+
+    /// The disclosure names which half was asked, so an empty wrapper half is
+    /// never ambiguous: `included` for a local read, `withheld` for a relayed
+    /// one. Spelled as literals, so renaming a value fails here.
+    #[test]
+    fn the_envelope_says_whether_wrappers_were_asked() {
+        let local = components_envelope(vec![], ComponentSources::RunnerAndWrappers);
+        assert_eq!(local["data"]["wrapperComponents"], json!("included"));
+        let relayed = components_envelope(vec![], ComponentSources::RunnerOnly);
+        assert_eq!(relayed["data"]["wrapperComponents"], json!("withheld"));
+        assert_eq!(
+            relayed["data"]["components"],
+            json!([]),
+            "the disclosure sits beside the list, it does not replace it"
+        );
     }
 
     #[test]
@@ -5522,7 +5635,10 @@ mod components_envelope_tests {
 // ============================================================================
 #[cfg(test)]
 mod ws_dispatch_selection_tests {
-    use super::{try_ws_dispatch_for_app, ws_collect_components};
+    use super::{
+        components_read, try_ws_dispatch_for_app, ws_collect_components, ws_components_for,
+        ComponentSources,
+    };
     use crate::mcp::app_discovery::DiscoveredApp;
     use crate::mcp::app_dispatch::AppDispatcher;
     use crate::mcp::app_registry::{AppRegistry, AppTransport};
@@ -5999,6 +6115,152 @@ mod ws_dispatch_selection_tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(ids, expected, "merged ids must contain every WS component");
+    }
+
+    /// Plan 2026-10-23-console-presentation-spaces Phase 6, review round 1:
+    /// the relay's marker header, and only that header, selects the
+    /// runner-only read. Presence is the signal, so an empty value or a
+    /// re-cased name still marks the request. The header name is spelled
+    /// here as a literal, so renaming the constant fails this test.
+    #[test]
+    fn the_relay_marker_selects_the_runner_only_read() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+        assert_eq!(
+            ComponentSources::for_request(&HeaderMap::new()),
+            ComponentSources::RunnerAndWrappers,
+            "a local read asks the wrappers"
+        );
+        let marked = |name: &[u8], value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_bytes(name).unwrap(),
+                HeaderValue::from_static(value),
+            );
+            ComponentSources::for_request(&headers)
+        };
+        assert_eq!(
+            marked(b"x-qontinui-relayed", "http_request"),
+            ComponentSources::RunnerOnly
+        );
+        assert_eq!(
+            marked(b"X-Qontinui-Relayed", ""),
+            ComponentSources::RunnerOnly
+        );
+        assert_eq!(
+            marked(b"x-qontinui-relay", "http_request"),
+            ComponentSources::RunnerAndWrappers,
+            "a header that is not the marker selects nothing"
+        );
+    }
+
+    /// A live wrapper that never answers, and a dispatcher at the PRODUCTION
+    /// command timeout, so any dispatch made waits its full 30 s.
+    async fn hung_wrapper() -> (
+        std::sync::Arc<AppRegistry>,
+        std::sync::Arc<AppDispatcher>,
+        std::sync::Arc<CommandRelay>,
+        u64,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn, rx) = ws.test_register("hung-wrapper").await;
+        registry
+            .upsert(
+                sample_app("hung-wrapper"),
+                None,
+                AppTransport::Websocket,
+                Some(conn),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(ws);
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+        (registry, dispatcher, relay, conn, rx)
+    }
+
+    /// A relayed read asks no wrapper at all, so a wrapper that never answers
+    /// cannot hold it. The local read beside it DOES send that wrapper a
+    /// `getComponents` command, which is what makes the first half
+    /// discriminating: the wrapper is live and dispatchable, and the
+    /// runner-only read leaves it alone anyway.
+    #[tokio::test]
+    async fn a_runner_only_read_dispatches_to_no_wrapper() {
+        let (registry, dispatcher, relay, conn, mut rx) = hung_wrapper().await;
+
+        let withheld = tokio::time::timeout(
+            Duration::from_secs(2),
+            ws_components_for(ComponentSources::RunnerOnly, &registry, &dispatcher),
+        )
+        .await
+        .expect("a runner-only read must not wait on a wrapper");
+        assert!(withheld.is_empty(), "{withheld:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a runner-only read sent the wrapper a command"
+        );
+
+        let (registry_h, dispatcher_h) = (registry.clone(), dispatcher.clone());
+        let local = tokio::spawn(async move {
+            ws_components_for(
+                ComponentSources::RunnerAndWrappers,
+                &registry_h,
+                &dispatcher_h,
+            )
+            .await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a local read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-1" }])),
+                    error: None,
+                },
+            )
+            .await;
+        assert_eq!(local.await.unwrap(), vec![json!({ "id": "wrapper-1" })]);
+    }
+
+    /// The read core under each source selection, with the runner's own
+    /// registry stubbed. A relayed read returns the runner's entries alone and
+    /// says the wrappers were withheld. When the runner's own read fails, a
+    /// relayed read is an ERROR: with no wrapper half to fall back to, an
+    /// empty list would claim the runner registers nothing.
+    #[tokio::test]
+    async fn a_relayed_read_returns_the_runners_registry_or_its_error() {
+        let (registry, dispatcher, _relay, _conn, mut rx) = hung_wrapper().await;
+
+        let body = components_read(
+            ComponentSources::RunnerOnly,
+            &registry,
+            &dispatcher,
+            async { Ok::<_, String>(json!([{ "id": "runner-1" }])) },
+        )
+        .await
+        .expect("the runner's own registry answered")
+        .0;
+        assert_eq!(body["data"]["components"], json!([{ "id": "runner-1" }]));
+        assert_eq!(body["data"]["wrapperComponents"], json!("withheld"));
+
+        let failed = components_read(
+            ComponentSources::RunnerOnly,
+            &registry,
+            &dispatcher,
+            async { Err::<serde_json::Value, _>("UI Bridge request timed out".to_string()) },
+        )
+        .await;
+        let (status, _) = failed.expect_err("a failed runner read is not an empty list");
+        assert!(status.is_server_error(), "{status}");
+        assert!(rx.try_recv().is_err(), "no wrapper was asked either time");
     }
 }
 
