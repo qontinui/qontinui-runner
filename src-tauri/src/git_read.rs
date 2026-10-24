@@ -147,14 +147,7 @@ fn shorten_unambiguous(repo: &Repository, full: &str) -> Read<String> {
     if short.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
         return Err(unsupported("a top-level-ref-shaped name"));
     }
-    // git's first rule reads `$GIT_DIR/<short>` as a file, and on a
-    // case-insensitive filesystem a branch named `head` finds `HEAD` there
-    // (the CLI then prints `heads/head`). Any FILE of that name in either git
-    // dir is left to the CLI.
-    if [repo.path(), repo.commondir()]
-        .iter()
-        .any(|d| d.join(short).is_file())
-    {
+    if shadowed_by_a_git_dir_file(repo, short) {
         return Err(unsupported("a name a git-dir file shadows"));
     }
     for prefix in earlier {
@@ -178,6 +171,19 @@ fn not_a_symref_chain(repo: &Repository, target: &str) -> Read<()> {
     Ok(())
 }
 
+/// True when a FILE named `name` sits in either git dir. git's first DWIM
+/// rule (`%s`) reads `$GIT_DIR/<name>`, and on a case-insensitive filesystem a
+/// branch named `head` finds `HEAD` there: `rev-parse head` answers HEAD's
+/// commit and `symbolic-ref --short` prints `heads/head`. libgit2 skips that
+/// rule for a one-level name that is not all caps, so it would answer with
+/// the branch. Such a name is left to the CLI (a harmless decline for
+/// `config` or `index`, which the CLI resolves to the branch too).
+fn shadowed_by_a_git_dir_file(repo: &Repository, name: &str) -> bool {
+    [repo.path(), repo.commondir()]
+        .iter()
+        .any(|d| d.join(name).is_file())
+}
+
 /// True for a spec git could read as an object id rather than a ref name.
 fn hex_shaped(spec: &str) -> bool {
     !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_hexdigit())
@@ -188,10 +194,17 @@ fn hex_shaped(spec: &str) -> bool {
 /// — libgit2's `git_reference_dwim` uses the same list in the same order),
 /// WITHOUT looking the object up: `rev-parse --verify` prints a dangling ref's
 /// target too. `None` when no rule names a ref. A hex-shaped spec is `Err`:
-/// git may read it as an (abbreviated) object id.
+/// git may read it as an (abbreviated) object id. So is a lowercase-bearing
+/// spec a git-dir file shadows ([`shadowed_by_a_git_dir_file`]); an all-caps
+/// name (`HEAD`, `ORIG_HEAD`) is read through `%s` by both, so it is not.
 fn resolve_ref(repo: &Repository, spec: &str) -> Read<Option<Oid>> {
     if hex_shaped(spec) {
         return Err(unsupported("a hex-shaped revision"));
+    }
+    if !spec.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        && shadowed_by_a_git_dir_file(repo, spec)
+    {
+        return Err(unsupported("a revision a git-dir file shadows"));
     }
     let Some(r) = found(repo.resolve_reference_from_short_name(spec))? else {
         return Ok(None);
@@ -938,6 +951,43 @@ mod tests {
             Some("origin/main"),
             "the public resolver still answers what the CLI answers"
         );
+    }
+
+    /// A name a git-dir file shadows goes to the CLI, for ref reads and for
+    /// `symbolic-ref --short` alike. `config` is a file in every git dir, so
+    /// that arm runs everywhere; `head` is the arm where git2 and the CLI
+    /// would really disagree, and it exists only on a case-insensitive
+    /// filesystem (where `.git/head` opens `HEAD`).
+    #[test]
+    fn a_name_a_git_dir_file_shadows_falls_back_to_the_cli() {
+        let t = tempfile::tempdir().unwrap();
+        let c = clone_on_feature(t.path(), "main");
+        git(&c, &["branch", "config", "HEAD~1"]);
+        let repo = open(&c).unwrap();
+        assert!(verify_ref(&repo, "config").is_err(), "git2 must decline");
+        assert!(is_ancestor(&repo, "config", "HEAD").is_err());
+        let want = cli(&c, &["rev-parse", "--verify", "--quiet", "config"]);
+        assert!(want.is_some(), "premise: the CLI resolves the branch");
+        let mut tally = Tally::default();
+        let got = or_cli(
+            Some(&repo),
+            &mut tally,
+            |r| verify_ref(r, "config"),
+            || cli(&c, &["rev-parse", "--verify", "--quiet", "config"]),
+        );
+        assert_eq!(got, want);
+        assert_eq!(tally.fell_back, 1);
+        // The branch itself is an ordinary name and still answers in-process.
+        assert!(verify_ref(&repo, "feature").unwrap().is_some());
+
+        if c.join(".git").join("head").is_file() {
+            git(&c, &["branch", "head", "HEAD~1"]);
+            assert!(
+                verify_ref(&repo, "head").is_err(),
+                "on a case-insensitive filesystem `head` is HEAD to the CLI"
+            );
+            assert!(ahead_behind(&repo, "head", "HEAD").is_err());
+        }
     }
 
     /// A linked worktree of a shallow clone: git keeps `shallow` in the

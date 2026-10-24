@@ -127,6 +127,7 @@ struct Entry {
 /// Per-directory cache of [`LocalFacts`].
 pub(super) struct CaptureMemo {
     map: Mutex<HashMap<PathBuf, Entry>>,
+    cap: usize,
 }
 
 impl CaptureMemo {
@@ -136,8 +137,13 @@ impl CaptureMemo {
     }
 
     pub(super) fn new() -> CaptureMemo {
+        CaptureMemo::with_cap(MEMO_CAP)
+    }
+
+    fn with_cap(cap: usize) -> CaptureMemo {
         CaptureMemo {
             map: Mutex::new(HashMap::new()),
+            cap,
         }
     }
 
@@ -171,7 +177,7 @@ impl CaptureMemo {
         let mut map = self.lock();
         match (&facts, before) {
             (Some(f), Some(fp)) if fingerprint(dir, head_oid).as_ref() == Some(&fp) => {
-                if map.len() >= MEMO_CAP && !map.contains_key(dir) {
+                if map.len() >= self.cap && !map.contains_key(dir) {
                     map.clear();
                 }
                 map.insert(
@@ -445,6 +451,31 @@ mod tests {
         });
         assert_eq!(captures, 1, "recaptured");
         assert_eq!(memo.len(), 1, "and now it held still, so it is kept");
+    }
+
+    #[test]
+    fn a_full_memo_is_emptied_before_a_new_directory_is_stored() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let root = t.path().join(format!("r{i}"));
+                std::fs::create_dir_all(&root).unwrap();
+                tree(&root)
+            })
+            .collect();
+        let memo = CaptureMemo::with_cap(2);
+        let now = Instant::now();
+        for d in &dirs[..2] {
+            memo.local_facts(d, OID, now, AGE, || Some(facts(1)));
+        }
+        assert_eq!(memo.len(), 2, "at the cap");
+        // Re-storing a directory already held does not empty the memo.
+        std::fs::write(dirs[0].join(".git").join("index"), b"DIRC-moved").unwrap();
+        memo.local_facts(&dirs[0], OID, now, AGE, || Some(facts(2)));
+        assert_eq!(memo.len(), 2, "an existing key is replaced in place");
+        // A third directory empties it first, then is stored alone.
+        memo.local_facts(&dirs[2], OID, now, AGE, || Some(facts(3)));
+        assert_eq!(memo.len(), 1, "emptied, then the new entry stored");
     }
 
     #[test]
