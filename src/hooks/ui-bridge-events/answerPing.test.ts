@@ -56,6 +56,14 @@ describe("answerPing", () => {
     await expect(answerPing("main", neverEmit, neverHttp, 20)).resolves.toBe("failed");
   });
 
+  it("treats an HTTP leg that throws synchronously as failed and falls back", async () => {
+    const http = vi.fn(() => {
+      throw new Error("sync");
+    });
+    const emit = vi.fn().mockResolvedValue(undefined);
+    await expect(answerPing("main", emit, http)).resolves.toBe("event");
+  });
+
   it("reports failed when both legs fail", async () => {
     const http = vi.fn().mockResolvedValue(false);
     const emit = vi.fn().mockRejectedValue(new Error("ipc down"));
