@@ -498,6 +498,10 @@ pub struct AppState {
     /// critical path — a pre-fetch failure leaves this empty and the task
     /// proceeds unchanged.
     pub prehydration_cache: Arc<crate::unified_workflow_executor::prehydration::PrehydrationCache>,
+    /// The [`crate::terminal::CloseMode`] a `close-request` asked for, carried
+    /// one-shot to the `CloseRequested` worker that runs the teardown (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`, D1).
+    pub pending_close_mode: crate::terminal::PendingCloseMode,
 }
 
 impl AppState {

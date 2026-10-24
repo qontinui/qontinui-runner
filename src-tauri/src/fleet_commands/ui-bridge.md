@@ -245,6 +245,17 @@ curl -s -X POST $BASE/control/page/refresh
 # same path an OS X-click takes). `window.close()` via /control/page/evaluate
 # is a no-op for top-level webviews, so drop to this for close-handler tests.
 curl -s -X POST $BASE/control/page/close-request
+
+# A RESTART that keeps PTY-holder panes alive (runner only): the teardown
+# DETACHES every holder-backed terminal pane instead of killing it, so the next
+# runner adopts it with its process still running. In-process panes still die.
+# Without the field (or with any other value) the close kills every pane, as
+# the X button does. Main window only: `handoff` with a non-main `label` is a
+# 400; a runner with no main window (headless) answers 409 with context code
+# HANDOFF_REQUIRES_MAIN_WINDOW — use force-close there, which takes the same
+# field.
+curl -s -X POST $BASE/control/page/close-request -H "Content-Type: application/json" -d '{"handoff": "holders"}'
+curl -s -X POST $BASE/control/page/force-close -H "X-Qontinui-Force-Close: 1" -d '{"handoff": "holders", "reason": "restart"}'
 ```
 
 ### Console Errors

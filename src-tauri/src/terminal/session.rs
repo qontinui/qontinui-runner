@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1421,9 +1421,10 @@ struct IdentitySeamOutcome {
 /// on-exit hook ([`TerminalSession::set_on_exit`]) and frozen on the session
 /// ([`TerminalSession::exit_snapshot`]).
 ///
-/// `close_requested` is [`mark_exited_was_runner_initiated`]'s verdict: a
-/// runner-initiated close (tab close, remote close, `close_all`) cleared
-/// `is_alive` before its kill, so the exit is the kill's, not the agent's.
+/// `close_requested` is the close intent's verdict ([`CloseIntent`]): a
+/// runner-initiated close (tab close, remote close, `close_all`) recorded
+/// [`CloseIntent::RunnerKill`] before its kill, so the exit is the kill's,
+/// not the agent's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaneExitFacts {
     /// The pane's real exit code; `None` when the wait failed.
@@ -1437,6 +1438,264 @@ impl PaneExitFacts {
     /// process (see [`on_exit_hook_code`]) or no status was observed.
     pub fn agent_exit_code(self) -> Option<i32> {
         on_exit_hook_code(self.code, self.close_requested)
+    }
+}
+
+/// Why the runner is closing a pane, recorded on the session BEFORE the close
+/// acts on the pane's process — the ONE classifier the waiter reads when its
+/// `wait` settles (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D3). It replaced an `is_alive` swap, which could only say "the runner got
+/// there first" and so had no way to say "the runner DETACHED".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CloseIntent {
+    /// No close was started: a settled `wait` is the process's own exit.
+    None = 0,
+    /// The runner killed (or is closing after the exit of) the pane: the exit
+    /// code is the kill's, not the agent's.
+    RunnerKill = 1,
+    /// The runner DETACHED the pane from its PTY holder: the settled `wait` is
+    /// the detach, the process is still running, and NOTHING exit-shaped may
+    /// follow from it.
+    Handoff = 2,
+}
+
+impl CloseIntent {
+    fn load(slot: &AtomicU8) -> Self {
+        match slot.load(Ordering::SeqCst) {
+            1 => CloseIntent::RunnerKill,
+            2 => CloseIntent::Handoff,
+            _ => CloseIntent::None,
+        }
+    }
+
+    /// SeqCst, and always BEFORE the act it announces (the kill, the
+    /// release): the waiter that wakes on that act must see it.
+    fn store(self, slot: &AtomicU8) {
+        slot.store(self as u8, Ordering::SeqCst);
+    }
+}
+
+/// How [`TerminalSession::close_inner`] treats the pane's process — one close
+/// body for every kind, so the kill, post-exit and handoff paths cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseKind {
+    /// End the process tree.
+    Kill,
+    /// The process already exited on its own (`close_after_graceful_exit`):
+    /// no kill, every other teardown step.
+    AlreadyExited,
+    /// Detach a holder-backed pane and leave its process running for the next
+    /// runner to adopt. A pane with no live holder (a `LocalPty`) is closed as
+    /// [`CloseKind::Kill`].
+    Handoff,
+}
+
+/// What a handoff close did to one pane — what
+/// `TerminalManager::close_all(_, CloseMode::Handoff)` counts in its summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffOutcome {
+    /// Detached, the holder took the detach: the process survives.
+    Detached { holder_pid: u32 },
+    /// Detached, but the holder shares the runner's unit cgroup and dies with
+    /// it (D4): reported KILLED, never survivable.
+    KilledUnprotected { holder_pid: u32, reason: String },
+    /// Released, but the holder did not take the detach within its budget —
+    /// it may survive; the next boot sweep decides (D4).
+    Unconfirmed { holder_pid: u32, reason: String },
+    /// No holder: an in-process pane, killed exactly as by a normal close.
+    KilledInProcess,
+}
+
+impl HandoffOutcome {
+    /// The reason a [`Self::KilledUnprotected`] pane carries.
+    pub const UNPROTECTED_CGROUP: &'static str = "unprotected_cgroup";
+}
+
+/// The side effects the waiter thread runs when a pane's process EXITS —
+/// everything except the coord-close hook, which lives on the session
+/// ([`TerminalSession::set_on_exit`]). Behind a trait so the handoff guard
+/// (D3) is tested without a Tauri `AppHandle`.
+pub(crate) trait WaiterEffects: Send {
+    /// The Tauri `terminal-exit` event plus its WS re-broadcast.
+    fn emit_exit(&self, terminal_id: &str, code: Option<i32>);
+    /// Settle unseen review notes `unknown`.
+    fn settle_review_notes(&self, terminal_id: &str);
+    /// The mobile "exited" push.
+    fn push_mobile_exited(&self, terminal_id: &str, title: &str, code: Option<i32>);
+    /// The clean-exit pop-out window close.
+    fn close_pop_out_if_empty(&self, terminal_id: &str, code: Option<i32>);
+}
+
+/// Production [`WaiterEffects`].
+struct TauriWaiterEffects {
+    app: AppHandle,
+}
+
+impl WaiterEffects for TauriWaiterEffects {
+    fn emit_exit(&self, terminal_id: &str, code: Option<i32>) {
+        TauriExitSink { app: &self.app }.emit_exit(terminal_id, code);
+    }
+    fn settle_review_notes(&self, terminal_id: &str) {
+        // Fire-and-forget; never `confirmed` on a guess.
+        crate::mcp::session_review::settle_on_terminal_exit(
+            self.app.clone(),
+            terminal_id.to_string(),
+        );
+    }
+    fn push_mobile_exited(&self, terminal_id: &str, title: &str, code: Option<i32>) {
+        crate::commands::workflow_events::emit_terminal_exited(terminal_id, title, code);
+    }
+    fn close_pop_out_if_empty(&self, terminal_id: &str, code: Option<i32>) {
+        if let Some(assignments) = tauri::Manager::try_state::<
+            std::sync::Arc<crate::window_assignments::WindowAssignments>,
+        >(&self.app)
+        {
+            crate::commands::terminal_windows::auto_close_owner_window_if_empty(
+                &self.app,
+                assignments.inner(),
+                terminal_id,
+                code,
+            );
+        }
+    }
+}
+
+/// Everything the waiter thread reads and writes once `wait` settles — the
+/// same `Arc`s the session holds. Built in `spawn_with_io` before the session
+/// exists, and (in tests) from a built session ([`TerminalSession::waiter`]).
+struct Waiter {
+    id: TerminalId,
+    title: String,
+    alive: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>>,
+    coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>>,
+    close_intent: Arc<AtomicU8>,
+    io: Arc<dyn PaneIo>,
+}
+
+/// What [`Waiter::settled`] concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaiterVerdict {
+    /// The process exited; every exit-time side effect ran.
+    Exited,
+    /// The pane was handed off: the process is still running in its holder,
+    /// and nothing exit-shaped ran.
+    HandedOff,
+}
+
+impl Waiter {
+    /// Block for the pane's whole life on `wait`, then settle it.
+    fn run(self, effects: &dyn WaiterEffects) -> WaiterVerdict {
+        let waited = self.io.wait();
+        self.settled(waited, effects)
+    }
+
+    /// The waiter's body once `wait` returned `waited`.
+    ///
+    /// The close intent is read FIRST (D3). A `Handoff` settle is the detach,
+    /// whatever value `wait` carries: the coord session mirror must stay
+    /// active, review notes unsettled, no mobile push, no pop-out close, no
+    /// exit event — the process is alive in its holder and the next runner
+    /// adopts it. The exit code and snapshot are left unset too: there was
+    /// no exit to record.
+    fn settled(&self, waited: Result<i32, String>, effects: &dyn WaiterEffects) -> WaiterVerdict {
+        let intent = CloseIntent::load(&self.close_intent);
+        // Only while the pane still reports a holder that took the handoff:
+        // a holder that died (or a child that exited) under the handoff is a
+        // REAL exit, and falls through to the exit path — as a runner-initiated
+        // one, since the runner's close is what this settle answers.
+        if intent == CloseIntent::Handoff {
+            if let Some(h) = self.io.holder_handoff() {
+                self.alive.store(false, Ordering::SeqCst);
+                info!(
+                    terminal_id = %self.id,
+                    holder_pid = h.holder_pid,
+                    child_pid = h.child_pid,
+                    "terminal handed off — process left running in holder {}",
+                    h.holder_pid
+                );
+                return WaiterVerdict::HandedOff;
+            }
+            warn!(
+                terminal_id = %self.id,
+                settled = ?waited,
+                "a handoff close's pane no longer reports a live holder — treating the settle \
+                 as the process's exit"
+            );
+        }
+
+        let code = match waited {
+            Ok(code) => Some(code),
+            Err(e) => {
+                warn!(terminal_id = %self.id, error = %e, "Failed to wait on child process");
+                None
+            }
+        };
+        // Record the exit code BEFORE clearing `is_alive`. The other order
+        // left a window in which a refused write reported "exited with code
+        // unknown" for a code that was already known.
+        if let Ok(mut ec) = self.exit_code.lock() {
+            *ec = code;
+        }
+        self.alive.store(false, Ordering::SeqCst);
+        // A runner-initiated close recorded its intent before its kill — in
+        // which case the exit code is the KILL's, not the agent's (see
+        // `on_exit_hook_code`).
+        let exit_facts = PaneExitFacts {
+            code,
+            close_requested: intent != CloseIntent::None,
+        };
+        if let Ok(mut snap) = self.exit_snapshot.lock() {
+            *snap = Some((exit_facts, std::time::Instant::now()));
+        }
+
+        info!(terminal_id = %self.id, exit_code = ?code, "Terminal process exited");
+
+        // "The child process ended" — the Tauri event plus its WS
+        // re-broadcast. NOT the only notice a pane sends: the tear-down path
+        // sends a second one when the SESSION goes away, which is a different
+        // fact and the one that makes the webview drop the tab. See
+        // `terminal::exit_notice`.
+        effects.emit_exit(&self.id, code);
+
+        // Review notes sent into this pane and not yet seen arriving in its
+        // transcript can no longer arrive: settle them `unknown`.
+        effects.settle_review_notes(&self.id);
+
+        // Push notification for mobile (fire-and-forget)
+        effects.push_mobile_exited(&self.id, &self.title, code);
+
+        // R1 — close the coord session mirror the instant the PTY process
+        // exits, instead of letting it linger `active` until coord's own
+        // stale→closed watcher reaps it (the runner no longer self-closes
+        // abandoned sessions; see coord_sync plan A3). Read the coord id +
+        // hook populated after registration; if the terminal was never wired
+        // into coord there's simply nothing to do. The hook calls
+        // `SessionRegistry::close_by_id`, which is idempotent.
+        let coord_id = self.coord_session_id.lock().ok().and_then(|slot| *slot);
+        if let Some(coord_id) = coord_id {
+            if let Ok(slot) = self.on_exit.lock() {
+                if let Some(cb) = slot.as_ref() {
+                    debug!(
+                        terminal_id = %self.id,
+                        coord_session = %coord_id,
+                        "terminal exit — closing coord session mirror"
+                    );
+                    cb(coord_id, exit_facts);
+                }
+            }
+        }
+
+        // P1 (close-on-clean-exit): on a CLEAN exit only, close the owning
+        // `term-N` pop-out window iff this was its last live session. A
+        // non-zero / unknown exit stays visible (honesty). Guarded inside the
+        // helper.
+        effects.close_pop_out_if_empty(&self.id, code);
+        WaiterVerdict::Exited
     }
 }
 
@@ -1469,11 +1728,19 @@ pub struct TerminalSession {
     rows: AtomicU16,
     /// Whether the shell process is still alive.
     is_alive: Arc<AtomicBool>,
+    /// Why the runner is closing this pane — [`CloseIntent`] as a `u8`, shared
+    /// with the waiter, which reads it to classify a settled `wait`.
+    close_intent: Arc<AtomicU8>,
+    /// How a handoff close observes whether this pane's holder survives the
+    /// runner's stop — `holder_census::holder_protection` (the live holder's
+    /// cgroup, the same reading `/restart-readiness` makes, so an ADOPTED pane
+    /// is classified as truly as a freshly spawned one). A test substitutes it.
+    protection_probe: fn(u32) -> crate::session::tracking_health::HolderProtection,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
     /// The exit facts FROZEN by the waiter as the process ended, with that
     /// instant: the code and whether a runner-initiated close caused the exit
-    /// ([`mark_exited_was_runner_initiated`]). Readers that come AFTER the
+    /// ([`CloseIntent`]). Readers that come AFTER the
     /// exit — the continuation reaper above all — read this snapshot, so a dead
     /// tab the operator closes later still reads as the crash it was (plan
     /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`).
@@ -2382,121 +2649,32 @@ impl TerminalSession {
         let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
-        // Spawn waiter thread: detects process exit
-        let waiter_id = id.clone();
-        let waiter_title = title.clone();
-        let waiter_alive = is_alive.clone();
-        let waiter_exit = exit_code.clone();
+        // Spawn waiter thread: detects process exit. Its whole body is
+        // `Waiter::run` — see `Waiter::settled` for what an exit does, and
+        // for the handoff guard (a detach is not an exit).
         let exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>> =
             Arc::new(Mutex::new(None));
-        let waiter_exit_snapshot = exit_snapshot.clone();
+        let close_intent = Arc::new(AtomicU8::new(CloseIntent::None as u8));
         // Retain a clone for the session struct (input-line warn hook)
         // before the original handle is moved into the waiter thread.
         let session_app_handle = app_handle.clone();
-        let waiter_app = app_handle;
-        let waiter_coord_session_id = coord_session_id.clone();
-        let waiter_on_exit = on_exit.clone();
-        let waiter_io = io.clone();
+        let waiter = Waiter {
+            id: id.clone(),
+            title: title.clone(),
+            alive: is_alive.clone(),
+            exit_code: exit_code.clone(),
+            exit_snapshot: exit_snapshot.clone(),
+            coord_session_id: coord_session_id.clone(),
+            on_exit: on_exit.clone(),
+            close_intent: close_intent.clone(),
+            io: io.clone(),
+        };
+        let waiter_effects = TauriWaiterEffects { app: app_handle };
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
                 // Blocks for the pane's whole life; the seam owns the child.
-                let code = match waiter_io.wait() {
-                    Ok(code) => Some(code),
-                    Err(e) => {
-                        warn!(terminal_id = %waiter_id, error = %e, "Failed to wait on child process");
-                        None
-                    }
-                };
-
-                // Record the exit code BEFORE clearing `is_alive`. The other
-                // order left a window in which a refused write reported
-                // "exited with code unknown" for a code that was already known.
-                if let Ok(mut ec) = waiter_exit.lock() {
-                    *ec = code;
-                }
-                // `swap` reports whether a runner-initiated close (`close_inner`
-                // / `close_kill_only`) had already cleared `is_alive` before its
-                // kill — in which case the exit code is the KILL's, not the
-                // agent's (see `on_exit_hook_code`).
-                let runner_initiated = mark_exited_was_runner_initiated(&waiter_alive);
-                let exit_facts = PaneExitFacts {
-                    code,
-                    close_requested: runner_initiated,
-                };
-                if let Ok(mut snap) = waiter_exit_snapshot.lock() {
-                    *snap = Some((exit_facts, std::time::Instant::now()));
-                }
-
-                info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
-
-                // "The child process ended" — the Tauri event plus its WS
-                // re-broadcast. NOT the only notice a pane sends: the
-                // tear-down path sends a second one when the SESSION goes
-                // away, which is a different fact and the one that makes the
-                // webview drop the tab. See `terminal::exit_notice`.
-                TauriExitSink { app: &waiter_app }.emit_exit(&waiter_id, code);
-
-                // Review notes sent into this pane and not yet seen arriving in
-                // its transcript can no longer arrive: settle them `unknown`
-                // (never `confirmed` on a guess). Fire-and-forget.
-                crate::mcp::session_review::settle_on_terminal_exit(
-                    waiter_app.clone(),
-                    waiter_id.clone(),
-                );
-
-                // Push notification for mobile (fire-and-forget)
-                crate::commands::workflow_events::emit_terminal_exited(
-                    &waiter_id,
-                    &waiter_title,
-                    code,
-                );
-
-                // R1 — close the coord session mirror the instant the PTY
-                // process exits, instead of letting it linger `active`
-                // until coord's own stale→closed watcher reaps it (the
-                // runner no longer self-closes abandoned sessions; see
-                // coord_sync plan A3). Read the coord id + hook
-                // populated by `terminal_create` after registration; if the
-                // terminal was never wired into coord (registration failed,
-                // or close raced ahead via the frontend `terminal_close`
-                // path which clears nothing here but is idempotent on the
-                // registry side), there's simply nothing to do. The hook
-                // calls `SessionRegistry::close_by_id`, which is idempotent
-                // — a no-op when the session is already Closed.
-                let coord_id = waiter_coord_session_id
-                    .lock()
-                    .ok()
-                    .and_then(|slot| *slot);
-                if let Some(coord_id) = coord_id {
-                    if let Ok(slot) = waiter_on_exit.lock() {
-                        if let Some(cb) = slot.as_ref() {
-                            debug!(
-                                terminal_id = %waiter_id,
-                                coord_session = %coord_id,
-                                "terminal exit — closing coord session mirror"
-                            );
-                            cb(coord_id, exit_facts);
-                        }
-                    }
-                }
-
-                // P1 (close-on-clean-exit): on a CLEAN exit only, close the
-                // owning `term-N` pop-out window iff this was its last live
-                // session. A non-zero / unknown exit stays visible (honesty).
-                // Docked sessions (owner "main") and the main window are never
-                // auto-closed. Best-effort + cheap; guarded inside the helper.
-                if let Some(assignments) = tauri::Manager::try_state::<
-                    std::sync::Arc<crate::window_assignments::WindowAssignments>,
-                >(&waiter_app)
-                {
-                    crate::commands::terminal_windows::auto_close_owner_window_if_empty(
-                        &waiter_app,
-                        assignments.inner(),
-                        &waiter_id,
-                        code,
-                    );
-                }
+                waiter.run(&waiter_effects);
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
@@ -2511,6 +2689,8 @@ impl TerminalSession {
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             is_alive,
+            close_intent,
+            protection_probe: crate::terminal::holder_census::holder_protection,
             exit_code,
             reader_join: Mutex::new(Some(reader_handle)),
             waiter_join: Mutex::new(Some(waiter_handle)),
@@ -4817,15 +4997,19 @@ impl TerminalSession {
     /// a bare shell (the caller established no `claude` is alive anywhere) and
     /// the ordinary close applies.
     ///
-    /// `kill_child` is `is_alive()`, a COARSE proxy — it answers "is the pane's
+    /// Whether to kill is `is_alive()`, a COARSE proxy — it answers "is the pane's
     /// shell running", not "is a live `claude` in this pane". The relaunch
     /// window that makes the difference is closed one level up, by
     /// `TerminalManager::graceful_exit`'s re-probe, which refuses the close
     /// rather than reaching this function at all when a `claude` reappeared
     /// (see `graceful_exit::CloseTabResult`).
     pub(super) fn close_after_graceful_exit(&self) {
-        let kill_child = self.is_alive();
-        self.close_inner(None, kill_child);
+        let kind = if self.is_alive() {
+            CloseKind::Kill
+        } else {
+            CloseKind::AlreadyExited
+        };
+        self.close_inner(None, kind);
     }
 
     /// Check if the shell process is still alive.
@@ -4870,25 +5054,82 @@ impl TerminalSession {
     /// - once nothing is left, the joins and the shim-dir sweep are skipped
     ///   (the PTY child is already dead by then — that part always runs).
     pub fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
-        self.close_inner(deadline, true);
+        self.close_inner(deadline, CloseKind::Kill);
     }
 
-    /// The close body. `kill_child = false` skips only the process kill — for a
-    /// pane whose process is known to have exited already
-    /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
-    fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
-        info!(terminal_id = %self.id, "Closing terminal session");
-        // SeqCst, and BEFORE the kill: the waiter classifies the exit the kill
-        // causes as runner-initiated by seeing this store (see
-        // `mark_exited_was_runner_initiated`).
+    /// Close this pane for a runner RESTART: a holder-backed pane is detached
+    /// from its PTY holder and its process is LEFT RUNNING for the next
+    /// runner's boot sweep to adopt; a pane with no live holder is killed
+    /// exactly as by [`Self::close_with_deadline`]. Plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D2.
+    pub(crate) fn close_for_handoff(&self, deadline: Option<std::time::Instant>) -> HandoffOutcome {
+        self.close_inner(deadline, CloseKind::Handoff)
+    }
+
+    /// Whether this pane's process lives in an out-of-process holder that a
+    /// handoff close would detach rather than kill.
+    pub fn is_holder_backed(&self) -> bool {
+        self.io.holder_handoff().is_some()
+    }
+
+    /// The close body, one for every [`CloseKind`]. `AlreadyExited` skips only
+    /// the process kill — for a pane whose process is known to have exited
+    /// already ([`Self::close_after_graceful_exit`]); every other teardown
+    /// step runs. `Handoff` on a holder-backed pane keeps everything the live
+    /// process still owns (D2); on any other pane it IS `Kill`. The returned
+    /// [`HandoffOutcome`] is meaningful for `Handoff` only.
+    fn close_inner(&self, deadline: Option<std::time::Instant>, kind: CloseKind) -> HandoffOutcome {
+        self.close_inner_with(
+            deadline,
+            kind,
+            self.app_handle.as_ref().map(|app| TauriExitSink { app }),
+        )
+    }
+
+    /// [`Self::close_inner`] with the notice sink supplied — the seam a test
+    /// drives without a Tauri `AppHandle`.
+    fn close_inner_with<S: ExitNoticeSink>(
+        &self,
+        deadline: Option<std::time::Instant>,
+        kind: CloseKind,
+        sink: Option<S>,
+    ) -> HandoffOutcome {
+        // A handoff needs a live holder to hand the process to; without one
+        // (a `LocalPty`, a holder already gone) it is an ordinary kill.
+        let holder = match kind {
+            CloseKind::Handoff => self.io.holder_handoff(),
+            CloseKind::Kill | CloseKind::AlreadyExited => None,
+        };
+        let handoff = holder.is_some();
+        info!(terminal_id = %self.id, ?kind, handoff, "Closing terminal session");
+        // SeqCst, and BEFORE the kill or the release: the waiter classifies
+        // the settle that act causes by this intent (D3).
+        if handoff {
+            CloseIntent::Handoff.store(&self.close_intent);
+            // Before the detach, so no close it provokes (the webview's
+            // `pty-exit` record-close above all) can retire the record the
+            // next runner adopts this pane under, queue a coord `Closed`, or
+            // revoke the workdir's coord-mcp nonce the live process still
+            // uses (plan Phase 0, probe 6).
+            if let Some(store) = self.lifecycle_store() {
+                store.mark_terminal_handed_off(&self.id);
+            }
+        } else {
+            CloseIntent::RunnerKill.store(&self.close_intent);
+        }
         self.is_alive.store(false, Ordering::SeqCst);
 
         // Phase 2 — drop the isolated edit context first so the
         // claim-release fire-and-forget posts ahead of the PTY teardown
         // (release uses tokio::spawn; running it before we drain threads
-        // makes ordering observable in coord audit logs).
-        if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
-            slot.take();
+        // makes ordering observable in coord audit logs). NOT on a handoff:
+        // the process that holds those claims is still running, and keeps
+        // them until it really exits (D2 step 2).
+        if !handoff {
+            if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
+                slot.take();
+            }
         }
 
         // Kill the child process tree, if there is one.
@@ -4899,17 +5140,22 @@ impl TerminalSession {
         // walks EVERY live terminal on shutdown (138 were live during the
         // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
         // blocked thread at exactly the moment the process is trying to exit.
-        if kill_child {
-            let kill_budget =
-                std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
-            if let Err(e) = self.io.kill(kill_budget) {
-                warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
-            }
-        } else {
-            info!(
+        match (kind, handoff) {
+            (_, true) => info!(
+                terminal_id = %self.id,
+                "handoff close — detaching the pane from its PTY holder, no kill"
+            ),
+            (CloseKind::AlreadyExited, false) => info!(
                 terminal_id = %self.id,
                 "pane process already exited — closing without a kill"
-            );
+            ),
+            (CloseKind::Kill | CloseKind::Handoff, false) => {
+                let kill_budget =
+                    std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
+                if let Err(e) = self.io.kill(kill_budget) {
+                    warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
+                }
+            }
         }
 
         // Drop the writer to signal EOF on stdin.
@@ -4926,9 +5172,9 @@ impl TerminalSession {
             None => warn!(
                 terminal_id = %self.id,
                 "Could not acquire the writer lock within the shutdown budget — skipping \
-                 the stdin EOF flush (the PTY child has been killed, UNLESS this close \
-                 was entered with kill_child = false — the graceful-exit path, where the \
-                 child exited on its own `/exit`)"
+                 the stdin flush (the PTY child has been killed, UNLESS this close is \
+                 AlreadyExited — the graceful-exit path, where the child exited on its own \
+                 `/exit` — or a Handoff, where it is still running in its holder)"
             ),
         }
 
@@ -4938,7 +5184,18 @@ impl TerminalSession {
         // `release` can fail for more than a spent budget — a holder pane
         // released after a kill that did not land says so in its error — so
         // the log carries the pane's own reason rather than assuming one.
-        if let Err(e) = self.io.release(lock_budget) {
+        //
+        // On a handoff this release IS the detach (no prior `kill`), and it is
+        // floored like the kill: a detach squeezed to nothing by an exhausted
+        // shutdown budget would end the connection without the holder taking
+        // the frame, which reads as UNCONFIRMED.
+        let release_budget = if handoff {
+            std::cmp::max(lock_budget, KILL_FLOOR)
+        } else {
+            lock_budget
+        };
+        let released = self.io.release(release_budget);
+        if let Err(e) = &released {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
@@ -4986,7 +5243,15 @@ impl TerminalSession {
         // it is skipped once the shutdown budget is gone. `sweep_stale` reaps
         // what is left at the next materialize — exactly as it already does
         // after a crash.
-        if clamp_to_deadline(JOIN_TIMEOUT, deadline).is_zero() && deadline.is_some() {
+        //
+        // Not on a handoff: the live child's `PATH` still points at that dir,
+        // and the adopting runner owns it from then on (D2 step 6).
+        if handoff {
+            debug!(
+                terminal_id = %self.id,
+                "Handoff — the install-intercept shim dir stays with the live process"
+            );
+        } else if clamp_to_deadline(JOIN_TIMEOUT, deadline).is_zero() && deadline.is_some() {
             debug!(
                 terminal_id = %self.id,
                 "Shutdown budget exhausted — leaving the shim dir to the stale sweep"
@@ -5013,9 +5278,93 @@ impl TerminalSession {
         // removed the session from its map and the pane's handles are
         // released above, so the re-sync this notice triggers reads a
         // `terminal_list` the terminal is genuinely absent from.
-        self.notify_exit_on_teardown(self.app_handle.as_ref().map(|app| TauriExitSink { app }));
+        //
+        // A handoff sends the handed-off notice INSTEAD (D2 step 7): the
+        // exit notice makes the webview drop the tab and record a close, and
+        // the session did not end — its process is alive for the next runner.
+        let Some(holder) = holder else {
+            self.notify_exit_on_teardown(sink);
+            info!(terminal_id = %self.id, "Terminal session closed");
+            return HandoffOutcome::KilledInProcess;
+        };
+        // The notice is chosen AFTER the release, from what the pane reports
+        // then (review round 2).
+        let after = self.io.holder_handoff();
+        let holder_gone = after.is_none();
+        let outcome = handoff_outcome(&holder, after, released, self.protection_probe);
+        if holder_gone && matches!(outcome, HandoffOutcome::Unconfirmed { .. }) {
+            // An unconfirmed handoff whose holder is GONE handed nothing off:
+            // the pane really ended. Withdraw the handed-off mark so a close of
+            // this terminal is a real close again, and send the EXIT notice.
+            if let Some(store) = self.lifecycle_store() {
+                store.unmark_terminal_handed_off(&self.id);
+            }
+            self.notify_exit_on_teardown(sink);
+        } else if let Some(sink) = sink {
+            sink.emit_handed_off(&self.id, holder.holder_pid);
+        }
+        match &outcome {
+            HandoffOutcome::Detached { holder_pid } => info!(
+                terminal_id = %self.id,
+                holder_pid,
+                child_pid = holder.child_pid,
+                "Terminal session handed off — process left running in its holder"
+            ),
+            HandoffOutcome::KilledUnprotected { holder_pid, reason } => warn!(
+                terminal_id = %self.id,
+                holder_pid,
+                reason = %reason,
+                "Terminal session detached, but its holder shares the runner's unit cgroup \
+                 and dies with it — reported KILLED, not survivable"
+            ),
+            HandoffOutcome::Unconfirmed { holder_pid, reason } => warn!(
+                terminal_id = %self.id,
+                holder_pid,
+                reason = %reason,
+                "Terminal session released for handoff, but the detach is UNCONFIRMED — it may \
+                 survive; the next boot sweep decides"
+            ),
+            HandoffOutcome::KilledInProcess => {}
+        }
+        outcome
+    }
 
-        info!(terminal_id = %self.id, "Terminal session closed");
+    /// The app's session lifecycle store, when this session runs in an app.
+    fn lifecycle_store(
+        &self,
+    ) -> Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>> {
+        let app = self.app_handle.as_ref()?;
+        tauri::Manager::try_state::<
+            Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        >(app)
+        .map(|s| s.inner().clone())
+    }
+
+    /// Give up on handing this pane off WITHOUT touching it — the handoff
+    /// teardown's total budget ran out before its turn (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// review round 1). Its intent is recorded as a handoff and its terminal
+    /// marked handed off, exactly as a handoff close would, but nothing is
+    /// released: the imminent process exit ends this runner's connections,
+    /// which the holder reads as a detach, so the process lives on UNCONFIRMED.
+    /// The caller must not let the session DROP afterwards — a drop of a live
+    /// session closes it, and that close kills.
+    pub(crate) fn abandon_for_handoff(&self) -> HandoffOutcome {
+        let holder_pid = self.io.holder_handoff().map(|h| h.holder_pid).unwrap_or(0);
+        CloseIntent::Handoff.store(&self.close_intent);
+        if let Some(store) = self.lifecycle_store() {
+            store.mark_terminal_handed_off(&self.id);
+        }
+        self.is_alive.store(false, Ordering::SeqCst);
+        warn!(
+            terminal_id = %self.id,
+            holder_pid,
+            "handoff budget exhausted — pane left to its holder unreleased (UNCONFIRMED)"
+        );
+        HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: "the handoff teardown's budget ran out before this pane's release".to_string(),
+        }
     }
 
     /// Send the pane's tear-down exit notice. Returns `true` when one was sent.
@@ -5055,7 +5404,8 @@ impl TerminalSession {
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
         );
-        // SeqCst, before the kill — see `mark_exited_was_runner_initiated`.
+        // SeqCst, before the kill — see `CloseIntent`.
+        CloseIntent::RunnerKill.store(&self.close_intent);
         self.is_alive.store(false, Ordering::SeqCst);
 
         if let Err(e) = self.io.kill(KILL_FLOOR) {
@@ -5064,12 +5414,106 @@ impl TerminalSession {
     }
 }
 
-/// Called by the waiter once the child has exited: clears `is_alive` and
-/// reports whether a runner-initiated close (`close_inner` /
-/// `close_kill_only`, which clear it with SeqCst BEFORE they kill the child)
-/// got there first — i.e. whether this exit was caused by the runner's kill.
-fn mark_exited_was_runner_initiated(is_alive: &AtomicBool) -> bool {
-    !is_alive.swap(false, Ordering::SeqCst)
+#[cfg(test)]
+impl TerminalSession {
+    /// Test seam: run the waiter's settle for this session — the exact body
+    /// the waiter thread runs once `wait` returns `waited` — against `effects`.
+    /// `true` when it concluded the pane was handed off.
+    pub(crate) fn settle_waiter_for_test(
+        &self,
+        waited: Result<i32, String>,
+        effects: &dyn WaiterEffects,
+    ) -> bool {
+        self.waiter().settled(waited, effects) == WaiterVerdict::HandedOff
+    }
+
+    /// The [`Waiter`] over this session's own slots.
+    fn waiter(&self) -> Waiter {
+        Waiter {
+            id: self.id.clone(),
+            title: self.title(),
+            alive: self.is_alive.clone(),
+            exit_code: self.exit_code.clone(),
+            exit_snapshot: self.exit_snapshot.clone(),
+            coord_session_id: self.coord_session_id.clone(),
+            on_exit: self.on_exit.clone(),
+            close_intent: self.close_intent.clone(),
+            io: self.io.clone(),
+        }
+    }
+
+    /// Test seam: a handoff close with `sink` in place of the Tauri sink.
+    pub(crate) fn close_for_handoff_with<S: ExitNoticeSink>(
+        &self,
+        deadline: Option<std::time::Instant>,
+        sink: Option<S>,
+    ) -> HandoffOutcome {
+        self.close_inner_with(deadline, CloseKind::Handoff, sink)
+    }
+
+    /// Test seam: how a handoff close observes holder protection.
+    pub(crate) fn set_protection_probe_for_test(
+        &mut self,
+        probe: fn(u32) -> crate::session::tracking_health::HolderProtection,
+    ) {
+        self.protection_probe = probe;
+    }
+
+    /// Test seam: rename a fixture session (`make_test_session` is `"test"`).
+    pub(crate) fn set_id_for_test(&mut self, id: &str) {
+        self.id = id.to_string();
+    }
+
+    /// Test seam: put a fixture session on `io`, alive, as a spawn would.
+    pub(crate) fn set_io_for_test(&mut self, io: Arc<dyn PaneIo>) {
+        self.child_pid = io.pid();
+        self.io = io;
+        self.is_alive.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A handoff close's verdict for one holder pane, from the holder facts read
+/// BEFORE the release (`before`), the facts after it (`after`) and the
+/// release's own result. Pure, so D4's classification is tested on its own.
+///
+/// `protection` observes the live holder (production:
+/// `holder_census::holder_protection`): `UnprotectedCgroup` is reported
+/// KILLED (D4), and an unobservable `Unknown` is never read as survivable.
+fn handoff_outcome(
+    before: &super::pane_io::HolderHandoff,
+    after: Option<super::pane_io::HolderHandoff>,
+    released: Result<(), String>,
+    protection: fn(u32) -> crate::session::tracking_health::HolderProtection,
+) -> HandoffOutcome {
+    use crate::session::tracking_health::HolderProtection;
+    let holder_pid = before.holder_pid;
+    if let Err(e) = released {
+        return HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: format!("release failed: {e}"),
+        };
+    }
+    let confirmed = after.as_ref().is_some_and(|h| h.detach_confirmed);
+    if !confirmed {
+        return HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: match after {
+                Some(_) => "the holder did not take the detach within its budget".to_string(),
+                None => "the holder was gone by the end of the release".to_string(),
+            },
+        };
+    }
+    match protection(holder_pid) {
+        HolderProtection::Protected => HandoffOutcome::Detached { holder_pid },
+        HolderProtection::UnprotectedCgroup => HandoffOutcome::KilledUnprotected {
+            holder_pid,
+            reason: HandoffOutcome::UNPROTECTED_CGROUP.to_string(),
+        },
+        HolderProtection::Unknown => HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: "the holder's protection could not be observed".to_string(),
+        },
+    }
 }
 
 /// The exit code handed to the `on_exit` hook.
@@ -5097,7 +5541,7 @@ const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
-const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Cap on each bounded lock acquisition inside
 /// [`TerminalSession::close_with_deadline`] **when a shutdown deadline is in
@@ -5215,16 +5659,18 @@ pub(crate) mod tests {
 
     #[test]
     fn a_natural_exit_is_not_classified_as_runner_initiated() {
-        let alive = AtomicBool::new(true);
-        assert!(!mark_exited_was_runner_initiated(&alive));
-        assert!(!alive.load(Ordering::SeqCst));
+        let intent = AtomicU8::new(CloseIntent::None as u8);
+        assert_eq!(CloseIntent::load(&intent), CloseIntent::None);
+        CloseIntent::RunnerKill.store(&intent);
+        assert_eq!(CloseIntent::load(&intent), CloseIntent::RunnerKill);
+        CloseIntent::Handoff.store(&intent);
+        assert_eq!(CloseIntent::load(&intent), CloseIntent::Handoff);
     }
 
-    /// A pane that records whether `is_alive` was already cleared at the
-    /// moment it was killed.
+    /// A pane that records the close intent at the moment it was killed.
     struct AliveAtKillPaneIo {
-        alive: Arc<AtomicBool>,
-        alive_at_kill: Mutex<Option<bool>>,
+        intent: Arc<AtomicU8>,
+        alive_at_kill: Mutex<Option<CloseIntent>>,
     }
 
     impl crate::terminal::pane_io::PaneIo for AliveAtKillPaneIo {
@@ -5241,7 +5687,7 @@ pub(crate) mod tests {
             Ok(1)
         }
         fn kill(&self, _budget: Duration) -> Result<(), String> {
-            *self.alive_at_kill.lock().unwrap() = Some(self.alive.load(Ordering::SeqCst));
+            *self.alive_at_kill.lock().unwrap() = Some(CloseIntent::load(&self.intent));
             Ok(())
         }
         fn set_paused(&self, _paused: bool) -> Result<(), String> {
@@ -5258,17 +5704,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The load-bearing ordering: both runner close paths clear `is_alive`
-    /// BEFORE killing the child, so the waiter that wakes on the kill sees a
-    /// runner-initiated exit and hands the hook `None`. Reordering a close
-    /// path (or adding a kill that does not clear the flag) fails this.
+    /// The load-bearing ordering: both runner close paths record the
+    /// RunnerKill intent BEFORE killing the child, so the waiter that wakes on
+    /// the kill sees a runner-initiated exit and hands the hook `None`.
     #[test]
-    fn both_runner_close_paths_clear_is_alive_before_the_kill() {
+    fn both_runner_close_paths_record_the_kill_intent_before_the_kill() {
         for kill_only in [false, true] {
             let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
             session.is_alive.store(true, Ordering::SeqCst);
             let io = Arc::new(AliveAtKillPaneIo {
-                alive: session.is_alive.clone(),
+                intent: session.close_intent.clone(),
                 alive_at_kill: Mutex::new(None),
             });
             let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
@@ -5280,11 +5725,9 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 *io.alive_at_kill.lock().unwrap(),
-                Some(false),
-                "kill_only={kill_only}: is_alive must be cleared before the kill"
+                Some(CloseIntent::RunnerKill),
+                "kill_only={kill_only}: the kill intent must be recorded before the kill"
             );
-            // The waiter waking on that kill classifies it as runner-initiated.
-            assert!(mark_exited_was_runner_initiated(&session.is_alive));
             assert_eq!(on_exit_hook_code(Some(1), true), None);
         }
     }
@@ -5664,6 +6107,8 @@ pub(crate) mod tests {
             // Mark the session as already-dead so Drop doesn't try to
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
+            close_intent: Arc::new(AtomicU8::new(CloseIntent::None as u8)),
+            protection_probe: |_| crate::session::tracking_health::HolderProtection::Protected,
             exit_code: Arc::new(Mutex::new(None)),
             exit_snapshot: Arc::new(Mutex::new(None)),
             reader_join: Mutex::new(None),
@@ -9231,5 +9676,461 @@ pub(crate) mod tests {
             0,
             "no byte reached the parser — the old gate signal is blind to this"
         );
+    }
+
+    // =======================================================================
+    // Handoff close (plan
+    // 2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them,
+    // Phase 1): D2's close body and D3's waiter guard.
+    // =======================================================================
+
+    /// A holder-backed pane double: records `kill` / `release`, answers
+    /// `holder_handoff` like `DaemonPaneIo` (Some while live; the detach is
+    /// confirmed once released without a kill), and settles `wait` the way the
+    /// holder does — `Ok(0)` on a detach, `Ok(1)` on a kill.
+    pub(crate) struct FakeHolderIo {
+        pub(crate) holder: bool,
+        pub(crate) take_detach: bool,
+        /// The holder is gone by the end of the release.
+        pub(crate) vanish_on_release: bool,
+        pub(crate) kills: std::sync::atomic::AtomicUsize,
+        pub(crate) releases: std::sync::atomic::AtomicUsize,
+        settled: (Mutex<Option<i32>>, std::sync::Condvar),
+    }
+
+    impl FakeHolderIo {
+        pub(crate) fn holder() -> Self {
+            Self::new(true)
+        }
+        pub(crate) fn in_process() -> Self {
+            Self::new(false)
+        }
+        fn new(holder: bool) -> Self {
+            FakeHolderIo {
+                holder,
+                take_detach: true,
+                vanish_on_release: false,
+                kills: Default::default(),
+                releases: Default::default(),
+                settled: (Mutex::new(None), std::sync::Condvar::new()),
+            }
+        }
+        fn settle(&self, code: i32) {
+            let mut slot = self.settled.0.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(code);
+            }
+            self.settled.1.notify_all();
+        }
+        pub(crate) fn kill_count(&self) -> usize {
+            self.kills.load(Ordering::SeqCst)
+        }
+        pub(crate) fn release_count(&self) -> usize {
+            self.releases.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::terminal::pane_io::PaneIo for FakeHolderIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            let mut slot = self.settled.0.lock().unwrap();
+            while slot.is_none() {
+                slot = self.settled.1.wait(slot).unwrap();
+            }
+            Ok(slot.unwrap())
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            self.settle(1);
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            Some(4243)
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn holder_handoff(&self) -> Option<crate::terminal::pane_io::HolderHandoff> {
+            if !self.holder
+                || self.kill_count() > 0
+                || (self.vanish_on_release && self.release_count() > 0)
+            {
+                return None;
+            }
+            Some(crate::terminal::pane_io::HolderHandoff {
+                holder_pid: 4242,
+                child_pid: 4243,
+                detach_confirmed: self.take_detach && self.release_count() > 0,
+            })
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            // A release with no prior kill is the detach.
+            self.settle(0);
+            Ok(())
+        }
+    }
+
+    /// Records every waiter effect.
+    #[derive(Default)]
+    pub(crate) struct RecordingWaiterEffects {
+        pub(crate) calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl WaiterEffects for RecordingWaiterEffects {
+        fn emit_exit(&self, _terminal_id: &str, _code: Option<i32>) {
+            self.calls.lock().unwrap().push("exit_event");
+        }
+        fn settle_review_notes(&self, _terminal_id: &str) {
+            self.calls.lock().unwrap().push("review_notes");
+        }
+        fn push_mobile_exited(&self, _terminal_id: &str, _title: &str, _code: Option<i32>) {
+            self.calls.lock().unwrap().push("mobile_push");
+        }
+        fn close_pop_out_if_empty(&self, _terminal_id: &str, _code: Option<i32>) {
+            self.calls.lock().unwrap().push("pop_out_close");
+        }
+    }
+
+    /// A fixture session on `io`, under a unique id, with a coord id and a
+    /// hook that counts its calls.
+    fn handoff_fixture(
+        io: Arc<FakeHolderIo>,
+        tag: &str,
+    ) -> (TerminalSession, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.set_id_for_test(&format!("handoff-{tag}-{}", uuid::Uuid::new_v4()));
+        session.set_io_for_test(io);
+        session.set_coord_session_id(uuid::Uuid::new_v4());
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = closes.clone();
+        session.set_on_exit(Box::new(move |_, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        (session, closes)
+    }
+
+    fn shim_dir_for(id: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}{id}",
+            crate::install_effects_producer::intercept::shim_materializer::SHIM_DIR_PREFIX
+        ))
+    }
+
+    /// D2: a handed-off holder pane gets `release` and never `kill`; its
+    /// isolated edit context (and the coord claims it holds) is kept; its
+    /// install-intercept shim dir survives; and it announces a handoff, not an
+    /// exit. The SAME fixture closed with `Kill` does all four the other way —
+    /// the non-vacuous baseline.
+    #[test]
+    fn a_handoff_close_detaches_a_holder_pane_and_keeps_what_its_process_owns() {
+        for handoff in [true, false] {
+            let io = Arc::new(FakeHolderIo::holder());
+            let (session, _) = handoff_fixture(io.clone(), "close");
+            session.set_isolated_edit_ctx(
+                crate::agent_worktree::isolated_edit::IsolatedEditContext::for_test(
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+            let shim = shim_dir_for(session.id());
+            std::fs::create_dir_all(&shim).unwrap();
+            let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+
+            let outcome = if handoff {
+                session.close_for_handoff_with(None, Some(&sink))
+            } else {
+                session.close_inner_with(None, CloseKind::Kill, Some(&sink))
+            };
+
+            if handoff {
+                assert_eq!(outcome, HandoffOutcome::Detached { holder_pid: 4242 });
+                assert_eq!(io.kill_count(), 0, "a handoff never kills");
+                assert_eq!(io.release_count(), 1, "the release IS the detach");
+                assert!(
+                    session.isolated_edit_ctx.lock().unwrap().is_some(),
+                    "the live process keeps its claims"
+                );
+                assert!(
+                    shim.exists(),
+                    "the live child's PATH still points at the shim dir"
+                );
+                assert!(
+                    sink.notices().is_empty(),
+                    "no exit notice: the session did not end"
+                );
+                assert_eq!(sink.handed_off(), vec![(session.id().to_string(), 4242)]);
+                assert_eq!(
+                    CloseIntent::load(&session.close_intent),
+                    CloseIntent::Handoff
+                );
+                let _ = std::fs::remove_dir_all(&shim);
+            } else {
+                assert_eq!(io.kill_count(), 1, "Kill kills");
+                assert!(session.isolated_edit_ctx.lock().unwrap().is_none());
+                assert!(!shim.exists(), "Kill reaps the shim dir");
+                assert_eq!(sink.notices().len(), 1, "Kill announces the exit");
+                assert!(sink.handed_off().is_empty());
+                assert_eq!(
+                    CloseIntent::load(&session.close_intent),
+                    CloseIntent::RunnerKill
+                );
+            }
+        }
+    }
+
+    /// D2, last line: a pane with no holder (a `LocalPty`) given
+    /// `close_for_handoff` is killed exactly as by a normal close.
+    #[test]
+    fn a_handoff_close_kills_an_in_process_pane_as_today() {
+        let io = Arc::new(FakeHolderIo::in_process());
+        let (session, _) = handoff_fixture(io.clone(), "local");
+        let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+        let outcome = session.close_for_handoff_with(None, Some(&sink));
+        assert_eq!(outcome, HandoffOutcome::KilledInProcess);
+        assert_eq!(io.kill_count(), 1);
+        assert_eq!(io.release_count(), 1);
+        assert_eq!(sink.notices().len(), 1, "the exit notice, as for any kill");
+        assert!(sink.handed_off().is_empty());
+        assert_eq!(
+            CloseIntent::load(&session.close_intent),
+            CloseIntent::RunnerKill
+        );
+    }
+
+    /// D4 (review round 1: observed from the live holder, not remembered from
+    /// its spawn): a holder in the runner's unit cgroup is still detached (no
+    /// kill) but reported KILLED with `unprotected_cgroup`; an unobservable
+    /// protection is UNCONFIRMED, never survivable; and a holder that did not
+    /// take the detach is UNCONFIRMED.
+    #[test]
+    fn a_handoff_reports_an_unprotected_holder_killed_and_an_untaken_detach_unconfirmed() {
+        use crate::session::tracking_health::HolderProtection;
+        let none = Option::<&crate::terminal::exit_notice::RecordingExitSink>::None;
+
+        let io = Arc::new(FakeHolderIo::holder());
+        let (mut session, _) = handoff_fixture(io.clone(), "cgroup");
+        session.set_protection_probe_for_test(|_| HolderProtection::UnprotectedCgroup);
+        assert_eq!(
+            session.close_for_handoff_with(None, none),
+            HandoffOutcome::KilledUnprotected {
+                holder_pid: 4242,
+                reason: HandoffOutcome::UNPROTECTED_CGROUP.to_string()
+            }
+        );
+        assert_eq!(io.kill_count(), 0, "still detached, never killed");
+
+        let io = Arc::new(FakeHolderIo::holder());
+        let (mut session, _) = handoff_fixture(io.clone(), "unknown");
+        session.set_protection_probe_for_test(|_| HolderProtection::Unknown);
+        assert!(matches!(
+            session.close_for_handoff_with(None, none),
+            HandoffOutcome::Unconfirmed {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        assert_eq!(io.kill_count(), 0);
+
+        let mut untaken = FakeHolderIo::holder();
+        untaken.take_detach = false;
+        let untaken = Arc::new(untaken);
+        let (session, _) = handoff_fixture(untaken.clone(), "untaken");
+        assert!(matches!(
+            session.close_for_handoff_with(None, none),
+            HandoffOutcome::Unconfirmed {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        assert_eq!(untaken.kill_count(), 0);
+    }
+
+    /// Review round 2: a handoff whose holder is GONE by the end of the
+    /// release handed nothing off — the pane really ended, so it sends the
+    /// EXIT notice (the webview drops the tab), not the handed-off one.
+    #[test]
+    fn a_handoff_whose_holder_vanished_sends_the_exit_notice() {
+        let mut io = FakeHolderIo::holder();
+        io.vanish_on_release = true;
+        let (session, _) = handoff_fixture(Arc::new(io), "vanished");
+        let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+        assert!(matches!(
+            session.close_for_handoff_with(None, Some(&sink)),
+            HandoffOutcome::Unconfirmed { .. }
+        ));
+        assert_eq!(sink.notices().len(), 1, "the exit notice");
+        assert!(sink.handed_off().is_empty(), "never the handed-off notice");
+    }
+
+    /// Review round 1, item 3: a Handoff intent whose pane reports NO live
+    /// holder when `wait` settles (the holder died, the child exited under the
+    /// handoff) is a real exit — every effect runs, as a runner-initiated one.
+    #[test]
+    fn a_handoff_settle_with_no_live_holder_is_a_runner_initiated_exit() {
+        let io = Arc::new(FakeHolderIo::in_process());
+        let (session, closes) = handoff_fixture(io, "noholder");
+        let facts: Arc<Mutex<Option<PaneExitFacts>>> = Arc::new(Mutex::new(None));
+        {
+            let (closes, facts) = (closes.clone(), facts.clone());
+            session.set_on_exit(Box::new(move |_, exit| {
+                closes.fetch_add(1, Ordering::SeqCst);
+                *facts.lock().unwrap() = Some(exit);
+            }));
+        }
+        CloseIntent::Handoff.store(&session.close_intent);
+        let effects = RecordingWaiterEffects::default();
+
+        assert!(!session.settle_waiter_for_test(Ok(1), &effects));
+        assert_eq!(
+            effects.calls.lock().unwrap().len(),
+            4,
+            "every exit effect runs"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "the coord row is closed");
+        assert!(facts.lock().unwrap().unwrap().close_requested);
+        assert_eq!(session.exit_code(), Some(1));
+    }
+
+    /// Review round 1, item 5: a pane the handoff budget never reached is
+    /// abandoned untouched — no release, no kill — and reported unconfirmed.
+    #[test]
+    fn abandoning_a_handoff_touches_nothing_and_reports_unconfirmed() {
+        let io = Arc::new(FakeHolderIo::holder());
+        let (session, _) = handoff_fixture(io.clone(), "abandon");
+        assert!(matches!(
+            session.abandon_for_handoff(),
+            HandoffOutcome::Unconfirmed {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        assert_eq!((io.kill_count(), io.release_count()), (0, 0));
+        assert_eq!(
+            CloseIntent::load(&session.close_intent),
+            CloseIntent::Handoff
+        );
+        assert!(!session.is_alive(), "a later drop must not close (kill) it");
+    }
+
+    /// D3: the waiter's settle after a HANDOFF runs none of the exit-time side
+    /// effects — no coord close, review-note settle, mobile push, pop-out close
+    /// or exit event — and records no exit; after a natural exit and after a
+    /// runner kill, all of them run (the kill's code is withheld from the
+    /// hook). Non-vacuous: the same fixture, the same settle, three intents.
+    #[test]
+    fn the_waiter_skips_every_exit_effect_on_a_handoff_and_runs_them_otherwise() {
+        let all = vec!["exit_event", "review_notes", "mobile_push", "pop_out_close"];
+        for intent in [
+            CloseIntent::Handoff,
+            CloseIntent::None,
+            CloseIntent::RunnerKill,
+        ] {
+            let io = Arc::new(FakeHolderIo::holder());
+            let (session, closes) = handoff_fixture(io, "waiter");
+            let facts: Arc<Mutex<Option<PaneExitFacts>>> = Arc::new(Mutex::new(None));
+            {
+                let (closes, facts) = (closes.clone(), facts.clone());
+                session.set_on_exit(Box::new(move |_, exit| {
+                    closes.fetch_add(1, Ordering::SeqCst);
+                    *facts.lock().unwrap() = Some(exit);
+                }));
+            }
+            intent.store(&session.close_intent);
+            let effects = RecordingWaiterEffects::default();
+
+            let handed_off = session.settle_waiter_for_test(Ok(0), &effects);
+
+            let calls = effects.calls.lock().unwrap().clone();
+            if intent == CloseIntent::Handoff {
+                assert!(handed_off);
+                assert!(calls.is_empty(), "no exit effect on a handoff: {calls:?}");
+                assert_eq!(
+                    closes.load(Ordering::SeqCst),
+                    0,
+                    "the coord row stays active"
+                );
+                assert_eq!(session.exit_code(), None, "there was no exit to record");
+                assert!(session.exit_snapshot().is_none());
+            } else {
+                assert!(!handed_off);
+                assert_eq!(calls, all, "every exit effect, intent {intent:?}");
+                assert_eq!(closes.load(Ordering::SeqCst), 1);
+                assert_eq!(session.exit_code(), Some(0));
+                assert_eq!(
+                    facts.lock().unwrap().unwrap().close_requested,
+                    intent == CloseIntent::RunnerKill
+                );
+            }
+        }
+    }
+
+    /// D3 end to end on a REAL waiter thread: the thread blocked in `wait`
+    /// wakes on the handoff's release and settles as a handoff, because the
+    /// intent was stored before the release. The kill twin wakes as an exit.
+    #[test]
+    fn a_live_waiter_woken_by_a_handoff_release_runs_no_exit_effect() {
+        for handoff in [true, false] {
+            let io = Arc::new(FakeHolderIo::holder());
+            let (session, closes) = handoff_fixture(io, "live");
+            let effects = Arc::new(RecordingWaiterEffects::default());
+            let waiter = session.waiter();
+            let thread_effects = effects.clone();
+            let t = std::thread::spawn(move || waiter.run(thread_effects.as_ref()));
+            let sink = Option::<&crate::terminal::exit_notice::RecordingExitSink>::None;
+            if handoff {
+                session.close_for_handoff_with(None, sink);
+            } else {
+                session.close_inner_with(None, CloseKind::Kill, sink);
+            }
+            let verdict = t.join().unwrap();
+            if handoff {
+                assert_eq!(verdict, WaiterVerdict::HandedOff);
+                assert!(effects.calls.lock().unwrap().is_empty());
+                assert_eq!(closes.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(verdict, WaiterVerdict::Exited);
+                assert_eq!(effects.calls.lock().unwrap().len(), 4);
+                assert_eq!(closes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_outcome_classifies_release_failures_as_unconfirmed() {
+        use crate::session::tracking_health::HolderProtection;
+        let protected: fn(u32) -> HolderProtection = |_| HolderProtection::Protected;
+        let before = crate::terminal::pane_io::HolderHandoff {
+            holder_pid: 7,
+            child_pid: 8,
+            detach_confirmed: false,
+        };
+        let taken = crate::terminal::pane_io::HolderHandoff {
+            detach_confirmed: true,
+            ..before.clone()
+        };
+        assert_eq!(
+            handoff_outcome(&before, Some(taken.clone()), Ok(()), protected),
+            HandoffOutcome::Detached { holder_pid: 7 }
+        );
+        assert!(matches!(
+            handoff_outcome(&before, Some(taken), Err("boom".into()), protected),
+            HandoffOutcome::Unconfirmed { .. }
+        ));
+        assert!(matches!(
+            handoff_outcome(&before, None, Ok(()), protected),
+            HandoffOutcome::Unconfirmed { .. }
+        ));
     }
 }

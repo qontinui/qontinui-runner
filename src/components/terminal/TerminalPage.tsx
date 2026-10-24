@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
@@ -18,6 +19,11 @@ import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
 import { deliverApprovals } from "./approveAll";
 import { writeToTerminalById } from "./writeToTerminalById";
 import { buildSessionCloseRecord } from "./useTerminalManager";
+import {
+  listenForHandoffs,
+  paneExitDisposition,
+  type TerminalHandedOffEvent,
+} from "./terminalHandoff";
 import { buildTerminalSessionRoster } from "./terminalSessionRoster";
 import { compareByUsageHeadroom } from "../settings/types";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -1090,8 +1096,34 @@ function TerminalPageInner({
     [updateTab],
   );
 
+  // Handoff restart (plan 2026-10-21-graceful-runner-restart-detaches-holder-
+  // panes-instead-of-killing-them): a `terminal-handed-off` pane's process is
+  // still running in its PTY holder for the next runner to adopt — record it,
+  // so `handleExit` below never treats it as an exit.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void listenForHandoffs((event, handler) => listen<TerminalHandedOffEvent>(event, handler)).then(
+      (fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      },
+    );
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
+      // A handed-off pane did not exit: no record-close (it would close the
+      // record the adoption needs, queue a coord Closed and maybe revoke the
+      // workdir's coord-mcp nonce) and no tab update.
+      if (paneExitDisposition(terminalId) === "handed-off") {
+        logger.info(`terminal ${terminalId} was handed off to its PTY holder — not an exit`);
+        return;
+      }
       // Record the durable session CLOSE when a pty backing a Claude session
       // exits. Read the latest tab from the ref so this stays identity-stable.
       //

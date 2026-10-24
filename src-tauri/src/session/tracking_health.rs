@@ -195,6 +195,71 @@ pub struct HolderPane {
     /// holder's inclusive subtree plus the child's). Filled by [`evaluate`];
     /// the census itself leaves it empty.
     pub claude_pids: Vec<u32>,
+    /// Whether the holder is protected from the runner's own stop (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D4/D6). Observed by the census from the LIVE holder
+    /// (`crate::terminal::holder_census::holder_protection`), never assumed.
+    pub protection: HolderProtection,
+    /// What a HANDOFF restart (a graceful close that detaches holder panes
+    /// instead of killing them) would do to this pane. Derived from `state`,
+    /// `protection` and `child_pid` by [`HolderPane::handoff_verdict`]; kept
+    /// in step by [`HolderPane::refresh_handoff`].
+    pub handoff: PaneHandoff,
+    /// Why `handoff` is `killed` or `unknown`; `null` for `survivable` and
+    /// `no_process`.
+    pub handoff_reason: Option<HandoffReason>,
+}
+
+/// Whether a holder is protected from something the runner's own stop
+/// triggers. The Linux spawner's `Unprotected::Cgroup`
+/// (`qontinui_pty_holder::spawn`), observed rather than remembered: a plain
+/// holder inside a systemd unit's cgroup dies when that unit stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderProtection {
+    /// Outside every unit the runner's stop takes down — its own transient
+    /// `qontinui-pty-holder-*.scope`, or no systemd unit at all; on Windows
+    /// and macOS, by spawn-route construction (no route there leaves a holder
+    /// inside the runner's kill domain, so the spawner never reports one).
+    Protected,
+    /// Shares a systemd unit cgroup with whatever spawned it, and dies when
+    /// that unit stops or crash-restarts.
+    UnprotectedCgroup,
+    /// Not observed: no holder pid, an unreadable `/proc/<pid>/cgroup`, or a
+    /// dead holder. **Never read as protected.**
+    Unknown,
+}
+
+/// What a handoff restart would do to one holder pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneHandoff {
+    /// A live, answering holder whose protection is proven: detached, it
+    /// keeps its child running across the restart.
+    Survivable,
+    /// The pane's process dies anyway — see [`HandoffReason`].
+    Killed,
+    /// Nothing proves either way. **Never counted as survivable.**
+    Unknown,
+    /// The holder is dead and no recorded child may still be running:
+    /// nothing for a handoff to keep or to lose.
+    NoProcess,
+}
+
+/// Why a pane's handoff is `killed` or `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffReason {
+    /// Live holder inside a systemd unit cgroup: dies with that unit (D4).
+    UnprotectedCgroup,
+    /// The holder is already dead; its still-running child is reaped by the
+    /// next boot sweep.
+    HolderDead,
+    /// The holder is `unknown` or `incompatible`: this runner cannot ask it
+    /// to detach.
+    UnresolvedHolder,
+    /// A live holder whose protection could not be observed.
+    ProtectionUnknown,
 }
 
 impl HolderPane {
@@ -205,6 +270,36 @@ impl HolderPane {
             self.state,
             HolderPaneState::Unknown | HolderPaneState::Incompatible
         )
+    }
+
+    /// What a handoff restart would do to this pane — fail-closed: only a
+    /// LIVE holder whose protection is PROVEN is `survivable`.
+    pub fn handoff_verdict(&self) -> (PaneHandoff, Option<HandoffReason>) {
+        match self.state {
+            HolderPaneState::Unknown | HolderPaneState::Incompatible => {
+                (PaneHandoff::Unknown, Some(HandoffReason::UnresolvedHolder))
+            }
+            HolderPaneState::Dead if self.child_pid.is_some() => {
+                (PaneHandoff::Killed, Some(HandoffReason::HolderDead))
+            }
+            HolderPaneState::Dead => (PaneHandoff::NoProcess, None),
+            HolderPaneState::Live => match self.protection {
+                HolderProtection::Protected => (PaneHandoff::Survivable, None),
+                HolderProtection::UnprotectedCgroup => {
+                    (PaneHandoff::Killed, Some(HandoffReason::UnprotectedCgroup))
+                }
+                HolderProtection::Unknown => {
+                    (PaneHandoff::Unknown, Some(HandoffReason::ProtectionUnknown))
+                }
+            },
+        }
+    }
+
+    /// Re-derive `handoff` / `handoff_reason` from the pane's current facts.
+    pub fn refresh_handoff(&mut self) {
+        let (handoff, reason) = self.handoff_verdict();
+        self.handoff = handoff;
+        self.handoff_reason = reason;
     }
 }
 
@@ -2289,6 +2384,9 @@ mod tests {
             holder_versions: vec![],
             detail: None,
             claude_pids: vec![],
+            protection: HolderProtection::Unknown,
+            handoff: PaneHandoff::Unknown,
+            handoff_reason: None,
         }
     }
 

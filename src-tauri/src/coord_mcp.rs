@@ -5693,7 +5693,7 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1) —
 /// see [`mint_and_register_nonce`] for what it freezes. The caller has already
 /// validated it ([`validate_spawn_tenant`]); `None` keeps the machine pin.
-fn register_proxy_nonce(
+pub(crate) fn register_proxy_nonce(
     workdir: &str,
     terminal_id: Option<&str>,
     session_tenant: Option<Uuid>,

@@ -3810,6 +3810,7 @@ pub mod emergency_quit {
         app_handle: tauri::AppHandle,
         app_state: Arc<AppState>,
         reason: String,
+        close_mode: crate::terminal::CloseMode,
     ) -> bool {
         if !try_claim_teardown() {
             warn!("A teardown is already in progress — ignoring duplicate request: {reason}");
@@ -3839,7 +3840,8 @@ pub mod emergency_quit {
         crate::commands::terminal_windows::mark_app_quitting();
 
         warn!(
-            "FORCE-CLOSE accepted ({reason}) — running the off-loop teardown, hard budget {}s",
+            "FORCE-CLOSE accepted ({reason}, {close_mode:?}) — running the off-loop teardown, \
+             hard budget {}s",
             force_close_budget().as_secs()
         );
 
@@ -3876,7 +3878,7 @@ pub mod emergency_quit {
         // change smuggled in behind a threading fix).
         std::thread::spawn(move || {
             let budget = shutdown_budget::Budget::start(shutdown_budget::WORKER_BUDGET);
-            run_teardown(&app_handle, &app_state, &budget);
+            run_teardown(&app_handle, &app_state, &budget, close_mode);
 
             info!(
                 "Force-close teardown finished in {}ms — requesting Tauri app exit",
@@ -3941,10 +3943,17 @@ pub mod emergency_quit {
     /// shutdown in general. Which door was taken is already in the log — the
     /// close handler logs `Window close requested`, [`request_force_close`]
     /// logs `FORCE-CLOSE accepted`.
+    ///
+    /// `close_mode` is the [`crate::terminal::CloseMode`] the close request
+    /// stated: `Handoff` detaches holder-backed terminal panes instead of
+    /// killing them (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`).
+    /// Nothing else in the sequence changes with it.
     pub fn run_teardown(
         app_handle: &tauri::AppHandle,
         app_state: &Arc<AppState>,
         budget: &shutdown_budget::Budget,
+        close_mode: crate::terminal::CloseMode,
     ) {
         use tauri::Manager;
 
@@ -4065,9 +4074,13 @@ pub mod emergency_quit {
         // i.e. ≈4s each and `O(terminals)` unbounded without the cap. Past the
         // deadline the remaining sessions get a kill-only teardown: the child
         // process tree still dies, the joins and the shim-dir sweep are
-        // skipped.
+        // skipped. In handoff mode a holder pane is detached instead, past the
+        // deadline too, and the teardown logs one `handoff: …` summary line.
         if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
-            tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
+            tm.close_all(
+                budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET),
+                close_mode,
+            );
         }
 
         kill_orphaned_ai_processes(app_state, budget);
