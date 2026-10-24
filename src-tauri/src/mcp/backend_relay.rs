@@ -3588,7 +3588,7 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /health`, `/status` | none — device status |
 /// | `GET /apps/{app_id}/spec/list`, `/spec/graph` | none — app specs, not session content |
 /// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
-/// | `GET /ui-bridge/control/components` | none — component and action metadata (names, descriptions, declared effects), no element text |
+/// | `GET /ui-bridge/control/components` | none — relayed, it carries the runner's own registry only: `ui_bridge::elements::ComponentSources` withholds every WebSocket-registered app's reply from a request bearing `relay_path_policy::RELAYED_REQUEST_HEADER`. What remains is `serializeComponent` metadata (ids, names, descriptions, actions with declared effects) and no component state; some names embed a saved project's name, or a registered app's self-declared name while the runner's UI Bridge integration page lists that app |
 /// | `POST /ui-bridge/control/page-health` | terminal stream, strictest, refuse — its text findings quote the same webview as the snapshot |
 /// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
 /// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
@@ -4292,6 +4292,19 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
             }
         }
     }
+    // Mark the request as relayed, AFTER the frame's own headers are copied:
+    // `insert` replaces every value already under the name, so the local API
+    // always sees the marker and no frame can strip or replace it. It only
+    // ever narrows what a handler does for a remote caller; see
+    // `relay_path_policy::RELAYED_REQUEST_HEADER`.
+    header_map.insert(
+        reqwest::header::HeaderName::from_static(
+            crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER,
+        ),
+        reqwest::header::HeaderValue::from_static(
+            crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER_VALUE,
+        ),
+    );
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -7485,6 +7498,179 @@ mod tests {
         );
     }
 
+    /// Every request the arm forwards arrives with the relay's marker, and a
+    /// frame cannot replace it. A frame that sends the marker's own name with
+    /// another value, or with none, still arrives carrying exactly the arm's
+    /// value. The name and value are spelled here as literals, so renaming
+    /// either fails this test.
+    #[tokio::test]
+    async fn every_relayed_request_carries_the_relay_marker() {
+        async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let marker: Vec<String> = headers
+                .get_all("x-qontinui-relayed")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect();
+            (
+                AxumStatus::OK,
+                [("content-type", "application/json")],
+                json!({ "marker": marker }).to_string(),
+            )
+        }
+        // A fallback, not a `.route("…")`: the relay registration tripwire
+        // scans `.route` literals, test code included, and a test router must
+        // not count as the runner registering a route. The frame's path,
+        // `/status`, is RELAY_ALLOWED (see the GET round trip above).
+        let base = spawn_test_server(Router::new().fallback(handler)).await;
+        for frame_headers in [
+            json!({}),
+            json!({ "X-Qontinui-Relayed": "forged" }),
+            json!({ "x-qontinui-relayed": "" }),
+        ] {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "req-marker",
+                "method": "GET",
+                "path": "/status",
+                "headers": frame_headers.clone(),
+                "body_b64": ""
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(reply["status"], 200, "{reply}");
+            let body: Value =
+                serde_json::from_slice(&b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+            assert_eq!(
+                body["marker"],
+                json!(["http_request"]),
+                "frame headers {frame_headers}"
+            );
+        }
+    }
+
+    /// Plan 2026-10-23-console-presentation-spaces Phase 6, review round 1:
+    /// a relayed component read never waits on a WebSocket app. The relay
+    /// awaits every `http_request` inline on its read loop, which has to answer
+    /// the server's PING inside 20 s, and one dispatch to a wrapper that never
+    /// answers waits the command relay's 30 s.
+    ///
+    /// The loopback API here serves the component route through the real read
+    /// core, `ui_bridge::elements::components_read`: source selection from the
+    /// request's headers, the WebSocket fan-out, the merge and the envelope.
+    /// Only the runner's own IPC read is stubbed. The registered wrapper is
+    /// live and never answers, and the dispatcher uses the PRODUCTION command
+    /// timeout. Relayed, the read returns at once with the runner's entries and
+    /// `wrapperComponents: "withheld"`, and the wrapper is sent nothing. The
+    /// same route read LOCALLY does send that wrapper `getComponents`, so the
+    /// wrapper was live and dispatchable the whole time.
+    #[tokio::test]
+    async fn a_relayed_component_read_never_waits_on_a_websocket_app() {
+        use crate::mcp::app_discovery::DiscoveredApp;
+        use crate::mcp::app_dispatch::AppDispatcher;
+        use crate::mcp::app_registry::{AppRegistry, AppTransport};
+        use crate::mcp::command_relay::{CommandRelay, CommandResponse};
+        use crate::mcp::ui_bridge::elements::{components_read, ComponentSources};
+        use crate::mcp::ws_relay::WsConnectionManager;
+
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn, mut wrapper_rx) = ws.test_register("hung-wrapper").await;
+        registry
+            .upsert(
+                DiscoveredApp {
+                    app_id: "hung-wrapper".into(),
+                    app_name: "hung-wrapper".into(),
+                    app_type: "web".into(),
+                    framework: None,
+                    url: "http://unused".into(),
+                    port: 0,
+                    base_path: "".into(),
+                    version: None,
+                    capabilities: vec![],
+                    element_count: None,
+                    component_count: None,
+                    discovered_at: 0,
+                },
+                None,
+                AppTransport::Websocket,
+                Some(conn),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(ws);
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // A fallback, not a `.route("…")`, so this test router never counts as
+        // the runner registering the component route (the registration
+        // tripwire scans `.route` literals, test code included). The relay
+        // forwards only the component path here, and the local read below
+        // asks for the same one.
+        let (reg, disp) = (registry.clone(), dispatcher.clone());
+        let base = spawn_test_server(Router::new().fallback(move |headers: HeaderMap| {
+            let (reg, disp) = (reg.clone(), disp.clone());
+            async move {
+                components_read(
+                    ComponentSources::for_request(&headers),
+                    &reg,
+                    &disp,
+                    async { Ok::<_, String>(json!([{ "id": "runner-own" }])) },
+                )
+                .await
+            }
+        }))
+        .await;
+
+        let frame = json!({
+            "type": "http_request",
+            "request_id": "req-components",
+            "method": "GET",
+            "path": "/ui-bridge/control/components",
+            "headers": {},
+            "body_b64": ""
+        });
+        let reply = tokio::time::timeout(Duration::from_secs(5), relay_http_to_base(&base, &frame))
+            .await
+            .expect("a relayed component read waited on a WebSocket app");
+        assert_eq!(reply["status"], 200, "{reply}");
+        let body: Value =
+            serde_json::from_slice(&b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        assert_eq!(body["data"]["components"], json!([{ "id": "runner-own" }]));
+        assert_eq!(body["data"]["wrapperComponents"], "withheld");
+        assert!(
+            wrapper_rx.try_recv().is_err(),
+            "the relayed read sent the wrapper a command"
+        );
+
+        let url = format!("{base}/ui-bridge/control/components");
+        let local = tokio::spawn(async move { reqwest::get(url).await?.json::<Value>().await });
+        let command = tokio::time::timeout(Duration::from_secs(5), wrapper_rx.recv())
+            .await
+            .expect("a local read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: Value = serde_json::from_str(&command).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-own" }])),
+                    error: None,
+                },
+            )
+            .await;
+        let local = local
+            .await
+            .unwrap()
+            .expect("the local read answered over HTTP");
+        assert_eq!(
+            local["data"]["components"],
+            json!([{ "id": "runner-own" }, { "id": "wrapper-own" }])
+        );
+        assert_eq!(local["data"]["wrapperComponents"], "included");
+    }
+
     #[test]
     fn http_relay_error_builds_command_response_with_json_body() {
         let reply = http_relay_error(&json!("rid-7"), 400, "invalid HTTP method");
@@ -9978,56 +10164,106 @@ mod egress_tests {
         assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
     }
 
-    /// Plan 2026-10-23-console-presentation-spaces Phase 6: the UI Bridge
-    /// dashboard's two relay reads take the snapshot's egress verdicts. Page
-    /// health quotes the text of the elements it flags in the runner's own
-    /// webview, session panes included, so while a bound tenant refuses it is
-    /// refused exactly as the snapshot is, before the loopback API is called,
-    /// and once every bound tenant permits it flows. The component registry is
-    /// action metadata with no element text, so it flows even while a bound
-    /// tenant refuses.
+    // Plan 2026-10-23-console-presentation-spaces Phase 6: the egress verdicts
+    // of the UI Bridge dashboard's two relay reads, one claim per test. Page
+    // health quotes up to 120 characters of the text of each element it flags
+    // in the runner's own webview, session panes included, so it is gated as
+    // the snapshot is: judged by the strictest bound tenant, and refused
+    // before the loopback API is called. The component read carries the
+    // runner's own registry metadata, and no egress flow is consulted for it.
+
+    /// The bound tenant every test below judges a read by.
+    const DASHBOARD_TENANT: u128 = 0x7e7a_0016;
+
+    fn dashboard_frame(method: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({"request_id": "rq", "method": method, "path": path})
+    }
+
+    /// Page health is refused with the terminal-stream verdict while a bound
+    /// tenant refuses that flow, and the loopback API is never called. Fails
+    /// if page health drops out of the egress match.
     #[tokio::test]
-    async fn the_ui_bridge_dashboard_reads_take_the_snapshots_egress_verdicts() {
+    async fn page_health_is_refused_while_a_bound_tenant_refuses_terminal_streaming() {
         use crate::egress::test_support::{fake_bound_tenants, pin_for};
-        fn relay_frame(method: &str, path: &str) -> serde_json::Value {
-            serde_json::json!({"request_id": "rq", "method": method, "path": path})
-        }
-        let tenant = uuid::Uuid::from_u128(0x7e7a_0016);
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
         let _on = pin(Flow::TerminalStream, Level::On);
         let _bound = fake_bound_tenants(vec![tenant]);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
         let counter = crate::egress::test_support::ConnCounter::start();
-        let page_health = relay_frame("POST", "/ui-bridge/control/page-health");
 
-        {
-            let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
-            for request in [
-                relay_frame("GET", "/ui-bridge/control/snapshot"),
-                page_health.clone(),
-            ] {
-                let reply = relay_http_to_base(&counter.http_base(), &request).await;
-                assert_eq!(
-                    status_and_flow(&reply),
-                    (409, Some("terminal_stream".into())),
-                    "{request}"
-                );
-            }
-            assert_eq!(
-                counter.count(),
-                0,
-                "a refused read never reaches the loopback API"
-            );
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("POST", "/ui-bridge/control/page-health"),
+        )
+        .await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("terminal_stream".into())),
+            "{reply}"
+        );
+        assert_eq!(
+            counter.count(),
+            0,
+            "a refused read never reaches the loopback API"
+        );
+    }
 
-            let components = relay_frame("GET", "/ui-bridge/control/components");
-            let reply = relay_http_to_base(&counter.http_base(), &components).await;
-            assert_ne!(reply["status"], 409, "{reply}");
-            assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
-        }
-
+    /// Page health reaches the loopback API once every bound tenant permits
+    /// terminal streaming: the refusal test's setup, with that tenant's pin
+    /// flipped to on, so the tenant's verdict is the only thing the two tests
+    /// differ in. The stub's 503 is what comes back. Fails if page health is
+    /// refused whatever the tenants say.
+    #[tokio::test]
+    async fn page_health_reaches_the_loopback_api_once_every_bound_tenant_permits() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
         let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
-        let before = counter.count();
-        let reply = relay_http_to_base(&counter.http_base(), &page_health).await;
-        assert_ne!(reply["status"], 409, "{reply}");
-        assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("POST", "/ui-bridge/control/page-health"),
+        )
+        .await;
+        assert_eq!(
+            reply["status"], 503,
+            "the loopback stub's own answer: {reply}"
+        );
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    /// The component read consults no egress flow at all: with every flow
+    /// pinned off, both flow-wide and for the bound tenant, it still reaches
+    /// the loopback API, and the stub's 503 is what comes back. Fails if the
+    /// component route joins the egress match (a 409), or leaves
+    /// `RELAY_ALLOWED` (a 403).
+    #[tokio::test]
+    async fn the_component_read_consults_no_egress_flow() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _flow_pins: Vec<_> = Flow::ALL
+            .into_iter()
+            .map(|f| pin(f, Level::Off))
+            .collect();
+        let _tenant_pins: Vec<_> = Flow::ALL
+            .into_iter()
+            .map(|f| pin_for(f, tenant, Level::Off))
+            .collect();
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("GET", "/ui-bridge/control/components"),
+        )
+        .await;
+        assert_eq!(
+            reply["status"], 503,
+            "the loopback stub's own answer: {reply}"
+        );
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
     }
 
     /// Re-review m5: a recognised record carrying NO run id is unattributable

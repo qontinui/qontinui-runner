@@ -54,16 +54,26 @@
 //!   ENTIRE runner API surface rides this arm: ~60 routes across its domain
 //!   clients. Each one below is a measured call site, not a guess.
 //! * **qontinui-web's own frontend.** `runnerProxyGet`
-//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s three reads,
-//!   and the co-pilot planner's `POST prompt-home/plan`
-//!   (`lib/co-pilot/planClient.ts`).
+//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s four reads —
+//!   the spec list, the spec graph and the snapshot are listed below, while
+//!   the fourth, `useRunnerApps`'s `GET /apps`, is on no entry, so this arm
+//!   answers it 403 (qontinui-runner#2178 proposes one) — and the co-pilot
+//!   planner's `POST prompt-home/plan` (`lib/co-pilot/planClient.ts`).
 //!   The console's UI Bridge dashboard (`/admin/coord/ui-bridge`, plan
-//!   `2026-10-23-console-presentation-spaces` Phase 6) adds two reads of the
-//!   runner's own webview, both in `admin/coord/ui-bridge/_lib/relayReads.ts`:
+//!   `2026-10-23-console-presentation-spaces` Phase 6) reuses those hooks and
+//!   makes four relay calls of its own from
+//!   `admin/coord/ui-bridge/_lib/relayReads.ts`, a module that phase's web
+//!   half adds (it is on qontinui-web main once that half lands):
+//!   `fetchRunnerHealth` (`GET /health`, listed below);
 //!   `fetchRunnerComponents` (`GET /ui-bridge/control/components`, through
 //!   `runnerProxyGet`) and `fetchRunnerPageHealth`
 //!   (`POST /ui-bridge/control/page-health`, through `runnerProxyPost`, the
-//!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`).
+//!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`), the two
+//!   entries listed for it; and `fetchRunnerVisibility`
+//!   (`POST /ui-bridge/control/visibility`, the occlusion sweep), which this
+//!   arm REFUSES on purpose. Phase 6 adds no entry for the sweep, the
+//!   dashboard renders the 403 as a labelled UNKNOWN, and
+//!   `the_dashboard_reads_open_nothing_beside_them` pins the refusal.
 //!
 //! Nothing else in the workspace sends an `http_request` frame.
 //!
@@ -75,6 +85,22 @@
 //! `/api/v1/...` SSE streams. Listing a route that does not exist would fail
 //! this module's own registration tripwire, and refusing a 404 with a 403
 //! changes nothing a client can observe. Add the entry WITH the route.
+//!
+//! Two web calls to routes the runner DOES register are refused as well, and
+//! the bullet above says why each one is: `GET /apps` and
+//! `POST /ui-bridge/control/visibility`.
+//!
+//! # What a relayed request looks like to the local API
+//!
+//! The arm forwards the frame's method, path, query, headers and body. It
+//! drops `host`, `connection`, `transfer-encoding`, `content-length`,
+//! `origin` and `sec-fetch-site` from the headers, and adds one header of its
+//! own: [`RELAYED_REQUEST_HEADER`]. It is inserted after the frame's headers are
+//! copied, so every relayed request carries it and no frame can strip or
+//! replace it. A handler that must answer a REMOTE caller more narrowly
+//! than a local one reads it through [`is_relayed_request`]. One does today:
+//! the component read (`ui_bridge::elements::ComponentSources`), which keeps
+//! a relayed read to the runner's own registry.
 //!
 //! # The drift tripwire
 //!
@@ -135,21 +161,38 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     // -- qontinui-web: co-pilot planner (`planClient.ts`) ---------------
     ("POST", "/prompt-home/plan"),
     // -- qontinui-web: UI Bridge dashboard (`/admin/coord/ui-bridge`) ---
-    // Two reads of the runner's OWN webview, both made from
-    // `admin/coord/ui-bridge/_lib/relayReads.ts`.
+    // Both called from `admin/coord/ui-bridge/_lib/relayReads.ts`.
     //
-    // `fetchRunnerComponents` (through `runnerProxyGet`): the component action
-    // registry with each action's declared `effect`. Metadata only (ids,
-    // labels, descriptions, param schemas), never component state. The
-    // invocation route each action advertises,
+    // `fetchRunnerComponents` (through `runnerProxyGet`). A LOCAL read of this
+    // route merges two sources: the runner's own webview registry, and the
+    // `getComponents` reply of every live WebSocket-registered app. Those
+    // replies are passed through unvalidated, and nothing in the merged list
+    // says which app sent which entry. A RELAYED read returns the runner's own
+    // registry only
+    // (`ui_bridge::elements::ComponentSources`, keyed on
+    // [`RELAYED_REQUEST_HEADER`]). No registered app is asked, which has two
+    // effects. None of them can hold the relay's read loop, which awaits this
+    // call inline, for the 30 s each dispatch may wait. And no third-party
+    // page's JSON reaches a remote caller as if it were the runner's. What
+    // flows is the runner's `serializeComponent` output: ids, names,
+    // descriptions, and actions with their declared `effect`. It carries no
+    // component state. Some names and descriptions embed runtime data: a saved
+    // project's name, and, while the runner's UI Bridge integration page lists
+    // a registered app, that app's self-declared name. The invocation route
+    // each action advertises,
     // `POST /ui-bridge/control/component/{id}/action/{action_id}`, stays off.
     ("GET", "/ui-bridge/control/components"),
-    // `fetchRunnerPageHealth` (through `runnerProxyPost`): POST because the
-    // route is registered as one, not because it writes. The handler ignores
-    // its body and makes one fixed, non-forcing `discover` read, the IPC the
-    // snapshot handler already makes on an empty registry. Its findings quote
-    // webview text, so its response takes the snapshot's egress gate
-    // (`backend_relay::http_request_egress_refusal`).
+    // `fetchRunnerPageHealth` (through `runnerProxyPost`). POST because the
+    // route is registered as one. It changes no settings, sessions, files or
+    // app state. It ignores its body, sends the runner's own webview one
+    // `discover` on every call (`screenshots::discover_all_elements_payload`),
+    // and analyses the reply in bounded passes. The `discover` has one side
+    // effect, in the webview SDK: its executor clears its in-memory discovery
+    // cache and rebuilds it from the live DOM. Every `discover` does that,
+    // including the one the snapshot handler sends when the registry is
+    // empty, although that one sends a different payload. Page health's
+    // findings quote webview text, so its response takes the snapshot's
+    // egress gate (`backend_relay::http_request_egress_refusal`).
     ("POST", "/ui-bridge/control/page-health"),
     // -- mobile: task runs, chat, workflow control ---------------------
     ("GET", "/task-runs"),
@@ -236,6 +279,31 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     ("GET", "/analytics/account-usage"),
     ("GET", "/analytics/prepaid-balance"),
 ];
+
+/// The header the `http_request` arm adds to every request it forwards to the
+/// local API, so a handler can tell a REMOTE caller from a local one.
+///
+/// `backend_relay::relay_http_to_base` inserts it after copying the frame's
+/// own headers. `insert` replaces every value already under the name, so a
+/// relayed request always carries this header and a frame can neither strip
+/// it nor pre-empt it. Presence is the whole signal: the value only names the
+/// arm.
+///
+/// **It may only ever NARROW what a handler does.** Any local caller can send
+/// it too, so it is never a credential and never grants anything. A local
+/// caller that sends it gets the narrower answer a remote one gets, which
+/// costs it nothing it could not have by leaving the header out.
+pub const RELAYED_REQUEST_HEADER: &str = "x-qontinui-relayed";
+
+/// The value [`RELAYED_REQUEST_HEADER`] carries: the arm that forwarded the
+/// request.
+pub const RELAYED_REQUEST_HEADER_VALUE: &str = "http_request";
+
+/// Did this request reach the local API through the relay's `http_request`
+/// arm? Reads [`RELAYED_REQUEST_HEADER`] by presence, whatever its value.
+pub fn is_relayed_request(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RELAYED_REQUEST_HEADER)
+}
 
 /// What the relay may do with one `http_request` frame's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2716,14 +2784,32 @@ fn e2e_mock() -> Router {
 
     /// **The UI Bridge family relays exactly three reads.** The runner
     /// registers hundreds of routes under `/ui-bridge/`: `page/evaluate`,
-    /// `page/close-request`, every element and component action, the SDK and
-    /// invoke proxies. Each one is enumerated from the source tree and asked
+    /// `page/close-request`, element and component actions, the SDK and
+    /// invoke proxies. Every path the two enumerations below find is asked
     /// under every method, both as registered and with its placeholders
     /// filled. Only the snapshot, the component registry and page health may
     /// answer `Allow`, each under its one method, so a wildcard or an extra
     /// method that reaches this family fails here and names the route.
     /// Widening the family on purpose means adding its pair to `RELAYED`, with
     /// the client that needs it named on the `RELAY_ALLOWED` entry.
+    ///
+    /// What is enumerated, exactly. The family is the union of two sources,
+    /// because each has a blind spot the other covers:
+    ///
+    /// - `registered_routes()`: every `.route("…", …)` call under `src/` whose
+    ///   first token is a string literal. It reaches `/ui-bridge/` routes
+    ///   registered outside `mcp::ui_bridge`, such as `/ui-bridge/ws`. It
+    ///   cannot see a literal preceded by a comment inside `.route(`, or
+    ///   either path an `add_dual!` registers through `concat!`.
+    /// - `ui_bridge::route_manifest()`, which
+    ///   `ui_bridge::manifest_drift_tests::manifest_matches_route_calls` holds
+    ///   equal to every `.route(` call in `mcp::ui_bridge`: comment-prefixed
+    ///   literals and both paths of every `add_dual!` included.
+    ///
+    /// At this test's writing, every `/ui-bridge/` registration under `src/`
+    /// takes one of those three forms: a plain literal, a comment-prefixed
+    /// literal, or an `add_dual!`. A registration in any other form, such as a
+    /// path from a constant, is invisible to both sources, and so to this test.
     #[test]
     fn the_ui_bridge_family_relays_exactly_the_three_named_reads() {
         const RELAYED: &[(&str, &str)] = &[
@@ -2742,6 +2828,11 @@ fn e2e_mock() -> Router {
         let family: std::collections::BTreeSet<String> = registered_routes()
             .into_iter()
             .map(|(_, path)| path)
+            .chain(
+                crate::mcp::ui_bridge::route_manifest()
+                    .iter()
+                    .map(|(_, path)| (*path).to_string()),
+            )
             .filter(|path| path.starts_with("/ui-bridge/"))
             .collect();
         assert!(
@@ -2749,6 +2840,21 @@ fn e2e_mock() -> Router {
             "the route scan found only {} `/ui-bridge/` registrations — it is broken, not the family",
             family.len()
         );
+        // The literal scan alone cannot see these, so their presence is what
+        // shows the manifest half of the union is in effect: both paths of an
+        // `add_dual!`, and a literal behind a comment inside `.route(`.
+        for unscannable in [
+            "/ui-bridge/control/wait-for-element",
+            "/ui-bridge/ai/wait-for-element",
+            "/ui-bridge/control/state-summary",
+        ] {
+            assert!(
+                family.contains(unscannable),
+                "{unscannable} is missing from the family. Either the manifest is no longer \
+                 part of the enumeration, or the route was renamed; if it was renamed, name \
+                 another `add_dual!` or comment-prefixed route here"
+            );
+        }
         for path in &family {
             let filled = with_placeholders_filled(path);
             for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
