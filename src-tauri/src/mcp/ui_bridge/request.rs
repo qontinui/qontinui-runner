@@ -619,14 +619,15 @@ pub(super) async fn gather_ui_error_signals(
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
         ping: crate::ui_error::ping_ask_now(),
     });
+    let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error.is_some(),
         has_recent_crash: recent_crash.is_some(),
         ui_dead: Some(ui_dead),
         native_ui_wedged: native_ui.wedged,
         embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
-        pg_reachable: crate::database::pg::health::status_pg_reachable(),
-        pg_schema_ok: crate::database::pg::health::status_pg_schema_ok(),
+        pg_reachable,
+        pg_schema_ok,
         ..Default::default()
     });
     let json = match &ui_error {

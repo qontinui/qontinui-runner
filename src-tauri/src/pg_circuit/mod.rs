@@ -745,18 +745,51 @@ impl GuardedPool {
         let started = Instant::now();
         let circuit = self.shared.circuit.clone();
         if circuit.is_closed() {
+            // The same reading of the evidence as the prober's default trial:
+            // any server reply proves reachability; only a refused connect is
+            // `false`; everything else is "could not tell".
             let probe = async {
                 let conn = match self.get().await {
                     Ok(c) => c,
+                    // The breaker tripped on this probe: `reachable()` then
+                    // reads the trip's cause class.
+                    Err(e @ PgCheckoutError::Unavailable(_)) => {
+                        return (Some(false), Some(e.to_string()))
+                    }
                     Err(e @ PgCheckoutError::Saturated { .. }) => {
                         return (None, Some(e.to_string()))
                     }
-                    Err(e) => return (Some(false), Some(e.to_string())),
+                    Err(PgCheckoutError::Pool(e)) => {
+                        return match classify(&e) {
+                            (Outcome::NonTripFailure(NonTripKind::BackendError), _) => {
+                                (Some(true), Some(render_pool_error(&e)))
+                            }
+                            _ => (None, Some(render_pool_error(&e))),
+                        }
+                    }
                 };
                 match conn.simple_query("SELECT 1").await {
                     Ok(_) => (Some(true), None),
                     Err(e) if e.as_db_error().is_some() => (Some(true), None),
-                    Err(e) => (Some(false), Some(format!("SELECT 1: {e}"))),
+                    Err(e) => {
+                        let msg = format!("SELECT 1: {e}");
+                        match client_failure_class(&e) {
+                            CauseClass::ConnectRefused => {
+                                // A refused socket under a checked-out
+                                // connection: the same evidence a refused
+                                // connect is, so it trips the breaker.
+                                if self.shared.circuit.is_closed() {
+                                    self.set_cause_class(CauseClass::ConnectRefused);
+                                }
+                                self.shared
+                                    .circuit
+                                    .record(Outcome::TripFailure(msg.clone()));
+                                self.ensure_prober();
+                                (Some(false), Some(msg))
+                            }
+                            _ => (None, Some(msg)),
+                        }
+                    }
                 }
             };
             let bound = self.shared.trial_timeout + Duration::from_secs(1);
@@ -777,16 +810,27 @@ impl GuardedPool {
                 .last_probe()
                 .unwrap_or_else(|| self.observe(started, None, None));
         }
+        // Another trial holds the slot: wait for its verdict. A wait that
+        // ends Closed is an observation; one that runs out observed nothing,
+        // so it is returned as "could not tell" and NOT stored over the last
+        // real observation.
         match tokio::time::timeout(self.shared.trial_timeout, circuit.wait_closed()).await {
             Ok(()) => self.observe(started, Some(true), None),
-            Err(_) => {
-                let e = circuit
-                    .snapshot()
-                    .last_error
-                    .unwrap_or_else(|| "database unavailable".to_string());
-                self.observe(started, Some(false), Some(e))
-            }
+            Err(_) => ProbeObservation {
+                at: SystemTime::now(),
+                at_instant: Instant::now(),
+                duration: started.elapsed(),
+                reachable: None,
+                error: Some("waited for an in-flight trial that has not concluded".to_string()),
+            },
         }
+    }
+
+    /// Wait up to `bound` for the breaker to be Closed. `true` when it is.
+    pub async fn wait_available(&self, bound: Duration) -> bool {
+        tokio::time::timeout(bound, self.shared.circuit.wait_closed())
+            .await
+            .is_ok()
     }
 }
 
@@ -1177,6 +1221,15 @@ mod tests {
         assert!(e.to_string().contains("28P01"), "{e}");
         assert_eq!(g.breaker_state(), CircuitState::Closed);
         assert_eq!(g.breaker_snapshot().backend_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn probe_now_reads_a_server_error_reply_as_reachable() {
+        let pg = PgStandIn::start(Mode::AuthError).await;
+        let g = guarded(&pg.url(), 1000, 1000, 2);
+        let obs = g.probe_now().await;
+        assert_eq!(obs.reachable, Some(true), "the server answered: {obs:?}");
+        assert_eq!(g.breaker_state(), CircuitState::Closed);
     }
 
     #[tokio::test]
