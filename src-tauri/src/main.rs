@@ -215,6 +215,7 @@ mod planning_bridge;
 mod playwright;
 mod pm_detect;
 mod process_capture;
+pub(crate) use qontinui_runner_lib::process_deadline;
 pub(crate) use qontinui_runner_lib::process_helpers;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the

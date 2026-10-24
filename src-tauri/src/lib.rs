@@ -40,6 +40,9 @@ pub mod observable_bridge;
 // gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
 pub mod git_posture;
 pub mod process_helpers;
+// Deadline-honest bounded run (process creation INCLUDED) for read-only
+// probes; reuses `process_helpers` internals, so it lives beside it.
+pub mod process_deadline;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
 // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
