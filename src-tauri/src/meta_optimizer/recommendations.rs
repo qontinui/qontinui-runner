@@ -962,3 +962,16 @@ pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
         }
     }
 }
+
+#[cfg(test)]
+mod fail_safe_tests {
+    use super::*;
+
+    /// An unreadable dedup check reads as a duplicate, so a PG outage never
+    /// lets a duplicate recommendation through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_duplicate_check_fails_safe_on_an_unreadable_database() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        assert!(is_content_duplicate(&pg, "hash"));
+    }
+}

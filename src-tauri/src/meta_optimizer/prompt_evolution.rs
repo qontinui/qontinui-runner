@@ -395,3 +395,26 @@ pub fn record_evolution_full_with_pg(
         baseline_prompt_hash,
     )
 }
+
+#[cfg(test)]
+mod fail_safe_tests {
+    use super::*;
+
+    /// A database that fails every call must never open the guards: an
+    /// unreadable state reads as an active evolution and as in cooldown, so a
+    /// PG outage cannot let a second rewrite through (plan
+    /// 2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout,
+    /// Phase 6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_evolution_guards_fail_safe_on_an_unreadable_database() {
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        assert!(
+            has_active_evolution(&pg, "fixer"),
+            "unreadable must read as active"
+        );
+        assert!(
+            is_in_cooldown(&pg, "fixer", 24),
+            "unreadable must read as in cooldown"
+        );
+    }
+}
