@@ -1415,6 +1415,10 @@ struct IdentitySeamOutcome {
     /// bounded [`crate::served_corpus::probe`] so the zero-I/O briefing render
     /// right after the seam can carry its `[served-corpus: …]` header line.
     served: crate::served_corpus::ServedCorpus,
+    /// The `--settings` carrier the seam materialized and exported as
+    /// `QONTINUI_CLAUDE_HOOK_SETTINGS`, or `None` when materialization failed.
+    /// Feeds [`TerminalSession::permission_request_hook`] for the shim path.
+    hook_carrier: Option<std::path::PathBuf>,
 }
 
 /// What the waiter thread knows when a pane's process exits, handed to the
@@ -1559,6 +1563,14 @@ pub struct TerminalSession {
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
     /// such field, so it travels beside it like `sessionIdsByTerminal`).
     spawn_name: std::sync::OnceLock<String>,
+    /// Whether this terminal was handed a carrier that registers the
+    /// `PermissionRequest` hook (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7), served beside `TerminalInfo` on `GET /terminals` as
+    /// `permissionRequestHook`. Set once, by [`Self::spawn`]; unset (an adopted
+    /// holder pane, a remote mirror, a test fixture) reads `absent`.
+    permission_request_hook:
+        std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1718,6 +1730,10 @@ impl TerminalSession {
         // IS the shell is kept: only a shell pane gets a composed spawn-prompt
         // file below — a direct exec's argv already settled its own carrier.
         let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
+        // The argv's own `--settings`, if any, is half of what this terminal
+        // reports as `permissionRequestHook` (plan 2026-10-23 D7); the seam's
+        // carrier below is the other half. Kept before `command` is consumed.
+        let spawn_argv: Vec<String> = command.clone().unwrap_or_default();
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1813,6 +1829,10 @@ impl TerminalSession {
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
+        let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
+            Some(&spawn_argv),
+            seam.hook_carrier.as_deref(),
+        );
 
         // ---- The canonical runner-context briefing --------------------------
         // Rendered HERE, immediately after the identity seam, and NOT in
@@ -1892,7 +1912,7 @@ impl TerminalSession {
             )?,
         };
 
-        Self::spawn_with_io(
+        let session = Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1903,7 +1923,11 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )
+        )?;
+        // Only THIS path records it: an adopted holder pane or a remote mirror
+        // is built by `spawn_with_io` alone and reads `absent`.
+        session.set_permission_request_hook(permission_request_hook);
+        Ok(session)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].
@@ -2530,6 +2554,7 @@ impl TerminalSession {
             grid,
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -3345,7 +3370,7 @@ impl TerminalSession {
                 .entered();
         let hook_result = crate::session::claude_hook::materialize(&hook_dir);
         drop(hook_span);
-        match hook_result {
+        match &hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -3514,6 +3539,7 @@ impl TerminalSession {
             pinned_session_id: pinned,
             coord_mcp,
             served,
+            hook_carrier: hook_result,
         })
     }
 
@@ -4481,6 +4507,23 @@ impl TerminalSession {
     /// The `claude --name` this session was spawned with, if any.
     pub fn spawn_name(&self) -> Option<String> {
         self.spawn_name.get().cloned()
+    }
+
+    /// Record what [`Self::spawn`] handed this terminal (first write wins).
+    pub fn set_permission_request_hook(
+        &self,
+        hook: crate::session::claude_hook::PermissionRequestHook,
+    ) {
+        let _ = self.permission_request_hook.set(hook);
+    }
+
+    /// `GET /terminals` `permissionRequestHook`: `Absent` unless
+    /// [`Self::spawn`] recorded a current carrier.
+    pub fn permission_request_hook(&self) -> crate::session::claude_hook::PermissionRequestHook {
+        self.permission_request_hook
+            .get()
+            .copied()
+            .unwrap_or(crate::session::claude_hook::PermissionRequestHook::Absent)
     }
 
     /// Read the coord-native session id, if one has been wired.
@@ -5684,6 +5727,7 @@ pub(crate) mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),

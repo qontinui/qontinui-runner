@@ -1532,6 +1532,8 @@ mod script_tests {
     const STOP_HOOK: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
     const PRECOMPACT_HOOK: &str =
         include_str!("../../resources/session-restore/claude_precompact_hook.sh");
+    const PERMISSION_REQUEST_HOOK: &str =
+        include_str!("../../resources/session-restore/claude_permission_request_hook.sh");
 
     /// Every rung of the cascade, exercised unconditionally. `jq` is rung ONE
     /// -- the rung most production boxes actually run -- so skipping it when the
@@ -1908,6 +1910,304 @@ mod script_tests {
         }
     }
 
+    // ── The PermissionRequest hook (plan 2026-10-23-runner-sessions-stop-at-
+    // permission-dialogs-so-accept-them-by-default-with-a-tenant-switch,
+    // Phase 2). It must print Claude Code's allow envelope ONLY for a
+    // `decision: allow` answer, and NOTHING on any failure — a stray byte on
+    // its stdout would be parsed as a hook decision.
+
+    /// Exactly what the hook prints on an allow.
+    const ALLOW_ENVELOPE: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+    /// A Phase 0-shaped PermissionRequest payload.
+    const PR_PAYLOAD: &str = r#"{"session_id":"c4095874-264a-4ce7-9c7f-7d6c9b1748ba","hook_event_name":"PermissionRequest","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"rmdir $X/"}}"#;
+
+    /// One PermissionRequest-hook run: stdout, the curl argv (empty when curl
+    /// was never called), and the wall time.
+    struct PrRun {
+        stdout: String,
+        curl_args: Vec<String>,
+        elapsed: Duration,
+    }
+
+    /// Run the bundled PermissionRequest hook on a stripped PATH with NO JSON
+    /// parser at all (the hook must need none). `bin_setup` populates the bin
+    /// dir: a fake curl, the real one, or nothing.
+    fn run_pr_hook(envs: &[(&str, &str)], bin_setup: impl FnOnce(&Path, &Path)) -> PrRun {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let bash = which_host("bash").expect("bash is on PATH (this module drives bash)");
+        std::os::unix::fs::symlink(&bash, bin.join("bash")).unwrap();
+        let argv = tmp.path().join("curl-argv.txt");
+        bin_setup(&bin, &argv);
+
+        let hook = tmp.path().join("claude_permission_request_hook.sh");
+        write_exe(&hook, PERMISSION_REQUEST_HOOK);
+        let payload_file = tmp.path().join("payload.json");
+        std::fs::write(&payload_file, PR_PAYLOAD).unwrap();
+        let mut cmd = Command::new(&bash);
+        cmd.arg("-c")
+            .arg(format!(
+                "exec '{}' '{}' < '{}'",
+                bash.display(),
+                hook.display(),
+                payload_file.display()
+            ))
+            .env_clear()
+            .env("PATH", bin.display().to_string())
+            .envs(envs.iter().copied());
+        let started = std::time::Instant::now();
+        let res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("the hook runs inside its budget");
+        let elapsed = started.elapsed();
+        assert!(
+            res.status.success(),
+            "the PermissionRequest hook must never fail a session: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        PrRun {
+            stdout: String::from_utf8_lossy(&res.stdout).into_owned(),
+            curl_args: std::fs::read_to_string(&argv)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            elapsed,
+        }
+    }
+
+    const PR_SEAM: [(&str, &str); 2] = [
+        ("QONTINUI_RUNNER_API_PORT", "9876"),
+        ("QONTINUI_TERMINAL_ID", "term-1"),
+    ];
+
+    /// A fake curl that records its argv, drains the payload with a builtin,
+    /// and then runs `tail` (print a body, exit non-zero, …).
+    fn fake_curl(tail: &str) -> impl FnOnce(&Path, &Path) + '_ {
+        move |bin, argv| {
+            let bash = which_host("bash").unwrap();
+            write_exe(
+                &bin.join("curl"),
+                &format!(
+                    "#!{}\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n\
+                     IFS= read -r -d '' _ 2>/dev/null || true\n{tail}\n",
+                    bash.display(),
+                    argv.display()
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn the_permission_request_hook_prints_the_allow_envelope_only_for_decision_allow() {
+        let allow = run_pr_hook(
+            &PR_SEAM,
+            fake_curl(r#"printf '%s' '{"recorded":true,"decision":"allow","session":"term-1"}'"#),
+        );
+        assert_eq!(allow.stdout, format!("{ALLOW_ENVELOPE}\n"));
+        // Addressed to the pad, on the seam's port and terminal id, inside the
+        // ~1 s budget, with the payload on stdin.
+        assert!(
+            allow
+                .curl_args
+                .iter()
+                .any(|a| a == "http://127.0.0.1:9876/sessions/term-1/permission-request"),
+            "{:?}",
+            allow.curl_args
+        );
+        for flag in [
+            "-fsS",
+            "--connect-timeout",
+            "--max-time",
+            "--data-binary",
+            "@-",
+        ] {
+            assert!(
+                allow.curl_args.iter().any(|a| a == flag),
+                "{flag} missing: {:?}",
+                allow.curl_args
+            );
+        }
+        let at = |f: &str| allow.curl_args.iter().position(|a| a == f).unwrap();
+        assert_eq!(allow.curl_args[at("--connect-timeout") + 1], "1");
+        assert_eq!(allow.curl_args[at("--max-time") + 1], "1");
+
+        // The fallback port is honoured when the API port is unset.
+        let fallback = run_pr_hook(
+            &[
+                ("QONTINUI_INSTALL_INTERCEPT_PORT", "9999"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+            ],
+            fake_curl(r#"printf '%s' '{"decision":"allow"}'"#),
+        );
+        assert_eq!(fallback.stdout, format!("{ALLOW_ENVELOPE}\n"));
+        assert!(fallback
+            .curl_args
+            .iter()
+            .any(|a| a.starts_with("http://127.0.0.1:9999/")));
+
+        // Every other answer — including bodies that merely MENTION allow —
+        // prints nothing at all.
+        for body in [
+            r#"printf '%s' '{"decision":"none"}'"#,
+            r#"printf '%s' '{"decision":"none","reason":"allow","class_key":"allow"}'"#,
+            r#"printf '%s' '{"decision":"allowed"}'"#,
+            r#"printf '%s' 'allow'"#,
+            r#"printf '%s' 'not json'"#,
+            "true",
+            // A non-2xx (curl -f exits 22 and prints nothing).
+            "exit 22",
+            // An allow body followed by a curl failure (a timeout mid-read):
+            // a failed request answers nothing, whatever arrived.
+            r#"printf '%s' '{"decision":"allow"}'; exit 28"#,
+        ] {
+            let run = run_pr_hook(&PR_SEAM, fake_curl(body));
+            assert!(run.stdout.is_empty(), "{body}: printed {:?}", run.stdout);
+        }
+    }
+
+    #[test]
+    fn the_permission_request_hook_is_silent_without_its_seam() {
+        let allow = r#"printf '%s' '{"decision":"allow"}'"#;
+        for envs in [
+            vec![("QONTINUI_TERMINAL_ID", "term-1")],
+            vec![("QONTINUI_RUNNER_API_PORT", "9876")],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "98x6"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "../x"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "a/b"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", ".."),
+            ],
+        ] {
+            let run = run_pr_hook(&envs, fake_curl(allow));
+            assert!(run.stdout.is_empty(), "{envs:?}: printed {:?}", run.stdout);
+            assert!(run.curl_args.is_empty(), "{envs:?}: curl was called");
+        }
+        // No curl on PATH at all.
+        let run = run_pr_hook(&PR_SEAM, |_, _| {});
+        assert!(run.stdout.is_empty(), "printed {:?}", run.stdout);
+    }
+
+    /// The REAL curl, so the ~1 s budget is curl's own, not a fake's: a dead
+    /// runner (connection refused) and a hung one (accepts, never answers)
+    /// both print nothing, and the hung one is cut off by `--max-time 1`.
+    /// Then a real loopback answer of `allow` prints the envelope, which
+    /// proves the request shape against an actual HTTP exchange.
+    #[test]
+    fn the_permission_request_hook_prints_nothing_against_a_dead_or_hung_runner() {
+        let real_curl = which_host("curl").expect("`curl` must be on PATH to exercise the hook");
+        let with_real_curl = |bin: &Path, _argv: &Path| {
+            std::os::unix::fs::symlink(&real_curl, bin.join("curl")).unwrap();
+        };
+        let seam = |port: u16| {
+            [
+                ("QONTINUI_RUNNER_API_PORT", port.to_string()),
+                ("QONTINUI_TERMINAL_ID", "term-1".to_string()),
+            ]
+        };
+
+        // Dead: a port that was just released.
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let env = seam(dead_port);
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let dead = run_pr_hook(&envs, with_real_curl);
+        assert!(
+            dead.stdout.is_empty(),
+            "dead runner printed {:?}",
+            dead.stdout
+        );
+
+        // Hung: listening (the kernel completes the handshake) but never
+        // accepting or answering.
+        let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let env = seam(hung.local_addr().unwrap().port());
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let run = run_pr_hook(&envs, with_real_curl);
+        assert!(
+            run.stdout.is_empty(),
+            "hung runner printed {:?}",
+            run.stdout
+        );
+        assert!(
+            run.elapsed < Duration::from_secs(8),
+            "the hook must be cut off by curl's ~1 s budget, took {:?}",
+            run.elapsed
+        );
+        drop(hung);
+
+        // Live: one real HTTP exchange answering allow.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = live.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = live.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+            }
+            let answer = r#"{"recorded":true,"decision":"allow","session":"term-1"}"#;
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            String::from_utf8_lossy(&req).into_owned()
+        });
+        let env = seam(port);
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let run = run_pr_hook(&envs, with_real_curl);
+        let request = server.join().unwrap();
+        assert_eq!(
+            run.stdout,
+            format!("{ALLOW_ENVELOPE}\n"),
+            "request was:\n{request}"
+        );
+        assert!(
+            request.starts_with("POST /sessions/term-1/permission-request "),
+            "{request}"
+        );
+        assert!(
+            request.ends_with(PR_PAYLOAD),
+            "the payload is forwarded verbatim: {request}"
+        );
+    }
+
     /// The static twin of the behavioural tests above: no bundled hook may
     /// reach for an interpreter without offering `python3` AND a rung that
     /// needs no interpreter at all. This is what catches a reintroduction in
@@ -1919,6 +2219,7 @@ mod script_tests {
             ("claude_session_hook.sh", SESSION_HOOK),
             ("claude_stop_hook.sh", STOP_HOOK),
             ("claude_precompact_hook.sh", PRECOMPACT_HOOK),
+            ("claude_permission_request_hook.sh", PERMISSION_REQUEST_HOOK),
         ] {
             // Strip comments FIRST. Every literal below also appears in the
             // prose explaining the defect, so a grep over the raw file is

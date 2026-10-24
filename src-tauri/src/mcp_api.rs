@@ -2750,6 +2750,14 @@ async fn health(
         // the switch refused in this process. The per-deployment answer to
         // "which flows are on" — read by the desktop Privacy section.
         "egress": crate::egress::health_json(),
+        // The permission auto-accept dial (plan 2026-10-23-runner-sessions-
+        // stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-
+        // switch, D7): `answered` — has coord answered `permission_auto_accept`
+        // in this process; `level` — `on` | `off`, null when unanswered or
+        // unrecognised (UNKNOWN, never a level); `acceptCount` — how many
+        // PermissionRequest dialogs the pad has answered `allow` since boot.
+        // Field names are a contract read by qontinui-claude-config.
+        "permissionAutoAccept": crate::session::permission_accept::health_json(),
         // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
         // api-refuses-other-local-users): installed/enabled/supported, the kill
         // switch's name, and admit/refusal counters. No uid or SID is served —
