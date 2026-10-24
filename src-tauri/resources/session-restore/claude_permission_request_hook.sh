@@ -23,14 +23,20 @@
 # nonce exactly — and NOTHING otherwise. Printing nothing is Claude Code's "no
 # decision": the dialog shows as it always has.
 #
-# The nonce (QONTINUI_PERMREQ_NONCE) is a per-spawn secret the runner put in
-# this session's env. It is NEVER sent: only the runner that spawned the
-# session knows it, so a process squatting the loopback port while the runner
-# is down cannot make this script answer a prompt.
+# Two per-spawn secrets the runner put in this session's env prove the answer
+# came from the runner that spawned the session:
+#   - the REQUEST KEY (QONTINUI_PERMREQ_KEY) is SENT, in X-Qontinui-Permreq-Key;
+#     the pad answers allow only for the terminal's own key;
+#   - the NONCE (QONTINUI_PERMREQ_NONCE) is NEVER sent; the pad echoes it only
+#     on an allow for the right key, and this script requires the exact echo.
+# The key is derived one-way from the nonce, so a process squatting the
+# loopback port while the runner is down learns only the key and cannot forge
+# the echo; and a caller that does not hold the key cannot harvest a nonce
+# from the running pad.
 #
 # FAIL-CLOSED-TO-THE-DIALOG INVARIANTS (a broken runner must never answer a
 # prompt, and must never break a session):
-#   - missing port / terminal id / nonce / curl         -> exit 0, no output
+#   - missing port / terminal id / key / nonce / curl   -> exit 0, no output
 #   - curl error / timeout / non-2xx / any other body   -> exit 0, no output
 #   - an allow without the exact nonce echo             -> exit 0, no output
 #   - ONE bound for the whole exchange: curl reads the payload from stdin
@@ -45,6 +51,7 @@
 #   QONTINUI_RUNNER_API_PORT         the runner's loopback API port
 #   QONTINUI_INSTALL_INTERCEPT_PORT  fallback port (same server by default)
 #   QONTINUI_TERMINAL_ID             the per-PTY terminal id — the pad's key
+#   QONTINUI_PERMREQ_KEY             the per-spawn request key this script sends
 #   QONTINUI_PERMREQ_NONCE           the per-spawn nonce the allow must echo
 #
 # A `claude` started by hand outside the runner has no QONTINUI_TERMINAL_ID,
@@ -54,6 +61,7 @@ set -u
 port="${QONTINUI_RUNNER_API_PORT:-${QONTINUI_INSTALL_INTERCEPT_PORT:-}}"
 term="${QONTINUI_TERMINAL_ID:-}"
 nonce="${QONTINUI_PERMREQ_NONCE:-}"
+key="${QONTINUI_PERMREQ_KEY:-}"
 [ -z "$port" ] && exit 0
 # A port is digits; anything else would re-point the request.
 case "$port" in
@@ -71,6 +79,11 @@ case "$nonce" in
   "" | *[!0-9a-f]*) exit 0 ;;
 esac
 [ "${#nonce}" -ge 16 ] || exit 0
+# The key is lowercase hex too (it is placed in a header line).
+case "$key" in
+  "" | *[!0-9a-f]*) exit 0 ;;
+esac
+[ "${#key}" -ge 16 ] || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 
 # `-T -` streams stdin as the request body DURING the transfer, so the read is
@@ -79,7 +92,8 @@ command -v curl >/dev/null 2>&1 || exit 0
 # 100-continue round trip; `--noproxy '*'` keeps a proxy env var from routing
 # a loopback call elsewhere. stdin is the hook's own, inherited by curl.
 resp="$(curl -fsS --noproxy '*' --connect-timeout 1 --max-time 1 \
-  -X POST -H 'Content-Type: application/json' -H 'Expect:' -T - \
+  -X POST -H 'Content-Type: application/json' -H 'Expect:' \
+  -H "X-Qontinui-Permreq-Key: ${key}" -T - \
   "http://127.0.0.1:${port}/sessions/${term}/permission-request" 2>/dev/null)" || exit 0
 
 # Match the KEY and the VALUE together, so a body that merely contains the
