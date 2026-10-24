@@ -792,6 +792,9 @@ pub struct FinishSessionRequest {
 ///   is NOT told. A re-finish that carries a `reason` RESTAMPS an
 ///   already-finished mark (`changed: "marker"`, a new `finishedAt`,
 ///   `finishSynced: false`, the finish re-sent to coord with the new time).
+///   A caller that sends a `reason` on EVERY call (a poll, say) therefore
+///   restamps and re-queues on every call and keeps `finishSynced` false; a
+///   poll must send no reason.
 ///   `changed: "none"` — a re-finish with no reason, i.e. the read-back —
 ///   wrote nothing locally; on a mark coord has not ACKed it RE-OFFERS the
 ///   owed coord write (the retry door) and reports that attempt's verdict,
