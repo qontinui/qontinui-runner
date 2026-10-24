@@ -35,7 +35,8 @@ pub fn compute_content_hash(
 /// in a non-terminal state (pending, canary, applied).
 ///
 /// The read's error is KEPT: an unreadable state is neither "duplicate" nor
-/// "new", so the caller (`parser::save_parsed_recommendations`) fails the save
+/// "new", so the caller (`parser::is_duplicate_recommendation`, and through it
+/// `parser::save_parsed_recommendations`) fails the save
 /// rather than skip a recommendation (which would report "0 created") or
 /// insert a possible duplicate.
 pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> Result<bool, String> {

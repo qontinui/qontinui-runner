@@ -49,8 +49,8 @@
 //! Bridged spelling (added in review; `catch_unwind` panic arms that map to
 //! `Err` excluded): 22 sites before, 14 after (8 converted: the replay-history
 //! read, the stage-name and two reflection-prefix workflow lookups, the
-//! comparison benchmark lookup, and the three meta-optimizer guards, which
-//! now fail safe with a `warn!`). The 40 after are exactly [`ALLOWLIST`].
+//! comparison benchmark lookup, and the three meta-optimizer dedup/guard
+//! reads, which now fail safe with a `warn!` or pass their error up). The 40 after are exactly [`ALLOWLIST`].
 //!
 //! Allowlist entries are keyed by file + the site's whitespace-stripped text
 //! (from the receiver through the fallback head), never by line number, and

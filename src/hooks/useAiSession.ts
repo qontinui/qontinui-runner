@@ -453,12 +453,13 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         });
         // On a DB outage the reply is `success: false` yet still carries the
         // live in-memory output: show it, and report the history read failed.
-        const { log } = aiOutputOf(outputResponse);
+        const { log, historyUnavailable } = aiOutputOf(outputResponse);
         if (log) {
           parsedMessages = parseOutputLog(log);
         }
         if (!outputResponse.success) {
-          readError ??= `history read failed: ${outputResponse.message ?? "unknown error"}`;
+          const fallback = historyUnavailable ? "database unavailable" : "unknown error";
+          readError ??= `history read failed: ${outputResponse.message ?? fallback}`;
         }
       } catch (e) {
         console.error("[useAiSession] Failed to load session messages:", e);

@@ -452,7 +452,7 @@ fn is_duplicate_recommendation(
     );
     // Check content hash first (covers pending, canary, applied)
     if super::recommendations::is_content_duplicate(pg_db, &hash)
-        .map_err(|e| format!("recommendation dedup check unreadable: {e}"))?
+        .map_err(|e| format!("content-hash dedup check unreadable: {e}"))?
     {
         return Ok(true);
     }
@@ -460,7 +460,7 @@ fn is_duplicate_recommendation(
     let rejected = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(pg_db.count_rejected_by_title(title))
     })
-    .map_err(|e| format!("recommendation dedup check unreadable: {e}"))?;
+    .map_err(|e| format!("rejected-title dedup check unreadable: {e}"))?;
     Ok(rejected > 0)
 }
 
@@ -521,7 +521,9 @@ pub fn save_parsed_recommendations(
                     "prompt_rewrite",
                     Some(&rec.agent_type),
                     Some(&recommended_value),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -593,7 +595,9 @@ pub fn save_parsed_recommendations(
                     "config_change",
                     None,
                     Some(&recommended_value),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -665,7 +669,9 @@ pub fn save_parsed_recommendations(
                     "config_change",
                     None,
                     Some(&recommended_value),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -708,7 +714,9 @@ pub fn save_parsed_recommendations(
                     "finding",
                     None,
                     Some(&metadata),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate finding: {}", title);
                     continue;
                 }
@@ -791,7 +799,9 @@ pub fn save_parsed_recommendations(
                     rec_type,
                     Some(&rec.agent),
                     Some(&recommended_value),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -866,7 +876,9 @@ pub fn save_parsed_recommendations(
                     "prompt_rewrite",
                     Some(&rec.target_agent),
                     Some(&recommended_value),
-                )? {
+                )
+                .map_err(|e| format!("{e} ({count} already created by this save)"))?
+                {
                     debug!("Skipping duplicate meta-prompt rewrite: {}", title);
                     continue;
                 }
@@ -1344,7 +1356,7 @@ prompt_content: |
         assert!(
             saved
                 .as_ref()
-                .is_err_and(|e| e.contains("recommendation dedup check unreadable")),
+                .is_err_and(|e| e.contains("content-hash dedup check unreadable")),
             "an unreadable dedup check must fail the save, never report 0 created: {saved:?}"
         )
     }

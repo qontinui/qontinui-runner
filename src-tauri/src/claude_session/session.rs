@@ -1780,7 +1780,8 @@ impl ClaudeSession {
     ///
     /// Returns:
     /// - `Ok(Some(prompt))` — there is history; send this as the initial prompt.
-    /// - `Ok(None)` — no `session_ctx`, empty output_log, or no parseable turns.
+    /// - `Ok(None)` — no `session_ctx`, empty output_log, no parseable turns, or a
+    ///   NON-outage read error (read as an empty log).
     /// - `Err(BuildReplayErr::NoPg)` — PG global isn't initialized; caller
     ///   typically aborts the respawn since persistence won't work either way.
     /// - `Err(BuildReplayErr::Unreadable)` — the database is down: the history
@@ -2099,16 +2100,18 @@ impl ClaudeSession {
                 let new_session = Arc::new(new_session);
 
                 // Send replay prompt if we have conversation context
+                let mut context_restored = false;
                 if let Some(ref replay_prompt) = conversation_context {
-                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
-                        warn!("Failed to send replay prompt: {}", e);
+                    match new_session.send_initial_prompt(replay_prompt) {
+                        Ok(_) => context_restored = true,
+                        Err(e) => warn!("Failed to send replay prompt: {}", e),
                     }
                 }
 
                 // Remove old session and re-register under the same ID
                 sm.remove(session_id);
                 if let Err(e) = sm.register(session_id, new_session.clone()) {
-                    warn!("Failed to re-register session after restart: {}", e);
+                    not_restarted(format!("the new session could not be registered ({e})"));
                     return;
                 }
 
@@ -2127,8 +2130,13 @@ impl ClaudeSession {
                         emit_ai_output(
                             app_handle,
                             &format!(
-                                "Session restarted on account '{}'. Conversation context restored.",
-                                label
+                                "Session restarted on account '{}'. {}",
+                                label,
+                                if context_restored {
+                                    "Conversation context restored."
+                                } else {
+                                    "No prior conversation was replayed."
+                                }
                             ),
                             "status",
                             None,

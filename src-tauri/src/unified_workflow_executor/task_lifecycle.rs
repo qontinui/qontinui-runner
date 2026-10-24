@@ -223,7 +223,7 @@ impl LoopController {
                         }
                         Err(e) => {
                             warn!(
-                                "Failed to parse meta-optimizer recommendations for task {}: {}",
+                                "Failed to save meta-optimizer recommendations for task {}: {}",
                                 eid, e
                             );
                         }
