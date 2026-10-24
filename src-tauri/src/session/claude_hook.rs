@@ -8,8 +8,8 @@
 //! Phase-0 probe PROVED that a `SessionStart` hook supplied ONLY via
 //! `claude --settings <file>` fires on both, additively — Claude MERGES the
 //! `--settings` file's hooks on top of any `~/.claude` config WITHOUT writing
-//! to it. So the entire delivery is FIVE runner-owned files in the runner's OWN
-//! app-data dir (`~/.qontinui/runner/session-restore/`) — four bundled scripts
+//! to it. So the entire delivery is SIX runner-owned files in the runner's OWN
+//! app-data dir (`~/.qontinui/runner/session-restore/`) — five bundled scripts
 //! and the one `--settings` carrier that registers them ([`hook_files`] is the
 //! roster):
 //!
@@ -23,8 +23,15 @@
 //!     `PreCompact`, unconditional.
 //!   * `claude_stop_hook.sh` — the continuation verdict. `Stop`, and the ONLY
 //!     one whose REGISTRATION is gated.
-//!   * `claude_hook_settings.json` / `claude_hook_settings-nostop.json` —
-//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...] },
+//!   * `claude_permission_request_hook.sh` — the permission auto-accept
+//!     decision point (plan
+//!     `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+//!     D2/D6). `PermissionRequest`, unconditional: the DECISION is dialled at
+//!     the runner's pad per prompt, never at registration, so the key is in
+//!     both variants.
+//!   * `claude_hook_settings-permreq.json` / `claude_hook_settings-permreq-nostop.json` —
+//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...],
+//!     "PermissionRequest": [...], "Stop": [...] },
 //!     "permissions": { "allow": [...] } }`, each `command` pointing at the
 //!     corresponding materialized script. **`permissions.allow` rides this same
 //!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
@@ -35,12 +42,22 @@
 //!     per assistant turn. The two variants use DISTINCT FILENAMES because the
 //!     hook dir is machine-global — see [`session_restore_dir`].
 //!
-//! **Exactly one of the two carrier names exists on a given box per posture**,
-//! so nothing outside this module should name one: in the DEFAULT (dark)
-//! posture `claude_hook_settings.json` is the file that is NOT written. The
-//! bundled scripts' own headers therefore say "the runner-owned `--settings`
-//! carrier" rather than a filename — pinned by
+//! **This build writes exactly one of its two carrier names per posture**, so
+//! nothing outside this module should name one: in the DEFAULT (dark) posture
+//! the armed name ([`HOOK_SETTINGS_NAME`]) is the file that is NOT written.
+//! The bundled scripts' own headers therefore say "the runner-owned
+//! `--settings` carrier" rather than a filename — pinned by
 //! `tests::only_the_stop_script_may_name_a_carrier_file`.
+//!
+//! **The names carry a ROSTER TOKEN (`-permreq`).** The dir is machine-global
+//! (see [`session_restore_dir`]), and an OLDER runner instance on the same box
+//! writes the pre-`PermissionRequest` carrier under the old names
+//! (`claude_hook_settings.json` / `claude_hook_settings-nostop.json`, listed in
+//! [`RETIRED_SETTINGS_NAMES`]). Had this build kept those names, that older
+//! instance would overwrite this build's carrier with a hook-less file while
+//! this process's cache still reported a hit — the per-variant-name rule below,
+//! applied to the roster change. A future roster change takes a new token the
+//! same way.
 //!
 //! ## Two delivery paths, because only one has a wrapper in the chain
 //!
@@ -68,7 +85,7 @@
 //! ## Materialization
 //!
 //! [`materialize`] is idempotent, and CACHED: the first call in a process
-//! writes all five files (cheap, a few hundred bytes each) and every later call
+//! writes all six files (cheap, a few hundred bytes each) and every later call
 //! for the same (`base_dir`, variant) costs one `stat` per file — see
 //! [`cached_materialization`]. A runner upgrade that ships a newer template
 //! still refreshes them because it is a NEW PROCESS, not because each call
@@ -130,11 +147,24 @@ const PRECOMPACT_HOOK_SCRIPT: &str =
 /// delivering the policy became the desired baseline.)
 const POLICY_HOOK_SCRIPT: &str =
     include_str!("../../resources/session-restore/claude_policy_hook.sh");
+/// PermissionRequest-hook script template (bundled) — the permission
+/// auto-accept decision point (plan
+/// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// Phase 2). A dumb curl like its siblings: it reads its seam from env
+/// (`QONTINUI_TERMINAL_ID`, `QONTINUI_RUNNER_API_PORT`), POSTs the payload to
+/// the runner's `POST /sessions/{id}/permission-request` pad within ~1 s, and
+/// prints Claude Code's allow envelope ONLY when the pad answers
+/// `decision: allow`. Every decision — the tenant dial, the never-answered
+/// classes — lives in [`crate::session::permission_accept`]. Registered in
+/// BOTH variants: no dial gates its registration (D6), so a flip of the dial
+/// reaches running sessions instead of only new ones.
+const PERMISSION_REQUEST_HOOK_SCRIPT: &str =
+    include_str!("../../resources/session-restore/claude_permission_request_hook.sh");
 /// Settings template (bundled). [`build_settings`] parses it and resolves each
 /// `command` by the `@@…@@` PLACEHOLDER that command already carries —
 /// `@@HOOK_SCRIPT@@`, `@@STOP_HOOK_SCRIPT@@`, `@@PRECOMPACT_HOOK_SCRIPT@@`,
-/// `@@POLICY_HOOK_SCRIPT@@` — swapping in the matching materialized script's
-/// absolute path.
+/// `@@POLICY_HOOK_SCRIPT@@`, `@@PERMISSION_REQUEST_HOOK_SCRIPT@@` — swapping in
+/// the matching materialized script's absolute path.
 ///
 /// **The placeholders are load-bearing, not decoration.** They are the
 /// substitution KEY, which is what lets ONE `SessionStart` block carry TWO
@@ -153,9 +183,12 @@ const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
 const PRECOMPACT_HOOK_SCRIPT_NAME: &str = "claude_precompact_hook.sh";
 /// File name of the materialized SessionStart policy-injection script.
 const POLICY_HOOK_SCRIPT_NAME: &str = "claude_policy_hook.sh";
+/// File name of the materialized PermissionRequest-hook script.
+const PERMISSION_REQUEST_HOOK_SCRIPT_NAME: &str = "claude_permission_request_hook.sh";
 /// File name of the materialized `--settings` file for the ARMED variant
-/// ([`StopHookRegistration::Registered`]).
-const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
+/// ([`StopHookRegistration::Registered`]). Carries the `-permreq` roster token
+/// — see the module docs and [`RETIRED_SETTINGS_NAMES`].
+const HOOK_SETTINGS_NAME: &str = "claude_hook_settings-permreq.json";
 /// File name of the materialized `--settings` file for the DARK variant
 /// ([`StopHookRegistration::Omitted`]).
 ///
@@ -169,7 +202,22 @@ const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
 /// the other process's cache still reports a hit. Separate names make that
 /// impossible by construction rather than narrowing the race — the same reason
 /// `coord_mcp.rs` keys its `--mcp-config` filename per workdir+terminal.
-const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-nostop.json";
+///
+/// The same rule covers a ROSTER change, which is why both names carry the
+/// `-permreq` token: an older build writes a carrier without the
+/// `PermissionRequest` key, and it must not be able to write it under a name
+/// this build delivers.
+const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-permreq-nostop.json";
+
+/// The carrier names of the PREVIOUS roster (before the `PermissionRequest`
+/// key). This build never writes or delivers them; an older runner instance on
+/// the same box still may, which is exactly why this build moved off them. DO
+/// NOT delete them from disk — that would be reaching into another live
+/// process's delivery (see [`hook_files`]).
+pub const RETIRED_SETTINGS_NAMES: [&str; 2] = [
+    "claude_hook_settings.json",
+    "claude_hook_settings-nostop.json",
+];
 
 /// Template placeholders, one per bundled script. These are the substitution
 /// KEY — [`resolve_commands`] matches each `command` on the placeholder it
@@ -179,6 +227,7 @@ const HOOK_SCRIPT_PLACEHOLDER: &str = "@@HOOK_SCRIPT@@";
 const STOP_HOOK_SCRIPT_PLACEHOLDER: &str = "@@STOP_HOOK_SCRIPT@@";
 const PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER: &str = "@@PRECOMPACT_HOOK_SCRIPT@@";
 const POLICY_HOOK_SCRIPT_PLACEHOLDER: &str = "@@POLICY_HOOK_SCRIPT@@";
+const PERMISSION_REQUEST_HOOK_SCRIPT_PLACEHOLDER: &str = "@@PERMISSION_REQUEST_HOOK_SCRIPT@@";
 
 /// Whether the delivered settings registers the `Stop` continuation hook.
 ///
@@ -246,6 +295,101 @@ pub fn settings_path(base_dir: &Path, reg: StopHookRegistration) -> PathBuf {
     base_dir.join(reg.settings_name())
 }
 
+/// Whether `path` names a carrier THIS build writes — one of the two current
+/// roster names, either variant. Every such file registers the
+/// `PermissionRequest` hook ([`build_settings`] refuses a template without
+/// it), so this is what `GET /terminals` `permissionRequestHook` keys on for a
+/// `--settings` carried in a spawn's argv.
+pub fn is_current_carrier(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == HOOK_SETTINGS_NAME || n == HOOK_SETTINGS_NAME_NOSTOP)
+}
+
+/// Whether a terminal was handed a carrier that registers the
+/// `PermissionRequest` hook — `GET /terminals` `permissionRequestHook` (plan
+/// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// D7). Decided ONCE, at spawn, from what the spawn actually carried; a pane
+/// adopted from a holder or mirrored from another machine was spawned by
+/// someone else and reads [`PermissionRequestHook::Absent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionRequestHook {
+    /// Spawned with a carrier THIS build wrote ([`is_current_carrier`]).
+    Registered,
+    /// No such carrier: adopted, remote, spawned by an older build, or the
+    /// carrier could not be materialized.
+    Absent,
+}
+
+impl PermissionRequestHook {
+    /// The wire word: `"registered"` | `"absent"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionRequestHook::Registered => "registered",
+            PermissionRequestHook::Absent => "absent",
+        }
+    }
+}
+
+/// The carrier a spawn's argv names with `--settings <path>` (or
+/// `--settings=<path>`), if any. PURE.
+fn argv_settings_path(argv: &[String]) -> Option<&str> {
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--settings" {
+            return it.next().map(String::as_str);
+        }
+        if let Some(path) = arg.strip_prefix("--settings=") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Whether `program` is `claude` itself (a direct exec — no identity shim in
+/// the chain to turn [`CLAUDE_SETTINGS_ENV`] into `--settings`). PURE.
+///
+/// Splits on BOTH separators rather than through `Path`: a Windows argv
+/// (`C:\npm\claude.cmd`) is not split on `\` by `Path` on a Unix host, and the
+/// verdict must not depend on which OS evaluates it.
+fn is_direct_claude_exec(program: &str) -> bool {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = base.split('.').next().unwrap_or(base);
+    stem.eq_ignore_ascii_case("claude")
+}
+
+/// What a terminal spawned with `command` (`None`/empty ⇒ the interactive
+/// shell) reports as `permissionRequestHook`, given the carrier its identity
+/// seam materialized into [`CLAUDE_SETTINGS_ENV`] (`seam_carrier`). PURE.
+///
+/// The three delivery paths, each judged on what it actually hands the child:
+///
+/// 1. A spawn whose argv carries `--settings <path>` — the direct-exec path
+///    ([`direct_spawn_settings_args`]) and the provider adapter's launch spec
+///    (`provider_adapter::ClaudeAdapter::capture_hook_delivery`) — is
+///    `Registered` iff that path is a carrier THIS build writes.
+/// 2. A direct `claude` exec WITHOUT such an argv carrier is `Absent`: no shim
+///    sits in its chain, so the env var reaches no `--settings`.
+/// 3. Anything else — the shell pane, where the identity shim appends
+///    `--settings $QONTINUI_CLAUDE_HOOK_SETTINGS` to the `claude` typed in it —
+///    is `Registered` iff the seam materialized a current carrier.
+pub fn permission_request_hook_for(
+    command: Option<&[String]>,
+    seam_carrier: Option<&Path>,
+) -> PermissionRequestHook {
+    let argv = command.unwrap_or(&[]);
+    let registered = match argv_settings_path(argv) {
+        Some(path) => is_current_carrier(Path::new(path)),
+        None if argv.first().is_some_and(|p| is_direct_claude_exec(p)) => false,
+        None => seam_carrier.is_some_and(is_current_carrier),
+    };
+    if registered {
+        PermissionRequestHook::Registered
+    } else {
+        PermissionRequestHook::Absent
+    }
+}
+
 /// Env var the runner injects at spawn carrying the absolute path of the
 /// materialized Claude `--settings` hook file. The identity shim's `claude`
 /// wrapper reads it and appends `--settings $that` to the real argv. Empty/unset
@@ -275,7 +419,7 @@ pub fn session_restore_dir() -> PathBuf {
 /// pinned via `--session-id`; only the confirmation hook is absent). The hook
 /// script is marked executable on Unix.
 ///
-/// CACHED PER (`base_dir`, [`StopHookRegistration`]) (Phase 6, B2). The four
+/// CACHED PER (`base_dir`, [`StopHookRegistration`]) (Phase 6, B2). The five
 /// SCRIPTS are byte-identical for a given `base_dir` (they are `include_str!`'d
 /// constants), and the settings file is a function of `base_dir` AND the
 /// registration variant — the two variants write DIFFERENT filenames with
@@ -414,6 +558,18 @@ fn materialize_from_template(
     }
     set_executable(&policy_script_path);
 
+    // PermissionRequest hook (permission auto-accept, plan 2026-10-23 Phase 2)
+    // — same carrier, same fail-open posture; registered in BOTH variants.
+    let permission_request_script_path = base_dir.join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(
+        &permission_request_script_path,
+        PERMISSION_REQUEST_HOOK_SCRIPT.as_bytes(),
+    ) {
+        tracing::warn!(error = %e, path = %permission_request_script_path.display(), "session-restore: claude permission-request-hook script write failed");
+        return None;
+    }
+    set_executable(&permission_request_script_path);
+
     // Build the settings by parsing the template, resolving each `command`'s
     // OWN `@@…@@` placeholder to that script's absolute path, and (when dark)
     // dropping the `Stop` key entirely. serde_json does the JSON escaping, so a
@@ -424,6 +580,7 @@ fn materialize_from_template(
         &stop_script_path,
         &precompact_script_path,
         &policy_script_path,
+        &permission_request_script_path,
         stop,
     ) {
         Some(s) => s,
@@ -520,6 +677,7 @@ fn build_settings(
     stop: &Path,
     precompact: &Path,
     policy: &Path,
+    permission_request: &Path,
     reg: StopHookRegistration,
 ) -> Option<String> {
     let mut root: serde_json::Value = serde_json::from_str(template).ok()?;
@@ -533,8 +691,15 @@ fn build_settings(
         // and `PreCompact` is unconditional by design. Checked by name because
         // the resolve below iterates whatever events the template HAS — it
         // cannot notice one that was never there.
+        //
+        // `PermissionRequest` is load-bearing in both variants too, for a
+        // REPORTING reason as well as a behavioural one: `GET /terminals`
+        // reports `permissionRequestHook: registered` for any terminal handed
+        // a carrier this build wrote ([`is_current_carrier`]), and that is only
+        // true if no such carrier can lack the key.
         hooks.get("SessionStart")?;
         hooks.get("PreCompact")?;
+        hooks.get("PermissionRequest")?;
         // SETTLE `Stop` BEFORE resolving, never after. Order is load-bearing:
         // under the dark variant the key is DELETED, so a malformed `Stop` block
         // never reaches the delivered file and must not be able to veto it.
@@ -567,6 +732,10 @@ fn build_settings(
                 (STOP_HOOK_SCRIPT_PLACEHOLDER, stop),
                 (PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER, precompact),
                 (POLICY_HOOK_SCRIPT_PLACEHOLDER, policy),
+                (
+                    PERMISSION_REQUEST_HOOK_SCRIPT_PLACEHOLDER,
+                    permission_request,
+                ),
             ],
         )?;
     }
@@ -583,9 +752,9 @@ static MATERIALIZED: once_cell::sync::Lazy<
 
 /// Every file a [`materialize`] under `reg` is responsible for, in `base_dir`.
 ///
-/// The four SCRIPTS are variant-INDEPENDENT (they are written unconditionally
+/// The five SCRIPTS are variant-INDEPENDENT (they are written unconditionally
 /// — registration is gated, materialization is not), so both variants leave all
-/// four on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
+/// five on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
 /// check below validates the file this variant actually delivers rather than
 /// the other one's.
 ///
@@ -594,18 +763,19 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// after a flag flip). That is fine and harmless — every instance's spawn
 /// points `--settings` at its own name — so DO NOT "clean it up": deleting the
 /// other variant's file would be reaching into another live process's delivery.
-fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
+fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 6] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
+        base_dir.join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME),
         settings_path(base_dir, reg),
     ]
 }
 
 /// The settings path for `base_dir` if this process already materialized it
-/// UNDER THE WANTED VARIANT and all five files are still present. `None` (⇒
+/// UNDER THE WANTED VARIANT and all six files are still present. `None` (⇒
 /// full rewrite) otherwise, so an operator who deletes the dir gets it back on
 /// the next spawn — and a variant change rewrites rather than serving a file
 /// whose bytes were produced under the other flag state.
@@ -668,8 +838,9 @@ mod tests {
         assert!(settings_args_from(None).is_empty());
     }
 
-    /// Everything that must hold for BOTH variants: all four scripts on disk,
-    /// SessionStart + PreCompact registered and pointing at them, no
+    /// Everything that must hold for BOTH variants: all five scripts on disk,
+    /// SessionStart + PreCompact + PermissionRequest registered and pointing at
+    /// them, no
     /// unsubstituted placeholders, `permissions.allow` intact, and nothing
     /// outside the tempdir. Returns the parsed settings for variant-specific
     /// assertions.
@@ -685,7 +856,7 @@ mod tests {
             reg.settings_name()
         );
 
-        // All four scripts exist alongside it — registration is gated,
+        // All five scripts exist alongside it — registration is gated,
         // MATERIALIZATION is not.
         let script_path = tmp.join(HOOK_SCRIPT_NAME);
         let stop_script_path = tmp.join(STOP_HOOK_SCRIPT_NAME);
@@ -701,6 +872,11 @@ mod tests {
             policy_script_path.exists(),
             "policy-hook script materialized"
         );
+        let permission_request_script_path = tmp.join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME);
+        assert!(
+            permission_request_script_path.exists(),
+            "permission-request-hook script materialized"
+        );
 
         // Settings is valid JSON with every placeholder substituted.
         let settings_text = std::fs::read_to_string(settings_path).unwrap();
@@ -709,6 +885,7 @@ mod tests {
             STOP_HOOK_SCRIPT_PLACEHOLDER,
             PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER,
             POLICY_HOOK_SCRIPT_PLACEHOLDER,
+            PERMISSION_REQUEST_HOOK_SCRIPT_PLACEHOLDER,
         ] {
             assert!(
                 !settings_text.contains(placeholder),
@@ -734,6 +911,35 @@ mod tests {
             precompact_cmd.contains(PRECOMPACT_HOOK_SCRIPT_NAME),
             "PreCompact command runs our precompact-hook script"
         );
+
+        // PermissionRequest is registered in BOTH variants (D6 — no dial
+        // gates its registration; the decision is dialled at the pad), with
+        // the `*` matcher the Phase 0 probe measured, as ONE command.
+        let permission_request = v["hooks"]["PermissionRequest"]
+            .as_array()
+            .expect("PermissionRequest registered in every variant");
+        assert_eq!(permission_request.len(), 1, "one PermissionRequest block");
+        assert_eq!(permission_request[0]["matcher"].as_str(), Some("*"));
+        let pr_cmds = permission_request[0]["hooks"].as_array().unwrap();
+        assert_eq!(pr_cmds.len(), 1, "one PermissionRequest command");
+        assert_eq!(
+            pr_cmds[0]["command"].as_str(),
+            Some(format!("bash '{}'", permission_request_script_path.display()).as_str()),
+            "PermissionRequest command runs our permission-request-hook script"
+        );
+
+        // The permission-request script POSTs to the pad within the ~1 s
+        // budget, reads the seam env, and prints exactly Claude Code's allow
+        // envelope (behaviour is exercised for real in
+        // `spawn_prompt::script_tests`).
+        let pr_text = std::fs::read_to_string(&permission_request_script_path).unwrap();
+        assert!(pr_text.contains("/permission-request"));
+        assert!(pr_text.contains("QONTINUI_RUNNER_API_PORT"));
+        assert!(pr_text.contains("QONTINUI_TERMINAL_ID"));
+        assert!(pr_text.contains("--connect-timeout 1 --max-time 1"));
+        assert!(pr_text.contains(
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+        ));
 
         // The precompact script POSTs to the context-low route, reads the seam
         // env, and never blocks the compaction (exit 0 everywhere).
@@ -850,6 +1056,7 @@ mod tests {
             stop_script_path.as_path(),
             precompact_script_path.as_path(),
             policy_script_path.as_path(),
+            permission_request_script_path.as_path(),
         ] {
             let below = path.strip_prefix(tmp).unwrap_or_else(|_| {
                 panic!("{} is not under the base {}", path.display(), tmp.display())
@@ -948,7 +1155,7 @@ mod tests {
     /// shares it), so the two variants must not share a filename. If they did,
     /// a dark temp runner rewriting the file would silently disarm an armed
     /// primary whose own per-process cache still reports a hit (variant matches,
-    /// four files exist) and therefore never rewrites. Distinct names make the
+    /// all six files exist) and therefore never rewrites. Distinct names make the
     /// collision impossible by construction.
     #[test]
     fn the_two_variants_write_distinct_settings_files_that_coexist() {
@@ -988,15 +1195,172 @@ mod tests {
             "another instance's write cannot disarm this instance's settings"
         );
 
-        // Both variants leave all three SCRIPTS on disk (materialization is not
+        // Both variants leave all five SCRIPTS on disk (materialization is not
         // gated, only registration is).
         for name in [
             HOOK_SCRIPT_NAME,
             STOP_HOOK_SCRIPT_NAME,
             PRECOMPACT_HOOK_SCRIPT_NAME,
+            POLICY_HOOK_SCRIPT_NAME,
+            PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
         ] {
             assert!(tmp.path().join(name).exists(), "{name} materialized");
         }
+
+        // ...and both variants register PermissionRequest — the key is not a
+        // variant dimension (D6).
+        for v in [&armed_v, &dark_v] {
+            assert!(
+                v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"].is_string(),
+                "PermissionRequest registered in both variants"
+            );
+        }
+    }
+
+    /// The ROSTER-change twin of the per-variant-name rule: an OLDER runner
+    /// sharing the machine-global dir writes a carrier with no
+    /// `PermissionRequest` key under the PREVIOUS names. This build never
+    /// writes or delivers those names, so such a write cannot replace the file
+    /// this build hands its sessions — and this build never deletes them.
+    #[test]
+    fn an_older_rosters_carrier_cannot_overwrite_this_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let ours = materialize_with(tmp.path(), reg).unwrap();
+            assert!(
+                !RETIRED_SETTINGS_NAMES
+                    .contains(&ours.file_name().unwrap().to_string_lossy().as_ref()),
+                "{reg:?} delivers a retired name: {}",
+                ours.display()
+            );
+            assert!(is_current_carrier(&ours), "{}", ours.display());
+        }
+        for retired in RETIRED_SETTINGS_NAMES {
+            assert!(
+                !tmp.path().join(retired).exists(),
+                "this build wrote the retired name {retired}"
+            );
+            assert!(!is_current_carrier(&tmp.path().join(retired)));
+            // An older instance writes its hook-less carrier there...
+            std::fs::write(tmp.path().join(retired), r#"{"hooks":{}}"#).unwrap();
+        }
+        // ...and ours is untouched and still served from the cache.
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let ours = materialize_with(tmp.path(), reg).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ours).unwrap()).unwrap();
+            assert!(
+                v["hooks"]["PermissionRequest"].is_array(),
+                "{reg:?}: an older roster's write reached this build's carrier"
+            );
+        }
+        // The retired files are left in place (another process's delivery).
+        for retired in RETIRED_SETTINGS_NAMES {
+            assert!(tmp.path().join(retired).exists());
+        }
+    }
+
+    /// `GET /terminals` `permissionRequestHook`, over the three delivery paths.
+    #[test]
+    fn permission_request_hook_follows_the_carrier_each_spawn_path_hands_over() {
+        use PermissionRequestHook::{Absent, Registered};
+        let dir = Path::new("/r/session-restore");
+        let armed = settings_path(dir, StopHookRegistration::Registered);
+        let dark = settings_path(dir, StopHookRegistration::Omitted);
+        let old = dir.join("claude_hook_settings-nostop.json");
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+        // 3. The shell pane: the seam's carrier rides the env var to the shim.
+        assert_eq!(permission_request_hook_for(None, Some(&dark)), Registered);
+        assert_eq!(
+            permission_request_hook_for(Some(&[]), Some(&armed)),
+            Registered
+        );
+        assert_eq!(
+            permission_request_hook_for(None, None),
+            Absent,
+            "materialize failed"
+        );
+        assert_eq!(
+            permission_request_hook_for(None, Some(&old)),
+            Absent,
+            "a retired roster's carrier does not register the hook"
+        );
+
+        // 1. A direct exec carrying `--settings` (direct_spawn_settings_args,
+        // the provider adapter's launch spec): judged on THAT path.
+        let direct = s(&[
+            "/bin/claude",
+            "--settings",
+            &dark.to_string_lossy(),
+            "-p",
+            "x",
+        ]);
+        assert_eq!(permission_request_hook_for(Some(&direct), None), Registered);
+        let eq_form = s(&["claude", &format!("--settings={}", armed.display())]);
+        assert_eq!(
+            permission_request_hook_for(Some(&eq_form), None),
+            Registered
+        );
+        let stale = s(&["claude", "--settings", &old.to_string_lossy()]);
+        assert_eq!(
+            permission_request_hook_for(Some(&stale), Some(&dark)),
+            Absent,
+            "the argv's own carrier decides, not the env var"
+        );
+
+        // 2. A direct `claude` exec with no argv carrier: no shim, so Absent
+        // even though the seam materialized one.
+        for program in [
+            "claude",
+            "/usr/local/bin/claude",
+            r"C:\npm\claude.cmd",
+            "CLAUDE.exe",
+        ] {
+            let bare = s(&[program, "--resume", "abc"]);
+            assert_eq!(
+                permission_request_hook_for(Some(&bare), Some(&dark)),
+                Absent,
+                "{program}"
+            );
+        }
+        // A wrapper program goes through the shim like the shell pane does.
+        let wrapped = s(&["bash", "-lc", "claude"]);
+        assert_eq!(
+            permission_request_hook_for(Some(&wrapped), Some(&dark)),
+            Registered
+        );
+        assert_eq!(Registered.as_str(), "registered");
+        assert_eq!(Absent.as_str(), "absent");
+    }
+
+    #[test]
+    fn is_current_carrier_names_exactly_this_builds_two_files() {
+        let dir = Path::new("/x/session-restore");
+        assert!(is_current_carrier(&settings_path(
+            dir,
+            StopHookRegistration::Registered
+        )));
+        assert!(is_current_carrier(&settings_path(
+            dir,
+            StopHookRegistration::Omitted
+        )));
+        for other in [
+            "claude_hook_settings.json",
+            "claude_hook_settings-nostop.json",
+            "settings.json",
+            "claude_hook_settings-permreq.json.bak",
+            "",
+        ] {
+            assert!(!is_current_carrier(&dir.join(other)), "{other:?}");
+        }
+        assert!(!is_current_carrier(Path::new("")));
     }
 
     /// The cache's real contract, not the tautology it replaced: `materialize`
@@ -1011,7 +1375,7 @@ mod tests {
         let original = std::fs::read_to_string(&a).unwrap();
 
         // Cache HIT is observable: clobber the settings content, call again with
-        // the same (base_dir, variant) — all four files still exist, so the call
+        // the same (base_dir, variant) — all six files still exist, so the call
         // short-circuits and our clobbered bytes are still there.
         std::fs::write(&a, "{\"clobbered\":true}").unwrap();
         let b = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
@@ -1019,7 +1383,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&b).unwrap(),
             "{\"clobbered\":true}",
-            "a cached call must not rewrite the four files"
+            "a cached call must not rewrite the six files"
         );
 
         // Cache MISS on a missing file: delete the settings file and the next
@@ -1033,16 +1397,19 @@ mod tests {
             "an externally deleted file forces a rewrite"
         );
 
-        // Same for a deleted SCRIPT — the existence check covers all four.
-        std::fs::write(&c, "{\"clobbered\":true}").unwrap();
-        std::fs::remove_file(tmp.path().join(STOP_HOOK_SCRIPT_NAME)).unwrap();
-        let d = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&d).unwrap(),
-            original,
-            "a deleted script forces the settings rewrite too"
-        );
-        assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
+        // Same for a deleted SCRIPT — the existence check covers all six,
+        // including the sixth entry this roster added.
+        for script in [STOP_HOOK_SCRIPT_NAME, PERMISSION_REQUEST_HOOK_SCRIPT_NAME] {
+            std::fs::write(&c, "{\"clobbered\":true}").unwrap();
+            std::fs::remove_file(tmp.path().join(script)).unwrap();
+            let d = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&d).unwrap(),
+                original,
+                "a deleted {script} forces the settings rewrite too"
+            );
+            assert!(tmp.path().join(script).exists());
+        }
     }
 
     /// The production entry point is the env wrapper, so pin that it picks the
@@ -1149,25 +1516,36 @@ mod tests {
             // fails on every session start. Fail open instead.
             (
                 "unknown placeholder",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@WHO_KNOWS@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@WHO_KNOWS@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]}}"##,
             ),
             (
                 "command is not a string",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":42}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":42}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]}}"##,
             ),
             // PreCompact is load-bearing in both variants; a template missing
             // it entirely is malformed, and generic iteration cannot notice an
             // event that was never there.
             (
                 "PreCompact absent",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]}}"##,
+            ),
+            // PermissionRequest is load-bearing in both variants: a carrier
+            // this build writes is REPORTED as registering it
+            // (`permissionRequestHook`), so one without it must not exist.
+            (
+                "PermissionRequest absent",
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]}}"##,
+            ),
+            (
+                "PermissionRequest inner hooks empty",
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[]}]}}"##,
             ),
             // A SECOND matcher block in one event, malformed. The first is
             // well-formed, so this fixture fails for the reason it NAMES rather
             // than tripping an earlier check.
             (
                 "SessionStart second matcher malformed",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]},{"hooks":[]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]},{"hooks":[]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]}}"##,
             ),
         ];
         for (name, template) in bad {
@@ -1176,7 +1554,7 @@ mod tests {
                 StopHookRegistration::Omitted,
             ] {
                 assert!(
-                    build_settings(template, p, p, p, p, reg).is_none(),
+                    build_settings(template, p, p, p, p, p, reg).is_none(),
                     "{name} ({reg:?}) must fail open with None, not panic or partial output"
                 );
             }
@@ -1188,19 +1566,19 @@ mod tests {
         let bad_stop_only = [
             (
                 "Stop an empty array",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"Stop":[]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}],"Stop":[]}}"##,
             ),
             (
                 "Stop entry has no inner hooks array",
-                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"Stop":[{}]}}"##,
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}],"Stop":[{}]}}"##,
             ),
         ];
         for (name, template) in bad_stop_only {
             assert!(
-                build_settings(template, p, p, p, p, StopHookRegistration::Registered).is_none(),
+                build_settings(template, p, p, p, p, p, StopHookRegistration::Registered).is_none(),
                 "{name} must fail open when the Stop hook is being registered"
             );
-            let out = build_settings(template, p, p, p, p, StopHookRegistration::Omitted)
+            let out = build_settings(template, p, p, p, p, p, StopHookRegistration::Omitted)
                 .unwrap_or_else(|| panic!("{name}: a dropped Stop key is not a build failure"));
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
@@ -1217,7 +1595,8 @@ mod tests {
         const NO_STOP: &str = r#"{
             "hooks": {
               "SessionStart": [{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],
-              "PreCompact": [{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]
+              "PreCompact": [{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],
+              "PermissionRequest": [{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]
             },
             "permissions": { "allow": ["mcp__coord-mcp"] }
         }"#;
@@ -1225,6 +1604,7 @@ mod tests {
         let stop = Path::new("/x/claude_stop_hook.sh");
         let precompact = Path::new("/x/claude_precompact_hook.sh");
         let policy = Path::new("/x/claude_policy_hook.sh");
+        let permission_request = Path::new("/x/claude_permission_request_hook.sh");
 
         let out = build_settings(
             NO_STOP,
@@ -1232,6 +1612,7 @@ mod tests {
             stop,
             precompact,
             policy,
+            permission_request,
             StopHookRegistration::Omitted,
         )
         .expect("a Stop-less template builds in the dark variant");
@@ -1250,6 +1631,11 @@ mod tests {
             v["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str(),
             Some(format!("bash '{}'", precompact.display()).as_str()),
             "the PreCompact hook survives"
+        );
+        assert_eq!(
+            v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"].as_str(),
+            Some(format!("bash '{}'", permission_request.display()).as_str()),
+            "the PermissionRequest hook survives"
         );
         assert!(
             v["permissions"]["allow"]
@@ -1270,6 +1656,7 @@ mod tests {
                 stop,
                 precompact,
                 policy,
+                permission_request,
                 StopHookRegistration::Registered
             )
             .is_none(),
@@ -1279,20 +1666,22 @@ mod tests {
 
     /// FIX 5(c) — the substitution→parse/serialize rewrite is exactly the change
     /// a snapshot guards. Assert on PARSED values (key order and whitespace are
-    /// irrelevant): the armed output registers EXACTLY the three events, each
+    /// irrelevant): the armed output registers EXACTLY the four events, each
     /// pointing at its own script, with `permissions.allow` intact.
     #[test]
-    fn armed_settings_registers_exactly_the_three_events_with_the_expected_commands() {
+    fn armed_settings_registers_exactly_the_four_events_with_the_expected_commands() {
         let session = Path::new("/x/claude_session_hook.sh");
         let stop = Path::new("/x/claude_stop_hook.sh");
         let precompact = Path::new("/x/claude_precompact_hook.sh");
         let policy = Path::new("/x/claude_policy_hook.sh");
+        let permission_request = Path::new("/x/claude_permission_request_hook.sh");
         let out = build_settings(
             HOOK_SETTINGS,
             session,
             stop,
             precompact,
             policy,
+            permission_request,
             StopHookRegistration::Registered,
         )
         .expect("the bundled template builds when armed");
@@ -1303,8 +1692,8 @@ mod tests {
         events.sort_unstable();
         assert_eq!(
             events,
-            ["PreCompact", "SessionStart", "Stop"],
-            "exactly the three events, no more and no fewer"
+            ["PermissionRequest", "PreCompact", "SessionStart", "Stop"],
+            "exactly the four events, no more and no fewer"
         );
 
         // Command COUNT per event, stated explicitly. `SessionStart` carries
@@ -1313,7 +1702,12 @@ mod tests {
         // blanket "one command per event" would have been true before
         // `2026-08-08-runner-enforced-policy-pull` Phase 1 and is now exactly
         // the assumption this module must not make.
-        for (event, commands) in [("SessionStart", 2), ("Stop", 1), ("PreCompact", 1)] {
+        for (event, commands) in [
+            ("SessionStart", 2),
+            ("Stop", 1),
+            ("PreCompact", 1),
+            ("PermissionRequest", 1),
+        ] {
             let blocks = hooks[event].as_array().unwrap();
             assert_eq!(blocks.len(), 1, "{event}: one matcher block");
             let inner = blocks[0]["hooks"].as_array().unwrap();
@@ -1331,6 +1725,7 @@ mod tests {
             ("SessionStart", 1, policy),
             ("Stop", 0, stop),
             ("PreCompact", 0, precompact),
+            ("PermissionRequest", 0, permission_request),
         ] {
             assert_eq!(
                 hooks[event][0]["hooks"][index]["command"].as_str(),
@@ -1338,6 +1733,32 @@ mod tests {
                 "{event}[{index}]: command points at its OWN script"
             );
         }
+
+        // The DARK variant drops `Stop` and nothing else — in particular it
+        // keeps `PermissionRequest` (D6: not a variant dimension).
+        let dark = build_settings(
+            HOOK_SETTINGS,
+            session,
+            stop,
+            precompact,
+            policy,
+            permission_request,
+            StopHookRegistration::Omitted,
+        )
+        .expect("the bundled template builds when dark");
+        let dark: serde_json::Value = serde_json::from_str(&dark).unwrap();
+        let mut dark_events: Vec<&str> = dark["hooks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        dark_events.sort_unstable();
+        assert_eq!(
+            dark_events,
+            ["PermissionRequest", "PreCompact", "SessionStart"],
+            "the dark variant registers PermissionRequest too"
+        );
 
         assert_eq!(
             v["permissions"]["allow"].as_array(),
@@ -1369,6 +1790,10 @@ mod tests {
               "Stop": [
                 {"hooks":[{"type":"command","command":"bash '@@STOP_HOOK_SCRIPT@@'"}]},
                 {"hooks":[{"type":"command","command":"bash '@@STOP_HOOK_SCRIPT@@'"}]}
+              ],
+              "PermissionRequest": [
+                {"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]},
+                {"matcher":"Bash","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}
               ]
             }
         }"#;
@@ -1376,12 +1801,14 @@ mod tests {
         let stop = Path::new("/x/claude_stop_hook.sh");
         let precompact = Path::new("/x/claude_precompact_hook.sh");
         let policy = Path::new("/x/claude_policy_hook.sh");
+        let permission_request = Path::new("/x/claude_permission_request_hook.sh");
         let out = build_settings(
             MULTI,
             session,
             stop,
             precompact,
             policy,
+            permission_request,
             StopHookRegistration::Registered,
         )
         .expect("a multi-block template builds");
@@ -1394,7 +1821,12 @@ mod tests {
 
         // Block COUNTS first, so a template that lost a matcher cannot pass the
         // per-entry checks below by simply not having the entry.
-        for (event, blocks) in [("SessionStart", 2), ("PreCompact", 2), ("Stop", 2)] {
+        for (event, blocks) in [
+            ("SessionStart", 2),
+            ("PreCompact", 2),
+            ("Stop", 2),
+            ("PermissionRequest", 2),
+        ] {
             assert_eq!(
                 v["hooks"][event].as_array().unwrap().len(),
                 blocks,
@@ -1415,6 +1847,8 @@ mod tests {
             ("PreCompact", 1, 0, precompact),
             ("Stop", 0, 0, stop),
             ("Stop", 1, 0, stop),
+            ("PermissionRequest", 0, 0, permission_request),
+            ("PermissionRequest", 1, 0, permission_request),
         ] {
             assert_eq!(
                 v["hooks"][event][block]["hooks"][entry]["command"].as_str(),
@@ -1475,7 +1909,7 @@ mod tests {
             StopHookRegistration::Omitted,
         ] {
             assert!(
-                build_settings(HOOK_SETTINGS, p, p, p, p, reg).is_some(),
+                build_settings(HOOK_SETTINGS, p, p, p, p, p, reg).is_some(),
                 "the bundled template builds under {reg:?}"
             );
         }
@@ -1501,6 +1935,10 @@ mod tests {
             assert!(tmp.path().join(HOOK_SCRIPT_NAME).exists());
             assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
             assert!(tmp.path().join(PRECOMPACT_HOOK_SCRIPT_NAME).exists());
+            assert!(tmp
+                .path()
+                .join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME)
+                .exists());
         }
 
         // A later good build still works — the failed attempt cached nothing.
@@ -1556,6 +1994,10 @@ mod tests {
             (HOOK_SCRIPT_NAME, HOOK_SCRIPT),
             (PRECOMPACT_HOOK_SCRIPT_NAME, PRECOMPACT_HOOK_SCRIPT),
             (POLICY_HOOK_SCRIPT_NAME, POLICY_HOOK_SCRIPT),
+            (
+                PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
+                PERMISSION_REQUEST_HOOK_SCRIPT,
+            ),
         ] {
             // Checked separately, NOT by a single `contains` on the shorter
             // name: `claude_hook_settings-nostop.json` does not contain
@@ -1575,5 +2017,61 @@ mod tests {
             STOP_HOOK_SCRIPT.contains(HOOK_SETTINGS_NAME),
             "{STOP_HOOK_SCRIPT_NAME} is armed-only, so its header must name `{HOOK_SETTINGS_NAME}`"
         );
+
+        // ...and no script may name a RETIRED roster's carrier as its own: this
+        // build never writes those names, so a header naming one sends an
+        // operator to `stat` a file only an OLDER runner writes. Matched with
+        // a closing backtick so the current names (which share the prefix) do
+        // not satisfy it.
+        for (script_name, text) in [
+            (HOOK_SCRIPT_NAME, HOOK_SCRIPT),
+            (STOP_HOOK_SCRIPT_NAME, STOP_HOOK_SCRIPT),
+            (PRECOMPACT_HOOK_SCRIPT_NAME, PRECOMPACT_HOOK_SCRIPT),
+            (POLICY_HOOK_SCRIPT_NAME, POLICY_HOOK_SCRIPT),
+            (
+                PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
+                PERMISSION_REQUEST_HOOK_SCRIPT,
+            ),
+        ] {
+            for retired in RETIRED_SETTINGS_NAMES {
+                assert!(
+                    !text.contains(&format!("`{retired}`")),
+                    "{script_name} names the retired carrier `{retired}`"
+                );
+            }
+        }
+    }
+
+    /// The roster [`hook_files`] stats: six entries — five scripts plus the
+    /// variant's carrier — every one of which [`materialize_with`] writes.
+    #[test]
+    fn hook_files_is_the_six_entry_roster_materialize_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let files = hook_files(tmp.path(), reg);
+            assert_eq!(files.len(), 6);
+            let names: Vec<String> = files
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    HOOK_SCRIPT_NAME,
+                    STOP_HOOK_SCRIPT_NAME,
+                    PRECOMPACT_HOOK_SCRIPT_NAME,
+                    POLICY_HOOK_SCRIPT_NAME,
+                    PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
+                    reg.settings_name(),
+                ]
+            );
+            materialize_with(tmp.path(), reg).unwrap();
+            for f in &files {
+                assert!(f.exists(), "{} not materialized", f.display());
+            }
+        }
     }
 }
