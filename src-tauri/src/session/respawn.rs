@@ -715,6 +715,8 @@ async fn materialize(
             model_transcript,
             config_dir: &config_dir,
             title,
+            // No name to carry: the CLI derives one, as before.
+            name: None,
             // Land back on the tile the session used to occupy when this box
             // still remembers it; otherwise the default page, zone 0 (a wrong
             // tile beats a lost session).
