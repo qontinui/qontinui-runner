@@ -446,7 +446,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         name: "device_jwt_live",
         title: "Coord device JWT live",
         verifies: "a live coord device JWT is present in the access-token slot \
-                   and is not near expiry",
+                   and has not expired",
         fix: "kick refresher / re-pair",
         advisory: false,
         always_run: false,
@@ -1045,29 +1045,25 @@ fn inherited_session_markers_check() -> (bool, String) {
 pub const DEVICE_JWT_LIVE_CHECK_NAME: &str = CHECK_SPECS[6].name;
 pub const DEVICE_JWT_LIVE_CHECK_FIX: &str = CHECK_SPECS[6].fix;
 
-/// The check-5 predicate over an `AuthManager`: a live device JWT is present
-/// and not near expiry. `(ok, detail)`. The single source of truth for "does
-/// this runner hold a usable coord device JWT" — both the full [`diagnose`]
-/// chain and the Phase-5 provisioning gate call it.
+/// The check-5 predicate over an `AuthManager`: a device JWT is present and
+/// has not EXPIRED. `(ok, detail)`. The single source of truth for "does this
+/// runner hold a usable coord device JWT" — both the full [`diagnose`] chain
+/// and the Phase-5 provisioning gate call it.
+///
+/// Keyed on [`crate::auth::AuthManager::device_jwt_is_live`], NOT on
+/// `device_jwt_needs_refresh`: the refresh window is the last TWO hours of a
+/// valid JWT (TTL/2), and a credential inside it still authenticates. Keying on
+/// the threshold failed provisioning readiness for a device holding a JWT with
+/// 100 minutes of life left, exactly while coord was down and the refresher
+/// was retrying.
 fn device_jwt_live_predicate(auth: &crate::auth::AuthManager) -> (bool, String) {
-    match auth.device_jwt_needs_refresh() {
-        Ok(false) => {
-            if auth
-                .get_access_token()
-                .ok()
-                .filter(|t| !t.trim().is_empty())
-                .is_some()
-            {
-                (true, "device JWT present and not near expiry".into())
-            } else {
-                (false, "no device JWT in the access-token slot".into())
-            }
-        }
-        Ok(true) => (
+    match auth.device_jwt_is_live() {
+        Ok(true) => (true, "device JWT present and unexpired".into()),
+        Ok(false) => (
             false,
-            "device JWT missing, expired, or near expiry (needs refresh)".into(),
+            "device JWT missing, opaque, or expired (needs refresh or re-pair)".into(),
         ),
-        Err(e) => (false, format!("could not read device-JWT freshness: {e}")),
+        Err(e) => (false, format!("could not read the device JWT: {e}")),
     }
 }
 
@@ -4607,6 +4603,37 @@ mod tests {
             !report.checks.iter().any(|c| c.name == "suppressed"),
             "an ordinary blocking check after a red is still skipped"
         );
+    }
+
+    #[test]
+    fn device_jwt_live_predicate_keys_on_expiry_not_the_refresh_window() {
+        fn jwt(exp: i64) -> String {
+            use base64::Engine as _;
+            let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none"}"#),
+                enc(format!(r#"{{"exp":{exp}}}"#).as_bytes())
+            )
+        }
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_doctor_jwt_live");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("live.enc");
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        let auth = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let now = chrono::Utc::now().timestamp();
+
+        let (ok, detail) = device_jwt_live_predicate(&auth);
+        assert!(!ok, "absent: {detail}");
+        // Inside the TTL/2 refresh window, still valid: LIVE.
+        auth.store_tokens(&jwt(now + 100 * 60), "").unwrap();
+        let (ok, detail) = device_jwt_live_predicate(&auth);
+        assert!(ok, "100 min of life left must be live: {detail}");
+        // Past exp: not live.
+        auth.store_tokens(&jwt(now - 120), "").unwrap();
+        let (ok, detail) = device_jwt_live_predicate(&auth);
+        assert!(!ok, "expired: {detail}");
     }
 
     #[test]
