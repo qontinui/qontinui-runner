@@ -5548,6 +5548,31 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
 /// reason in that list's note.
 ///
+/// **The per-repo tenant binding writes are IN, with their risk stated** (plan
+/// `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant` Phase 6; the
+/// design fork is coord finding `e28caba2-9727-494a-91a0-4a321c377cb3`).
+/// `coord_bind_repo_tenant` / `coord_unbind_repo_tenant` move a repository's
+/// governance — and with it who coord mints that repo's push and clone tokens
+/// for — from one tenant to another. They are onboarding-family in substance,
+/// named outside the `coord_onboard` prefix on purpose so the sessions coord's
+/// bind door admits can reach them. What a LEAKED device nonce reaches through
+/// them: this proxy presents the paired device JWT, which passes coord's
+/// possession check, so possession is NOT the limit here. The limits are
+/// coord's: the device's USER must hold `admin` in BOTH the losing and the
+/// gaining tenant, the credential's own tenant must be one of the two, coord
+/// itself writes an audit row per tenant and a `repo_bound` / `repo_unbound`
+/// operator notification on every call, and either side undoes it with one
+/// call. Residual risk: tokens minted for the repo while a wrong binding stood
+/// are not taken back by the unbind. This differs from
+/// `coord_request_expedited_land`, withheld because a land cannot be undone and
+/// its only gate is that same possession check. `coord_enroll_repo` stays
+/// withheld as an onboarding-family name (its HTTP twin remains the door); the
+/// binding writes are let through because they carry a both-tenants admin
+/// check and a server-written audit and notification that no other
+/// onboarding-family write has — that is the security rationale the note
+/// above asks for. As of this entry coord does not serve the three binding
+/// tools yet; they are forwarded ahead, which the note below says is harmless.
+///
 /// `coord_merge_order` stays IN although coord keeps it off the device floor.
 /// It is a READ: it composes a safe merge ordering from the queue, the PR
 /// dependency edges and the plan `Depends-On` graph. coord grants it to the
@@ -5589,6 +5614,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // the per-repo tenant binding door, forwarded ahead of coord serving it.
+    // coord will authorize it (the device user must be admin in BOTH tenants);
+    // this list only forwards. Risk and limits: the doc comment above.
+    "coord_bind_repo_tenant",
     "coord_bind_self_session",
     "coord_blockers",
     "coord_build_info",
@@ -5717,6 +5747,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_register_gate",
     "coord_reject_gate",
     "coord_reopen_gate",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // the bindings read twin.
+    "coord_repo_tenant_bindings",
     "coord_repoint_gate",
     "coord_report_status",
     "coord_request_handoff",
@@ -5733,8 +5766,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_snooze_gate",
     "coord_submit_escalate_evidence",
     "coord_symbol_lookup",
+    // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
+    // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
+    "coord_tenants_for_repo",
     "coord_twin_catalog",
     "coord_typecheck_file",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // release / reclaim.
+    "coord_unbind_repo_tenant",
     "coord_unmute_gate",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
@@ -17615,6 +17654,45 @@ mod coord_mcp_body_gate_tests {
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant`
+    /// Phase 6: the per-repo tenant binding tools and the repo-tenants read
+    /// twin forward (the binding tools ahead of coord serving them). Their
+    /// names deliberately stay OUT of the `coord_onboard` family, whose prefix
+    /// exclusion would mask them from the device-provisioned sessions coord's
+    /// bind door is designed to admit — so this pins both that
+    /// they forward and that no deliberate exclusion (named or by prefix)
+    /// claims them, and that the source-text parser reads each exactly once
+    /// despite the comments above them.
+    #[test]
+    fn repo_tenant_binding_tools_forward_and_are_not_deliberately_withheld() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_bind_repo_tenant",
+            "coord_repo_tenant_bindings",
+            "coord_tenants_for_repo",
+            "coord_unbind_repo_tenant",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            // Covers the named exclusions AND the `coord_onboard` prefix.
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be deliberately withheld (by name or prefix)"
+            );
             assert!(
                 COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
                 "{tool} must sit in sorted position"
