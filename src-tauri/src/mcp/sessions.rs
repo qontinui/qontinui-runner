@@ -1655,6 +1655,16 @@ async fn operator_touch_notification(
 /// dial, or any never-answered class — it prints nothing and the dialog shows.
 /// Each `allow` is counted (`/health` `permissionAutoAccept.acceptCount`) and
 /// logged by its capture class key alone, never the command or its arguments.
+///
+/// An `allow` is answered only for a terminal THIS runner process spawned, and
+/// it ECHOES that terminal's per-spawn nonce (`"nonce"`), which the hook
+/// requires next to `"decision":"allow"` — so whatever squats the loopback port
+/// while the runner is down cannot answer a prompt. `"decision_reason"` is a
+/// fixed label saying why (never payload content).
+///
+/// The body limit is raised to [`PERMISSION_REQUEST_BODY_LIMIT`] on this route:
+/// a `Write`/`Edit` prompt carries the file content, and axum's 2 MB default
+/// would turn a large one into a 413 (the dialog, fail-closed, but no capture).
 async fn permission_request(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -1671,6 +1681,7 @@ async fn permission_request(
             "class_key": null,
             "dossier_slug": null,
             "decision": AcceptVerdict::None.as_str(),
+            "decision_reason": "a browser Origin header is not a hook",
             "session": id,
         }));
     }
@@ -1678,28 +1689,38 @@ async fn permission_request(
     let outcome = crate::session::permission_prompt_capture::observe_permission_request(&id, &body);
     let class = outcome.class();
     // 2. Decide.
-    let decision = permission_accept::decide(&body);
-    if decision == AcceptVerdict::Allow {
+    let decision = permission_accept::decide(&id, &body);
+    if decision.verdict == AcceptVerdict::Allow {
         permission_accept::record_accept();
-        // The class key is the ONLY thing logged about the prompt.
+        // The class key is the ONLY thing logged about the prompt; the id is
+        // Debug-formatted so a crafted path segment cannot forge a log line.
         let class_key = class
             .map(|c| c.class_key.clone())
             .unwrap_or_else(|| accept_class_key_fallback(&body));
         tracing::info!(
-            terminal = %id,
+            terminal = ?id,
             class_key = %class_key,
             "permission auto-accept: answered a PermissionRequest dialog with allow"
         );
     }
-    Json(serde_json::json!({
+    let mut answer = serde_json::json!({
         "recorded": outcome.counted(),
         "reason": outcome.label(),
         "class_key": class.map(|c| c.class_key.as_str()),
         "dossier_slug": class.map(|c| c.dossier_slug.as_str()),
-        "decision": decision.as_str(),
+        "decision": decision.verdict.as_str(),
+        "decision_reason": decision.reason,
         "session": id,
-    }))
+    });
+    if let Some(nonce) = decision.nonce {
+        answer["nonce"] = serde_json::Value::String(nonce);
+    }
+    Json(answer)
 }
+
+/// The request-body ceiling for `POST /sessions/{id}/permission-request` —
+/// the precedent `state_machine.rs` sets for its own large bodies.
+const PERMISSION_REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// The class key for an `allow` whose payload the capture did not classify
 /// (it decides on `tool_name` + `permission_mode`, the capture on its own
@@ -2716,7 +2737,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route(
             "/sessions/{id}/permission-request",
-            post(permission_request),
+            post(permission_request).layer(axum::extract::DefaultBodyLimit::max(
+                PERMISSION_REQUEST_BODY_LIMIT,
+            )),
         )
         .route("/sessions/{id}/policy-context", get(policy_context))
         .route("/sessions/policy-context-stats", get(policy_context_stats))
@@ -2782,7 +2805,9 @@ mod permission_prompt_capture_route_tests {
     fn permission_request_app() -> Router {
         Router::new().route(
             "/sessions/{id}/permission-request",
-            post(permission_request),
+            post(permission_request).layer(axum::extract::DefaultBodyLimit::max(
+                PERMISSION_REQUEST_BODY_LIMIT,
+            )),
         )
     }
 
@@ -3071,6 +3096,12 @@ mod permission_prompt_capture_route_tests {
             .unwrap()
             .class;
 
+        // Each terminal is one THIS process spawned: it holds a grant.
+        let nonce = crate::session::permission_accept::new_nonce();
+        for term in ["term-decide-on", "term-decide-off", "term-decide-cold"] {
+            crate::session::permission_accept::register_terminal_grant(term, nonce.clone(), None);
+        }
+
         pin.set("on");
         let before_count = class_count(&class.dossier_slug);
         let before_accepts = accept_count();
@@ -3082,6 +3113,7 @@ mod permission_prompt_capture_route_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["decision"], "allow", "{body}");
+        assert_eq!(body["nonce"], nonce.as_str(), "the allow echoes the nonce");
         assert_eq!(body["recorded"], true, "the capture rode the same request");
         assert_eq!(body["class_key"], class.class_key.as_str());
         assert_eq!(class_count(&class.dossier_slug), before_count + 1);
@@ -3097,6 +3129,7 @@ mod permission_prompt_capture_route_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["decision"], "none", "{body}");
+        assert!(body.get("nonce").is_none(), "a none never echoes the nonce");
         assert_eq!(body["recorded"], true, "an off dial still records");
         assert_eq!(class_count(&class.dossier_slug), before_count + 2);
         assert_eq!(accept_count(), before_accepts, "a none is not counted");
@@ -3126,9 +3159,120 @@ mod permission_prompt_capture_route_tests {
             .find("observe_permission_request(&id, &body)")
             .expect("the pad records the capture");
         let decide_at = handler
-            .find("permission_accept::decide(&body)")
+            .find("permission_accept::decide(&id, &body)")
             .expect("the pad decides");
         assert!(capture_at < decide_at, "the capture is recorded FIRST");
+        for term in ["term-decide-on", "term-decide-off", "term-decide-cold"] {
+            crate::session::permission_accept::forget_terminal_grant(term, &nonce);
+        }
+    }
+
+    /// RISK 5: a terminal this process did not spawn (no grant) is never
+    /// answered `allow`, even with the dial answered `on`.
+    #[tokio::test]
+    async fn an_unknown_terminal_is_answered_none() {
+        let pin = crate::mcp::fleet_policy_poller::pin_permission_auto_accept_for_test();
+        pin.set("on");
+        let (status, body) = post_json(
+            permission_request_app(),
+            "/sessions/term-decide-nobody/permission-request",
+            decision_payload("Qzx7NobodyTool", "default").to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decision"], "none", "{body}");
+        assert_eq!(
+            body["decision_reason"],
+            "terminal was not spawned by this runner process"
+        );
+        assert!(body.get("nonce").is_none());
+    }
+
+    /// ARMING (black box; compiles against the BASE 5571ce756 — only base-era
+    /// symbols): the pad answers a `decision`, and garbage is `none`. The base
+    /// pad answers no `decision` key, so this fails on the assertion there.
+    #[tokio::test]
+    async fn arming_the_pad_answers_decision_none_on_garbage() {
+        let (status, body) = post_json(
+            permission_request_app(),
+            "/sessions/term-arming-decision/permission-request",
+            "not json".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decision"], "none", "{body}");
+    }
+
+    /// BUG 1 + RISK 5, end to end: the REAL bundled hook, the REAL curl and
+    /// the REAL pad on a loopback listener. A payload over 1 MB (a `Write`
+    /// carrying file content) is streamed by curl itself and still answered
+    /// `allow`; the hook prints the envelope because the pad echoed THIS
+    /// terminal's nonce. Over 2 MB proves the route's raised body limit.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_hook_gets_allow_from_the_real_pad_for_a_payload_over_one_megabyte() {
+        const HOOK: &str =
+            include_str!("../../resources/session-restore/claude_permission_request_hook.sh");
+        const ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+        let pin = crate::mcp::fleet_policy_poller::pin_permission_auto_accept_for_test();
+        pin.set("on");
+        let term = "term-e2e-large";
+        let nonce = crate::session::permission_accept::new_nonce();
+        crate::session::permission_accept::register_terminal_grant(term, nonce.clone(), None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, permission_request_app()).await;
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = tmp.path().join("claude_permission_request_hook.sh");
+        std::fs::write(&hook, HOOK).unwrap();
+        for size in [1_200_000usize, 3_000_000] {
+            let payload = serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "permission_mode": "default",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/w/big.txt", "content": "a".repeat(size)},
+            })
+            .to_string();
+            assert!(payload.len() > size);
+            let payload_file = tmp.path().join(format!("payload-{size}.json"));
+            std::fs::write(&payload_file, &payload).unwrap();
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    "exec bash '{}' < '{}'",
+                    hook.display(),
+                    payload_file.display()
+                ))
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("QONTINUI_RUNNER_API_PORT", port.to_string())
+                .env("QONTINUI_TERMINAL_ID", term)
+                .env(crate::session::permission_accept::NONCE_ENV, &nonce);
+            let out = tokio::task::spawn_blocking(move || {
+                crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(30))
+            })
+            .await
+            .unwrap()
+            .expect("the hook runs inside its budget");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{ALLOW}\n"),
+                "a {size}-byte payload must still be answered allow; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        server.abort();
+        crate::session::permission_accept::forget_terminal_grant(term, &nonce);
+        drop(pin);
     }
 
     /// The pad stays lenient: garbage and a browser `Origin` answer 200 with

@@ -1042,72 +1042,61 @@ pub(crate) const PERMISSION_AUTO_ACCEPT_ON: &str = "on";
 
 /// The level that turns auto-accept OFF — the only level the stream-json path
 /// acts on (an answered `off` from an EXPLICIT row denies a headless control
-/// request, D5; see [`PERMISSION_AUTO_ACCEPT_SCOPE`]).
+/// request, D5; see [`PermissionAutoAcceptDial::resolved_scope`]).
 pub(crate) const PERMISSION_AUTO_ACCEPT_OFF: &str = "off";
 
 /// What an unrecognised level (and the cache before any answer, and a poisoned
 /// lock) normalizes to: the empty string, which is neither `on` nor `off`.
 const PERMISSION_AUTO_ACCEPT_UNRECOGNISED: &str = "";
 
-/// The cached level (`on` | `off` | [`PERMISSION_AUTO_ACCEPT_UNRECOGNISED`]).
-static PERMISSION_AUTO_ACCEPT_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
-
-fn permission_auto_accept_cache() -> &'static RwLock<String> {
-    PERMISSION_AUTO_ACCEPT_LEVEL
-        .get_or_init(|| RwLock::new(PERMISSION_AUTO_ACCEPT_UNRECOGNISED.to_string()))
+/// Everything the dial holds, as ONE value behind ONE lock, so a reader can
+/// never see the level of one poll beside the scope, answer time or tenant of
+/// another.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PermissionAutoAcceptDial {
+    /// Whether coord has given THIS process a 2xx answer at least once. Never
+    /// reset: later failures keep last-good. Freshness is
+    /// [`Self::answered_at`]'s job, judged by the reader
+    /// ([`crate::session::permission_accept`]).
+    pub(crate) answered: bool,
+    /// `on` | `off` | [`PERMISSION_AUTO_ACCEPT_UNRECOGNISED`].
+    pub(crate) level: String,
+    /// The `resolved_scope` of the last 2xx (`none` = no row, coord's domain
+    /// default applied; `tenant` / `repo` / … = an explicit row), or `None`
+    /// before any answer and on a coord that sends no scope.
+    pub(crate) resolved_scope: Option<String>,
+    /// When the last 2xx arrived. An answer that is not refreshed — the device
+    /// credential went dark and every poll since has 401'd — goes STALE, and
+    /// the interactive verdict reads a stale answer as unanswered.
+    pub(crate) answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tenant whose credential the last 2xx was asked under (the `tenant`
+    /// claim of the presented device JWT), or `None` when that credential names
+    /// no tenant. The dial is the DEFAULT credential's tenant's dial, so a
+    /// terminal spawned for a different tenant is not governed by it.
+    pub(crate) tenant: Option<uuid::Uuid>,
 }
 
-/// Whether THIS process has received a 2xx answer for
-/// [`PERMISSION_AUTO_ACCEPT_DOMAIN`]. Never reset: once coord has answered,
-/// later failures keep last-good, so the cached level is a real answer.
-static PERMISSION_AUTO_ACCEPT_ANSWERED: AtomicBool = AtomicBool::new(false);
+static PERMISSION_AUTO_ACCEPT_STATE: OnceLock<RwLock<PermissionAutoAcceptDial>> = OnceLock::new();
 
-fn set_permission_auto_accept_answered(answered: bool) {
-    PERMISSION_AUTO_ACCEPT_ANSWERED.store(answered, Ordering::Release);
+fn permission_auto_accept_state() -> &'static RwLock<PermissionAutoAcceptDial> {
+    PERMISSION_AUTO_ACCEPT_STATE.get_or_init(|| RwLock::new(PermissionAutoAcceptDial::default()))
 }
 
-fn set_permission_auto_accept_level(level: &str) {
-    if let Ok(mut g) = permission_auto_accept_cache().write() {
-        *g = level.to_string();
-    }
-}
-
-/// The `resolved_scope` of the last 2xx (`none` = no row, coord's domain
-/// default applied; `tenant` / `repo` / … = an explicit row), or `None` before
-/// any answer, on a coord that sends no scope, and behind a poisoned lock.
-static PERMISSION_AUTO_ACCEPT_SCOPE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-
-fn permission_auto_accept_scope_cache() -> &'static RwLock<Option<String>> {
-    PERMISSION_AUTO_ACCEPT_SCOPE.get_or_init(|| RwLock::new(None))
-}
-
-fn set_permission_auto_accept_scope(scope: Option<String>) {
-    if let Ok(mut g) = permission_auto_accept_scope_cache().write() {
-        *g = scope;
-    }
-}
-
-/// See [`PERMISSION_AUTO_ACCEPT_SCOPE`]. Lock-only.
-pub(crate) fn permission_auto_accept_scope() -> Option<String> {
-    permission_auto_accept_scope_cache()
+/// The dial as it stands RIGHT NOW, in one read. A poisoned lock reads as the
+/// cold-start value (unanswered) — never `on`. Lock-only, safe on the request
+/// path — the pad and the stream-json dispatcher both read it once per
+/// decision.
+pub(crate) fn permission_auto_accept_dial() -> PermissionAutoAcceptDial {
+    permission_auto_accept_state()
         .read()
-        .ok()
-        .and_then(|g| g.clone())
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
-/// The dial as it stands RIGHT NOW: `(answered, level)`. Reads the answered
-/// flag FIRST (Acquire), then the level; a poisoned lock reads as unrecognised.
-/// Lock-only, safe on the request path — the pad and the stream-json
-/// dispatcher both read it once per decision.
-pub(crate) fn permission_auto_accept_dial() -> (bool, String) {
-    let answered = PERMISSION_AUTO_ACCEPT_ANSWERED.load(Ordering::Acquire);
-    (
-        answered,
-        read_cached_level(
-            permission_auto_accept_cache(),
-            PERMISSION_AUTO_ACCEPT_UNRECOGNISED,
-        ),
-    )
+fn write_permission_auto_accept_state(f: impl FnOnce(&mut PermissionAutoAcceptDial)) {
+    if let Ok(mut g) = permission_auto_accept_state().write() {
+        f(&mut g);
+    }
 }
 
 /// Normalize coord's `effective_level` onto `on` | `off`. PURE. Trimmed and
@@ -1149,13 +1138,12 @@ fn permission_auto_accept_outcome_for_error(err: FetchError) -> PollOutcome {
     }
 }
 
-/// Whether `outcome` marks [`PERMISSION_AUTO_ACCEPT_ANSWERED`]. PURE. Only a
-/// 2xx does.
+/// Whether `outcome` is an authoritative answer. PURE. Only a 2xx is.
 fn is_authoritative_permission_auto_accept_answer(outcome: &PollOutcome) -> bool {
     matches!(outcome, PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow)
 }
 
-/// The WRITE, if any, that `outcome` implies for the level cache. PURE.
+/// The WRITE, if any, that `outcome` implies for the level. PURE.
 /// `None` ⇒ no write at all (last-good kept because nothing was written).
 fn next_permission_auto_accept_level(outcome: &PollOutcome) -> Option<String> {
     match outcome {
@@ -1167,45 +1155,71 @@ fn next_permission_auto_accept_level(outcome: &PollOutcome) -> Option<String> {
     }
 }
 
-/// Apply one poll outcome to the cache: the level write, then the answered
-/// flag. The SAME function the poll loop calls, so a test drives the shipping
-/// sequence ("unanswered, then answered `on`", "an on→off flip") rather than a
-/// copy of it.
-///
-/// The scope moves ONLY with an authoritative answer — a kept failure says
-/// nothing new about which row is in force.
-fn apply_permission_auto_accept_poll(poll: &PermissionAutoAcceptPoll) {
-    if let Some(level) = next_permission_auto_accept_level(&poll.outcome) {
-        set_permission_auto_accept_level(&level);
-    }
-    if is_authoritative_permission_auto_accept_answer(&poll.outcome) {
-        set_permission_auto_accept_scope(poll.resolved_scope.clone());
-        set_permission_auto_accept_answered(true);
-    }
-}
-
-/// What one permission auto-accept poll yields: the cache outcome plus the
-/// scope coord reported beside it (`None` on any non-2xx, and on a coord that
-/// predates the field).
+/// What one permission auto-accept poll yields: the cache outcome, the scope
+/// coord reported beside it, and the tenant the presented credential names
+/// (scope and tenant are `None` on any non-2xx).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionAutoAcceptPoll {
     outcome: PollOutcome,
     resolved_scope: Option<String>,
+    tenant: Option<uuid::Uuid>,
 }
 
-/// One poll of the [`PERMISSION_AUTO_ACCEPT_DOMAIN`] cache.
+/// Apply one poll to the dial, in ONE write: the level, and — only for an
+/// authoritative answer — the scope, the answered flag, the answer time and
+/// the answering tenant. A kept failure says nothing new about which row is in
+/// force, so it moves none of them. The SAME function the poll loop calls, so
+/// a test drives the shipping sequence rather than a copy of it.
+fn apply_permission_auto_accept_poll(
+    poll: &PermissionAutoAcceptPoll,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let level = next_permission_auto_accept_level(&poll.outcome);
+    let authoritative = is_authoritative_permission_auto_accept_answer(&poll.outcome);
+    write_permission_auto_accept_state(|s| {
+        if let Some(level) = level {
+            s.level = level;
+        }
+        if authoritative {
+            s.answered = true;
+            s.resolved_scope = poll.resolved_scope.clone();
+            s.answered_at = Some(now);
+            s.tenant = poll.tenant;
+        }
+    });
+}
+
+/// One poll of the [`PERMISSION_AUTO_ACCEPT_DOMAIN`] cache, under the DEFAULT
+/// device credential — the same one every other domain here is asked under —
+/// recording which tenant that credential names.
 async fn poll_permission_auto_accept_once() -> PermissionAutoAcceptPoll {
-    match fetch_fleet_policy(PERMISSION_AUTO_ACCEPT_DOMAIN).await {
-        Ok(body) => permission_auto_accept_poll_for_body(&body),
+    let device_jwt = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            return PermissionAutoAcceptPoll {
+                outcome: permission_auto_accept_outcome_for_error(FetchError::NoJwt),
+                resolved_scope: None,
+                tenant: None,
+            }
+        }
+    };
+    let tenant = crate::auth::jwt_tenant_claim(&device_jwt);
+    match fetch_fleet_policy_with(PERMISSION_AUTO_ACCEPT_DOMAIN, &device_jwt).await {
+        Ok(body) => permission_auto_accept_poll_for_body(&body, tenant),
         Err(e) => PermissionAutoAcceptPoll {
             outcome: permission_auto_accept_outcome_for_error(e),
             resolved_scope: None,
+            tenant: None,
         },
     }
 }
 
-/// A 2xx body → outcome + its trimmed `resolved_scope`. PURE.
-fn permission_auto_accept_poll_for_body(body: &FleetPolicyResponse) -> PermissionAutoAcceptPoll {
+/// A 2xx body → outcome + its trimmed `resolved_scope` + the answering tenant.
+/// PURE.
+fn permission_auto_accept_poll_for_body(
+    body: &FleetPolicyResponse,
+    tenant: Option<uuid::Uuid>,
+) -> PermissionAutoAcceptPoll {
     PermissionAutoAcceptPoll {
         outcome: permission_auto_accept_outcome_for_body(body),
         resolved_scope: body
@@ -1214,6 +1228,7 @@ fn permission_auto_accept_poll_for_body(body: &FleetPolicyResponse) -> Permissio
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        tenant,
     }
 }
 
@@ -1231,26 +1246,33 @@ pub(crate) struct PermissionAutoAcceptPin(crate::test_env::TestLockGuard);
 
 #[cfg(test)]
 impl PermissionAutoAcceptPin {
-    /// Pin the level AS AN AUTHORITATIVE ANSWER from an EXPLICIT tenant row
-    /// (stands in for a 2xx poll with `resolved_scope: "tenant"`).
+    /// Pin the level AS A FRESH AUTHORITATIVE ANSWER from an EXPLICIT tenant
+    /// row, asked under a credential that names no tenant.
     pub(crate) fn set(&self, level: &str) {
         self.set_with_scope(level, Some("tenant"));
     }
 
-    /// Pin an authoritative answer with an explicit `resolved_scope` —
+    /// Pin a fresh authoritative answer with an explicit `resolved_scope` —
     /// `Some("none")` is coord's no-row default, `None` a coord that sends no
     /// scope.
     pub(crate) fn set_with_scope(&self, level: &str, scope: Option<&str>) {
-        set_permission_auto_accept_level(level);
-        set_permission_auto_accept_scope(scope.map(str::to_string));
-        set_permission_auto_accept_answered(true);
+        self.set_dial(PermissionAutoAcceptDial {
+            answered: true,
+            level: level.to_string(),
+            resolved_scope: scope.map(str::to_string),
+            answered_at: Some(chrono::Utc::now()),
+            tenant: None,
+        });
+    }
+
+    /// Pin the whole dial.
+    pub(crate) fn set_dial(&self, dial: PermissionAutoAcceptDial) {
+        write_permission_auto_accept_state(|s| *s = dial);
     }
 
     /// Back to the cold-start state: no answer, no level, no scope.
     pub(crate) fn set_unanswered(&self) {
-        set_permission_auto_accept_level(PERMISSION_AUTO_ACCEPT_UNRECOGNISED);
-        set_permission_auto_accept_scope(None);
-        set_permission_auto_accept_answered(false);
+        self.set_dial(PermissionAutoAcceptDial::default());
     }
 
     /// Feed one poll through the shipping apply path: `Some(level)` is a 2xx
@@ -1260,22 +1282,22 @@ impl PermissionAutoAcceptPin {
             Some(level) => PermissionAutoAcceptPoll {
                 outcome: PollOutcome::Updated(normalize_permission_auto_accept_level(Some(level))),
                 resolved_scope: Some("tenant".to_string()),
+                tenant: None,
             },
             None => PermissionAutoAcceptPoll {
                 outcome: PollOutcome::Kept("test: transient failure".to_string()),
                 resolved_scope: None,
+                tenant: None,
             },
         };
-        apply_permission_auto_accept_poll(&poll);
+        apply_permission_auto_accept_poll(&poll, chrono::Utc::now());
     }
 }
 
 #[cfg(test)]
 impl Drop for PermissionAutoAcceptPin {
     fn drop(&mut self) {
-        set_permission_auto_accept_level(PERMISSION_AUTO_ACCEPT_UNRECOGNISED);
-        set_permission_auto_accept_scope(None);
-        set_permission_auto_accept_answered(false);
+        write_permission_auto_accept_state(|s| *s = PermissionAutoAcceptDial::default());
     }
 }
 
@@ -3082,7 +3104,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // a flip reaches RUNNING sessions within one tick, because the pad reads
         // the cache per prompt rather than at spawn.
         let permission_auto_accept_poll = poll_permission_auto_accept_once().await;
-        apply_permission_auto_accept_poll(&permission_auto_accept_poll);
+        apply_permission_auto_accept_poll(&permission_auto_accept_poll, chrono::Utc::now());
         let permission_auto_accept_outcome = permission_auto_accept_poll.outcome;
         let permission_auto_accept_key = plan_capture_log_key(&permission_auto_accept_outcome);
         if is_new_outcome(
@@ -5232,7 +5254,9 @@ mod tests {
                 None,
             ),
         ] {
-            let poll = permission_auto_accept_poll_for_body(&decode(raw));
+            let tenant = Some(uuid::Uuid::from_u128(0xA1));
+            let poll = permission_auto_accept_poll_for_body(&decode(raw), tenant);
+            assert_eq!(poll.tenant, tenant, "the answering tenant rides the poll");
             assert_eq!(
                 poll.outcome,
                 PollOutcome::Updated(want.to_string()),
@@ -5267,44 +5291,62 @@ mod tests {
         assert_eq!(next_permission_auto_accept_level(&skipped), None);
     }
 
-    /// The shipping apply path: unanswered before the first 2xx, answered
-    /// after it, and a 401 after an explicit `off` does NOT reopen anything.
+    /// The shipping apply path, in ONE write per poll: unanswered before the
+    /// first 2xx; a 2xx sets level, scope, answer time and answering tenant
+    /// together; a 401/404 after an explicit `off` moves none of them.
     #[test]
     fn permission_auto_accept_apply_path_is_answered_only_by_a_2xx() {
         let _pin = pin_permission_auto_accept_for_test();
+        let tenant_a = Some(uuid::Uuid::from_u128(0xA1));
         let failed = |err| PermissionAutoAcceptPoll {
             outcome: permission_auto_accept_outcome_for_error(err),
             resolved_scope: None,
+            tenant: None,
         };
         let answered = |level: &str, scope: &str| PermissionAutoAcceptPoll {
             outcome: PollOutcome::Updated(level.to_string()),
             resolved_scope: Some(scope.to_string()),
+            tenant: tenant_a,
         };
-        assert_eq!(permission_auto_accept_dial(), (false, String::new()));
-        assert_eq!(permission_auto_accept_scope(), None);
-
-        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(401)));
-        assert_eq!(permission_auto_accept_dial(), (false, String::new()));
-
-        apply_permission_auto_accept_poll(&answered("off", "tenant"));
-        assert_eq!(permission_auto_accept_dial(), (true, "off".to_string()));
-        assert_eq!(permission_auto_accept_scope().as_deref(), Some("tenant"));
-
-        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(404)));
+        let t0 = chrono::Utc::now();
         assert_eq!(
             permission_auto_accept_dial(),
-            (true, "off".to_string()),
-            "a 404 keeps an explicit off"
-        );
-        assert_eq!(
-            permission_auto_accept_scope().as_deref(),
-            Some("tenant"),
-            "a failure does not move the scope"
+            PermissionAutoAcceptDial::default()
         );
 
-        apply_permission_auto_accept_poll(&answered("on", "none"));
-        assert_eq!(permission_auto_accept_dial(), (true, "on".to_string()));
-        assert_eq!(permission_auto_accept_scope().as_deref(), Some("none"));
+        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(401)), t0);
+        assert_eq!(
+            permission_auto_accept_dial(),
+            PermissionAutoAcceptDial::default()
+        );
+
+        apply_permission_auto_accept_poll(&answered("off", "tenant"), t0);
+        let want_off = PermissionAutoAcceptDial {
+            answered: true,
+            level: "off".to_string(),
+            resolved_scope: Some("tenant".to_string()),
+            answered_at: Some(t0),
+            tenant: tenant_a,
+        };
+        assert_eq!(permission_auto_accept_dial(), want_off);
+
+        let t1 = t0 + chrono::Duration::minutes(5);
+        apply_permission_auto_accept_poll(&failed(FetchError::AuthOrAbsent(404)), t1);
+        assert_eq!(
+            permission_auto_accept_dial(),
+            want_off,
+            "a 404 keeps the explicit off, its scope, tenant AND its answer time"
+        );
+
+        apply_permission_auto_accept_poll(&answered("on", "none"), t1);
+        let d = permission_auto_accept_dial();
+        assert_eq!((d.answered, d.level.as_str()), (true, "on"));
+        assert_eq!(d.resolved_scope.as_deref(), Some("none"));
+        assert_eq!(
+            d.answered_at,
+            Some(t1),
+            "each 2xx refreshes the answer time"
+        );
     }
 
     #[test]
@@ -5318,7 +5360,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(body.contains("poll_permission_auto_accept_once().await"));
-        assert!(body.contains("apply_permission_auto_accept_poll(&permission_auto_accept_poll)"));
+        assert!(body.contains("apply_permission_auto_accept_poll(&permission_auto_accept_poll"));
     }
 
     // -----------------------------------------------------------------------

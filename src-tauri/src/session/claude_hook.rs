@@ -353,9 +353,35 @@ fn argv_settings_path(argv: &[String]) -> Option<&str> {
 /// (`C:\npm\claude.cmd`) is not split on `\` by `Path` on a Unix host, and the
 /// verdict must not depend on which OS evaluates it.
 fn is_direct_claude_exec(program: &str) -> bool {
+    program_stem(program).eq_ignore_ascii_case("claude")
+}
+
+/// `program`'s basename without its extension, splitting on BOTH separators.
+fn program_stem(program: &str) -> &str {
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let stem = base.split('.').next().unwrap_or(base);
-    stem.eq_ignore_ascii_case("claude")
+    base.split('.').next().unwrap_or(base)
+}
+
+/// Shells whose interactive `claude` resolves through the identity shim the
+/// seam prepends to `PATH` — the only non-empty argv the env-var carrier
+/// reaches.
+const SHELL_PROGRAMS: [&str; 10] = [
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nu",
+];
+
+/// Whether `program` is one of [`SHELL_PROGRAMS`]. PURE.
+fn is_shell_program(program: &str) -> bool {
+    let stem = program_stem(program);
+    SHELL_PROGRAMS.iter().any(|s| stem.eq_ignore_ascii_case(s))
 }
 
 /// What a terminal spawned with `command` (`None`/empty ⇒ the interactive
@@ -368,20 +394,27 @@ fn is_direct_claude_exec(program: &str) -> bool {
 ///    ([`direct_spawn_settings_args`]) and the provider adapter's launch spec
 ///    (`provider_adapter::ClaudeAdapter::capture_hook_delivery`) — is
 ///    `Registered` iff that path is a carrier THIS build writes.
-/// 2. A direct `claude` exec WITHOUT such an argv carrier is `Absent`: no shim
-///    sits in its chain, so the env var reaches no `--settings`.
-/// 3. Anything else — the shell pane, where the identity shim appends
-///    `--settings $QONTINUI_CLAUDE_HOOK_SETTINGS` to the `claude` typed in it —
-///    is `Registered` iff the seam materialized a current carrier.
+/// 2. The SHELL pane (an empty argv) or an explicit shell wrapper
+///    ([`SHELL_PROGRAMS`]) — where the identity shim appends
+///    `--settings $QONTINUI_CLAUDE_HOOK_SETTINGS` to the `claude` started in
+///    it — is `Registered` iff the seam materialized a current carrier.
+/// 3. Everything else is `Absent`: a direct `claude` exec without an argv
+///    carrier (no shim in its chain), and any other program (`node cli.js`,
+///    `npm run dev`, another agent CLI) — nothing shows the env var ever
+///    reaches a `claude` there.
 pub fn permission_request_hook_for(
     command: Option<&[String]>,
     seam_carrier: Option<&Path>,
 ) -> PermissionRequestHook {
     let argv = command.unwrap_or(&[]);
-    let registered = match argv_settings_path(argv) {
-        Some(path) => is_current_carrier(Path::new(path)),
-        None if argv.first().is_some_and(|p| is_direct_claude_exec(p)) => false,
-        None => seam_carrier.is_some_and(is_current_carrier),
+    let registered = match (argv_settings_path(argv), argv.first()) {
+        (Some(path), _) => is_current_carrier(Path::new(path)),
+        (None, Some(program)) if is_direct_claude_exec(program) => false,
+        (None, None) => seam_carrier.is_some_and(is_current_carrier),
+        (None, Some(program)) if is_shell_program(program) => {
+            seam_carrier.is_some_and(is_current_carrier)
+        }
+        (None, Some(_)) => false,
     };
     if registered {
         PermissionRequestHook::Registered
@@ -1266,6 +1299,28 @@ mod tests {
         }
     }
 
+    /// ARMING (black box; compiles against the BASE 5571ce756 — only base-era
+    /// symbols): the carrier `materialize_with` writes registers the
+    /// PermissionRequest hook, pointing at a materialized script.
+    #[test]
+    fn arming_the_carrier_registers_the_permission_request_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let command = v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            command.contains("claude_permission_request_hook.sh"),
+            "PermissionRequest registered: {v}"
+        );
+        assert!(tmp
+            .path()
+            .join("claude_permission_request_hook.sh")
+            .exists());
+    }
+
     /// `GET /terminals` `permissionRequestHook`, over the three delivery paths.
     #[test]
     fn permission_request_hook_follows_the_carrier_each_spawn_path_hands_over() {
@@ -1330,12 +1385,41 @@ mod tests {
                 "{program}"
             );
         }
-        // A wrapper program goes through the shim like the shell pane does.
-        let wrapped = s(&["bash", "-lc", "claude"]);
-        assert_eq!(
-            permission_request_hook_for(Some(&wrapped), Some(&dark)),
-            Registered
-        );
+        // An explicit SHELL wrapper goes through the shim like the shell pane.
+        for shell in [
+            "bash",
+            "/bin/sh",
+            "zsh",
+            "pwsh",
+            r"C:\Windows\System32\cmd.exe",
+        ] {
+            let wrapped = s(&[shell, "-lc", "claude"]);
+            assert_eq!(
+                permission_request_hook_for(Some(&wrapped), Some(&dark)),
+                Registered,
+                "{shell}"
+            );
+            assert_eq!(
+                permission_request_hook_for(Some(&wrapped), None),
+                Absent,
+                "{shell} with no materialized carrier"
+            );
+        }
+        // RISK 6: any OTHER program with no argv carrier is absent, however a
+        // carrier was materialized for its env.
+        for argv in [
+            s(&["node", "/opt/claude-code/cli.js"]),
+            s(&["npm", "run", "dev"]),
+            s(&["codex"]),
+            s(&["pi", "--model", "x"]),
+            s(&["python3", "-m", "http.server"]),
+        ] {
+            assert_eq!(
+                permission_request_hook_for(Some(&argv), Some(&dark)),
+                Absent,
+                "{argv:?}"
+            );
+        }
         assert_eq!(Registered.as_str(), "registered");
         assert_eq!(Absent.as_str(), "absent");
     }

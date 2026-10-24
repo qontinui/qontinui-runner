@@ -306,6 +306,17 @@ fn control_response_for(request_id: &str, subtype: &str, denies: bool) -> Outgoi
 /// Handle a control request from the CLI.
 /// In bypass permissions mode we approve everything, unless the tenant's
 /// permission auto-accept dial is answered `off` — see [`control_response_for`].
+///
+/// **The deny arm is INERT on today's launch arguments.** Claude Code sends a
+/// `can_use_tool` control request only to a session started with
+/// `--permission-prompt-tool stdio`, and no runner launch path passes that
+/// flag (these sessions run in `bypassPermissions`), so no `can_use_tool`
+/// reaches this function today. The arm exists so the tenant switch holds the
+/// day a launch path does pass it. Its wire shape (`behavior: "deny"` +
+/// `message`, beside the `allowed` mirror) follows the runner's existing allow
+/// envelope and Claude Code's documented permission result; it is NOT pinned
+/// against a live Claude Code control exchange — verify it there before
+/// relying on it.
 fn handle_control_request(
     ctrl_req: &crate::claude_protocol::types::CliControlRequest,
     stdin_writer: &Arc<StdinWriter>,

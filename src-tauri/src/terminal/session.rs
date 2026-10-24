@@ -1571,6 +1571,11 @@ pub struct TerminalSession {
     /// holder pane, a remote mirror, a test fixture) reads `absent`.
     permission_request_hook:
         std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
+    /// The per-spawn nonce this terminal's child carries as
+    /// `QONTINUI_PERMREQ_NONCE`, once [`Self::spawn`] registered it as the
+    /// terminal's grant (`session::permission_accept`). `Drop` forgets the
+    /// grant only while it is still this nonce's.
+    permission_request_nonce: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1775,6 +1780,15 @@ impl TerminalSession {
                 cmd.env(k, v);
             }
         }
+        // Permission auto-accept (plan
+        // `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`):
+        // a per-spawn secret the carrier's PermissionRequest hook requires the
+        // runner's pad to ECHO before it answers a dialog. Set AFTER the
+        // caller's env so neither a caller nor an inherited copy (a runner
+        // started inside a runner session) can plant a known value. Recorded
+        // as this terminal's grant once the child is up, below.
+        let permreq_nonce = crate::session::permission_accept::new_nonce();
+        cmd.env(crate::session::permission_accept::NONCE_ENV, &permreq_nonce);
 
         // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
         // placed into the PTY env — the caller pin wins, else the credential-
@@ -1925,8 +1939,10 @@ impl TerminalSession {
             pinned_session_id,
         )?;
         // Only THIS path records it: an adopted holder pane or a remote mirror
-        // is built by `spawn_with_io` alone and reads `absent`.
+        // is built by `spawn_with_io` alone and reads `absent` — and holds no
+        // grant, so the pad never answers its prompts.
         session.set_permission_request_hook(permission_request_hook);
+        session.record_permission_request_grant(permreq_nonce, spawn_tenant);
         Ok(session)
     }
 
@@ -2555,6 +2571,7 @@ impl TerminalSession {
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -4517,6 +4534,19 @@ impl TerminalSession {
         let _ = self.permission_request_hook.set(hook);
     }
 
+    /// Register this terminal's permission auto-accept grant: the nonce its
+    /// child env carries and the tenant it was spawned for (`None` when the
+    /// caller named none). First write wins.
+    fn record_permission_request_grant(&self, nonce: String, spawn_tenant: Option<uuid::Uuid>) {
+        if self.permission_request_nonce.set(nonce.clone()).is_ok() {
+            crate::session::permission_accept::register_terminal_grant(
+                &self.id,
+                nonce,
+                spawn_tenant,
+            );
+        }
+    }
+
     /// `GET /terminals` `permissionRequestHook`: `Absent` unless
     /// [`Self::spawn`] recorded a current carrier.
     pub fn permission_request_hook(&self) -> crate::session::claude_hook::PermissionRequestHook {
@@ -5238,6 +5268,9 @@ impl Drop for TerminalSession {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
         }
+        if let Some(nonce) = self.permission_request_nonce.get() {
+            crate::session::permission_accept::forget_terminal_grant(&self.id, nonce);
+        }
     }
 }
 
@@ -5728,6 +5761,7 @@ pub(crate) mod tests {
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),

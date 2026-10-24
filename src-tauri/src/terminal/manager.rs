@@ -1011,18 +1011,13 @@ impl TerminalManager {
     }
 
     /// List all terminal sessions with their info, sorted by creation time.
+    /// Derived from [`Self::list_with_permission_request_hooks`], so the two
+    /// listings cannot disagree on membership or order.
     pub fn list(&self) -> Vec<TerminalInfo> {
-        let sessions = match self.sessions.lock() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Sessions lock poisoned: {}", e);
-                return Vec::new();
-            }
-        };
-
-        let mut infos: Vec<TerminalInfo> = sessions.values().map(|s| s.info()).collect();
-        infos.sort_by_key(|info| info.created_at);
-        infos
+        self.list_with_permission_request_hooks()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
     }
 
     /// [`Self::list`] with each terminal's `permissionRequestHook` beside its
