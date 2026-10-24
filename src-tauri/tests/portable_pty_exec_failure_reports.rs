@@ -55,8 +55,13 @@ fn an_inheritable_fd_is_still_closed_in_the_child() {
         "-c",
         &format!("[ -e /proc/$$/fd/{leaked} ] && exit 7; exit 0"),
     ]);
-    let mut child = open_pty().slave.spawn_command(cmd).unwrap();
+    // Keep the pair (and so the master) alive until the child exits. Dropping
+    // the master hangs up the PTY, and a child that has not yet run its check
+    // then dies of SIGHUP — a race CI lost (exit 1, signal Hangup).
+    let pair = open_pty();
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
     let status = child.wait().unwrap();
+    drop(pair);
     // SAFETY: closing the duplicate we made.
     unsafe { libc::close(leaked) };
     assert!(
