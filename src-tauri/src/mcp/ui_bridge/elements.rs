@@ -2336,7 +2336,7 @@ pub(crate) async fn try_ws_dispatch_for_app(
 ///
 /// [`relay_path_policy::RELAYED_REQUEST_HEADER`]: crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ComponentSources {
+enum ComponentSources {
     /// A local read: the runner's own registry, then every live wrapper's.
     RunnerAndWrappers,
     /// A relayed read: the runner's own registry, and no wrapper is asked.
@@ -2345,9 +2345,13 @@ pub(crate) enum ComponentSources {
 
 impl ComponentSources {
     /// The sources a request is answered from, decided by whether the relay
-    /// forwarded it. Private: its one production caller is [`components_read`],
-    /// so a component read's sources always come from that request's own
-    /// headers, and no code outside this module can select them another way.
+    /// forwarded it. Its one production caller is [`components_read`], so a
+    /// component read's sources come from that request's own headers. No code
+    /// outside this module can select them another way, and the compiler
+    /// holds that: this type, [`ws_components_for`] and [`components_envelope`]
+    /// are private to the module. Outside it, the one way to run the component
+    /// read is [`components_read`], which takes headers, not a choice of
+    /// sources.
     fn for_request(headers: &HeaderMap) -> Self {
         if crate::mcp::relay_path_policy::is_relayed_request(headers) {
             Self::RunnerOnly
@@ -2368,7 +2372,7 @@ impl ComponentSources {
 
 /// The wrappers' half of a component read. For a relayed read it is empty and
 /// no wrapper is dispatched to, so none can hold the read.
-pub(crate) async fn ws_components_for(
+async fn ws_components_for(
     sources: ComponentSources,
     registry: &AppRegistry,
     dispatcher: &AppDispatcher,
@@ -2565,7 +2569,7 @@ pub(crate) async fn components_read(
 /// authoritative. The mirror has been dropped; `data.components` is the
 /// single source of truth and the regression test
 /// `components_envelope_omits_top_level_mirror` locks it in.
-pub(crate) fn components_envelope(
+fn components_envelope(
     components: Vec<serde_json::Value>,
     sources: ComponentSources,
 ) -> serde_json::Value {
@@ -6386,6 +6390,46 @@ mod ws_dispatch_selection_tests {
                  but it contains `{chosen_elsewhere}`: {body}"
             );
         }
+    }
+
+    /// The pin above holds the handler's BODY. This one holds its BINDING: the
+    /// component route is registered exactly once in this file, and that
+    /// registration routes GET, and no other method, to
+    /// `ui_bridge_get_components_handler`. Bound to another handler, the route
+    /// would be served by a body the pin above never reads, and every test
+    /// above would stay green. A rebind, a second method chained onto the
+    /// registration, or a move to another file turns this red, so whoever
+    /// moves the registration moves this pin with it. Whitespace is ignored,
+    /// as above.
+    #[test]
+    fn the_component_route_is_bound_to_that_handler() {
+        const PATH: &str = "/ui-bridge/control/components";
+        const BINDING: &str = "get(ui_bridge_get_components_handler)";
+        let compact: String = include_str!("elements.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Built at run time, so this test's own source never matches it.
+        let registration = format!(".route(\"{PATH}\",");
+        let bound: Vec<&str> = compact.split(registration.as_str()).skip(1).collect();
+        assert_eq!(
+            bound.len(),
+            1,
+            "`{PATH}` must be registered exactly once in elements.rs, but {} registrations \
+             were found",
+            bound.len()
+        );
+        let rest = bound[0].strip_prefix(BINDING).unwrap_or_else(|| {
+            panic!(
+                "`{PATH}` must be routed to `{BINDING}`, but its registration reads `{}`",
+                bound[0].chars().take(80).collect::<String>()
+            )
+        });
+        assert!(
+            rest.starts_with(')') || rest.starts_with(",)"),
+            "`{PATH}` must route GET alone to the handler, but `{BINDING}` is followed by `{}`",
+            rest.chars().take(80).collect::<String>()
+        );
     }
 }
 
