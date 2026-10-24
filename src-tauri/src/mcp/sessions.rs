@@ -1896,7 +1896,10 @@ mod tests {
         store.mark_finish_synced("s", Some(first_at));
 
         let again = apply_finish(&store, "s", finish_req(Some("second"))).unwrap();
-        assert_eq!(again["changed"], "marker", "the mark was rewritten: {again}");
+        assert_eq!(
+            again["changed"], "marker",
+            "the mark was rewritten: {again}"
+        );
         assert_eq!(again["session"]["finishReason"], "second");
         let again_at = again["session"]["finishedAt"].as_i64().unwrap();
         assert_ne!(again_at, first_at, "restamped");

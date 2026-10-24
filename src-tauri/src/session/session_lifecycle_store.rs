@@ -6990,7 +6990,11 @@ mod tests {
             2,
             "on an UNSYNCED mark the read re-offers the owed write (the retry door)"
         );
-        assert_eq!(sent.lock().unwrap()[1], Some(stamped), "with the SAME stamp");
+        assert_eq!(
+            sent.lock().unwrap()[1],
+            Some(stamped),
+            "with the SAME stamp"
+        );
 
         store.mark_finish_synced("s", Some(stamped));
         assert!(store.get("s").unwrap().finish_synced);
@@ -7038,7 +7042,11 @@ mod tests {
             .unwrap()
             .get("s")
             .expect("persisted");
-        assert_eq!(on_disk.finished_at, Some(restamped), "the restamp is durable");
+        assert_eq!(
+            on_disk.finished_at,
+            Some(restamped),
+            "the restamp is durable"
+        );
         assert!(!on_disk.finish_synced);
 
         let un = store.set_finished("s", false, None).unwrap();
@@ -7129,7 +7137,11 @@ mod tests {
     #[test]
     fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
-        assert_eq!(restamp_at(1_000, 5_000), 5_000, "a later clock is taken as is");
+        assert_eq!(
+            restamp_at(1_000, 5_000),
+            5_000,
+            "a later clock is taken as is"
+        );
         assert_eq!(
             restamp_at(1_000, 400),
             400,
