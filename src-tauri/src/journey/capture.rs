@@ -1614,6 +1614,27 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(4);
         let taken_at = began + Duration::from_millis(4800);
+        // `tokio::select!` without `biased;` polls its branches in a RANDOM
+        // order, so one draw catches a revert only half the time. 32 draws
+        // with a re-queued snapshot each make a revert fail with probability
+        // 1 - 2^-32.
+        for draw in 0..32 {
+            tx.send(JourneyEvent::Snapshot {
+                key: key(),
+                app_version: None,
+                snapshot: Arc::new(json!({})),
+                taken_at,
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    next_event(&mut rx, &c).await,
+                    Some(JourneyEvent::Snapshot { .. })
+                ),
+                "draw {draw}: the queued snapshot must be served before the due timer"
+            );
+        }
         tx.send(JourneyEvent::Snapshot {
             key: key(),
             app_version: None,
