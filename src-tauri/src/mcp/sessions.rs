@@ -3189,18 +3189,20 @@ mod permission_prompt_capture_route_tests {
     }
 
     /// ARMING (black box; compiles against the BASE 5571ce756 — only base-era
-    /// symbols): the pad answers a `decision`, and garbage is `none`. The base
-    /// pad answers no `decision` key, so this fails on the assertion there.
+    /// symbols): the pad handler the hook's curl reaches answers a `decision`,
+    /// and garbage is `none`. It CALLS the handler itself — the entry point the
+    /// population uses — rather than a router built around it. The base pad
+    /// answers no `decision` key, so this fails on the assertion there.
     #[tokio::test]
     async fn arming_the_pad_answers_decision_none_on_garbage() {
-        let (status, body) = post_json(
-            permission_request_app(),
-            "/sessions/term-arming-decision/permission-request",
-            "not json".to_string(),
+        let Json(body) = permission_request(
+            Path("term-arming-decision".to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"not json"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["decision"], "none", "{body}");
+        assert_eq!(body["session"], "term-arming-decision", "{body}");
     }
 
     /// BUG 1 + RISK 5, end to end: the REAL bundled hook, the REAL curl and
