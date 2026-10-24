@@ -165,6 +165,12 @@ pub struct StatusFetch {
     /// which coord's row became `finished` (the legacy `done` included).
     /// Absent ⇒ the time is unknown, and wind-down falls back to not bounding
     /// the idle window by it. Never consulted by the restart verdict.
+    ///
+    /// For a finish the runner delivered, this is the runner's DECLARED finish
+    /// instant on the runner's clock (its `finished` PATCH carries the mark's
+    /// `finished_at` as `last_progress_at`), not coord's receipt time — so the
+    /// wind-down's floor can sit earlier than it did before that change, by up
+    /// to the outbox lag.
     pub finished_at_by_session_id: HashMap<String, i64>,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.

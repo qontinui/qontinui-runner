@@ -399,6 +399,22 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
+/// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
+/// re-finishing an already-finished mark): `now`, unless that EQUALS the old
+/// stamp (two finishes inside one millisecond), in which case one past it.
+///
+/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
+/// two stamps only to DIFFER, so a late ACK of the old row can never sync the
+/// new mark. Taking `now` otherwise — rather than `max(now, prev + 1)` — keeps
+/// a clock stepped backwards from dating the new finish in the future. Pure.
+fn restamp_at(prev: i64, now: i64) -> i64 {
+    if now == prev {
+        prev.saturating_add(1)
+    } else {
+        now
+    }
+}
+
 /// Best-effort identity overlay for an existing record — the D1 "who is this
 /// session" fields that live outside the spawn-time record.
 ///
@@ -2185,11 +2201,20 @@ impl SessionLifecycleStore {
     ///
     /// **A re-finish that carries a reason RESTAMPS** (plan
     /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
-    /// Phase 3): `finished_at` moves to now (strictly past the old stamp),
-    /// `finish_synced` is cleared and the finish is re-sent to coord, so a
+    /// Phase 3): `finished_at` moves to now (always a stamp DIFFERENT from the
+    /// old one — see `restamp_at`), `finish_synced` is cleared and the finish
+    /// is re-sent to coord carrying the new time as its write instant. So a
     /// session revived after its first finish and finished again carries the
-    /// SECOND finish time on both sides — and a reader comparing it with the
-    /// session's last prompt reads it finished, not revived. The re-sent row
+    /// SECOND finish time locally, and coord is told it.
+    ///
+    /// Whether coord's own clock follows depends on the COORD build. A coord
+    /// carrying that plan's Phase 2 (in flight at this writing) moves its
+    /// transition clock (`state_started_at`, served as `since`) on every
+    /// finish, finished → finished included. An older coord moves it only when
+    /// the status actually CHANGES: a revival coord saw (the row moved off
+    /// `finished`) re-dates it on either build, but a re-finish of a row coord
+    /// still reads `finished` does not, so there `sessionStatusSince` can LAG
+    /// this `finished_at`. The re-sent row
     /// carries the new stamp, so only coord's ACK of THAT write pairs with the
     /// new mark ([`Self::mark_finish_synced`]); a late ACK of the old row is a
     /// stale one and is ignored. Reported as [`FinishChange::Marker`], since
@@ -2281,11 +2306,8 @@ impl SessionLifecycleStore {
         if finished {
             rec.finished_at = Some(match rec.finished_at {
                 None => now,
-                // A RESTAMP (a re-finish that carried a reason). Strictly past
-                // the old stamp even within one millisecond or across a
-                // backwards clock step, so the ACK matcher can always tell the
-                // re-sent write from the old one.
-                Some(prev) => now.max(prev.saturating_add(1)),
+                // A RESTAMP (a re-finish that carried a reason).
+                Some(prev) => restamp_at(prev, now),
             });
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
@@ -6994,9 +7016,9 @@ mod tests {
             "a second declared finish rewrites the mark itself"
         );
         let restamped = again.record.finished_at.unwrap();
-        assert!(
-            restamped > stamped,
-            "the second finish is dated by itself: {restamped} > {stamped}"
+        assert_ne!(
+            restamped, stamped,
+            "the second finish is dated by itself, never by the first"
         );
         assert!(
             !again.record.finish_synced,
@@ -7100,6 +7122,24 @@ mod tests {
         );
     }
 
+    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
+    /// matcher needs): two finishes inside one millisecond still differ, and a
+    /// clock stepped backwards dates the new finish at `now` rather than
+    /// pushing it past the old one into the future.
+    #[test]
+    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+        assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
+        assert_eq!(restamp_at(1_000, 5_000), 5_000, "a later clock is taken as is");
+        assert_eq!(
+            restamp_at(1_000, 400),
+            400,
+            "a clock stepped back is not pushed into the future"
+        );
+        for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
+            assert_ne!(restamp_at(prev, now), prev);
+        }
+    }
+
     /// Review (adoption) L1, as amended by the restamp: a blank reason on an
     /// already-finished mark is no reason — a read that rewrites nothing
     /// (`changed: none`). Any real reason, the stored one included, is a new
@@ -7133,7 +7173,7 @@ mod tests {
                 .expect("known id");
             assert_eq!(out.changed, FinishChange::Marker, "reason {r:?} restamps");
             assert_eq!(out.record.finish_reason.as_deref(), Some(r));
-            assert!(out.record.finished_at > last, "reason {r:?} moved the stamp");
+            assert_ne!(out.record.finished_at, last, "reason {r:?} moved the stamp");
             last = out.record.finished_at;
         }
     }

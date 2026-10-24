@@ -1899,7 +1899,7 @@ mod tests {
         assert_eq!(again["changed"], "marker", "the mark was rewritten: {again}");
         assert_eq!(again["session"]["finishReason"], "second");
         let again_at = again["session"]["finishedAt"].as_i64().unwrap();
-        assert!(again_at > first_at, "restamped: {again_at} > {first_at}");
+        assert_ne!(again_at, first_at, "restamped");
         assert_eq!(
             again["coord"]["queued"], true,
             "the restamped finish is re-sent to coord: {again}"

@@ -404,6 +404,10 @@ pub struct LiveClaudeProcess {
     /// finish time, which a reader compares against the session's last real
     /// prompt to tell a revived session from one that finished again (plan
     /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`).
+    /// A finished → finished re-finish moves it only on a coord build carrying
+    /// that plan's Phase 2; an older coord moves it only when the status
+    /// actually changes, so after such a re-finish it can lag the runner's
+    /// `finishedAt`.
     ///
     /// `None` = UNKNOWN, never "now" and never "the epoch": it is `None`
     /// wherever [`Self::session_status`] is (a nested subagent, an ambiguous
