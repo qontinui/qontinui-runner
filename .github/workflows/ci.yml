@@ -1810,6 +1810,10 @@ jobs:
         # attacker would need physical/local access AND the ability to
         # drive many timing-measured auth attempts. Revisit when rsa
         # ships a fix or adb_client switches RSA implementations.
+        # rsa 0.9.10 has a second dependent, jsonwebtoken 10.4.0
+        # (`rust_crypto`), reached via the restate chain described under
+        # RUSTSEC-2026-0387 below. That path is never exercised, because
+        # restate verifies EdDSA tokens only.
         #
         # --ignore RUSTSEC-2026-0194 + RUSTSEC-2026-0195: two quick-xml
         # < 0.41 DoS advisories published together on 2026-07-02 (quadratic
@@ -1915,6 +1919,49 @@ jobs:
         # zip >= 9. Re-assess immediately if updater signature checking is
         # ever disabled or bypassed, if runner code starts calling
         # `extract()` on a zip 4 archive, or if the updater extracts on Unix.
+        #
+        # --ignore RUSTSEC-2026-0387: crypto-bigint 0.5.5, timing variability
+        # in operations meant to be constant-time. Dated 2026-10-23, and it
+        # red-ed `security` on every runner PR, docs-only ones included (e.g.
+        # #2274), without any change to Cargo.lock.
+        #
+        # NOT UPGRADABLE FROM HERE. The fix is >= 0.7.6, a semver-MAJOR bump.
+        # 0.5.5 is the last 0.5 release, and every elliptic-curve 0.13.x
+        # requires `crypto-bigint ^0.5`. crypto-bigint enters through exactly
+        # one chain:
+        #
+        #   qontinui-runner (default `restate` feature) -> restate-sdk 0.10
+        #     -> restate-sdk-shared-core 0.10.0 (`request_identity`)
+        #     -> jsonwebtoken 10.4.0 (`rust_crypto`) -> p256 0.13 / p384 0.13
+        #     -> elliptic-curve 0.13.8 (directly, and via ecdsa / primeorder)
+        #     -> crypto-bigint 0.5.5
+        #
+        # No later release in that chain moves it, semver-major ones included.
+        # As of 2026-10-24, every jsonwebtoken up to the latest, 11.1.0,
+        # requires p256 ^0.13.2 and p384 ^0.13.0, and restate-sdk up to the
+        # latest, 0.12.1, still takes jsonwebtoken ^10.3.
+        #
+        # NOT REACHABLE. Only jsonwebtoken's ES256/ES384 code reaches it.
+        # restate-sdk-shared-core's request_identity verifies EdDSA tokens and
+        # nothing else (`Validation::new(Algorithm::EdDSA)`). That path uses
+        # ed25519-dalek, which does not depend on crypto-bigint. Even that
+        # check runs only when an identity key is set through the endpoint
+        # builder's `.identity_key(..)`, and runner code never calls it. So no
+        # p256/p384 operation runs. If one did, ECDSA verification works only
+        # on public inputs (key, signature, message), and a timing leak
+        # exposes only secret operands. The runner has no direct dependency on
+        # jsonwebtoken, p256, p384 or elliptic-curve.
+        #
+        # Drop this ignore when jsonwebtoken ships on p256/p384 >= 0.14
+        # (elliptic-curve 0.14 -> crypto-bigint 0.7) and restate-sdk adopts
+        # that release. Moving restate-sdk to the `aws_lc_rs` backend with
+        # default features off would also remove p256 from the graph. That
+        # swaps the crypto backend, adds the aws-lc-rs C build, and means
+        # re-listing the defaults the runner needs (`http_server`, for
+        # `HttpServer::new` in src-tauri/src/restate/http_endpoint.rs). So
+        # it is not done here. Re-assess immediately if the runner starts
+        # signing with an ES256/ES384 key, or starts using a P-256/P-384
+        # private key through elliptic-curve 0.13 anywhere.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -1923,7 +1970,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0387
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
