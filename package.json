@@ -98,6 +98,7 @@
     "prebuild": "node scripts/check-frontend-toolchain.mjs",
     "build": "pnpm exec tsc && pnpm exec vite build",
     "build:exe": "node scripts/build-exe.mjs",
+    "build-profile:test": "node --test scripts/__tests__/build-profile.test.mjs",
     "provenance:test": "node --test scripts/__tests__/frontend-provenance.test.mjs",
     "bundle:profile-sidecar": "node scripts/bundle-profile-sidecar.mjs",
     "build-storybook": "storybook build",
