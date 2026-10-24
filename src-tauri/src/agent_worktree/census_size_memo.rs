@@ -268,4 +268,37 @@ mod tests {
             10
         );
     }
+
+    /// The production wrappers go through the ONE process-global store: a
+    /// second `bytes_or_measure` of an unchanged directory is a hit, and
+    /// `clear()` empties that same store. Every other test here owns its own
+    /// store, so this is the one that pins the wiring. Its `clear()` can only
+    /// make a concurrent census test measure again, which none of them treats
+    /// as a failure; no other test calls `clear()`.
+    #[test]
+    fn the_production_wrappers_share_the_global_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(bytes_or_measure(dir.path(), || Some(7)), 7);
+        let mut called = false;
+        let got = bytes_or_measure(dir.path(), || {
+            called = true;
+            Some(999)
+        });
+        assert_eq!(got, 7, "a second read of an unchanged dir is a hit");
+        assert!(!called, "the hit must not measure");
+        clear();
+        assert!(
+            memo()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(dir.path())
+                .is_none(),
+            "clear() empties the global store"
+        );
+        assert_eq!(
+            bytes_or_measure(dir.path(), || Some(8)),
+            8,
+            "measured again after clear()"
+        );
+    }
 }
