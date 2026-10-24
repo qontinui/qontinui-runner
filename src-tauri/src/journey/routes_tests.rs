@@ -6,7 +6,7 @@ use super::*;
 use crate::journey::read::TimedEdge;
 use crate::journey::test_fixtures::{edge, frontier, key, timeline, writing};
 use chrono::TimeZone;
-use qontinui_types::journey::{FrontierEntry, LedgerState};
+use qontinui_types::journey::{FrontierEntry, JourneyEdgeObservation, LedgerState};
 
 fn at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap()
@@ -625,4 +625,80 @@ fn edge_timing_uses_the_shared_ledger_code() {
         &failing,
     );
     assert_eq!(code(&v), "ledger_write_failing");
+}
+
+// -- Review fix 2 on the shared per-node split ------------------------------
+
+#[test]
+fn prior_knowledge_lists_only_settled_nodes_as_measured() {
+    // C is reached only by a typed URL; nothing is open anywhere.
+    let settled = vec![
+        edge(1, "a", Some("b"), "affordance", "changed", "fp-a1"),
+        edge(2, "x", Some("c"), "push", "changed", "fp-x1"),
+    ];
+    let g = build_graph(&settled, &[], &writing(), &JourneyFilter::default());
+    let p = requires_prior_knowledge(&g);
+    assert!(p.nodes.iter().any(|n| n.node_key == key("c")), "{p:?}");
+    if p.frontier.unsettled_because(&g.coverage, true).is_none() {
+        let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+        assert_eq!(status(&v), "measured", "{v:#}");
+    }
+
+    // A withdrawn click into C makes C doubtful: it may never be listed as a
+    // measured finding.
+    let mut withdrawn = edge(3, "a", Some("c"), "affordance", "changed", "fp-a2");
+    withdrawn.invalidated_at = Some("2026-10-02T00:00:00Z".into());
+    let mut rows = settled.clone();
+    rows.push(withdrawn);
+    let g = build_graph(&rows, &[], &writing(), &JourneyFilter::default());
+    let p = requires_prior_knowledge(&g);
+    assert!(
+        p.unsettled.iter().any(|n| n.node_key == key("c")),
+        "fixture must make C unsettled: {p:?}"
+    );
+    let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+    if status(&v) == "measured" {
+        let listed: Vec<&str> = v["value"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["nodeKey"].as_str().unwrap())
+            .collect();
+        assert!(!listed.contains(&key("c").as_str()), "{v:#}");
+        let dims = v["provenance"]["coverage"]["unmeasured"]
+            .as_array()
+            .unwrap();
+        assert!(
+            dims.iter()
+                .any(|d| d["dimension"] == "unsettled_prior_knowledge_nodes"),
+            "a measured list with an unsettled remainder is degraded: {v:#}"
+        );
+    } else {
+        assert_eq!(status(&v), "unknown", "never absent over a doubt: {v:#}");
+        assert!(v["provenance"]["source"]["result"]["unsettled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["nodeKey"] == key("c")));
+    }
+}
+
+#[test]
+fn edge_timing_applies_trust_before_withdrawal() {
+    // An untrusted row is rejected even when it is also withdrawn, exactly
+    // as build_graph counts it.
+    let mut bad = timed(2, "a", "b", Some(200));
+    bad.edge.observed_at = "yesterday".into();
+    bad.edge.invalidated_at = Some("2026-10-02T00:00:00Z".into());
+    let rows = vec![timed(1, "a", "b", Some(100)), bad];
+    let v = answer_edge_timing(
+        &ctx("edge-timing"),
+        &rows,
+        &key("a"),
+        &key("b"),
+        &JourneyFilter::default(),
+        &writing(),
+    );
+    assert_eq!(v["value"]["rowsRejected"], 1, "{v:#}");
+    assert_eq!(v["value"]["edgesInvalidated"], 0, "{v:#}");
 }

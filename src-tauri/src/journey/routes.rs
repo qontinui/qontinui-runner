@@ -61,7 +61,7 @@ use axum::Json;
 use chrono::{DateTime, SecondsFormat, Utc};
 use qontinui_types::journey::{
     build_graph, dead_ends, frontier, reachable_from, requires_prior_knowledge, steps_to,
-    JourneyCoverage, JourneyEdgeObservation, JourneyFilter, JourneyGraph, JourneyLedgerHealth,
+    trusted_edge_row, JourneyCoverage, JourneyFilter, JourneyGraph, JourneyLedgerHealth,
     JourneySearchFrontier, RunKind,
 };
 use qontinui_vision_core::{
@@ -308,6 +308,10 @@ fn detail_for(query: &str, code: UnknownCode, dim: Option<&UnmeasuredDimension>)
              searched part; they are listed in provenance.source.result",
             if n == 1 { "y" } else { "ies" }
         ),
+        "unsettled_prior_knowledge_nodes" => format!(
+            "{query}: {n} node(s) qualify on their kept arrivals but a filtered or withdrawn \
+             row could still be a click into them; they are listed in `unsettled`"
+        ),
         "rows_unparseable" => {
             format!("{query}: {n} ledger row(s) did not parse, so what they record is unknown")
         }
@@ -363,6 +367,7 @@ fn answer<T: Serialize>(
     frontier: &JourneySearchFrontier,
     coverage: &JourneyCoverage,
     subject_observed: bool,
+    extra: Vec<UnmeasuredDimension>,
 ) -> Value {
     // The shared crate names every gap of the searched part — the ledger
     // state, an empty ledger, open frontier, unmeasured departures — so the
@@ -373,6 +378,7 @@ fn answer<T: Serialize>(
         .map(|(dim, count, code)| UnmeasuredDimension::new(dim, count, unknown_code(code)))
         .collect();
     unmeasured.extend(ctx.gaps.dimensions());
+    unmeasured.extend(extra);
     let considered = coverage.nodes_observed;
     let unsettled_nodes = frontier.nodes.len() as u64;
     let obs_coverage = ObservationCoverage {
@@ -494,6 +500,7 @@ pub(crate) fn answer_graph(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
         &whole,
         &graph.coverage,
         true,
+        Vec::new(),
     )
 }
 
@@ -509,6 +516,7 @@ pub(crate) fn answer_reachable(ctx: &AnswerCtx<'_>, graph: &JourneyGraph, from: 
         &r.frontier,
         &r.coverage,
         r.from_observed,
+        Vec::new(),
     )
 }
 
@@ -530,6 +538,7 @@ pub(crate) fn answer_steps(
         &s.frontier,
         &s.coverage,
         subject,
+        Vec::new(),
     )
 }
 
@@ -546,6 +555,7 @@ pub(crate) fn answer_dead_ends(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Val
         &d.frontier,
         &d.coverage,
         true,
+        Vec::new(),
     )
 }
 
@@ -553,9 +563,30 @@ pub(crate) fn answer_dead_ends(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Val
 /// the read has no gap, AND the shared settle gate is closed
 /// ([`Positive::SettledListing`]) — "no affordance arrives here" is a claim
 /// about the whole graph, so any unexplored part can falsify it.
+///
+/// The shared crate already splits qualifying nodes: `nodes` are settled
+/// against every row the graph left out, `unsettled` are not. That split
+/// does NOT cover the open frontier (an unexplored affordance could lead into
+/// a listed node), so the whole-graph gate still applies to `nodes`. When the
+/// gate is closed and the read has no gap, `nodes` is `measured` — each one
+/// individually settled — and a non-empty `unsettled` DEGRADES it through an
+/// `unsettled_prior_knowledge_nodes` dimension rather than voiding it:
+/// demoting a settled node because a different node is doubtful would hide a
+/// true finding, while the degradation keeps "this list may be incomplete"
+/// on the wire. With no settled node, the answer is never `absent` while
+/// anything is unsettled.
 pub(crate) fn answer_prior_knowledge(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) -> Value {
     let p = requires_prior_knowledge(graph);
     let positive = !p.nodes.is_empty();
+    let unsettled_dims = if p.unsettled.is_empty() {
+        Vec::new()
+    } else {
+        vec![UnmeasuredDimension::new(
+            "unsettled_prior_knowledge_nodes",
+            p.unsettled.len() as u64,
+            UnknownCode::InputMissing,
+        )]
+    };
     answer(
         ctx,
         &p,
@@ -564,6 +595,7 @@ pub(crate) fn answer_prior_knowledge(ctx: &AnswerCtx<'_>, graph: &JourneyGraph) 
         &p.frontier,
         &p.coverage,
         true,
+        unsettled_dims,
     )
 }
 
@@ -586,32 +618,19 @@ pub(crate) fn answer_frontier(
         &f.frontier,
         &f.coverage,
         f.node_observed,
+        Vec::new(),
     )
-}
-
-fn keeps(filter: &JourneyFilter, edge: &JourneyEdgeObservation, at: DateTime<Utc>) -> bool {
-    if filter.since.is_some_and(|since| at < since) {
-        return false;
-    }
-    if let Some(v) = &filter.app_version {
-        if edge.app_version.as_deref() != Some(v.as_str()) {
-            return false;
-        }
-    }
-    if filter.run_kind.is_some_and(|k| edge.run_kind != k) {
-        return false;
-    }
-    true
 }
 
 /// `edge-timing?from=&to=`: the distribution of one edge's timelines. Edge
 /// identity is the node keys (`JourneyNode::key()`), never jsonb equality.
 ///
 /// Each row of the pair is handled exactly as `build_graph` handles an edge,
-/// in the same order: withdrawn → excluded and counted; failing `validate()`
-/// or carrying a non-RFC 3339 `observedAt` → REJECTED and counted (an
-/// unmeasured `rows_rejected` dimension, never a sample and never "filtered
-/// out"); then the filter. Samples pool every trigger and outcome of the pair
+/// through the same shared functions in the same order: untrusted
+/// (`trusted_edge_row` refuses it — fails `validate()` or a non-RFC 3339
+/// `observedAt`) → REJECTED and counted (an unmeasured `rows_rejected`
+/// dimension, never a sample and never "filtered out"); withdrawn → excluded
+/// and counted; then `JourneyFilter::keeps`. Samples pool every trigger and outcome of the pair
 /// (see [`JourneyEdgeTimingAnswer`]). Measured iff at least one sample
 /// survives; rows without a timeline count toward `n` and are reported as
 /// unmeasured.
@@ -637,18 +656,15 @@ pub(crate) fn answer_edge_timing(
         if !same_edge {
             continue;
         }
+        let Ok(observed_at) = trusted_edge_row(e) else {
+            rejected += 1;
+            continue;
+        };
         if e.invalidated_at.is_some() {
             invalidated += 1;
             continue;
         }
-        let observed_at = match (e.validate(), parse_ts(Some(&e.observed_at))) {
-            (Ok(()), Some(at)) => at,
-            _ => {
-                rejected += 1;
-                continue;
-            }
-        };
-        if !keeps(filter, e, observed_at) {
+        if !filter.keeps(e, observed_at) {
             filtered_out += 1;
             continue;
         }

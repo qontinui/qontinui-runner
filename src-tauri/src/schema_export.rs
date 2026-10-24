@@ -906,6 +906,7 @@ pub fn export_all_schemas() -> Value {
         "JourneyUnmeasuredDepartures",
         qj::JourneyUnmeasuredDepartures
     );
+    add!("JourneyArrivalDoubt", qj::JourneyArrivalDoubt);
     add!(
         "JourneyEdgeTimingAnswer",
         crate::journey_wire::JourneyEdgeTimingAnswer
@@ -1052,8 +1053,10 @@ mod tests {
         // JourneySearchFrontier, JourneySearchFrontierNode, JourneyGraphEdge,
         // DetectedAnimation, MetricDistribution, and the 9 Observation-envelope
         // types) so the TS pass declares each once = 596.
-        // The codegen's "Processing N top-level types" line should read 596 here.
-        assert_eq!(obj.len(), 596, "Expected 596 schema entries");
+        // + JourneyArrivalDoubt (shared by JourneyGraph and
+        // JourneyPriorKnowledge) = 597.
+        // The codegen's "Processing N top-level types" line should read 597 here.
+        assert_eq!(obj.len(), 597, "Expected 597 schema entries");
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
@@ -1068,6 +1071,7 @@ mod tests {
             "JourneyPriorKnowledge",
             "JourneyFrontier",
             "JourneyUnmeasuredDepartures",
+            "JourneyArrivalDoubt",
             "JourneyEdgeTimingAnswer",
             "ChangeTimeline",
             "EdgeTiming",
