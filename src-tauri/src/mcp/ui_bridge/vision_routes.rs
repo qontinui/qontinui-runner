@@ -2392,7 +2392,10 @@ pub struct AssertRequest {
     /// assertions (`animation_settled`, `settled_within`,
     /// `state_entered_within`) evaluate against. A ref that does not resolve
     /// to a stored timeline leaves those assertions `unknown`, with the
-    /// resolution's own code — never an error-as-pass.
+    /// resolution's own code — never an error-as-pass. The ref is scoped to
+    /// the app the assertions are about: `target` when one is sent, else the
+    /// runner's own app (the default frame source); a ref naming another
+    /// app's observation does not resolve.
     #[serde(default, alias = "timeline_ref")]
     pub timeline_ref: Option<String>,
 }
@@ -2532,6 +2535,8 @@ pub struct AssertResponse {
 pub struct TimelineRefResolution {
     /// The edge-observation id as sent.
     pub id: String,
+    /// The app the ref was resolved within.
+    pub app_id: String,
     /// Whether a stored timeline was loaded and fed to the evaluator.
     pub loaded: bool,
     /// Why not, when it was not: the code every timeline assertion then
@@ -2545,6 +2550,7 @@ impl TimelineRefResolution {
     /// resolution the response reports. Pure.
     pub(crate) fn of(
         id: &str,
+        app_id: &str,
         lookup: crate::journey::read::TimelineRefLookup,
     ) -> (
         Option<Box<qontinui_vision_core::ChangeTimeline>>,
@@ -2557,6 +2563,7 @@ impl TimelineRefResolution {
                 None,
                 TimelineRefResolution {
                     id: id.to_string(),
+                    app_id: app_id.to_string(),
                     loaded: false,
                     unknown: Some(UnknownInfo::new(code, detail)),
                 },
@@ -2567,13 +2574,14 @@ impl TimelineRefResolution {
                 Some(t),
                 TimelineRefResolution {
                     id: id.to_string(),
+                    app_id: app_id.to_string(),
                     loaded: true,
                     unknown: None,
                 },
             ),
             L::NotFound => fail(
                 C::NoObservations,
-                format!("timelineRef {id:?} names no journey edge observation"),
+                format!("timelineRef {id:?} names no journey edge observation of app {app_id:?}"),
             ),
             L::NoTimeline => fail(
                 C::InputMissing,
@@ -2842,9 +2850,13 @@ async fn vision_assert_handler(
     let (timeline, timeline_ref) = match req.timeline_ref.as_deref() {
         None => (None, None),
         Some(id) => {
+            let app_id = req
+                .target
+                .as_deref()
+                .unwrap_or(crate::spec_api::storage::RUNNER_APP_ID);
             let lookup =
-                crate::journey::read::read_timeline_by_id(&state.app_state.pg_db, id).await;
-            let (t, resolution) = TimelineRefResolution::of(id, lookup);
+                crate::journey::read::read_timeline_by_id(&state.app_state.pg_db, app_id, id).await;
+            let (t, resolution) = TimelineRefResolution::of(id, app_id, lookup);
             (t, Some(resolution))
         }
     };
@@ -4083,7 +4095,7 @@ mod timeline_ref_tests {
     use qontinui_vision_core::{Assertion, AssertionOutcome, EvalContext, UnknownCode};
 
     fn evaluate(lookup: TimelineRefLookup) -> (Vec<AssertionResult>, TimelineRefResolution) {
-        let (t, resolution) = TimelineRefResolution::of("ref-1", lookup);
+        let (t, resolution) = TimelineRefResolution::of("ref-1", "qontinui-web", lookup);
         let ctx = EvalContext {
             timeline: t.as_deref(),
             ..Default::default()
@@ -4154,6 +4166,21 @@ mod timeline_ref_tests {
                 assert_eq!(result.code, Some(code));
             }
         }
+    }
+
+    /// A ref the app-scoped read did not find (another app's observation
+    /// included) is unknown and says which app it was looked up in.
+    #[test]
+    fn a_ref_not_found_in_the_app_names_the_app() {
+        let (r, res) = evaluate(TimelineRefLookup::NotFound);
+        assert_eq!(res.app_id, "qontinui-web");
+        assert!(res
+            .unknown
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("of app \"qontinui-web\""));
+        assert!(r.iter().all(|x| x.outcome == AssertionOutcome::Unknown));
     }
 
     #[test]

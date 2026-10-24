@@ -129,12 +129,15 @@ pub(crate) const FRONTIER_READ_SQL: &str = concat!(
     " LIMIT $2"
 );
 
-/// One edge's timeline, by id, for `/vision/assert` `timeline_ref`.
+/// One edge's timeline, by id AND app, for `/vision/assert` `timeline_ref`:
+/// a ref naming another app's observation resolves to no row (unknown), so a
+/// timeline is never evaluated against the wrong app.
 pub(crate) const TIMELINE_BY_ID_SQL: &str = concat!(
     "SELECT e.timeline, ",
     ts_sql!("e.invalidated_at"),
     "\n  FROM project.journey_edge_observations e\n",
-    " WHERE e.id = $1::text::uuid"
+    " WHERE e.id = $1::text::uuid\n",
+    "   AND e.app_id = $2"
 );
 
 /// Why a read produced no rows to compute over. Never an empty result.
@@ -313,10 +316,10 @@ pub(crate) async fn read_timed_edges(
             bad += 1;
             continue;
         };
-        let raw = row
-            .try_get::<_, Option<serde_json::Value>>(1)
-            .unwrap_or(None);
-        let (timeline, timeline_unparseable) = parse_timeline(raw);
+        let (timeline, timeline_unparseable) = timeline_column(
+            row.try_get::<_, Option<serde_json::Value>>(1)
+                .map_err(|e| e.to_string()),
+        );
         out.push(TimedEdge {
             edge,
             timeline,
@@ -341,8 +344,46 @@ pub(crate) enum TimelineRefLookup {
     Unavailable(LedgerUnavailable),
 }
 
-/// Load one edge observation's timeline by id.
-pub(crate) async fn read_timeline_by_id(pg: &PgDb, id: &str) -> TimelineRefLookup {
+/// The `timeline` column as decoded: a DECODE error is an unparseable
+/// timeline (counted, `producer_failed`), never "no timeline".
+pub(crate) fn timeline_column(
+    decoded: Result<Option<serde_json::Value>, String>,
+) -> (Option<ChangeTimeline>, bool) {
+    match decoded {
+        Ok(raw) => parse_timeline(raw),
+        Err(e) => {
+            tracing::warn!("journey read: the timeline column did not decode: {e}");
+            (None, true)
+        }
+    }
+}
+
+/// Resolve one `timeline_ref` row from its two decoded columns. A decode
+/// error on `invalidated_at` is UNAVAILABLE (whether the row is live is not
+/// known — never "live"); one on `timeline` is UNPARSEABLE (never "no
+/// timeline").
+pub(crate) fn resolve_ref_row(
+    timeline: Result<Option<serde_json::Value>, String>,
+    invalidated_at: Result<Option<String>, String>,
+) -> TimelineRefLookup {
+    match invalidated_at {
+        Err(e) => {
+            return TimelineRefLookup::Unavailable(LedgerUnavailable::Failed(format!(
+                "the edge's invalidated_at did not decode: {e}"
+            )))
+        }
+        Ok(Some(at)) => return TimelineRefLookup::Withdrawn(at),
+        Ok(None) => {}
+    }
+    match timeline_column(timeline) {
+        (Some(t), _) => TimelineRefLookup::Found(Box::new(t)),
+        (None, true) => TimelineRefLookup::Unparseable,
+        (None, false) => TimelineRefLookup::NoTimeline,
+    }
+}
+
+/// Load one edge observation's timeline by id, scoped to `app_id`.
+pub(crate) async fn read_timeline_by_id(pg: &PgDb, app_id: &str, id: &str) -> TimelineRefLookup {
     if uuid::Uuid::parse_str(id).is_err() {
         return TimelineRefLookup::NotFound;
     }
@@ -352,7 +393,7 @@ pub(crate) async fn read_timeline_by_id(pg: &PgDb, id: &str) -> TimelineRefLooku
     };
     let rows = match bounded(
         "journey timeline_ref read",
-        conn.query(TIMELINE_BY_ID_SQL, &[&id]),
+        conn.query(TIMELINE_BY_ID_SQL, &[&id, &app_id]),
     )
     .await
     {
@@ -362,17 +403,12 @@ pub(crate) async fn read_timeline_by_id(pg: &PgDb, id: &str) -> TimelineRefLooku
     let Some(row) = rows.first() else {
         return TimelineRefLookup::NotFound;
     };
-    if let Ok(Some(at)) = row.try_get::<_, Option<String>>(1) {
-        return TimelineRefLookup::Withdrawn(at);
-    }
-    let raw = row
-        .try_get::<_, Option<serde_json::Value>>(0)
-        .unwrap_or(None);
-    match parse_timeline(raw) {
-        (Some(t), _) => TimelineRefLookup::Found(Box::new(t)),
-        (None, true) => TimelineRefLookup::Unparseable,
-        (None, false) => TimelineRefLookup::NoTimeline,
-    }
+    resolve_ref_row(
+        row.try_get::<_, Option<serde_json::Value>>(0)
+            .map_err(|e| e.to_string()),
+        row.try_get::<_, Option<String>>(1)
+            .map_err(|e| e.to_string()),
+    )
 }
 
 #[cfg(test)]
@@ -476,5 +512,36 @@ mod tests {
         let (t, bad) = parse_timeline(Some(serde_json::json!({"nope": 1})));
         assert!(t.is_none());
         assert!(bad);
+    }
+
+    // -- Review fixes: decode errors are never "no timeline" or "live" ------
+
+    #[test]
+    fn a_decode_error_is_unparseable_or_unavailable_never_absent_or_live() {
+        assert_eq!(timeline_column(Err("bad type".into())), (None, true));
+        assert!(matches!(
+            resolve_ref_row(Ok(None), Err("bad type".into())),
+            TimelineRefLookup::Unavailable(LedgerUnavailable::Failed(_))
+        ));
+        assert_eq!(
+            resolve_ref_row(Err("bad type".into()), Ok(None)),
+            TimelineRefLookup::Unparseable
+        );
+        assert_eq!(
+            resolve_ref_row(Ok(None), Ok(None)),
+            TimelineRefLookup::NoTimeline
+        );
+        assert_eq!(
+            resolve_ref_row(Ok(None), Ok(Some("2026-10-01T00:00:00Z".into()))),
+            TimelineRefLookup::Withdrawn("2026-10-01T00:00:00Z".into())
+        );
+    }
+
+    #[test]
+    fn a_timeline_ref_is_scoped_to_its_app() {
+        assert!(
+            TIMELINE_BY_ID_SQL.contains("AND e.app_id = $2"),
+            "a ref from another app must resolve to no row: {TIMELINE_BY_ID_SQL}"
+        );
     }
 }
