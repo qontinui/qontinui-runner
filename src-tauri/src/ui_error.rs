@@ -1452,9 +1452,10 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
 ///
 /// All four sinks (`/health`, the operations heartbeat, the web-backend
 /// heartbeat relay, and the UI-Bridge diagnostics surfaces) call this so their
-/// `derived_status` stays in lockstep. Only the `/health` handler passes a
-/// probed `pg_reachable` and `pg_schema_ok`; the others pass `None`, so a
-/// reachable-but-unmigrated database degrades `/health` alone. All four DO pass a real
+/// `derived_status` stays in lockstep. All four read `pg_reachable` and
+/// `pg_schema_ok` from the same cached PG health snapshot
+/// (`database::pg::health`), so a down or unmigrated database degrades every
+/// sink, not `/health` alone. All four DO pass a real
 /// `ui_dead` — the heartbeat sinks especially, since nothing polls `/health`
 /// on an end user's machine and the heartbeats are the only path by which a
 /// dead UI is ever visible off-box. All four also pass a real
