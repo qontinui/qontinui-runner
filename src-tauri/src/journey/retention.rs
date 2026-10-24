@@ -24,8 +24,9 @@
 //! its route pattern — including a CONCRETE path carrying user input — and a
 //! leaked frontier `node_key` never ages out (the primary key bounds the
 //! table, nothing expires a row). The first tick of the loop below therefore
-//! runs [`scrub_templates_once`], which, on the instance that owns the shared
-//! root state (the primary), and once per database:
+//! runs [`scrub_templates_once`], which, on a runner whose database is its
+//! OWN to scrub ([`DatabaseScope`]: the primary, or a secondary confined to a
+//! private cluster), and once per database:
 //! - invalidates (the existing `invalidated_*` columns, token
 //!   [`TEMPLATE_SCRUB_VERSION`]) AND REDACTS every live edge observed before
 //!   this process started whose from- or to-node carries a `pathnameTemplate`:
@@ -33,17 +34,30 @@
 //!   not outlive the scrub. No stored row carries the router assertion D1 now
 //!   requires, so none is trusted;
 //! - deletes every frontier row of the leaked shape — `node_key` starting with
-//!   `unmodelled:/` — and redacts the template inside every remaining frontier
-//!   node. Label-keyed and modelled rows (`activation_failed`,
-//!   `budget_exhausted`, …) are kept.
+//!   `unmodelled:/` — last seen before the same cutoff, and redacts the
+//!   template inside every remaining frontier node last seen before it.
+//!   Label-keyed and modelled rows (`activation_failed`, `budget_exhausted`,
+//!   …) are kept, and so is any row this build refreshed after the cutoff (a
+//!   router-asserted `/runs/[id]` also keys as `unmodelled:/…`).
 //!
 //! The MARKER is a row in the database itself (`project.settings`, key
 //! [`TEMPLATE_SCRUB_VERSION`], value = the cutoff as a JSON string), claimed in the SAME
 //! transaction as the scrub, so it can never exist without its scrub and needs
-//! no database identity. Only the owning instance scrubs and claims it: a temp
-//! runner on this build must not mark a shared database while a pre-D1
-//! primary is still writing leaked rows into it — the primary's own first
-//! start on this build is what scrubs. The marker is what keeps a later start
+//! no database identity.
+//!
+//! WHO scrubs is decided by whether this process's database is SHARED, not by
+//! primary-ness ([`database_scope`]). The supervisor gives every secondary it
+//! roots a PRIVATE embedded cluster (`QONTINUI_EMBEDDED_PG_DIR=<root>/embedded-pg`,
+//! with `DATABASE_URL` / `RUNNER_DATABASE_URL` stripped — qontinui-supervisor
+//! `src/process/instance_root.rs`), and no primary ever starts against it, so
+//! a primary-only rule would leave that secondary's leaked rows unscrubbed
+//! forever. So the scrub runs on the primary AND on a secondary whose database
+//! is a confined private cluster (an instance root, an embedded arm, its data
+//! root under that instance root). It is refused only for a secondary attached
+//! to a database it does not provably own alone — the machine-shared cluster or
+//! a `DATABASE_URL`: that runner must not mark a shared database while a pre-D1
+//! primary is still writing leaked rows into it, and the primary's own first
+//! start on this build is what scrubs it. The marker is what keeps a later start
 //! from withdrawing rows a router-asserting build wrote legitimately; the
 //! cutoff bounds the one run to rows older than the scrubbing process.
 //!
@@ -151,18 +165,23 @@ pub(crate) const SCRUB_INVALIDATE_EDGES_SQL: &str = r#"UPDATE project.journey_ed
         OR to_node->>'pathnameTemplate' IS NOT NULL)"#;
 
 /// Delete the leaked frontier SHAPE: a template-keyed unmodelled node
-/// (`unmodelled:/…`). `LIKE` with a literal prefix: neither `:` nor `/` is a
-/// wildcard. A label-keyed or modelled row (`activation_failed`,
-/// `budget_exhausted`, …) is kept — no snapshot necessarily re-derives it.
+/// (`unmodelled:/…`) last seen before `$1`, the same cutoff the edge update
+/// binds. `LIKE` with a literal prefix: neither `:` nor `/` is a wildcard. A
+/// label-keyed or modelled row (`activation_failed`, `budget_exhausted`, …) is
+/// kept — no snapshot necessarily re-derives it — and so is a row this build
+/// refreshed after the cutoff, which only a router assertion can have keyed.
 pub(crate) const SCRUB_DELETE_FRONTIER_SQL: &str = r#"DELETE FROM project.journey_frontier
- WHERE node_key LIKE 'unmodelled:/%'"#;
+ WHERE node_key LIKE 'unmodelled:/%'
+   AND last_seen_at < $1::text::timestamptz"#;
 
-/// Redact the template inside every REMAINING frontier node (a modelled node's
-/// key is `spec#states`, but its stored node still carries the template). The
-/// row and its reason are kept.
+/// Redact the template inside every REMAINING frontier node last seen before
+/// `$1` (a modelled node's key is `spec#states`, but its stored node still
+/// carries the template). The row and its reason are kept; a node this build
+/// refreshed after the cutoff carries a router-asserted template and is left.
 pub(crate) const SCRUB_REDACT_FRONTIER_SQL: &str = r#"UPDATE project.journey_frontier
    SET node = jsonb_set(node, '{pathnameTemplate}', 'null'::jsonb)
- WHERE node->>'pathnameTemplate' IS NOT NULL"#;
+ WHERE node->>'pathnameTemplate' IS NOT NULL
+   AND last_seen_at < $1::text::timestamptz"#;
 
 /// What one scrub run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,11 +224,11 @@ pub(crate) async fn run_scrub_statements(
         .await
         .map_err(err)?;
     let frontier_deleted = tx
-        .execute(SCRUB_DELETE_FRONTIER_SQL, &[])
+        .execute(SCRUB_DELETE_FRONTIER_SQL, &[&cutoff])
         .await
         .map_err(err)?;
     let frontier_redacted = tx
-        .execute(SCRUB_REDACT_FRONTIER_SQL, &[])
+        .execute(SCRUB_REDACT_FRONTIER_SQL, &[&cutoff])
         .await
         .map_err(err)?;
     tx.commit().await.map_err(err)?;
@@ -220,14 +239,92 @@ pub(crate) async fn run_scrub_statements(
     }))
 }
 
+/// Whether this process's database is its own to scrub. See the module doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DatabaseScope {
+    /// This runner owns the shared root state (the primary): it scrubs
+    /// whichever database it runs on.
+    Owner,
+    /// A secondary confined to a PRIVATE embedded cluster under its own
+    /// instance root: nobody else writes there, so it scrubs.
+    PrivateCluster,
+    /// A secondary on a database it cannot prove is its alone (the
+    /// machine-shared cluster, a `DATABASE_URL`, an unresolved arm). Refused:
+    /// the owner scrubs a shared database.
+    SharedSecondary(String),
+}
+
+/// The process facts [`database_scope`] decides from — gathered by
+/// [`ScopeInputs::current`] at the call site, injected in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeInputs {
+    /// [`crate::instance::owns_shared_root_state`].
+    pub owns_shared_root_state: bool,
+    /// `QONTINUI_INSTANCE_ROOT`, when set.
+    pub instance_root: Option<std::path::PathBuf>,
+    /// The database arm this process actually took.
+    pub db_arm: crate::embedded_pg::DbArm,
+    /// The embedded data root actually handed to the bootstrap (`None` off
+    /// the embedded arms).
+    pub embedded_data_root: Option<std::path::PathBuf>,
+}
+
+impl ScopeInputs {
+    /// This process's facts: the same globals `/health` reports.
+    pub(crate) fn current() -> Self {
+        Self {
+            owns_shared_root_state: crate::instance::owns_shared_root_state(),
+            instance_root: crate::instance::instance_root(),
+            db_arm: crate::embedded_pg::db_arm(),
+            embedded_data_root: crate::embedded_pg::embedded_data_root()
+                .map(std::path::PathBuf::from),
+        }
+    }
+}
+
+/// Decide [`DatabaseScope`]. A secondary scrubs only when EVERY fact proves a
+/// private cluster: an instance root, an embedded arm (so no `DATABASE_URL`
+/// was taken), and a data root lexically under that root with no `..`.
+pub(crate) fn database_scope(i: &ScopeInputs) -> DatabaseScope {
+    use crate::embedded_pg::DbArm;
+    if i.owns_shared_root_state {
+        return DatabaseScope::Owner;
+    }
+    let Some(root) = i.instance_root.as_deref() else {
+        return DatabaseScope::SharedSecondary(
+            "no instance root, so its database may be the machine-shared one".to_string(),
+        );
+    };
+    if !matches!(i.db_arm, DbArm::EmbeddedOwned | DbArm::EmbeddedAttached) {
+        return DatabaseScope::SharedSecondary(format!(
+            "database arm is {}, not a private embedded cluster",
+            i.db_arm.as_str()
+        ));
+    }
+    let Some(data) = i.embedded_data_root.as_deref() else {
+        return DatabaseScope::SharedSecondary("embedded data root not recorded".to_string());
+    };
+    let escapes = data
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    if escapes || !data.starts_with(root) {
+        return DatabaseScope::SharedSecondary(format!(
+            "embedded data root {} is not under instance root {}",
+            data.display(),
+            root.display()
+        ));
+    }
+    DatabaseScope::PrivateCluster
+}
+
 /// What the scrub should do, decided from what was observed. Pure, so every
 /// arm is tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScrubDecision {
-    /// This runner does not own the shared root state: only the instance that
-    /// does (the primary) scrubs and claims the marker, so its first start on
+    /// A secondary on a database it does not provably own alone: the owner
+    /// (the primary) scrubs and claims the marker there, so its first start on
     /// this build always scrubs what a pre-D1 primary wrote. Settled.
-    NotOwner,
+    SharedDatabase(String),
     /// The journey tables do not exist: nothing can have leaked. Settled.
     SchemaAbsent(String),
     /// The database could not be asked; retried next tick.
@@ -251,7 +348,7 @@ impl ScrubDecision {
 /// The observations the decision is made from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScrubObservation {
-    pub owns_shared_root_state: bool,
+    pub scope: DatabaseScope,
     /// `None` = not asked (an earlier arm decided).
     pub schema: Option<SchemaProbe>,
     /// `None` = not asked; `Some(Err)` = the read failed.
@@ -261,8 +358,8 @@ pub(crate) struct ScrubObservation {
 }
 
 pub(crate) fn scrub_decision(obs: &ScrubObservation) -> ScrubDecision {
-    if !obs.owns_shared_root_state {
-        return ScrubDecision::NotOwner;
+    if let DatabaseScope::SharedSecondary(why) = &obs.scope {
+        return ScrubDecision::SharedDatabase(why.clone());
     }
     match &obs.schema {
         None => return ScrubDecision::Retry("journey schema not probed".to_string()),
@@ -291,9 +388,10 @@ pub(crate) fn scrub_decision(obs: &ScrubObservation) -> ScrubDecision {
 /// The health line for a decision that did not run the scrub.
 fn decision_summary(d: &ScrubDecision) -> String {
     match d {
-        ScrubDecision::NotOwner => "not run: this runner does not own the shared root state; \
-                                    the owning (primary) instance scrubs this database"
-            .to_string(),
+        ScrubDecision::SharedDatabase(why) => format!(
+            "not run: this secondary's database may be shared ({why}); the owning (primary) \
+             instance scrubs it"
+        ),
         ScrubDecision::SchemaAbsent(m) => {
             format!("not needed: journey schema absent (missing: {m})")
         }
@@ -314,16 +412,16 @@ static TEMPLATE_SCRUB_SETTLED: std::sync::atomic::AtomicBool =
 
 /// Gather what [`scrub_decision`] needs, asking the database only as far as
 /// the decision requires.
-async fn observe_for_scrub(conn: &deadpool_postgres::Object, owns: bool) -> ScrubObservation {
+async fn observe_for_scrub(
+    conn: &deadpool_postgres::Object,
+    scope: DatabaseScope,
+) -> ScrubObservation {
     let mut obs = ScrubObservation {
-        owns_shared_root_state: owns,
+        scope,
         schema: None,
         marker_store: None,
         marker: None,
     };
-    if !owns {
-        return obs;
-    }
     let probe = journey_schema_supported(conn).await;
     let present = probe == SchemaProbe::Present;
     obs.schema = Some(probe);
@@ -361,23 +459,48 @@ pub(crate) async fn scrub_templates_once(pg: &PgDb, cutoff: &str) {
     if TEMPLATE_SCRUB_SETTLED.load(Ordering::Acquire) {
         return;
     }
-    let owns = crate::instance::owns_shared_root_state();
+    let pass = scrub_pass(pg, cutoff, &ScopeInputs::current()).await;
+    health::record_template_scrub(pass.summary);
+    if pass.settled {
+        TEMPLATE_SCRUB_SETTLED.store(true, Ordering::Release);
+    }
+}
+
+/// What one [`scrub_pass`] did: the `/journey/health` line, and whether this
+/// process should stop trying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScrubPass {
+    pub summary: String,
+    pub settled: bool,
+}
+
+/// One scrub attempt, deciding WHO scrubs from `inputs` before the database is
+/// touched: a secondary on a possibly-shared database settles without
+/// acquiring a connection.
+pub(crate) async fn scrub_pass(pg: &PgDb, cutoff: &str, inputs: &ScopeInputs) -> ScrubPass {
+    let scope = database_scope(inputs);
+    if let DatabaseScope::SharedSecondary(why) = &scope {
+        let decision = ScrubDecision::SharedDatabase(why.clone());
+        return ScrubPass {
+            summary: decision_summary(&decision),
+            settled: decision.settles(),
+        };
+    }
     let mut conn = match pg.pool().get().await {
         Ok(c) => c,
         Err(e) => {
-            health::record_template_scrub(format!(
-                "not run (retried next tick): PG pool error: {e}"
-            ));
-            return;
+            return ScrubPass {
+                summary: format!("not run (retried next tick): PG pool error: {e}"),
+                settled: false,
+            }
         }
     };
-    let decision = scrub_decision(&observe_for_scrub(&conn, owns).await);
+    let decision = scrub_decision(&observe_for_scrub(&conn, scope).await);
     if decision != ScrubDecision::Run {
-        health::record_template_scrub(decision_summary(&decision));
-        if decision.settles() {
-            TEMPLATE_SCRUB_SETTLED.store(true, Ordering::Release);
-        }
-        return;
+        return ScrubPass {
+            summary: decision_summary(&decision),
+            settled: decision.settles(),
+        };
     }
     match run_scrub_statements(&mut conn, cutoff).await {
         Ok(Some(out)) => {
@@ -386,22 +509,25 @@ pub(crate) async fn scrub_templates_once(pg: &PgDb, cutoff: &str) {
                  {} frontier row(s)",
                 out.edges_invalidated, out.frontier_deleted, out.frontier_redacted
             );
-            health::record_template_scrub(format!(
-                "applied: invalidated+redacted {} edge(s) observed before {cutoff}, deleted {} \
-                 unmodelled:/ frontier row(s), redacted {} more",
-                out.edges_invalidated, out.frontier_deleted, out.frontier_redacted
-            ));
-            TEMPLATE_SCRUB_SETTLED.store(true, Ordering::Release);
+            ScrubPass {
+                summary: format!(
+                    "applied: invalidated+redacted {} edge(s) observed before {cutoff}, deleted \
+                     {} unmodelled:/ frontier row(s), redacted {} more",
+                    out.edges_invalidated, out.frontier_deleted, out.frontier_redacted
+                ),
+                settled: true,
+            }
         }
-        Ok(None) => {
-            health::record_template_scrub(
-                "already applied to this database (claimed concurrently)".to_string(),
-            );
-            TEMPLATE_SCRUB_SETTLED.store(true, Ordering::Release);
-        }
+        Ok(None) => ScrubPass {
+            summary: "already applied to this database (claimed concurrently)".to_string(),
+            settled: true,
+        },
         Err(e) => {
             warn!("journey template scrub failed (retried next tick): {e}");
-            health::record_template_scrub(format!("failed (retried next tick): {e}"));
+            ScrubPass {
+                summary: format!("failed (retried next tick): {e}"),
+                settled: false,
+            }
         }
     }
 }
@@ -616,9 +742,17 @@ mod tests {
             !sql.contains("pathnameTemplate") && !sql.contains(" OR "),
             "a modelled / label-keyed row is redacted, never deleted"
         );
-        assert!(!sql.contains('$'), "the delete binds nothing");
         assert!(SCRUB_REDACT_FRONTIER_SQL.starts_with("UPDATE project.journey_frontier"));
         assert!(SCRUB_REDACT_FRONTIER_SQL.contains("jsonb_set(node, '{pathnameTemplate}'"));
+        // Both frontier statements are bounded by the SAME cutoff as the edge
+        // update, so a row this build refreshed afterwards is left alone.
+        for sql in [SCRUB_DELETE_FRONTIER_SQL, SCRUB_REDACT_FRONTIER_SQL] {
+            assert!(
+                sql.contains("AND last_seen_at < $1::text::timestamptz"),
+                "unbounded: {sql}"
+            );
+            assert!(!sql.contains("$2"), "the cutoff is the only bind");
+        }
         // The LIKE prefix carries no wildcard of its own.
         assert!(!"unmodelled:/".contains(['%', '_']));
     }
@@ -648,7 +782,11 @@ mod tests {
         marker: Option<Result<Option<String>, String>>,
     ) -> ScrubObservation {
         ScrubObservation {
-            owns_shared_root_state: owns,
+            scope: if owns {
+                DatabaseScope::Owner
+            } else {
+                DatabaseScope::SharedSecondary("test".into())
+            },
             schema,
             marker_store: store,
             marker,
@@ -656,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owning_instance_scrubs_or_claims_the_marker() {
+    fn a_secondary_on_a_shared_database_never_scrubs_or_claims_the_marker() {
         // A temp runner on a shared database, marker absent: it must not
         // scrub (and so cannot claim the marker) while a pre-D1 primary may
         // still be writing leaked rows.
@@ -666,8 +804,153 @@ mod tests {
             Some(Ok(true)),
             Some(Ok(None)),
         ));
-        assert_eq!(d, ScrubDecision::NotOwner);
+        assert_eq!(d, ScrubDecision::SharedDatabase("test".into()));
         assert!(d.settles());
+        // A private-cluster secondary with the marker absent scrubs.
+        let mut private = observed(
+            true,
+            Some(SchemaProbe::Present),
+            Some(Ok(true)),
+            Some(Ok(None)),
+        );
+        private.scope = DatabaseScope::PrivateCluster;
+        assert_eq!(scrub_decision(&private), ScrubDecision::Run);
+    }
+
+    // ---- who scrubs: the database's scope, not primary-ness -------------------
+
+    use crate::embedded_pg::DbArm;
+    use std::path::PathBuf;
+
+    /// The facts of a runner the supervisor spawned under an instance root
+    /// (qontinui-supervisor `src/process/instance_root.rs`): named, so not the
+    /// owner; `QONTINUI_EMBEDDED_PG_DIR=<root>/embedded-pg`; DATABASE_URL
+    /// stripped, so the embedded arm.
+    fn supervisor_secondary(arm: DbArm) -> ScopeInputs {
+        ScopeInputs {
+            owns_shared_root_state: false,
+            instance_root: Some(PathBuf::from("/srv/q/instances/temp-7")),
+            db_arm: arm,
+            embedded_data_root: Some(PathBuf::from("/srv/q/instances/temp-7/embedded-pg")),
+        }
+    }
+
+    #[test]
+    fn a_supervisor_rooted_secondary_owns_its_private_cluster() {
+        for arm in [DbArm::EmbeddedOwned, DbArm::EmbeddedAttached] {
+            assert_eq!(
+                database_scope(&supervisor_secondary(arm)),
+                DatabaseScope::PrivateCluster
+            );
+        }
+    }
+
+    #[test]
+    fn the_primary_owns_its_database_whatever_the_arm() {
+        for arm in [
+            DbArm::External,
+            DbArm::EmbeddedOwned,
+            DbArm::EmbeddedAttached,
+        ] {
+            let mut i = supervisor_secondary(arm);
+            i.owns_shared_root_state = true;
+            i.instance_root = None;
+            assert_eq!(database_scope(&i), DatabaseScope::Owner);
+        }
+    }
+
+    #[test]
+    fn a_secondary_that_cannot_prove_a_private_cluster_is_refused() {
+        // Attached to the machine-shared cluster: no instance root.
+        let shared = ScopeInputs {
+            owns_shared_root_state: false,
+            instance_root: None,
+            db_arm: DbArm::EmbeddedAttached,
+            embedded_data_root: Some(PathBuf::from("/home/u/.local/share/x/embedded-pg")),
+        };
+        // A DATABASE_URL passed back in through extra_env: external arm.
+        let external = supervisor_secondary(DbArm::External);
+        // An unresolved or degraded arm.
+        let unknown = supervisor_secondary(DbArm::Unknown);
+        let degraded = supervisor_secondary(DbArm::Degraded);
+        // A data root outside the instance root (the machine-shared default).
+        let mut outside = supervisor_secondary(DbArm::EmbeddedAttached);
+        outside.embedded_data_root = Some(PathBuf::from("/home/u/.local/share/x/embedded-pg"));
+        // A data root that climbs out of the instance root.
+        let mut climbs = supervisor_secondary(DbArm::EmbeddedOwned);
+        climbs.embedded_data_root = Some(PathBuf::from("/srv/q/instances/temp-7/../shared/pg"));
+        // A data root that is a sibling sharing a string prefix.
+        let mut sibling = supervisor_secondary(DbArm::EmbeddedOwned);
+        sibling.embedded_data_root = Some(PathBuf::from("/srv/q/instances/temp-7b/embedded-pg"));
+        // No recorded data root.
+        let mut unrecorded = supervisor_secondary(DbArm::EmbeddedOwned);
+        unrecorded.embedded_data_root = None;
+        for (name, i) in [
+            ("shared", shared),
+            ("external", external),
+            ("unknown", unknown),
+            ("degraded", degraded),
+            ("outside", outside),
+            ("climbs", climbs),
+            ("sibling", sibling),
+            ("unrecorded", unrecorded),
+        ] {
+            assert!(
+                matches!(database_scope(&i), DatabaseScope::SharedSecondary(_)),
+                "{name}: {:?}",
+                database_scope(&i)
+            );
+        }
+    }
+
+    /// A pool that can never connect, so a pass that ATTEMPTS the database
+    /// ends on a pool error instead of the scope refusal.
+    fn unreachable_pg() -> Arc<PgDb> {
+        PgDb::new_noop_for_test()
+    }
+
+    /// The CALL SITE: `scrub_pass` is what `scrub_templates_once` runs. A
+    /// supervisor-rooted secondary must go on to its own database (here a pool
+    /// error, retried), not settle as "not the owner" — the defect that left
+    /// every secondary's leaked rows unscrubbed.
+    #[tokio::test]
+    async fn the_call_site_scrubs_a_private_cluster_secondary() {
+        let pg = unreachable_pg();
+        let pass = scrub_pass(
+            &pg,
+            "2026-10-24T00:00:00.000000Z",
+            &supervisor_secondary(DbArm::EmbeddedOwned),
+        )
+        .await;
+        assert!(
+            pass.summary.contains("PG pool error"),
+            "a private-cluster secondary must reach for its database: {}",
+            pass.summary
+        );
+        assert!(!pass.settled, "an unreached database is retried");
+    }
+
+    #[tokio::test]
+    async fn the_call_site_refuses_a_secondary_on_the_shared_cluster_without_touching_it() {
+        let pg = unreachable_pg();
+        let shared = ScopeInputs {
+            owns_shared_root_state: false,
+            instance_root: None,
+            db_arm: DbArm::EmbeddedAttached,
+            embedded_data_root: Some(PathBuf::from("/home/u/.local/share/x/embedded-pg")),
+        };
+        let pass = scrub_pass(&pg, "2026-10-24T00:00:00.000000Z", &shared).await;
+        assert!(
+            pass.summary
+                .starts_with("not run: this secondary's database may be shared"),
+            "{}",
+            pass.summary
+        );
+        assert!(
+            !pass.summary.contains("PG pool error"),
+            "the pool is never asked"
+        );
+        assert!(pass.settled);
     }
 
     #[test]
@@ -820,6 +1103,21 @@ mod tests {
             .await
             .expect("seed frontier");
         }
+        // A router-asserted template this build refreshed AFTER the cutoff:
+        // its key has the leaked shape, but the scrub must leave it.
+        let router_node = serde_json::json!({
+            "specId": null, "stateIds": [], "modelled": false,
+            "pathnameTemplate": "/runs/[id]", "pageLabel": null
+        });
+        conn.execute(
+            "INSERT INTO project.journey_frontier \
+             (app_id, node_key, node, affordance_fingerprint, reason, last_seen_at) \
+             VALUES ($1, 'unmodelled:/runs/[id]', $2, 'fp', 'not_yet_activated', \
+                     now() + interval '1 hour')",
+            &[&app, &router_node],
+        )
+        .await
+        .expect("seed post-cutoff frontier");
         let cutoff = (chrono::Utc::now() + chrono::Duration::seconds(5))
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let first = run_scrub_statements(&mut conn, &cutoff)
@@ -834,7 +1132,8 @@ mod tests {
                 conn.query_one(sql, &[&app, &format!("%{SENTINEL}%")])
                     .await
                     .unwrap()
-                    .get::<_, i64>(0)
+                    .try_get::<_, i64>(0)
+                    .expect("count")
             }
         };
         assert_eq!(
@@ -863,7 +1162,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .get(0);
+            .try_get(0)
+            .expect("column 0");
         assert_eq!(live, 1, "only the clean edge stays live");
         let kept: Vec<String> = conn
             .query(
@@ -873,18 +1173,33 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .map(|r| r.get(0))
+            .map(|r| r.try_get(0).expect("column 0"))
             .collect();
         assert_eq!(
             kept,
-            vec!["activation_failed", "budget_exhausted"],
-            "only the unmodelled:/ row is deleted"
+            vec!["activation_failed", "budget_exhausted", "not_yet_activated"],
+            "only the pre-cutoff unmodelled:/ row is deleted"
+        );
+        let router_template: Option<String> = conn
+            .query_one(
+                "SELECT node->>'pathnameTemplate' FROM project.journey_frontier \
+                 WHERE app_id = $1 AND node_key = 'unmodelled:/runs/[id]'",
+                &[&app],
+            )
+            .await
+            .unwrap()
+            .try_get(0)
+            .expect("column 0");
+        assert_eq!(
+            router_template.as_deref(),
+            Some("/runs/[id]"),
+            "a row refreshed after the cutoff is neither deleted nor redacted"
         );
         let marker: Option<String> = conn
             .query_opt(SCRUB_MARKER_READ_SQL, &[&TEMPLATE_SCRUB_VERSION])
             .await
             .unwrap()
-            .map(|r| r.get(0));
+            .map(|r| r.try_get(0).expect("column 0"));
         assert_eq!(
             marker
                 .as_deref()
