@@ -12334,7 +12334,7 @@ pub fn create_router(
     }
 
     // The `ui-bridge-ping` emitter is NOT started here any more: it runs on its
-    // own OS thread, started from `main.rs` setup beside the heartbeat
+    // own OS thread, started from `main.rs` setup beside the API server spawn
     // (`ui_ping.rs`). A `tokio::spawn` here landed on `app-rt`, which is what
     // let a starved runtime stop the ping.
 
