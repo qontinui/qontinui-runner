@@ -70,8 +70,11 @@ export function ClaudeCliSection({
   // actually applies, which a fleet policy overrides on an unpinned machine.
   // The selector buttons and the custom-dir chooser keep editing the LOCAL
   // mode (`settings.claude_cli.account_selection_mode`).
-  const { mode: effectiveSelectionMode, fleetManaged: selectionFleetManaged } =
-    displayedAccountSelection(settings);
+  const {
+    mode: effectiveSelectionMode,
+    fleetManaged: selectionFleetManaged,
+    fleetUnread: selectionFleetUnread,
+  } = displayedAccountSelection(settings);
 
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
@@ -742,6 +745,15 @@ export function ClaudeCliSection({
                     className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("blue").bg} ${getAccentColors("blue").text} font-medium`}
                   >
                     Managed by fleet policy: {accountSelectionModeLabel(effectiveSelectionMode)}
+                  </span>
+                )}
+                {selectionFleetUnread && (
+                  <span
+                    data-testid="account-selection-fleet-unread"
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground font-medium"
+                    title="This runner has not yet heard from coord whether the fleet sets an account selection mode. The mode chosen here applies until it does; pin it to keep it either way."
+                  >
+                    Fleet policy not read yet
                   </span>
                 )}
               </div>

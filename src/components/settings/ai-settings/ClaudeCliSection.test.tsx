@@ -28,6 +28,7 @@ function render(opts: {
   local: AccountSelectionMode;
   pinned: boolean;
   fleet: AccountSelectionMode | null;
+  answered?: boolean;
 }) {
   const settings: AiSettings = {
     ...DEFAULT_AI_SETTINGS,
@@ -40,6 +41,7 @@ function render(opts: {
     fleet_account_selection_mode: opts.fleet,
     effective_account_selection_mode: opts.pinned ? opts.local : (opts.fleet ?? opts.local),
     account_selection_source: opts.pinned ? "pinned" : opts.fleet ? "fleet" : "local",
+    fleet_account_selection_answered: opts.answered ?? true,
   };
   return renderToStaticMarkup(
     <ClaudeCliSection
@@ -93,5 +95,21 @@ describe("ClaudeCliSection under a fleet account-selection policy", () => {
     expect(html).toContain('data-testid="auto-select-rule-caption"');
     expect(html).not.toContain('name="manual_account"');
     expect(html).not.toContain('id="claude-cli-custom-config-dir"');
+    expect(html).not.toContain("account-selection-fleet-unread");
+  });
+
+  it("before coord has answered, an unpinned machine says the fleet is unread", () => {
+    const html = render({ local: "least_usage", pinned: false, fleet: null, answered: false });
+
+    expect(html).toContain('data-testid="account-selection-fleet-unread"');
+    expect(html).not.toContain("account-selection-fleet-managed");
+    // The local mode is what applies right now.
+    expect(html).toContain('data-testid="auto-select-rule-caption"');
+  });
+
+  it("a pinned machine shows no unread note even before coord has answered", () => {
+    const html = render({ local: "manual", pinned: true, fleet: null, answered: false });
+
+    expect(html).not.toContain("account-selection-fleet-unread");
   });
 });
