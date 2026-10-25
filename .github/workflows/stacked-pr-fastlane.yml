@@ -212,8 +212,9 @@ jobs:
   # two dep graphs (different flag sets => different artifacts) to learn one
   # extra thing. Lint levels come solely from src-tauri/Cargo.toml
   # [lints.clippy] (T1 correctness/suspicious are `deny` there and fail this
-  # job; T3 style/complexity/perf stay `warn`), which is the same invocation and
-  # the same contract as ci.yml's ubuntu `Clippy check` step.
+  # job; T3 style/complexity/perf stay `warn`), which is the same invocation
+  # (`cargo clippy --all-targets`, so a deny-tier lint in #[cfg(test)] code
+  # fails here too) and the same contract as ci.yml's ubuntu `Clippy check` step.
   #
   # This is NOT the diff-scoped reviewdog lane from clippy-tiers.yml. That one
   # needs `pull-requests: write` and posts review comments; this lane stays
@@ -228,7 +229,9 @@ jobs:
     # The single largest line in the 40-minute ceiling. Sized for a cold cache:
     # ci.yml records the cache-less dependency graph as ~755 check-compiles
     # (~17 min on the windows leg; ubuntu is materially faster), plus ~5 min of
-    # setup and frontend build. A warm restore lands at ~8-12 min. If this ever
+    # setup and frontend build. A warm restore lands at ~8-12 min -- measured
+    # with default-target clippy; `--all-targets` adds the test-target check
+    # pass, not yet measured in this lane. If this ever
     # needs more than 25, the honest response is to cut the job, not to raise
     # the cap.
     timeout-minutes: 25
@@ -246,11 +249,14 @@ jobs:
       # ui-bridge; this job deliberately does not. Those two exist for the TEST
       # target (the SDK<->runner manifest diff test reads ui-bridge's
       # types.ts at test RUNTIME) and for a frontend spec-registry import that no
-      # longer exists in this tree. Plain `cargo clippy` compiles no test
-      # targets, and nothing under src/ resolves a path outside this repo
-      # (tsconfig.json's only alias is `@/* -> src/*`), so both clones are dead
-      # weight in this lane. If a future test-target compile lands here, they
-      # come back with it.
+      # longer exists in this tree. This lane's `cargo clippy --all-targets`
+      # check-compiles the test targets too, but checking reads no file outside
+      # this repo (every include_str!/include_bytes! under src-tauri resolves
+      # inside it; ui-bridge's types.ts is read by a test at RUN time, and this
+      # lane runs no test), and nothing under src/ resolves a path outside it
+      # either (tsconfig.json's only alias is `@/* -> src/*`), so both clones are
+      # dead weight in this lane. If a future test RUN lands here, they come back
+      # with it.
       - name: Check out sibling qontinui-schemas
         uses: ./.github/actions/checkout-sibling
 
@@ -315,7 +321,11 @@ jobs:
       # image with the same CARGO_TERM_COLOR. That cache is saved only from main
       # (ci.yml's `save-if`) and contains dependency artifacts for every flag set
       # that job compiled, clippy's among them — so this lane rides main's warm
-      # cache instead of paying a cold dep graph on every stacked push.
+      # cache instead of paying a cold dep graph on every stacked push. That holds
+      # only while the two clippy invocations MATCH: `--all-targets` unifies the
+      # dev-dependencies' features into the build (tokio's `test-util`, for one),
+      # so a default-target clippy here would need differently-hashed dependency
+      # artifacts that main's `test` job no longer produces.
       #
       # Restore is unrestricted, so this costs the `test` job nothing. A miss
       # (someone renames that job, or bumps the toolchain here and not there) is
@@ -356,7 +366,7 @@ jobs:
       - name: Clippy check
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
   # Frontend arm. Mirrors ci.yml's standalone `frontend-tests` job — which is
   # green on main and deliberately clones no sibling repos, because the vitest

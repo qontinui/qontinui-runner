@@ -577,8 +577,10 @@ jobs:
         # job (below) so it no longer sits on the windows `test` critical path
         # (~12 min saved there). cfg(windows) lint coverage is preserved in that
         # job — see plan 2026-07-22-runner-ci-sccache-workspace-crate-caching.md
-        # Phase 2. This ubuntu leg stays the in-job blocking full-workspace
-        # clippy (clippy-tiers.yml is diff-scoped/advisory, not a substitute).
+        # Phase 2. This ubuntu leg stays the in-job blocking clippy over the
+        # src-tauri package and every target it has (`cd src-tauri` selects that
+        # one package; the holder crates get their own job). clippy-tiers.yml is
+        # diff-scoped/advisory, not a substitute.
         if: matrix.platform == 'ubuntu-22.04'
         # Plain `cargo clippy` (no `-D warnings`): lint levels come solely from
         # src-tauri/Cargo.toml [lints.clippy]. T1 correctness/suspicious groups
@@ -587,7 +589,9 @@ jobs:
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
         # `--all-targets` lints test code too, so a deny-tier lint in a test
         # fails the PR that adds it (it used to surface only in the nightly
-        # clippy-tiers.yml job, where the baseline rotted unnoticed).
+        # clippy-tiers.yml job, where the baseline rotted unnoticed). The local
+        # pre-push hook (.pre-commit-hooks/cargo-prepush.sh) still runs the
+        # default target only, so it is looser than this step for test code.
         run: |
           cd src-tauri
           cargo clippy --all-targets
@@ -1518,12 +1522,15 @@ jobs:
   clippy-windows:
     name: Clippy (windows)
     runs-on: windows-latest
-    # Default-target clippy, 23 successful runs 2026-10-22..10-25: job p50
+    # Default-target clippy, 23 successful runs 2026-10-22..10-25 on commits now
+    # on main (push and pull_request events; GraphQL check-run timings): job p50
     # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
     # `--all-targets` roughly doubles the step: the one measured run
     # (qontinui-runner#2030, 2026-10-06, PR cache from a default-target main)
     # took 24.8m for the step and 28.3m for the job. 60 min is ~2.1x that run
-    # and ~1.8x the ~33m job the 14.0m step max projects to.
+    # and ~1.8x the ~33m job the 14.0m step max projects to. Hosted minutes
+    # are free on this public repo, but the longer job holds a windows slot
+    # against the org's shared hosted-job concurrency cap for ~13 min more.
     # Previously unbounded, i.e. GitHub's 360-minute default.
     timeout-minutes: 60
     steps:
