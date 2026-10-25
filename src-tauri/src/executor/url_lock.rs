@@ -551,12 +551,40 @@ mod tests {
     /// same UI, so they must contend for ONE lock. Before the key was
     /// canonicalized, flipping the runner's default URL to `127.0.0.1` while
     /// persisted steps kept `localhost` would have silently split the lock.
+    ///
+    /// Entered the way the population enters: `UrlLockManager::acquire`, the
+    /// call `UiBridgeHandler::execute` makes — a `127.0.0.1` acquirer must
+    /// BLOCK behind a `localhost` holder until it releases.
     #[tokio::test]
     async fn test_loopback_spellings_share_one_lock() {
         let mgr = UrlLockManager::new();
 
-        mgr.acquire("http://localhost:9876/ui-bridge", "task-1", "Workflow A")
+        UrlLockManager::acquire(
+            &mgr,
+            "http://localhost:9876/ui-bridge",
+            "task-1",
+            "Workflow A",
+        )
+        .await;
+
+        let waiter_mgr = mgr.clone();
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_flag = acquired.clone();
+        let waiter = tokio::spawn(async move {
+            UrlLockManager::acquire(
+                &waiter_mgr,
+                "http://127.0.0.1:9876/ui-bridge",
+                "task-2",
+                "Workflow B",
+            )
             .await;
+            acquired_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "a 127.0.0.1 acquirer must wait behind the localhost holder"
+        );
 
         for other in [
             "http://127.0.0.1:9876/ui-bridge",
@@ -575,6 +603,17 @@ mod tests {
         assert!(!mgr.is_locked("http://[::1]:9876/ui-bridge").await);
         assert!(!mgr.is_locked("http://127.0.0.1:9877/ui-bridge").await);
         assert_eq!(mgr.info().await[0].url, "http://127.0.0.1:9876/ui-bridge");
+
+        // Releasing under the OTHER spelling frees the one key, and the waiter gets it.
+        assert!(
+            mgr.release("http://127.0.0.1:9876/ui-bridge", "task-1")
+                .await
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the 127.0.0.1 acquirer proceeds once the localhost holder releases")
+            .expect("waiter task panicked");
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
