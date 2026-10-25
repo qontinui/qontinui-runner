@@ -241,14 +241,14 @@ fn copy_transcript_never_truncates_a_newer_destination_subagent_file() {
     );
     // Ping-pong: the destination already holds a LONGER copy of one file
     // (the session ran there after an earlier migration) and a SHORTER,
-    // stale copy of the other.
+    // stale copy of the other — an older prefix of the source's bytes.
     seed_session(
         &dst_cfg,
         working_dir,
         sid,
         &[
             ("subagents/agent-old.jsonl", b"short, then appended to"),
-            ("subagents/agent-grown.jsonl", b"stale"),
+            ("subagents/agent-grown.jsonl", b"a much"),
         ],
     );
 
@@ -893,6 +893,184 @@ fn delta_sync_never_touches_the_main_transcript() {
 
     sync(&src, &dst, &carried);
     assert_eq!(std::fs::read(&carried.path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Overwrite `<cfg>/projects/<slug>/<SID>.jsonl` with `bytes`.
+fn write_main(cfg: &Path, bytes: &[u8]) {
+    let main = crate::terminal::transcript::session_transcript_path(cfg, WD, SID);
+    std::fs::write(main, bytes).unwrap();
+}
+
+fn read_main(cfg: &Path) -> Vec<u8> {
+    std::fs::read(crate::terminal::transcript::session_transcript_path(cfg, WD, SID)).unwrap()
+}
+
+/// A destination that FORKED — its `.jsonl` files are smaller than the
+/// source's but are not a prefix of them, so each carries a tail of its own —
+/// is never overwritten: not the main `<sid>.jsonl`, not a subagent
+/// transcript, and not by the delta sync after the source grows further. Its
+/// in-place sidecar is kept too (the fork ran the session last).
+#[test]
+fn a_diverged_destination_jsonl_is_never_overwritten() {
+    let tmp = scratch("diverged");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let src_side = seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nsource tail, longer\n"),
+            ("custom-title.json", br#"{"customTitle":"src"}"#),
+        ],
+    );
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nfork\n"),
+            ("custom-title.json", br#"{"customTitle":"fork"}"#),
+        ],
+    );
+    write_main(
+        &src,
+        b"{\"type\":\"user\"}\n{\"type\":\"assistant\",\"tail\":\"source, longer\"}\n",
+    );
+    write_main(&dst, b"{\"type\":\"user\"}\n{\"fork\":1}\n");
+
+    let carried = carry(&src, &dst);
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            skipped_present: 1,
+            skipped_other: 2,
+            ..SessionDirCarry::default()
+        },
+        "the main transcript and the subagent are both skipped as diverged"
+    );
+    assert_eq!(read_main(&dst), b"{\"type\":\"user\"}\n{\"fork\":1}\n");
+    let dst_side = literal_sidecar(&dst);
+    let dst_sub = dst_side.join("subagents").join("agent-a1.jsonl");
+    assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
+    assert_eq!(
+        std::fs::read(dst_side.join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"fork"}"#
+    );
+    let recorded = carried
+        .files
+        .iter()
+        .find(|f| f.rel == Path::new("subagents").join("agent-a1.jsonl"))
+        .unwrap();
+    assert_eq!(recorded.wrote, CarryWrite::Diverged);
+
+    // The old pane writes more; the delta sync still leaves the fork alone.
+    append(
+        &src_side.join("subagents").join("agent-a1.jsonl"),
+        b"and the old pane wrote even more\n",
+    );
+    let done = sync(&src, &dst, &carried);
+    assert_eq!(done.skipped_other, 1, "{done:?}");
+    assert_eq!(done.copied, 0, "{done:?}");
+    assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A destination whose `.jsonl` files are an older PREFIX of the source's (an
+/// append-only extension) is replaced: main transcript and subagent alike.
+#[test]
+fn an_append_only_prefix_destination_jsonl_is_extended() {
+    let tmp = scratch("prefix");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nb\n")]);
+    seed_session(&dst, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
+    write_main(
+        &src,
+        b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+    );
+
+    let carried = carry(&src, &dst);
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            copied: 1,
+            ..SessionDirCarry::default()
+        }
+    );
+    assert_eq!(
+        read_main(&dst),
+        b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n"
+    );
+    assert_eq!(
+        std::fs::read(literal_sidecar(&dst).join("subagents").join("agent-a1.jsonl")).unwrap(),
+        b"a\nb\n"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A carry whose overwrite of an EXISTING (smaller) destination failed records
+/// that destination's stamp with `wrote: Failed`; the delta sync retries it
+/// while the destination still has that stamp, even though the source did
+/// not move on.
+#[test]
+fn delta_sync_retries_a_failed_overwrite_of_an_existing_destination() {
+    let tmp = scratch("delta-retry-overwrite");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nb\n")]);
+    let mut carried = carry(&src, &dst);
+    // As if the overwrite had failed: the destination still holds the older,
+    // smaller copy it would have replaced, and the record says so.
+    let dst_file = literal_sidecar(&dst)
+        .join("subagents")
+        .join("agent-a1.jsonl");
+    std::fs::write(&dst_file, b"a\n").unwrap();
+    let entry = carried
+        .files
+        .iter_mut()
+        .find(|f| f.rel == Path::new("subagents").join("agent-a1.jsonl"))
+        .unwrap();
+    entry.dst = FileStamp::of(&dst_file);
+    entry.wrote = CarryWrite::Failed;
+    assert!(entry.dst.is_some(), "the failed overwrite left a destination");
+
+    let done = sync(&src, &dst, &carried);
+    assert_eq!(done.copied, 1, "{done:?}");
+    assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\nb\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The rename's one retry re-checks the destination first: when the first
+/// rename fails with `PermissionDenied` and the destination changes before
+/// the retry, the copy backs out — `Ok(false)`, the destination as the other
+/// writer left it, and no `*.partial` behind.
+#[test]
+fn the_rename_retry_backs_out_when_the_destination_changed_during_the_pause() {
+    let tmp = scratch("rename-retry");
+    let (from, to) = (tmp.join("src.jsonl"), tmp.join("dst.jsonl"));
+    std::fs::write(&from, b"a\nb\nfrom the old pane\n").unwrap();
+    std::fs::write(&to, b"a\n").unwrap();
+    let expected = FileStamp::of(&to);
+    let mut calls = 0;
+
+    let outcome = copy_if_destination_is_with(&from, &to, expected, |a, b| {
+        calls += 1;
+        if calls == 1 {
+            // The resumed process writes while this rename is refused.
+            append(b, b"resumed wrote this\n");
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        std::fs::rename(a, b)
+    });
+
+    assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+    assert_eq!(calls, 1, "the retry must not rename over a changed destination");
+    assert_eq!(std::fs::read(&to).unwrap(), b"a\nresumed wrote this\n");
+    let partials: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(PARTIAL_SUFFIX))
+        .collect();
+    assert!(partials.is_empty(), "left behind: {partials:?}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
