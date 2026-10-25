@@ -423,8 +423,8 @@ impl PaneIo for LocalPty {
             };
             match terminate_tree_of(root, pid, budget) {
                 Ok(report) if report.budget_spent => Err(format!(
-                    "tree kill of pid {pid} exceeded its {budget:?} budget after {} pass(es); \
-                     killed {:?}",
+                    "tree kill of pid {pid} ended unfinished (its {budget:?} budget or its pass \
+                     cap) after {} pass(es); killed {:?}",
                     report.passes, report.killed
                 )),
                 Ok(report) => {

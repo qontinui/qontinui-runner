@@ -35,12 +35,13 @@
 //!    were about that process and no other.
 //!    - `ECHILD`: the pid is not an unreaped child of this process — nothing is
 //!      signalled.
-//!    - The root is a zombie: `Ok` with `root_exited` and `passes == 0`, no
-//!      member opened and no walk. A zombie pins nothing: its waiter may reap
-//!      it at any moment, and its children are already re-parented.
 //!    - An `expected_token` (the start token recorded when a tracked pid was
 //!      spawned, `crate::proc_identity::start_token`'s format) that differs
 //!      from the token read inside that window: "reused", nothing signalled.
+//!      Checked first, so a zombie with the wrong token is "reused" too.
+//!    - The root is a zombie: `Ok` with `root_exited` and `passes == 0`, no
+//!      member opened and no walk. A zombie pins nothing: its waiter may reap
+//!      it at any moment, and its children are already re-parented.
 //!    - Only then `SIGSTOP`. A stopped live process cannot exit on its own, so
 //!      its waiter cannot reap it during the walk.
 //! 3. **[`LinuxFreezeTable`]**, a `process_tree::ProcessTable` driven by the
@@ -112,7 +113,13 @@
 //! the stat read taken just BEFORE this walk's `SIGSTOP`: a job-control stop
 //! (or `SIGCONT`) from someone else landing between that read and the
 //! `SIGSTOP` is misread, so such a member may be resumed when it had been
-//! stopped, or left stopped when it had just been continued.
+//! stopped, or left stopped when it had just been continued. A member that
+//! someone else kills or continues mid-walk is noticed — the snapshot sees
+//! the exit, the finalizer re-checks that every member is still stopped —
+//! and the report says `recheck_snapshot_failed`; a member continued and
+//! stopped again between two looks is not noticed. If THIS process dies
+//! mid-walk (a crash, a `SIGKILL`), no finalizer runs: every member it
+//! stopped stays stopped until someone sends it `SIGCONT` or kills it.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -162,7 +169,7 @@ pub fn kill_tree(
     expected_token: Option<&str>,
     budget: Duration,
 ) -> Result<TreeKillReport, TreeKillError> {
-    kill_tree_with(pid, expected_token, budget, Handles::PidFd)
+    kill_tree_with(pid, expected_token, budget, Handles::PidFd, confirm_stopped)
 }
 
 /// How members are signalled. Production always asks for a pidfd and falls
@@ -179,9 +186,10 @@ fn kill_tree_with(
     expected_token: Option<&str>,
     budget: Duration,
     handles: Handles,
+    confirm: Confirm,
 ) -> Result<TreeKillReport, TreeKillError> {
     let deadline = Instant::now() + budget;
-    match freeze_root(pid, expected_token, handles, deadline, confirm_stopped)? {
+    match freeze_root(pid, expected_token, handles, deadline, confirm)? {
         Frozen::RootExited => Ok(TreeKillReport {
             root_exited: true,
             ..TreeKillReport::default()
@@ -295,9 +303,9 @@ fn freeze_root(
             format!("pid {pid}: its liveness could not be checked ({e}); nothing signalled")
         }));
     }
-    if exited_pid == spid {
-        return Ok(Frozen::RootExited);
-    }
+    // The token first, zombie or not: a zombie keeps its start time, and a
+    // zombie that is a DIFFERENT child of this process (a reaped and reused
+    // pid) is "reused", never "already exited" (review round 5).
     if let Some(want) = expected_token {
         match proc_identity::start_token_of(&st) {
             Some(have) if have == want => {}
@@ -314,6 +322,9 @@ fn freeze_root(
                 )))
             }
         }
+    }
+    if exited_pid == spid {
+        return Ok(Frozen::RootExited);
     }
     if let Err(e) = root.signal(libc::SIGSTOP) {
         return Err(refuse(format!(
@@ -528,7 +539,13 @@ fn any_thread_alive(pid: u32) -> io::Result<bool> {
 /// until every thread of `pid` is stopped, traced-stopped, dead, or gone.
 /// `false` when the wait ran out.
 fn confirm_stopped(pid: u32, deadline: Instant) -> bool {
-    let end = (Instant::now() + STOP_CONFIRM).min(deadline);
+    confirm_stopped_within(pid, deadline, STOP_CONFIRM)
+}
+
+/// [`confirm_stopped`] with its bound as a parameter: tests that assert a
+/// complete walk give a loaded box longer than [`STOP_CONFIRM`].
+fn confirm_stopped_within(pid: u32, deadline: Instant, bound: Duration) -> bool {
+    let end = (Instant::now() + bound).min(deadline);
     loop {
         if all_threads_stopped(pid) {
             return true;
@@ -537,7 +554,7 @@ fn confirm_stopped(pid: u32, deadline: Instant) -> bool {
             tracing::warn!(
                 target: "tree_kill",
                 "pid {pid}: SIGSTOP delivered but not every thread stopped within \
-                 {STOP_CONFIRM:?} (or within the walk's budget); a child it forks meanwhile is \
+                 {bound:?} (or within the walk's budget); a child it forks meanwhile is \
                  found only by a later pass"
             );
             return false;
@@ -621,7 +638,22 @@ impl ProcessTable for LinuxFreezeTable {
         for m in self.members.borrow().iter() {
             match m.liveness() {
                 Liveness::Alive => alive.push(m.pid),
-                Liveness::Exited => exited.push((m.pid, m.start_ticks)),
+                Liveness::Exited => {
+                    // `open` never admits an exited process and a stopped
+                    // one cannot exit by itself, so this exit came from
+                    // outside the walk (a third-party SIGKILL, the OOM
+                    // killer): what it forked meanwhile may be missed
+                    // (review round 5).
+                    if !self.incomplete.replace(true) {
+                        tracing::warn!(
+                            target: "tree_kill",
+                            "pid {}: a member exited during the walk; the walk may be \
+                             incomplete",
+                            m.pid
+                        );
+                    }
+                    exited.push((m.pid, m.start_ticks));
+                }
                 Liveness::Unknown(e) => {
                     exited.push((m.pid, m.start_ticks));
                     self.incomplete.set(true);
@@ -833,6 +865,21 @@ impl LinuxFreezeTable {
             .collect();
         for i in undoomed {
             self.terminate(&i);
+        }
+        // Every member must still be stopped: one a third party continued
+        // (SIGCONT) may have forked since the walk last looked (review round
+        // 5). A member that has exited reads as stopped here — it forks
+        // nothing — and its exit was already flagged by the snapshot.
+        for m in self.members.borrow().iter() {
+            if !all_threads_stopped(m.pid) {
+                self.incomplete.set(true);
+                tracing::warn!(
+                    target: "tree_kill",
+                    "pid {}: running again before the kill (continued from outside the \
+                     walk); a child it forked meanwhile may be missed",
+                    m.pid
+                );
+            }
         }
         self.finalize(walked)
     }
@@ -1158,7 +1205,10 @@ mod tests {
         let mut tree = Tree::sh("sleep 300 & sh -c 'sleep 300 & wait' & wait", false);
         tree.await_descendants(3);
         let root = tree.pid();
-        let report = kill_tree(root, None, BUDGET).expect("tree kill");
+        // Patient stop confirmation: the completeness asserts below must not
+        // depend on a loaded box stopping each member within STOP_CONFIRM.
+        let report =
+            kill_tree_with(root, None, BUDGET, Handles::PidFd, patient).expect("tree kill");
         assert!(report.killed.contains(&root), "{report:?}");
         for (pid, _) in &tree.recorded {
             assert!(report.killed.contains(pid), "{pid} not killed: {report:?}");
@@ -1179,11 +1229,7 @@ mod tests {
     /// group AND session, where a group kill cannot reach — is still killed.
     #[test]
     fn reaches_a_descendant_that_left_the_group_and_session() {
-        let has_setsid = Command::new("sh")
-            .args(["-c", "command -v setsid"])
-            .stdout(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let has_setsid = probe(Command::new("sh").args(["-c", "command -v setsid"]));
         assert!(has_setsid, "this test needs util-linux `setsid` on PATH");
         let mut tree = Tree::sh("sh -c 'setsid sleep 300 & wait' & wait", true);
         let root = tree.pid();
@@ -1396,7 +1442,10 @@ mod tests {
     /// `terminate` in exactly that root-first order, on a real fixture.
     #[test]
     fn finalizer_kills_the_root_last_whatever_the_doom_order() {
-        let mut tree = Tree::sh("sleep 300 & wait", false);
+        // The root is not stopped here (no freeze_root), so it must outlive
+        // its child by itself: `wait` returns, then it execs, and only the
+        // SIGKILL ends it.
+        let mut tree = Tree::sh("sleep 300 & wait; exec sleep 300", false);
         tree.await_descendants(1);
         let (root, root_start) = (tree.pid(), tree.start());
         let (child, child_start) = tree.recorded[0];
@@ -1410,6 +1459,33 @@ mod tests {
         let status = tree.wait();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
         assert_ends(child, child_start);
+    }
+
+    /// Whether a prerequisite probe exits 0 within 5 s. Spawned and polled
+    /// with `try_wait`, so a probe that hangs fails the test instead of
+    /// hanging it; one still running at the bound is killed and reaped.
+    fn probe(cmd: &mut Command) -> bool {
+        let Ok(mut child) = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+            return false;
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Stop confirmation with a 5 s bound (still capped by the walk's
+    /// deadline), for tests that assert a COMPLETE walk on a loaded box.
+    fn patient(pid: u32, deadline: Instant) -> bool {
+        confirm_stopped_within(pid, deadline, Duration::from_secs(5))
     }
 
     /// A stop confirmation that never sees the stop take effect.
@@ -1496,6 +1572,87 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(tree.try_wait().is_none(), "the undoomed root was killed");
         assert_ne!(state(root), Some(b'T'), "the root was left stopped");
+    }
+
+    /// Review round 5, finding 1: a ZOMBIE child whose start token is not the
+    /// recorded one is "reused" — a different child of this process now at
+    /// that pid — never "already exited", and nothing is signalled.
+    #[test]
+    fn a_zombie_with_the_wrong_token_is_reused_not_exited() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        wait_until("the child to become a zombie", || {
+            stat(pid).is_some_and(|s| s.zombie)
+        });
+        let result = kill_tree(pid, Some("linux:not-this-boot:1"), BUDGET);
+        // Reap before asserting, so a red run leaves no zombie behind.
+        child.wait().unwrap();
+        let err = result.expect_err("a zombie with the wrong token must be refused");
+        assert!(err.to_string().contains("was reused"), "{err}");
+        assert!(err.to_string().contains("nothing signalled"), "{err}");
+    }
+
+    /// Review round 5, finding 2a: a member SIGKILLed by a third party
+    /// mid-walk makes the next snapshot say the walk may be incomplete.
+    #[test]
+    fn a_member_killed_from_outside_mid_walk_is_flagged() {
+        let mut tree = Tree::sh("sleep 300 & wait", false);
+        tree.await_descendants(1);
+        let (child, child_start) = tree.recorded[0];
+        let Frozen::Table(table) = freeze_root(
+            tree.pid(),
+            None,
+            Handles::PidFd,
+            Instant::now() + BUDGET,
+            confirm_stopped,
+        )
+        .expect("freeze root") else {
+            panic!("a live root froze as exited");
+        };
+        let h = table.open(child).expect("a child of the frozen root opens");
+        table.snapshot().expect("snapshot");
+        assert!(!table.incomplete.get(), "a clean snapshot was flagged");
+        // The third party: this test, through its own pidfd.
+        kill_if_same(child, child_start);
+        wait_until("the killed member to read as exited", || {
+            table.has_exited(&h)
+        });
+        table.snapshot().expect("snapshot");
+        assert!(table.incomplete.get(), "an outside kill was not flagged");
+    }
+
+    /// Review round 5, finding 2b: a member a third party CONTINUED mid-walk
+    /// is noticed before the kill — and still killed.
+    #[test]
+    fn a_member_continued_from_outside_is_flagged_and_still_killed() {
+        let mut tree = Tree::sh("sleep 300 & wait; exec sleep 300", false);
+        tree.await_descendants(1);
+        let (child, child_start) = tree.recorded[0];
+        let Frozen::Table(table) = freeze_root(
+            tree.pid(),
+            None,
+            Handles::PidFd,
+            Instant::now() + BUDGET,
+            confirm_stopped,
+        )
+        .expect("freeze root") else {
+            panic!("a live root froze as exited");
+        };
+        table.open(child).expect("a child of the frozen root opens");
+        wait_until("open to stop the member", || state(child) == Some(b'T'));
+        let Opened::Fd(fd) = pidfd::open(child as i32) else {
+            panic!("pidfd of the member");
+        };
+        fd.send_signal(libc::SIGCONT).expect("SIGCONT");
+        wait_until("the member to run again", || {
+            matches!(any_thread_running(child), Ok(true))
+        });
+        let report = table
+            .finalize_walk(Ok(TreeKillReport::default()))
+            .expect("finalize");
+        assert!(report.recheck_snapshot_failed, "{report:?}");
+        assert!(report.killed.contains(&child), "{report:?}");
+        assert_ends(child, child_start);
     }
 
     /// T7: killing an already-killed (but unreaped) root again is harmless —
@@ -1626,12 +1783,7 @@ mod tests {
     /// `waitid` does not report it. It and its child must be killed, never
     /// reported "already exited" with nothing killed.
     fn kills_a_root_whose_main_thread_exited(handles: Handles) {
-        let has_ctypes = Command::new("python3")
-            .args(["-c", "import ctypes, threading"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let has_ctypes = probe(Command::new("python3").args(["-c", "import ctypes, threading"]));
         assert!(has_ctypes, "this test needs python3 (with ctypes) on PATH");
         let mut cmd = Command::new("python3");
         cmd.args(["-c", LEADER_EXITS]);
@@ -1643,7 +1795,8 @@ mod tests {
             "the root's main thread to exit while another thread runs",
             || stat(root).is_some_and(|s| s.zombie) && matches!(any_thread_running(root), Ok(true)),
         );
-        let report = kill_tree_with(root, None, BUDGET, handles).expect("tree kill");
+        let report =
+            kill_tree_with(root, None, BUDGET, handles, confirm_stopped).expect("tree kill");
         assert!(
             !report.root_exited,
             "a live root read as exited: {report:?}"
@@ -1672,7 +1825,8 @@ mod tests {
         let mut tree = Tree::sh("sleep 300 & sh -c 'sleep 300 & wait' & wait", false);
         tree.await_descendants(3);
         let root = tree.pid();
-        let report = kill_tree_with(root, None, BUDGET, Handles::PidOnly).expect("tree kill");
+        let report =
+            kill_tree_with(root, None, BUDGET, Handles::PidOnly, patient).expect("tree kill");
         assert!(report.killed.contains(&root), "{report:?}");
         assert!(!report.budget_spent, "{report:?}");
         assert!(!report.recheck_snapshot_failed, "{report:?}");
