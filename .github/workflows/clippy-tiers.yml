@@ -201,7 +201,9 @@ jobs:
   # comments/fails ONLY on findings introduced on the lines this PR changed —
   # style rot elsewhere in the tree is ignored. This is the T3 mechanism: warn-
   # tier lints (style/complexity/perf) stay non-blocking globally but a NEW one
-  # you introduce is surfaced on your diff.
+  # you introduce is surfaced on your diff. DEFAULT TARGET ONLY: a warn-tier
+  # lint added in #[cfg(test)] code gets no annotation here (ci.yml's
+  # --all-targets legs print it, without blocking, and fail on deny-tier ones).
   #
   # ADVISORY / NOT A REQUIRED CHECK — do NOT add to required-status-checks or
   # branch protection. Promote to required only after burn-in (plan Phase 2).

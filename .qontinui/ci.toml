@@ -158,7 +158,8 @@ cargo_build_jobs = 1
 #   anyway — extra coverage (it is the only cfg(windows) lint pass a Windows
 #   CI node gets), not a parity break, but it is a third full compile that
 #   `test (windows-latest)` does not pay, so wall-clock comparisons against
-#   that leg must subtract it.
+#   that leg must subtract it. It also runs DEFAULT TARGETS ONLY, while both
+#   hosted clippy legs in ci.yml run `--all-targets` -- see the step comment.
 #
 # - The separate `holder-crates` job (ci.yml, matrix ubuntu + windows) runs
 #   `cargo test -p qontinui-pty-holder -p qontinui-runner-win32` and
@@ -330,8 +331,8 @@ name = "rust-clippy"
 # hosted clippy legs run `--all-targets` (GitHub-hosted minutes are free on
 # this public repo), while this lane runs on fleet hosts, where CI ranks below
 # session spawns (served production-and-cost spawns-outrank-ci-and-builds), so
-# it does not pay the test-target check pass. Its verdict is a subset of
-# ci.yml's. Lint levels come solely from
+# it does not pay the test-target check pass. On a Windows or Linux node its
+# lint coverage is a subset of ci.yml's. Lint levels come solely from
 # src-tauri/Cargo.toml [lints.clippy] (T1 correctness/suspicious = deny,
 # T3 style/perf = warn). Adding `-D warnings` here would fail every
 # dispatch on the ~200 pre-existing warn-tier lints CI deliberately
@@ -363,8 +364,9 @@ command = ["cargo", "test", "-p", "qontinui-pty-holder", "-p", "qontinui-runner-
 timeout_secs = 1800
 
 [[steps]]
-# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy, levels
-# from the crate's own [lints] table, exactly like `rust-clippy`.
+# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy (no
+# `-D warnings`), like `rust-clippy`, but over all targets; levels from the
+# crate's own [lints] table.
 name = "holder-crates-clippy"
 command = ["cargo", "clippy", "-p", "qontinui-pty-holder", "--all-targets"]
 timeout_secs = 1800
