@@ -318,7 +318,7 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
         surface: "device_jwt_refresher",
         timing: PinTiming::Live,
         readers: &[
-            "mcp/device_jwt_refresher.rs::refresher_loop",
+            "mcp/device_jwt_refresher.rs::refresher_pass",
             "mcp/device_jwt_refresher.rs::publish_coord_credential_status",
             "mcp/device_jwt_refresher.rs::read_sweep_inputs",
         ],
