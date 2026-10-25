@@ -2331,26 +2331,48 @@ async fn handle_ai_search(
     )
     .await
     {
-        Ok(data) => {
-            // Unwrap ApiResponse {success, data} wrapper from control endpoint
-            if let Some(inner) = data.get("data") {
-                Json(inner.clone())
-            } else {
-                Json(data)
-            }
-        }
+        Ok(data) => Json(ai_read_envelope("ai/search", data)),
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via IPC
             debug!("SDK ai/search unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_search", payload).await {
-                Ok(data) => {
-                    // The control endpoint wraps in ApiResponse, extract the data
-                    Json(data)
-                }
+                Ok(data) => Json(ai_read_envelope("ai/search", data)),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }
+    }
+}
+
+/// The `{success, data}` envelope for an AI read (`/ai/search`, `/ai/find`),
+/// whichever transport carried it.
+///
+/// The three arms hand back different shapes: the HTTP SDK sends its own
+/// `ApiResponse` (`{success: true, data: …}`), the WebSocket relay returns the
+/// bare result, and the IPC fallback has already had its envelope flattened by
+/// `extract_response_data`. A body that carries a `success` key is an envelope
+/// (or a failure) and passes through untouched, so a malformed verdict stays
+/// the caller's to read rather than being blessed as `true`. A `null` body —
+/// a relay frame that said `success` but carried no result — is UNKNOWN, not an
+/// empty answer, and becomes a failure. Anything else is the payload and is
+/// wrapped. Before this, both handlers stripped the envelope, so ui-bridge-mcp
+/// — which reads an absent `success` as a failure — reported every answer as
+/// one.
+///
+/// Both handlers keep their ungated IPC fallback (`UNGATED_READ_ONLY_FALLBACKS`),
+/// so an answer from the runner's own UI after a failed app dispatch is now
+/// reported as a success like every other exempt read; it is no longer masked
+/// as a failure by the missing envelope.
+fn ai_read_envelope(route: &str, data: serde_json::Value) -> serde_json::Value {
+    if data.get("success").is_some() {
+        data
+    } else if data.is_null() {
+        serde_json::json!({
+            "success": false,
+            "error": format!("{route}: the answer carried no payload, so the result is UNKNOWN"),
+        })
+    } else {
+        serde_json::json!({ "success": true, "data": data })
     }
 }
 
@@ -5491,12 +5513,12 @@ async fn handle_ai_find(
     )
     .await
     {
-        Ok(data) => Json(data),
+        Ok(data) => Json(ai_read_envelope("ai/find", data)),
         Err(_sdk_err) => {
             debug!("SDK ai/find unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_find", payload).await {
-                Ok(data) => Json(data),
+                Ok(data) => Json(ai_read_envelope("ai/find", data)),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }
@@ -9314,5 +9336,75 @@ mod connect_bearer_scope_tests {
             leaked.is_empty(),
             "the operator bearer went out over plaintext http after an https -> http redirect: {leaked:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ai_read_envelope_tests {
+    use super::ai_read_envelope;
+    use crate::mcp::ui_bridge::request::extract_response_data;
+    use serde_json::json;
+
+    #[test]
+    fn a_bare_relay_search_answer_is_wrapped() {
+        // ui-bridge react/commandHandlers.ts `aiSearch` over the WebSocket relay.
+        let bare = json!({"results": [], "total": 0, "scannedCount": 12, "timestamp": 1});
+        assert_eq!(
+            ai_read_envelope("ai/search", bare.clone()),
+            json!({"success": true, "data": bare})
+        );
+    }
+
+    #[test]
+    fn the_ipc_answer_is_wrapped_once_after_extraction() {
+        // The runner frontend's IPC reply, as `ui_bridge_request_sync` flattens it.
+        let payload = json!({"results": [], "bestMatch": null, "scannedCount": 3});
+        let frame = json!({"requestId": "r1", "success": true, "data": payload});
+        assert_eq!(
+            ai_read_envelope("ai/search", extract_response_data(&frame)),
+            json!({"success": true, "data": payload})
+        );
+    }
+
+    #[test]
+    fn an_ipc_failure_stays_a_failure_after_extraction() {
+        let frame = json!({"requestId": "r1", "success": false, "error": "no engine", "data": {}});
+        let out = ai_read_envelope("ai/find", extract_response_data(&frame));
+        assert_eq!(out["success"], json!(false));
+        assert_eq!(out["error"], json!("no engine"));
+    }
+
+    #[test]
+    fn a_find_result_is_wrapped() {
+        let found = json!({"found": false, "ambiguous": false, "reason": "nothing"});
+        assert_eq!(
+            ai_read_envelope("ai/find", found.clone()),
+            json!({"success": true, "data": found})
+        );
+    }
+
+    #[test]
+    fn the_http_sdk_envelope_passes_through_unstripped() {
+        let envelope = json!({"success": true, "data": {"results": []}});
+        assert_eq!(ai_read_envelope("ai/search", envelope.clone()), envelope);
+    }
+
+    #[test]
+    fn a_failure_passes_through_as_a_failure() {
+        let failure = json!({"success": false, "error": "no app", "code": "X"});
+        assert_eq!(ai_read_envelope("ai/search", failure.clone()), failure);
+    }
+
+    #[test]
+    fn a_non_boolean_success_is_not_blessed_as_true() {
+        let odd = json!({"success": "yes", "results": []});
+        assert_eq!(ai_read_envelope("ai/search", odd.clone()), odd);
+    }
+
+    #[test]
+    fn a_null_answer_is_unknown_not_empty() {
+        let out = ai_read_envelope("ai/search", serde_json::Value::Null);
+        assert_eq!(out["success"], json!(false));
+        assert!(out["error"].as_str().unwrap().contains("UNKNOWN"));
     }
 }
