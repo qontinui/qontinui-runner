@@ -36,7 +36,9 @@ use uuid::Uuid;
 
 use super::handoff::HandoffError;
 use super::SessionRegistry;
-use crate::mcp::remote_terminal::{grants, now_epoch_secs, AttachGrant};
+use crate::mcp::remote_terminal::{
+    grants, now_epoch_secs, AttachGrant, GrantInsert, RemoteAttachGrants,
+};
 
 /// Catch-up poll cadence.
 ///
@@ -162,36 +164,114 @@ pub(super) fn parse_attach_push(text: &str, device_id: Uuid) -> Option<PendingAt
     Some(pending)
 }
 
-/// Record one request in the grant table. Returns `false` when the row was
-/// unusable (no readable expiry).
-pub fn record(pending: PendingAttach) -> bool {
+/// Record one request in the process-wide grant table. See [`record_into`].
+pub fn record(pending: PendingAttach) -> GrantInsert {
+    record_into(grants(), pending, now_epoch_secs())
+}
+
+/// What one catch-up pass did with the rows coord listed — the fold of every
+/// row's [`GrantInsert`].
+///
+/// Coord's list is every unexpired, unconsumed grant for the device, not only
+/// the ones this process has not seen, so in steady state a pass is all
+/// `known`. Only `new` is news.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CatchupTally {
+    /// Rows the table did not hold before this pass.
+    pub new: usize,
+    /// Rows it already held — expiry refreshed, nothing else changed.
+    pub known: usize,
+    /// Rows refused by the table, or unusable as a grant. Each is logged
+    /// where it was refused.
+    pub refused: usize,
+    /// Create rows this process already spent (always 0 for attach).
+    pub spent: usize,
+}
+
+impl CatchupTally {
+    /// Count one row's outcome.
+    pub fn note(&mut self, outcome: GrantInsert) {
+        match outcome {
+            GrantInsert::Recorded => self.new += 1,
+            GrantInsert::Refreshed => self.known += 1,
+            GrantInsert::Refused | GrantInsert::Unusable => self.refused += 1,
+            GrantInsert::RefusedSpent => self.spent += 1,
+        }
+    }
+}
+
+/// Record one request in `table`, the seam behind [`record`] (which passes
+/// [`grants`]) so a test can drive a table of its own.
+///
+/// Logs `grant recorded` at INFO only for a row the table did not hold, and
+/// only once it is in: the push and every catch-up pass re-deliver the same
+/// grant for its whole 15-minute life, and logging each delivery put ~50 INFO
+/// lines in the log per grant. A refresh is TRACE. A capacity refusal is
+/// WARNed inside `insert`, where its reason is known.
+fn record_into(table: &RemoteAttachGrants, pending: PendingAttach, now: u64) -> GrantInsert {
     let jti = pending.grant_jti.clone();
     let session = pending.session_id;
     let source_user = pending.source_user_id;
-    match pending.into_grant() {
-        Some(grant) => {
-            tracing::info!(
-                grant_jti = %jti,
-                session = %session,
-                source_device = %grant.source_device_id,
-                source_user = ?source_user,
-                expires_at = grant.expires_at,
-                "remote attach: grant recorded"
-            );
-            // `false` = table full of live bindings; the refusal is logged
-            // there. The row is still recorded on coord's side, so the
-            // source sees `attach_grant_unknown` and can retry later.
-            grants().insert(grant, now_epoch_secs())
-        }
-        None => {
-            tracing::warn!(
-                grant_jti = %jti,
-                session = %session,
-                "remote attach: request carries an unreadable expires_at — skipped"
-            );
-            false
-        }
+    let Some(grant) = pending.into_grant() else {
+        tracing::warn!(
+            grant_jti = %jti,
+            session = %session,
+            "remote attach: request carries an unreadable expires_at — skipped"
+        );
+        return GrantInsert::Unusable;
+    };
+    let source_device = grant.source_device_id.clone();
+    let expires_at = grant.expires_at;
+    // `Refused` = a poisoned lock, or a table full of live bindings (logged
+    // there). The row is still recorded on coord's side, so the source sees
+    // `attach_grant_unknown` and can retry later.
+    let outcome = table.insert(grant, now);
+    match outcome {
+        GrantInsert::Recorded => tracing::info!(
+            grant_jti = %jti,
+            session = %session,
+            source_device = %source_device,
+            source_user = ?source_user,
+            expires_at,
+            "remote attach: grant recorded"
+        ),
+        GrantInsert::Refreshed => tracing::trace!(
+            grant_jti = %jti,
+            expires_at,
+            "remote attach: grant already recorded — expiry refreshed"
+        ),
+        GrantInsert::Refused | GrantInsert::RefusedSpent | GrantInsert::Unusable => {}
     }
+    outcome
+}
+
+/// Record every row of one catch-up pass in `table` and log ONE summary line:
+/// INFO when the pass recorded something new, TRACE otherwise. A refusal that
+/// persists across passes must not bring back a per-tick INFO line — each one
+/// is already logged where it is refused.
+fn record_all(table: &RemoteAttachGrants, rows: Vec<PendingAttach>, now: u64) -> CatchupTally {
+    let mut tally = CatchupTally::default();
+    for pending in rows {
+        tally.note(record_into(table, pending, now));
+    }
+    if tally.new > 0 {
+        tracing::info!(
+            new = tally.new,
+            known = tally.known,
+            refused = tally.refused,
+            spent = tally.spent,
+            "remote attach: catch-up recorded new pending grants"
+        );
+    } else {
+        tracing::trace!(
+            new = tally.new,
+            known = tally.known,
+            refused = tally.refused,
+            spent = tally.spent,
+            "remote attach: catch-up recorded new pending grants"
+        );
+    }
+    tally
 }
 
 /// Handle one inbound `/ws` frame on the attach arm. Not an attach request
@@ -248,15 +328,7 @@ pub(super) async fn run_catchup(
                     "remote attach: coord reports attach_grants storage absent — push arm is the only feed"
                 );
             }
-            if !list.requests.is_empty() {
-                tracing::info!(
-                    count = list.requests.len(),
-                    "remote attach: catch-up recording pending grants"
-                );
-            }
-            for pending in list.requests {
-                record(pending);
-            }
+            record_all(grants(), list.requests, now_epoch_secs());
             grants().purge_expired(now_epoch_secs());
         }
         Err(HandoffError::Status(401 | 403, _)) => {
@@ -445,5 +517,279 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(present.requests.len(), 1);
+    }
+
+    // ---- Logging only what is new (plan
+    // `2026-10-19-runner-remote-attach-catch-up-re-records-the-same-grants`) --
+    //
+    // Coord's `GET /sessions/attach-requests` lists every unexpired, unconsumed
+    // grant on every 15 s pass, not only unseen ones. Measured 2026-10-19:
+    // 30,008 `grant recorded` INFO lines for 602 distinct jtis, and a
+    // `count=20` summary every tick. Every test below drives a LOCAL table
+    // except the entry-point one, which writes unique jtis to the global table.
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn row(jti: &str) -> PendingAttach {
+        PendingAttach {
+            grant_jti: jti.to_string(),
+            source_device_id: Some(Uuid::from_u128(1)),
+            source_user_id: Some(Uuid::from_u128(2)),
+            target_device_id: Some(Uuid::from_u128(10)),
+            session_id: Uuid::from_u128(20),
+            terminal_id: None,
+            expires_at: json!(NOW + 900),
+        }
+    }
+
+    fn rows(n: usize) -> Vec<PendingAttach> {
+        (0..n).map(|i| row(&format!("jti-{i}"))).collect()
+    }
+
+    /// The lines of a capture other than its sentinel.
+    fn besides<'a>(logs: &'a str, sentinel: &str) -> Vec<&'a str> {
+        logs.lines().filter(|l| !l.contains(sentinel)).collect()
+    }
+
+    /// A row that cannot become a grant is `Unusable`, and never reaches the
+    /// table; a readable one is `Recorded`, then `Refreshed`.
+    #[test]
+    fn record_into_answers_unusable_for_an_unreadable_expiry() {
+        let table = RemoteAttachGrants::new();
+        let mut bad = row("jti-bad");
+        bad.expires_at = json!("not a time");
+        assert_eq!(record_into(&table, bad, NOW), GrantInsert::Unusable);
+        assert_eq!(table.len(), 0);
+        assert_eq!(
+            record_into(&table, row("jti-ok"), NOW),
+            GrantInsert::Recorded
+        );
+        assert_eq!(
+            record_into(&table, row("jti-ok"), NOW),
+            GrantInsert::Refreshed
+        );
+    }
+
+    /// The tally a pass returns counts a re-listed grant as `known`, not
+    /// `new`. Fails against an `insert` whose refresh arm answers `Recorded`.
+    #[test]
+    fn record_all_counts_only_unseen_rows_as_new() {
+        let table = RemoteAttachGrants::new();
+        assert_eq!(
+            record_all(&table, rows(20), NOW),
+            CatchupTally {
+                new: 20,
+                ..CatchupTally::default()
+            }
+        );
+        assert_eq!(
+            record_all(&table, rows(20), NOW),
+            CatchupTally {
+                known: 20,
+                ..CatchupTally::default()
+            }
+        );
+        let mut mixed = rows(19);
+        mixed.push(row("jti-new"));
+        assert_eq!(
+            record_all(&table, mixed, NOW),
+            CatchupTally {
+                new: 1,
+                known: 19,
+                refused: 0,
+                spent: 0,
+            }
+        );
+    }
+
+    /// The steady state is silent at INFO, and one new grant among known ones
+    /// is exactly one `grant recorded` line plus one summary with `new=1`.
+    /// Each capture first logs a sentinel the test requires, so a capture lost
+    /// to tracing's global-cache race cannot pass as "logged nothing".
+    #[test]
+    fn a_pass_over_known_grants_logs_nothing_at_info() {
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: attach record_all capture is live";
+        let table = RemoteAttachGrants::new();
+        record_all(&table, rows(20), NOW);
+
+        let (tally, logs) = capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            record_all(&table, rows(20), NOW)
+        });
+        assert_eq!(tally.known, 20);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        assert!(
+            besides(&logs, SENTINEL).is_empty(),
+            "a pass over 20 known grants logs nothing at INFO: {logs}"
+        );
+
+        let mut mixed = rows(19);
+        mixed.push(row("jti-new"));
+        let (tally, logs) = capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            record_all(&table, mixed.clone(), NOW)
+        });
+        assert_eq!(tally.new, 1);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let others = besides(&logs, SENTINEL);
+        let recorded: Vec<&&str> = others
+            .iter()
+            .filter(|l| l.contains("remote attach: grant recorded"))
+            .collect();
+        assert_eq!(recorded.len(), 1, "{logs}");
+        assert!(recorded[0].contains("grant_jti=jti-new"), "{logs}");
+        let summary: Vec<&&str> = others
+            .iter()
+            .filter(|l| l.contains("remote attach: catch-up recorded new pending grants"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{logs}");
+        assert!(summary[0].contains("new=1"), "{logs}");
+        assert!(summary[0].contains("known=19"), "{logs}");
+        assert_eq!(others.len(), 2, "nothing else at INFO: {logs}");
+    }
+
+    /// Serve `body` as the answer to every request, recording each request
+    /// line — a canned coord for `GET /sessions/attach-requests`.
+    async fn serve_canned(
+        listener: tokio::net::TcpListener,
+        body: String,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let text = String::from_utf8_lossy(&head);
+            let request_line = text.lines().next().unwrap_or_default().to_string();
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request_line);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    }
+
+    /// The entry point, end to end: `run_catchup` against a loopback coord
+    /// serving the same 20 rows twice. The first pass records them (20
+    /// `grant recorded` lines and one `new=20` summary); the second, which is
+    /// every later 15 s tick in production, logs nothing at INFO.
+    ///
+    /// Writes the GLOBAL table (that is what `run_catchup` feeds), so its jtis
+    /// are unique to this run and removed afterwards. Runs under
+    /// `isolated_ambient` so `attach_device_auth` reads no real credential.
+    #[test]
+    fn run_catchup_logs_a_relisted_grant_once_rather_than_on_every_pass() {
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: attach run_catchup capture is live";
+        // `count_and_resolve_bearer` (lib `auth`) logs this at INFO on every
+        // 25th coord call process-wide, at most once a minute. It is not this
+        // module's line, and which test's call is the 25th is not ours to fix.
+        const UNRELATED: &str = "coord data-plane device-JWT coverage";
+        let _amb = crate::test_env::isolated_ambient();
+
+        let device = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let jtis: Vec<String> = (0..20).map(|i| format!("{run}-{i}")).collect();
+        let expires = now_epoch_secs() + 900;
+        let body = json!({
+            "requests": jtis.iter().map(|jti| json!({
+                "grant_jti": jti,
+                "source_device_id": Uuid::from_u128(1).to_string(),
+                "source_user_id": Uuid::from_u128(2).to_string(),
+                "target_device_id": device.to_string(),
+                "session_id": Uuid::from_u128(20).to_string(),
+                "terminal_id": null,
+                "expires_at": expires,
+            })).collect::<Vec<_>>(),
+            "storage": "present",
+        })
+        .to_string();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.spawn(serve_canned(listener, body, seen.clone()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let coord_url = format!("http://{addr}");
+        let pass = || {
+            capture_logs(|| {
+                tracing::info!("{SENTINEL}");
+                rt.block_on(run_catchup(
+                    &http,
+                    &coord_url,
+                    device,
+                    Duration::from_secs(10),
+                ));
+            })
+            .1
+        };
+
+        let first = pass();
+        let held: Vec<bool> = jtis.iter().map(|j| grants().contains(j)).collect();
+        let second = pass();
+        for jti in &jtis {
+            grants().remove(jti);
+        }
+
+        let expected_line = format!("GET /sessions/attach-requests?device_id={device} HTTP/1.1");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![expected_line.clone(), expected_line],
+            "one GET per pass, on the catch-up route"
+        );
+        assert!(held.iter().all(|h| *h), "the first pass records every row");
+
+        assert!(
+            first.contains(SENTINEL),
+            "the capture must be live: {first:?}"
+        );
+        assert_eq!(
+            first.matches("remote attach: grant recorded").count(),
+            20,
+            "{first}"
+        );
+        let summary: Vec<&str> = first
+            .lines()
+            .filter(|l| l.contains("remote attach: catch-up recorded new pending grants"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{first}");
+        assert!(summary[0].contains("new=20"), "{first}");
+
+        assert!(
+            second.contains(SENTINEL),
+            "the capture must be live: {second:?}"
+        );
+        let noise: Vec<&str> = besides(&second, SENTINEL)
+            .into_iter()
+            .filter(|l| !l.contains(UNRELATED))
+            .collect();
+        assert!(
+            noise.is_empty(),
+            "a pass that re-lists only known grants logs nothing at INFO: {noise:?}"
+        );
     }
 }
