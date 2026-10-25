@@ -60,7 +60,9 @@ pub struct TreeKillReport {
     /// The wall-clock budget ran out before the walk saw an empty pass.
     pub budget_spent: bool,
     /// A re-check pass (after the first) could not read the process snapshot,
-    /// so a child forked during the kills may have been missed.
+    /// so a child forked during the kills may have been missed. The Linux
+    /// table also sets it when a single process's `/proc` entry or pidfd could
+    /// not be read during the walk, for the same reason.
     pub recheck_snapshot_failed: bool,
 }
 
@@ -116,12 +118,17 @@ pub trait ProcessTable {
     ///
     /// Windows gets that from the kernel: an open process handle keeps the pid
     /// reserved. Linux has no such rule — a pid is free the moment its process
-    /// is reaped — so the Linux table supplies it by STOP-ON-OPEN: `open`
-    /// stops the process (`SIGSTOP` through a pidfd) before returning its
-    /// handle, and `terminate` only marks it, deferring every kill until the
-    /// walk has returned. A stopped process cannot exit on its own, and a
-    /// stopped parent cannot reap its children, so every handle's pid stays
-    /// reserved for as long as the walk holds it.
+    /// is reaped — so the Linux table STOPS each process as it opens it
+    /// (`SIGSTOP` through a pidfd), and `terminate` only marks it, deferring
+    /// every kill until the walk has returned. That keeps a member from
+    /// exiting on its own and a stopped parent from reaping, but it does not
+    /// reserve the pid outright: a member someone else `SIGKILL`s under a
+    /// parent that ignores `SIGCHLD` is reaped by the kernel at once, and the
+    /// root's waiter is the caller itself. What keeps a stranger out there is
+    /// the Linux table's `open`: it reads a candidate's parent only after
+    /// taking the candidate's pidfd, requires that parent to be a member whose
+    /// own pidfd says it is still alive, and its snapshot drops the rows whose
+    /// parent member has exited.
     type Handle;
     /// "Now", in the units creation times are compared in (FILETIME).
     fn now(&self) -> u64;
@@ -144,10 +151,13 @@ pub trait ProcessTable {
 /// Every member's handle is held until the call returns, so a member killed in
 /// one pass still pins its pid in the next: a process the snapshot lists under
 /// that pid is the member's own child, never a stranger's that reused the pid.
-/// On Linux the same invariant holds by stop-on-open (see
-/// [`ProcessTable::Handle`]): the walk opens a parent before its children, so
-/// each member is stopped before anything below it is linked, no member exits
-/// or is reaped during the walk, and the deferred kills land after it returns.
+/// On Linux a handle does not pin its pid by itself (see
+/// [`ProcessTable::Handle`]): the table stops each member as it opens it — the
+/// walk opens a parent before its children — so a member normally neither
+/// exits nor reaps during the walk, and the deferred kills land after it
+/// returns. A member freed by someone else mid-walk is kept from linking a
+/// stranger by that table's own liveness check on the parent, not by this
+/// function.
 ///
 /// `Err` when the root is `self_pid`, when its creation time is unreadable,
 /// when the FIRST snapshot fails (after signalling the root alone, so the

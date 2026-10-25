@@ -103,8 +103,14 @@ mod tests {
             .arg("300")
             .spawn()
             .unwrap();
-        let Opened::Fd(fd) = open(child.id() as i32) else {
-            panic!("pidfd_open of a live child failed");
+        let fd = match open(child.id() as i32) {
+            Opened::Fd(fd) => fd,
+            other => {
+                // Never leave the fixture running for 300 s.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pidfd_open of a live child failed: {other:?}");
+            }
         };
         assert!(fd.send_signal(0).is_ok());
         assert!(!fd.has_exited());

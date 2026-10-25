@@ -31,9 +31,16 @@
 //! 3. **[`LinuxFreezeTable`]**, a `process_tree::ProcessTable` driven by the
 //!    SAME generic `process_tree::walk` the Windows kill uses. Its `open` takes
 //!    a pidfd, re-reads the stat, and stops the process — but only when its
-//!    parent is the root or a member this table has already stopped (vet D3),
-//!    so no process outside the tree is ever stopped. Its `terminate` only
-//!    marks a member doomed: every kill is deferred until the walk returns.
+//!    parent is the root or a member this table has already stopped and whose
+//!    pidfd says it is still alive (vet D3), so no process outside the tree is
+//!    ever stopped. Its `terminate` only marks a member doomed: every kill is
+//!    deferred until the walk returns.
+//!
+//!    Whether a member has exited is answered by its PIDFD alone, never by
+//!    `/proc`: a process whose main thread called `pthread_exit` shows its
+//!    leader as `Z` there while its other threads run on, and a `/proc` read
+//!    can fail (`EMFILE`, `ENFILE`) for a live process. Reading either as
+//!    "exited" would report a live root as already gone and kill nothing.
 //! 4. **The finalizer** (every return path, and on drop): `SIGKILL` each doomed
 //!    member through its pidfd, `SIGCONT` each member this walk stopped and did
 //!    not doom, and rebuild `report.killed` from the kills actually delivered.
@@ -41,14 +48,20 @@
 //! **Why this is sound.** The walk opens a parent before its children, and
 //! every member is stopped as it is opened: `open` sends `SIGSTOP` and then
 //! waits, for at most `STOP_CONFIRM` (200 ms), until every thread of the
-//! process is in state `T`. A stopped parent cannot reap its children, and
-//! nothing in the tree exits during the walk, so every member's pid stays
-//! reserved until the walk returns: the Linux equivalent of the handle the
-//! Windows walk holds on each member. A child forked in the instant before its
-//! parent stopped is visible in `/proc` by then, and the next pass finds it. If
-//! the root is killed by someone else mid-walk, its waiter may reap it and its
-//! pid name a stranger; so each snapshot drops the rows whose parent is a
-//! member that has exited.
+//! process is in state `T`. A stopped member cannot exit on its own and a
+//! stopped parent cannot reap, so in the ordinary case every member's pid stays
+//! reserved until the walk returns. That alone is NOT what keeps strangers
+//! out: a member that someone else `SIGKILL`s under a parent that ignores
+//! `SIGCHLD` (or sets `SA_NOCLDWAIT`) is reaped by the kernel at once, and the
+//! root's waiter is the runner itself, so a pid can still be freed mid-walk.
+//! What keeps strangers out is the order inside `open`: the pidfd is taken
+//! first, the stat read second, the parent is then required to be a member
+//! whose pidfd says it is alive — alive now, so alive at the stat read, so the
+//! read's ppid named that member — and the `SIGSTOP` through the new pidfd
+//! succeeding proves the stat read was about the process behind it. Each
+//! snapshot also drops the rows whose parent is a member whose pidfd says it
+//! has exited. A child forked in the instant before its parent stopped is
+//! visible in `/proc` by then, and the next pass finds it.
 //!
 //! **Known residue.** Start times tick at 10 ms: a pid reused within one tick
 //! of a snapshot passes `admits_descendant`, but then needs a reserved parent
@@ -59,16 +72,19 @@
 //! log names it. A member whose threads do not all stop within
 //! `STOP_CONFIRM` (one in uninterruptible I/O) can complete one more fork
 //! before it stops; a later pass finds that child unless the walk has already
-//! ended, and the log names the member.
+//! ended, and the log names the member. A process whose `/proc` entry or pidfd
+//! cannot be read (an errno other than "no such process") is logged with its
+//! errno and makes the report say `recheck_snapshot_failed`, so a walk that may
+//! have missed a descendant never reports itself complete.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::time::{Duration, Instant};
 
 use qontinui_runner_win32::process_tree::{walk, ProcessTable, TreeKillError, TreeKillReport};
 
 use crate::pidfd::{self, Opened, PidFd};
-use crate::proc_identity::{self, ProcStat};
+use crate::proc_identity;
 use crate::spawn::signalable_pid;
 
 /// Longest wait for one process's stop to take effect on every thread. A
@@ -87,7 +103,10 @@ const STOP_CONFIRM: Duration = Duration::from_millis(200);
 ///
 /// `Ok` with `root_exited` and `passes == 0` when the root was already a
 /// zombie. `report.killed` lists the `SIGKILL`s actually delivered,
-/// descendants first. Every `Err` before the walk signalled nothing.
+/// descendants first. `report.recheck_snapshot_failed` is also set when any
+/// process's `/proc` entry or pidfd could not be read during the walk, since a
+/// descendant may then have been missed. Every `Err` before the walk signalled
+/// nothing.
 pub fn kill_tree(
     pid: u32,
     expected_token: Option<&str>,
@@ -155,9 +174,15 @@ fn freeze_root(
     }
     let via = match open_handle(spid, handles) {
         Ok(via) => via,
+        Err(e) if is_no_such_process(&e) => {
+            return Err(refuse(format!(
+                "pid {pid}: no such process ({e}: it has exited and been reaped, or never \
+                 existed); nothing signalled"
+            )))
+        }
         Err(e) => {
             return Err(refuse(format!(
-                "pid {pid}: no such process to open ({e}); nothing signalled"
+                "pid {pid}: pidfd_open failed ({e}); nothing signalled"
             )))
         }
     };
@@ -170,10 +195,18 @@ fn freeze_root(
     }
     // Read INSIDE the window: the descriptor is held, and the liveness check
     // below proves this read was about the process behind it.
-    let Some(st) = proc_identity::stat(pid) else {
-        return Err(refuse(format!(
-            "pid {pid}: /proc/{pid}/stat is unreadable (it has exited); nothing signalled"
-        )));
+    let st = match proc_identity::try_stat(pid) {
+        Ok(Some(st)) => st,
+        Ok(None) => {
+            return Err(refuse(format!(
+                "pid {pid}: no such process (its /proc entry is gone); nothing signalled"
+            )))
+        }
+        Err(e) => {
+            return Err(refuse(format!(
+                "pid {pid}: /proc/{pid}/stat is unreadable ({e}); nothing signalled"
+            )))
+        }
     };
     let exited_pid = match waitid_nowait(spid) {
         Ok(p) => p,
@@ -232,8 +265,15 @@ fn freeze_root(
         members: RefCell::new(vec![root]),
         doom_order: RefCell::new(Vec::new()),
         handles,
-        released: RefCell::new(false),
+        incomplete: Cell::new(false),
+        released: Cell::new(false),
     }))
+}
+
+/// `ESRCH` or `ENOENT`: the process is not there. Any other errno means the
+/// question could not be answered.
+fn is_no_such_process(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`: `Ok(pid)` when `pid` is an
@@ -303,10 +343,12 @@ impl Member {
         match &self.via {
             Via::Fd(fd) => fd.send_signal(sig),
             Via::Pid => {
-                let same = proc_identity::stat(self.pid)
-                    .is_some_and(|s| s.start_ticks == self.start_ticks);
-                if !same {
-                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                // Absent or another process: provably not this member (ESRCH).
+                // Unreadable: its identity is UNKNOWN, so nothing is sent and
+                // the read's own error is returned.
+                match proc_identity::try_stat(self.pid)? {
+                    Some(s) if s.start_ticks == self.start_ticks => {}
+                    _ => return Err(io::Error::from_raw_os_error(libc::ESRCH)),
                 }
                 let pid = signalable_pid(self.pid)
                     .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -321,16 +363,72 @@ impl Member {
         }
     }
 
-    /// Gone: absent, a zombie, a different start time — or, through the
-    /// pidfd, exited.
+    /// Whether this member has exited (a zombie, or reaped).
+    ///
+    /// Through a pidfd, the pidfd is the ONLY authority (review round 1): a
+    /// `/proc` stat shows a process whose main thread called `pthread_exit` as
+    /// `Z` while its other threads run, and a stat read can fail for a live
+    /// process. Without a pidfd, `/proc` is all there is: absent or a
+    /// different start time is exited, a `Z` leader is exited only once no
+    /// thread of it is left alive (a stopped thread is alive), and anything
+    /// unreadable is UNKNOWN — answered "not exited", so the member is still
+    /// killed, never dropped.
     fn exited(&self) -> bool {
-        if let Via::Fd(fd) = &self.via {
-            if fd.has_exited() {
-                return true;
-            }
+        match &self.via {
+            Via::Fd(fd) => fd.has_exited(),
+            Via::Pid => match proc_identity::try_stat(self.pid) {
+                Ok(None) => true,
+                Ok(Some(s)) if s.start_ticks != self.start_ticks => true,
+                Ok(Some(s)) if s.zombie => matches!(any_thread_alive(self.pid), Ok(false)),
+                Ok(Some(_)) | Err(_) => false,
+            },
         }
-        proc_identity::stat(self.pid).is_none_or(|s| s.zombie || s.start_ticks != self.start_ticks)
     }
+}
+
+/// The state letter of every thread of `pid` (`/proc/<pid>/task/*/stat`, read
+/// as bytes). A thread that vanished mid-listing is left out; any other read
+/// failure is an `Err`.
+fn thread_states(pid: u32) -> io::Result<Vec<u8>> {
+    let mut states = Vec::new();
+    let threads = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(threads) => threads,
+        Err(e) if is_no_such_process(&e) => return Ok(states),
+        Err(e) => return Err(e),
+    };
+    for thread in threads {
+        let path = thread?.path().join("stat");
+        match std::fs::read(&path) {
+            Ok(raw) => match proc_identity::parse_stat_bytes(&raw) {
+                Some(st) => states.push(st.state),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: unparseable", path.display()),
+                    ))
+                }
+            },
+            Err(e) if is_no_such_process(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(states)
+}
+
+/// Whether any thread of `pid` is neither stopped nor dead.
+fn any_thread_running(pid: u32) -> io::Result<bool> {
+    Ok(thread_states(pid)?
+        .into_iter()
+        .any(|s| !matches!(s, b'T' | b't' | b'Z' | b'X' | b'x')))
+}
+
+/// Whether any thread of `pid` has not exited — a STOPPED thread is alive.
+/// What decides, without a pidfd, whether a process whose leader shows `Z` has
+/// really exited.
+fn any_thread_alive(pid: u32) -> io::Result<bool> {
+    Ok(thread_states(pid)?
+        .into_iter()
+        .any(|s| !matches!(s, b'Z' | b'X' | b'x')))
 }
 
 /// Wait, at most [`STOP_CONFIRM`], until every thread of `pid` is stopped,
@@ -354,28 +452,8 @@ fn confirm_stopped(pid: u32) -> bool {
 }
 
 fn all_threads_stopped(pid: u32) -> bool {
-    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        // The process is gone: nothing of it is running.
-        return true;
-    };
-    for thread in threads {
-        let Ok(thread) = thread else {
-            return false;
-        };
-        let stat = std::fs::read_to_string(thread.path().join("stat"))
-            .ok()
-            .and_then(|raw| proc_identity::parse_stat(&raw));
-        match stat {
-            // The thread exited between the listing and the read.
-            None => {}
-            Some(ProcStat {
-                state: b'T' | b't' | b'Z' | b'X' | b'x',
-                ..
-            }) => {}
-            Some(_) => return false,
-        }
-    }
-    true
+    // A thread whose state cannot be read counts as running.
+    matches!(any_thread_running(pid), Ok(false))
 }
 
 /// `CLOCK_BOOTTIME` in `sysconf(_SC_CLK_TCK)` ticks: the clock and unit of
@@ -410,8 +488,11 @@ pub struct LinuxFreezeTable {
     /// Indices `terminate` marked, in the walk's order (descendants first).
     doom_order: RefCell<Vec<usize>>,
     handles: Handles,
+    /// A process's `/proc` entry or pidfd could not be read during the walk
+    /// (an errno other than "no such process"): a descendant may be missing.
+    incomplete: Cell<bool>,
     /// The finalizer has run (it runs once: explicitly, or on drop).
-    released: RefCell<bool>,
+    released: Cell<bool>,
 }
 
 impl ProcessTable for LinuxFreezeTable {
@@ -432,13 +513,35 @@ impl ProcessTable for LinuxFreezeTable {
             .filter(|m| m.exited())
             .map(|m| m.pid)
             .collect();
-        Ok(pids
-            .into_iter()
-            .filter_map(|pid| {
-                let ppid = u32::try_from(proc_identity::stat(pid)?.ppid).ok()?;
-                (!dead_parents.contains(&ppid)).then_some((pid, ppid))
-            })
-            .collect())
+        let mut rows = Vec::with_capacity(pids.len());
+        let mut first_unreadable: Option<(u32, io::Error)> = None;
+        let mut unreadable = 0usize;
+        for pid in pids {
+            match proc_identity::try_stat(pid) {
+                Ok(Some(st)) => {
+                    if let Ok(ppid) = u32::try_from(st.ppid) {
+                        if !dead_parents.contains(&ppid) {
+                            rows.push((pid, ppid));
+                        }
+                    }
+                }
+                // Exited since the listing: not a descendant to reach.
+                Ok(None) => {}
+                Err(e) => {
+                    unreadable += 1;
+                    first_unreadable.get_or_insert((pid, e));
+                }
+            }
+        }
+        if let Some((pid, e)) = first_unreadable {
+            self.incomplete.set(true);
+            tracing::warn!(
+                target: "tree_kill",
+                "process snapshot: {unreadable} /proc stat file(s) unreadable (first: pid {pid}, \
+                 {e}); a descendant among them is not reached"
+            );
+        }
+        Ok(rows)
     }
 
     fn open(&self, pid: u32) -> Option<usize> {
@@ -448,13 +551,22 @@ impl ProcessTable for LinuxFreezeTable {
         if let Some(i) = known {
             return (!self.members.borrow()[i].exited()).then_some(i);
         }
-        let via = open_handle(signalable_pid(pid)?, self.handles).ok()?;
-        let st = proc_identity::stat(pid)?;
-        if st.zombie {
-            // Exited: nothing to stop or kill, and its children are already
-            // re-parented away from it.
-            return None;
-        }
+        let via = match open_handle(signalable_pid(pid)?, self.handles) {
+            Ok(via) => via,
+            Err(e) if is_no_such_process(&e) => return None,
+            Err(e) => {
+                self.note_unreachable(pid, "pidfd_open failed", &e);
+                return None;
+            }
+        };
+        let st = match proc_identity::try_stat(pid) {
+            Ok(Some(st)) => st,
+            Ok(None) => return None,
+            Err(e) => {
+                self.note_unreachable(pid, "/proc stat unreadable", &e);
+                return None;
+            }
+        };
         // Vet D3: stop ONLY a child of a process this walk already holds
         // stopped and that has not exited. Such a parent's pid is its own, so
         // this process is in the tree.
@@ -474,14 +586,18 @@ impl ProcessTable for LinuxFreezeTable {
             resume: st.state != b'T',
             doomed: false,
         };
+        // Exited — through the pidfd just taken, not the stat's `Z`, which a
+        // live process whose main thread exited also shows: nothing to stop or
+        // kill, and its children are already re-parented away from it.
+        if member.exited() {
+            return None;
+        }
         // Success also proves the stat above was this process's: the signal
         // reached the process behind the handle, so it had not been reaped.
         if let Err(e) = member.signal(libc::SIGSTOP) {
-            tracing::warn!(
-                target: "tree_kill",
-                "pid {pid} (child of {}): SIGSTOP refused ({e}); it and its subtree are not walked",
-                st.ppid
-            );
+            if !is_no_such_process(&e) {
+                self.note_unreachable(pid, "SIGSTOP refused", &e);
+            }
             return None;
         }
         confirm_stopped(pid);
@@ -512,6 +628,16 @@ impl ProcessTable for LinuxFreezeTable {
 }
 
 impl LinuxFreezeTable {
+    /// A process in (or possibly in) the tree that this walk could not reach:
+    /// logged with its errno, and the report will not claim a complete walk.
+    fn note_unreachable(&self, pid: u32, what: &str, e: &io::Error) {
+        self.incomplete.set(true);
+        tracing::warn!(
+            target: "tree_kill",
+            "pid {pid}: {what} ({e}); it and its subtree are not walked"
+        );
+    }
+
     /// Step 4: kill the doomed, resume the rest this walk stopped, and make the
     /// walk's answer say what was actually delivered.
     fn finalize(
@@ -532,6 +658,9 @@ impl LinuxFreezeTable {
                     }
                 }
                 report.killed = killed;
+                if self.incomplete.get() {
+                    report.recheck_snapshot_failed = true;
+                }
                 Ok(report)
             }
             Err(TreeKillError::SnapshotFailed {
@@ -560,11 +689,27 @@ impl LinuxFreezeTable {
             let m = &members[i];
             match m.signal(libc::SIGKILL) {
                 Ok(()) => killed.push(m.pid),
-                Err(e) => tracing::warn!(
-                    target: "tree_kill",
-                    "pid {}: SIGKILL not delivered ({e})",
-                    m.pid
-                ),
+                // Reaped, or (no pidfd) the pid now names another process.
+                Err(e) if is_no_such_process(&e) => {}
+                Err(e) => {
+                    // Not provably gone, and possibly stopped by this walk: do
+                    // not leave it frozen (review round 1, finding 3).
+                    tracing::warn!(
+                        target: "tree_kill",
+                        "pid {}: SIGKILL not delivered ({e}) and it is not provably gone",
+                        m.pid
+                    );
+                    if m.resume {
+                        if let Err(e) = m.signal(libc::SIGCONT) {
+                            tracing::warn!(
+                                target: "tree_kill",
+                                "pid {}: SIGCONT not delivered either ({e}); it may be left \
+                                 stopped",
+                                m.pid
+                            );
+                        }
+                    }
+                }
             }
         }
         for m in members.iter().filter(|m| m.resume && !m.doomed) {
@@ -590,8 +735,9 @@ impl Drop for LinuxFreezeTable {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::proc_identity::ProcStat;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
 
     const BUDGET: Duration = Duration::from_secs(5);
 
@@ -664,8 +810,12 @@ mod tests {
     impl Tree {
         fn sh(script: &str, own_group: bool) -> Tree {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", script])
-                .stdin(Stdio::null())
+            cmd.args(["-c", script]);
+            Tree::spawn(cmd, own_group)
+        }
+
+        fn spawn(mut cmd: Command, own_group: bool) -> Tree {
+            cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             if own_group {
@@ -674,16 +824,26 @@ mod tests {
                 cmd.process_group(0);
             }
             Tree {
-                child: cmd.spawn().expect("spawn sh"),
+                child: cmd.spawn().expect("spawn the fixture"),
                 recorded: Vec::new(),
                 own_group,
                 reaped: false,
             }
         }
 
-        fn wait(&mut self) -> std::process::ExitStatus {
+        fn wait(&mut self) -> ExitStatus {
             let status = self.child.wait().unwrap();
             self.reaped = true;
+            status
+        }
+
+        /// `Child::try_wait`, remembering a reap so `Drop` never group-kills
+        /// an id the reaped root no longer pins.
+        fn try_wait(&mut self) -> Option<ExitStatus> {
+            let status = self.child.try_wait().unwrap();
+            if status.is_some() {
+                self.reaped = true;
+            }
             status
         }
 
@@ -695,15 +855,23 @@ mod tests {
             stat(self.pid()).expect("root stat").start_ticks
         }
 
-        /// Wait (bounded) for at least `n` descendants, then record them.
+        /// Wait (bounded) for at least `n` descendants, recording them on
+        /// every round, so a timeout still leaves them for `Drop` to kill.
         fn await_descendants(&mut self, n: usize) {
             let root = self.pid();
-            let mut found = Vec::new();
-            wait_until("the fixture's descendants", || {
-                found = descendants_of(root);
-                found.len() >= n
-            });
-            self.recorded = found;
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.recorded = descendants_of(root);
+                if self.recorded.len() >= n {
+                    return;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "timed out waiting for {n} descendants of the fixture: {:?}",
+                    self.recorded
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
 
         fn first_line(&mut self) -> String {
@@ -818,19 +986,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!gone(gc, gc_start), "the grandchild was killed");
         assert_ne!(state(gc), Some(b'T'), "the grandchild was left stopped");
-        assert!(
-            tree.child.try_wait().unwrap().is_none(),
-            "the root was killed"
-        );
+        assert!(tree.try_wait().is_none(), "the root was killed");
     }
 
-    /// T4: a child that was already reaped signals nothing.
+    /// T4: a child that was already reaped signals nothing. This reaches the
+    /// `pidfd_open` ESRCH arm. Residue: a reaped pid that ANOTHER child of this
+    /// process has since been given passes the `waitid` proof; for a tracked
+    /// pid the start token recorded at spawn (`expected_token`) closes that.
     #[test]
     fn signals_nothing_for_a_reaped_child() {
         let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        kill_tree(pid, None, BUDGET).expect_err("a reaped child must be refused");
+        let err = kill_tree(pid, None, BUDGET).expect_err("a reaped child must be refused");
+        assert!(err.to_string().contains("no such process"), "{err}");
     }
 
     /// T5: this process is never a root.
@@ -856,7 +1025,9 @@ mod tests {
             .open(member)
             .expect("a child of the frozen root opens");
         assert_eq!(table.creation_time(&h), Some(member_start));
-        assert_eq!(state(member), Some(b'T'), "open stops the member");
+        // `open` waits for the stop only up to STOP_CONFIRM: on a loaded box
+        // give the state change its own bounded wait.
+        wait_until("open to stop the member", || state(member) == Some(b'T'));
         let report = table
             .finalize(Ok(TreeKillReport::default()))
             .expect("finalize");
@@ -888,10 +1059,7 @@ mod tests {
         assert_eq!(table.open(outsider_pid), None);
         assert_ne!(state(outsider_pid), Some(b'T'), "an outsider was stopped");
         drop(table);
-        assert!(
-            outsider.child.try_wait().unwrap().is_none(),
-            "an outsider was killed"
-        );
+        assert!(outsider.try_wait().is_none(), "an outsider was killed");
         assert_ne!(
             state(outsider_pid),
             Some(b'T'),
@@ -998,7 +1166,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!gone(pid, start), "the child was killed");
         assert_ne!(state(pid), Some(b'T'), "the child was left stopped");
-        assert!(tree.child.try_wait().unwrap().is_none());
+        assert!(tree.try_wait().is_none(), "the child was killed");
     }
 
     /// T13's other half: the token recorded at spawn is accepted, so the
@@ -1012,6 +1180,58 @@ mod tests {
         assert!(report.killed.contains(&tree.pid()), "{report:?}");
         let (pid, start) = tree.recorded[0];
         assert_ends(pid, start);
+    }
+
+    /// A root whose MAIN thread calls `pthread_exit` while another thread
+    /// runs on, after starting a `sleep 300` child whose pid it prints.
+    const LEADER_EXITS: &str = "import ctypes, subprocess, threading, time\n\
+        child = subprocess.Popen(['sleep', '300'])\n\
+        print(child.pid, flush=True)\n\
+        threading.Thread(target=time.sleep, args=(300,)).start()\n\
+        ctypes.CDLL(None).pthread_exit(None)\n";
+
+    /// Review round 1, finding 1: `/proc/<pid>/stat` shows such a root's
+    /// leader as `Z`, yet the process is alive — its pidfd is not readable and
+    /// `waitid` does not report it. It and its child must be killed, never
+    /// reported "already exited" with nothing killed.
+    fn kills_a_root_whose_main_thread_exited(handles: Handles) {
+        let has_ctypes = Command::new("python3")
+            .args(["-c", "import ctypes, threading"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(has_ctypes, "this test needs python3 (with ctypes) on PATH");
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", LEADER_EXITS]);
+        let mut tree = Tree::spawn(cmd, false);
+        let child: u32 = tree.first_line().parse().expect("child pid");
+        tree.recorded = vec![(child, stat(child).expect("child stat").start_ticks)];
+        let root = tree.pid();
+        wait_until(
+            "the root's main thread to exit while another thread runs",
+            || stat(root).is_some_and(|s| s.zombie) && matches!(any_thread_running(root), Ok(true)),
+        );
+        let report = kill_tree_with(root, None, BUDGET, handles).expect("tree kill");
+        assert!(
+            !report.root_exited,
+            "a live root read as exited: {report:?}"
+        );
+        assert!(report.killed.contains(&root), "{report:?}");
+        assert!(report.killed.contains(&child), "{report:?}");
+        wait_until("the root to be reaped", || tree.try_wait().is_some());
+        let (child, child_start) = tree.recorded[0];
+        assert_ends(child, child_start);
+    }
+
+    #[test]
+    fn kills_a_root_whose_main_thread_exited_through_its_pidfd() {
+        kills_a_root_whose_main_thread_exited(Handles::PidFd);
+    }
+
+    #[test]
+    fn kills_a_root_whose_main_thread_exited_without_pidfd() {
+        kills_a_root_whose_main_thread_exited(Handles::PidOnly);
     }
 
     /// The no-pidfd fallback (Linux < 5.3), forced: members are signalled by

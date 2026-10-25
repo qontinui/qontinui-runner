@@ -110,7 +110,18 @@ pub struct ProcStat {
 /// parenthesised and may itself contain `)` or spaces, so every field this
 /// reads is counted from after the LAST `)`.
 pub fn parse_stat(raw: &str) -> Option<ProcStat> {
-    let (_, rest) = raw.rsplit_once(')')?;
+    parse_stat_bytes(raw.as_bytes())
+}
+
+/// [`parse_stat`] over the raw bytes, which is how the file must be read: the
+/// comm is whatever the process named itself, and need not be UTF-8 (a
+/// `read_to_string` of such a file fails, and the process would read as
+/// absent). Only the tail after the LAST `)` is interpreted, and it is ASCII.
+pub fn parse_stat_bytes(raw: &[u8]) -> Option<ProcStat> {
+    let close = raw.iter().rposition(|&b| b == b')')?;
+    // Byte-to-char widening of the ASCII tail, not a decode: a stray
+    // non-ASCII byte becomes some Latin-1 char and fails the number parses.
+    let rest: String = raw[close + 1..].iter().map(|&b| char::from(b)).collect();
     let f: Vec<&str> = rest.split_whitespace().collect();
     // After the comm: state(0) ppid(1) pgrp(2) session(3) … starttime(19).
     let state = *f.first()?.as_bytes().first()?;
@@ -126,7 +137,7 @@ pub fn parse_stat(raw: &str) -> Option<ProcStat> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{parse_stat, ProcStat};
+    use super::{parse_stat_bytes, ProcStat};
 
     /// This boot's id, read once.
     pub fn boot_id() -> Option<&'static str> {
@@ -140,8 +151,33 @@ mod imp {
         .as_deref()
     }
 
+    /// `/proc/<pid>/stat`, read as bytes: `Ok(None)` when there is no such
+    /// process (`ENOENT`, or `ESRCH` from a process that exited mid-read),
+    /// `Err` when the entry exists but could not be read or parsed (`EMFILE`,
+    /// `ENFILE`, `EACCES`, …) — a caller that must not mistake "could not
+    /// look" for "not there" matches on that.
+    pub fn try_stat(pid: u32) -> std::io::Result<Option<ProcStat>> {
+        let path = format!("/proc/{pid}/stat");
+        match std::fs::read(&path) {
+            Ok(raw) => parse_stat_bytes(&raw).map(Some).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{path}: unparseable"),
+                )
+            }),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`try_stat`], forgiving: anything unreadable is `None`.
     pub fn stat(pid: u32) -> Option<ProcStat> {
-        parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+        try_stat(pid).ok().flatten()
     }
 
     pub fn start_token(pid: u32) -> Option<String> {
@@ -189,7 +225,7 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{list_pids, start_token_of, stat, try_list_pids};
+pub use imp::{list_pids, start_token_of, stat, try_list_pids, try_stat};
 
 #[cfg(windows)]
 mod imp {
@@ -289,6 +325,15 @@ mod tests {
             Some((b'T', false)),
             "a stopped process is told apart by its state letter"
         );
+        // A comm that is not UTF-8 still parses: only the ASCII tail is read.
+        assert_eq!(
+            parse_stat_bytes(b"7 (a\xffb) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42").map(|s| (
+                s.state,
+                s.ppid,
+                s.start_ticks
+            )),
+            Some((b'S', 1, 42))
+        );
         assert_eq!(parse_stat("no paren here"), None);
         assert_eq!(parse_stat("1 (x) S 1 2"), None, "truncated stat");
     }
@@ -301,6 +346,12 @@ mod tests {
         assert!(try_list_pids().unwrap().contains(&me));
         assert!(list_pids().contains(&me));
         let mine = stat(me).unwrap();
+        assert_eq!(try_stat(me).unwrap(), Some(mine));
+        assert_eq!(
+            try_stat(u32::MAX).unwrap(),
+            None,
+            "no such process is Ok(None)"
+        );
         assert_eq!(start_token_of(&mine), start_token(me));
         assert_ne!(mine.state, b'T', "this process is running, not stopped");
     }
