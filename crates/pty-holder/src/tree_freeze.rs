@@ -229,9 +229,11 @@ fn freeze_root(
         doomed: false,
     };
     if let Err(e) = root.signal(0) {
-        return Err(refuse(format!(
-            "pid {pid} was reaped while it was being checked ({e}); nothing signalled"
-        )));
+        return Err(refuse(if is_no_such_process(&e) {
+            format!("pid {pid} was reaped while it was being checked ({e}); nothing signalled")
+        } else {
+            format!("pid {pid}: its liveness could not be checked ({e}); nothing signalled")
+        }));
     }
     if exited_pid == spid {
         return Ok(Frozen::RootExited);
@@ -363,27 +365,52 @@ impl Member {
         }
     }
 
-    /// Whether this member has exited (a zombie, or reaped).
+    /// Whether this member is alive, has exited (a zombie, or reaped), or
+    /// cannot be told.
     ///
     /// Through a pidfd, the pidfd is the ONLY authority (review round 1): a
     /// `/proc` stat shows a process whose main thread called `pthread_exit` as
     /// `Z` while its other threads run, and a stat read can fail for a live
     /// process. Without a pidfd, `/proc` is all there is: absent or a
     /// different start time is exited, a `Z` leader is exited only once no
-    /// thread of it is left alive (a stopped thread is alive), and anything
-    /// unreadable is UNKNOWN — answered "not exited", so the member is still
-    /// killed, never dropped.
-    fn exited(&self) -> bool {
+    /// thread of it is left alive (a stopped thread is alive). A failed poll
+    /// or read is [`Liveness::Unknown`], and each caller decides which way an
+    /// unanswered question falls (review round 2).
+    fn liveness(&self) -> Liveness {
         match &self.via {
-            Via::Fd(fd) => fd.has_exited(),
+            Via::Fd(fd) => match fd.has_exited() {
+                Ok(true) => Liveness::Exited,
+                Ok(false) => Liveness::Alive,
+                Err(e) => Liveness::Unknown(e),
+            },
             Via::Pid => match proc_identity::try_stat(self.pid) {
-                Ok(None) => true,
-                Ok(Some(s)) if s.start_ticks != self.start_ticks => true,
-                Ok(Some(s)) if s.zombie => matches!(any_thread_alive(self.pid), Ok(false)),
-                Ok(Some(_)) | Err(_) => false,
+                Ok(None) => Liveness::Exited,
+                Ok(Some(s)) if s.start_ticks != self.start_ticks => Liveness::Exited,
+                Ok(Some(s)) if s.zombie => match any_thread_alive(self.pid) {
+                    Ok(true) => Liveness::Alive,
+                    Ok(false) => Liveness::Exited,
+                    Err(e) => Liveness::Unknown(e),
+                },
+                Ok(Some(_)) => Liveness::Alive,
+                Err(e) => Liveness::Unknown(e),
             },
         }
     }
+
+    /// For KILL decisions: exited only when provably so. An UNKNOWN member is
+    /// still killed (or still counted as the root), never dropped.
+    fn exited(&self) -> bool {
+        matches!(self.liveness(), Liveness::Exited)
+    }
+}
+
+/// What [`Member::liveness`] could establish.
+#[derive(Debug)]
+enum Liveness {
+    Alive,
+    Exited,
+    /// The pidfd poll or the `/proc` read failed.
+    Unknown(io::Error),
 }
 
 /// The state letter of every thread of `pid` (`/proc/<pid>/task/*/stat`, read
@@ -489,7 +516,11 @@ pub struct LinuxFreezeTable {
     doom_order: RefCell<Vec<usize>>,
     handles: Handles,
     /// A process's `/proc` entry or pidfd could not be read during the walk
-    /// (an errno other than "no such process"): a descendant may be missing.
+    /// (an errno other than "no such process"), or a doomed member's SIGKILL
+    /// failed: a descendant may be missing or alive. Any unreadable entry on
+    /// the box sets it, so on a host whose `/proc` refuses other users' stat
+    /// files (`hidepid=1`) EVERY walk reports `recheck_snapshot_failed` — the
+    /// honest answer there, since this walk cannot see those processes' parents.
     incomplete: Cell<bool>,
     /// The finalizer has run (it runs once: explicitly, or on drop).
     released: Cell<bool>,
@@ -505,14 +536,25 @@ impl ProcessTable for LinuxFreezeTable {
     fn snapshot(&self) -> io::Result<Vec<(u32, u32)>> {
         let pids = proc_identity::try_list_pids()?;
         // A member that has exited no longer pins its pid; a row naming it as
-        // parent may be a stranger's child (vet D2).
-        let dead_parents: Vec<u32> = self
-            .members
-            .borrow()
-            .iter()
-            .filter(|m| m.exited())
-            .map(|m| m.pid)
-            .collect();
+        // parent may be a stranger's child (vet D2). One whose liveness cannot
+        // be read is treated the same way for LINKING (fail closed), and the
+        // walk then says it may be incomplete (review round 2).
+        let mut dead_parents: Vec<u32> = Vec::new();
+        for m in self.members.borrow().iter() {
+            match m.liveness() {
+                Liveness::Alive => {}
+                Liveness::Exited => dead_parents.push(m.pid),
+                Liveness::Unknown(e) => {
+                    dead_parents.push(m.pid);
+                    self.incomplete.set(true);
+                    tracing::warn!(
+                        target: "tree_kill",
+                        "pid {}: liveness unreadable ({e}); its children are not linked",
+                        m.pid
+                    );
+                }
+            }
+        }
         let mut rows = Vec::with_capacity(pids.len());
         let mut first_unreadable: Option<(u32, io::Error)> = None;
         let mut unreadable = 0usize;
@@ -570,12 +612,20 @@ impl ProcessTable for LinuxFreezeTable {
         // Vet D3: stop ONLY a child of a process this walk already holds
         // stopped and that has not exited. Such a parent's pid is its own, so
         // this process is in the tree.
-        let parent_in_tree = u32::try_from(st.ppid).is_ok_and(|ppid| {
-            self.members
-                .borrow()
-                .iter()
-                .any(|m| m.pid == ppid && !m.exited())
-        });
+        let mut parent_in_tree = false;
+        if let Ok(ppid) = u32::try_from(st.ppid) {
+            for m in self.members.borrow().iter().filter(|m| m.pid == ppid) {
+                match m.liveness() {
+                    Liveness::Alive => parent_in_tree = true,
+                    Liveness::Exited => {}
+                    // Fail closed: an unanswered liveness never links a child
+                    // (review round 2).
+                    Liveness::Unknown(e) => {
+                        self.note_unreachable(pid, "its parent's liveness is unreadable", &e)
+                    }
+                }
+            }
+        }
         if !parent_in_tree {
             return None;
         }
@@ -693,7 +743,9 @@ impl LinuxFreezeTable {
                 Err(e) if is_no_such_process(&e) => {}
                 Err(e) => {
                     // Not provably gone, and possibly stopped by this walk: do
-                    // not leave it frozen (review round 1, finding 3).
+                    // not leave it frozen (review round 1, finding 3), and do
+                    // not report the walk complete (review round 2).
+                    self.incomplete.set(true);
                     tracing::warn!(
                         target: "tree_kill",
                         "pid {}: SIGKILL not delivered ({e}) and it is not provably gone",
@@ -732,7 +784,9 @@ impl Drop for LinuxFreezeTable {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+// `cfg(test)` alone: this module is already Linux-only (lib.rs), and
+// scripts/check_untimed_subprocess.py recognises exactly `#[cfg(test)]`.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::proc_identity::ProcStat;

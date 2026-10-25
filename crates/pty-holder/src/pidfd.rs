@@ -76,18 +76,39 @@ impl PidFd {
     }
 
     /// Whether the process behind this descriptor has exited (a zombie, or
-    /// reaped): a pidfd polls readable from that moment. A failed poll answers
-    /// `false` — an unreadable state is never reported as "exited".
-    pub fn has_exited(&self) -> bool {
-        let mut p = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd for the duration of the call; a zero
-        // timeout, so it never blocks.
-        let rc = unsafe { libc::poll(&mut p, 1, 0) };
-        rc == 1 && p.revents & libc::POLLIN != 0
+    /// reaped): a pidfd polls readable from that moment. `Err` when the poll
+    /// itself fails (`EINTR` is retried): the caller decides what an
+    /// unanswered question means for it — never silently "alive" or "exited".
+    pub fn has_exited(&self) -> io::Result<bool> {
+        loop {
+            let mut p = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call; a zero
+            // timeout, so it never blocks.
+            let rc = unsafe { libc::poll(&mut p, 1, 0) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            // POLLIN once the process has exited; a reaped one also reports
+            // POLLHUP.
+            if p.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return Ok(true);
+            }
+            if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(io::Error::other(format!(
+                    "pidfd poll reported revents {:#x}",
+                    p.revents
+                )));
+            }
+            return Ok(false);
+        }
     }
 }
 
@@ -113,10 +134,10 @@ mod tests {
             }
         };
         assert!(fd.send_signal(0).is_ok());
-        assert!(!fd.has_exited());
+        assert!(!fd.has_exited().unwrap());
         fd.send_signal(libc::SIGKILL).unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !fd.has_exited() {
+        while !fd.has_exited().unwrap() {
             assert!(std::time::Instant::now() < end, "SIGKILL never landed");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
