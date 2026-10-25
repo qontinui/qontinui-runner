@@ -338,6 +338,38 @@ mod tests {
         assert_eq!(parse_stat("1 (x) S 1 2"), None, "truncated stat");
     }
 
+    /// Review round 3, finding 6: a process whose comm is not UTF-8 parses
+    /// in full. Before `parse_stat_bytes` its stat file failed
+    /// `read_to_string` and the process read as ABSENT — to the freeze walk
+    /// and to `reap`'s `session_members` / `in_session` alike — so this pins
+    /// that such processes are now seen. The comm here also carries `)` and
+    /// spaces, and invalid UTF-8 on both sides of them.
+    #[test]
+    fn pty_holder_reap_parse_stat_bytes_reads_a_non_utf8_comm() {
+        let raw: &[u8] =
+            b"4242 (\xc3\x28 x) \xff\xfe) T 17 4242 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 123456";
+        // Precondition, without a decode (source_guard bans one here): byte
+        // 0xFF never occurs in UTF-8, and `\xc3\x28` is a broken sequence.
+        assert!(raw.contains(&0xff), "precondition: not UTF-8");
+        assert_eq!(
+            parse_stat_bytes(raw),
+            Some(ProcStat {
+                state: b'T',
+                zombie: false,
+                ppid: 17,
+                pgrp: 4242,
+                session: 4000,
+                start_ticks: 123456,
+            })
+        );
+        // A non-ASCII byte AFTER the comm is not a number: rejected, not
+        // misread.
+        assert_eq!(
+            parse_stat_bytes(b"1 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9\xff"),
+            None
+        );
+    }
+
     /// Vet D4: the strict listing answers, and lists this process.
     #[cfg(target_os = "linux")]
     #[test]
