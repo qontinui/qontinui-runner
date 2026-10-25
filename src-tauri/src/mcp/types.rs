@@ -68,13 +68,43 @@ pub fn get_mcp_api_port() -> u16 {
         .unwrap_or(MCP_API_PORT)
 }
 
-/// Returns the base URL for this runner instance (e.g., "http://localhost:9877").
+/// The ONE address the runner's HTTP API listens on: the IPv4 loopback.
+///
+/// `mcp_api::try_bind_port` binds exactly this address, and every URL the
+/// runner builds for its own API (or a sibling runner's) names it through
+/// [`runner_loopback_base`] — so the address a self-call dials IS the address
+/// the listener binds, and the two cannot drift apart.
+///
+/// Why not `localhost`: Windows resolves `localhost` to `::1` FIRST, and
+/// nothing listens there, so every NEW connection to `http://localhost:<port>`
+/// first attempts a doomed IPv6 connect. Measured 2026-10-25 against a live
+/// runner's `GET /health`: a fresh `reqwest::Client` (most self-calls build
+/// one per call) paid ~+305 ms (hyper's 300 ms happy-eyeballs fallback), curl
+/// ~+205 ms, Python `urllib` and PowerShell 5.1 ~+2 s (no fallback at all).
+/// Plan `2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect`;
+/// `src-tauri/tests/runner_self_urls_use_ipv4_loopback.rs` keeps new call
+/// sites from spelling `localhost` again.
+pub const RUNNER_API_BIND_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
+
+/// The base URL of the runner HTTP API listening on `port` — this runner's or a
+/// sibling instance's (every runner binds [`RUNNER_API_BIND_IP`]), e.g.
+/// `"http://127.0.0.1:9877"`. No trailing slash.
+///
+/// Prefer [`get_self_base_url`] (the actually-bound port of THIS runner) when an
+/// `AppState` is in scope; use this when the port comes from elsewhere (a
+/// sibling instance's record, a parsed command, a config value).
+///
+/// Takes any `Display` port because the callers hold it as `u16` (the bound
+/// port), `i32` (a `runner_instances` row) or `String` (a parsed command), and
+/// the URL is the same text either way.
+pub fn runner_loopback_base(port: impl std::fmt::Display) -> String {
+    format!("http://{}:{}", RUNNER_API_BIND_IP, port)
+}
+
+/// Returns the base URL for this runner instance (e.g. `"http://127.0.0.1:9877"`).
 /// Reads the actual bound port from AppState.
 pub fn get_self_base_url(app_state: &crate::commands::AppState) -> String {
-    let port = app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
-    format!("http://localhost:{}", port)
+    runner_loopback_base(runner_api_port(app_state))
 }
 
 /// Returns just the actually-bound API port for this runner instance.
@@ -122,8 +152,8 @@ impl UiBridgeFamily {
 }
 
 /// Returns the base URL for a UI Bridge endpoint family on this runner
-/// instance, e.g. `"http://localhost:9877/ui-bridge/control"` or
-/// `"http://localhost:9877/ui-bridge/sdk"`.
+/// instance, e.g. `"http://127.0.0.1:9877/ui-bridge/control"` or
+/// `"http://127.0.0.1:9877/ui-bridge/sdk"`.
 ///
 /// Reads the actually-bound port from `app_state.api_port` (same source
 /// as [`get_self_base_url`]), so secondary/temp runners on non-default
@@ -132,12 +162,9 @@ pub fn runner_ui_bridge_base(
     app_state: &crate::commands::AppState,
     family: UiBridgeFamily,
 ) -> String {
-    let port = app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
     format!(
-        "http://localhost:{}/ui-bridge/{}",
-        port,
+        "{}/ui-bridge/{}",
+        runner_loopback_base(runner_api_port(app_state)),
         family.as_path_segment()
     )
 }
@@ -147,7 +174,47 @@ pub fn runner_ui_bridge_base(
 /// For code paths that do have AppState, prefer `get_self_base_url` which
 /// uses the actual bound port and works correctly with multi-instance runners.
 pub fn get_self_base_url_from_env() -> String {
-    format!("http://localhost:{}", get_mcp_api_port())
+    runner_loopback_base(get_mcp_api_port())
+}
+
+/// Rewrite a URL whose HOST is a loopback name (`localhost`, any case, or
+/// `[::1]`) to name [`RUNNER_API_BIND_IP`] instead; every other URL is
+/// returned unchanged.
+///
+/// Two jobs, one function:
+/// - **No doomed IPv6 connect.** Windows resolves `localhost` to `::1` first;
+///   an IPv4-only listener (this runner's API, and most dev servers) is then
+///   reached only after that connect fails.
+/// - **One key per listener.** Code that KEYS on a URL string (the per-URL
+///   workflow lock, the UI Bridge failure tracker, the SDK connection map) must
+///   not see `http://localhost:9876/ui-bridge` and
+///   `http://127.0.0.1:9876/ui-bridge` as two resources — persisted steps and
+///   skills still carry the `localhost` spelling.
+///
+/// Only the authority's host is touched (`http://localhost.example` and a
+/// `localhost` in the path or query are left alone).
+pub fn canonical_loopback_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let host_start = scheme_end + 3;
+    let rest = url.get(host_start..).unwrap_or("");
+    let host_len = if rest.starts_with('[') {
+        rest.find(']').map(|i| i + 1).unwrap_or(rest.len())
+    } else {
+        rest.find([':', '/', '?', '#']).unwrap_or(rest.len())
+    };
+    let host = rest.get(..host_len).unwrap_or("");
+    if host.eq_ignore_ascii_case("localhost") || host == "[::1]" {
+        format!(
+            "{}{}{}",
+            url.get(..host_start).unwrap_or(""),
+            RUNNER_API_BIND_IP,
+            rest.get(host_len..).unwrap_or("")
+        )
+    } else {
+        url.to_string()
+    }
 }
 
 /// Shared state for the API server (authoritative definition)
@@ -903,4 +970,82 @@ pub struct TaskOutputQuery {
 #[derive(Debug, Deserialize)]
 pub struct SetTaskAutoContinueRequest {
     pub auto_continue: bool,
+}
+
+#[cfg(test)]
+mod loopback_base_url_tests {
+    //! Plan `2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect`:
+    //! every self-URL names the address the listener binds. Literal
+    //! expectations, so a regression to `localhost` (or to any other host)
+    //! reds these rather than moving with a shared constant.
+    use super::*;
+
+    #[test]
+    fn bind_ip_is_the_ipv4_loopback() {
+        assert_eq!(RUNNER_API_BIND_IP.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn loopback_base_names_127_0_0_1_and_the_given_port() {
+        assert_eq!(runner_loopback_base(9876), "http://127.0.0.1:9876");
+        assert_eq!(runner_loopback_base(9899), "http://127.0.0.1:9899");
+    }
+
+    #[test]
+    fn canonical_loopback_url_rewrites_only_a_loopback_host() {
+        for (input, want) in [
+            (
+                "http://localhost:9876/ui-bridge",
+                "http://127.0.0.1:9876/ui-bridge",
+            ),
+            (
+                "http://LocalHost:3000/path?q=localhost",
+                "http://127.0.0.1:3000/path?q=localhost",
+            ),
+            ("http://localhost", "http://127.0.0.1"),
+            ("http://localhost/", "http://127.0.0.1/"),
+            ("ws://localhost:9877", "ws://127.0.0.1:9877"),
+            ("http://[::1]:9876/health", "http://127.0.0.1:9876/health"),
+            (
+                "http://localhost:8080/api/v1?key=val",
+                "http://127.0.0.1:8080/api/v1?key=val",
+            ),
+            // Unchanged: already canonical, not loopback, or only LOOKS like it.
+            ("http://127.0.0.1:5000", "http://127.0.0.1:5000"),
+            (
+                "http://192.168.1.10:3000/api",
+                "http://192.168.1.10:3000/api",
+            ),
+            (
+                "http://localhost.example:80/",
+                "http://localhost.example:80/",
+            ),
+            (
+                "http://example.com/localhost:9876",
+                "http://example.com/localhost:9876",
+            ),
+            ("localhost:9876", "localhost:9876"),
+        ] {
+            assert_eq!(canonical_loopback_url(input), want, "input {input}");
+        }
+    }
+
+    #[test]
+    fn env_base_url_names_127_0_0_1_and_the_env_port() {
+        let _lock = crate::test_env::env_lock();
+        let _env =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT", "QONTINUI_RUNNER_API_URL"]);
+        std::env::set_var("QONTINUI_PORT", "9877");
+        std::env::remove_var("QONTINUI_RUNNER_API_URL");
+
+        assert_eq!(get_self_base_url_from_env(), "http://127.0.0.1:9877");
+        assert_eq!(
+            crate::api_config::get_runner_api_url(),
+            "http://127.0.0.1:9877"
+        );
+        assert_eq!(
+            crate::api_config::get_ipc_response_url(),
+            "http://127.0.0.1:9877/ui-bridge/ipc-response"
+        );
+    }
 }

@@ -14025,8 +14025,11 @@ fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     // co-located with the runner. Loopback traffic bypasses Windows Firewall, so
     // every uniquely-renamed `qontinui-runner-<id>.exe` copy avoids triggering a
     // first-run permission prompt. Also reduces attack surface — the API is never
-    // exposed to LAN.
-    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    // exposed to LAN. Every URL the runner builds for its own API names this SAME
+    // constant (`runner_loopback_base`), so the address a self-call dials cannot
+    // drift from the address bound here.
+    socket
+        .bind(&std::net::SocketAddr::from((crate::mcp::types::RUNNER_API_BIND_IP, port)).into())?;
     socket.listen(1024)?;
     Ok(socket.into())
 }

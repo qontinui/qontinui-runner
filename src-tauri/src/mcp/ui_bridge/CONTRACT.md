@@ -9,7 +9,7 @@ The two authoritative route registries — *do not duplicate these here, link
 and diff against them*:
 
 - **Runner manifest** — `route_manifest()` at `mod.rs:312`, exposed live at
-  `GET http://localhost:9876/ui-bridge/_routes`. Concatenates per-family
+  `GET http://127.0.0.1:9876/ui-bridge/_routes`. Concatenates per-family
   `route_entries()` from ~22 submodules.
 - **SDK contract** — `UI_BRIDGE_ROUTES: RouteDefinition[]` at
   `ui-bridge/packages/ui-bridge/src/server/types.ts:1182` (190 entries).
@@ -545,7 +545,7 @@ not aspirational names.
 **Discovery recipe:**
 
 ```bash
-curl http://localhost:9876/ui-bridge/control/elements | jq '.data[] | .id'
+curl http://127.0.0.1:9876/ui-bridge/control/elements | jq '.data[] | .id'
 ```
 
 Run against the page in question (or a temp runner spawned via the
@@ -623,6 +623,6 @@ The direct-eval fallback emits the same shape plus `source: "direct_eval"`.
   Spawns a temp runner, hits each route, asserts response shape and status
   code. Catches the deeper field-stripping / query-param-drop bugs the
   manifest diff can't see.
-- **Live manifest endpoint** — `GET http://localhost:9876/ui-bridge/_routes`
+- **Live manifest endpoint** — `GET http://127.0.0.1:9876/ui-bridge/_routes`
   returns the runner's actual registered route list. Useful for
   spot-checking what a running build exposes versus what this doc claims.

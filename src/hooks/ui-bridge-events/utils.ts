@@ -1,4 +1,4 @@
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, runnerBaseForPort } from "@/lib/runner-api";
 import {
   type RegisteredElement,
   type RegisteredComponent,
@@ -13,7 +13,7 @@ import type { SerializedElement, SerializedComponent } from "./types";
 export async function httpSendResponse(response: unknown): Promise<boolean> {
   try {
     const port = getApiPort();
-    const resp = await fetch(`http://localhost:${port}/ui-bridge/ipc-response`, {
+    const resp = await fetch(`${runnerBaseForPort(port)}/ui-bridge/ipc-response`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(response),
@@ -92,7 +92,7 @@ function mintDocumentNonce(): string {
  */
 export function pongUrl(port: number | string, source: PongSource, windowLabel: string): string {
   return (
-    `http://localhost:${port}/ui-bridge/pong?source=${source}` +
+    `${runnerBaseForPort(port)}/ui-bridge/pong?source=${source}` +
     `&label=${encodeURIComponent(windowLabel)}&doc=${encodeURIComponent(DOCUMENT_NONCE)}`
   );
 }

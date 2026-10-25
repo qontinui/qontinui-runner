@@ -555,22 +555,12 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
 // Handlers
 // =============================================================================
 
-/// Normalize localhost to 127.0.0.1 to avoid IPv6 resolution issues on Windows.
-/// Windows often resolves `localhost` to `::1` (IPv6) first, but many dev servers
-/// (Next.js, FastAPI, etc.) only bind to IPv4 `0.0.0.0`. This causes reqwest to
-/// hang on the IPv6 connect attempt before falling back to IPv4, exceeding timeouts.
-fn normalize_localhost_url(url: &str) -> String {
-    url.replace("://localhost:", "://127.0.0.1:")
-        .replace("://localhost/", "://127.0.0.1/")
-        .replace("://localhost", "://127.0.0.1") // handle bare localhost without port
-}
-
 /// POST /ui-bridge/sdk/connect — Connect to an SDK app
 async fn handle_connect(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
-    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
+    let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     info!(url = %url, "Connecting to SDK app");
 
     // Check if we're already connected to this URL
@@ -3725,7 +3715,7 @@ async fn handle_discover_and_cache(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<DiscoverAndCacheRequest>,
 ) -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
+    let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     let app_name = req.app_name.unwrap_or_else(|| "Unknown App".to_string());
 
     info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
@@ -8105,49 +8095,9 @@ async fn handle_sse_event_stream(
 mod tests {
     use super::*;
 
-    #[test]
-    fn normalize_localhost_with_port() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost:3000/path"),
-            "http://127.0.0.1:3000/path"
-        );
-    }
-
-    #[test]
-    fn normalize_bare_localhost() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost"),
-            "http://127.0.0.1"
-        );
-    }
-
-    #[test]
-    fn normalize_localhost_with_trailing_slash() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost/"),
-            "http://127.0.0.1/"
-        );
-    }
-
-    #[test]
-    fn normalize_non_localhost_unchanged() {
-        let url = "http://192.168.1.10:3000/api";
-        assert_eq!(normalize_localhost_url(url), url);
-    }
-
-    #[test]
-    fn normalize_already_ip_unchanged() {
-        let url = "http://127.0.0.1:5000";
-        assert_eq!(normalize_localhost_url(url), url);
-    }
-
-    #[test]
-    fn normalize_preserves_path_and_query() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost:8080/api/v1?key=val"),
-            "http://127.0.0.1:8080/api/v1?key=val"
-        );
-    }
+    // `normalize_localhost_url`'s cases moved with it to
+    // `mcp::types::canonical_loopback_url` (plan
+    // 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
 
     /// Every action name passed to `dispatch_app_request` (or the
     /// snapshot-synthesis tri-state shim `try_ws_dispatch` that still wraps
