@@ -876,7 +876,8 @@ impl SecureStorage {
     fn load_tokens(&self) -> Result<StoredTokens> {
         if !self.storage_path.exists() {
             // TRACE, not DEBUG: this runs on every token read of an unpaired
-            // store, so at DEBUG it floods (see `first_initialization`).
+            // store, so at DEBUG it floods (plan
+            // `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`).
             trace!("Storage file does not exist, returning empty tokens");
             return Ok(StoredTokens::default());
         }
@@ -3371,6 +3372,10 @@ mod tests {
         "Access token not in secure storage",
         // auth `get_access_token`, store absent and no keychain
         "Access token not in keychain",
+        // auth `get_refresh_token`, store absent
+        "Refresh token not in secure storage",
+        // auth `get_refresh_token`, store absent and no keychain
+        "Refresh token not in keychain",
     ];
 
     /// The per-read and absent-store lines are silent at DEBUG and still
@@ -3387,12 +3392,15 @@ mod tests {
         );
 
         let reads = || {
-            tracing::info!("{CAPTURE_SENTINEL}");
+            // DEBUG, not INFO: the DEBUG capture's sentinel then also proves
+            // that capture really admitted DEBUG events.
+            tracing::debug!("{CAPTURE_SENTINEL}");
             let paired = crate::auth::AuthManager::with_storage_no_keychain(present.clone());
             assert_eq!(paired.get_access_token().unwrap(), "t");
             assert_eq!(paired.get_refresh_token().unwrap(), "");
             let unpaired = crate::auth::AuthManager::with_storage_no_keychain(absent.clone());
             assert!(unpaired.get_access_token().is_err());
+            assert!(unpaired.get_refresh_token().is_err());
         };
 
         // Every line that `logs` carries at `level`, or that it lacks there.

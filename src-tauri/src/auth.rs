@@ -837,12 +837,14 @@ impl AuthManager {
         // Try file storage first (primary)
         match self.secure_storage.get_refresh_token() {
             Ok(token) => {
-                // TRACE: a per-read line, demoted with the access-token ones.
+                // TRACE, like the access-token lines above: every refresh read
+                // lands here, on a paired store or (the two arms below) an
+                // unpaired one.
                 trace!("Retrieved refresh token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
-                debug!("Refresh token not in secure storage: {}", e);
+                trace!("Refresh token not in secure storage: {}", e);
             }
         }
 
@@ -853,7 +855,7 @@ impl AuthManager {
                 Ok(token)
             }
             Err(e) => {
-                debug!("Refresh token not in keychain: {}", e);
+                trace!("Refresh token not in keychain: {}", e);
                 Err(anyhow::anyhow!("Refresh token not found in any storage"))
             }
         }
