@@ -432,7 +432,13 @@ fn rust_test_regions(lines: &[LexedLine]) -> (Vec<(usize, usize)>, Vec<(String, 
         // remembering a `#[path = "…"]` (its string lives in `scanned`, not `code`).
         let mut j = i + 1;
         let mut path_attr: Option<String> = None;
-        while j < lines.len() {
+        // `#[cfg(test)] mod tests;` / `#[cfg(test)] mod tests { … }` on ONE line:
+        // the gated item is the rest of the attribute's own line.
+        let same_line = s.split_once(']').map(|(_, r)| r.trim()).unwrap_or("");
+        if !same_line.is_empty() {
+            j = i;
+        }
+        while same_line.is_empty() && j < lines.len() {
             let t = lines[j].code.trim();
             if t.is_empty() || t.starts_with("#[") {
                 if t.starts_with("#[path") {
@@ -450,7 +456,11 @@ fn rust_test_regions(lines: &[LexedLine]) -> (Vec<(usize, usize)>, Vec<(String, 
         if j >= lines.len() {
             break;
         }
-        let item = lines[j].code.trim();
+        let item = if same_line.is_empty() {
+            lines[j].code.trim()
+        } else {
+            same_line
+        };
         let item_body = item
             .trim_start_matches("pub(crate) ")
             .trim_start_matches("pub(super) ")
@@ -777,6 +787,7 @@ fn the_guard_flags_every_forbidden_form_and_only_those() {
         (Lang::Rust, r#"let u = format!("http://localhost:{}", vite_port); // runner-localhost-ok: Vite dev server"#),
         (Lang::Rust, "// runner-localhost-ok: a target app's dev server\nlet u = format!(\"http://localhost:{}\", p);"),
         (Lang::Rust, "#[cfg(test)]\nmod tests {\n    const U: &str = \"http://localhost:9876\";\n}"),
+        (Lang::Rust, "#[cfg(test)] mod tests {\n    const U: &str = \"http://localhost:9876\";\n}"),
         (Lang::Js, "const u = `http://127.0.0.1:${port}/runners`;"),
         (Lang::Js, "// fetch(`http://localhost:${port}`)"),
         (Lang::Js, "const t = \"Don't\"; // http://localhost:9876"),
@@ -828,6 +839,7 @@ fn test_only_module_files_come_from_cfg_test_declarations() {
     let sources = vec![
         src("src/mcp/origin_guard.rs", "pub fn f() {}\n\n#[cfg(test)]\nmod tests;\n"),
         src("src/step_executor/mod.rs", "pub mod executor;\n#[cfg(test)]\nmod injected_step_tests;\n"),
+        src("src/peer/mod.rs", "pub fn f() {}\n#[cfg(test)] mod one_line_tests;\n"),
         src(
             "src/step_executor/executor.rs",
             "#[cfg(test)]\n#[path = \"typed_dispatch_corpus_tests.rs\"]\nmod typed_dispatch_corpus_tests;\n",
@@ -843,7 +855,8 @@ fn test_only_module_files_come_from_cfg_test_declarations() {
         "{set:?}"
     );
     assert!(
-        set.contains(&PathBuf::from("src/step_executor/injected_step_tests.rs")),
+        set.contains(&PathBuf::from("src/step_executor/injected_step_tests.rs"))
+            && set.contains(&PathBuf::from("src/peer/one_line_tests.rs")),
         "{set:?}"
     );
     assert!(

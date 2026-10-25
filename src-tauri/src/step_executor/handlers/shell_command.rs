@@ -603,7 +603,7 @@ impl ShellCommandHandler {
         None
     }
 
-    /// Probe `GET http://localhost:<port>/state-machine/status` and return whether
+    /// Probe `GET http://127.0.0.1:<port>/state-machine/status` and return whether
     /// a state machine is currently loaded in the Python bridge.
     ///
     /// Timeout is 3s so a hung or unreachable bridge doesn't block the step for

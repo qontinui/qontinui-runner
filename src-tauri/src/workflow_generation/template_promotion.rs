@@ -390,6 +390,26 @@ mod tests {
         assert!(params.iter().any(|p| p.name == "app_url"));
     }
 
+    /// The `app_url` extraction pattern recognises a scheme-less host:port in
+    /// either loopback spelling (the runner emits `127.0.0.1` since plan
+    /// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
+    #[test]
+    fn test_app_url_extraction_pattern_matches_both_loopback_spellings() {
+        let json = serde_json::json!({"command": "curl 127.0.0.1:9876/health"});
+        let params = extract_parameters(&json);
+        let app_url = params
+            .iter()
+            .find(|p| p.name == "app_url")
+            .expect("an app_url parameter");
+        let re = regex::Regex::new(&app_url.extraction_pattern).expect("pattern compiles");
+        for (text, want) in [
+            ("curl 127.0.0.1:9876/health", "127.0.0.1:9876"),
+            ("curl localhost:3000/x", "localhost:3000"),
+        ] {
+            assert_eq!(re.find(text).map(|m| m.as_str()), Some(want), "{text}");
+        }
+    }
+
     #[test]
     fn test_extract_parameters_with_path() {
         let json = serde_json::json!({

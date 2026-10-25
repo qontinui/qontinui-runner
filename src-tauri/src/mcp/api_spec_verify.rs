@@ -27,7 +27,7 @@ pub struct VerifyApiSpecRequest {
     pub app_id: String,
     /// Spec ID (filename without extension, e.g., "event-history")
     pub spec_id: String,
-    /// Override base URL (default: http://localhost:{self_port})
+    /// Override base URL (default: http://127.0.0.1:{self_port})
     pub base_url: Option<String>,
     /// Only run assertions with these IDs (if empty, run all)
     pub assertion_ids: Option<Vec<String>>,

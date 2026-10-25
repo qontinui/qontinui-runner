@@ -309,7 +309,7 @@ pub struct UrlLockInfo {
 
 /// Normalize a URL to its base form for lock key purposes.
 ///
-/// Canonicalizes a loopback host (`localhost`, `[::1]`) to the IPv4 loopback,
+/// Canonicalizes a `localhost` host to the IPv4 loopback,
 /// then strips trailing slashes and path segments after the UI Bridge base.
 /// For example, `http://localhost:3001/api/ui-bridge/sdk/execute` becomes
 /// `http://127.0.0.1:3001/api/ui-bridge`. The host step is what keeps a
@@ -560,7 +560,8 @@ mod tests {
 
         for other in [
             "http://127.0.0.1:9876/ui-bridge",
-            "http://[::1]:9876/ui-bridge/control/snapshot",
+            "http://127.0.0.1:9876/ui-bridge/control/snapshot",
+            "http://LOCALHOST:9876/ui-bridge/sdk/elements",
         ] {
             let result = mgr.try_acquire(other, "task-2", "Workflow B").await;
             assert!(

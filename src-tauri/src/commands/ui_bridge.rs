@@ -497,7 +497,7 @@ pub struct UIBridgeExplorationResult {
 /// fingerprint-based state discovery.
 ///
 /// # Arguments
-/// * `runner_url` - URL of the runner (default: http://localhost:9876)
+/// * `runner_url` - URL of the runner (default: http://127.0.0.1:9876)
 /// * `config` - Optional exploration configuration
 ///
 /// # Returns
