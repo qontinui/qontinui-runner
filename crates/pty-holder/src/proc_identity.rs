@@ -91,6 +91,11 @@ pub fn is_same_process(pid: u32, token: Option<&str>) -> bool {
 /// The `/proc/<pid>/stat` fields the Linux reapers read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcStat {
+    /// The state letter (field 3): `R`, `S`, `D`, `T` (stopped), `t`
+    /// (tracing stop), `Z`, … — what lets a tree kill's tests say "never left
+    /// stopped" (plan `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`,
+    /// vet D9).
+    pub state: u8,
     /// State `Z`: exited, not yet reaped by its parent. A signal changes
     /// nothing about it, so reapers skip it.
     pub zombie: bool,
@@ -108,8 +113,10 @@ pub fn parse_stat(raw: &str) -> Option<ProcStat> {
     let (_, rest) = raw.rsplit_once(')')?;
     let f: Vec<&str> = rest.split_whitespace().collect();
     // After the comm: state(0) ppid(1) pgrp(2) session(3) … starttime(19).
+    let state = *f.first()?.as_bytes().first()?;
     Some(ProcStat {
-        zombie: *f.first()? == "Z",
+        state,
+        zombie: state == b'Z',
         ppid: f.get(1)?.parse().ok()?,
         pgrp: f.get(2)?.parse().ok()?,
         session: f.get(3)?.parse().ok()?,
@@ -138,24 +145,51 @@ mod imp {
     }
 
     pub fn start_token(pid: u32) -> Option<String> {
-        let st = stat(pid)?;
-        Some(format!("linux:{}:{}", boot_id()?, st.start_ticks))
+        start_token_of(&stat(pid)?)
     }
 
-    /// Every pid in `/proc`, unordered. A process that exits while this runs
-    /// may or may not be listed; callers re-verify each pid they act on.
+    /// The start token `stat` was read from: `linux:<boot id>:<start ticks>`,
+    /// the format [`super::start_token`] answers. For a caller that has
+    /// already read the stat inside its own identity window (a pidfd held
+    /// across the read) and must compare THAT read, not a second one.
+    pub fn start_token_of(stat: &ProcStat) -> Option<String> {
+        Some(format!("linux:{}:{}", boot_id()?, stat.start_ticks))
+    }
+
+    /// Every pid in `/proc`, unordered; `Err` when the listing cannot be read
+    /// to its end, so a caller can tell "no such process" from "could not
+    /// look" (plan `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`,
+    /// vet D4). A process that exits while this runs may or may not be listed;
+    /// callers re-verify each pid they act on.
+    pub fn try_list_pids() -> std::io::Result<Vec<u32>> {
+        read_pids(true)
+    }
+
+    /// [`try_list_pids`], forgiving: an unreadable `/proc` lists nothing, and
+    /// an entry that fails mid-listing is skipped, as this always did.
     pub fn list_pids() -> Vec<u32> {
-        std::fs::read_dir("/proc")
-            .map(|rd| {
-                rd.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        read_pids(false).unwrap_or_default()
+    }
+
+    fn read_pids(strict: bool) -> std::io::Result<Vec<u32>> {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            match entry {
+                Ok(e) => {
+                    if let Some(pid) = e.file_name().to_str().and_then(|n| n.parse().ok()) {
+                        pids.push(pid);
+                    }
+                }
+                Err(e) if strict => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(pids)
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{list_pids, stat};
+pub use imp::{list_pids, start_token_of, stat, try_list_pids};
 
 #[cfg(windows)]
 mod imp {
@@ -238,6 +272,7 @@ mod tests {
         assert_eq!(
             parse_stat(raw),
             Some(ProcStat {
+                state: b'S',
                 zombie: false,
                 ppid: 1,
                 pgrp: 1234,
@@ -245,13 +280,29 @@ mod tests {
                 start_ticks: 987654,
             })
         );
-        assert!(
-            parse_stat("9 (z) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5")
-                .unwrap()
-                .zombie
+        let zombie = parse_stat("9 (z) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5").unwrap();
+        assert!(zombie.zombie);
+        assert_eq!(zombie.state, b'Z');
+        assert_eq!(
+            parse_stat("9 (z) T 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5")
+                .map(|s| (s.state, s.zombie)),
+            Some((b'T', false)),
+            "a stopped process is told apart by its state letter"
         );
         assert_eq!(parse_stat("no paren here"), None);
         assert_eq!(parse_stat("1 (x) S 1 2"), None, "truncated stat");
+    }
+
+    /// Vet D4: the strict listing answers, and lists this process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_reap_try_list_pids_lists_this_process() {
+        let me = std::process::id();
+        assert!(try_list_pids().unwrap().contains(&me));
+        assert!(list_pids().contains(&me));
+        let mine = stat(me).unwrap();
+        assert_eq!(start_token_of(&mine), start_token(me));
+        assert_ne!(mine.state, b'T', "this process is running, not stopped");
     }
 
     #[cfg(any(target_os = "linux", windows))]

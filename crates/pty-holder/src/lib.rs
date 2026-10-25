@@ -46,6 +46,12 @@
 //!   teardown, reaping.
 //! - [`proc_identity`] — a process's start token, so a recorded pid can be
 //!   told from a recycled one (Phase 3).
+//! - `pidfd` (Linux only) — the process handle every Linux kill here signals
+//!   through, so a check and its kill are about one process.
+//! - `tree_freeze` (Linux only) — the freeze walk: a direct child's whole
+//!   process tree killed with no stranger signalled, through the same generic
+//!   walk as the Windows tree kill (plan
+//!   `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`, Phase 1).
 //! - [`reap`] — a pane's process tree is reaped by its own holder at pane end,
 //!   and a dead holder's proven remainder by the boot sweep (Phase 3, D8).
 //! - [`sweep`] — the boot sweep: the per-pane lock directory IS the orphan
@@ -62,6 +68,8 @@ pub mod lock;
 pub mod metadata;
 pub mod modes;
 pub mod pane;
+#[cfg(target_os = "linux")]
+pub mod pidfd;
 pub mod proc_identity;
 pub mod protocol;
 pub mod pty;
@@ -75,6 +83,8 @@ pub mod startup;
 pub mod sweep;
 pub mod terminate;
 pub mod transport;
+#[cfg(target_os = "linux")]
+pub mod tree_freeze;
 
 #[cfg(test)]
 mod source_guard;

@@ -109,9 +109,19 @@ impl std::error::Error for TreeKillError {}
 
 /// What the walk needs from the operating system. A trait so the linking rule
 /// and the pass loop are tested against a scripted process table — pid reuse
-/// included — on every OS; the Windows implementation is [`Win32Table`].
+/// included — on every OS; the Windows implementation is [`Win32Table`], the
+/// Linux one is `qontinui_pty_holder::tree_freeze::LinuxFreezeTable`.
 pub trait ProcessTable {
     /// An owned process handle. While one is held, its pid cannot be reused.
+    ///
+    /// Windows gets that from the kernel: an open process handle keeps the pid
+    /// reserved. Linux has no such rule — a pid is free the moment its process
+    /// is reaped — so the Linux table supplies it by STOP-ON-OPEN: `open`
+    /// stops the process (`SIGSTOP` through a pidfd) before returning its
+    /// handle, and `terminate` only marks it, deferring every kill until the
+    /// walk has returned. A stopped process cannot exit on its own, and a
+    /// stopped parent cannot reap its children, so every handle's pid stays
+    /// reserved for as long as the walk holds it.
     type Handle;
     /// "Now", in the units creation times are compared in (FILETIME).
     fn now(&self) -> u64;
@@ -134,6 +144,10 @@ pub trait ProcessTable {
 /// Every member's handle is held until the call returns, so a member killed in
 /// one pass still pins its pid in the next: a process the snapshot lists under
 /// that pid is the member's own child, never a stranger's that reused the pid.
+/// On Linux the same invariant holds by stop-on-open (see
+/// [`ProcessTable::Handle`]): the walk opens a parent before its children, so
+/// each member is stopped before anything below it is linked, no member exits
+/// or is reaped during the walk, and the deferred kills land after it returns.
 ///
 /// `Err` when the root is `self_pid`, when its creation time is unreadable,
 /// when the FIRST snapshot fails (after signalling the root alone, so the

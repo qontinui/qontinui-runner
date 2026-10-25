@@ -104,50 +104,24 @@ pub fn terminate_verified_holder(
 #[cfg(target_os = "linux")]
 mod imp {
     use super::Termination;
+    use crate::pidfd::{self, Opened};
 
     pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), String>) -> Termination {
-        // SAFETY: pidfd_open(pid, 0) takes no pointers; the result is either
-        // -1 or a new descriptor owned (and closed) below.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOSYS) {
-                return super::plain_kill(pid, verify, "pidfd_open unavailable");
-            }
-            return Termination::refused(format!("pidfd_open({pid}): {err}"));
-        }
-        let fd = fd as libc::c_int;
-        let result = match verify() {
-            Err(why) => Termination::refused(why),
-            Ok(()) => {
-                // SAFETY: a pidfd we own; null siginfo, no flags.
-                let rc = unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        fd,
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    )
-                };
-                if rc == 0 {
-                    Termination {
-                        signalled: true,
-                        detail: "SIGKILL to the verified holder through its pidfd".into(),
-                    }
-                } else {
-                    Termination::refused(format!(
-                        "pidfd_send_signal: {}",
-                        std::io::Error::last_os_error()
-                    ))
-                }
-            }
+        let fd = match pidfd::open(pid) {
+            Opened::Fd(fd) => fd,
+            Opened::NoPidFd => return super::plain_kill(pid, verify, "pidfd_open unavailable"),
+            Opened::Gone(err) => return Termination::refused(format!("pidfd_open({pid}): {err}")),
         };
-        // SAFETY: closing the descriptor pidfd_open returned, exactly once.
-        unsafe {
-            libc::close(fd);
+        match verify() {
+            Err(why) => Termination::refused(why),
+            Ok(()) => match fd.send_signal(libc::SIGKILL) {
+                Ok(()) => Termination {
+                    signalled: true,
+                    detail: "SIGKILL to the verified holder through its pidfd".into(),
+                },
+                Err(e) => Termination::refused(format!("pidfd_send_signal: {e}")),
+            },
         }
-        result
     }
 }
 

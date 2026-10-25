@@ -168,41 +168,8 @@ pub use linux::own_holder_scope_cgroup;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::ReapReport;
+    use crate::pidfd::{self, Opened};
     use crate::proc_identity::{list_pids, stat};
-
-    /// A pidfd, closed on drop.
-    struct PidFd(libc::c_int);
-
-    impl Drop for PidFd {
-        fn drop(&mut self) {
-            // SAFETY: a descriptor pidfd_open returned, closed exactly once.
-            unsafe {
-                libc::close(self.0);
-            }
-        }
-    }
-
-    enum Opened {
-        Fd(PidFd),
-        /// `pidfd_open` does not exist on this kernel.
-        NoPidFd,
-        /// The process is gone (or not ours to open).
-        Gone,
-    }
-
-    fn pidfd_open(pid: i32) -> Opened {
-        // SAFETY: pidfd_open(pid, 0) takes no pointers; the result is -1 or a
-        // new descriptor owned by the returned PidFd.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd >= 0 {
-            return Opened::Fd(PidFd(fd as libc::c_int));
-        }
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-            Opened::NoPidFd
-        } else {
-            Opened::Gone
-        }
-    }
 
     /// SIGKILL `pid` only if `still_ours(pid)` holds AFTER a handle on it was
     /// taken. `Some(detail)` names the route when a kill was delivered.
@@ -210,23 +177,13 @@ mod linux {
         pid: i32,
         still_ours: impl Fn(i32) -> bool,
     ) -> Option<&'static str> {
-        match pidfd_open(pid) {
-            Opened::Gone => None,
+        match pidfd::open(pid) {
+            Opened::Gone(_) => None,
             Opened::Fd(fd) => {
                 if !still_ours(pid) {
                     return None;
                 }
-                // SAFETY: a pidfd we own; null siginfo, no flags.
-                let rc = unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        fd.0,
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    )
-                };
-                (rc == 0).then_some("pidfd")
+                fd.send_signal(libc::SIGKILL).is_ok().then_some("pidfd")
             }
             Opened::NoPidFd => {
                 if !still_ours(pid) {

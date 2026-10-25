@@ -37,18 +37,34 @@ portable-pty = "0.8"
 # and the runner read one VT grammar.
 vte = "0.15"
 
+# The generic process-TREE walk (`process_tree::walk` and its `ProcessTable`
+# trait) is plain logic, not Win32: the Windows boot sweep drives it with a
+# Toolhelp table, and the Linux freeze walk (`tree_freeze`, plan
+# 2026-10-25-runner-kill-paths-never-kill-anything-off-windows, D-1 "Where the
+# code lives") drives the SAME walk with a /proc + pidfd table. So this is a
+# dependency on every target. Off Windows the crate compiles its OS-neutral
+# modules only, which add `tracing` to the holder binary and nothing else.
+qontinui-runner-win32 = { path = "../runner-win32" }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `tree_freeze` logs what a tree kill could not do (a member that refused
+# SIGSTOP, a kernel without pidfd_open) into the runner's own log; the report
+# type it returns is runner-win32's and carries no notes. Already in the
+# dependency graph through runner-win32, so this adds an edge, not a crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing = "0.1"
 
 # Target-gated with an EXPLICIT feature list, as crates/runner-win32 does: a
 # plain `windows-sys` dependency takes default features and resolves none of
 # these call sites.
 [target.'cfg(windows)'.dependencies]
-# The RUNNER-side spawner (`spawn`) decides the holder's job-breakaway route
-# through runner-win32's `holder_spawn` (plan D4 as corrected 2026-09-27). The
-# holder binary itself uses only runner-win32's `process_tree` (the boot
-# sweep's tree reap and `proc_identity::creation_time`).
-qontinui-runner-win32 = { path = "../runner-win32" }
+# runner-win32 itself is in [dependencies] above (every target). On Windows the
+# RUNNER-side spawner (`spawn`) also decides the holder's job-breakaway route
+# through its `holder_spawn` (plan D4 as corrected 2026-09-27), and the holder
+# binary uses its `process_tree` (the boot sweep's tree reap and
+# `proc_identity::creation_time`).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     # SECURITY_ATTRIBUTES, TOKEN_USER, GetTokenInformation — the pipe DACL.
