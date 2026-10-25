@@ -236,7 +236,7 @@ pub fn format_manifest(entries: &[ManifestEntry], runner_api_port: u16) -> Strin
          To call one of their actions, emit a `command` step:\n\n",
     );
     out.push_str(&format!(
-        "`curl -sS -X POST http://localhost:{port}/ui-bridge/control/component/<wrapperId>/action/<actionId> -H \"Content-Type: application/json\" -d '{{ ...params... }}'`\n\n",
+        "`curl -sS -X POST http://127.0.0.1:{port}/ui-bridge/control/component/<wrapperId>/action/<actionId> -H \"Content-Type: application/json\" -d '{{ ...params... }}'`\n\n",
         port = runner_api_port
     ));
     out.push_str("Available wrappers and actions:\n\n");

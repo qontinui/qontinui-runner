@@ -309,15 +309,20 @@ pub struct UrlLockInfo {
 
 /// Normalize a URL to its base form for lock key purposes.
 ///
-/// Strips trailing slashes and path segments after the UI Bridge base.
+/// Canonicalizes a loopback host (`localhost`, `[::1]`) to the IPv4 loopback,
+/// then strips trailing slashes and path segments after the UI Bridge base.
 /// For example, `http://localhost:3001/api/ui-bridge/sdk/execute` becomes
-/// `http://localhost:3001/api/ui-bridge`.
+/// `http://127.0.0.1:3001/api/ui-bridge`. The host step is what keeps a
+/// persisted `localhost` step and a `127.0.0.1` step on the SAME runner
+/// mutually exclusive (plan
+/// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn normalize_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
+    let canonical = crate::mcp::types::canonical_loopback_url(url);
+    let trimmed = canonical.trim_end_matches('/');
 
     // If URL contains known SDK/control path segments, strip them
     for segment in &["/sdk/", "/control/"] {
@@ -542,6 +547,33 @@ mod tests {
         assert!(err.contains("task-1"));
     }
 
+    /// A `localhost` step and a `127.0.0.1` step on the same runner drive the
+    /// same UI, so they must contend for ONE lock. Before the key was
+    /// canonicalized, flipping the runner's default URL to `127.0.0.1` while
+    /// persisted steps kept `localhost` would have silently split the lock.
+    #[tokio::test]
+    async fn test_loopback_spellings_share_one_lock() {
+        let mgr = UrlLockManager::new();
+
+        mgr.acquire("http://localhost:9876/ui-bridge", "task-1", "Workflow A")
+            .await;
+
+        for other in [
+            "http://127.0.0.1:9876/ui-bridge",
+            "http://[::1]:9876/ui-bridge/control/snapshot",
+        ] {
+            let result = mgr.try_acquire(other, "task-2", "Workflow B").await;
+            assert!(
+                result.is_err(),
+                "{other} must contend with the localhost holder"
+            );
+            assert!(mgr.is_locked(other).await, "{other}");
+        }
+        // A different port is a different runner: not contended.
+        assert!(!mgr.is_locked("http://127.0.0.1:9877/ui-bridge").await);
+        assert_eq!(mgr.info().await[0].url, "http://127.0.0.1:9876/ui-bridge");
+    }
+
     #[tokio::test]
     async fn test_try_acquire_succeeds_same_holder() {
         let mgr = UrlLockManager::new();
@@ -638,19 +670,19 @@ mod tests {
     fn test_normalize_url_function() {
         assert_eq!(
             normalize_url("http://localhost:3001/api/ui-bridge/sdk/execute"),
-            "http://localhost:3001/api/ui-bridge"
+            "http://127.0.0.1:3001/api/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:3001/api/ui-bridge/control/snapshot"),
-            "http://localhost:3001/api/ui-bridge"
+            "http://127.0.0.1:3001/api/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:9876/ui-bridge/"),
-            "http://localhost:9876/ui-bridge"
+            "http://127.0.0.1:9876/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:9876/ui-bridge"),
-            "http://localhost:9876/ui-bridge"
+            "http://127.0.0.1:9876/ui-bridge"
         );
     }
 }

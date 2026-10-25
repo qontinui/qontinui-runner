@@ -135,7 +135,8 @@ fn extract_parameters(workflow_json: &serde_json::Value) -> Vec<TemplateParamete
                 name: "app_url".to_string(),
                 description: "Application URL or host:port".to_string(),
                 default_value: s.clone(),
-                extraction_pattern: r"https?://[^\s/]+(?::\d+)?|localhost:\d+".to_string(),
+                extraction_pattern: r"https?://[^\s/]+(?::\d+)?|(?:localhost|127\.0\.0\.1):\d+"
+                    .to_string(),
             });
         }
 
@@ -345,6 +346,7 @@ mod tests {
         assert!(is_url_pattern("http://localhost:3000"));
         assert!(is_url_pattern("https://example.com/api"));
         assert!(is_url_pattern("localhost:8080"));
+        assert!(is_url_pattern("127.0.0.1:9876"));
         assert!(!is_url_pattern("hello world"));
         assert!(!is_url_pattern("cargo test"));
     }

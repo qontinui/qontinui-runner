@@ -514,7 +514,7 @@ pub async fn ui_bridge_run_exploration(
     let bridge_compartment = state.inner().clone();
     let self_url = {
         let port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
-        format!("http://localhost:{}", port)
+        crate::mcp::types::runner_loopback_base(port)
     };
 
     spawn_blocking_tracked(move || -> Result<CommandResponse, String> {

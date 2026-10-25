@@ -842,7 +842,14 @@ impl StepHandler for UiBridgeHandler {
             .unwrap_or(DEFAULT_UI_BRIDGE_ACTION);
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
         let default_ui_bridge = format!("{}/ui-bridge", self_base);
-        let raw_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
+        // A persisted step (or a skill default) may still say `localhost`;
+        // canonicalize it so it neither pays the doomed `::1` connect nor keys
+        // the URL lock / failure tracker apart from a `127.0.0.1` step.
+        let canonical_step_url = step
+            .ui_bridge_url
+            .as_deref()
+            .map(crate::mcp::types::canonical_loopback_url);
+        let raw_url = canonical_step_url.as_deref().unwrap_or(&default_ui_bridge);
 
         // SDK operations (navigate, execute, assert) always go through the runner's SDK proxy.
         // The `ui_bridge_url` may be a page URL (e.g., "http://localhost:3001/build/page-sweep")

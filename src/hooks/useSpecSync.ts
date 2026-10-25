@@ -11,7 +11,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAiSession } from "./useAiSession";
 import { buildPageSpecPrompt } from "@/lib/page-analysis-prompt-builder";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, runnerBaseForPort } from "@/lib/runner-api";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
@@ -130,7 +130,7 @@ export async function getQuarantinedStateIds(): Promise<Set<string>> {
     if (!base) return new Set();
     return fetchQuarantinedStateIdsFromBase(base);
   }
-  return fetchQuarantinedStateIdsFromBase(`http://localhost:${port}`);
+  return fetchQuarantinedStateIdsFromBase(`${runnerBaseForPort(port)}`);
 }
 
 async function fetchQuarantinedStateIdsFromBase(base: string): Promise<Set<string>> {

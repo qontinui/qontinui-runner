@@ -334,7 +334,7 @@ pub async fn verify_api_spec(
     let port = super::types::get_mcp_api_port();
     let base_url = request
         .base_url
-        .unwrap_or_else(|| format!("http://localhost:{}", port));
+        .unwrap_or_else(|| super::types::runner_loopback_base(port));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
