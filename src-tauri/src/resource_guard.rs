@@ -3061,6 +3061,12 @@ pub(crate) fn capture_logs<R>(f: impl FnMut() -> R) -> (R, String) {
 /// empty capture is also what the race produces. Have `f` emit a sentinel line
 /// first and assert the sentinel IS present; then "nothing else was logged"
 /// cannot pass on a lost capture, and the retry never fires.
+///
+/// Because a lost capture re-runs `f`, `f` should be safe to run more than
+/// once: a closure that bumps a counter or performs a one-shot effect will see
+/// it again on the retry, and its caller's later assertions on that effect then
+/// fail for the race's reason rather than the log's (still a failure, never a
+/// false pass).
 #[cfg(test)]
 pub(crate) fn capture_logs_at<R>(level: tracing::Level, mut f: impl FnMut() -> R) -> (R, String) {
     const CAPTURE_ATTEMPTS: usize = 5;

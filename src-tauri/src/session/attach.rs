@@ -390,7 +390,7 @@ pub fn start_poll_task(registry: Arc<SessionRegistry>) -> tokio::task::JoinHandl
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -657,7 +657,7 @@ mod tests {
 
     /// Serve `body` as the answer to every request, recording each request
     /// line — a canned coord for `GET /sessions/attach-requests`.
-    async fn serve_canned(
+    pub(in crate::session) async fn serve_canned(
         listener: tokio::net::TcpListener,
         body: String,
         seen: Arc<std::sync::Mutex<Vec<String>>>,

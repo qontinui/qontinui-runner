@@ -177,6 +177,12 @@ impl RemoteAttachGrants {
     /// answers.
     pub fn insert(&self, grant: AttachGrant, now: u64) -> GrantInsert {
         let Ok(mut map) = self.inner.lock() else {
+            // Every other refusal is logged where it is decided; without this
+            // line a poisoned table would drop the grant without a trace.
+            warn!(
+                grant_jti = %grant.grant_jti,
+                "remote attach: grant NOT recorded (the grant table lock is poisoned)"
+            );
             return GrantInsert::Refused;
         };
         map.retain(|_, g| g.expires_at > now);

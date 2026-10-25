@@ -879,4 +879,108 @@ mod tests {
         }
         assert!(!table.contains("jti-0"), "the spent grant stays spent");
     }
+
+    /// The create entry point, end to end: `run_catchup` against a loopback
+    /// coord serving the same 20 rows twice. The first pass records them (20
+    /// `grant recorded` lines and one `new=20` summary); the second, which is
+    /// every later 60 s tick in production, logs nothing at INFO.
+    ///
+    /// Writes the GLOBAL table (that is what `run_catchup` feeds), so its jtis
+    /// are unique to this run and removed afterwards. Runs under
+    /// `isolated_ambient` so the coord GET reads no real credential.
+    #[test]
+    fn run_catchup_logs_a_relisted_create_grant_once_rather_than_on_every_pass() {
+        use super::super::attach::tests::serve_canned;
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: create run_catchup capture is live";
+        // Logged at INFO by the lib `auth` on every 25th coord call
+        // process-wide (see the attach twin); not this module's line.
+        const UNRELATED: &str = "coord data-plane device-JWT coverage";
+        let _amb = crate::test_env::isolated_ambient();
+
+        let device = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let jtis: Vec<String> = (0..20).map(|i| format!("{run}-{i}")).collect();
+        let expires = now_epoch_secs() + 900;
+        let body = json!({
+            "requests": jtis.iter().map(|jti| json!({
+                "grant_jti": jti,
+                "source_device_id": Uuid::from_u128(1).to_string(),
+                "source_user_id": Uuid::from_u128(2).to_string(),
+                "target_device_id": device.to_string(),
+                "expires_at": expires,
+            })).collect::<Vec<_>>(),
+            "storage": "present",
+        })
+        .to_string();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.spawn(serve_canned(listener, body, seen.clone()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let coord_url = format!("http://{addr}");
+        let pass = || {
+            capture_logs(|| {
+                tracing::info!("{SENTINEL}");
+                rt.block_on(run_catchup(
+                    &http,
+                    &coord_url,
+                    device,
+                    Duration::from_secs(10),
+                ));
+            })
+            .1
+        };
+
+        let first = pass();
+        let held: Vec<bool> = jtis.iter().map(|j| create_grants().contains(j)).collect();
+        let second = pass();
+        for jti in &jtis {
+            create_grants().remove(jti);
+        }
+
+        let expected_line = format!("GET /sessions/create-requests?device_id={device} HTTP/1.1");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![expected_line.clone(), expected_line],
+            "one GET per pass, on the create catch-up route"
+        );
+        assert!(held.iter().all(|h| *h), "the first pass records every row");
+
+        assert!(
+            first.contains(SENTINEL),
+            "the capture must be live: {first:?}"
+        );
+        assert_eq!(
+            first.matches("remote create: grant recorded").count(),
+            20,
+            "{first}"
+        );
+        let summary: Vec<&str> = first
+            .lines()
+            .filter(|l| l.contains("remote create: catch-up recorded new pending grants"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{first}");
+        assert!(summary[0].contains("new=20"), "{first}");
+
+        assert!(
+            second.contains(SENTINEL),
+            "the capture must be live: {second:?}"
+        );
+        let noise: Vec<&str> = besides(&second, SENTINEL)
+            .into_iter()
+            .filter(|l| !l.contains(UNRELATED))
+            .collect();
+        assert!(
+            noise.is_empty(),
+            "a pass that re-lists only known grants logs nothing at INFO: {noise:?}"
+        );
+    }
 }
