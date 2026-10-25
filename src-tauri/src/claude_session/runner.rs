@@ -669,13 +669,11 @@ fn run_claude_session_inline(
     // Store child PID for stop functionality
     let child_pid = child.id();
     if let Some(ref tracker) = pid_tracker {
-        if let Ok(mut pids) = tracker.lock() {
-            pids.push(child_pid);
-            info!(
-                "Registered AI process PID {} for session {}",
-                child_pid, session_id
-            );
-        }
+        crate::tree_kill::track_ai_pid(tracker, child_pid);
+        info!(
+            "Registered AI process PID {} for session {}",
+            child_pid, session_id
+        );
     }
 
     // Register inline PID with SessionManager for stale task sweep visibility

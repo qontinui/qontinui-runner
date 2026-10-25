@@ -147,6 +147,33 @@ impl SessionManager {
         }
     }
 
+    /// The pid of every interactive session and every inline-pid entry that
+    /// belongs to task run `task_run_id`: its key is the id itself, or starts
+    /// with `{task_run_id}-` (workflow phase sessions are keyed
+    /// `{task_run_id}-agentic-N`). A per-task stop kills exactly these.
+    pub fn pids_for_task_run(&self, task_run_id: &str) -> Vec<u32> {
+        let prefix = format!("{task_run_id}-");
+        let belongs = |key: &str| key == task_run_id || key.starts_with(&prefix);
+        let mut pids: Vec<u32> = self
+            .sessions
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(k, _)| belongs(k))
+                    .map(|(_, s)| s.pid())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(guard) = self.inline_pids.lock() {
+            pids.extend(guard.iter().filter(|(k, _)| belongs(k)).map(|(_, p)| *p));
+        }
+        pids.retain(|p| *p != 0);
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
     /// List all sessions with their task_run_id, current state, and PID.
     /// Includes ClaudeSessions and inline PID registrations.
     /// Used by the stale task sweep to check session liveness.
@@ -368,6 +395,18 @@ impl std::fmt::Debug for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pids_for_task_run_matches_the_id_and_its_dash_suffixes_only() {
+        let sm = SessionManager::new();
+        sm.register_inline_pid("A", 11);
+        sm.register_inline_pid("A-agentic-1", 12);
+        sm.register_inline_pid("AB", 13);
+        sm.register_inline_pid("B", 14);
+        assert_eq!(sm.pids_for_task_run("A"), vec![11, 12]);
+        assert_eq!(sm.pids_for_task_run("B"), vec![14]);
+        assert!(sm.pids_for_task_run("C").is_empty());
+    }
 
     #[test]
     fn worktree_path_matches_on_exact_string_without_touching_fs() {

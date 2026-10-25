@@ -307,9 +307,9 @@ mod tiered_info;
 mod timeout_config;
 mod trace_api;
 mod tracing_layers;
-// In-process process-TREE kill (no `taskkill` spawn) for the runner's Windows
-// kill paths — plan 2026-10-19-served-corpus-probe-budget-excludes-process-creation.
-#[cfg(windows)]
+// In-process process-TREE kill (no `taskkill` spawn) for the runner's kill
+// paths, on every OS — plans 2026-10-19-served-corpus-probe-budget-excludes-
+// process-creation and 2026-10-25-runner-kill-paths-never-kill-anything-off-windows.
 mod tree_kill;
 mod trigger_system;
 mod tunnel;

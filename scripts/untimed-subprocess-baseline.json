@@ -129,16 +129,6 @@
       "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain caller is routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
     },
     {
-      "site": "src-tauri/src/graphql/mutation.rs::MutationRoot::stop_task_run",
-      "waits": [
-        "kill"
-      ],
-      "reason_covers_waits": [
-        "kill"
-      ],
-      "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `kill -9` on the `#[cfg(not(windows))]` arm (Windows ends the tree in-process, spawning nothing). A one-shot termination of a named pid, bounded by the OS's own terminate call."
-    },
-    {
       "site": "src-tauri/src/mcp/code_semantics/cargo_check.rs::probe_cargo",
       "waits": [
         "cargo"

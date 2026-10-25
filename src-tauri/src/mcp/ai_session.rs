@@ -1826,51 +1826,23 @@ pub async fn stop_ai_analysis(
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("MCP API: Stop AI analysis requested");
 
-    // First, kill all tracked AI processes immediately
-    // This is the key fix - previously we only stopped monitoring, not the actual processes
-    let pids_to_kill: Vec<u32> = {
-        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
-        let pids_copy = pids.clone();
-        pids.clear(); // Clear the tracker
-        pids_copy
-    };
+    // First, kill every tracked AI process tree, in-process, on every OS.
+    // Only a tree whose root is still the tracked process is signalled.
+    let tally = crate::tree_kill::kill_tracked(
+        &state.current_ai_pids,
+        std::time::Duration::from_secs(5),
+        "MCP API: stop AI analysis",
+    )
+    .await;
 
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut killed_count = 0;
-    for pid in &pids_to_kill {
-        info!("MCP API: Killing AI process PID {}", pid);
-        // The entire process tree (cmd.exe spawns node.exe for claude), ended
-        // in-process: no `taskkill` is spawned to do it.
-        #[cfg(windows)]
-        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
-            .await
-        {
-            Ok(report) => {
-                info!(
-                    "MCP API: Successfully killed process tree for PID {} ({:?})",
-                    pid, report.killed
-                );
-                killed_count += 1;
-            }
-            Err(e) => {
-                // Most often the process had already exited, which is fine.
-                warn!("MCP API: tree kill for PID {} returned error: {}", pid, e);
-                killed_count += 1;
-            }
-        }
-        // Unchanged off Windows: this path never killed anything there (it
-        // spawned `taskkill`, which does not exist). A separate defect.
-        #[cfg(not(windows))]
-        error!(
-            "MCP API: no process-tree kill on this platform; AI process PID {} was not signalled",
-            pid
-        );
-    }
-
-    if !pids_to_kill.is_empty() {
+    if tally.attempted() > 0 {
         emit_ai_output(
             &state.app_handle,
-            &format!("⛔ Killed {} AI process(es)", killed_count),
+            &format!(
+                "⛔ Killed {} AI process(es){}",
+                tally.killed,
+                tally.qualifiers()
+            ),
             "status",
             None,
             None,
@@ -1899,7 +1871,7 @@ pub async fn stop_ai_analysis(
         }
     };
 
-    if running_tasks.is_empty() && pids_to_kill.is_empty() {
+    if running_tasks.is_empty() && tally.attempted() == 0 {
         info!("MCP API: No running tasks to stop");
         return Ok(Json(ApiResponse::success(())));
     }
@@ -1944,9 +1916,10 @@ pub async fn stop_ai_analysis(
     emit_ai_output(
         &state.app_handle,
         &format!(
-            "Stopped {} running task(s), killed {} process(es)",
+            "Stopped {} running task(s), killed {} process(es){}",
             running_tasks.len(),
-            killed_count
+            tally.killed,
+            tally.qualifiers()
         ),
         "status",
         None,
@@ -4137,67 +4110,42 @@ pub mod emergency_quit {
     /// the runner, which is the concrete harm `POST /restart-runner`'s bare
     /// `process::exit` does today.
     fn kill_orphaned_ai_processes(app_state: &Arc<AppState>, budget: &shutdown_budget::Budget) {
-        let pids_to_kill: Vec<u32> = {
-            // Poison-recovering: a panicked writer elsewhere must not silently
-            // turn "kill the orphans" into a no-op.
-            let mut pids = app_state
-                .ai_pid_tracker
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let copy = pids.clone();
-            pids.clear();
-            copy
-        };
-        if pids_to_kill.is_empty() {
-            return;
-        }
-        info!(
-            "Shutdown: killing {} orphaned AI process(es): {:?}",
-            pids_to_kill.len(),
-            pids_to_kill
-        );
         let kill_deadline = budget.sub_deadline(shutdown_budget::AI_KILL_BUDGET);
-        for pid in &pids_to_kill {
-            if Instant::now() >= kill_deadline {
-                warn!(
-                    "Shutdown: AI-process kill loop hit its {}s cap — leaving the remaining \
-                     PIDs to process exit",
-                    shutdown_budget::AI_KILL_BUDGET.as_secs()
-                );
-                break;
-            }
-            // The whole tree is CORRECT here and must stay: it kills a CHILD
-            // AGENT'S OWN process tree (the `claude` CLI and whatever it
-            // spawned), which is the semantics of quitting the app.
-            // Categorically different from a tree kill of the RUNNER's own
-            // PID, which would take every live Claude Code session on the box
-            // down with it and is forbidden. In-process: no `taskkill` spawn.
-            let per_kill = std::cmp::max(
-                std::cmp::min(
-                    shutdown_budget::TASKKILL_TIMEOUT,
-                    kill_deadline.saturating_duration_since(Instant::now()),
-                ),
-                // Floored: skipping a kill leaks a process tree that outlives
-                // the runner.
-                shutdown_budget::TASKKILL_FLOOR,
+        // The whole tree is CORRECT here and must stay: it kills a CHILD
+        // AGENT'S OWN process tree (the `claude` CLI and whatever it spawned),
+        // which is the semantics of quitting the app. Categorically different
+        // from a tree kill of the RUNNER's own PID, which would take every live
+        // Claude Code session on the box down with it and is forbidden.
+        // In-process: no `taskkill` spawn.
+        let tally = crate::tree_kill::kill_tracked_with_deadline(
+            &app_state.ai_pid_tracker,
+            "Shutdown",
+            || {
+                if Instant::now() >= kill_deadline {
+                    warn!(
+                        "Shutdown: AI-process kill loop hit its {}s cap — leaving the remaining \
+                         PIDs to process exit",
+                        shutdown_budget::AI_KILL_BUDGET.as_secs()
+                    );
+                    return None;
+                }
+                Some(std::cmp::max(
+                    std::cmp::min(
+                        shutdown_budget::TASKKILL_TIMEOUT,
+                        kill_deadline.saturating_duration_since(Instant::now()),
+                    ),
+                    // Floored: skipping a kill leaks a process tree that
+                    // outlives the runner.
+                    shutdown_budget::TASKKILL_FLOOR,
+                ))
+            },
+        );
+        if tally.attempted() > 0 {
+            info!(
+                "Shutdown: killed {} orphaned AI process tree(s){}",
+                tally.killed,
+                tally.qualifiers()
             );
-            #[cfg(windows)]
-            match crate::tree_kill::kill_tree_by_pid(*pid, per_kill) {
-                Ok(report) if report.budget_spent => warn!(
-                    "Shutdown: tree kill for PID {pid} exceeded its {per_kill:?} budget — \
-                     killed {:?}",
-                    report.killed
-                ),
-                Ok(_) => info!("Shutdown: killed AI process tree for PID {pid}"),
-                // Most often the process had already exited.
-                Err(e) => info!("Shutdown: AI process PID {pid} not killed: {e}"),
-            }
-            // Unchanged off Windows (never killed anything there).
-            #[cfg(not(windows))]
-            {
-                let _ = per_kill;
-                error!("Shutdown: no process-tree kill on this platform; PID {pid} not signalled");
-            }
         }
     }
 

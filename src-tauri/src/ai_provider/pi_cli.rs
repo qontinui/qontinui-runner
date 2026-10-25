@@ -410,10 +410,9 @@ fn execute_argv(
 }
 
 /// Wall-clock cap on [`kill_child_tree`]'s in-process tree walk.
-#[cfg(target_os = "windows")]
 const PI_TREE_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Kill the child and — on Windows — its whole process tree.
+/// Kill the child and its whole process tree, on every OS.
 ///
 /// Killing only the direct child (`cmd.exe` for the shim path, `node` for
 /// the fallback) orphans grandchildren (pi's actual node process), which
@@ -421,18 +420,11 @@ const PI_TREE_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// the reader threads until the orphan exits on its own. The in-process tree
 /// kill takes the whole tree down without spawning a process.
 fn kill_child_tree(child: &mut std::process::Child) {
-    #[cfg(target_os = "windows")]
-    {
-        if let Err(e) = crate::tree_kill::kill_child_tree(child, PI_TREE_KILL_BUDGET) {
-            warn!(
-                "tree kill of pi pid {} failed ({e}); falling back to plain kill",
-                child.id()
-            );
-            let _ = child.kill();
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
+    if let Err(e) = crate::tree_kill::kill_child_tree(child, PI_TREE_KILL_BUDGET) {
+        warn!(
+            "tree kill of pi pid {} failed ({e}); falling back to plain kill",
+            child.id()
+        );
         let _ = child.kill();
     }
     let _ = child.wait();

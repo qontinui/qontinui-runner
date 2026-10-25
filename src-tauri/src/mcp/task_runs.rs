@@ -218,42 +218,21 @@ pub async fn stop_task_run(
         })));
     }
 
-    // Kill all tracked AI processes (same logic as stop_ai_analysis)
-    // This ensures the actual Claude CLI process is terminated, not just marked as stopped
-    let pids_to_kill: Vec<u32> = {
-        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
-        let pids_copy = pids.clone();
-        pids.clear();
-        pids_copy
-    };
-
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut killed_count = 0;
-    for pid in &pids_to_kill {
-        info!("Killing AI process PID {} for task {}", pid, id);
-        // In-process tree kill: no `taskkill` is spawned to do it.
-        #[cfg(windows)]
-        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
-            .await
-        {
-            Ok(_) => {
-                info!("Successfully killed process tree for PID {}", pid);
-                killed_count += 1;
-            }
-            Err(e) => {
-                // Process may have already exited.
-                info!("Tree kill for PID {}: {}", pid, e);
-                killed_count += 1;
-            }
-        }
-        // Unchanged off Windows: this path never killed anything there (it
-        // spawned `taskkill`, which does not exist). A separate defect.
-        #[cfg(not(windows))]
-        error!(
-            "No process-tree kill on this platform; PID {} was not signalled",
-            pid
-        );
-    }
+    // Kill THIS task run's process trees only (its interactive and inline
+    // sessions); every other task's tracked trees stay alive and tracked.
+    let task_pids = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .map(|sm| sm.pids_for_task_run(&id))
+        .unwrap_or_default();
+    let tally = crate::tree_kill::kill_tracked_subset(
+        &state.current_ai_pids,
+        &task_pids,
+        std::time::Duration::from_secs(5),
+        &format!("stop task run {id}"),
+    )
+    .await;
+    let kill_summary = crate::tree_kill::task_stop_summary(&tally);
 
     // Mark as stopped in database
     state
@@ -287,10 +266,7 @@ pub async fn stop_task_run(
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
-        &format!(
-            "🛑 Task {} stopped (killed {} process(es))",
-            id, killed_count
-        ),
+        &format!("🛑 Task {} stopped ({})", id, kill_summary),
         "status",
         None,
         None,
@@ -300,11 +276,11 @@ pub async fn stop_task_run(
     let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
     broadcaster.task_run_update(&id, "stopped", None, None);
 
-    info!("Task {} stopped, killed {} process(es)", id, killed_count);
+    info!("Task {} stopped, {}", id, kill_summary);
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": format!("Task run stopped, killed {} process(es)", killed_count)
+        "message": format!("Task run stopped, {}", kill_summary)
     })))
 }
 
