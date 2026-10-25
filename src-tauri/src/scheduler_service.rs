@@ -2063,33 +2063,17 @@ impl SchedulerService {
         (all_met, status)
     }
 
-    /// Check if runner is idle (not executing workflows or AI tasks)
+    /// Check if runner is idle (not executing workflows or AI tasks), through
+    /// the shared typed `/status` reader (`crate::runner_idle`): idle only on a
+    /// `data` that reads `Ready` with no AI analysis running; anything
+    /// unreadable withholds the run.
     async fn check_idle(&self) -> bool {
-        let client = reqwest::Client::new();
-        let status_url = format!("{}/status", self.self_base_url());
-        match client.get(&status_url).send().await {
-            Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    let executor_state = json
-                        .get("executor_state")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown");
-                    let ai_running = json
-                        .get("ai_analysis_running")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    // Idle = Ready state and no AI analysis running
-                    executor_state == "Ready" && !ai_running
-                } else {
-                    false
-                }
-            }
-            Err(e) => {
-                warn!("Failed to check idle status: {}", e);
-                false
-            }
-        }
+        let base = crate::runner_idle::self_status_base_url(self.app_state.as_deref());
+        let verdict =
+            crate::runner_idle::check_runner_idle(&base, crate::runner_idle::STATUS_PROBE_TIMEOUT)
+                .await;
+        crate::runner_idle::log_verdict("scheduler require_idle", &verdict);
+        verdict.is_idle()
     }
 
     /// Check if repositories have been inactive for the required duration
@@ -2829,6 +2813,11 @@ fn run_prompt_session_id(response: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(String::from)
 }
+
+// Test support (stub `/status`, the idle-gated task) for the `require_idle`
+// entry-point test in `mod tests` below.
+#[cfg(test)]
+mod idle_gate_stub;
 
 #[cfg(test)]
 mod tests {
@@ -4127,5 +4116,56 @@ mod tests {
             lost_race.contains("return;"),
             "a lost race must record nothing"
         );
+    }
+
+    // ---- `require_idle`, entered through `gate_conditions` against a stub /status ----
+    //
+    // `gate_conditions` is the per-task decision both `tick_pass` and the
+    // missed-run reconciler (`reconcile_task`) call. With no `AppState` the
+    // service reaches its own API through `QONTINUI_PORT`, which the test points
+    // at the stub (coord finding `89c8c10e`).
+
+    /// One test walks the whole matrix so `QONTINUI_PORT` is mutated, under the
+    /// env lock, for one short window. The idle case is FIRST: it is the one the
+    /// envelope defect starved.
+    #[tokio::test]
+    async fn scheduler_idle_gate_fires_only_when_status_data_reads_ready_and_idle() {
+        let _lock = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        let (port, reply) = super::idle_gate_stub::spawn_status_stub().await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let task = super::idle_gate_stub::idle_gated_task();
+        assert!(task.has_conditions());
+
+        // Idle fires — twice, so the verdict is stable rather than a first-read fluke.
+        *reply.lock().unwrap() = (200, super::idle_gate_stub::READY_AND_IDLE);
+        for round in 1..=2 {
+            let gate =
+                SchedulerService::gate_conditions(&service, &task, std::time::Instant::now()).await;
+            assert!(
+                matches!(gate, ConditionGate::Fire),
+                "round {round}: /status data reads Ready with no AI analysis, so the task must fire; got {gate:?}"
+            );
+        }
+
+        for (case, code, body) in super::idle_gate_stub::NOT_IDLE {
+            *reply.lock().unwrap() = (code, body);
+            match SchedulerService::gate_conditions(&service, &task, std::time::Instant::now())
+                .await
+            {
+                ConditionGate::Wait(status) => assert_eq!(status.idle_met, Some(false), "{case}"),
+                other => panic!("{case}: the task must wait, got {other:?}"),
+            }
+        }
+
+        // Nothing listening: an unreachable /status is not idle either.
+        let (closed, _held) = super::idle_gate_stub::closed_port();
+        std::env::set_var("QONTINUI_PORT", closed.to_string());
+        match SchedulerService::gate_conditions(&service, &task, std::time::Instant::now()).await {
+            ConditionGate::Wait(status) => assert_eq!(status.idle_met, Some(false), "closed port"),
+            other => panic!("closed port: the task must wait, got {other:?}"),
+        }
     }
 }

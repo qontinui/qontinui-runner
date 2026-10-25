@@ -241,6 +241,7 @@ mod resource_guard;
 mod restate;
 mod rework;
 mod routing;
+mod runner_idle;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
