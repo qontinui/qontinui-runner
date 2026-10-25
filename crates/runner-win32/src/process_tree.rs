@@ -57,7 +57,8 @@ pub struct TreeKillReport {
     pub root_exited: bool,
     /// Snapshot passes made.
     pub passes: usize,
-    /// The wall-clock budget ran out before the walk saw an empty pass.
+    /// The walk ended before it saw an empty pass: the wall-clock budget ran
+    /// out, or the last of [`TREE_KILL_PASSES`] passes still found members.
     pub budget_spent: bool,
     /// A re-check pass (after the first) could not read the process snapshot,
     /// so a child forked during the kills may have been missed. The Linux
@@ -250,6 +251,11 @@ pub fn walk<T: ProcessTable>(
             }
         }
         let found_any = members.len() > first_new;
+        // The pass cap is about to end a walk that is still finding members:
+        // as unfinished as a spent budget, and reported the same way.
+        if found_any && pass + 1 == TREE_KILL_PASSES {
+            report.budget_spent = true;
+        }
         if !root_signalled {
             root_signalled = true;
             if table.terminate(root) {
@@ -560,6 +566,9 @@ mod walk_tests {
         alive: bool,
     }
 
+    /// A scripted reuse: the process that takes a dead pid, and its child.
+    type Reuse = ((u32, Proc), (u32, Proc));
+
     /// A process table where a pid is reused only while NO handle to it is
     /// open — the Windows rule the walk relies on — and where a scripted
     /// reuse fires as soon as that becomes possible.
@@ -568,13 +577,16 @@ mod walk_tests {
         procs: RefCell<HashMap<u32, Proc>>,
         /// pid -> (the reusing process, a child of it), installed once the pid
         /// is dead and unpinned.
-        reuse: RefCell<HashMap<u32, ((u32, Proc), (u32, Proc))>>,
+        reuse: RefCell<HashMap<u32, Reuse>>,
         clock: RefCell<u64>,
         terminated: RefCell<Vec<u32>>,
         /// Snapshot calls that succeed before every later one fails; `None`
         /// = never fails.
         snapshots_ok: Option<usize>,
         snapshots_taken: RefCell<usize>,
+        /// A fork bomb: every snapshot first adds one NEW child of this pid,
+        /// so every pass finds a member.
+        forks_under: Option<u32>,
     }
 
     /// A handle that pins its pid until dropped.
@@ -647,6 +659,10 @@ mod walk_tests {
                 return Err(std::io::Error::other("scripted snapshot failure"));
             }
             self.fire_reuse();
+            if let Some(ppid) = self.fake.forks_under {
+                // Created after the root and before this snapshot's `now()`.
+                self.add(10_000 + n as u32, ppid, 500);
+            }
             Ok(self
                 .fake
                 .procs
@@ -704,6 +720,22 @@ mod walk_tests {
         let root = root_of(&t, 100);
         let r = walk(&t, &root, 100, SELF, BUDGET).unwrap();
         assert_eq!(r.killed, vec![300, 200, 100], "{r:?}");
+        assert!(!r.budget_spent, "a walk that ended on an empty pass: {r:?}");
+    }
+
+    /// A walk the pass cap ends while it is still finding members is not
+    /// complete: it says so through `budget_spent`, as a spent budget does.
+    #[test]
+    fn process_tree_walk_flags_a_walk_the_pass_cap_ended() {
+        let t = Table::new(Fake {
+            forks_under: Some(100),
+            ..Fake::default()
+        });
+        t.add(100, 1, 10);
+        let root = root_of(&t, 100);
+        let r = walk(&t, &root, 100, SELF, BUDGET).unwrap();
+        assert_eq!(r.passes, TREE_KILL_PASSES, "{r:?}");
+        assert!(r.budget_spent, "{r:?}");
     }
 
     #[test]

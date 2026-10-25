@@ -118,20 +118,29 @@ mod tests {
 
     /// The handle outlives the pid's meaning: once the process is reaped, a
     /// signal through it fails instead of reaching whatever reuses the pid.
+    /// Kills and reaps the fixture on drop, so a failed assertion never
+    /// leaves `sleep 300` running. `kill` on an already-reaped `Child` is a
+    /// no-op (std tracks the reap), never a signal to a reused pid.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn pty_holder_pidfd_tracks_one_process_through_exit_and_reap() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .unwrap();
-        let fd = match open(child.id() as i32) {
+        let mut child = Reaped(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
+        let fd = match open(child.0.id() as i32) {
             Opened::Fd(fd) => fd,
-            other => {
-                // Never leave the fixture running for 300 s.
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("pidfd_open of a live child failed: {other:?}");
-            }
+            other => panic!("pidfd_open of a live child failed: {other:?}"),
         };
         assert!(fd.send_signal(0).is_ok());
         assert!(!fd.has_exited().unwrap());
@@ -143,7 +152,7 @@ mod tests {
         }
         // A zombie still exists for a signal; a reaped process does not.
         assert!(fd.send_signal(0).is_ok());
-        child.wait().unwrap();
+        child.0.wait().unwrap();
         assert_eq!(
             fd.send_signal(0).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)

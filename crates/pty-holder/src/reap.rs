@@ -434,7 +434,8 @@ mod imp {
             Ok(tree) => {
                 if tree.budget_spent {
                     report.note(format!(
-                        "tree kill of {child} hit its {TREE_KILL_BUDGET:?} budget after {} pass(es)",
+                        "tree kill of {child} ended unfinished (its {TREE_KILL_BUDGET:?} budget or \
+                         its pass cap) after {} pass(es)",
                         tree.passes
                     ));
                 }
