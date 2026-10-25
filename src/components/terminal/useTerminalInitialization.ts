@@ -583,11 +583,13 @@ export function placeRestorePlaceholders(params: {
   placeholders: readonly PlaceholderRecord[];
   pageId: string;
   knownPageIds: readonly string[];
+  /** The GRID assignments (`useZoneLayout().gridView`), the snapshot's in tmux mode. */
   assignments: Record<number, string>;
   /** Sessions already running in one of this page's tabs. */
   runningSessionIds: ReadonlySet<string>;
   createTab: (claudeSessionId: string, name: string, workingDir: string | null) => string;
-  assignTabToZone: (zoneIdx: number, tabId: string) => void;
+  /** `useZoneLayout().placeRestoredTab` — a recorded grid zone, never the shown slot. */
+  placeRestoredTab: (zoneIdx: number, tabId: string) => void;
   ensurePages: (pages: Array<{ id: string; name: string }>) => void;
 }): string[] {
   const created: string[] = [];
@@ -602,7 +604,7 @@ export function placeRestorePlaceholders(params: {
     );
     created.push(tabId);
     if (placeholderMayTakeZone(rec.zoneIndex, tabId, params.assignments)) {
-      params.assignTabToZone(rec.zoneIndex, tabId);
+      params.placeRestoredTab(rec.zoneIndex, tabId);
     }
   }
   params.ensurePages(missingPlaceholderPages(params.placeholders, params.knownPageIds));
@@ -1919,12 +1921,12 @@ export function useTerminalInitialization({
             placeholders: restoreSet.placeholders,
             pageId,
             knownPageIds,
-            assignments: zoneLayout.assignments,
+            assignments: zoneLayout.gridView.assignments,
             runningSessionIds: new Set(
               liveTabsRef.current.map((t) => t.claudeSessionId).filter((id): id is string => !!id),
             ),
             createTab: createRestorePlaceholderTab,
-            assignTabToZone: zoneLayout.assignTabToZone,
+            placeRestoredTab: zoneLayout.placeRestoredTab,
             ensurePages: requestEnsurePages,
           });
         }

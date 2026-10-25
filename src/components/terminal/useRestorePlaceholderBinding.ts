@@ -79,6 +79,7 @@ export function readyZoneAssignments(
 export function useRestorePlaceholderBinding(params: {
   pageId: string;
   tabs: readonly TerminalTab[];
+  /** The GRID assignments (`useZoneLayout().gridView`), the snapshot's in tmux mode. */
   assignments: Record<number, string>;
   createRestorePlaceholderTab: (
     claudeSessionId: string,
@@ -86,7 +87,12 @@ export function useRestorePlaceholderBinding(params: {
     workingDir: string | null,
   ) => string;
   removeRestorePlaceholderTabs: (claudeSessionIds?: readonly string[]) => void;
-  assignTabToZone: (zoneIdx: number, tabId: string) => void;
+  /**
+   * `useZoneLayout().placeRestoredTab`: a placeholder's zone is its RECORDED
+   * grid zone, so in tmux mode it goes into the grid snapshot and never swaps
+   * the shown session — the same rule as every other restore.
+   */
+  placeRestoredTab: (zoneIdx: number, tabId: string) => void;
 }): void {
   const {
     pageId,
@@ -94,7 +100,7 @@ export function useRestorePlaceholderBinding(params: {
     assignments,
     createRestorePlaceholderTab,
     removeRestorePlaceholderTabs,
-    assignTabToZone,
+    placeRestoredTab,
   } = params;
   const cohort = useRestoreCohort();
   const pendingZones = useRef(new Map<string, number>());
@@ -116,10 +122,10 @@ export function useRestorePlaceholderBinding(params: {
     for (const r of create) {
       const tabId = createRestorePlaceholderTab(r.claudeSessionId, r.name, r.workingDir);
       if (placeholderMayTakeZone(r.zoneIndex, tabId, assignmentsRef.current)) {
-        assignTabToZone(r.zoneIndex, tabId);
+        placeRestoredTab(r.zoneIndex, tabId);
       }
     }
-  }, [cohort.rows, pageId, createRestorePlaceholderTab, assignTabToZone]);
+  }, [cohort.rows, pageId, createRestorePlaceholderTab, placeRestoredTab]);
 
   useEffect(() => {
     const stale = stalePlaceholderSessions(tabs, cohort.rows);
@@ -140,20 +146,20 @@ export function useRestorePlaceholderBinding(params: {
           // A second render may never come if the pane is already here.
           for (const [terminalId, zone] of readyZoneAssignments(pendingZones.current, tabs)) {
             pendingZones.current.delete(terminalId);
-            assignTabToZone(zone, terminalId);
+            placeRestoredTab(zone, terminalId);
           }
         }
       }),
-    [pageId, tabs, removeRestorePlaceholderTabs, assignTabToZone],
+    [pageId, tabs, removeRestorePlaceholderTabs, placeRestoredTab],
   );
 
   useEffect(() => {
     if (pendingZones.current.size === 0) return;
     for (const [terminalId, zone] of readyZoneAssignments(pendingZones.current, tabs)) {
       pendingZones.current.delete(terminalId);
-      assignTabToZone(zone, terminalId);
+      placeRestoredTab(zone, terminalId);
     }
-  }, [tabs, assignTabToZone]);
+  }, [tabs, placeRestoredTab]);
 }
 
 /**

@@ -309,10 +309,10 @@ const PageSessionScope = memo(function PageSessionScope({
   useRestorePlaceholderBinding({
     pageId,
     tabs,
-    assignments: zoneLayout.assignments,
+    assignments: zoneLayout.gridView.assignments,
     createRestorePlaceholderTab: terminalManager.createRestorePlaceholderTab,
     removeRestorePlaceholderTabs: terminalManager.removeRestorePlaceholderTabs,
-    assignTabToZone: zoneLayout.assignTabToZone,
+    placeRestoredTab: zoneLayout.placeRestoredTab,
   });
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope

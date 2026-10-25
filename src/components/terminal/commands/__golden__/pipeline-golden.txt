@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3400
+# tier: golden   inputs: 3484
 
 /admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 /admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
@@ -639,6 +639,8 @@
 /generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound	-
 /generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound	-
 /generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound	-
+/grid mode	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
+/grid mode --tenant	none	-	null	none	-
 /help	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 /help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 /help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -1361,6 +1363,18 @@
 /tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound	-
 /tags-clear 3 best	literal	terminal.tag-clear	[]	unbound	-
 /tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound	-
+/terminal.mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+/terminal.mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+/terminal.mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+/terminal.mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+/terminal.mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+/terminal.mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
+/terminal.mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+/terminal.mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+/terminal.mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+/terminal.mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+/tmux mode	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+/tmux mode --tenant	none	-	null	none	-
 /toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
 /toggle auto focus "1 gmail fix the bug"	none	-	null	none	-
 /toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1551,6 +1565,30 @@
 /verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 /verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 /verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+/work mode	fuzzy	terminal.mode	[["mode","mode"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "mode"
+/work mode "1 gmail fix the bug"	none	-	null	none	-
+/work mode "1 gmail fix the bug" --tenant	none	-	null	none	-
+/work mode "3 best"	none	-	null	none	-
+/work mode "3 best" --tenant	none	-	null	none	-
+/work mode --tenant	none	-	null	none	-
+/work mode 1 gmail fix the bug	none	-	null	none	-
+/work mode 1 gmail fix the bug --tenant	none	-	null	none	-
+/work mode 3 best	none	-	null	none	-
+/work mode 3 best --tenant	none	-	null	none	-
+/work mode grid	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
+/work mode grid --tenant	none	-	null	none	-
+/work mode tmux	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+/work mode tmux --tenant	none	-	null	none	-
+/work-mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+/work-mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+/work-mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+/work-mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+/work-mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+/work-mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
+/work-mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+/work-mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+/work-mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+/work-mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
 /yes all	pattern	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
 /yes all "1 gmail fix the bug"	none	-	null	none	-
 /yes all "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2167,6 +2205,8 @@ generate-workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbo
 generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound	-
 generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound	-
 generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound	-
+grid mode	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
+grid mode --tenant	none	-	null	none	-
 help	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -2889,6 +2929,18 @@ tags-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 3 best	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound	-
+terminal.mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+terminal.mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+terminal.mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+terminal.mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+terminal.mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+terminal.mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
+terminal.mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+terminal.mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+terminal.mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+terminal.mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+tmux mode	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+tmux mode --tenant	none	-	null	none	-
 toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
 toggle auto focus "1 gmail fix the bug"	none	-	null	none	-
 toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -3079,6 +3131,30 @@ verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound	-
 verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+work mode	fuzzy	terminal.mode	[["mode","mode"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "mode"
+work mode "1 gmail fix the bug"	none	-	null	none	-
+work mode "1 gmail fix the bug" --tenant	none	-	null	none	-
+work mode "3 best"	none	-	null	none	-
+work mode "3 best" --tenant	none	-	null	none	-
+work mode --tenant	none	-	null	none	-
+work mode 1 gmail fix the bug	none	-	null	none	-
+work mode 1 gmail fix the bug --tenant	none	-	null	none	-
+work mode 3 best	none	-	null	none	-
+work mode 3 best --tenant	none	-	null	none	-
+work mode grid	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
+work mode grid --tenant	none	-	null	none	-
+work mode tmux	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+work mode tmux --tenant	none	-	null	none	-
+work-mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+work-mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+work-mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+work-mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+work-mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
+work-mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
+work-mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
+work-mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
+work-mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
+work-mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
 yes all	pattern	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
 yes all "1 gmail fix the bug"	none	-	null	none	-
 yes all "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -3149,6 +3225,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.metrics [bool] do the thing	ai	terminal.metrics	[]	refused	error /metrics: "count" must be text or a number (got true/false)
 «ai» terminal.metrics [empty] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
 «ai» terminal.metrics [valid] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«ai» terminal.mode [alien] do the thing	ai	terminal.mode	[["nonsense","x"]]	refused	error /terminal.mode: takes no argument named "nonsense"
+«ai» terminal.mode [bool] do the thing	ai	terminal.mode	[]	refused	error /terminal.mode: "mode" must be text or a number (got true/false)
+«ai» terminal.mode [empty] do the thing	ai	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+«ai» terminal.mode [valid] do the thing	ai	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
 «ai» terminal.mute [alien] do the thing	ai	terminal.mute	[["nonsense","x"]]	refused	error /mute: takes no arguments (got "nonsense")
 «ai» terminal.mute [bool] do the thing	ai	terminal.mute	[]	refused	error /mute: "count" must be text or a number (got true/false)
 «ai» terminal.mute [empty] do the thing	ai	terminal.mute	[]	ok	noop /mute · sound was already muted
@@ -3321,6 +3401,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.metrics [bool]	direct	terminal.metrics	[["count",true]]	threw	error /metrics: "count" must be text or a number (got true/false)
 «direct» terminal.metrics [empty]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
 «direct» terminal.metrics [valid]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«direct» terminal.mode [alien]	direct	terminal.mode	[["nonsense","x"]]	threw	error /terminal.mode: takes no argument named "nonsense"
+«direct» terminal.mode [bool]	direct	terminal.mode	[["mode",true]]	threw	error /terminal.mode: "mode" must be text or a number (got true/false)
+«direct» terminal.mode [empty]	direct	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
+«direct» terminal.mode [valid]	direct	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
 «direct» terminal.mute [alien]	direct	terminal.mute	[["nonsense","x"]]	threw	error /mute: takes no arguments (got "nonsense")
 «direct» terminal.mute [bool]	direct	terminal.mute	[["count",true]]	threw	error /mute: "count" must be text or a number (got true/false)
 «direct» terminal.mute [empty]	direct	terminal.mute	[]	ok	noop /mute · sound was already muted

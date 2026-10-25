@@ -1907,7 +1907,7 @@ describe("restart cohort placeholders", () => {
         created.push([sid, name]);
         return `restore-placeholder-${sid}`;
       },
-      assignTabToZone: (z, t) => zones.push([z, t]),
+      placeRestoredTab: (z, t) => zones.push([z, t]),
       ensurePages: (pages) => ensured.push(...pages),
     });
     expect(ids).toEqual(["restore-placeholder-P1", "restore-placeholder-P2"]);
@@ -1932,7 +1932,7 @@ describe("restart cohort placeholders", () => {
       runningSessionIds: new Set(),
       assignments: {},
       createTab: (sid) => `restore-placeholder-${sid}`,
-      assignTabToZone: (z, t) => zones.push([z, t]),
+      placeRestoredTab: (z, t) => zones.push([z, t]),
       ensurePages: () => {},
     });
     expect(zones).toEqual([[1, "restore-placeholder-P3"]]);
@@ -1950,7 +1950,7 @@ describe("restart cohort placeholders", () => {
       assignments: { 2: "t-operator" },
       runningSessionIds: new Set(["LIVE"]),
       createTab: (sid) => `restore-placeholder-${sid}`,
-      assignTabToZone: (z, t) => zones.push([z, t]),
+      placeRestoredTab: (z, t) => zones.push([z, t]),
       ensurePages: () => {},
     });
     expect(created).toEqual(["restore-placeholder-P1"]);

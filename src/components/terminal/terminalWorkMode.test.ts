@@ -563,4 +563,12 @@ describe("tmuxMountedTabIds", () => {
     expect(mounted.has("worker")).toBe(false);
     expect([...mounted]).toEqual(ids.slice(0, MAX_WEBGL_PANES));
   });
+
+  it("skips a restore placeholder in the MRU — no PTY to keep warm", () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `t${i}`);
+    const tabs = [...ptys(ids), { id: "ph", type: "restore-placeholder" }];
+    const mounted = tmuxMountedTabIds("t0", ["t0", "ph", ...ids.slice(1)], tabs);
+    expect(mounted.has("ph")).toBe(false);
+    expect([...mounted]).toEqual(ids.slice(0, MAX_WEBGL_PANES));
+  });
 });

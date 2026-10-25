@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import type { TabClassification } from "../classifyTabs";
 import type { TerminalWorkMode } from "../terminalWorkMode";
 import { isSyntheticTab } from "../syntheticTabs";
+import { isPtylessTab } from "../useTerminalManager";
 import { ZoneCell, type ZoneCellSharedProps } from "./ZoneCell";
 import type { MaximizedNav } from "./MaximizedHeader";
 
@@ -139,12 +140,7 @@ function takesParkedCell(
   classification: TabClassification | undefined,
 ): boolean {
   if (classification === "offscreen") return true;
-  return (
-    classification === "hidden" &&
-    tab.type !== "plan" &&
-    tab.type !== "restore-placeholder" &&
-    !tab.sessionBacked
-  );
+  return classification === "hidden" && !isPtylessTab(tab) && !tab.sessionBacked;
 }
 
 export function buildZoneCells({
