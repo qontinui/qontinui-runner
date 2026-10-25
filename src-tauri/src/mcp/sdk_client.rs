@@ -506,7 +506,10 @@ fn app_code_from_body(body: &str) -> Option<String> {
 /// app-answered `{success:false}`, `Timeout`, `Disconnected`, `Displaced`,
 /// `NotResponsive`, an HTTP send/non-2xx failure. `ui_bridge_request_sync`
 /// targets the RUNNER's Tauri window, never the app, so falling back would
-/// re-execute the action on the wrong UI. Those are answered with
+/// re-execute the action on the wrong UI — and, for a READ handler
+/// (`ai/search`, `ai/find`, `ai/snapshot`, `ai/summary`), would answer with
+/// the runner's own data shaped exactly like the app's, a successful read of
+/// the wrong surface. Those are answered with
 /// `Some(body)`: `{success:false, error, code, failure_origin, detail}`.
 ///
 /// Why not re-read the live connection state after the error (the former
@@ -2321,7 +2324,7 @@ async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiSearch",
         body.clone(),
@@ -2339,8 +2342,14 @@ async fn handle_ai_search(
                 Json(data)
             }
         }
-        Err(_sdk_err) => {
-            // No SDK app connected — fall back to the runner's own UI via IPC
+        Err(sdk_err) => {
+            // Only "no SDK app connected" may search the runner's own UI. Any
+            // other error means an app WAS the target, and the runner's own
+            // elements would answer as a successful search of the wrong
+            // surface — indistinguishable from the app's own SearchResponse.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/search") {
+                return Json(refusal);
+            }
             debug!("SDK ai/search unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_search", payload).await {
@@ -2754,7 +2763,7 @@ async fn handle_network_request(
 
 /// GET /ui-bridge/sdk/ai/snapshot — Semantic AI snapshot
 async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getSemanticSnapshot",
         serde_json::json!({}),
@@ -2765,7 +2774,10 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/snapshot") {
+                return Json(refusal);
+            }
             debug!("SDK ai/snapshot unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
                 Ok(data) => Json(data),
@@ -2777,7 +2789,7 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
 
 /// GET /ui-bridge/sdk/ai/summary — Page summary
 async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getPageSummary",
         serde_json::json!({}),
@@ -2788,7 +2800,10 @@ async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_jso
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/summary") {
+                return Json(refusal);
+            }
             debug!("SDK ai/summary unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
                 Ok(data) => Json(data),
@@ -5481,7 +5496,7 @@ async fn handle_ai_find(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiFind",
         body.clone(),
@@ -5492,7 +5507,10 @@ async fn handle_ai_find(
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/find") {
+                return Json(refusal);
+            }
             debug!("SDK ai/find unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_find", payload).await {
@@ -8517,6 +8535,10 @@ mod tests {
             "handle_send_keys_to_page",
             "handle_find_by_text",
             "handle_navigate_by_adapter",
+            "handle_ai_search",
+            "handle_ai_find",
+            "handle_ai_snapshot",
+            "handle_ai_summary",
         ] {
             // A handler the journey ledger wraps keeps its original body in
             // `<handler>_dispatch`; the wrapper itself only records.
@@ -8559,24 +8581,22 @@ mod tests {
 
     /// Read-only handlers that KNOWINGLY keep the ungated IPC fallback: they
     /// only read (elements, snapshot, forms, routes, …), so a fallback cannot
-    /// re-execute an action on the wrong UI — at worst it answers with the
-    /// runner's own data. Gating them is a separate follow-up. A handler that
-    /// ACTS must never be added here; it must ask `ipc_fallback_refusal`.
-    const UNGATED_READ_ONLY_FALLBACKS: [&str; 16] = [
+    /// re-execute an action on the wrong UI. It can still answer with the
+    /// runner's own data as if it were the app's, which is why the four
+    /// `/ai/*` reads were gated and left this list; gating the rest is a
+    /// separate follow-up. A handler that ACTS must never be added here; it
+    /// must ask `ipc_fallback_refusal`.
+    const UNGATED_READ_ONLY_FALLBACKS: [&str; 12] = [
         "handle_elements",
         "handle_element",
         "handle_snapshot",
         "handle_discover",
         "handle_components",
         "handle_console_errors",
-        "handle_ai_search",
         "handle_forms",
         "handle_network_requests",
-        "handle_ai_snapshot",
-        "handle_ai_summary",
         "handle_undo_state",
         "handle_element_state",
-        "handle_ai_find",
         "handle_diagnostics",
         "handle_page_routes",
     ];
