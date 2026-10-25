@@ -326,7 +326,12 @@ working_dir = "src-tauri"
 
 [[steps]]
 name = "rust-clippy"
-# PLAIN clippy, exactly like ci.yml: lint levels come solely from
+# PLAIN clippy, DEFAULT TARGETS ONLY -- a declared divergence: ci.yml's two
+# hosted clippy legs run `--all-targets` (GitHub-hosted minutes are free on
+# this public repo), while this lane runs on fleet hosts, where CI ranks below
+# session spawns (served production-and-cost spawns-outrank-ci-and-builds), so
+# it does not pay the test-target check pass. Its verdict is a subset of
+# ci.yml's. Lint levels come solely from
 # src-tauri/Cargo.toml [lints.clippy] (T1 correctness/suspicious = deny,
 # T3 style/perf = warn). Adding `-D warnings` here would fail every
 # dispatch on the ~200 pre-existing warn-tier lints CI deliberately

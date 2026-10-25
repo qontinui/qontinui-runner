@@ -585,9 +585,12 @@ jobs:
         # are `deny` there, so a correctness lint still exits non-zero and fails
         # this required check; T3 style/complexity/perf stay `warn` (emitted,
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+        # `--all-targets` lints test code too, so a deny-tier lint in a test
+        # fails the PR that adds it (it used to surface only in the nightly
+        # clippy-tiers.yml job, where the baseline rotted unnoticed).
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
       # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
       #
@@ -1515,10 +1518,14 @@ jobs:
   clippy-windows:
     name: Clippy (windows)
     runs-on: windows-latest
-    # 88 successful runs, 2026-08-08..08-20: p50 14.7m, p90 16.5m, max 19.4m.
-    # 45 min = p90 + ~28 min headroom (2.3x the worst observed success).
+    # Default-target clippy, 23 successful runs 2026-10-22..10-25: job p50
+    # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
+    # `--all-targets` roughly doubles the step: the one measured run
+    # (qontinui-runner#2030, 2026-10-06, PR cache from a default-target main)
+    # took 24.8m for the step and 28.3m for the job. 60 min is ~2.1x that run
+    # and ~1.8x the ~33m job the 14.0m step max projects to.
     # Previously unbounded, i.e. GitHub's 360-minute default.
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -1593,7 +1600,7 @@ jobs:
         # correctness lint fails this check.
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
