@@ -704,6 +704,16 @@ impl RemoteCreateGrants {
             .unwrap_or(false)
     }
 
+    /// Drop a row without spending it — test cleanup for tests that must
+    /// write the GLOBAL table (the catch-up entry point feeds only that one).
+    /// Production retires a grant through `resolve`/`consume`, never this.
+    #[cfg(test)]
+    pub(crate) fn remove(&self, grant_jti: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(grant_jti);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().map(|m| m.len()).unwrap_or(0)
     }
@@ -4252,9 +4262,24 @@ mod tests {
             let _held = poisoned.inner.lock().unwrap();
             panic!("test: poisoning the lock");
         }));
+        const SENTINEL: &str = "sentinel: poisoned attach table capture is live";
+        let (outcome, logs) = crate::resource_guard::capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            poisoned.insert(grant("j1", None, NOW + 600), NOW)
+        });
+        assert_eq!(outcome, GrantInsert::Refused);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let warns: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("grant table lock is poisoned"))
+            .collect();
         assert_eq!(
-            poisoned.insert(grant("j1", None, NOW + 600), NOW),
-            GrantInsert::Refused
+            warns.len(),
+            1,
+            "a poisoned table names itself rather than dropping the grant silently: {logs}"
         );
     }
 
