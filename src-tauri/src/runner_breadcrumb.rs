@@ -782,8 +782,6 @@ mod tests {
     #[test]
     fn publish_with_key_then_remove_published_deletes_both_files() {
         let amb = isolated_ambient();
-        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
-        std::env::remove_var(PRIMARY_PORT_ENV);
         remove_published(); // a clean slate whatever a sibling left behind
 
         let port = 9891;
@@ -836,8 +834,6 @@ mod tests {
     #[test]
     fn publish_records_the_key_even_when_the_breadcrumb_write_fails() {
         let amb = isolated_ambient();
-        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
-        std::env::remove_var(PRIMARY_PORT_ENV);
         remove_published();
 
         let port = 9892;
