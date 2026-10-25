@@ -450,11 +450,16 @@ fn materialize_transcript_locally(
 ///
 /// Every holding dir is visited, not just the first: a session that ran on
 /// several accounts left part of its `<sid>/subagents/` on each, and the
-/// per-file rules make the union safe (append-only `.jsonl` keeps the larger
-/// copy; an in-place sidecar follows whichever side ran the session last). A
-/// target that already had the transcript still gets the carry. One holder
-/// failing never ends the walk; the call fails only when the target ends up
-/// with no transcript and at least one holder failed.
+/// per-file rules make the union safe (an existing `.jsonl` is replaced only by
+/// a source it is a byte-prefix of, so a fork's own tail is never lost; an
+/// in-place sidecar follows whichever side ran the session last).
+///
+/// A target that already held `<sid>.jsonl` KEEPS it
+/// ([`MainTranscript::KeepExisting`](crate::terminal::session_carry::MainTranscript)),
+/// as before the side-car carry existed — that copy is the one this target
+/// resumes, even when a holder's is larger — but its `<sid>/` still gets the
+/// carry. One holder failing never ends the walk; the call fails only when the
+/// target ends up with no transcript and at least one holder failed.
 fn materialize_from(
     config_dir: &str,
     candidates: &[String],
@@ -467,6 +472,11 @@ fn materialize_from(
         claude_session_id,
     );
     let mut found = target_path.exists();
+    let main = if found {
+        crate::terminal::session_carry::MainTranscript::KeepExisting
+    } else {
+        crate::terminal::session_carry::MainTranscript::ExtendPrefix
+    };
     let mut last_error = None;
     for src in candidates {
         if src == config_dir {
@@ -480,11 +490,12 @@ fn materialize_from(
         if !candidate.exists() {
             continue;
         }
-        match crate::terminal::session_carry::copy_transcript(
+        match crate::terminal::session_carry::carry_session(
             src,
             config_dir,
             working_dir,
             claude_session_id,
+            main,
         ) {
             Ok(carried) => {
                 tracing::info!(
@@ -1465,6 +1476,53 @@ mod tests {
         assert!(
             sub.join("agent-b.jsonl").exists(),
             "second holder's subagents carried"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A target that already holds `<sid>.jsonl` keeps it byte-for-byte even
+    /// when a holder's copy is a LARGER append-only extension of it (the
+    /// early-return rule), while that holder's `<sid>/` is still carried.
+    #[test]
+    fn local_materialization_keeps_a_present_target_transcript() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-keep-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "55555555-6666-7777-8888-999999999999";
+        let (target, holder) = (tmp.join(".claude-t"), tmp.join(".claude-h"));
+        seed_holder(&target, working_dir, sid, b"{}\n", &[]);
+        seed_holder(
+            &holder,
+            working_dir,
+            sid,
+            b"{}\n{\"more\":1}\n",
+            &[("subagents/agent-h.jsonl", b"h\n")],
+        );
+
+        assert!(materialize_from(
+            target.to_str().unwrap(),
+            &[holder.to_str().unwrap().to_string()],
+            working_dir,
+            sid
+        )
+        .unwrap());
+        let main = crate::terminal::transcript::session_transcript_path(&target, working_dir, sid);
+        assert_eq!(
+            std::fs::read(&main).unwrap(),
+            b"{}\n",
+            "the target's own transcript is kept, not replaced by a holder's"
+        );
+        assert!(
+            main.parent()
+                .unwrap()
+                .join(sid)
+                .join("subagents")
+                .join("agent-h.jsonl")
+                .is_file(),
+            "the side-car carry still runs into a present target"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

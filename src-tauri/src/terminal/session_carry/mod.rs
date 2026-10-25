@@ -15,8 +15,11 @@
 //!   the cross-machine respawn receiver (`crate::session::respawn`).
 //! - [`delta_sync`] tops the destination's `<sid>/` up once the OLD writer has
 //!   exited, for files the old pane wrote between the carry and its close. It
-//!   never touches `<sid>.jsonl` and never overwrites a file the resumed
-//!   process has written since the carry.
+//!   never touches `<sid>.jsonl`, and backs out if the destination changed
+//!   since the carry; best-effort — see [`delta_sync`].
+//! - No carry replaces an existing `.jsonl` (main or subagent) unless the
+//!   destination's bytes are a prefix of the source's: a destination that
+//!   diverged is a fork with its own tail, and is left alone.
 //! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
 //!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
@@ -66,7 +69,9 @@ pub(crate) struct SessionDirCarry {
     pub skipped_present: usize,
     /// Never followed: a symlink or junction (including `<sid>/` itself), a
     /// leftover `*.partial`, a directory past the depth bound, or a session id
-    /// that is not one plain path component.
+    /// that is not one plain path component. Also an existing `.jsonl` — the
+    /// main `<sid>.jsonl` included — whose bytes are not a prefix of the
+    /// source's: a diverged fork, never overwritten.
     pub skipped_other: usize,
     /// Read or write errors (including an unreadable `<sid>/`); each is logged.
     pub failed: usize,
@@ -102,8 +107,26 @@ pub(crate) struct CarriedFile {
     /// The source as the carry read it (before copying).
     pub src: FileStamp,
     /// The destination as the carry left it; `None` when it is absent (a
-    /// failed copy).
+    /// failed copy of a file the destination did not have).
     pub dst: Option<FileStamp>,
+    /// What the carry did to the destination.
+    pub wrote: CarryWrite,
+}
+
+/// What the carry did to one destination file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarryWrite {
+    /// Written now.
+    Copied,
+    /// Already current — left untouched.
+    Present,
+    /// An existing `.jsonl` whose bytes are not a prefix of the source's — a
+    /// fork with its own tail, left untouched.
+    Diverged,
+    /// The write failed. `dst` is what was there afterwards: absent, or an
+    /// existing file the failed overwrite left in place — [`delta_sync`]
+    /// retries it while it still has that stamp.
+    Failed,
 }
 
 /// One subagent whose transcript the destination holds after a carry.
@@ -125,7 +148,7 @@ pub(crate) struct DeltaSync {
     /// The destination changed since the carry (the resumed process wrote it,
     /// or a file appeared there the carry did not put there) — never touched.
     pub refused_destination_changed: usize,
-    /// Not followed (same rules as the carry).
+    /// Not followed (same rules as the carry, including a diverged `.jsonl`).
     pub skipped_other: usize,
     /// Read or write errors; each is logged.
     pub failed: usize,
@@ -163,10 +186,42 @@ fn require_session_uuid(claude_session_id: &str) -> Result<(), String> {
     }
 }
 
+/// What [`carry_session`] may do to an existing destination `<sid>.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainTranscript {
+    /// Replace it when it is a strict byte-prefix of the source's (an
+    /// append-only extension); keep it otherwise.
+    ExtendPrefix,
+    /// Never replace an existing one (only an absent one is written). The
+    /// respawn receiver uses this for a target that already held the
+    /// transcript: that copy is what the target resumes, even when a holder's
+    /// is larger.
+    KeepExisting,
+}
+
+/// [`carry_session`] with [`MainTranscript::ExtendPrefix`].
+pub(crate) fn copy_transcript(
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    working_dir: &str,
+    claude_session_id: &str,
+) -> Result<TranscriptCopy, String> {
+    carry_session(
+        src_config_dir,
+        dst_config_dir,
+        working_dir,
+        claude_session_id,
+        MainTranscript::ExtendPrefix,
+    )
+}
+
 /// Copy the session transcript from the source account's project dir into
 /// the target account's matching project dir. The source file is never
 /// modified or removed. Skips the copy when the destination already exists
-/// and is at least as large (idempotent retry).
+/// and is at least as large (idempotent retry), and when it is smaller but
+/// its bytes are not a prefix of the source's (a fork: counted in
+/// `skipped_other` and warned, never overwritten). `main` can forbid
+/// replacing an existing destination at all.
 ///
 /// Then carries the session's sibling directory `<sid>/` file by file. Claude
 /// Code keeps each subagent's transcript there
@@ -183,11 +238,12 @@ fn require_session_uuid(claude_session_id: &str) -> Result<(), String> {
 /// the main transcript was already present, so a retry completes a partial
 /// carry. Every write goes to `<name>.partial` and is renamed into place, so a
 /// copy cut short by a killed runner never looks finished to the size rule.
-pub(crate) fn copy_transcript(
+pub(crate) fn carry_session(
     src_config_dir: &str,
     dst_config_dir: &str,
     working_dir: &str,
     claude_session_id: &str,
+    main: MainTranscript,
 ) -> Result<TranscriptCopy, String> {
     require_session_uuid(claude_session_id)?;
     let src = super::transcript::session_transcript_path(
@@ -216,22 +272,54 @@ pub(crate) fn copy_transcript(
     let src_meta = std::fs::metadata(&src)
         .map_err(|e| format!("source transcript missing at {}: {e}", src.display()))?;
     let dst_len = std::fs::metadata(&dst).map(|dst_meta| dst_meta.len()).ok();
+    let main_verdict = match dst_len {
+        None => Verdict::Write,
+        // Already migrated (retry / repeated hint), or the newer copy.
+        Some(len) if len >= src_meta.len() => Verdict::Current,
+        // Smaller: an older prefix of the source, or a fork that wrote its
+        // own tail. Only the first may be replaced.
+        Some(_) => match is_byte_prefix(&dst, &src) {
+            Ok(true) if main == MainTranscript::ExtendPrefix => Verdict::Write,
+            Ok(true) => Verdict::Current,
+            Ok(false) => Verdict::Diverged,
+            Err(e) => {
+                return Err(format!(
+                    "compare {} with {} failed: {e}",
+                    dst.display(),
+                    src.display()
+                ))
+            }
+        },
+    };
     // Which side ran the session last, decided once from the append-only main
-    // transcript: the larger one. Sidecars that are rewritten in place (not
-    // appended) follow it -- on a migration the source is newer, but on a
-    // respawn that tops up from several holders the TARGET may be.
-    let source_is_newer = dst_len.is_none_or(|len| src_meta.len() >= len);
-    // Already migrated (retry / repeated hint).
-    let already_present = dst_len.is_some_and(|len| len >= src_meta.len());
-    if !already_present {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+    // transcript: the larger one, unless the destination diverged (then it ran
+    // on its own and keeps its in-place sidecars). Sidecars that are rewritten
+    // in place (not appended) follow it -- on a migration the source is newer,
+    // but on a respawn that tops up from several holders the TARGET may be.
+    let source_is_newer = main_verdict != Verdict::Diverged
+        && dst_len.is_none_or(|len| src_meta.len() >= len);
+    match main_verdict {
+        Verdict::Write => {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+            }
+            copy_via_partial(&src, &dst).map_err(|e| {
+                format!("copy {} -> {} failed: {e}", src.display(), dst.display())
+            })?;
         }
-        copy_via_partial(&src, &dst)
-            .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+        Verdict::Diverged => warn!(
+            from = %src.display(),
+            to = %dst.display(),
+            "session transcript carry: the destination <sid>.jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
+        ),
+        Verdict::Current => {}
     }
-    let (session_dir, files) = carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
+    let (mut session_dir, files) =
+        carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
+    if main_verdict == Verdict::Diverged {
+        session_dir.skipped_other += 1;
+    }
     // Beside the two transcripts actually used above, so a long-cwd target
     // resolves to the same `<prefix>-<hash>` dir the main copy landed in.
     let subagents = carried_subagents(
@@ -369,56 +457,139 @@ fn carry_session_dir(
         WalkEvent::Failed => carry.failed += 1,
         WalkEvent::File { from, rel, src } => {
             let to = dst_dir.join(rel);
-            if destination_is_current(from, &to, src.len, source_is_newer) {
-                carry.skipped_present += 1;
-            } else {
-                let written = to
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|()| copy_via_partial(from, &to));
-                match written {
-                    Ok(()) => carry.copied += 1,
-                    Err(e) => {
-                        warn!(
-                            from = %from.display(),
-                            to = %to.display(),
-                            error = %e,
-                            "session transcript carry: file copy failed"
-                        );
-                        carry.failed += 1;
+            let wrote = match destination_verdict(from, &to, src.len, source_is_newer) {
+                Ok(Verdict::Current) => {
+                    carry.skipped_present += 1;
+                    CarryWrite::Present
+                }
+                Ok(Verdict::Diverged) => {
+                    warn!(
+                        from = %from.display(),
+                        to = %to.display(),
+                        "session transcript carry: destination .jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
+                    );
+                    carry.skipped_other += 1;
+                    CarryWrite::Diverged
+                }
+                Ok(Verdict::Write) => {
+                    let written = to
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|()| copy_via_partial(from, &to));
+                    match written {
+                        Ok(()) => {
+                            carry.copied += 1;
+                            CarryWrite::Copied
+                        }
+                        Err(e) => {
+                            warn!(
+                                from = %from.display(),
+                                to = %to.display(),
+                                error = %e,
+                                "session transcript carry: file copy failed"
+                            );
+                            carry.failed += 1;
+                            CarryWrite::Failed
+                        }
                     }
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        from = %from.display(),
+                        to = %to.display(),
+                        error = %e,
+                        "session transcript carry: could not compare with the destination"
+                    );
+                    carry.failed += 1;
+                    CarryWrite::Failed
+                }
+            };
             files.push(CarriedFile {
                 rel: rel.to_path_buf(),
                 src,
                 dst: FileStamp::of(&to),
+                wrote,
             });
         }
     });
     (carry, files)
 }
 
-/// Whether the destination already holds what `from` should leave there. A
-/// `.jsonl` transcript is append-only, so a destination at least as large is
-/// the newer copy (a repeated hint, or a migration back) and must never be
-/// truncated. Anything else (e.g. `custom-title.json`, a JSON file overwritten
-/// in place rather than appended to) keeps the destination's copy when the
-/// destination side ran the session last, and otherwise is current only when
-/// its bytes are identical.
-fn destination_is_current(from: &Path, to: &Path, from_len: u64, source_is_newer: bool) -> bool {
+/// What a carry should do with one destination file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Absent, or an older copy that may be replaced.
+    Write,
+    /// Already holds what the source would leave there.
+    Current,
+    /// An existing `.jsonl` that is not a prefix of the source's.
+    Diverged,
+}
+
+/// What the carry should do with `to`, given `from`. A `.jsonl` transcript is
+/// append-only, so a destination at least as large is the newer copy (a
+/// repeated hint, or a migration back) and must never be truncated, and a
+/// smaller one is replaced only when its bytes are a prefix of the source's —
+/// otherwise it is a fork with a tail of its own ([`Verdict::Diverged`]).
+/// Anything else (e.g. `custom-title.json`, a JSON file overwritten in place
+/// rather than appended to) keeps the destination's copy when the destination
+/// side ran the session last, and otherwise is current only when its bytes
+/// are identical.
+fn destination_verdict(
+    from: &Path,
+    to: &Path,
+    from_len: u64,
+    source_is_newer: bool,
+) -> std::io::Result<Verdict> {
     let Ok(to_meta) = std::fs::metadata(to) else {
-        return false;
+        return Ok(Verdict::Write);
     };
     if is_jsonl(from) {
-        return to_meta.len() >= from_len;
+        return Ok(if to_meta.len() >= from_len {
+            Verdict::Current
+        } else if is_byte_prefix(to, from)? {
+            Verdict::Write
+        } else {
+            Verdict::Diverged
+        });
     }
-    !source_is_newer
+    let current = !source_is_newer
         || (to_meta.len() == from_len
             && matches!(
                 (std::fs::read(from), std::fs::read(to)),
                 (Ok(a), Ok(b)) if a == b
-            ))
+            ));
+    Ok(if current {
+        Verdict::Current
+    } else {
+        Verdict::Write
+    })
+}
+
+/// Whether the bytes of `prefix` are a prefix of the bytes of `of` (`false`
+/// when `prefix` is the longer). Compared in chunks, so a large transcript is
+/// never read into memory whole.
+fn is_byte_prefix(prefix: &Path, of: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    const CHUNK: usize = 64 * 1024;
+    let mut p = std::fs::File::open(prefix)?;
+    let mut o = std::fs::File::open(of)?;
+    let p_len = p.metadata()?.len();
+    if p_len > o.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
+    let mut remaining = p_len;
+    while remaining > 0 {
+        let n = usize::try_from(remaining).map_or(CHUNK, |r| r.min(CHUNK));
+        p.read_exact(&mut a[..n])?;
+        o.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Ok(false);
+        }
+        remaining -= n as u64;
+    }
+    Ok(true)
 }
 
 fn is_jsonl(path: &Path) -> bool {
@@ -559,13 +730,17 @@ fn meta_description(path: &Path) -> Option<String> {
 ///   past both its carried size and the destination's (append-only, never
 ///   truncate); any other file must differ in size or mtime. A file that is new
 ///   since the carry counts as moved on when the destination is still absent,
-///   and so does a file the carry failed to write.
+///   and so does a file the carry failed to write ([`CarryWrite::Failed`]),
+///   whether that left the destination absent or left an older copy in place;
+/// - an existing destination `.jsonl` is replaced only when its bytes are a
+///   prefix of the source's; a diverged one counts as `skipped_other`.
 ///
 /// The copy re-checks the destination immediately before its rename (and
 /// again before its one retry) and backs out if it changed while the bytes
 /// were being written. That narrows the race with the resumed process to the
-/// gap between that check and the rename; it does not close it — Windows has
-/// no rename-if-unchanged — so this is best-effort, not a guarantee.
+/// gap between that check and the rename; it does not close it —
+/// `std::fs::rename` has no compare-and-swap form — so this is best-effort,
+/// not a guarantee.
 ///
 /// `<sid>.jsonl` is never touched: from the moment of respawn the resumed
 /// process owns the destination's main transcript.
@@ -610,14 +785,43 @@ pub(crate) fn delta_sync(
                 sync.refused_destination_changed += 1;
                 return;
             }
-            // A file the carry failed to write (destination still absent) is
-            // retried even when its source did not move on: there is nothing
-            // at the destination to overwrite.
-            let moved_on = recorded
-                .is_none_or(|r| r.dst.is_none() || source_moved_on(rel, r.src, src, dst_now));
+            // A file the carry failed to write is retried even when its source
+            // did not move on — the destination is still exactly what the
+            // failed write left (checked above): absent, or the older copy it
+            // meant to replace. A recorded-absent destination likewise has
+            // nothing to overwrite.
+            let moved_on = recorded.is_none_or(|r| {
+                r.wrote == CarryWrite::Failed
+                    || r.dst.is_none()
+                    || source_moved_on(rel, r.src, src, dst_now)
+            });
             if !moved_on {
                 sync.unchanged += 1;
                 return;
+            }
+            if dst_now.is_some() && is_jsonl(rel) {
+                match is_byte_prefix(&to, from) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            from = %from.display(),
+                            to = %to.display(),
+                            "session delta sync: destination .jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
+                        );
+                        sync.skipped_other += 1;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            from = %from.display(),
+                            to = %to.display(),
+                            error = %e,
+                            "session delta sync: could not compare with the destination"
+                        );
+                        sync.failed += 1;
+                        return;
+                    }
+                }
             }
             match copy_if_destination_is(from, &to, dst_now) {
                 Ok(true) => sync.copied += 1,
@@ -661,19 +865,37 @@ fn copy_if_destination_is(
     to: &Path,
     expected: Option<FileStamp>,
 ) -> std::io::Result<bool> {
+    copy_if_destination_is_with(from, to, expected, |a, b| std::fs::rename(a, b))
+}
+
+/// [`copy_if_destination_is`] with the rename injected, so the re-check before
+/// the retry is testable.
+fn copy_if_destination_is_with<R>(
+    from: &Path,
+    to: &Path,
+    expected: Option<FileStamp>,
+    mut rename: R,
+) -> std::io::Result<bool>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let partial = write_partial(from, to)?;
-    // Not `rename_with_retry`: a `PermissionDenied` here is most likely the
-    // resumed `claude` holding the destination open while it writes, so the
-    // stamp is checked again before the one retry, never assumed unchanged.
+    // Not `rename_with_retry`: the stamp is checked again before the one
+    // retry, never assumed unchanged across the pause. An open handle does
+    // NOT protect the destination: on Windows `std::fs::rename` replaces with
+    // POSIX semantics and node opens files with `FILE_SHARE_DELETE`, so a live
+    // writer's handle does not stop the replace. A `PermissionDenied` is more
+    // likely a transient filter (antivirus, indexer) or an opener without
+    // share-delete — and whatever caused it, the destination may have moved on.
     let mut attempt = 0;
     let outcome = loop {
         if FileStamp::of(to) != expected {
             break Ok(false);
         }
-        match std::fs::rename(&partial, to) {
+        match rename(&partial, to) {
             Ok(()) => break Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt == 0 => {
                 attempt += 1;
