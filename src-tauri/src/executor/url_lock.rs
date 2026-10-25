@@ -570,7 +570,9 @@ mod tests {
             );
             assert!(mgr.is_locked(other).await, "{other}");
         }
-        // A different port is a different runner: not contended.
+        // An explicit [::1] is left as written (a deliberate IPv6 target), so it
+        // is a different key; a different port is a different runner.
+        assert!(!mgr.is_locked("http://[::1]:9876/ui-bridge").await);
         assert!(!mgr.is_locked("http://127.0.0.1:9877/ui-bridge").await);
         assert_eq!(mgr.info().await[0].url, "http://127.0.0.1:9876/ui-bridge");
     }
