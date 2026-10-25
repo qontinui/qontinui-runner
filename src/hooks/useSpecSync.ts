@@ -130,7 +130,7 @@ export async function getQuarantinedStateIds(): Promise<Set<string>> {
     if (!base) return new Set();
     return fetchQuarantinedStateIdsFromBase(base);
   }
-  return fetchQuarantinedStateIdsFromBase(`${runnerBaseForPort(port)}`);
+  return fetchQuarantinedStateIdsFromBase(runnerBaseForPort(port));
 }
 
 async function fetchQuarantinedStateIdsFromBase(base: string): Promise<Set<string>> {

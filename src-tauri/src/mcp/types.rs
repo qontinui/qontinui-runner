@@ -177,9 +177,12 @@ pub fn get_self_base_url_from_env() -> String {
     runner_loopback_base(get_mcp_api_port())
 }
 
-/// Rewrite a URL whose HOST is a loopback name (`localhost`, any case, or
-/// `[::1]`) to name [`RUNNER_API_BIND_IP`] instead; every other URL is
-/// returned unchanged.
+/// Rewrite a URL whose HOST is `localhost` (any case) to name
+/// [`RUNNER_API_BIND_IP`] instead; every other URL is returned unchanged.
+///
+/// An explicit `[::1]` is left alone on purpose: it is a deliberate choice of
+/// the IPv6 loopback (some dev servers bind only `::1`), and dialing it at the
+/// IPv4 address would break a connect that works today.
 ///
 /// Two jobs, one function:
 /// - **No doomed IPv6 connect.** Windows resolves `localhost` to `::1` first;
@@ -205,7 +208,7 @@ pub fn canonical_loopback_url(url: &str) -> String {
         rest.find([':', '/', '?', '#']).unwrap_or(rest.len())
     };
     let host = rest.get(..host_len).unwrap_or("");
-    if host.eq_ignore_ascii_case("localhost") || host == "[::1]" {
+    if host.eq_ignore_ascii_case("localhost") {
         format!(
             "{}{}{}",
             url.get(..host_start).unwrap_or(""),
@@ -1004,7 +1007,7 @@ mod loopback_base_url_tests {
             ("http://localhost", "http://127.0.0.1"),
             ("http://localhost/", "http://127.0.0.1/"),
             ("ws://localhost:9877", "ws://127.0.0.1:9877"),
-            ("http://[::1]:9876/health", "http://127.0.0.1:9876/health"),
+            ("http://[::1]:9876/health", "http://[::1]:9876/health"),
             (
                 "http://localhost:8080/api/v1?key=val",
                 "http://127.0.0.1:8080/api/v1?key=val",

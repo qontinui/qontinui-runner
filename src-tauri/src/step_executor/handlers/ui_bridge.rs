@@ -702,10 +702,25 @@ struct ComparisonResult {
 // Extract origin helper
 // ---------------------------------------------------------------------------
 
+/// The URL a UI Bridge step dials and locks: the step's own `ui_bridge_url`
+/// with a `localhost` host canonicalized to `127.0.0.1`, else `default`.
+///
+/// A persisted step (or a skill default) may still say `localhost`; left as
+/// written it would pay the doomed `::1` connect on every new connection and
+/// key the per-URL workflow lock and the failure tracker apart from a
+/// `127.0.0.1` step on the SAME runner. Plan
+/// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect.
+fn step_dial_url(step_url: Option<&str>, default: &str) -> String {
+    step_url
+        .map(crate::mcp::types::canonical_loopback_url)
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Extract the origin (scheme + host + port) from a URL.
 ///
-/// Given `http://localhost:9876/ui-bridge`, returns `http://localhost:9876`.
-/// Falls back to the default `http://localhost:9876` if parsing fails.
+/// Given `http://127.0.0.1:9876/ui-bridge`, returns `http://127.0.0.1:9876`.
+/// Falls back to this runner's own base (`get_self_base_url_from_env`) if
+/// parsing fails.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -842,14 +857,12 @@ impl StepHandler for UiBridgeHandler {
             .unwrap_or(DEFAULT_UI_BRIDGE_ACTION);
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
         let default_ui_bridge = format!("{}/ui-bridge", self_base);
-        // A persisted step (or a skill default) may still say `localhost`;
-        // canonicalize it so it neither pays the doomed `::1` connect nor keys
-        // the URL lock / failure tracker apart from a `127.0.0.1` step.
-        let canonical_step_url = step
-            .ui_bridge_url
-            .as_deref()
-            .map(crate::mcp::types::canonical_loopback_url);
-        let raw_url = canonical_step_url.as_deref().unwrap_or(&default_ui_bridge);
+        // The URL as the step wrote it: what the audit log and the network
+        // policy judge.
+        let authored_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
+        // The URL dialed and locked: canonical, see `step_dial_url`.
+        let dial_url = step_dial_url(step.ui_bridge_url.as_deref(), &default_ui_bridge);
+        let raw_url: &str = &dial_url;
 
         // SDK operations (navigate, execute, assert) always go through the runner's SDK proxy.
         // The `ui_bridge_url` may be a page URL (e.g., "http://localhost:3001/build/page-sweep")
@@ -875,13 +888,13 @@ impl StepHandler for UiBridgeHandler {
         context.audit_logger.log(
             crate::security::audit::SecurityAuditEvent::new(
                 crate::security::audit::AuditEventType::PolicyEvaluation,
-                format!("UI Bridge {}: {}", action, raw_url),
+                format!("UI Bridge {}: {}", action, authored_url),
                 crate::security::audit::AuditDecision::Allowed,
             )
             .with_step(step_name)
             .with_metadata(serde_json::json!({
                 "action": action,
-                "url": raw_url,
+                "url": authored_url,
                 "profile": context.security_policy.profile_name,
             })),
         );
@@ -890,7 +903,7 @@ impl StepHandler for UiBridgeHandler {
         if context.security_policy.network.mode
             != crate::security::policy::NetworkMode::Unrestricted
         {
-            let (domain, protocol) = extract_domain_from_url(raw_url);
+            let (domain, protocol) = extract_domain_from_url(authored_url);
             if !domain.is_empty() {
                 if let Err(denial) = crate::security::PolicyEngine::evaluate_network(
                     &context.security_policy,
@@ -2520,6 +2533,27 @@ mod tests {
     }
 
     // --- extract_origin tests ---
+
+    /// A persisted step that still says `localhost` is dialed and locked at
+    /// 127.0.0.1; a step with no URL gets the default; any other host, and an
+    /// explicit `[::1]`, is left as written.
+    #[test]
+    fn test_step_dial_url_canonicalizes_a_localhost_step_only() {
+        let default = "http://127.0.0.1:9877/ui-bridge";
+        assert_eq!(
+            step_dial_url(Some("http://localhost:9877/ui-bridge"), default),
+            "http://127.0.0.1:9877/ui-bridge"
+        );
+        assert_eq!(step_dial_url(None, default), default);
+        assert_eq!(
+            step_dial_url(Some("http://example.test:3001/ui-bridge"), default),
+            "http://example.test:3001/ui-bridge"
+        );
+        assert_eq!(
+            step_dial_url(Some("http://[::1]:3001/ui-bridge"), default),
+            "http://[::1]:3001/ui-bridge"
+        );
+    }
 
     #[test]
     fn test_extract_origin_with_path() {

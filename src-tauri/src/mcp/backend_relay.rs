@@ -4150,7 +4150,7 @@ async fn handle_http_request(api_state: &Arc<ApiState>, data: &Value) -> Option<
 }
 
 /// Transport-agnostic core of the `http_request` relay: given the loopback
-/// base URL (e.g. `http://localhost:9876`) and the inbound envelope, issue
+/// base URL (e.g. `http://127.0.0.1:9876`) and the inbound envelope, issue
 /// the local call and build the `command_response` reply frame. Split out so
 /// it can be unit-tested against a real local server without constructing a
 /// full `ApiState`. Always returns a `command_response` value.

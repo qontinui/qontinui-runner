@@ -411,7 +411,7 @@ mod tests {
         // Curl template uses the runner port we passed in.
         assert!(
             s.contains(
-                "http://localhost:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"
+                "http://127.0.0.1:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"
             ),
             "curl template missing or has wrong port"
         );
