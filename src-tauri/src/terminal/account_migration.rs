@@ -1022,9 +1022,10 @@ pub fn migrate_session(
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
     // and its exit — detached, because `close` does not wait for the `claude`
     // and this fn is synchronous. It waits (bounded) until `old_writer` is
-    // gone from the whole process table and never touches `<sid>.jsonl` or a
-    // file the resumed process has written. Runs after a failed close too:
-    // the pane was already gone, and the wait still decides.
+    // gone from the whole process table and never touches `<sid>.jsonl`; for
+    // a side-car file it backs out if the destination changed since the
+    // carry — best-effort, see `session_carry::delta_sync`. Runs after a
+    // failed close too: the pane was already gone, and the wait still decides.
     crate::terminal::session_carry::spawn_delta_sync_after_exit(
         old_writer,
         src_config_dir.to_string(),
