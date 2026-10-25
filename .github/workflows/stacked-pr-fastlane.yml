@@ -67,7 +67,8 @@ name: Stacked PR fast lane
 #
 #   TARGET — single-digit billable minutes for the ordinary push. The `scope`
 #   job below reads the PR diff and runs only the arm(s) the diff touches, so a
-#   Rust-only push pays the Rust arm (~8-12 min warm) and a frontend-only push
+#   Rust-only push pays the Rust arm (~8-12 min warm, measured before its
+#   clippy went --all-targets; unmeasured since) and a frontend-only push
 #   pays the frontend arm (~3-5 min). `cancel-in-progress` means a loop session
 #   pushing five times in ten minutes pays for one settled run, not five.
 #
@@ -250,9 +251,11 @@ jobs:
       # target (the SDK<->runner manifest diff test reads ui-bridge's
       # types.ts at test RUNTIME) and for a frontend spec-registry import that no
       # longer exists in this tree. This lane's `cargo clippy --all-targets`
-      # check-compiles the test targets too, but checking reads no file outside
-      # this repo (every include_str!/include_bytes! under src-tauri resolves
-      # inside it; ui-bridge's types.ts is read by a test at RUN time, and this
+      # check-compiles the test targets too, but checking reads no file from
+      # qontinui-web or ui-bridge (every include_str!/include_bytes! under
+      # src-tauri resolves inside this repo, and the only sibling it compiles is
+      # the qontinui-schemas path dependency this step checks out; ui-bridge's
+      # types.ts is read by a test at RUN time, and this
       # lane runs no test), and nothing under src/ resolves a path outside it
       # either (tsconfig.json's only alias is `@/* -> src/*`), so both clones are
       # dead weight in this lane. If a future test RUN lands here, they come back
@@ -293,7 +296,11 @@ jobs:
       # free-disk-space reclaim. Both guard the LINK step (rustc/LLVM commit
       # spike, and a target dir holding full debug objects). `cargo clippy`
       # emits metadata and links nothing, so neither pressure exists here and
-      # neither is worth ~2 min of every run. If this job ever dies with ENOSPC
+      # neither is worth ~2 min of every run. That was judged for a default-target
+      # clippy; `--all-targets` also type-checks the bin's and lib's test builds
+      # concurrently, and its peak memory on this lane is unmeasured (ci.yml's
+      # ubuntu leg runs the same command with its 12 GB swapfile in place). If
+      # this job ever dies with ENOSPC
       # or an OOM signature, re-add them — do not silently raise the timeout.
       - name: Install dependencies (Ubuntu)
         timeout-minutes: 10
