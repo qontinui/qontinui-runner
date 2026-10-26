@@ -1528,31 +1528,22 @@ mod tests {
         "QONTINUI_SECURE_STORAGE_DIR",
     ];
 
-    /// Enter a subject launch: fixture env, a root at `<fixture>/subject`, the
-    /// fixture's own dir keys cleared, and `WEBVIEW2_USER_DATA_FOLDER` (not an
-    /// ambient key) captured for restore.
-    fn subject_env(
-        amb: &crate::test_env::IsolatedAmbient,
-    ) -> (PathBuf, crate::test_env::EnvVarRestore) {
-        let restore = crate::test_env::EnvVarRestore::capture(&[
-            "WEBVIEW2_USER_DATA_FOLDER",
-            // A D5 default with no runner reader, so not an ambient key.
-            "QONTINUI_TOUCH_LEDGER_DIR",
-        ]);
-        std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
-        std::env::remove_var("QONTINUI_TOUCH_LEDGER_DIR");
+    /// Enter a subject launch: fixture env (which has already removed every
+    /// other root-confined key, and captures them all for restore), a root at
+    /// `<fixture>/subject`, and the fixture's own dir keys cleared.
+    fn subject_env(amb: &crate::test_env::IsolatedAmbient) -> PathBuf {
         for key in FIXTURE_DIR_KEYS {
             std::env::remove_var(key);
         }
         let root = amb.dir().join("subject");
         std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
-        (root, restore)
+        root
     }
 
     #[test]
     fn apply_exports_every_default_and_creates_the_dirs() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = subject_env(&amb);
+        let root = subject_env(&amb);
         std::env::set_var("QONTINUI_PORT", "9881");
         std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
 
@@ -1583,7 +1574,7 @@ mod tests {
     #[test]
     fn apply_refuses_the_primary_port_and_writes_nothing() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = subject_env(&amb);
+        let root = subject_env(&amb);
         std::env::set_var(
             "QONTINUI_PORT",
             crate::runner_breadcrumb::PRIMARY_PORT.to_string(),
@@ -1603,6 +1594,51 @@ mod tests {
 
         // A CLI bin under the same root does not care about the port.
         assert_eq!(apply_instance_root_env(false), Ok(Some(root)));
+    }
+
+    /// A session a SUBJECT runner hosts (a supervisor temp or named runner)
+    /// inherits that runner's whole instance-root family and its identity, and
+    /// a test binary it runs inherits them in turn. The fixture must start from
+    /// none of them: every confined location set OUTSIDE the subject root, and
+    /// the instance name and primary port set, before the fixture is built
+    /// (coord finding e0834743; plan
+    /// 2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard).
+    /// Two host-injected keys are deliberately NOT cleared by the fixture and
+    /// so are not covered here: `QONTINUI_PORT` (tests set it around their
+    /// fixtures; the plan's D4) and `QONTINUI_DISABLE_KEYCHAIN` (CI sets it).
+    #[test]
+    fn a_subject_hosted_session_leaks_no_instance_family_into_the_fixture() {
+        let _lock = crate::test_env::env_lock();
+        let host = tempfile::tempdir().expect("the hosting runner's own root");
+        let mut keys: Vec<&'static str> = ROOT_CONFINED_ENV_KEYS.to_vec();
+        keys.extend([
+            "QONTINUI_INSTANCE_NAME",
+            "QONTINUI_PRIMARY_PORT",
+            "QONTINUI_INSTANCE_ROOT",
+            "QONTINUI_PORT",
+        ]);
+        let _outer = crate::test_env::EnvVarRestore::capture(&keys);
+        for key in ROOT_CONFINED_ENV_KEYS {
+            std::env::set_var(key, host.path().join(key));
+        }
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-host-subject");
+        // Not the default 9876, which an unset key also resolves to.
+        std::env::set_var("QONTINUI_PRIMARY_PORT", "9878");
+
+        let amb = crate::test_env::isolated_ambient();
+        assert!(
+            !is_secondary(),
+            "an inherited instance name must not make the fixture read secondary"
+        );
+        assert_eq!(
+            std::env::var_os("QONTINUI_PRIMARY_PORT"),
+            None,
+            "an inherited primary port must not reach the fixture"
+        );
+        let root = subject_env(&amb);
+        std::env::set_var("QONTINUI_PORT", "9881");
+        assert_eq!(apply_instance_root_env(true), Ok(Some(root)));
+        assert!(!shares_primary_settings());
     }
 
     #[test]

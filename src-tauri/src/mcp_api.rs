@@ -5565,6 +5565,16 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   same shape as `coord_post_finding`: it records what an overlord did, and
 ///   performs nothing.
 ///
+/// * the triage-pass ledger (plan
+///   `2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote`
+///   Phase 2b) — `coord_overlord_pass_record` (twin `POST /coord/overlord/passes`),
+///   the store-of-record for one `/triage-sessions` pass and its per-terminal
+///   rows, so session FLOW (time-to-close, nudge→progress) is measured rather
+///   than recalled. Like `coord_overlord_record` it is an append-only,
+///   self-attributed write that performs nothing. Its reads
+///   (`coord_query_overlord_passes`, `coord_query_overlord_flow`) need no entry:
+///   they ride the `coord_query_` read-family prefix.
+///
 /// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
 /// reported eleven names that coord ADVERTISED to this door's principal, which
 /// this list neither allowed nor named as deliberate. Each was classified; the
@@ -5723,6 +5733,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_operator_touch_classify",
     "coord_orient",
     "coord_overlord_interventions",
+    // Plan 2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote
+    // Phase 2b: the triage-PASS ledger write (twin `POST /coord/overlord/passes`).
+    // An append-only, self-attributed record of one /triage-sessions pass and its
+    // per-terminal rows; it records what the overlord observed and did, and
+    // performs nothing. Its two reads (`coord_query_overlord_passes`,
+    // `coord_query_overlord_flow`) ride the `coord_query_` prefix below.
+    "coord_overlord_pass_record",
     "coord_overlord_record",
     "coord_pending_agent_questions",
     "coord_pin_worktree",
@@ -17601,6 +17618,7 @@ mod coord_mcp_body_gate_tests {
             "coord_session_obligations",
             "coord_overlord_record",
             "coord_overlord_interventions",
+            "coord_overlord_pass_record",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(!coord_mcp_withholding_is_deliberate(tool));
@@ -17620,6 +17638,26 @@ mod coord_mcp_body_gate_tests {
             );
         }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+        // The pass ledger's two reads are NOT named in the list: they forward
+        // through the `coord_query_` read-family prefix, so the parser must not
+        // find them as named entries while the gate still lets them through.
+        for read in ["coord_query_overlord_passes", "coord_query_overlord_flow"] {
+            assert!(coord_mcp_tool_is_allowed(read), "{read} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(read));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":read,"arguments":{}}
+                }))
+                .is_ok(),
+                "{read} must be callable through the proxy"
+            );
+            assert!(
+                !parsed.allowed.iter().any(|t| t == read),
+                "{read} rides the prefix and must not be named: {:?}",
+                parsed.allowed
+            );
+        }
     }
 
     /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`
