@@ -62,7 +62,7 @@
 //! 5. **The transcript, into the TARGET account's project dir**
 //!    (`<config-dir>/projects/<slug>/<sid>.jsonl`, plus its `<sid>/` directory of
 //!    subagent transcripts, best-effort). Local copy first — reusing
-//!    [`crate::terminal::session_carry::carry_session`] — then
+//!    [`crate::terminal::session_carry::carry_for_respawn`] — then
 //!    coord's warm→cold `?stream=transcript` tier for the cross-machine case.
 //!    Neither yielding bytes is a hard failure: `--resume` against a
 //!    non-existent transcript would start an EMPTY conversation wearing the
@@ -426,7 +426,7 @@ fn resolve_working_dir(
 /// afterwards (copied now, or already there), `Ok(false)` when no local dir
 /// holds it.
 ///
-/// Reuses [`crate::terminal::session_carry::carry_session`] rather than
+/// Reuses [`crate::terminal::session_carry::carry_for_respawn`] rather than
 /// re-implementing the copy: same idempotent "skip when the destination is
 /// already at least as large" behaviour, same never-touch-the-source rule, and
 /// the same best-effort carry of the session's `<sid>/` directory (subagent
@@ -455,7 +455,7 @@ fn materialize_transcript_locally(
 /// in-place sidecar follows whichever side ran the session last).
 ///
 /// A target that already held `<sid>.jsonl` KEEPS it
-/// ([`MainTranscript::KeepExisting`](crate::terminal::session_carry::MainTranscript)),
+/// ([`RespawnCarry::KeepExisting`](crate::terminal::session_carry::RespawnCarry)),
 /// as before the side-car carry existed — that copy is the one this target
 /// resumes, even when a holder's is larger — but its `<sid>/` still gets the
 /// carry. One holder failing never ends the walk; the call fails only when the
@@ -473,9 +473,9 @@ fn materialize_from(
     );
     let mut found = target_path.exists();
     let main = if found {
-        crate::terminal::session_carry::MainTranscript::KeepExisting
+        crate::terminal::session_carry::RespawnCarry::KeepExisting
     } else {
-        crate::terminal::session_carry::MainTranscript::ExtendPrefix
+        crate::terminal::session_carry::RespawnCarry::ExtendPrefix
     };
     let mut last_error = None;
     for src in candidates {
@@ -490,7 +490,7 @@ fn materialize_from(
         if !candidate.exists() {
             continue;
         }
-        match crate::terminal::session_carry::carry_session(
+        match crate::terminal::session_carry::carry_for_respawn(
             src,
             config_dir,
             working_dir,
