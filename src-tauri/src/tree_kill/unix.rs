@@ -47,24 +47,31 @@ pub(super) fn kill_tree(
             "pid {pid}: refusing to kill this process's own tree; nothing signalled"
         ));
     }
-    // SAFETY: a zeroed siginfo_t is a valid out-parameter for waitid.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves the child
-    // unreaped, WNOHANG keeps the call from blocking.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            spid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc != 0 {
+    // An EINTR is retried, as `tree_freeze::waitid_nowait` does: it says
+    // nothing about the pid (review r2, finding 11).
+    let info = loop {
+        // SAFETY: a zeroed siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves the
+        // child unreaped, WNOHANG keeps the call from blocking.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                spid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            break info;
+        }
         let e = std::io::Error::last_os_error();
-        return Err(format!(
-            "pid {pid} is not an unreaped child of this runner ({e}); nothing signalled"
-        ));
-    }
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!(
+                "pid {pid} is not an unreaped child of this runner ({e}); nothing signalled"
+            ));
+        }
+    };
     if info.si_pid == spid {
         return Ok(TreeKillReport {
             root_exited: true,

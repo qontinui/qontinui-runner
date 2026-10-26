@@ -119,7 +119,7 @@ pub(crate) fn kill_child_tree(
 
 /// What was recorded for one pid: by [`track_ai_pid`] (a tracker entry), or
 /// by [`record_spawn_identity`] (a Doctor-listed process in no tracker).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Recorded {
     /// The pid's start token at record time; `None` when unreadable, or on an
     /// OS with no token.
@@ -215,13 +215,15 @@ pub(crate) fn record_spawn_token(pid: u32, token: Option<String>) {
     match (&token, ids.get(&pid)) {
         (None, _) => warn!(
             target: "tree_kill",
-            "pid {pid}: its start token is unreadable, so a Doctor force-stop will refuse to              signal it"
+            "pid {pid}: its start token is unreadable, so a Doctor force-stop will refuse to \
+             signal it"
         ),
         (Some(_), Some(r)) if r.tracker.is_some() => {
             if r.token != token {
                 warn!(
                     target: "tree_kill",
-                    "pid {pid}: a stale tracked record holds this pid, so a Doctor force-stop                      will refuse to signal it"
+                    "pid {pid}: a stale tracked record holds this pid, so a Doctor force-stop \
+                     will refuse to signal it"
                 );
             }
         }
@@ -386,6 +388,16 @@ fn recorded(pid: u32) -> Result<Recorded, KillOutcome> {
     })
 }
 
+/// Drop the record of `pid`, but only while it is still `recorded`: a newer
+/// record written for the same pid in the meantime is kept (review r2,
+/// finding 3).
+fn forget_record(pid: u32, recorded: &Recorded) {
+    let mut ids = identities();
+    if ids.get(&pid) == Some(recorded) {
+        ids.remove(&pid);
+    }
+}
+
 /// Kill `pid`'s tree under its `recorded` identity. A token mismatch
 /// ("reused") drops the stale record.
 fn kill_recorded(pid: u32, recorded: &Recorded, budget: Duration) -> KillOutcome {
@@ -394,7 +406,7 @@ fn kill_recorded(pid: u32, recorded: &Recorded, budget: Duration) -> KillOutcome
     let require_token = START_TOKENS_EXIST || recorded.tracker.is_none();
     let result = kill_verified(pid, recorded.token.as_deref(), require_token, budget);
     if matches!(&result, Err(e) if e.contains(" was reused")) {
-        identities().remove(&pid);
+        forget_record(pid, recorded);
     }
     KillOutcome::from_result(result)
 }
@@ -489,18 +501,41 @@ fn windows_kill_verified(
     terminate_tree_of(&root, pid, budget).map_err(|e| e.to_string())
 }
 
-/// After a kill of a pid taken out of `tracker`: a pid whose outcome is not
-/// final goes back into the tracker, keeping its record; any other pid's
-/// record is dropped.
-fn settle(tracker: &Mutex<Vec<u32>>, pid: u32, taken: bool, outcome: &KillOutcome) {
-    if taken && !outcome.is_final() {
+/// After a kill of `pid` under its `recorded` identity (`None`: it had none),
+/// `taken` saying whether the pid was taken out of `tracker` for it.
+///
+/// A final outcome drops the record. A pid refused for a reason that may pass
+/// keeps its record for a retry, and goes back into the tracker if it was
+/// taken out — but only while it still carries the recorded token: one that
+/// exited meanwhile (its waiter's removal found the pid already drained) is
+/// dropped instead of becoming a stale entry (review r2, findings 1 and 2).
+fn settle(
+    tracker: &Mutex<Vec<u32>>,
+    pid: u32,
+    taken: bool,
+    recorded: Option<&Recorded>,
+    outcome: &KillOutcome,
+) {
+    let Some(recorded) = recorded else {
+        return;
+    };
+    if outcome.is_final() {
+        forget_record(pid, recorded);
+    } else if !taken {
+        // A Doctor-recorded pid in no tracker: its record stays for a retry.
+    } else if spawn_token(pid) == recorded.token {
         lock_tracker(tracker).push(pid);
         warn!(
             target: "tree_kill",
             "pid {pid}: not signalled for a reason that may pass; it stays tracked"
         );
     } else {
-        identities().remove(&pid);
+        forget_record(pid, recorded);
+        info!(
+            target: "tree_kill",
+            "pid {pid}: not signalled, and it no longer carries its recorded start token, so \
+             it is no longer tracked"
+        );
     }
 }
 
@@ -514,11 +549,12 @@ pub(crate) async fn kill_tracked(
     let pids = drain(tracker);
     let mut tally = KillTally::default();
     for pid in pids {
-        let outcome = match recorded(pid) {
-            Ok(r) => kill_recorded_async(pid, r, budget).await,
-            Err(refused) => refused,
+        let rec = recorded(pid);
+        let outcome = match &rec {
+            Ok(r) => kill_recorded_async(pid, r.clone(), budget).await,
+            Err(refused) => refused.clone(),
         };
-        settle(tracker, pid, true, &outcome);
+        settle(tracker, pid, true, rec.as_ref().ok(), &outcome);
         tally.record(label, pid, outcome);
     }
     tally
@@ -537,17 +573,18 @@ pub(crate) fn kill_tracked_with_deadline(
     let mut tally = KillTally::default();
     let mut spent = false;
     for pid in pids {
-        let outcome = match (!spent).then(&mut next_budget).flatten() {
-            Some(budget) => kill_tracked_pid(pid, budget),
-            None => {
-                spent = true;
-                KillOutcome::Refused(format!(
-                    "pid {pid}: the kill deadline was spent before it was reached; nothing \
-                     signalled"
-                ))
-            }
+        let budget = (!spent).then(&mut next_budget).flatten();
+        spent = budget.is_none();
+        let rec = recorded(pid);
+        let outcome = match (&rec, budget) {
+            (Err(refused), _) => refused.clone(),
+            (Ok(r), Some(budget)) => kill_recorded(pid, r, budget),
+            (Ok(_), None) => KillOutcome::Refused(format!(
+                "pid {pid}: the kill deadline was spent before it was reached; nothing \
+                 signalled"
+            )),
         };
-        settle(tracker, pid, true, &outcome);
+        settle(tracker, pid, true, rec.as_ref().ok(), &outcome);
         tally.record(label, pid, outcome);
     }
     tally
@@ -599,8 +636,8 @@ pub(crate) async fn kill_tracked_subset(
                     t.retain(|p| *p != pid);
                     t.len() != before
                 };
-                let outcome = kill_recorded_async(pid, r, budget).await;
-                settle(tracker, pid, taken, &outcome);
+                let outcome = kill_recorded_async(pid, r.clone(), budget).await;
+                settle(tracker, pid, taken, Some(&r), &outcome);
                 outcome
             }
             Err(refused) => refused,
@@ -667,6 +704,66 @@ fn drain(tracker: &Mutex<Vec<u32>>) -> Vec<u32> {
 
 #[cfg(test)]
 mod source_tests;
+
+/// `settle`, against pids far above any the OS allocates (so no process holds
+/// them and no other test records them).
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    fn insert(pid: u32, token: &str, tracker: Option<&Mutex<Vec<u32>>>) -> Recorded {
+        let r = Recorded {
+            token: Some(token.to_string()),
+            tracker: tracker.map(tracker_key),
+        };
+        identities().insert(pid, r.clone());
+        r
+    }
+
+    fn transient() -> KillOutcome {
+        KillOutcome::Refused("pid: the kill deadline was spent; nothing signalled".into())
+    }
+
+    /// Review r2, finding 1: a drained pid refused for a reason that may pass,
+    /// but which no longer carries its recorded token (it exited and its
+    /// waiter's removal found it drained), is not pushed back.
+    #[test]
+    fn a_pid_that_left_its_token_is_not_put_back() {
+        let tracker = Mutex::new(Vec::new());
+        let pid = 4_000_000_001;
+        let r = insert(pid, "gone:1", Some(&tracker));
+        settle(&tracker, pid, true, Some(&r), &transient());
+        assert!(lock_tracker(&tracker).is_empty());
+        assert!(!identities().contains_key(&pid));
+    }
+
+    /// Review r2, finding 2: an untracked (Doctor-recorded) pid refused for a
+    /// reason that may pass keeps its record, so a retry can reach it.
+    #[test]
+    fn an_untaken_transient_refusal_keeps_the_record() {
+        let tracker = Mutex::new(Vec::new());
+        let pid = 4_000_000_002;
+        let r = insert(pid, "doctor:2", Some(&tracker));
+        settle(&tracker, pid, false, Some(&r), &transient());
+        assert_eq!(identities().get(&pid), Some(&r));
+        settle(&tracker, pid, false, Some(&r), &KillOutcome::AlreadyExited);
+        assert!(!identities().contains_key(&pid));
+    }
+
+    /// Review r2, finding 3: a record written for the same pid after the kill
+    /// read its identity is never dropped by that kill's settle.
+    #[test]
+    fn a_newer_record_for_the_pid_is_kept() {
+        let tracker = Mutex::new(Vec::new());
+        let pid = 4_000_000_003;
+        let old = insert(pid, "old:3", Some(&tracker));
+        let new = insert(pid, "new:3", Some(&tracker));
+        settle(&tracker, pid, true, Some(&old), &KillOutcome::AlreadyExited);
+        assert_eq!(identities().get(&pid), Some(&new));
+        forget_record(pid, &new);
+        assert!(!identities().contains_key(&pid));
+    }
+}
 
 #[cfg(all(test, windows))]
 mod tests {

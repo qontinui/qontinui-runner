@@ -26,6 +26,12 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
             tracing::info!(target: "tree_kill", "Doctor: PID {} had already exited", pid);
             Ok(())
         }
+        // A second force-stop of a pid already ended and reaped: as done as
+        // `AlreadyExited` (review r2, finding 9).
+        crate::tree_kill::KillOutcome::Refused(why) if why.contains("no such process") => {
+            tracing::info!(target: "tree_kill", "Doctor: PID {} is gone: {}", pid, why);
+            Ok(())
+        }
         crate::tree_kill::KillOutcome::Refused(why) => {
             tracing::warn!(target: "tree_kill", "Doctor: PID {} not signalled: {}", pid, why);
             Err(format!("Failed to force-stop process tree: {why}"))

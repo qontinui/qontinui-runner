@@ -70,10 +70,7 @@ fn production_code(source: &str) -> String {
         out.push(lines[i]);
         i += 1;
     }
-    out.join(
-        "
-",
-    )
+    out.join("\n")
 }
 
 #[test]
@@ -224,9 +221,20 @@ fn per_task_endpoints_call_the_tested_helper_only() {
     }
 }
 
+/// `source`'s production code with comment lines, and lines that MATCH a
+/// phrase (`.contains(`) rather than produce one, removed.
+fn producing_code(source: &str) -> String {
+    without_comment_lines(&production_code(source))
+        .lines()
+        .filter(|line| !line.contains(".contains("))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Every final-refusal phrase is carried by a message a kill path produces,
 /// so a reworded message cannot silently turn a final refusal into a retry
-/// or the reverse (review r1, finding 7).
+/// or the reverse (review r1, finding 7). Only production code is searched,
+/// never a test module or a matcher (review r2, finding 8).
 #[test]
 fn every_final_refusal_phrase_is_produced_somewhere() {
     let own = include_str!("mod.rs");
@@ -236,9 +244,11 @@ fn every_final_refusal_phrase_is_produced_somewhere() {
         .map(|(_, rest)| rest)
         .expect("mod.rs holds FINAL_REFUSALS");
     let producers = [
-        after_const,
-        include_str!("unix.rs"),
-        include_str!("../../../crates/pty-holder/src/tree_freeze.rs"),
+        producing_code(after_const),
+        producing_code(include_str!("unix.rs")),
+        producing_code(include_str!(
+            "../../../crates/pty-holder/src/tree_freeze.rs"
+        )),
     ];
     for phrase in super::FINAL_REFUSALS {
         assert!(
@@ -246,4 +256,96 @@ fn every_final_refusal_phrase_is_produced_somewhere() {
             "no kill path produces `{phrase}`"
         );
     }
+}
+
+#[test]
+fn producing_code_drops_matchers_tests_and_comments() {
+    let src = "fn a() { Err(\"pid 1 was reused\") }\n\
+               fn b(e: &str) -> bool { e.contains(\" was gone\") }\n\
+               // no such process\n\
+               #[cfg(test)]\n\
+               mod tests {\n    \
+                   const X: &str = \"cannot ever be proven\";\n\
+               }";
+    let code = producing_code(src);
+    assert!(code.contains(" was reused"), "{code}");
+    for cut in [" was gone", "no such process", "cannot ever be proven"] {
+        assert!(!code.contains(cut), "{cut} was kept: {code}");
+    }
+}
+
+/// How many (comment-stripped) lines above a Doctor `ProcessRegistration {`
+/// its spawn identity must be recorded.
+const REGISTRATION_WINDOW: usize = 8;
+
+/// Lines (1-based, in comment-stripped production code) of `source` that
+/// build a Doctor `ProcessRegistration` with no spawn-identity record just
+/// above it; and whether `source` builds one at all without ever forgetting
+/// the record.
+fn unrecorded_registrations(source: &str) -> (Vec<usize>, bool) {
+    let code = without_comment_lines(&production_code(source));
+    let lines: Vec<&str> = code.lines().collect();
+    let mut missing = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("ProcessRegistration {") || line.contains("struct ProcessRegistration") {
+            continue;
+        }
+        let from = i.saturating_sub(REGISTRATION_WINDOW);
+        if !lines[from..i].iter().any(|l| {
+            l.contains("tree_kill::record_spawn_identity(")
+                || l.contains("tree_kill::record_spawn_token(")
+        }) {
+            missing.push(i + 1);
+        }
+    }
+    let registers = code.contains("ProcessRegistration {");
+    let forgets = code.contains("tree_kill::forget_spawn_identity(");
+    (missing, registers && !forgets)
+}
+
+#[test]
+fn registration_detector_flags_a_registration_with_no_record() {
+    let bare = "let pid = child.id();\nlet reg = ProcessRegistration {\n    pid,\n};";
+    assert_eq!(unrecorded_registrations(bare), (vec![2], true));
+    let ok = "let t = crate::tree_kill::record_spawn_identity(pid);\nlet reg = \
+              ProcessRegistration {\n    pid,\n};\ncrate::tree_kill::forget_spawn_identity(pid, \
+              t.as_deref());";
+    assert_eq!(unrecorded_registrations(ok), (vec![], false));
+}
+
+/// Review r2, finding 4: every Doctor registration outside `doctor/` records
+/// the pid's spawn identity just before it (so the Doctor's force-stop can
+/// reach it) and its file forgets the record again.
+#[test]
+fn every_doctor_registration_records_a_spawn_identity() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let skip = [src.join("doctor"), src.join("tree_kill")];
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    assert!(
+        files.len() > 100,
+        "src walk found only {} files",
+        files.len()
+    );
+    let mut sites = 0;
+    let mut offenders = Vec::new();
+    for file in files
+        .iter()
+        .filter(|f| !skip.iter().any(|s| f.starts_with(s)))
+    {
+        let source = std::fs::read_to_string(file).expect("read source file");
+        sites += source.matches("ProcessRegistration {").count();
+        let (missing, never_forgets) = unrecorded_registrations(&source);
+        for line in missing {
+            offenders.push(format!(
+                "{}:{line} records no spawn identity",
+                file.display()
+            ));
+        }
+        if never_forgets {
+            offenders.push(format!("{} never forgets its record", file.display()));
+        }
+    }
+    assert!(sites >= 4, "found only {sites} Doctor registrations");
+    assert!(offenders.is_empty(), "{offenders:?}");
 }
