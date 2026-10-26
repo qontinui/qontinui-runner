@@ -519,8 +519,12 @@ impl Grid {
         }
         let start = self.idx(row, start_col);
         let end = self.idx(row, end_col);
+        // Erased cells take the pen's background, as a destroyed wide-glyph
+        // half does (xterm's background-colour erase); with the default pen
+        // this is the default cell.
+        let blank = self.blank_cell();
         for cell in &mut self.cells[start..end] {
-            *cell = Cell::default();
+            *cell = blank;
         }
         self.dirty = true;
     }
@@ -1499,6 +1503,19 @@ mod tests {
             "right half blanked"
         );
         assert_eq!(g.row_text(0), "    c");
+    }
+
+    /// Round 10 nit: an erase fills with the pen's background too, like the
+    /// destroyed half (xterm BCE); the default pen erases to the default cell.
+    #[test]
+    fn an_erase_takes_the_pen_background() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "abc\x1b[1;1H\x1b[44m\x1b[K".as_bytes());
+        assert_eq!(g.row_text(0), "");
+        assert!(g.snapshot().cells.iter().all(|c| c.bg != COLOR_DEFAULT));
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "abc\x1b[1;1H\x1b[K".as_bytes());
+        assert!(g.snapshot().cells.iter().all(|c| *c == Cell::default()));
     }
 
     /// Nit 2: the blank takes the current pen's background.
