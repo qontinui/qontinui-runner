@@ -62,7 +62,7 @@
 //! 5. **The transcript, into the TARGET account's project dir**
 //!    (`<config-dir>/projects/<slug>/<sid>.jsonl`, plus its `<sid>/` directory of
 //!    subagent transcripts, best-effort). Local copy first — reusing
-//!    [`crate::terminal::session_carry::copy_transcript`] verbatim — then
+//!    [`crate::terminal::session_carry::carry_session`] — then
 //!    coord's warm→cold `?stream=transcript` tier for the cross-machine case.
 //!    Neither yielding bytes is a hard failure: `--resume` against a
 //!    non-existent transcript would start an EMPTY conversation wearing the
@@ -426,7 +426,7 @@ fn resolve_working_dir(
 /// afterwards (copied now, or already there), `Ok(false)` when no local dir
 /// holds it.
 ///
-/// Reuses [`crate::terminal::session_carry::copy_transcript`] rather than
+/// Reuses [`crate::terminal::session_carry::carry_session`] rather than
 /// re-implementing the copy: same idempotent "skip when the destination is
 /// already at least as large" behaviour, same never-touch-the-source rule, and
 /// the same best-effort carry of the session's `<sid>/` directory (subagent
@@ -502,6 +502,7 @@ fn materialize_from(
                     session = %claude_session_id,
                     from = %src,
                     to = %config_dir,
+                    main = carried.main.event_name(),
                     session_dir_copied = carried.session_dir.copied,
                     session_dir_failed = carried.session_dir.failed,
                     "session respawn: transcript carried from a local account dir"
