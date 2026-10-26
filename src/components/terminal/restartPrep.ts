@@ -26,6 +26,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import { describeThrown } from "@/lib/utils";
+import { restoreCohortStore } from "./restorePlaceholders";
 
 // ── Wire types ────────────────────────────────────────────────────────
 
@@ -439,6 +440,13 @@ export interface RestartPrepSnapshot {
 export interface RestartPrepDeps {
   invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
   listen: (event: string, onPayload: (payload: unknown) => void) => Promise<() => void>;
+  /**
+   * The cohort `prepareId` was dismissed here: end it in the webview through
+   * the one end every dismiss shares (the cohort store's `endCohort` — the
+   * queue and the placeholder tabs follow it), so the panel's Dismiss stops
+   * the restore queue exactly as the strip's does, event channel or not.
+   */
+  onDismissed?: (prepareId: string) => void;
 }
 
 export interface RestartPrepStore {
@@ -683,6 +691,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         set({ record: reply });
       }
       if (reply.state !== "done") throw new Error(`the record reads ${reply.state}, not done`);
+      deps.onDismissed?.(reply.prepare_id);
       set({ dismiss: { phase: "done", message: "dismissed" } });
       return reply;
     } catch (err) {
@@ -758,6 +767,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
 /** The webview's one store. Loads `listen` lazily so a node test never touches it. */
 export const restartPrepStore: RestartPrepStore = createRestartPrepStore({
   invoke: (cmd, args) => tauriInvoke(cmd, args),
+  onDismissed: (prepareId) => restoreCohortStore.endCohort(prepareId),
   listen: async (event, onPayload) => {
     const { listen } = await import("@tauri-apps/api/event");
     return listen(event, (e) => onPayload(e.payload));

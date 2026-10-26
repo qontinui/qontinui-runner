@@ -165,6 +165,13 @@ pub struct ResumeRequest {
     /// module docs.
     #[serde(default)]
     pub generation: Option<String>,
+    /// The restart cohort the caller is restoring (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`): when
+    /// set, an id is resumed only while THAT prepare's cohort is `restoring`.
+    /// A placeholder's Restore names it, so a restore queued before the cohort
+    /// was dismissed (from any surface) restores nothing once it is.
+    #[serde(default)]
+    pub prepare_id: Option<String>,
 }
 
 /// One id's verdict.
@@ -375,6 +382,22 @@ fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'st
         return Some("holder_sweep_pending");
     }
     None
+}
+
+/// The skip reason when a resume names a restart cohort (`prepare_id`) that
+/// is not the one `restoring` now — dismissed, done, or replaced. Its prefix is
+/// what the webview's restore queue reads to drop the row rather than show a
+/// failure.
+pub const COHORT_NOT_RESTORING: &str = "cohort_not_restoring";
+
+/// Why a resume naming `prepare_id` is refused, or `None` when it names none
+/// or names the cohort restoring now (`cohort`).
+fn cohort_refusal(prepare_id: Option<&str>, cohort: Option<&RestoringCohort>) -> Option<String> {
+    let wanted = prepare_id?;
+    match cohort {
+        Some(c) if c.prepare_id == wanted => None,
+        _ => Some(format!("{COHORT_NOT_RESTORING}({wanted})")),
+    }
 }
 
 /// Why a lifecycle row cannot be resumed, or the candidate it yields.
@@ -1002,6 +1025,7 @@ async fn run_batch(
     store: Arc<SessionLifecycleStore>,
     ids: Vec<String>,
     origin: SpawnOrigin,
+    prepare_id: Option<String>,
 ) -> Vec<ResumeRow> {
     let mut results = Vec::new();
     let operator = !origin.is_autonomous();
@@ -1010,6 +1034,11 @@ async fn run_batch(
         // Re-read per id: an overlapping call may have restored a row since
         // this batch began, and a restored row is no longer in the cohort.
         let cohort = crate::restart_prep::restore::restoring_cohort();
+        if let Some(why) = cohort_refusal(prepare_id.as_deref(), cohort.as_ref()) {
+            info!(id = %id, why = %why, "resume_door: refused — the named cohort is not restoring");
+            results.push(ResumeRow::skipped(id, why));
+            continue;
+        }
         let member = served_cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| {
             live_terminal_blocker(&tm, t)
         });
@@ -1162,6 +1191,7 @@ pub(crate) async fn resume_sessions(
         store,
         ids,
         origin,
+        req.prepare_id.clone(),
     ));
     let results = batch.await.map_err(|e| {
         (
@@ -1487,6 +1517,37 @@ mod tests {
     }
 
     /// No terminal rules a cold resume out.
+    /// Finding 4 (review): a Restore that names its cohort restores nothing
+    /// once that cohort is no longer `restoring` — a dismiss from ANY surface
+    /// ends every restore still queued — while a call naming none (the HTTP
+    /// route) is unaffected.
+    #[test]
+    fn a_resume_naming_a_cohort_that_is_not_restoring_is_refused() {
+        let cohort = restoring(&["a"]);
+        assert_eq!(cohort_refusal(Some("prep-test"), Some(&cohort)), None);
+        assert_eq!(cohort_refusal(None, Some(&cohort)), None);
+        assert_eq!(cohort_refusal(None, None), None);
+        assert_eq!(
+            cohort_refusal(Some("prep-test"), None).as_deref(),
+            Some("cohort_not_restoring(prep-test)"),
+            "dismissed: nothing is restoring"
+        );
+        assert_eq!(
+            cohort_refusal(Some("prep-old"), Some(&cohort)).as_deref(),
+            Some("cohort_not_restoring(prep-old)"),
+            "another prepare's cohort"
+        );
+        // Checked per id in the batch, before any admission.
+        let src = include_str!("resume_door.rs");
+        let (_, batch) = src.split_once("async fn run_batch(").expect("run_batch");
+        let (batch, _) = batch.split_once("\n}\n").expect("run_batch's body ends");
+        let refusal_at = batch
+            .find("cohort_refusal(")
+            .expect("the batch checks the cohort");
+        let classify_at = batch.find("classify(").expect("classify");
+        assert!(refusal_at < classify_at);
+    }
+
     fn no_blocker(_: &str) -> Option<&'static str> {
         None
     }

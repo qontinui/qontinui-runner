@@ -430,11 +430,15 @@ describe("the store", () => {
       expect(args).toEqual({ prepareId: "prep-1" });
       return { ...restoring, state: "done" };
     });
-    const store = createRestartPrepStore(f.deps);
+    const ended: string[] = [];
+    const store = createRestartPrepStore({ ...f.deps, onDismissed: (id) => ended.push(id) });
     await store.refresh();
     await store.dismiss();
     expect(store.getSnapshot().record?.state).toBe("done");
     expect(store.getSnapshot().dismiss).toEqual({ phase: "done", message: "dismissed" });
+    // Finding 4 (review): the panel's Dismiss ends the cohort in the webview
+    // through the same end as the strip's — the queue and placeholders follow.
+    expect(ended).toEqual(["prep-1"]);
     await expect(store.dismiss()).rejects.toThrow("nothing to dismiss");
     expect(f.calls.filter(([c]) => c === "restart_prep_dismiss")).toHaveLength(1);
   });

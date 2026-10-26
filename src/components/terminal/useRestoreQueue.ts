@@ -22,7 +22,13 @@
  *   leaves the mark where it was. The queue does not un-finish it first;
  * - **every other refusal or failure is `failed: <reason>` with Retry;**
  * - **Restore twice enqueues once:** a row already queued, restoring,
- *   waiting or back is not enqueued again.
+ *   waiting or back is not enqueued again;
+ * - **a cohort that ended takes its queue with it.** The queue follows the
+ *   cohort store: once the store no longer holds a row's prepare (dismissed
+ *   from the panel or the strip, or done), that row is dropped, and a row is
+ *   checked again just before its restore starts. Each restore also names its
+ *   prepare, so the backend refuses it (`cohort_not_restoring`) if the cohort
+ *   ended in between.
  *
  * On `resumed` the placeholder is replaced in its own zone by the live pane
  * the resume core created (`emitPlaceholderEvent({kind: "back"})`, handled per
@@ -54,12 +60,26 @@ export type RestorePhase =
 export type ResumeVerdict =
   | { outcome: "resumed"; terminalId: string | null }
   | { outcome: "busy"; lane: string }
+  /** The named cohort is no longer restoring: the row is dropped, not failed. */
+  | { outcome: "gone" }
   | { outcome: "failed"; reason: string };
+
+/** Mirrors `COHORT_NOT_RESTORING` in `session/resume_door.rs`. */
+export const COHORT_NOT_RESTORING = "cohort_not_restoring";
 
 /** The queue's effects, injected so its rules are testable without Tauri. */
 export interface RestoreQueueEffects {
-  /** Restore one session through the operator twin. Never throws. */
-  resume: (claudeSessionId: string) => Promise<ResumeVerdict>;
+  /**
+   * Restore one session of cohort `prepareId` through the operator twin.
+   * Never throws.
+   */
+  resume: (claudeSessionId: string, prepareId: string) => Promise<ResumeVerdict>;
+  /**
+   * Whether cohort `prepareId` is still the one restoring, as the webview
+   * knows it. Asked just before each restore starts; a row of an ended
+   * cohort is dropped unrun. Absent: always live.
+   */
+  cohortLive?: (prepareId: string) => boolean;
   /** Protect the open record from the liveness poll while its restore runs. */
   markPending: (claudeSessionId: string) => void;
   /** The restore landed: drop that protection. */
@@ -112,13 +132,25 @@ export function verdictFromReply(reply: unknown, claudeSessionId: string): Resum
   if (row.outcome === "skipped" && reason.startsWith("resource_guard:")) {
     return { outcome: "busy", lane: reason.slice("resource_guard:".length) };
   }
+  if (row.outcome === "skipped" && reason.startsWith(COHORT_NOT_RESTORING)) {
+    return { outcome: "gone" };
+  }
   return { outcome: "failed", reason };
 }
 
-/** Restore one session through the backend operator twin. */
-export async function resumeThroughOperatorTwin(claudeSessionId: string): Promise<ResumeVerdict> {
+/**
+ * Restore one session through the backend operator twin, naming its cohort so
+ * the backend restores nothing once that cohort is no longer restoring.
+ */
+export async function resumeThroughOperatorTwin(
+  claudeSessionId: string,
+  prepareId: string,
+): Promise<ResumeVerdict> {
   try {
-    const reply = await invoke("operator_resume_sessions", { ids: [claudeSessionId] });
+    const reply = await invoke("operator_resume_sessions", {
+      ids: [claudeSessionId],
+      prepareId,
+    });
     return verdictFromReply(reply, claudeSessionId);
   } catch (err) {
     return { outcome: "failed", reason: String(err) };
@@ -202,6 +234,26 @@ export class RestoreQueue {
     return { enqueued: this.enqueue(eligible), skippedHeld, skippedFinished, skippedBlocked };
   }
 
+  /**
+   * Keep only the work of cohort `prepareId` — the one the cohort store holds
+   * now (`null`: none). Rows of any other prepare are dropped from the queue
+   * and their progress forgotten; a busy-box wait with nothing left to retry
+   * is cancelled. A restore in flight still finishes (the backend refuses it
+   * if its cohort ended first).
+   */
+  retainPrepare(prepareId: string | null): void {
+    const keep = (r: RestorePlaceholder) => r.prepareId === prepareId;
+    const dropped = this.order.filter((r) => !keep(r));
+    if (dropped.length === 0) return;
+    this.order = this.order.filter(keep);
+    for (const r of dropped) this.phases.delete(r.claudeSessionId);
+    if (this.order.length === 0 && this.pauseTimer !== null) {
+      this.fx.clearTimer(this.pauseTimer);
+      this.pauseTimer = null;
+    }
+    this.changed();
+  }
+
   /** Forget everything (the cohort was dismissed). A restore in flight still finishes. */
   clear(): void {
     this.order = [];
@@ -220,7 +272,13 @@ export class RestoreQueue {
 
   private async pump(): Promise<void> {
     if (this.inFlight !== null || this.pauseTimer !== null) return;
-    const row = this.order.shift();
+    let row = this.order.shift();
+    // A row whose cohort ended while it waited is dropped unrun.
+    while (row && this.fx.cohortLive && !this.fx.cohortLive(row.prepareId)) {
+      this.phases.delete(row.claudeSessionId);
+      this.changed();
+      row = this.order.shift();
+    }
     if (!row) return;
     const id = row.claudeSessionId;
     this.inFlight = id;
@@ -229,12 +287,16 @@ export class RestoreQueue {
     this.fx.markPending(id);
     let verdict: ResumeVerdict;
     try {
-      verdict = await this.fx.resume(id);
+      verdict = await this.fx.resume(id, row.prepareId);
     } catch (err) {
       verdict = { outcome: "failed", reason: String(err) };
     }
     this.inFlight = null;
-    if (verdict.outcome === "resumed") {
+    if (verdict.outcome === "gone") {
+      // The cohort ended before this restore started: nothing was spawned.
+      this.phases.delete(id);
+      this.fx.clearPending(id);
+    } else if (verdict.outcome === "resumed") {
       this.phases.set(id, { phase: "back" });
       this.fx.clearPending(id);
       this.fx.onBack(row, verdict.terminalId);
@@ -278,32 +340,35 @@ export const restoreQueue = new RestoreQueue({
   },
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  cohortLive: (prepareId) => restoreCohortStore.getSnapshot().prepareId === prepareId,
+});
+
+// The queue follows the cohort store: a cohort that ended (dismissed from any
+// surface, or done) takes its queued restores with it.
+restoreCohortStore.subscribe(() => {
+  restoreQueue.retainPrepare(restoreCohortStore.getSnapshot().prepareId);
 });
 
 /**
  * Dismiss the restoring cohort: `restart_prep_dismiss` moves the record to
- * `done`, so no row is a placeholder or held from the orphan close any more.
- * Every waiting row stays in Past Sessions, resumable by hand; its
- * restore-pending marker (stamped when the queue started a restore of it) is
- * cleared, the queue is emptied and every page drops its placeholder tabs.
- * Answers `null` on success, else what went wrong (nothing is cleared then).
+ * `done`, so no row is a placeholder or held from the orphan close any more,
+ * and clears the restore-pending marker of every row not back. Every waiting
+ * row stays in Past Sessions, resumable by hand. Then the cohort ends here
+ * through the one end every dismiss shares (`endCohort`, which the panel's
+ * dismiss and the `restart-prep-changed` event reach too): the store
+ * empties, the queue drops what it held and every page drops its placeholder
+ * tabs. Answers `null` on success, else what went wrong (nothing is cleared
+ * then).
  */
 export async function dismissRestoreCohort(
   prepareId: string,
-  rows: readonly RestorePlaceholder[],
   deps: {
     dismiss: (prepareId: string) => Promise<void>;
-    clearPending: (claudeSessionId: string) => void;
-    queue: RestoreQueue;
-    store: { clear: () => void };
+    store: { endCohort: (prepareId: string) => void };
   } = {
     dismiss: async (id) => {
       await invoke("restart_prep_dismiss", { prepareId: id });
     },
-    clearPending: (id) => {
-      invoke("terminal_session_clear_restore_pending", { claudeSessionId: id }).catch(() => {});
-    },
-    queue: restoreQueue,
     store: restoreCohortStore,
   },
 ): Promise<string | null> {
@@ -312,10 +377,7 @@ export async function dismissRestoreCohort(
   } catch (err) {
     return String(err);
   }
-  for (const row of rows) deps.clearPending(row.claudeSessionId);
-  deps.queue.clear();
-  deps.store.clear();
-  emitPlaceholderEvent({ kind: "dismissed" });
+  deps.store.endCohort(prepareId);
   return null;
 }
 

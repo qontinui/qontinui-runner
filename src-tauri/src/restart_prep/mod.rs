@@ -207,6 +207,13 @@ pub struct PrepareRecord {
     /// written before this field existed.
     #[serde(default)]
     pub prepared_process: Option<String>,
+    /// Whether coord ever CONFIRMED a hold for this prepare (its read-back
+    /// named the prepare). A release answered `route_absent` settles only
+    /// while this is false: a coord without the self-hold route never held
+    /// anything for us, but one that confirmed a hold and then answers `404`
+    /// to its release has not let it go.
+    #[serde(default)]
+    pub coord_hold_confirmed: bool,
 }
 
 impl PrepareRecord {
@@ -228,6 +235,7 @@ impl PrepareRecord {
             last_change_at_ms: None,
             verdict: None,
             prepared_process: Some(running_process().to_string()),
+            coord_hold_confirmed: false,
         }
     }
 

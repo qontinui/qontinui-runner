@@ -4818,10 +4818,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
                         // Phase 6): placeholders the boot restore deliberately
                         // left alone, held against the orphan close until they
-                        // are restored, Finished or dismissed. Empty when no
-                        // record is `restoring` — the crash-boot path.
+                        // are restored, Finished or dismissed — and, from boot
+                        // until the boot step moves it to `restoring`, the rows
+                        // of a prepare the restarted runner will restore by
+                        // hand. Empty with no such record — the crash-boot path.
                         let tick_restoring_cohort =
-                            crate::restart_prep::restore::restoring_cohort_ids();
+                            crate::restart_prep::restore::withheld_cohort_ids();
                         let mut held_for_restore: usize = 0;
 
                         // Review F1 (plan 2026-09-12 Phase 5): a pane a

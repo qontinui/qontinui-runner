@@ -4811,7 +4811,7 @@ pub fn withheld_boot_restore_candidate(
 
 /// The `in_active_cohort` input of [`withheld_boot_restore_candidate`] for
 /// `rec`: an UNFINISHED row of the restart cohort being restored (`cohort` is
-/// [`crate::restart_prep::restore::restoring_cohort_ids`], read once per poll
+/// [`crate::restart_prep::restore::withheld_cohort_ids`], read once per poll
 /// tick, empty when nothing is restoring). A Finished placeholder is let go:
 /// nothing will restore it, and the orphan close may take it.
 pub fn in_active_cohort(cohort: &HashSet<String>, rec: &TerminalSessionRecord) -> bool {

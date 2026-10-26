@@ -179,9 +179,8 @@ export function useRestoreCohortRefresh(): void {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void listen("restart-prep-changed", () => {
-      void restoreCohortStore.refreshSet();
-      void restoreCohortStore.refreshStatus();
+    void listen("restart-prep-changed", (event) => {
+      void restoreCohortStore.onPrepChanged(event.payload);
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;

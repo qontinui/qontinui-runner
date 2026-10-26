@@ -1861,6 +1861,13 @@ fn live_restore_set_body(
         return restore_set_body(rows, None, |_| None, |_| false, |_| None, false);
     }
     let cohort = crate::restart_prep::restore::restoring_cohort();
+    // No cohort is `restoring` yet, but a prepare this restarted runner will
+    // restore by hand may still be on its way there (the boot step has not
+    // decided): its rows are withheld from the auto-restore meanwhile.
+    let rows = match cohort {
+        Some(_) => rows,
+        None => withhold_prepared_rows(rows, &crate::restart_prep::restore::withheld_cohort_ids()),
+    };
     use tauri::Manager;
     let terminals = crate::tauri_app_handle::current().and_then(|app| {
         app.try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1879,6 +1886,31 @@ fn live_restore_set_body(
             .held
             .is_none(),
     )
+}
+
+/// `rows` without the ones `withheld` names: the rows of a prepared restart
+/// this runner restores BY HAND
+/// ([`crate::restart_prep::restore::withheld_cohort_ids`]) before its record
+/// reaches `restoring`. From boot until the restart-prep boot step decides —
+/// and while a restarted runner's prepare is still in its window — the boot
+/// auto-restore must not take them: a drain lift folded in that gap (the boot
+/// read, a heartbeat, an expired hold) re-runs the deferred restore, which
+/// would otherwise resume every cohort row at once, held rows included and with
+/// no `--effort`. They are not placeholders yet either (nothing may restore
+/// them before the record is `restoring`); the record's move there announces
+/// `restart-prep-changed`, and the cohort store's re-read then draws them.
+/// `withheld` is empty with no prepare record — an unplanned crash restores
+/// exactly as before.
+fn withhold_prepared_rows(
+    rows: Vec<RestoreCandidate>,
+    withheld: &std::collections::HashSet<String>,
+) -> Vec<RestoreCandidate> {
+    if withheld.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|r| !withheld.contains(&r.record.claude_session_id))
+        .collect()
 }
 
 /// Whether a cohort row's recorded terminal is live for the restore set: this
@@ -3329,6 +3361,36 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Finding 3 (review): before a prepared cohort is `restoring`, a
+    /// restarted runner's withheld rows never reach the auto-restore; with
+    /// nothing withheld (an unplanned crash) every row does, as before.
+    #[test]
+    fn a_withheld_prepared_row_is_kept_out_of_the_auto_restore() {
+        let rows = || {
+            ["a", "b", "c"]
+                .iter()
+                .map(|id| RestoreCandidate {
+                    record: restore_candidate_record(id),
+                    transcript_exists: Some(true),
+                    location: TranscriptLocation::default(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let ids = |rows: Vec<RestoreCandidate>| -> Vec<String> {
+            rows.into_iter()
+                .map(|r| r.record.claude_session_id)
+                .collect()
+        };
+        let withheld: std::collections::HashSet<String> =
+            ["b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(ids(withhold_prepared_rows(rows(), &withheld)), ["a"]);
+        assert_eq!(
+            ids(withhold_prepared_rows(rows(), &Default::default())),
+            ["a", "b", "c"],
+            "a crash boot with no prepare record restores every row"
+        );
+    }
 
     /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):
     /// while a restart cohort is `restoring`, its rows leave the auto-restore

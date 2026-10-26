@@ -8,8 +8,9 @@
  *   one restore queue, page by page in strip order, and says how many it
  *   skipped.
  * - **Dismiss** ends the restore without restoring the rest: the record moves
- *   to `done`, every waiting session stays in Past Sessions (resumable by
- *   hand), the restore-pending markers are cleared and the placeholders go.
+ *   to `done` (irreversibly), every waiting session stays in Past Sessions
+ *   (resumable by hand only), the restore-pending markers are cleared and the
+ *   placeholders go — the same door, and the same end, as the panel's Dismiss.
  *
  * Renders nothing while no cohort is restoring; a restoring cohort with no
  * row left to show keeps a strip, so Dismiss stays reachable. It also owns the cohort's
@@ -42,7 +43,7 @@ export function RestoreCohortStrip({ notify }: { notify: (message: string) => vo
   const dismiss = async () => {
     if (cohort.prepareId === null) return;
     setDismissing(true);
-    const err = await dismissRestoreCohort(cohort.prepareId, cohort.rows);
+    const err = await dismissRestoreCohort(cohort.prepareId);
     setDismissing(false);
     if (err) notify(`The restart cohort was not dismissed: ${err}`);
   };
@@ -67,10 +68,13 @@ export function RestoreCohortStrip({ notify }: { notify: (message: string) => vo
         id: "dismiss",
         label: "Dismiss",
         description:
-          "End the restore: the waiting sessions stay in Past Sessions and their placeholders go.",
-        // `write` — moves the prepare record to `done`; every session is still
-        // resumable by hand from Past Sessions.
-        effect: "write",
+          "End the restore: the waiting sessions stop being placeholders and lose the shield " +
+          "that keeps them from the orphan close. It cannot be undone — they come back only " +
+          "by hand from Past Sessions.",
+        // `destructive` (CONTRACT.md Dim 1), as the panel's Dismiss of the same
+        // door: `restart_prep_dismiss` moves the record `restoring` → `done`,
+        // which has no reverse, and the waiting rows lose their shield.
+        effect: "destructive",
         handler: () => {
           void dismiss();
         },

@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import {
+  COHORT_NOT_RESTORING,
   GUARD_RETRY_MS,
   RestoreQueue,
   bulkSkipNotice,
@@ -47,11 +48,16 @@ function harness() {
   const back: Array<[string, string | null]> = [];
   const marked: string[] = [];
   const cleared: string[] = [];
+  /** The prepares the webview still knows as restoring. */
+  const live = new Set(["prep-1"]);
+  const named: string[] = [];
   const queue = new RestoreQueue({
-    resume: (id) => {
+    resume: (id, prepareId) => {
       calls.push(id);
+      named.push(prepareId);
       return new Promise((resolve) => pending.set(id, resolve));
     },
+    cohortLive: (prepareId) => live.has(prepareId),
     markPending: (id) => marked.push(id),
     clearPending: (id) => cleared.push(id),
     onBack: (r, t) => back.push([r.claudeSessionId, t]),
@@ -72,7 +78,7 @@ function harness() {
     // Let the queue's continuation run.
     await new Promise((r) => setTimeout(r, 0));
   };
-  return { queue, calls, timers, back, marked, cleared, settle, pending };
+  return { queue, calls, timers, back, marked, cleared, settle, pending, live, named };
 }
 
 describe("RestoreQueue", () => {
@@ -180,6 +186,41 @@ describe("RestoreQueue", () => {
     expect(h.calls).toEqual(["a", "a", "a", "b"]);
   });
 
+  // Finding 4 (review): a cohort dismissed from the PANEL (whose dismiss never
+  // touched the queue) must not go on being restored row by row.
+  it("a cohort that ended mid-Restore-all restores none of its remaining rows", async () => {
+    const h = harness();
+    h.queue.enqueueBulk([row("a"), row("b"), row("c")]);
+    expect(h.calls).toEqual(["a"]);
+    expect(h.named).toEqual(["prep-1"]);
+    // Dismissed while `a` is in flight: the store no longer holds prep-1.
+    h.live.delete("prep-1");
+    await h.settle("a", { outcome: "failed", reason: "x" });
+    expect(h.calls).toEqual(["a"]);
+    expect(h.queue.phaseOf("b")).toBeUndefined();
+    expect(h.queue.phaseOf("c")).toBeUndefined();
+  });
+
+  it("follows the cohort store: rows of another prepare are dropped at once", async () => {
+    const h = harness();
+    h.queue.enqueue([row("a"), row("b"), row("c", { prepareId: "prep-2" })]);
+    h.queue.retainPrepare("prep-1");
+    expect(h.queue.phaseOf("c")).toBeUndefined();
+    expect(h.queue.phaseOf("b")).toEqual({ phase: "queued" });
+    h.queue.retainPrepare(null);
+    expect(h.queue.phaseOf("b")).toBeUndefined();
+    await h.settle("a", { outcome: "resumed", terminalId: null });
+    expect(h.calls).toEqual(["a"]);
+  });
+
+  it("a restore the backend refuses because its cohort ended is dropped, not failed", async () => {
+    const h = harness();
+    h.queue.enqueue([row("a")]);
+    await h.settle("a", { outcome: "gone" });
+    expect(h.queue.phaseOf("a")).toBeUndefined();
+    expect(h.cleared).toEqual(["a"]);
+  });
+
   it("clear drops the queue and cancels a busy-box wait", async () => {
     const h = harness();
     h.queue.enqueue([row("a"), row("b")]);
@@ -210,6 +251,12 @@ describe("verdictFromReply", () => {
     expect(
       verdictFromReply(ok({ id: "a", outcome: "skipped", reason: "live_terminal" }), "a"),
     ).toEqual({ outcome: "failed", reason: "live_terminal" });
+    expect(
+      verdictFromReply(
+        ok({ id: "a", outcome: "skipped", reason: `${COHORT_NOT_RESTORING}(prep-1)` }),
+        "a",
+      ),
+    ).toEqual({ outcome: "gone" });
   });
   it("never reads a refused call or a missing row as resumed", () => {
     expect(
@@ -223,35 +270,31 @@ describe("verdictFromReply", () => {
 });
 
 describe("dismissRestoreCohort", () => {
-  it("dismisses, clears every restore-pending marker, the queue and the store", async () => {
-    const h = harness();
-    h.queue.enqueue([row("a")]);
-    const clearedPending: string[] = [];
-    let storeCleared = false;
-    const err = await dismissRestoreCohort("prep-1", [row("a"), row("b")], {
-      dismiss: async () => {},
-      clearPending: (id) => clearedPending.push(id),
-      queue: h.queue,
-      store: { clear: () => (storeCleared = true) },
+  // The backend's dismiss clears the restore-pending markers itself (one
+  // door for every surface); the webview ends the cohort through `endCohort`.
+  it("dismisses, then ends the cohort through the one shared end", async () => {
+    const ended: string[] = [];
+    const dismissed: string[] = [];
+    const err = await dismissRestoreCohort("prep-1", {
+      dismiss: async (id) => {
+        dismissed.push(id);
+      },
+      store: { endCohort: (id) => ended.push(id) },
     });
     expect(err).toBeNull();
-    expect(clearedPending).toEqual(["a", "b"]);
-    expect(storeCleared).toBe(true);
+    expect(dismissed).toEqual(["prep-1"]);
+    expect(ended).toEqual(["prep-1"]);
   });
 
   it("changes nothing when the backend refuses", async () => {
-    const clearedPending: string[] = [];
-    let storeCleared = false;
-    const err = await dismissRestoreCohort("prep-1", [row("a")], {
+    const ended: string[] = [];
+    const err = await dismissRestoreCohort("prep-1", {
       dismiss: async () => {
         throw new Error("not restoring");
       },
-      clearPending: (id) => clearedPending.push(id),
-      queue: harness().queue,
-      store: { clear: () => (storeCleared = true) },
+      store: { endCohort: (id) => ended.push(id) },
     });
     expect(err).toContain("not restoring");
-    expect(clearedPending).toEqual([]);
-    expect(storeCleared).toBe(false);
+    expect(ended).toEqual([]);
   });
 });

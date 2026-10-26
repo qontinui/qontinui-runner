@@ -245,12 +245,16 @@ pub async fn operator_resume_task_run(
 pub async fn operator_resume_sessions(
     app_handle: tauri::AppHandle,
     ids: Vec<String>,
+    prepare_id: Option<String>,
 ) -> Result<DoorReply, String> {
     let state = api_state(&app_handle)?;
     let request = crate::session::resume_door::ResumeRequest {
         ids: Some(ids),
         all: None,
         generation: None,
+        // A placeholder's Restore names its cohort: once that cohort is
+        // dismissed, a restore still queued restores nothing.
+        prepare_id,
     };
     Ok(door_reply(
         crate::session::resume_door::resume_sessions(state, request, OPERATOR).await,

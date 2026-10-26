@@ -249,6 +249,7 @@ fn census(procs: Vec<(&str, ProcEvidence)>) -> CensusEvidence {
             .collect(),
         unattributed_live: 0,
         device_drain: Some("drained".to_string()),
+        close_reasons: HashMap::new(),
     }
 }
 

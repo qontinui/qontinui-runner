@@ -73,13 +73,19 @@ pub async fn restart_prep_extend() -> Result<crate::restart_prep::prepare::PrepC
 
 /// `restart_prep_dismiss` — end a rebuilt runner's restore of the cohort
 /// `prepare_id` (Phase 6): the record moves to `done`, so its waiting rows are
-/// no longer placeholders nor held from the orphan close. Off the invoke
-/// allowlist like the doors above (see the module doc for the panel route).
+/// no longer placeholders nor held from the orphan close, and their
+/// restore-pending markers are cleared here — the one dismiss every surface
+/// (the panel, the strip) goes through. Off the invoke allowlist like the
+/// doors above (see the module doc for the panel route).
 #[tauri::command]
 pub async fn restart_prep_dismiss(
+    store: tauri::State<
+        '_,
+        std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    >,
     prepare_id: String,
 ) -> Result<crate::restart_prep::PrepareRecord, String> {
-    crate::restart_prep::restore::dismiss(&prepare_id)
+    crate::restart_prep::restore::dismiss(&prepare_id, &|id| store.clear_restore_pending(id))
 }
 
 /// `restart_prep_set_held` — the panel's held toggle (D6): hold a cohort row

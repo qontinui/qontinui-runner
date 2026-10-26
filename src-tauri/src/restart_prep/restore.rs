@@ -39,7 +39,7 @@
 //!
 //! The withheld-boot-restore shield's `in_active_cohort` arm
 //! (`session_lifecycle_store::withheld_boot_restore_candidate`) reads
-//! [`restoring_cohort_ids`] once per lifecycle poll tick, so a placeholder is
+//! [`withheld_cohort_ids`] once per lifecycle poll tick, so a placeholder is
 //! never orphan-closed while it waits for its Restore click.
 
 use std::collections::{BTreeMap, HashSet};
@@ -160,7 +160,10 @@ pub fn effort_to_apply(row: &CohortRow) -> Option<String> {
 /// The rows of a `restoring` record still waiting to be restored, keyed by
 /// Claude session id. A row whose restore already landed is no longer one of
 /// them: it is a live session again, and a later crash must auto-restore it
-/// like any other rather than turn it back into a placeholder.
+/// like any other rather than turn it back into a placeholder. Nor is a row
+/// that is no restore candidate at all
+/// ([`CohortRow::restore_candidate`]): the operator closed it during the
+/// prepare, so it was not open when the runner restarted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoringCohort {
     pub prepare_id: String,
@@ -178,7 +181,7 @@ impl RestoringCohort {
                 .cohort
                 .rows
                 .iter()
-                .filter(|row| !restored(row))
+                .filter(|row| !restored(row) && row.restore_candidate())
                 .map(|row| {
                     (
                         row.session.claude_session_id.clone(),
@@ -291,10 +294,50 @@ pub fn restoring_cohort() -> Option<RestoringCohort> {
     RestoringCohort::of(&rec)
 }
 
-/// The ids of [`restoring_cohort`], empty when there is none. Read once per
-/// lifecycle poll tick by the withheld-boot-restore shield.
-pub fn restoring_cohort_ids() -> HashSet<String> {
-    restoring_cohort().map(|c| c.ids()).unwrap_or_default()
+/// The ids of `rec`'s cohort rows that the boot AUTO-restore must leave
+/// alone, because this process restores them by hand (D6):
+///
+/// * the rows of a `restoring` record still waiting ([`RestoringCohort`]);
+/// * every restore candidate of a record still in its window on a runner
+///   that restarted since the prepare (`same_build_restart`, or
+///   [`PrepareRecord::restarted_since`]). That record is on its way to
+///   `restoring`: the boot step moves it there once the rebuilt runner's
+///   release settles, and Release hold on a restarted runner moves it there
+///   too — never to `cancelled` — so its rows will be restored by hand. Until
+///   then the record itself says so, which closes the gap in which a drain
+///   lift folded BEFORE the boot step decided (the boot read, a heartbeat,
+///   an expired hold) re-ran the deferred boot restore with no restoring
+///   cohort yet and auto-resumed every row at once.
+///
+/// Empty otherwise — no record, or a prepare whose sessions are still
+/// running in this process — so an unplanned crash with no prepare record
+/// auto-restores exactly as before.
+pub fn withheld_ids_of(rec: &PrepareRecord, same_build_restart: bool) -> HashSet<String> {
+    if let Some(cohort) = RestoringCohort::of(rec) {
+        return cohort.ids();
+    }
+    if rec.in_window() && (same_build_restart || rec.restarted_since()) {
+        return rec
+            .cohort
+            .rows
+            .iter()
+            .filter(|row| row.restore_candidate())
+            .map(|row| row.session.claude_session_id.clone())
+            .collect();
+    }
+    HashSet::new()
+}
+
+/// [`withheld_ids_of`] on the live record, empty with no controller or
+/// record. Read once per lifecycle poll tick by the withheld-boot-restore
+/// shield, and by the restore set before a cohort is `restoring`.
+pub fn withheld_cohort_ids() -> HashSet<String> {
+    let Some(ctl) = super::prepare::install_live() else {
+        return HashSet::new();
+    };
+    ctl.record()
+        .map(|rec| withheld_ids_of(&rec, ctl.same_build_restart()))
+        .unwrap_or_default()
 }
 
 /// Record a restore verdict on the cohort row `claude_session_id` of prepare
@@ -335,7 +378,11 @@ pub fn note_restore_on(
         {
             row.restore = Some(restore);
         }
-        if r.cohort.rows.iter().all(restored) {
+        if r.cohort
+            .rows
+            .iter()
+            .all(|row| restored(row) || !row.restore_candidate())
+        {
             r.state = PrepState::Done;
         }
     })
@@ -346,22 +393,40 @@ pub fn note_restore_on(
 /// no row is a placeholder or held against the orphan close any more — every
 /// row still waiting stays in Past Sessions, resumable by hand. Idempotent on
 /// a record that is already `done`; errs on any other state or prepare.
-pub fn dismiss_on(ctl: &RestartPrep, prepare_id: &str) -> Result<PrepareRecord, String> {
+///
+/// The ONE dismiss, whichever surface asked (the panel, the strip): it also
+/// clears the restore-pending marker (`clear_pending`) of every cohort row
+/// that is not back. The webview's restore queue stamps that marker before
+/// each attempt and clears it only on a landed restore, so a row whose
+/// restore failed, was refused or waited on a busy box would otherwise keep
+/// it — and a marked record is never orphan-closed by the lifecycle poll,
+/// long after the cohort that explained it is gone.
+pub fn dismiss_on(
+    ctl: &RestartPrep,
+    prepare_id: &str,
+    clear_pending: &dyn Fn(&str),
+) -> Result<PrepareRecord, String> {
     let current = ctl
         .record()
         .filter(|r| r.prepare_id == prepare_id)
         .ok_or_else(|| format!("no restart cohort {prepare_id} to dismiss"))?;
-    match current.state {
-        PrepState::Done => Ok(current),
+    let rec = match current.state {
+        PrepState::Done => current,
         PrepState::Restoring => ctl.update(prepare_id, |r| {
             if r.state == PrepState::Restoring {
                 r.state = PrepState::Done;
             }
-        }),
-        other => Err(format!(
-            "restart cohort {prepare_id} is {other:?}, not restoring — nothing to dismiss"
-        )),
+        })?,
+        other => {
+            return Err(format!(
+                "restart cohort {prepare_id} is {other:?}, not restoring — nothing to dismiss"
+            ))
+        }
+    };
+    for row in rec.cohort.rows.iter().filter(|row| !restored(row)) {
+        clear_pending(&row.session.claude_session_id);
     }
+    Ok(rec)
 }
 
 /// Set cohort row `claude_session_id`'s `held` flag by hand (the panel's held
@@ -448,10 +513,10 @@ pub async fn set_held(
 }
 
 /// [`dismiss_on`] on the live controller (the Tauri `restart_prep_dismiss`).
-pub fn dismiss(prepare_id: &str) -> Result<PrepareRecord, String> {
+pub fn dismiss(prepare_id: &str, clear_pending: &dyn Fn(&str)) -> Result<PrepareRecord, String> {
     let ctl =
         super::prepare::install_live().ok_or("restart prepare is not available in this build")?;
-    dismiss_on(ctl, prepare_id)
+    dismiss_on(ctl, prepare_id, clear_pending)
 }
 
 /// [`note_restore_on`] on the live controller. A failed write is logged: the
@@ -746,12 +811,101 @@ mod tests {
         assert!(empty.ids().is_empty());
     }
 
+    /// Finding 3 (review): from boot until the boot step decides, a prepared
+    /// record still in its window on a RESTARTED runner withholds its rows from
+    /// the auto-restore — derived from the record itself, so a drain lift
+    /// folded before the boot step cannot hand them to the boot restore. A
+    /// prepare whose sessions still run here (no restart) and no record at all
+    /// (an unplanned crash) withhold nothing.
+    #[test]
+    fn a_restarted_runners_prepare_withholds_its_rows_before_it_restores() {
+        let mut rec = record(PrepState::Preparing, &["a", "b"]);
+        assert!(
+            withheld_ids_of(&rec, false).is_empty(),
+            "not restarted: the sessions still run here"
+        );
+        let both: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(withheld_ids_of(&rec, true), both, "a same-build restart");
+        rec.prepared_build = "an-older-build".to_string();
+        assert_eq!(
+            withheld_ids_of(&rec, false),
+            both,
+            "a rebuild, before the boot step"
+        );
+        rec.state = PrepState::Ready;
+        assert_eq!(withheld_ids_of(&rec, false), both);
+        rec.hold_until_ms = Some(0);
+        assert_eq!(
+            withheld_ids_of(&rec, false),
+            both,
+            "an expired hold withholds too"
+        );
+        rec.state = PrepState::Restoring;
+        rec.cohort.rows[0].restore = Some(RowRestore {
+            at_ms: 0,
+            at: String::new(),
+            verdict: "resumed".to_string(),
+            effort_applied: None,
+            effort: None,
+        });
+        assert_eq!(
+            withheld_ids_of(&rec, false),
+            ["b".to_string()].into_iter().collect(),
+            "restoring: the rows still waiting"
+        );
+        for state in [PrepState::Done, PrepState::Cancelled] {
+            rec.state = state;
+            assert!(withheld_ids_of(&rec, true).is_empty(), "{state:?}");
+        }
+    }
+
+    /// Finding 6 (review): a row the operator closed during the prepare is no
+    /// restore candidate — not waiting, not withheld — and a cohort whose only
+    /// rows left are such rows is done.
+    #[test]
+    fn a_row_closed_by_the_user_during_the_prepare_is_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["kept", "closed"], 1_000);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        ctl.update(&prepare_id, |r| {
+            r.state = PrepState::Restoring;
+            let closed = r
+                .cohort
+                .rows
+                .iter_mut()
+                .find(|row| row.session.claude_session_id == "closed")
+                .unwrap();
+            closed.left_capture_at = Some(1_500);
+            closed.left_capture_reason = Some("user-close".to_string());
+        })
+        .unwrap();
+        let rec = ctl.record().unwrap();
+        let waiting = RestoringCohort::of(&rec).unwrap();
+        assert!(waiting.contains("kept") && !waiting.contains("closed"));
+        assert!(!withheld_ids_of(&rec, false).contains("closed"));
+        assert_eq!(rec.cohort.rows.len(), 2, "the row stays recorded");
+        note_restore_on(
+            &ctl,
+            &prepare_id,
+            "kept",
+            RowRestore {
+                at_ms: 2_000,
+                at: String::new(),
+                verdict: "resumed".to_string(),
+                effort_applied: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(ctl.record().unwrap().state, PrepState::Done);
+    }
+
     #[test]
     fn with_no_live_controller_there_is_no_restoring_cohort() {
         // The crash-boot / never-prepared path: a unit-test build installs no
         // controller, exactly like a runner that has no record.
         assert_eq!(restoring_cohort(), None);
-        assert!(restoring_cohort_ids().is_empty());
+        assert!(withheld_cohort_ids().is_empty());
     }
 
     #[test]
@@ -790,13 +944,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 1_000);
         let prepare_id = ctl.record().unwrap().prepare_id;
+        let cleared = std::sync::Mutex::new(Vec::<String>::new());
+        let clear = |id: &str| cleared.lock().unwrap().push(id.to_string());
         // Still preparing: there is no restore to dismiss.
-        assert!(dismiss_on(&ctl, &prepare_id).is_err());
+        assert!(dismiss_on(&ctl, &prepare_id, &clear).is_err());
         ctl.update(&prepare_id, |r| r.state = PrepState::Restoring)
             .unwrap();
-        assert!(dismiss_on(&ctl, "another-prepare").is_err());
-        let done = dismiss_on(&ctl, &prepare_id).unwrap();
+        assert!(dismiss_on(&ctl, "another-prepare", &clear).is_err());
+        assert!(
+            cleared.lock().unwrap().is_empty(),
+            "a refused dismiss clears nothing"
+        );
+        // s1 came back; s2 is still waiting (its restore failed, say).
+        note_restore_on(
+            &ctl,
+            &prepare_id,
+            "s1",
+            RowRestore {
+                at_ms: 2_000,
+                at: String::new(),
+                verdict: "resumed".to_string(),
+                effort_applied: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+        let done = dismiss_on(&ctl, &prepare_id, &clear).unwrap();
         assert_eq!(done.state, PrepState::Done);
+        // Finding 4 (review): the dismiss itself clears the restore-pending
+        // marker of every row not back, whichever surface asked for it.
+        assert_eq!(cleared.lock().unwrap().as_slice(), ["s2"]);
         assert_eq!(
             RestoringCohort::of(&done),
             None,
@@ -804,7 +981,7 @@ mod tests {
         );
         // Idempotent.
         assert_eq!(
-            dismiss_on(&ctl, &prepare_id).unwrap().state,
+            dismiss_on(&ctl, &prepare_id, &|_| {}).unwrap().state,
             PrepState::Done
         );
         assert_eq!(

@@ -65,8 +65,8 @@ src/components/terminal/RestartPrepPanel.tsx:515	literal	component	close	schema=
 src/components/terminal/RestartPrepPanel.tsx:535	literal	component	cancel	schema=no	arity=0	effect=destructive
 src/components/terminal/RestartPrepPanel.tsx:562	literal	component	extend	schema=no	arity=0	effect=destructive
 src/components/terminal/RestartPrepPanel.tsx:585	literal	component	dismiss	schema=no	arity=0	effect=destructive
-src/components/terminal/RestoreCohortStrip.tsx:55	literal	component	restore-all	schema=no	arity=0	effect=destructive
-src/components/terminal/RestoreCohortStrip.tsx:66	literal	component	dismiss	schema=no	arity=0	effect=write
+src/components/terminal/RestoreCohortStrip.tsx:56	literal	component	restore-all	schema=no	arity=0	effect=destructive
+src/components/terminal/RestoreCohortStrip.tsx:67	literal	component	dismiss	schema=no	arity=0	effect=destructive
 src/components/terminal/RestorePageBar.tsx:53	literal	component	restore-all	schema=no	arity=0	effect=destructive
 src/components/terminal/RestorePlaceholderPane.tsx:80	literal	component	restore	schema=no	arity=0	effect=destructive
 src/components/terminal/RestorePlaceholderPane.tsx:91	literal	component	finish	schema=no	arity=0	effect=write

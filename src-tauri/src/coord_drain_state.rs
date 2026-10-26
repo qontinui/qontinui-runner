@@ -622,6 +622,10 @@ struct Inner {
     /// The state the last event carried, so staleness transitions that happen
     /// between folds are still emitted by the next getter-driven check.
     last_emitted: Option<CoordDrainState>,
+    /// Whether the restart prepare's runner-local hold was gating autonomous
+    /// spawns at the last check — the same getter-driven edge for a hold that
+    /// starts or lifts outside any fold (its `until` passing silently).
+    last_local_hold: Option<bool>,
     /// Whether any read (or failed read) has been folded since boot.
     folded_once: bool,
 }
@@ -647,6 +651,7 @@ fn global() -> &'static Global {
                 deferred: BTreeSet::new(),
                 deferred_capped: false,
                 last_emitted: None,
+                last_local_hold: None,
                 folded_once: false,
             }),
             tx,
@@ -690,15 +695,44 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
     )
 }
 
+/// PURE: whether a getter-driven check owes an event — the coord state moved
+/// since the last event (a staleness flip), or the restart prepare's
+/// runner-local hold started or lifted since the last check (`local` now vs
+/// `last_local`). The first check of either emits nothing: there is no
+/// earlier reading to have moved from.
+fn change_due(
+    last_emitted: Option<&CoordDrainState>,
+    state: &CoordDrainState,
+    last_local: Option<bool>,
+    local: bool,
+) -> bool {
+    let state_moved = last_emitted.is_some_and(|last| last != state);
+    let hold_moved = last_local.is_some_and(|last| last != local);
+    state_moved || hold_moved
+}
+
 /// The current state. Cheap and synchronous: one mutex, no I/O.
+///
+/// Also the getter-driven edge for the restart prepare's runner-local hold:
+/// a hold that lifts by passing its `until` changes nothing a fold sees, so
+/// the next reader (the gate, the banner's poll) emits the snapshot whose
+/// `autonomousSpawnsAllowed` turned true — the edge a deferred boot restore
+/// re-runs on.
 pub fn current() -> CoordDrainState {
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let (state, emit) = {
         let mut inner = lock_inner();
         let state = current_locked(&inner);
-        let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
+        let emit = change_due(
+            inner.last_emitted.as_ref(),
+            &state,
+            inner.last_local_hold,
+            local,
+        );
+        inner.last_local_hold = Some(local);
         if emit {
             inner.last_emitted = Some(state.clone());
-            if state.allows_autonomous_spawns() {
+            if state.allows_autonomous_spawns() && !local {
                 inner.deferred.clear();
                 inner.deferred_capped = false;
             }
@@ -719,8 +753,15 @@ pub fn current() -> CoordDrainState {
 pub struct CoordDrainSnapshot {
     /// `clear` | `drained` | `unknown` | `not_enrolled`.
     pub state: &'static str,
-    /// Whether autonomous spawns run right now.
+    /// Whether autonomous spawns run right now: the EFFECTIVE gate — coord's
+    /// state allows them AND no restart-prepare runner-local hold defers them
+    /// (`local_hold`). A webview restore the gate deferred re-runs on this
+    /// field's false→true edge, so it must turn false under the local hold
+    /// too, or the hold's lift is no edge at all.
     pub autonomous_spawns_allowed: bool,
+    /// The restart prepare's runner-local hold while it defers autonomous
+    /// spawns (`restart_prep::local_hold_reason`), else `None`.
+    pub local_hold: Option<String>,
     pub until: Option<DateTime<Utc>>,
     pub reason: Option<String>,
     /// For `unknown`: since when.
@@ -743,7 +784,11 @@ pub struct CoordDrainSnapshot {
     pub boot_read_pending: bool,
 }
 
-fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
+fn snapshot_of(
+    state: &CoordDrainState,
+    local_hold: Option<String>,
+    inner: &Inner,
+) -> CoordDrainSnapshot {
     let mut by_origin: BTreeMap<String, usize> = BTreeMap::new();
     for (origin, _) in &inner.deferred {
         *by_origin.entry(origin.as_wire().to_string()).or_default() += 1;
@@ -758,7 +803,8 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
     };
     CoordDrainSnapshot {
         state: state.label(),
-        autonomous_spawns_allowed: state.allows_autonomous_spawns(),
+        autonomous_spawns_allowed: state.allows_autonomous_spawns() && local_hold.is_none(),
+        local_hold,
         until,
         reason,
         since,
@@ -785,16 +831,18 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         deferred: BTreeSet::new(),
         deferred_capped: false,
         last_emitted: None,
+        last_local_hold: None,
         folded_once: true,
     };
-    snapshot_of(state, &inner)
+    snapshot_of(state, None, &inner)
 }
 
 /// The current snapshot.
 pub fn snapshot() -> CoordDrainSnapshot {
+    let local_hold = crate::restart_prep::local_hold_reason();
     let state = current();
     let inner = lock_inner();
-    snapshot_of(&state, &inner)
+    snapshot_of(&state, local_hold, &inner)
 }
 
 /// Subscribe to state changes. The value is the state as of the last change.
@@ -815,6 +863,7 @@ fn emit_snapshot() {
 /// Fold under the lock, then publish and emit outside it.
 fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Transition {
     let now = Utc::now();
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let (transition, state) = {
         let mut inner = lock_inner();
         let before = current_locked(&inner);
@@ -824,7 +873,7 @@ fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Trans
         inner.last_fold_at = now;
         let after = current_locked(&inner);
         let changed = transition.changed || before != after;
-        if after.allows_autonomous_spawns() {
+        if after.allows_autonomous_spawns() && !local {
             inner.deferred.clear();
             inner.deferred_capped = false;
         }
@@ -883,9 +932,12 @@ fn log_transition(state: &CoordDrainState) {
 /// would count CALLS beside a distinct-KEY count, which is not comparable to
 /// the figure it qualifies.
 pub fn record_deferral(origin: SpawnOrigin, key: &str) {
+    // A deferral by the restart prepare's runner-local hold is counted like
+    // one by coord's drain: it is a hold the operator set.
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let emit = {
         let mut inner = lock_inner();
-        if current_locked(&inner).allows_autonomous_spawns() {
+        if current_locked(&inner).allows_autonomous_spawns() && !local {
             false
         } else if inner.deferred.len() >= MAX_DEFERRED_KEYS {
             // At the cap. Flip the flag ONCE (that transition is worth an
@@ -1725,6 +1777,7 @@ mod tests {
             .collect(),
             deferred_capped: false,
             last_emitted: None,
+            last_local_hold: None,
             folded_once: true,
         };
         let snap = snapshot_of(
@@ -1732,6 +1785,7 @@ mod tests {
                 until: None,
                 reason: Some("rebuild".into()),
             },
+            None,
             &inner,
         );
         let json = serde_json::to_value(&snap).unwrap();
@@ -1741,6 +1795,69 @@ mod tests {
         assert_eq!(json["deferredCount"], 3);
         assert_eq!(json["deferredByOrigin"]["looping_agent"], 2);
         assert_eq!(json["deferredByOrigin"]["steward"], 1);
+    }
+
+    /// Finding 2 (review): a webview restore the gate deferred re-runs on a
+    /// false→true edge of `autonomousSpawnsAllowed`. Under the restart
+    /// prepare's runner-local hold the gate defers while coord's state alone
+    /// reads clear, so the field must be the EFFECTIVE gate — else the hold's
+    /// lift is no edge, and the deferred restore never re-runs.
+    #[test]
+    fn the_snapshot_reads_the_local_hold_as_spawns_not_allowed() {
+        let inner = Inner {
+            tracker: DrainTracker::new(t0()),
+            last_fold: Instant::now(),
+            last_fold_at: t0(),
+            deferred: BTreeSet::new(),
+            deferred_capped: false,
+            last_emitted: None,
+            last_local_hold: None,
+            folded_once: true,
+        };
+        for state in [
+            CoordDrainState::Clear,
+            CoordDrainState::NotEnrolled { why: "no coord" },
+        ] {
+            let held = snapshot_of(&state, Some("prepare p — hold local".into()), &inner);
+            let json = serde_json::to_value(&held).unwrap();
+            assert_eq!(json["autonomousSpawnsAllowed"], false, "{state:?}");
+            assert_eq!(json["localHold"], "prepare p — hold local");
+            let lifted = snapshot_of(&state, None, &inner);
+            assert!(lifted.autonomous_spawns_allowed, "{state:?}");
+            assert_eq!(
+                serde_json::to_value(&lifted).unwrap()["localHold"],
+                serde_json::Value::Null
+            );
+        }
+    }
+
+    /// Finding 2: the hold's lift — including its `until` passing, which no
+    /// fold sees — is an edge the next getter-driven check emits.
+    #[test]
+    fn a_local_hold_starting_or_lifting_is_an_emitted_change() {
+        let clear = CoordDrainState::Clear;
+        assert!(
+            change_due(Some(&clear), &clear, Some(true), false),
+            "the lift"
+        );
+        assert!(
+            change_due(Some(&clear), &clear, Some(false), true),
+            "the start"
+        );
+        assert!(!change_due(Some(&clear), &clear, Some(true), true));
+        assert!(
+            !change_due(Some(&clear), &clear, None, true),
+            "the first look"
+        );
+        assert!(!change_due(None, &clear, None, false));
+        let unknown = CoordDrainState::Unknown {
+            since: t0(),
+            cause: "x".into(),
+        };
+        assert!(
+            change_due(Some(&clear), &unknown, Some(false), false),
+            "a staleness flip"
+        );
     }
 
     #[test]

@@ -417,9 +417,13 @@ export class RestoreCohortStore {
    * so a session that came back by another path (a PTY holder's adoption, a
    * restore elsewhere) stops being a placeholder, and a cohort the backend
    * finished empties the store. An unreadable read changes nothing.
+   *
+   * With no cohort known (and the last read readable) the periodic re-read
+   * does nothing; `force` reads anyway — for a change that announces a cohort
+   * this store has not seen yet ({@link onPrepChanged}).
    */
-  refreshSet(): Promise<void> {
-    if (this.prepareId === null && !this.unread) return Promise.resolve();
+  refreshSet(force = false): Promise<void> {
+    if (!force && this.prepareId === null && !this.unread) return Promise.resolve();
     if (this.setRead) return this.setRead;
     const epoch = this.backEpoch;
     this.setRead = (async () => {
@@ -489,6 +493,48 @@ export class RestoreCohortStore {
     if (!row) return;
     this.cohortRows.set(claudeSessionId, { ...row, held });
     this.rebuild();
+  }
+
+  /**
+   * A `restart-prep-changed` event: the prepare record changed. Two moves
+   * follow from its payload:
+   *
+   * - **a cohort this store has not seen began restoring** (Release hold on a
+   *   restarted runner, a rebuilt runner's boot step). The store may have
+   *   read "no cohort" before — at boot, before the record reached
+   *   `restoring` — and it re-reads only while it knows a cohort, so the set
+   *   is re-read regardless, or the placeholders and the strip never appear;
+   * - **the cohort this store holds left `restoring`** (dismissed from any
+   *   surface, or every row back): it ends here at once
+   *   ({@link endCohort}), whichever surface or path ended it.
+   *
+   * Anything else re-reads as before. An unrecognized payload re-reads too:
+   * it may well be the restoring cohort.
+   */
+  onPrepChanged(payload: unknown): Promise<void> {
+    const record = (payload as { record?: { prepare_id?: unknown; state?: unknown } } | null)
+      ?.record;
+    const prepareId = typeof record?.prepare_id === "string" ? record.prepare_id : null;
+    const state = typeof record?.state === "string" ? record.state : null;
+    if (prepareId !== null && prepareId === this.prepareId && state !== "restoring") {
+      this.endCohort(prepareId);
+    }
+    const announcesRestoring = state === "restoring" || prepareId === null;
+    void this.refreshStatus();
+    return this.refreshSet(announcesRestoring);
+  }
+
+  /**
+   * The cohort `prepareId` ended — dismissed (from the panel, the strip or
+   * any other door) or every row back. The ONE end of a cohort in the
+   * webview: the store empties, which drops every queued restore of it
+   * (`restoreQueue` follows the store) and every page's placeholder tabs. A
+   * no-op for any other prepare.
+   */
+  endCohort(prepareId: string): void {
+    if (this.prepareId !== prepareId) return;
+    this.clear();
+    emitPlaceholderEvent({ kind: "dismissed" });
   }
 
   /** The cohort was dismissed: nothing is a placeholder any more. */

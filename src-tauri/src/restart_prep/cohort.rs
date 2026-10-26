@@ -155,12 +155,24 @@ pub struct CohortRow {
     /// open again.
     #[serde(default)]
     pub left_capture_at: Option<i64>,
+    /// The lifecycle record's `close_reason` once the row left the capture
+    /// (`user-close`, `pty-exit`, `no-terminal`, …); `None` while it has not
+    /// left, or when its record was not closed (or not readable) when it did.
+    /// Cleared with [`Self::left_capture_at`].
+    #[serde(default)]
+    pub left_capture_reason: Option<String>,
     /// Phase 6: the last restore of this row by the rebuilt runner — its
     /// resume verdict and, when an effort was re-applied, whether the prompt
     /// line read back confirmed it. `None` until a restore was attempted.
     #[serde(default)]
     pub restore: Option<super::restore::RowRestore>,
 }
+
+/// The close reasons a session dies with when its runner stops: its PTY
+/// exited (`pty-exit` — a graceful stop fires it on every live pane), or the
+/// liveness poll closed a shell that went idle (`poll-dead`). The same two the
+/// restore set grants a grace window (`restorable_records`).
+pub const RESTART_SHAPED_CLOSE_REASONS: [&str; 2] = ["pty-exit", "poll-dead"];
 
 impl CohortRow {
     /// The name the panel and the verdict show: the session name, else the
@@ -170,6 +182,22 @@ impl CohortRow {
             .session_name
             .clone()
             .or_else(|| self.session.title.clone())
+    }
+
+    /// Whether the rebuilt runner restores this row. Not when it left the
+    /// capture during the prepare by a close a restart does not explain — the
+    /// operator closed the tab (`user-close`), the poll closed an orphan
+    /// (`no-terminal`), a duplicate row was superseded: the session was not
+    /// open when the runner restarted, so no placeholder brings it back and no
+    /// bulk restore takes it. The row stays recorded (and in Past Sessions).
+    /// A row that left with no close reason read — its record was still open,
+    /// or unreadable — stays a candidate: only a known non-restart close drops
+    /// it.
+    pub fn restore_candidate(&self) -> bool {
+        match (&self.left_capture_at, self.left_capture_reason.as_deref()) {
+            (Some(_), Some(reason)) => RESTART_SHAPED_CLOSE_REASONS.contains(&reason),
+            _ => true,
+        }
     }
 }
 
@@ -256,6 +284,7 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         notified_pid: None,
         resume_notified_at: None,
         left_capture_at: None,
+        left_capture_reason: None,
         restore: None,
     }
 }
@@ -271,11 +300,19 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
 ///   fresh row's `held` comes with it unless the operator set `held` by hand.
 /// * A session only in the fresh capture (opened during the prepare) joins.
 /// * A session only in the pinned cohort is kept — every session is recorded —
-///   and stamped `left_capture_at` the first time it is missing.
+///   and stamped `left_capture_at` the first time it is missing, with its
+///   lifecycle record's close reason (`close_reason_of`) once one is readable
+///   — which decides whether the rebuilt runner restores it
+///   ([`CohortRow::restore_candidate`]).
 ///
 /// Rows stay in ledger order (by Claude session id). The capture time and
 /// reason are the fresh capture's.
-pub fn merge_recapture(pinned: &Cohort, fresh: Cohort, now_ms: i64) -> Cohort {
+pub fn merge_recapture(
+    pinned: &Cohort,
+    fresh: Cohort,
+    now_ms: i64,
+    close_reason_of: &dyn Fn(&str) -> Option<String>,
+) -> Cohort {
     use std::collections::BTreeMap;
     let mut by_id: BTreeMap<String, CohortRow> = pinned
         .rows
@@ -308,6 +345,7 @@ pub fn merge_recapture(pinned: &Cohort, fresh: Cohort, now_ms: i64) -> Cohort {
                     }
                 }
                 row.left_capture_at = None;
+                row.left_capture_reason = None;
             }
             None => {
                 by_id.insert(id, fresh_row);
@@ -315,8 +353,14 @@ pub fn merge_recapture(pinned: &Cohort, fresh: Cohort, now_ms: i64) -> Cohort {
         }
     }
     for (id, row) in by_id.iter_mut() {
-        if !seen.contains(id) && row.left_capture_at.is_none() {
+        if seen.contains(id) {
+            continue;
+        }
+        if row.left_capture_at.is_none() {
             row.left_capture_at = Some(now_ms);
+        }
+        if row.left_capture_reason.is_none() {
+            row.left_capture_reason = close_reason_of(id);
         }
     }
     Cohort {
@@ -681,7 +725,7 @@ mod tests {
             ledger(&["a", "b"]),
             &fixed(vec![("a", read_max()), ("b", read_max())]),
         );
-        let merged = merge_recapture(&pinned, fresh, 1_000);
+        let merged = merge_recapture(&pinned, fresh, 1_000, &|_| None);
         assert_eq!(
             merged.rows[0].effort.level.as_deref(),
             Some("max"),
@@ -737,7 +781,7 @@ mod tests {
                 ("c", unread()),
             ]),
         );
-        let merged = merge_recapture(&pinned, fresh, 3_000);
+        let merged = merge_recapture(&pinned, fresh, 3_000, &|_| None);
         assert_eq!(merged.captured_at_ms, 2_000);
         let ids: Vec<&str> = merged
             .rows
@@ -761,12 +805,18 @@ mod tests {
         assert_eq!(merged.rows[2].left_capture_at, None, "c joined");
 
         // A later re-capture keeps b's first-missing time; b reappearing clears it.
-        let again = merge_recapture(&merged, build_cohort(ledger(&["a"]), &fixed(vec![])), 4_000);
+        let again = merge_recapture(
+            &merged,
+            build_cohort(ledger(&["a"]), &fixed(vec![])),
+            4_000,
+            &|_| None,
+        );
         assert_eq!(again.rows[1].left_capture_at, Some(3_000));
         let back = merge_recapture(
             &again,
             build_cohort(ledger(&["a", "b", "c"]), &fixed(vec![])),
             5_000,
+            &|_| None,
         );
         assert_eq!(back.rows[1].left_capture_at, None);
         // An effort unread at prepare is taken once it is read.
@@ -784,8 +834,50 @@ mod tests {
                 )]),
             ),
             6_000,
+            &|_| None,
         );
         assert_eq!(read.rows[1].effort.level.as_deref(), Some("high"));
+    }
+
+    /// Finding 6 (review): a session the operator closed during the prepare
+    /// left the capture by a `user-close`. It stays recorded, but it is no
+    /// restore candidate; one that died a restart's death (`pty-exit`) is, and
+    /// so is one whose close reason could not be read.
+    #[test]
+    fn a_session_closed_by_the_user_during_the_prepare_is_no_restore_candidate() {
+        let pinned = build_cohort(ledger(&["a", "b", "c", "d"]), &fixed(vec![]));
+        let reasons = |id: &str| match id {
+            "b" => Some("user-close".to_string()),
+            "c" => Some("pty-exit".to_string()),
+            _ => None,
+        };
+        let merged = merge_recapture(
+            &pinned,
+            build_cohort(ledger(&["a"]), &fixed(vec![])),
+            2_000,
+            &reasons,
+        );
+        let row = |id: &str| {
+            merged
+                .rows
+                .iter()
+                .find(|r| r.session.claude_session_id == id)
+                .unwrap()
+        };
+        assert_eq!(merged.rows.len(), 4, "every session is still recorded");
+        assert_eq!(row("b").left_capture_reason.as_deref(), Some("user-close"));
+        assert!(row("a").restore_candidate(), "still open");
+        assert!(!row("b").restore_candidate(), "closed on purpose");
+        assert!(row("c").restore_candidate(), "a restart-shaped close");
+        assert!(row("d").restore_candidate(), "no close reason read");
+        // Back in the capture: the reason goes with the stamp.
+        let back = merge_recapture(
+            &merged,
+            build_cohort(ledger(&["a", "b", "c", "d"]), &fixed(vec![])),
+            3_000,
+            &reasons,
+        );
+        assert!(back.rows.iter().all(|r| r.left_capture_reason.is_none()));
     }
 
     fn open_record(

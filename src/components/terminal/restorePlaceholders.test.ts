@@ -17,6 +17,7 @@ import {
   cohortStripText,
   effortBadgeText,
   missingPlaceholderPages,
+  onPlaceholderEvent,
   parsePlaceholderSet,
   placeholderSessionIdOf,
   restorePlaceholderTabId,
@@ -301,6 +302,50 @@ describe("RestoreCohortStore", () => {
     await store.refreshSet();
     expect(store.getSnapshot()).toMatchObject({ unread: false, prepareId: "prep-1" });
     expect(store.getSnapshot().rows.map((r) => r.claudeSessionId)).toEqual(["a"]);
+  });
+
+  // Finding 1 (review): the store read "no cohort" at boot (before the record
+  // reached `restoring`). Release hold then moves the record to `restoring`
+  // and announces it; the store must read the set although it holds no
+  // cohort, or no placeholder and no strip ever appear.
+  it("a restart-prep-changed naming a restoring cohort is read from the no-cohort state", async () => {
+    const reads: Array<PlaceholderSet | null> = [];
+    const io = {
+      readStatus: vi.fn(async () => ({ startedAt: null, rows: [cohortRow("a")] })),
+      readSet: vi.fn(async () => reads.shift() ?? null),
+    };
+    const store = new RestoreCohortStore(io);
+    store.publish({ placeholders: [], restartPrep: null });
+    expect(cohortRefreshInterval(store.getSnapshot())).toBeNull();
+    // A notice tick during a prepare announces nothing restoring: no read.
+    await store.onPrepChanged({ record: { prepare_id: "prep-1", state: "preparing" } });
+    expect(io.readSet).not.toHaveBeenCalled();
+    reads.push({
+      placeholders: [rec("a")],
+      restartPrep: { prepareId: "prep-1", holderSweepPending: false },
+    });
+    await store.onPrepChanged({ record: { prepare_id: "prep-1", state: "restoring" } });
+    expect(io.readSet).toHaveBeenCalledTimes(1);
+    expect(store.getSnapshot().prepareId).toBe("prep-1");
+    expect(store.getSnapshot().rows.map((r) => r.claudeSessionId)).toEqual(["a"]);
+  });
+
+  // Finding 4 (review): the cohort leaving `restoring` (dismissed from any
+  // surface) ends it here at once, placeholder tabs included.
+  it("a restart-prep-changed that ends the held cohort empties the store", async () => {
+    const store = new RestoreCohortStore(status([]));
+    store.publish({
+      placeholders: [rec("a")],
+      restartPrep: { prepareId: "prep-1", holderSweepPending: false },
+    });
+    const events: string[] = [];
+    const off = onPlaceholderEvent((e) => events.push(e.kind));
+    await store.onPrepChanged({ record: { prepare_id: "prep-other", state: "done" } });
+    expect(store.getSnapshot().prepareId).toBe("prep-1");
+    await store.onPrepChanged({ record: { prepare_id: "prep-1", state: "done" } });
+    off();
+    expect(store.getSnapshot()).toMatchObject({ prepareId: null, rows: [] });
+    expect(events).toEqual(["dismissed"]);
   });
 
   it("a read with no restoring cohort, a restore, or a dismissal empties it", () => {

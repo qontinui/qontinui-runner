@@ -301,6 +301,11 @@ pub struct CensusEvidence {
     /// `unknown`, `not_enrolled`); `None` when it was not read. A `confirmed`
     /// hold counts only while this reads `drained`.
     pub device_drain: Option<String>,
+    /// claude session id → its lifecycle record's `close_reason`, for each
+    /// cohort row whose record is closed. The re-capture records it on a row
+    /// that left the capture, which decides whether the rebuilt runner
+    /// restores it ([`super::cohort::CohortRow::restore_candidate`]).
+    pub close_reasons: HashMap<String, String>,
 }
 
 impl CensusEvidence {
@@ -312,6 +317,7 @@ impl CensusEvidence {
             live_terminals: HashSet::new(),
             unattributed_live: 0,
             device_drain: None,
+            close_reasons: HashMap::new(),
         }
     }
 }
@@ -383,6 +389,7 @@ pub fn evidence_from(
         live_terminals,
         unattributed_live,
         device_drain,
+        close_reasons: HashMap::new(),
     }
 }
 
@@ -709,7 +716,12 @@ impl RestartPrep {
             return TickOutcome::Idle(rec.state);
         }
         let (mut cohort, capture_error) = match capture {
-            Ok(fresh) => (merge_recapture(&rec.cohort, fresh, now_ms), None),
+            Ok(fresh) => (
+                merge_recapture(&rec.cohort, fresh, now_ms, &|id| {
+                    census.close_reasons.get(id).cloned()
+                }),
+                None,
+            ),
             Err(e) => (rec.cohort.clone(), Some(e)),
         };
         refresh_rows(&mut cohort, census);
@@ -1093,13 +1105,38 @@ async fn gather_census(app: &tauri::AppHandle, rec: &PrepareRecord) -> CensusEvi
             .iter()
             .map(|r| r.session.terminal_id.as_str()),
     );
-    evidence_from(
+    let mut evidence = evidence_from(
         fresh.pass.as_ref().map(|p| &p.report),
         census_error,
         &activity,
         live,
         Some(crate::coord_drain_state::current().label().to_string()),
-    )
+    );
+    evidence.close_reasons = close_reasons_in(app, rec);
+    evidence
+}
+
+/// The lifecycle `close_reason` of every cohort row of `rec` whose record is
+/// closed (see [`CensusEvidence::close_reasons`]).
+fn close_reasons_in(app: &tauri::AppHandle, rec: &PrepareRecord) -> HashMap<String, String> {
+    use tauri::Manager;
+    let Some(store) =
+        app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    else {
+        return HashMap::new();
+    };
+    rec.cohort
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let id = &row.session.claude_session_id;
+            let record = store.get(id)?;
+            (record.state == "closed")
+                .then_some(record.close_reason)
+                .flatten()
+                .map(|reason| (id.clone(), reason))
+        })
+        .collect()
 }
 
 /// One tick on the live record: the notice tick while a prepare is in its

@@ -46,9 +46,13 @@
 //! and records coord's per-lane outcome VERBATIM (`released | not_owner |
 //! absent | unreadable`), then marks the record `cancelled`, which lifts the
 //! freeze and any local hold. A release coord did not answer with a lane
-//! outcome (unreachable, refused, route absent) does NOT settle: the hold
-//! still stands, so the prepare stays in force, the attempt is recorded
-//! (`release_failed` in the view), and Release hold retries it.
+//! outcome (unreachable, refused) does NOT settle: the hold still stands, so
+//! the prepare stays in force, the attempt is recorded (`release_failed` in the
+//! view), and Release hold retries it. A coord without the self-hold route
+//! (`route_absent`) is the exception while it never confirmed a hold for this
+//! prepare: no coord hold of ours exists, so the release settles — with no
+//! coord write at all when the hold itself answered `route_absent`
+//! ([`release_settled`]).
 //!
 //! At boot, after the drain read and before any restore ([`on_boot`] runs
 //! inside `coord_drain_state::boot_read`), a record whose `prepared_build` is
@@ -188,8 +192,18 @@ pub trait HoldDoor: Send + Sync {
     fn role(&self) -> HoldRole;
     async fn hold(&self, req: &HoldRequest) -> HoldCall;
     async fn release(&self, prepare_id: &str) -> ReleaseCall;
-    /// `GET /coord/devices/me/drain`, the read-back for both.
+    /// `GET /coord/devices/me/drain`, the read-back for both. Reads only:
+    /// what the read means for the runner's own drain state is folded in by
+    /// [`Self::publish_read`], which the controller calls once the record says
+    /// what the read means for the cohort.
     async fn read_drain(&self) -> Result<DrainObservation, String>;
+    /// Fold a [`Self::read_drain`] answer into the runner's drain state, so the
+    /// banner and the gate see it now rather than on the next heartbeat. The
+    /// controller calls it AFTER recording what the read means: a release's
+    /// read-back lifts the drain, and a lifted drain re-runs every deferred
+    /// boot restore, so the record must already say `restoring` by then
+    /// (otherwise the cohort's rows reach the auto-restore all at once).
+    fn publish_read(&self, _read: &Result<DrainObservation, String>) {}
 }
 
 fn excerpt(body: &str) -> String {
@@ -379,10 +393,13 @@ impl HoldDoor for LiveDoor {
             }
             crate::coord_drain_state::Enrollment::Indeterminate(cause) => Err(cause),
         };
+        read
+    }
+
+    fn publish_read(&self, read: &Result<DrainObservation, String>) {
         // A fresh read is a fresh read: the banner and the gate see the hold
         // (or its release) now, not on the next heartbeat.
-        crate::coord_drain_state::fold_me_drain_read(&read);
-        read
+        crate::coord_drain_state::fold_me_drain_read(read);
     }
 }
 
@@ -445,14 +462,42 @@ pub fn spawns_held(hold: &HoldStatus) -> bool {
 /// Whether a release outcome SETTLES the hold: coord gave a lane outcome
 /// (`released | not_owner | absent | unreadable`), the hold was runner-local,
 /// or there is no coord lever to send one through. Anything else — coord
-/// unreachable, refused, route absent, an outcome this build does not know —
-/// leaves the hold standing, so the prepare stays in force.
-pub fn release_settled(outcome: &str) -> bool {
+/// unreachable, refused, an outcome this build does not know — leaves the
+/// hold standing, so the prepare stays in force.
+///
+/// `route_absent` (a coord with no self-hold route) settles only when coord
+/// never CONFIRMED a hold for this prepare (`coord_hold_confirmed` false): a
+/// coord without the route never held anything for us, so there is nothing
+/// to let go — and refusing to settle would leave the prepare (and its
+/// runner-local backstop) in force with no way to end it, before or after a
+/// rebuild. A coord that DID confirm a hold and then answers `404` to its
+/// release has not let it go: owner-conditional semantics are kept.
+pub fn release_settled(outcome: &str, coord_hold_confirmed: bool) -> bool {
     matches!(
         outcome,
         "released" | "not_owner" | "absent" | "unreadable" | "local"
-    ) || outcome.starts_with("not_sent: ")
+    ) || (outcome == "route_absent" && !coord_hold_confirmed)
+        || outcome.starts_with("not_sent: ")
         || outcome.starts_with("already released: ")
+}
+
+/// Whether coord ever confirmed a hold for `rec` (see
+/// [`PrepareRecord::coord_hold_confirmed`]); a record whose hold reads
+/// `confirmed` now has, whatever the flag says.
+fn coord_hold_was_confirmed(rec: &PrepareRecord) -> bool {
+    rec.coord_hold_confirmed || rec.hold == HoldStatus::Confirmed
+}
+
+/// Why `action` is refused on a runner rebuilt since `rec` was prepared, or
+/// `None`. The hold waits for a rebuild (D1); a rebuilt runner whose boot
+/// release did not settle owes a release — never a longer drain, and never a
+/// re-sent hold for the old prepare.
+fn rebuilt_refusal(rec: &PrepareRecord, action: &str) -> Option<String> {
+    (rec.prepared_build != running_build()).then(|| {
+        format!(
+            "this runner was rebuilt since the prepare — release the hold rather than {action} it"
+        )
+    })
 }
 
 /// PURE: the view of `rec` at `now_ms`.
@@ -797,6 +842,9 @@ impl RestartPrep {
                 match door.hold(&req).await {
                     HoldCall::Held { until_ms } => {
                         let read = door.read_drain().await;
+                        // A hold read-back only ever tightens the gate: fold
+                        // it in at once.
+                        door.publish_read(&read);
                         match confirms_hold(&read, &rec.prepare_id) {
                             Ok(()) => (HoldStatus::Confirmed, until_ms),
                             Err(cause) => (HoldStatus::Unconfirmed { cause }, until_ms),
@@ -832,6 +880,7 @@ impl RestartPrep {
             // A hold confirmed after a failed release supersedes that report.
             if hold == HoldStatus::Confirmed {
                 r.release = None;
+                r.coord_hold_confirmed = true;
             }
             r.hold = hold;
             if let Some(u) = until_ms {
@@ -841,7 +890,10 @@ impl RestartPrep {
         })
     }
 
-    /// Let the hold go and say what that answered.
+    /// Let the hold go and say what that answered, with the read-back the
+    /// release took (if any). The read-back is NOT folded into the drain state
+    /// here: the caller records what the release means first and then
+    /// publishes it ([`HoldDoor::publish_read`]).
     async fn release_hold(
         &self,
         door: &dyn HoldDoor,
@@ -849,10 +901,21 @@ impl RestartPrep {
         trigger: ReleaseTrigger,
         now_ms: i64,
         build: &str,
-    ) -> ReleaseReport {
-        let (outcome, read_back) = match &rec.hold {
+    ) -> (ReleaseReport, Option<Result<DrainObservation, String>>) {
+        let (outcome, read) = match &rec.hold {
             HoldStatus::Local | HoldStatus::LocalSecondary => ("local".to_string(), None),
             HoldStatus::ReleaseSent { outcome } => (format!("already released: {outcome}"), None),
+            // The hold POST answered `404` and coord never confirmed a hold:
+            // this coord has no self-hold route, so no coord hold of ours
+            // exists and releasing needs no coord write.
+            HoldStatus::Unconfirmed { cause }
+                if cause == "route_absent" && !coord_hold_was_confirmed(rec) =>
+            {
+                (
+                    "not_sent: no coord hold was taken (coord has no self-hold route)".to_string(),
+                    None,
+                )
+            }
             // `NotAttempted` too: a crash between coord's answer and the write
             // that records it leaves a hold the record does not know about.
             // The release is owner-conditional, so the worst answer is `absent`.
@@ -869,16 +932,17 @@ impl RestartPrep {
                         format!("enrollment_indeterminate: {cause}")
                     }
                 };
-                let read_back = if outcome.starts_with("not_sent: ")
+                let read = if outcome.starts_with("not_sent: ")
                     || outcome.starts_with("enrollment_indeterminate: ")
                 {
                     None
                 } else {
-                    Some(read_back_label(&door.read_drain().await))
+                    Some(door.read_drain().await)
                 };
-                (outcome, read_back)
+                (outcome, read)
             }
         };
+        let read_back = read.as_ref().map(read_back_label);
         info!(
             prepare = %rec.prepare_id,
             trigger = ?trigger,
@@ -886,14 +950,17 @@ impl RestartPrep {
             read_back = read_back.as_deref().unwrap_or("-"),
             "restart_prep: hold released"
         );
-        ReleaseReport {
-            at_ms: now_ms,
-            at: rfc3339(now_ms),
-            trigger,
-            on_build: build.to_string(),
-            outcome,
-            read_back,
-        }
+        (
+            ReleaseReport {
+                at_ms: now_ms,
+                at: rfc3339(now_ms),
+                trigger,
+                on_build: build.to_string(),
+                outcome,
+                read_back,
+            },
+            read,
+        )
     }
 
     /// Prepare for a restart. Idempotent while a prepare is active: a second
@@ -912,6 +979,11 @@ impl RestartPrep {
     {
         let _op = self.ops.lock().await;
         if let Some(rec) = self.record().filter(|r| r.is_active(now_ms)) {
+            // The same rule as Extend: a rebuilt runner owes the old prepare a
+            // release, never a re-sent hold.
+            if let Some(refusal) = rebuilt_refusal(&rec, "preparing again over") {
+                return Err(refusal);
+            }
             if matches!(
                 rec.hold,
                 HoldStatus::Confirmed | HoldStatus::Local | HoldStatus::LocalSecondary
@@ -966,12 +1038,8 @@ impl RestartPrep {
         };
         // The hold waits for a rebuild (D1). A rebuilt runner whose boot
         // release did not settle owes a release, never a longer drain.
-        if rec.prepared_build != running_build() {
-            return Err(
-                "this runner was rebuilt since the prepare — release the hold rather than \
-                 extending it"
-                    .to_string(),
-            );
+        if let Some(refusal) = rebuilt_refusal(&rec, "extending") {
+            return Err(refusal);
         }
         let from = rec.hold_until_ms.unwrap_or(now_ms).max(now_ms);
         let until = (from + DEFAULT_HOLD_MS).min(now_ms + MAX_HOLD_MS);
@@ -1007,6 +1075,7 @@ impl RestartPrep {
         self.update(&rec.prepare_id, |r| {
             if hold == HoldStatus::Confirmed {
                 r.release = None;
+                r.coord_hold_confirmed = true;
             }
             r.hold = hold;
             r.hold_until_ms = granted;
@@ -1026,11 +1095,11 @@ impl RestartPrep {
         let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
             return Err("no prepare is in progress — nothing to cancel".to_string());
         };
-        let report = self
+        let (report, read) = self
             .release_hold(door, &rec, ReleaseTrigger::Cancel, now_ms, running_build())
             .await;
         let outcome = report.outcome.clone();
-        let settled = release_settled(&outcome);
+        let settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
         // On a REBUILT runner — the boot step could not settle its release, so
         // the record stayed in its window — the release the operator pressed
         // is the one the boot step owed: the cohort moves to `restoring`, as
@@ -1055,7 +1124,14 @@ impl RestartPrep {
                 };
             }
             r.release = Some(report);
-        })?;
+        });
+        // Only now, with the record saying `restoring` (or `cancelled`), may the
+        // release's read-back lift the drain: a lifted drain re-runs every
+        // deferred boot restore, which must find the cohort restoring.
+        if let Some(read) = read.as_ref() {
+            door.publish_read(read);
+        }
+        let rec = rec?;
         if settled {
             // The record left its window: the same-build flag was its, not the
             // next prepare's.
@@ -1080,11 +1156,11 @@ impl RestartPrep {
             return BootStep::NotInWindow(rec.state);
         }
         if rec.prepared_build != build {
-            let report = self
+            let (report, read) = self
                 .release_hold(door, &rec, ReleaseTrigger::Rebuild, now_ms, build)
                 .await;
             let outcome = report.outcome.clone();
-            let settled = release_settled(&outcome);
+            let settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
             let applied = self.update(&rec.prepare_id, |r| {
                 if settled {
                     r.hold = HoldStatus::ReleaseSent {
@@ -1096,6 +1172,11 @@ impl RestartPrep {
             });
             if let Err(e) = applied {
                 warn!("{e}");
+            }
+            // The record says `restoring` before the read-back lifts the drain
+            // (see `cancel`).
+            if let Some(read) = read.as_ref() {
+                door.publish_read(read);
             }
             return if settled {
                 BootStep::ReleasedForRebuild { outcome }
@@ -1367,6 +1448,10 @@ mod tests {
         /// Runs inside the hold call — stands for work that lands while an
         /// operation awaits coord.
         on_hold: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Every read folded into the drain state, with the record's state ON
+        /// DISK at that moment (when `record_at` names the record).
+        published: Mutex<Vec<(String, Option<PrepState>)>>,
+        record_at: Mutex<Option<PathBuf>>,
     }
 
     impl MockDoor {
@@ -1380,6 +1465,8 @@ mod tests {
                 releases: Mutex::new(vec![]),
                 until_reply: Mutex::new(None),
                 on_hold: Mutex::new(None),
+                published: Mutex::new(vec![]),
+                record_at: Mutex::new(None),
             })
         }
         fn primary() -> Arc<Self> {
@@ -1429,6 +1516,19 @@ mod tests {
         }
         async fn read_drain(&self) -> Result<DrainObservation, String> {
             self.drain.lock().unwrap().clone()
+        }
+        fn publish_read(&self, read: &Result<DrainObservation, String>) {
+            let state = self
+                .record_at
+                .lock()
+                .unwrap()
+                .as_deref()
+                .and_then(load_from)
+                .map(|r| r.state);
+            self.published
+                .lock()
+                .unwrap()
+                .push((read_back_label(read), state));
         }
     }
 
@@ -1708,7 +1808,7 @@ mod tests {
         assert!(!ctl.same_build_restart(), "the flag left with its record");
         // A restoring cohort is the operator's to restore or dismiss before a
         // new prepare may replace it (Phase 5 review round 2).
-        crate::restart_prep::restore::dismiss_on(&ctl, &first.prepare_id).unwrap();
+        crate::restart_prep::restore::dismiss_on(&ctl, &first.prepare_id, &|_| {}).unwrap();
         let second = ctl
             .prepare(&*door, "again", T0 + 3_000, || async {
                 Ok(cohort(&["s1"]))
@@ -2046,14 +2146,20 @@ mod tests {
             }
         );
         assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Preparing);
-        assert!(!release_settled("refused: HTTP 500: boom"));
+        assert!(!release_settled("refused: HTTP 500: boom", false));
         assert!(!release_settled(
-            "enrollment_indeterminate: machine.json unreadable"
+            "enrollment_indeterminate: machine.json unreadable",
+            false
         ));
         assert!(release_settled(
-            "not_sent: a secondary instance never writes the device's drain"
+            "not_sent: a secondary instance never writes the device's drain",
+            false
         ));
-        assert!(release_settled("not_owner") && release_settled("local"));
+        assert!(release_settled("not_owner", true) && release_settled("local", true));
+        assert!(
+            !release_settled("route_absent", true),
+            "a confirmed coord hold is not let go by a 404"
+        );
     }
 
     #[tokio::test]
@@ -2288,6 +2394,132 @@ mod tests {
         );
     }
 
+    /// Finding 5 (review): with coord's self-hold route not deployed, the hold
+    /// POST answers `404` and the hold reads `unconfirmed: route_absent`. No
+    /// coord hold of ours exists, so Release hold must settle without a coord
+    /// write — the runner-local backstop lifts — instead of erring forever.
+    #[tokio::test]
+    async fn restart_prep_a_route_absent_hold_cancels_without_a_coord_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        *door.hold_reply.lock().unwrap() = Some(HoldCall::RouteAbsent);
+        *door.release_reply.lock().unwrap() = Some(ReleaseCall::RouteAbsent);
+        let rec = prepare(&ctl, &door).await;
+        assert_eq!(rec.hold.label(), "unconfirmed: route_absent");
+        assert!(
+            ctl.local_hold_reason(T0 + 1).is_some(),
+            "the backstop holds"
+        );
+        let rec = ctl
+            .cancel(&*door, T0 + 2)
+            .await
+            .expect("the release settles");
+        assert_eq!(rec.state, PrepState::Cancelled);
+        assert_eq!(
+            door.release_count(),
+            0,
+            "no coord write for a hold never taken"
+        );
+        assert!(
+            ctl.local_hold_reason(T0 + 3).is_none(),
+            "the backstop lifts"
+        );
+        assert!(rec.release.unwrap().outcome.starts_with("not_sent: "));
+    }
+
+    /// Finding 5: a rebuilt runner whose prepare's hold coord never confirmed,
+    /// and whose release coord answers `404`, settles and starts the restore.
+    #[tokio::test]
+    async fn restart_prep_a_rebuild_settles_a_route_absent_release_of_an_unconfirmed_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Unconfirmed {
+                cause: "coord_unreachable: timed out".to_string(),
+            },
+            T0 + DEFAULT_HOLD_MS,
+        );
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(ReleaseCall::RouteAbsent);
+        assert_eq!(
+            ctl.on_boot(&*door, running_build(), T0 + 1).await,
+            BootStep::ReleasedForRebuild {
+                outcome: "route_absent".to_string()
+            }
+        );
+        assert_eq!(door.release_count(), 1, "the release was still asked");
+        assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Restoring);
+    }
+
+    /// Finding 5: `prepare` on a rebuilt runner refuses exactly as `extend`
+    /// does — it never re-sends the OLD prepare's coord hold.
+    #[tokio::test]
+    async fn restart_prep_prepare_on_a_rebuilt_runner_refuses_like_extend() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Unconfirmed {
+                cause: "coord_unreachable: x".to_string(),
+            },
+            T0 + DEFAULT_HOLD_MS,
+        );
+        let door = MockDoor::primary();
+        let err = ctl
+            .prepare(&*door, "again", T0 + 1, || async { Ok(cohort(&["n"])) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("rebuilt"), "{err}");
+        assert_eq!(
+            door.hold_count(),
+            0,
+            "the old prepare's hold is not re-sent"
+        );
+        let extend = ctl.extend(&*door, T0 + 1).await.unwrap_err();
+        assert!(extend.contains("rebuilt"), "{extend}");
+    }
+
+    /// Finding 3 (review): the release's read-back lifts the drain, and a lifted
+    /// drain re-runs every deferred boot restore — so it is folded in only
+    /// once the record already says `restoring`, on the boot step and on
+    /// Release hold alike.
+    #[tokio::test]
+    async fn restart_prep_a_release_lifts_the_drain_only_once_the_record_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Confirmed,
+            T0 + DEFAULT_HOLD_MS,
+        );
+        let door = MockDoor::primary();
+        *door.record_at.lock().unwrap() = Some(ctl.path.clone());
+        ctl.on_boot(&*door, running_build(), T0 + 1).await;
+        assert_eq!(
+            door.published.lock().unwrap().as_slice(),
+            [("clear".to_string(), Some(PrepState::Restoring))]
+        );
+
+        // Release hold after a same-build restart.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            running_build(),
+            HoldStatus::Confirmed,
+            T0 + DEFAULT_HOLD_MS,
+        );
+        let door = MockDoor::primary();
+        *door.record_at.lock().unwrap() = Some(ctl.path.clone());
+        ctl.on_boot(&*door, running_build(), T0 + 1).await;
+        ctl.cancel(&*door, T0 + 2).await.unwrap();
+        assert_eq!(
+            door.published.lock().unwrap().last(),
+            Some(&("clear".to_string(), Some(PrepState::Restoring)))
+        );
+    }
+
     #[tokio::test]
     async fn restart_prep_extend_refuses_outside_the_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -2343,6 +2575,7 @@ mod tests {
             live_terminals: Default::default(),
             unattributed_live: 0,
             device_drain: None,
+            close_reasons: std::collections::HashMap::new(),
         };
         let mut v = crate::restart_prep::notice::verdict_of(&rec, &ev, None, T0);
         rec.verdict = Some(v.clone());
