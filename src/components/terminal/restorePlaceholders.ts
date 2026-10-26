@@ -80,7 +80,10 @@ export interface RestorePlaceholder {
   planSlug: string | null;
   /** `null` = not read. */
   effortLevel: string | null;
-  /** `transcript` | `screen` | `account_default` | `unknown`; `null` before the status read. */
+  /**
+   * `transcript` | `transcript_unrecognised` | `screen` | `account_default` | `unknown`;
+   * `null` before the status read.
+   */
   effortSource: string | null;
   /** `null` = not read yet. */
   held: boolean | null;
@@ -272,6 +275,23 @@ export function cohortCounts(rows: readonly RestorePlaceholder[]): CohortCounts 
   const c: CohortCounts = { waiting: 0, held: 0, finished: 0, blocked: 0, limitHit: 0 };
   for (const r of rows) c[cohortBucket(r)]++;
   return c;
+}
+
+/** `setTimeout`'s ceiling: a longer delay fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * PURE: how long until {@link restoreButtonLabel} changes on its own — the
+ * moment a usage-limited row's recorded reset passes — or `null` when it never
+ * does. The pane re-renders then, so "Account … resets at …" does not linger
+ * past the reset. Capped at the timer ceiling (the pane re-arms).
+ */
+export function restoreLabelRefreshMs(
+  p: RestorePlaceholder,
+  nowMs: number = Date.now(),
+): number | null {
+  if (!isLimitHit(p) || p.limitResetAt === null || p.limitResetAt <= nowMs) return null;
+  return Math.min(p.limitResetAt - nowMs + 1, MAX_TIMER_MS);
 }
 
 /**

@@ -21,13 +21,14 @@
  * read has not delivered reads "unknown" / "not read yet".
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { CheckCircle2, Hand, RotateCcw } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import {
   effortBadgeText,
   placeholderSessionIdOf,
   restoreButtonLabel,
+  restoreLabelRefreshMs,
   setPlaceholderFinished,
   setPlaceholderHeld,
   stateAtPrepareText,
@@ -49,6 +50,15 @@ export function RestorePlaceholderPane({ tabId }: { tabId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const ids = restorePlaceholderIds(sid);
+  // Re-render when a usage-limited row's reset passes, so its Restore label
+  // ("Account … resets at …") does not go stale while the pane sits open.
+  const [labelTick, setLabelTick] = useState(0);
+  const refreshMs = row ? restoreLabelRefreshMs(row) : null;
+  useEffect(() => {
+    if (refreshMs === null) return;
+    const handle = setTimeout(() => setLabelTick((t) => t + 1), refreshMs);
+    return () => clearTimeout(handle);
+  }, [refreshMs, labelTick]);
   const phase = queue.phaseOf(sid);
   const phaseText = restorePhaseText(phase);
   const inQueue =

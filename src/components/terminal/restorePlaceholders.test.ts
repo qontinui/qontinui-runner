@@ -23,6 +23,7 @@ import {
   parsePlaceholderSet,
   placeholderSessionIdOf,
   restoreButtonLabel,
+  restoreLabelRefreshMs,
   restorePlaceholderTabId,
   setPlaceholderFinished,
   setPlaceholderHeld,
@@ -212,6 +213,23 @@ describe("a usage-limited (limit_hit) row", () => {
       /^Restore \(account ben reset at /,
     );
     expect(restoreButtonLabel(placeholder(), NOW)).toBe("Restore");
+  });
+
+  it("schedules a re-render for the moment its reset passes", () => {
+    expect(restoreLabelRefreshMs(limited(), NOW)).toBe(3_600_001);
+    // After that delay the label has changed on its own.
+    const later = NOW + 3_600_001;
+    expect(restoreButtonLabel(limited(), later)).toMatch(/^Restore \(account ben reset at /);
+    expect(restoreLabelRefreshMs(limited(), later)).toBeNull();
+    expect(restoreLabelRefreshMs(limited({ limitResetAt: null }), NOW)).toBeNull();
+    expect(restoreLabelRefreshMs(placeholder(), NOW)).toBeNull();
+    expect(restoreLabelRefreshMs(limited({ limitResetAt: NOW + 30 * 86_400_000 }), NOW)).toBe(
+      2_147_483_647,
+    );
+    // The pane arms its timer from it.
+    const pane = readFileSync(join(__dirname, "RestorePlaceholderPane.tsx"), "utf8");
+    expect(pane).toMatch(/restoreLabelRefreshMs\(row\)/);
+    expect(pane).toMatch(/setTimeout\(\(\) => setLabelTick/);
   });
 });
 
