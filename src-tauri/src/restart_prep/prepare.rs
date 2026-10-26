@@ -613,6 +613,9 @@ pub enum BootStep {
     SameBuildHeld {
         expired: bool,
     },
+    /// Another runner process on the same instance root holds the record
+    /// (its ownership lock): this process changed nothing.
+    NotOwner,
 }
 
 type ChangeHook = Box<dyn Fn(&PrepChanged) + Send + Sync>;
@@ -634,6 +637,10 @@ pub struct RestartPrep {
     /// of the line last logged (`notice::log_told_busy`). In memory only, and
     /// cleared when a new prepare starts.
     pub(super) told_busy_logged: Mutex<HashMap<String, String>>,
+    /// This process's exclusive lock on the record (`<record>.lock`), once it
+    /// won it ([`Self::claim_ownership`]). Held for the process's life; the OS
+    /// releases it at exit.
+    owner_lock: Mutex<Option<std::fs::File>>,
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -668,6 +675,7 @@ impl RestartPrep {
             ops: tokio::sync::Mutex::new(()),
             on_change,
             told_busy_logged: Mutex::new(HashMap::new()),
+            owner_lock: Mutex::new(None),
         }
     }
 
@@ -1225,9 +1233,59 @@ impl RestartPrep {
         }
     }
 
+    /// Win (or confirm) this process's exclusive ownership of the record: an
+    /// OS file lock on `<record>.lock`, held for the process's life.
+    ///
+    /// Why: a second runner process started on the same instance root (it
+    /// later fails to bind the port and exits) reads the same record before it
+    /// gets that far. Without the lock it ran the boot step against the shared
+    /// record — releasing the hold and moving the cohort to `restoring` on
+    /// behalf of the runner that is actually serving. Only the process that
+    /// owns the record may mutate it at boot or tick it. `false` when another
+    /// process holds the lock, or the lock file cannot be opened (UNKNOWN is
+    /// never ownership).
+    pub fn claim_ownership(&self) -> bool {
+        let mut held = self.owner_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return true;
+        }
+        let path = self.path.with_extension("lock");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                *held = Some(file);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether this process owns the record (see [`Self::claim_ownership`]).
+    pub fn owns_record(&self) -> bool {
+        self.owner_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// The boot step: a rebuilt runner releases the hold and starts restoring;
-    /// the same build keeps it (re-trying a hold that never took).
+    /// the same build keeps it (re-trying a hold that never took). Only in the
+    /// process that owns the record ([`Self::claim_ownership`]); any other
+    /// returns [`BootStep::NotOwner`] having changed nothing.
     pub async fn on_boot(&self, door: &dyn HoldDoor, build: &str, now_ms: i64) -> BootStep {
+        if !self.claim_ownership() {
+            return BootStep::NotOwner;
+        }
         let _op = self.ops.lock().await;
         let Some(rec) = self.record() else {
             return BootStep::NoRecord;
@@ -1392,9 +1450,25 @@ pub async fn on_boot() {
     let Some(ctl) = install_live() else {
         return;
     };
+    // The previous process of a quick restart can still hold the lock for a
+    // moment while it exits: wait a bounded time for it before deciding this
+    // process is a duplicate that must not touch the record.
+    let deadline = std::time::Instant::now() + BOOT_OWNERSHIP_WAIT;
+    while !ctl.claim_ownership() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     let step = ctl.on_boot(&LiveDoor, running_build(), now_ms()).await;
+    if step == BootStep::NotOwner {
+        warn!(
+            "restart_prep: another runner process owns this instance's restart record — this \
+             process leaves it alone (boot step skipped)"
+        );
+    }
     info!(step = ?step, "restart_prep: boot step");
 }
+
+/// How long the live boot step waits for the record's ownership lock.
+const BOOT_OWNERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What [`RestartPrep::update_quiet`] compares: the record minus the fields a
 /// tick moves every time it looks — the re-capture time and the verdict's
@@ -2185,6 +2259,44 @@ mod tests {
             T0 + 3
         )
         .allows());
+    }
+
+    /// E2E: a second runner process on the same instance root (it later
+    /// failed to bind the port) ran the boot step against the shared record.
+    /// Only the process that owns the record's lock may: the other changes
+    /// nothing and reports `NotOwner`.
+    #[tokio::test]
+    async fn restart_prep_only_the_record_owner_runs_the_boot_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let serving = controller(&dir);
+        let door = MockDoor::new(HoldRole::Secondary);
+        prepare(&serving, &door).await;
+        assert!(
+            serving.claim_ownership(),
+            "the serving process owns the record"
+        );
+        let before = serving.record().unwrap();
+
+        // The duplicate process loads the same record file.
+        let duplicate = RestartPrep::load(dir.path().join(super::super::RECORD_FILE), None);
+        let step = duplicate.on_boot(&*door, "a-newer-build", T0 + 2).await;
+        assert_eq!(step, BootStep::NotOwner);
+        assert!(!duplicate.owns_record());
+        assert_eq!(
+            crate::restart_prep::load_from(&dir.path().join(super::super::RECORD_FILE)).unwrap(),
+            before,
+            "the shared record is untouched"
+        );
+        // The owner's own boot step still runs.
+        assert_eq!(
+            serving.on_boot(&*door, "a-newer-build", T0 + 3).await,
+            BootStep::ReleasedForRebuild {
+                outcome: "local".to_string()
+            }
+        );
+        // Once the owner is gone, the next process can own it.
+        drop(serving);
+        assert!(duplicate.claim_ownership());
     }
 
     #[tokio::test]

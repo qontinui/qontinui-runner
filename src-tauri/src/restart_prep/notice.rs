@@ -1315,6 +1315,11 @@ pub async fn tick_live() {
     let Some(ctl) = super::prepare::install_live() else {
         return;
     };
+    // Only the process that owns this instance's record ticks it (a second
+    // runner process on the same instance root must not write it).
+    if !ctl.owns_record() {
+        return;
+    }
     // Before the boot step has run, a rebuilt runner's record still reads
     // `preparing` over a cohort whose sessions are gone: scoring it now would
     // record them `closed` and could read `ready`.
