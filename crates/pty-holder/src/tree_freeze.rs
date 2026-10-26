@@ -61,10 +61,11 @@
 //!    member `open` stopped is doomed — including one the walk declined on
 //!    its creation time (a child forked after its snapshot), since `open`
 //!    already proved it a child of a live member. Then `SIGKILL` each doomed
-//!    member through its pidfd — every descendant first, the root last —
-//!    `SIGCONT` each member this walk stopped and did not doom (only a bare
-//!    finalize with no walk, or a drop after an unwind, leaves any), and
-//!    rebuild `report.killed` from the kills actually delivered.
+//!    member through its pidfd — each child before its parent (reverse
+//!    opening order), the root last — `SIGCONT` each member this walk
+//!    stopped and did not doom (only a bare finalize with no walk, or a drop
+//!    after an unwind, leaves any), and rebuild `report.killed` from the
+//!    kills actually delivered.
 //!
 //! **It blocks.** One deadline, `budget` after the call began, bounds it:
 //! no new pass starts past it, and each stop is confirmed by polling `/proc`
@@ -159,8 +160,9 @@ const STOP_CONFIRM: Duration = Duration::from_millis(200);
 /// async caller wraps it in `spawn_blocking`.
 ///
 /// `Ok` with `root_exited` and `passes == 0` when the root was already a
-/// zombie. `report.killed` lists the `SIGKILL`s actually delivered, every
-/// descendant before the root. `report.recheck_snapshot_failed` is also set when any
+/// zombie. `report.killed` lists the `SIGKILL`s actually delivered to
+/// members not yet exited, each child before its parent and the root last.
+/// `report.recheck_snapshot_failed` is also set when any
 /// process's `/proc` entry or pidfd could not be read during the walk, since a
 /// descendant may then have been missed. Every `Err` before the walk signalled
 /// nothing.
@@ -340,7 +342,6 @@ fn freeze_root(
     let stopped = confirm(pid, deadline);
     Ok(Frozen::Table(LinuxFreezeTable {
         members: RefCell::new(vec![root]),
-        doom_order: RefCell::new(Vec::new()),
         handles,
         deadline,
         confirm,
@@ -596,10 +597,10 @@ fn boottime_ticks() -> u64 {
 /// including one the walk opened and then declined.
 pub struct LinuxFreezeTable {
     /// The root first, then every process `open` stopped, in opening order.
+    /// `open` admits a process only as the child of a live member, so every
+    /// member's index is greater than its parent's: reverse index order is
+    /// children before parents, which is the order the finalizer kills in.
     members: RefCell<Vec<Member>>,
-    /// Indices `terminate` marked, in the walk's order. The finalizer kills
-    /// them descendants first and the root last, whatever that order was.
-    doom_order: RefCell<Vec<usize>>,
     handles: Handles,
     /// The walk's end (`budget` after `kill_tree` began): no stop
     /// confirmation waits past it.
@@ -794,10 +795,7 @@ impl ProcessTable for LinuxFreezeTable {
         let Some(m) = members.get_mut(*h) else {
             return false;
         };
-        if !m.doomed {
-            m.doomed = true;
-            self.doom_order.borrow_mut().push(*h);
-        }
+        m.doomed = true;
         true
     }
 
@@ -924,24 +922,27 @@ impl LinuxFreezeTable {
     }
 
     /// The finalizer proper, once. Returns the pids a `SIGKILL` was delivered
-    /// to: every doomed descendant in the walk's order, then the root last
-    /// (`walk` dooms the root in its first pass, before members later passes
-    /// find, so the walk's own order would kill it first).
+    /// to, in the order delivered: every doomed member in REVERSE opening
+    /// order, so each child dies before its parent and the root (index 0)
+    /// dies last. Not the walk's order: `walk` dooms a parent in one pass and
+    /// its child in a later one, and killing a parent first can orphan a
+    /// stopped process group, whose members the kernel then sends SIGHUP and
+    /// SIGCONT (review r1, finding 6).
+    ///
+    /// A member that has provably exited by now (a zombie: its SIGKILL would
+    /// still "succeed") is skipped and not counted — e.g. a root that exited
+    /// between its `waitid` check and its SIGSTOP (review r1, finding 11d).
+    /// An exit landing between this check and the SIGKILL is still counted.
     fn release(&self) -> Vec<u32> {
         if self.released.replace(true) {
             return Vec::new();
         }
         let members = self.members.borrow();
-        let order: Vec<usize> = {
-            let doomed = self.doom_order.borrow();
-            let descendants = doomed.iter().copied().filter(|&i| i != ROOT);
-            descendants
-                .chain(doomed.iter().copied().filter(|&i| i == ROOT))
-                .collect()
-        };
         let mut killed = Vec::new();
-        for &i in order.iter() {
-            let m = &members[i];
+        for m in members.iter().rev().filter(|m| m.doomed) {
+            if m.exited() {
+                continue;
+            }
             match m.signal(libc::SIGKILL) {
                 Ok(()) => killed.push(m.pid),
                 // Reaped, or (no pidfd) the pid now names another process.
@@ -1374,7 +1375,6 @@ mod tests {
     fn table_of(members: Vec<Member>) -> LinuxFreezeTable {
         LinuxFreezeTable {
             members: RefCell::new(members),
-            doom_order: RefCell::new(Vec::new()),
             handles: Handles::PidOnly,
             deadline: Instant::now() + BUDGET,
             confirm: confirm_stopped,
@@ -1459,6 +1459,66 @@ mod tests {
         let status = tree.wait();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
         assert_ends(child, child_start);
+    }
+
+    /// Review r1, finding 6: across passes `walk` dooms a parent (pass k)
+    /// before its child (pass k+1). The finalizer still kills every child
+    /// before its parent — reverse opening order — and the root last.
+    /// Driven through `terminate` in exactly the walk's parent-first order.
+    #[test]
+    fn finalizer_kills_children_before_parents_across_passes() {
+        let mut tree = Tree::sh("sh -c 'sleep 300 & wait' & wait; exec sleep 300", false);
+        tree.await_descendants(2);
+        let (root, root_start) = (tree.pid(), tree.start());
+        let (child, child_start) = tree.recorded[0];
+        let (grandchild, grandchild_start) = tree.recorded[1];
+        assert_eq!(
+            stat(grandchild).map(|st| st.ppid as u32),
+            Some(child),
+            "fixture shape: {:?}",
+            tree.recorded
+        );
+        // Stopped, as the walk leaves them, so the middle `sh` cannot reap
+        // its child between the two kills.
+        for pid in [child, grandchild] {
+            // SAFETY: a plain signal to this test's own live descendant.
+            unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+            wait_until("the SIGSTOP to land", || state(pid) == Some(b'T'));
+        }
+        let table = table_of(vec![
+            member(root, root_start),
+            member(child, child_start),
+            member(grandchild, grandchild_start),
+        ]);
+        for h in [ROOT, 1, 2] {
+            assert!(table.terminate(&h));
+        }
+        let report = table
+            .finalize(Ok(TreeKillReport::default()))
+            .expect("finalize");
+        assert_eq!(report.killed, vec![grandchild, child, root], "{report:?}");
+        let status = tree.wait();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert_ends(child, child_start);
+        assert_ends(grandchild, grandchild_start);
+    }
+
+    /// Review r1, finding 11d: a doomed member that has already exited (an
+    /// unreaped zombie, which a SIGKILL would still "reach") is not counted
+    /// as killed; a zombie root reads `root_exited`.
+    #[test]
+    fn finalizer_does_not_count_a_zombie_as_killed() {
+        let mut tree = Tree::sh("exit 0", false);
+        let (root, root_start) = (tree.pid(), tree.start());
+        wait_until("the root to become a zombie", || state(root) == Some(b'Z'));
+        let table = table_of(vec![member(root, root_start)]);
+        assert!(table.terminate(&ROOT));
+        let report = table
+            .finalize(Ok(TreeKillReport::default()))
+            .expect("finalize");
+        assert!(report.killed.is_empty(), "{report:?}");
+        assert!(report.root_exited, "{report:?}");
+        assert!(tree.wait().success());
     }
 
     /// Whether a prerequisite probe exits 0 within 5 s. Spawned and polled

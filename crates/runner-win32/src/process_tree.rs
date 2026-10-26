@@ -82,7 +82,8 @@ pub enum TreeKillError {
         detail: String,
         killed: Vec<u32>,
     },
-    /// `TerminateProcess` on the root failed and it is still running.
+    /// The kill of the root (`TerminateProcess` on Windows, `SIGKILL` on
+    /// Linux) was not delivered and the root is still running.
     RootSurvived { root_pid: u32, killed: Vec<u32> },
 }
 
@@ -101,8 +102,8 @@ impl std::fmt::Display for TreeKillError {
             ),
             TreeKillError::RootSurvived { root_pid, killed } => write!(
                 f,
-                "pid {root_pid}: TerminateProcess failed and the process is still running \
-                 (descendants killed: {killed:?})"
+                "pid {root_pid}: the kill of the root was not delivered and the process is \
+                 still running (descendants killed: {killed:?})"
             ),
         }
     }
