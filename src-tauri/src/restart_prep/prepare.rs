@@ -491,13 +491,22 @@ pub fn release_settled(outcome: &str, coord_hold_confirmed: bool) -> bool {
 /// answering `route_absent` to a hold it once confirmed. A runner that has
 /// NOT restarted keeps its sessions running and the prepare in force: its
 /// expired hold is renewed by Extend or ended by a release coord answers.
+///
+/// Coord's word beats the local clock: when the release's `read` back says
+/// coord still holds a drain for THIS prepare ([`confirms_hold`]) — coord's
+/// `until` ran past the recorded one, or the clocks disagree — the release
+/// does not settle, and Release hold stays the door to retry it. An
+/// unreadable or absent read keeps the escape, which is the coord-unreachable
+/// case it exists for. A hold with no recorded `until` never expires here.
 fn expired_release(
     rec: &PrepareRecord,
     restarted: bool,
     now_ms: i64,
     outcome: &str,
+    read: Option<&Result<DrainObservation, String>>,
 ) -> Option<String> {
-    (restarted && rec.hold_expired(now_ms)).then(|| {
+    let coord_still_holds = read.is_some_and(|r| confirms_hold(r, &rec.prepare_id).is_ok());
+    (restarted && rec.hold_expired(now_ms) && !coord_still_holds).then(|| {
         let until = rec
             .hold_until
             .clone()
@@ -1153,7 +1162,7 @@ impl RestartPrep {
         let mut outcome = report.outcome.clone();
         let mut settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
         if !settled {
-            if let Some(expired) = expired_release(&rec, rebuilt, now_ms, &outcome) {
+            if let Some(expired) = expired_release(&rec, rebuilt, now_ms, &outcome, read.as_ref()) {
                 outcome = expired;
                 report.outcome = outcome.clone();
                 settled = true;
@@ -1224,7 +1233,8 @@ impl RestartPrep {
             // A rebuilt runner has restarted by definition: an expired hold
             // settles here as it does on Release hold ([`expired_release`]).
             if !settled {
-                if let Some(expired) = expired_release(&rec, true, now_ms, &outcome) {
+                if let Some(expired) = expired_release(&rec, true, now_ms, &outcome, read.as_ref())
+                {
                     outcome = expired;
                     report.outcome = outcome.clone();
                     settled = true;
@@ -2824,6 +2834,45 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("coord_unreachable"), "{err}");
         assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Preparing);
+
+        // Coord's read-back still holds a drain for THIS prepare (its `until`
+        // ran past the recorded one): the local clock does not settle it.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(&dir, "an-older-build", HoldStatus::Confirmed, until);
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(parse_release_reply(404, ""));
+        *door.drain.lock().unwrap() = Ok(DrainObservation::Drained {
+            until: None,
+            reason: Some(format!("{HOLD_REASON_PREFIX}prep-boot: operator restart")),
+        });
+        assert!(
+            matches!(
+                ctl.on_boot(&*door, running_build(), until + 1).await,
+                BootStep::ReleaseFailed { .. }
+            ),
+            "coord still holds: no settle by expiry on boot"
+        );
+        assert!(
+            ctl.cancel(&*door, until + 2).await.is_err(),
+            "coord still holds: no settle by expiry on Release hold"
+        );
+        assert!(load_from(&ctl.path).unwrap().in_window());
+
+        // A hold with NO recorded `until` never counts as expired.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(&dir, "an-older-build", HoldStatus::Confirmed, until);
+        ctl.update("prep-boot", |r| {
+            r.hold_until_ms = None;
+            r.hold_until = None;
+        })
+        .unwrap();
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(unreachable());
+        assert!(matches!(
+            ctl.on_boot(&*door, running_build(), i64::MAX / 2).await,
+            BootStep::ReleaseFailed { .. }
+        ));
+        assert!(ctl.cancel(&*door, i64::MAX / 2).await.is_err());
     }
 
     #[tokio::test]
