@@ -87,6 +87,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::process_capture::process_tree::ProcessSnapshot;
+use crate::session::claude_session_registry::RawRegistry;
+use crate::session::duplicate_hosts::HandoffExclusions;
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
@@ -256,6 +258,15 @@ pub fn decide_bind_for_live_pty(
             };
         }
     }
+
+    // A VALID provider row that DISAGREES with the argv wins: the argv is the
+    // id the process was LAUNCHED with, and an in-pane `/clear` or `/resume`
+    // since then has moved it to the id the registry names (2026-10-23 review
+    // fix 6). When they agree, rung 2 binds exactly as before.
+    let cmdline_session_id = match (cmdline_session_id, provider_row) {
+        (Some(id), Some(row)) if id != row.session_id => None,
+        (id, _) => id,
+    };
 
     // RUNG 2 — the id the anchor's own argv NAMES (`--session-id`, `--resume`,
     // `-r` — see `process_tree::parse_session_id_from_cmdline`) IS the identity:
@@ -461,13 +472,24 @@ pub fn run_reconcile<I: TranscriptIndex>(
     index: &I,
     cmdline_ids: &HashMap<u32, String>,
 ) -> Vec<ReconcileAction> {
-    run_reconcile_with_provider(store, live, snapshot, index, cmdline_ids, &HashMap::new())
+    run_reconcile_with_provider(
+        store,
+        live,
+        snapshot,
+        index,
+        cmdline_ids,
+        &HashMap::new(),
+        &HandoffExclusions::default(),
+    )
 }
 
 /// [`run_reconcile`] with the provider-registry rung armed: `provider_rows`
 /// maps an anchor pid to its VALID provider row
 /// ([`valid_rows_for_ptys`]). Every row's id is pre-claimed so rung 3 never
-/// binds a session the provider says another live pane is running.
+/// binds a session the provider says another live pane is running. A pane
+/// [`provider_rung::binder_exclusion`] names — its row's id is forked across
+/// panes, or it is one side of a migration hand-off (`exclusions`) — is left
+/// alone at every rung.
 pub fn run_reconcile_with_provider<I: TranscriptIndex>(
     store: &SessionLifecycleStore,
     live: &[LivePty],
@@ -475,7 +497,9 @@ pub fn run_reconcile_with_provider<I: TranscriptIndex>(
     index: &I,
     cmdline_ids: &HashMap<u32, String>,
     provider_rows: &HashMap<u32, ValidProviderRow>,
+    exclusions: &HandoffExclusions,
 ) -> Vec<ReconcileAction> {
+    let forked = provider_rung::forked_session_ids(live.iter(), provider_rows);
     let live_terminal_ids: HashSet<String> = live.iter().map(|p| p.terminal_id.clone()).collect();
     // Session ids already owned by a CONFIRMED open row can't be re-bound to a
     // different live terminal — seed the claim set so the uniqueness gate sees
@@ -537,9 +561,23 @@ pub fn run_reconcile_with_provider<I: TranscriptIndex>(
             .ai_pid
             .and_then(|pid| cmdline_ids.get(&pid))
             .map(|s| s.as_str());
-        let candidates = index.candidates_for(&pty.working_dir);
         let provider_row = pty.ai_pid.and_then(|pid| provider_rows.get(&pid));
-        let via_provider = cmdline_sid.is_none() && provider_row.is_some();
+        if let Some(why) =
+            provider_rung::binder_exclusion(&pty.terminal_id, provider_row, &forked, exclusions)
+        {
+            tracing::debug!(
+                terminal_id = %pty.terminal_id,
+                why,
+                "session binder: pane left alone this pass"
+            );
+            actions.push(ReconcileAction::LeaveAlone {
+                terminal_id: pty.terminal_id.clone(),
+            });
+            continue;
+        }
+        let candidates = index.candidates_for(&pty.working_dir);
+        let via_provider =
+            provider_row.is_some_and(|row| cmdline_sid.is_none_or(|id| id != row.session_id));
         let action = decide_bind_for_live_pty(
             pty,
             existing.as_ref(),
@@ -970,16 +1008,44 @@ pub trait ProviderSessionIndex {
 /// It is read-only to us and best-effort: an absent/unparseable file, or a
 /// provider version that stops writing it, degrades to "no refresh this tick"
 /// and the title simply stays as it is.
-#[derive(Debug)]
-pub struct DiskProviderSessionIndex {
-    config_dirs: Vec<PathBuf>,
+///
+/// Built from the poll tick's ONE registry read
+/// ([`crate::session::claude_session_registry::read_raw_registry`], on the
+/// blocking pool), which the duplicate-host detector shares — so neither the
+/// bind pass, the title pass nor the re-bind touches the disk for it
+/// (2026-10-23 review fix 8).
+#[derive(Debug, Default)]
+pub struct RegistryProviderIndex {
+    /// `<pid>.json` → one entry per PARSEABLE file naming that pid, in
+    /// config-dir order; `None` for a file with no usable `sessionId`.
+    by_pid: HashMap<u32, Vec<Option<ProviderSessionMeta>>>,
 }
 
-impl DiskProviderSessionIndex {
-    pub fn discover() -> Self {
-        Self {
-            config_dirs: crate::terminal::transcript::find_claude_config_dirs(),
+impl RegistryProviderIndex {
+    pub fn from_raw(raw: &RawRegistry) -> Self {
+        let mut by_pid: HashMap<u32, Vec<Option<ProviderSessionMeta>>> = HashMap::new();
+        for file in &raw.files {
+            let (Some(pid), Ok(text)) = (file.file_pid, file.content.as_ref()) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<ProviderSessionFile>(text) else {
+                continue;
+            };
+            let dir = file.config_dir.to_string_lossy().into_owned();
+            by_pid.entry(pid).or_default().push(
+                parsed
+                    .session_id
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|session_id| ProviderSessionMeta {
+                        session_id,
+                        name: parsed.name.filter(|n| !n.trim().is_empty()),
+                        proc_start: parsed.proc_start,
+                        pid_domain: parsed.pid_domain,
+                        config_dir: Some(dir),
+                    }),
+            );
         }
+        Self { by_pid }
     }
 }
 
@@ -999,45 +1065,18 @@ struct ProviderSessionFile {
     pid_domain: Option<String>,
 }
 
-impl DiskProviderSessionIndex {
-    /// Parse the provider file for `pid` under one config dir. `None` for an
-    /// absent/unparseable file; `Some(None)` for a parseable one with no
-    /// usable `sessionId` (which [`ProviderSessionIndex::meta_for_pid`]
-    /// historically treated as a terminal answer).
-    fn read_one(dir: &Path, pid: u32) -> Option<Option<ProviderSessionMeta>> {
-        let path = dir.join("sessions").join(format!("{pid}.json"));
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let parsed = serde_json::from_str::<ProviderSessionFile>(&raw).ok()?;
-        Some(
-            parsed
-                .session_id
-                .filter(|s| !s.trim().is_empty())
-                .map(|session_id| ProviderSessionMeta {
-                    session_id,
-                    name: parsed.name.filter(|n| !n.trim().is_empty()),
-                    proc_start: parsed.proc_start,
-                    pid_domain: parsed.pid_domain,
-                    config_dir: Some(dir.to_string_lossy().into_owned()),
-                }),
-        )
-    }
-}
-
-impl ProviderSessionIndex for DiskProviderSessionIndex {
+impl ProviderSessionIndex for RegistryProviderIndex {
+    /// The FIRST parseable file for `pid` in config-dir order; one with no
+    /// usable `sessionId` is a terminal `None` (the historical answer).
     fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta> {
-        for dir in &self.config_dirs {
-            if let Some(found) = Self::read_one(dir, pid) {
-                return found;
-            }
-        }
-        None
+        self.by_pid.get(&pid)?.first().cloned().flatten()
     }
 
     fn metas_for_pid(&self, pid: u32) -> Vec<ProviderSessionMeta> {
-        self.config_dirs
-            .iter()
-            .filter_map(|dir| Self::read_one(dir, pid).flatten())
-            .collect()
+        self.by_pid
+            .get(&pid)
+            .map(|v| v.iter().flatten().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1139,9 +1178,10 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
 /// i.e. EXACTLY when that guard is false. Folding the title refresh into the
 /// bind pass would therefore mean it never runs for the case it exists to serve.
 ///
-/// The cost it adds to the poll tick is one small read per live claude anchor
-/// (the provider file is tiny and in the OS cache), not a transcript scan.
-/// Fail-open: a missing/unreadable provider index refreshes nothing.
+/// It reads nothing from disk for the registry: `registry` is the tick's ONE
+/// read, shared with the bind pass and the duplicate-host detector (only a
+/// re-bind's transcript existence probe stats a file). Fail-open: a
+/// missing/unreadable provider index refreshes nothing.
 ///
 /// It also carries the provider-registry RE-BIND of a confirmed record
 /// ([`rebind_confirmed_from_registry`], plan
@@ -1154,17 +1194,26 @@ pub fn refresh_titles_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
+    registry: &RawRegistry,
 ) -> TitlesPassOutcome {
     let live = anchor_live_ptys(live, snapshot);
-    let index = DiskProviderSessionIndex::discover();
+    let index = RegistryProviderIndex::from_raw(registry);
     let rebinds = if snapshot.names.is_empty() {
         Vec::new() // unreadable table: no row can be validated this tick
     } else {
-        rebind_confirmed_from_registry(store, &live, &index, snapshot, |cfg, wd, sid| {
-            !cfg.is_empty()
-                && crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid)
-                    .exists()
-        })
+        let exclusions = HandoffExclusions::current(store, chrono::Utc::now().timestamp_millis());
+        rebind_confirmed_from_registry(
+            store,
+            &live,
+            &index,
+            snapshot,
+            &exclusions,
+            |cfg, wd, sid| {
+                !cfg.is_empty()
+                    && crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid)
+                        .exists()
+            },
+        )
     };
     TitlesPassOutcome {
         titles: refresh_titles(store, &live, &index),
@@ -1242,6 +1291,7 @@ pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
+    registry: &RawRegistry,
     context: &str,
 ) -> Vec<ReconcileAction> {
     let live = anchor_live_ptys(live, snapshot);
@@ -1290,16 +1340,31 @@ pub async fn run_reconcile_pass(
         .map(|r| (r.claude_session_id, r.working_dir))
         .collect();
     let index = PrescannedTranscriptIndex::scan_off_runtime(scan_dirs, probes).await;
-    // Rung 2½ — the provider's own registry, for the unbound anchors only (a
-    // few tiny files; validity needs the table, so an unreadable one yields no
-    // rows and every pane falls through to rung 3 as before).
+    // Rung 2½ — the provider's own registry (the tick's one read, `registry`),
+    // for EVERY live anchor: a forked id is only visible across panes.
+    // Validity needs the table, so an unreadable one yields no rows and every
+    // pane falls through to rung 3 as before.
     let provider_rows = if snapshot.names.is_empty() || unbound.is_empty() {
         HashMap::new()
     } else {
-        valid_rows_for_ptys(live.iter(), &DiskProviderSessionIndex::discover(), snapshot)
+        valid_rows_for_ptys(
+            live.iter(),
+            &RegistryProviderIndex::from_raw(registry),
+            snapshot,
+        )
     };
-    let actions =
-        run_reconcile_with_provider(store, &live, snapshot, &index, &cmdline_ids, &provider_rows);
+    // The hand-off exclusions are read AFTER the prescan await above, so a
+    // migration that completed while it ran is seen (2026-10-23 review fix 1).
+    let exclusions = HandoffExclusions::current(store, chrono::Utc::now().timestamp_millis());
+    let actions = run_reconcile_with_provider(
+        store,
+        &live,
+        snapshot,
+        &index,
+        &cmdline_ids,
+        &provider_rows,
+        &exclusions,
+    );
 
     let bound = actions
         .iter()
@@ -1373,7 +1438,26 @@ pub async fn run_at_boot(
         return Vec::new(); // nothing to do
     }
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, &snapshot, "boot").await
+    let registry = read_registry_off_runtime().await;
+    run_reconcile_pass(store, &live, &snapshot, &registry, "boot").await
+}
+
+/// Read every account's `sessions/*.json` ONCE on the blocking pool — the
+/// poll tick's single registry read, shared by the bind pass, the title /
+/// re-bind pass and the duplicate-host detector (2026-10-23 review fix 8). A
+/// read that did not complete yields the default [`RawRegistry`], whose
+/// `complete == false` every consumer reads as "no evidence".
+pub async fn read_registry_off_runtime() -> RawRegistry {
+    spawn_blocking_tracked(|| {
+        crate::session::claude_session_registry::read_raw_registry(
+            &crate::terminal::transcript::find_claude_config_dirs(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "session registry read did not complete — no evidence this tick");
+        RawRegistry::default()
+    })
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend
@@ -1846,19 +1930,37 @@ mod tests {
 
     /// The real provider index parses the provider's own live-session file
     /// (`<config_dir>/sessions/<pid>.json`) — camelCase `sessionId`, and tolerant
-    /// of the unknown keys a foreign file carries.
+    /// of the unknown keys a foreign file carries — from the tick's ONE raw
+    /// registry read.
     #[test]
-    fn disk_provider_session_index_parses_the_provider_session_file() {
+    fn registry_provider_index_parses_the_provider_session_file() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(
-            dir.path().join("sessions").join("31520.json"),
+            sessions.join("31520.json"),
             r#"{"pid":31520,"sessionId":"ef07e29d-ed7d-4bb3-a85c-d6e3fe92c2f3","cwd":"D:\\qontinui-root","startedAt":1784135767563,"version":"2.1.210","kind":"interactive","name":"coord-push-to-branch-mcp","status":"idle"}"#,
         )
         .unwrap();
-        let index = DiskProviderSessionIndex {
-            config_dirs: vec![dir.path().to_path_buf()],
-        };
+        // A file with no name yet (never renamed).
+        std::fs::write(
+            sessions.join("42.json"),
+            r#"{"pid":42,"sessionId":"abc","status":"idle"}"#,
+        )
+        .unwrap();
+        // The real file shape carries procStart/pidDomain (2026-10-21), which
+        // the validity rule reads.
+        std::fs::write(
+            sessions.join("46416.json"),
+            r#"{"pid":46416,"sessionId":"0c4e3025","procStart":"134369923919058648","pidDomain":"win32:spaceship","kind":"interactive"}"#,
+        )
+        .unwrap();
+        // Garbage.
+        std::fs::write(sessions.join("43.json"), "not json").unwrap();
+
+        let raw =
+            crate::session::claude_session_registry::read_raw_registry(&[dir.path().to_path_buf()]);
+        let index = RegistryProviderIndex::from_raw(&raw);
         let cfg = Some(dir.path().to_string_lossy().into_owned());
         assert_eq!(
             index.meta_for_pid(31520),
@@ -1872,13 +1974,6 @@ mod tests {
         );
         // An absent pid is a clean None, never an error.
         assert_eq!(index.meta_for_pid(9999), None);
-
-        // A file with no name yet (never renamed) parses, name None.
-        std::fs::write(
-            dir.path().join("sessions").join("42.json"),
-            r#"{"pid":42,"sessionId":"abc","status":"idle"}"#,
-        )
-        .unwrap();
         assert_eq!(
             index.meta_for_pid(42),
             Some(ProviderSessionMeta {
@@ -1886,22 +1981,17 @@ mod tests {
                 ..meta("abc", None)
             })
         );
-
-        // The real file shape carries procStart/pidDomain (2026-10-21), which
-        // the validity rule reads.
-        std::fs::write(
-            dir.path().join("sessions").join("46416.json"),
-            r#"{"pid":46416,"sessionId":"0c4e3025","procStart":"134369923919058648","pidDomain":"win32:spaceship","kind":"interactive"}"#,
-        )
-        .unwrap();
         let got = index.metas_for_pid(46416);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].proc_start.as_deref(), Some("134369923919058648"));
         assert_eq!(got[0].pid_domain.as_deref(), Some("win32:spaceship"));
-
         // Garbage never panics or poisons the pass.
-        std::fs::write(dir.path().join("sessions").join("43.json"), "not json").unwrap();
         assert_eq!(index.meta_for_pid(43), None);
+        // A registry that was never read indexes nothing.
+        assert_eq!(
+            RegistryProviderIndex::from_raw(&RawRegistry::default()).meta_for_pid(42),
+            None
+        );
     }
 
     /// RUNG 2: a typed `--session-id` IS the identity — bind authoritative.

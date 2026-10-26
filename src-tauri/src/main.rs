@@ -5105,6 +5105,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // store / cmdline / snapshot op inside swallows its own
                         // errors, so a failure degrades to "bound nothing this
                         // tick", never a panic that would break the liveness loop.
+                        // ONE read of every account's `sessions/*.json` per
+                        // tick, on the blocking pool, shared by the bind pass,
+                        // the title / re-bind pass and the duplicate-host
+                        // detector below (plan 2026-10-21-account-migration-…,
+                        // review fix 8). An incomplete read is "no evidence"
+                        // to every consumer, never "no rows".
+                        let tick_registry = session::reconcile::read_registry_off_runtime().await;
                         if needs_reconcile {
                             let live_ptys: Vec<session::reconcile::LivePty> = live
                                 .iter()
@@ -5124,6 +5131,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 &poll_lifecycle_store,
                                 &live_ptys,
                                 &snap,
+                                &tick_registry,
                                 "periodic",
                             )
                             .await;
@@ -5164,6 +5172,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &poll_lifecycle_store,
                             &live_for_titles,
                             &snap,
+                            &tick_registry,
                         );
                         emit_session_bound(&poll_app_handle, &titles_outcome.rebinds);
 
@@ -5178,6 +5187,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &poll_lifecycle_store,
                             &live_for_titles,
                             &snap,
+                            &tick_registry,
                         );
 
                         poll_lifecycle_store.prune(
