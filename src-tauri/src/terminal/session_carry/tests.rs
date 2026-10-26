@@ -2286,3 +2286,177 @@ fn an_earlier_diverged_backup_is_never_carried_on() {
     assert_eq!(names(&dst), ["agent-a1.jsonl"]);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// R7 S2 — outside a migration ([`MainTranscript::ExtendPrefix`]) a diverged
+/// subagent `.jsonl` is kept in place BY DESIGN, and so is its fork's
+/// `.meta.json`: the source's differing meta is not copied over it, the carry
+/// records it kept, and the delta sync never overwrites it either.
+#[test]
+fn extend_prefix_keeps_a_diverged_subagents_forks_meta() {
+    let tmp = scratch("sub-meta-extend-prefix");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-a1.meta.json", LIVE_META),
+        ],
+    );
+    // Smaller than the source and not a prefix of it: `Diverged`, not
+    // `Current`, under the non-migration size rule.
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nf\n"),
+            ("subagents/agent-a1.meta.json", FORK_META),
+        ],
+    );
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
+    let sub = literal_sidecar(&dst).join("subagents");
+    let rec = |name: &str| {
+        carried
+            .files
+            .iter()
+            .find(|f| f.rel == Path::new("subagents").join(name))
+            .unwrap_or_else(|| panic!("{name} is recorded"))
+            .clone()
+    };
+    assert_eq!(rec("agent-a1.jsonl").wrote, CarryWrite::Diverged);
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+        b"a\nf\n"
+    );
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        FORK_META,
+        "the kept fork keeps its own meta"
+    );
+    let meta_rec = rec("agent-a1.meta.json");
+    assert_eq!(meta_rec.wrote, CarryWrite::Present);
+    assert!(meta_rec.kept_destination_newer);
+
+    std::fs::write(
+        literal_sidecar(&src)
+            .join("subagents")
+            .join("agent-a1.meta.json"),
+        br#"{"description":"live run, renamed later"}"#,
+    )
+    .unwrap();
+    let synced = sync(&carried);
+    assert_eq!(synced.copied, 0, "{synced:?}");
+    assert_eq!(synced.kept_destination_newer, 1, "{synced:?}");
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        FORK_META,
+        "the delta sync never overwrites the kept fork's meta"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// R7 S3 — a rename-aside that MOVES the fork and then reports an error is
+/// not a fork left in place: the fork is at its backup with its meta beside it
+/// under the same suffix, the slot is recorded `Failed` (empty), and the delta
+/// sync then fills it with the live file.
+#[test]
+fn a_rename_aside_that_moves_the_fork_then_errors_strands_it_at_its_backup() {
+    let (tmp, src, dst) = seed_forked_subagent_with_meta("sub-rename-moved-then-err");
+    let carried = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| {
+            std::fs::rename(from, to)?;
+            if from.ends_with("agent-a1.jsonl") {
+                return Err(std::io::Error::other("moved, then reported failure"));
+            }
+            Ok(())
+        },
+        || {},
+    )
+    .expect("a subagent never fails the carry");
+    let rec = carried
+        .files
+        .iter()
+        .find(|f| f.rel == Path::new("subagents").join("agent-a1.jsonl"))
+        .expect("the transcript is recorded");
+    assert_eq!(rec.wrote, CarryWrite::Failed, "{rec:?}");
+    assert_eq!(rec.dst, None, "the slot is empty");
+    assert_eq!(carried.session_dir.failed, 1, "{:?}", carried.session_dir);
+    let (backup, suffix) = only_transcript_backup_suffix(&dst);
+    assert_eq!(std::fs::read(&backup).unwrap(), b"a\nfork\n");
+    let sub = literal_sidecar(&dst).join("subagents");
+    assert_eq!(
+        std::fs::read(sub.join(format!("agent-a1.meta.json{suffix}"))).unwrap(),
+        FORK_META,
+        "the fork's meta follows it to its backup, same suffix"
+    );
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        LIVE_META,
+        "the slot's meta is the live one, not kept as the fork's"
+    );
+    assert!(agent_ids(&carried).is_empty(), "a1 is not yet resumable");
+
+    let synced = sync(&carried);
+    assert_eq!(synced.copied, 1, "{synced:?}");
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+        b"a\nlive\n",
+        "the delta sync fills the slot with the live file"
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// R7 S4 — the source meta of a subagent whose fork stayed in place FIRST
+/// appears after the carry, so no baseline record names it: the delta sync
+/// still never writes a meta beside the fork.
+#[test]
+fn delta_sync_never_writes_a_meta_beside_a_fork_left_in_place() {
+    let tmp = scratch("sub-meta-late");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nlive\n")]);
+    seed_session(&dst, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nf\n")]);
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
+    assert_eq!(carried.files.len(), 1, "{:?}", carried.files);
+    assert_eq!(carried.files[0].wrote, CarryWrite::Diverged);
+
+    std::fs::write(
+        literal_sidecar(&src)
+            .join("subagents")
+            .join("agent-a1.meta.json"),
+        LIVE_META,
+    )
+    .unwrap();
+    let synced = sync(&carried);
+    assert_eq!(synced.copied, 0, "{synced:?}");
+    assert_eq!(synced.kept_destination_newer, 1, "{synced:?}");
+    assert!(
+        !literal_sidecar(&dst)
+            .join("subagents")
+            .join("agent-a1.meta.json")
+            .exists(),
+        "no meta is written beside the fork"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

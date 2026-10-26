@@ -920,10 +920,13 @@ fn carry_walked_files(
 ) -> Vec<CarriedFile> {
     walked.sort_by_key(|(_, rel, _)| !is_jsonl(rel));
     let mut files = Vec::new();
-    // `<stem>.meta.json` (relative to `<sid>/`) of every subagent transcript a
-    // migration left diverged IN PLACE — it could not be moved aside, or was
-    // moved back after the copy failed. That fork keeps its own meta: the
-    // source's is not copied over it, and [`delta_sync`] never overwrites it.
+    // `<stem>.meta.json` (relative to `<sid>/`) of every subagent transcript
+    // left diverged IN PLACE ([`CarryWrite::Diverged`]) — kept by design
+    // outside a migration ([`MainTranscript::ExtendPrefix`] /
+    // [`MainTranscript::KeepExisting`]), or, on a migration, because it could
+    // not be moved aside or was moved back after the copy failed. That fork
+    // keeps its own meta: the source's is not copied over it, and
+    // [`delta_sync`] never overwrites it.
     let mut fork_metas: HashSet<PathBuf> = HashSet::new();
     for (from, rel, src) in walked {
         let (from, rel) = (from.as_path(), rel.as_path());
@@ -946,13 +949,7 @@ fn carry_walked_files(
                 CarryWrite::Present
             }
             Ok(Verdict::Diverged) if live_source_wins => {
-                let wrote = preserve_diverged_file(from, &to, &mut *rename_aside, carry);
-                if wrote == CarryWrite::Diverged {
-                    if let Some(meta) = sibling_meta_rel(rel) {
-                        fork_metas.insert(meta);
-                    }
-                }
-                wrote
+                preserve_diverged_file(from, &to, &mut *rename_aside, carry)
             }
             Ok(Verdict::Diverged) => {
                 warn!(
@@ -996,6 +993,14 @@ fn carry_walked_files(
                 CarryWrite::Failed
             }
         };
+        // Whatever the mode, a `.jsonl` left diverged in place keeps its
+        // fork's meta; the `.jsonl` sort above runs this before that meta's
+        // own turn.
+        if wrote == CarryWrite::Diverged {
+            if let Some(meta) = sibling_meta_rel(rel) {
+                fork_metas.insert(meta);
+            }
+        }
         files.push(CarriedFile {
             rel: rel.to_path_buf(),
             src,
@@ -1022,9 +1027,11 @@ fn sibling_meta_rel(jsonl_rel: &Path) -> Option<PathBuf> {
 /// [`TranscriptCopy::subagents`] and [`delta_sync`] never overwrites it.
 ///
 /// Wherever the fork ends up, its `agent-<id>.meta.json` goes with it: beside
-/// the backup when the fork was moved aside (copied, success or a copy that
-/// failed and could not move it back), and untouched in place when the fork
-/// stayed there (the caller keeps the source's meta off it).
+/// the backup when the fork was moved aside (copied, success, a copy that
+/// failed and could not move it back, or a rename-aside that reported an error
+/// after moving it — those last two are recorded [`CarryWrite::Failed`]), and
+/// untouched in place when the fork stayed there (the caller keeps the
+/// source's meta off it).
 fn preserve_diverged_file(
     from: &Path,
     to: &Path,
@@ -1042,6 +1049,27 @@ fn preserve_diverged_file(
             preserve_sibling_meta(to, &backup);
             carry.diverged_preserved += 1;
             CarryWrite::Copied
+        }
+        // The rename reported an error but MOVED the fork anyway: the claimed
+        // backup holds bytes (a diverged fork is never empty), or the
+        // destination path is free. That is the stranded-at-its-backup case
+        // below (`CopyFailed { restored: false }`), not a fork left in place:
+        // its meta goes beside the backup, and the slot is recorded `Failed`
+        // so [`delta_sync`] fills it with the live file.
+        Err(PreserveError::NotMovedAside {
+            backup: Some(backup),
+            error,
+        }) if std::fs::metadata(&backup).is_ok_and(|m| m.len() > 0) || !to.exists() => {
+            warn!(
+                from = %from.display(),
+                to = %to.display(),
+                backup = %backup.display(),
+                error = %error,
+                "session transcript carry: the rename-aside of a diverged destination .jsonl reported an error but moved the fork — it is preserved at its backup, and the live file was not copied"
+            );
+            carry.failed += 1;
+            preserve_sibling_meta(to, &backup);
+            CarryWrite::Failed
         }
         Err(PreserveError::NotMovedAside { backup, error }) => {
             warn!(
@@ -1455,7 +1483,9 @@ fn meta_description(path: &Path) -> Option<String> {
 /// Per regular file under the source's `<sid>/` (same walk as the carry):
 /// - an in-place file the carry kept as the destination's
 ///   ([`CarriedFile::kept_destination_newer`]) is never overwritten
-///   (`kept_destination_newer`);
+///   (`kept_destination_newer`), and neither is the `<stem>.meta.json` of any
+///   `.jsonl` the carry left [`CarryWrite::Diverged`] in place, even one whose
+///   source meta first appeared after the carry (also `kept_destination_newer`);
 /// - the destination must be EXACTLY as the carry left it (same size and
 ///   mtime; absent stays absent). Otherwise the resumed process — or someone —
 ///   has written it, and it is never touched (`refused_destination_changed`);
@@ -1492,6 +1522,16 @@ pub(crate) fn delta_sync(since: &TranscriptCopy) -> Result<DeltaSync, String> {
     }
     let baseline: HashMap<&Path, &CarriedFile> =
         since.files.iter().map(|f| (f.rel.as_path(), f)).collect();
+    // The `<stem>.meta.json` of every `.jsonl` the carry left diverged in
+    // place: that fork keeps its own meta, so the sync never writes one there —
+    // whether or not the carry saw a source meta (one that first appears
+    // after the carry has no baseline record to say so).
+    let fork_metas: HashSet<PathBuf> = since
+        .files
+        .iter()
+        .filter(|f| f.wrote == CarryWrite::Diverged)
+        .filter_map(|f| sibling_meta_rel(&f.rel))
+        .collect();
     walk_session_dir(src_dir, &mut |event| match event {
         WalkEvent::Skipped => sync.skipped_other += 1,
         WalkEvent::Failed => sync.failed += 1,
@@ -1505,7 +1545,7 @@ pub(crate) fn delta_sync(since: &TranscriptCopy) -> Result<DeltaSync, String> {
             }
             // The carry kept the destination's copy as the newer one; the
             // older side rewriting its own copy since does not change that.
-            if recorded.is_some_and(|r| r.kept_destination_newer) {
+            if recorded.is_some_and(|r| r.kept_destination_newer) || fork_metas.contains(rel) {
                 sync.kept_destination_newer += 1;
                 return;
             }
