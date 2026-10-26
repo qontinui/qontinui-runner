@@ -4725,6 +4725,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // registry is empty — an empty snapshot is an honest
                         // freshness proof.
                         poll_lifecycle_store.snapshot_heartbeat();
+                        // Run ledger: the agentic plane's liveness merge, on
+                        // the same tick (bounded by its own 30-min cadence).
+                        session::run_record_emitter::agentic_liveness_tick();
 
                         // Session-identity reporter (plan
                         // 2026-10-19-session-lookup-by-name-shows-claude-account-in-web,
