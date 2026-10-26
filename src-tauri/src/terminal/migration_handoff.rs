@@ -10,7 +10,7 @@
 //! right after a successful respawn, next to `store.mark_terminal_superseded`.
 //!
 //! It also keeps the respawned PANES for the usage-limit watcher's replay
-//! suppression (Phase 2b, [`usage_limit_match_is_replay`]): a pane a migration
+//! suppression (Phase 2b, [`usage_limit_replay_verdict`]): a pane a migration
 //! respawned re-renders the old transcript, so its first usage-limit match is
 //! the replayed banner, not news. On 2026-10-22 the watcher re-matched it on
 //! the new pane three times in 30 minutes and each probe correctly found the
@@ -63,10 +63,12 @@ pub fn recent_migration_handoffs(now_ms: i64) -> (HashSet<String>, HashSet<Strin
 /// it has produced no new turn.
 pub const REPLAY_SUPPRESSION_WINDOW: Duration = Duration::from_secs(10 * 60);
 
-/// One respawned pane: when, and whether it has produced a new turn since.
+/// One respawned pane: when, whether it has produced a new turn since, and
+/// whether its suppression has been lifted.
 struct ReplayGuard {
     respawned_at: Instant,
     turned: bool,
+    lifted: bool,
 }
 
 static REPLAY: Mutex<Option<HashMap<String, ReplayGuard>>> = Mutex::new(None);
@@ -79,13 +81,14 @@ pub fn note_respawned_pane(terminal_id: &str, now: Instant) {
         ReplayGuard {
             respawned_at: now,
             turned: false,
+            lifted: false,
         },
     );
 }
 
 /// Pure: a usage-limit match on a migration-respawned pane is a replay until
-/// the pane has produced one new turn, or `window` has passed since the
-/// respawn.
+/// a scan AFTER the one that first saw a new turn (`turned` is the state
+/// BEFORE the current scan), or `window` has passed since the respawn.
 pub fn replay_suppressed(
     respawned_at: Instant,
     turned: bool,
@@ -95,34 +98,65 @@ pub fn replay_suppressed(
     !turned && now.saturating_duration_since(respawned_at) < window
 }
 
-/// The usage-limit watcher's per-scan question for `terminal_id`: must a match
-/// on this screen be ignored as a replay? `screen_shows_turn` is whether the
-/// screen being scanned shows a turn in progress; seeing one ends the
-/// suppression for good. A pane that was not respawned by a migration, or
-/// whose suppression has ended, answers `false` (and is forgotten).
-pub fn usage_limit_match_is_replay(
+/// How the usage-limit watcher must treat one scan of a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayVerdict {
+    /// Not a pane a migration respawned: every match counts.
+    NotRespawned,
+    /// A respawned pane still replaying: no match counts.
+    Suppressed,
+    /// A respawned pane whose suppression has lifted: only a match in the
+    /// bottom rows counts (the replayed banner may still sit higher up).
+    BottomRowsOnly,
+}
+
+/// The usage-limit watcher's per-scan question for `terminal_id`.
+/// `screen_shows_turn` is whether the screen being scanned shows a turn in
+/// progress. Seeing one does NOT lift the suppression for THIS scan — the
+/// banner on that very screen may still be the replay — but from the next
+/// scan on (2026-10-23 review fix 3). Once lifted, the pane stays
+/// [`ReplayVerdict::BottomRowsOnly`] until it closes ([`retain_live_panes`]).
+pub fn usage_limit_replay_verdict(
     terminal_id: &str,
     screen_shows_turn: bool,
     now: Instant,
-) -> bool {
+) -> ReplayVerdict {
     let mut guard = REPLAY.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = guard.as_mut() else {
-        return false;
+    let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(terminal_id)) else {
+        return ReplayVerdict::NotRespawned;
     };
-    let Some(entry) = map.get_mut(terminal_id) else {
-        return false;
-    };
-    entry.turned |= screen_shows_turn;
+    if entry.lifted {
+        return ReplayVerdict::BottomRowsOnly;
+    }
     let suppressed = replay_suppressed(
         entry.respawned_at,
         entry.turned,
         now,
         REPLAY_SUPPRESSION_WINDOW,
     );
-    if !suppressed {
-        map.remove(terminal_id);
+    entry.turned |= screen_shows_turn;
+    if suppressed {
+        ReplayVerdict::Suppressed
+    } else {
+        entry.lifted = true;
+        ReplayVerdict::BottomRowsOnly
     }
-    suppressed
+}
+
+/// Whether `terminal_id`'s suppression is due to lift at `now` (a turn was
+/// seen, or the window has run out) but has not been lifted by a scan yet.
+/// The watcher scans such a pane even when its grid has not changed, so a
+/// banner frozen on a static screen is not skipped forever by the grid gate
+/// (2026-10-23 review fix 4).
+pub fn replay_release_due(terminal_id: &str, now: Instant) -> bool {
+    let guard = REPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(terminal_id))
+        .is_some_and(|e| {
+            !e.lifted
+                && !replay_suppressed(e.respawned_at, e.turned, now, REPLAY_SUPPRESSION_WINDOW)
+        })
 }
 
 /// Forget respawned panes that are no longer live.
@@ -173,44 +207,67 @@ mod tests {
         );
     }
 
+    /// Fix 3: the scan that first SEES the turn is still suppressed; the
+    /// lift comes on the next scan, and after it the pane is bottom-rows-only
+    /// for good.
+    ///
+    /// Mutation check: updating `turned` before computing `suppressed` lets
+    /// the turn's own scan through (the second assertion fails).
     #[test]
-    fn only_a_respawned_pane_is_suppressed_and_a_turn_ends_it_for_good() {
+    fn only_a_respawned_pane_is_suppressed_and_the_lift_follows_the_turn() {
         let t0 = Instant::now();
         let tid = "replay-test-respawned";
-        assert!(
-            !usage_limit_match_is_replay("replay-test-never-respawned", false, t0),
+        assert_eq!(
+            usage_limit_replay_verdict("replay-test-never-respawned", false, t0),
+            ReplayVerdict::NotRespawned,
             "an ordinary pane's match is news"
         );
         note_respawned_pane(tid, t0);
-        assert!(usage_limit_match_is_replay(
-            tid,
-            false,
-            t0 + Duration::from_secs(5)
-        ));
-        assert!(
-            !usage_limit_match_is_replay(tid, true, t0 + Duration::from_secs(6)),
-            "the scan that sees the turn already lets the match through"
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, t0 + Duration::from_secs(5)),
+            ReplayVerdict::Suppressed
+        );
+        assert!(!replay_release_due(tid, t0 + Duration::from_secs(5)));
+        assert_eq!(
+            usage_limit_replay_verdict(tid, true, t0 + Duration::from_secs(6)),
+            ReplayVerdict::Suppressed,
+            "the scan that first sees the turn does not lift the suppression"
         );
         assert!(
-            !usage_limit_match_is_replay(tid, false, t0 + Duration::from_secs(7)),
-            "and the pane stays un-suppressed after the turn"
+            replay_release_due(tid, t0 + Duration::from_secs(7)),
+            "a seen turn makes the release due"
         );
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, t0 + Duration::from_secs(7)),
+            ReplayVerdict::BottomRowsOnly
+        );
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, t0 + Duration::from_secs(8)),
+            ReplayVerdict::BottomRowsOnly,
+            "and stays bottom-rows-only"
+        );
+        assert!(!replay_release_due(tid, t0 + Duration::from_secs(8)));
     }
 
+    /// Fix 4: with no turn, the release is due once the window has run out —
+    /// the watcher's cue to scan a static screen.
+    ///
+    /// Mutation check: making `replay_release_due` require a seen turn fails
+    /// the past-window assertion.
     #[test]
     fn a_respawned_pane_with_no_turn_is_released_after_the_window() {
         let t0 = Instant::now();
         let tid = "replay-test-window";
         note_respawned_pane(tid, t0);
-        assert!(usage_limit_match_is_replay(
-            tid,
-            false,
-            t0 + Duration::from_secs(60)
-        ));
-        assert!(!usage_limit_match_is_replay(
-            tid,
-            false,
-            t0 + REPLAY_SUPPRESSION_WINDOW + Duration::from_secs(1)
-        ));
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, t0 + Duration::from_secs(60)),
+            ReplayVerdict::Suppressed
+        );
+        let past = t0 + REPLAY_SUPPRESSION_WINDOW + Duration::from_secs(1);
+        assert!(replay_release_due(tid, past));
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, past),
+            ReplayVerdict::BottomRowsOnly
+        );
     }
 }
