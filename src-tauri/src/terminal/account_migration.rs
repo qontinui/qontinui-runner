@@ -142,10 +142,25 @@ fn refund_migration_cap(claude_session_id: &str, stamp: i64) {
 pub(crate) enum MigrateError {
     /// [`begin_migration`] refused before anything was read or written: the
     /// session is already migrating, has already moved, is closed, or is gone. Nothing
-    /// failed and nothing changed.
+    /// failed and nothing changed. Also the re-check just before the respawn
+    /// ([`still_migratable`]): the session closed or moved while the carry
+    /// ran, so nothing was respawned and the old pane was not touched; the
+    /// carried files stay at the destination, which a carry never makes worse.
     Refused(MigrationRefusal),
     /// The migration ran and failed; the old pane is left in place.
     Failed(String),
+}
+
+impl From<String> for MigrateError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl From<&str> for MigrateError {
+    fn from(e: &str) -> Self {
+        Self::Failed(e.to_string())
+    }
 }
 
 impl std::fmt::Display for MigrateError {
@@ -258,9 +273,31 @@ pub(crate) fn begin_migration(
     src_config_dir: &str,
     current_record: impl FnOnce() -> Option<TerminalSessionRecord>,
 ) -> Result<MigrationInFlight, MigrationRefusal> {
+    let guard = claim_migration_slot(&caller_record.claude_session_id)?;
+    still_migratable(caller_record, src_config_dir, current_record())?;
+    Ok(guard)
+}
+
+/// The caller's view of the session against `current` (the session's record
+/// as read NOW): it must still exist ([`MigrationRefusal::Unknown`]), be open
+/// ([`MigrationRefusal::Closed`]), and run under `src_config_dir` in the
+/// caller's terminal ([`MigrationRefusal::AlreadyMoved`]); an unpinned record
+/// (no `config_dir`) stands for `src_config_dir`.
+///
+/// Run twice per migration, both times under the session's in-flight guard:
+/// by [`begin_migration`] as it takes the guard, and by [`migrate_session`]
+/// again just before the respawn, because the async prepare and the carry in
+/// between take real time and the operator may close the pane meanwhile. A
+/// closed pane must not be respawned: the second check aborts with the
+/// refusal, leaving the carried files in place (a carry never destroys data)
+/// and spawning nothing.
+fn still_migratable(
+    caller_record: &TerminalSessionRecord,
+    src_config_dir: &str,
+    current: Option<TerminalSessionRecord>,
+) -> Result<(), MigrationRefusal> {
     let sid = &caller_record.claude_session_id;
-    let guard = claim_migration_slot(sid)?;
-    let Some(current) = current_record() else {
+    let Some(current) = current else {
         return Err(MigrationRefusal::Unknown {
             session: sid.clone(),
         });
@@ -283,7 +320,7 @@ pub(crate) fn begin_migration(
             to: format!("terminal {}", current.terminal_id),
         });
     }
-    Ok(guard)
+    Ok(())
 }
 
 /// Outcome payload emitted on `session-account-migrated`.
@@ -1150,7 +1187,7 @@ pub(crate) async fn migrate_session_off_runtime(
 /// it. The guard is a local of this future until that spawn, so dropping the
 /// future at any await before it releases the slot; after it, the blocking
 /// task owns the guard and releases it when `work` ends.
-async fn run_migration_guarded<B, P, PF, W, T>(
+async fn run_migration_guarded<B, P, PF, W, T, E>(
     begin: B,
     prepare: P,
     work: W,
@@ -1160,8 +1197,10 @@ where
     P: FnOnce() -> PF,
     PF: std::future::Future,
     PF::Output: Send + 'static,
-    W: FnOnce(PF::Output) -> Result<T, String> + Send + 'static,
+    W: FnOnce(PF::Output) -> Result<T, E> + Send + 'static,
     T: Send + 'static,
+    E: Send + 'static,
+    MigrateError: From<E>,
 {
     let in_flight = begin().map_err(MigrateError::Refused)?;
     let prepared = prepare().await;
@@ -1171,7 +1210,7 @@ where
     })
     .await
     .map_err(|e| MigrateError::Failed(format!("migration task did not complete: {e}")))?
-    .map_err(MigrateError::Failed)
+    .map_err(MigrateError::from)
 }
 
 /// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
@@ -1196,7 +1235,8 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
 ///
 /// **The old pane closes only after the respawn has succeeded.** Any failure
 /// before that — transcript, trust, the spawn itself — returns with the old
-/// pane untouched, still sitting at its usage-limit prompt, and the caller
+/// pane untouched (and a session closed or moved while the carry ran is
+/// refused just before the respawn, [`still_migratable`]), still sitting at its usage-limit prompt, and the caller
 /// emits `skipped`. Until 2026-09-18 the order was close-then-respawn, so a
 /// respawn failure (three that day, from a resolver defect) was a vanished
 /// window with nothing in its place. For a moment two PTYs now carry one
@@ -1220,11 +1260,11 @@ fn migrate_session(
     src_config_dir: &str,
     dst_config_dir: &str,
     old_writer: Option<ProcIdentity>,
-) -> Result<MigrationOutcome, String> {
+) -> Result<MigrationOutcome, MigrateError> {
     use tauri::Manager;
 
     if crate::model_gateway::gateway_declared() {
-        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
+        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.into());
     }
 
     let working_dir = record.working_dir.clone().ok_or_else(|| {
@@ -1279,8 +1319,18 @@ fn migrate_session(
     if let Some(refusal) = trust.decision.refusal() {
         return Err(format!(
             "workspace trust for the destination account could not be derived — the old pane is left in place: {refusal}"
-        ));
+        )
+        .into());
     }
+
+    // 1c. Re-read the session's record, still under the in-flight guard, now
+    // that the carry is done: the operator may have closed the pane (or the
+    // session moved) since `begin_migration` read it, and a closed pane must
+    // not come back as a respawn. Abort with the refusal before anything is
+    // lifted or spawned; the carried files stay at the destination, which a
+    // carry never makes worse. Above the step-2 lift on purpose (see GUARD).
+    still_migratable(record, src_config_dir, store.get(&record.claude_session_id))
+        .map_err(MigrateError::Refused)?;
 
     // 2. Lift any gate-continuation registration off the old terminal
     // BEFORE the respawn: the new PTY is spawned with the carried gate identity
@@ -1305,8 +1355,8 @@ fn migrate_session(
     // lift and those two calls may exit early
     // — no `?`, no `return`, no `unwrap`/`expect` you add. Every fallible step
     // of this function is deliberately ABOVE this line (the `working_dir` and
-    // three `try_state` lookups, `copy_transcript`, and the trust-gate
-    // refusal), and it must stay that way. An early exit inserted inside the
+    // three `try_state` lookups, `copy_transcript`, the trust-gate refusal,
+    // and the step-1c record re-check), and it must stay that way. An early exit inserted inside the
     // window drops `carried_continuation`, whose RAII drop releases the
     // anchor, which silently reopens the double-spawn window this lift exists
     // to close — with NO compiler warning, no clippy lint and no failing test,
@@ -1421,7 +1471,7 @@ fn migrate_session(
                     reservation,
                 );
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -1903,7 +1953,7 @@ mod tests {
         let out = run_migration_guarded(
             || begin_migration(&rec, "C:/a", || Some(rec.clone())),
             || std::future::ready(7),
-            move |prepared| {
+            move |prepared| -> Result<_, String> {
                 let refused = matches!(
                     begin_migration(&probe, "C:/a", || Some(probe.clone())),
                     Err(MigrationRefusal::InFlight { .. })
@@ -2040,6 +2090,87 @@ mod tests {
         assert!(unrecorded);
         assert_eq!(skipped, None, "no session-account-migration-skipped");
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP);
+    }
+
+    /// R9 S5a — the re-check `migrate_session` runs just before the respawn,
+    /// under the guard `begin_migration` took: a pane the operator closed (or
+    /// a session that moved, or vanished) while the carry ran is refused with
+    /// the typed refusal, without contending for the slot it already holds;
+    /// an unchanged open record proceeds. A refusal returned from inside the
+    /// guarded work reaches the caller as `Refused`, not as a failure — so
+    /// the auto path reports nothing, exactly as for an up-front refusal.
+    #[tokio::test]
+    async fn a_session_closed_during_the_carry_is_refused_before_the_respawn() {
+        let sid = "test/account_migration/closed-mid-carry";
+        let seen = session_record(sid, "t-1", Some("C:/a"));
+        let held = begin_migration(&seen, "C:/a", || Some(seen.clone())).expect("starts open");
+        let mut closed = seen.clone();
+        closed.state = "closed".to_string();
+        assert_eq!(
+            still_migratable(&seen, "C:/a", Some(closed.clone())),
+            Err(MigrationRefusal::Closed {
+                session: sid.to_string()
+            }),
+            "closed while the carry ran: no respawn"
+        );
+        assert_eq!(
+            still_migratable(
+                &seen,
+                "C:/a",
+                Some(session_record(sid, "t-1", Some("C:/b")))
+            ),
+            Err(MigrationRefusal::AlreadyMoved {
+                to: "C:/b".to_string()
+            })
+        );
+        assert_eq!(
+            still_migratable(
+                &seen,
+                "C:/a",
+                Some(session_record(sid, "t-2", Some("C:/a")))
+            ),
+            Err(MigrationRefusal::AlreadyMoved {
+                to: "terminal t-2".to_string()
+            })
+        );
+        assert_eq!(
+            still_migratable(&seen, "C:/a", None),
+            Err(MigrationRefusal::Unknown {
+                session: sid.to_string()
+            })
+        );
+        assert_eq!(
+            still_migratable(&seen, "C:/a", Some(seen.clone())),
+            Ok(()),
+            "still open, same account, same terminal — and the held slot is no obstacle"
+        );
+        drop(held);
+
+        let rec = seen.clone();
+        let out = run_migration_guarded(
+            || begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            || std::future::ready(()),
+            move |()| -> Result<(), MigrateError> {
+                still_migratable(&seen, "C:/a", Some(closed)).map_err(MigrateError::Refused)
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Err(MigrateError::Refused(MigrationRefusal::Closed { .. }))
+            ),
+            "{out:?}"
+        );
+        let base = 1_770_000_000_000i64;
+        assert!(migration_cap_permits(sid, base));
+        let (unrecorded, skipped) = settle(
+            sid,
+            base,
+            out.map(|()| -> MigrationOutcome { unreachable!() }),
+        );
+        assert!(unrecorded, "a late refusal gives the cap slot back");
+        assert_eq!(skipped, None, "and reports nothing");
     }
 
     #[test]
