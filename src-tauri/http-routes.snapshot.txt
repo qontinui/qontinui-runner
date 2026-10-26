@@ -65,6 +65,7 @@ DELETE /ui-bridge/control/ai/bookmark/{name} ui_bridge_delete_bookmark_handler
 DELETE /ui-bridge/control/ai/bookmarks/{name} ui_bridge_delete_bookmark_handler
 DELETE /ui-bridge/control/annotation/{id} ui_bridge_annotations_delete_handler
 DELETE /ui-bridge/control/intent/{name} ui_bridge_delete_intent_handler
+DELETE /ui-bridge/control/media/override ui_bridge_media_override_restore_handler
 DELETE /ui-bridge/control/network/stubs ui_bridge_clear_network_stubs_handler
 DELETE /ui-bridge/control/network/stubs/{id} ui_bridge_delete_network_stub_handler
 DELETE /ui-bridge/design/style-guide ui_bridge_design_clear_style_guide_handler
@@ -76,6 +77,7 @@ DELETE /ui-bridge/sdk/ai/bookmark/{name} handle_ct_delete_bookmark
 DELETE /ui-bridge/sdk/annotations/{id} handle_annotation_delete
 DELETE /ui-bridge/sdk/cached-specs handle_delete_cached_specs
 DELETE /ui-bridge/sdk/control/intent/{name} handle_delete_intent
+DELETE /ui-bridge/sdk/control/media/override handle_media_override_restore
 DELETE /ui-bridge/sdk/design/style-guide handle_design_clear_style_guide
 DELETE /ui-bridge/sdk/render-log handle_clear_render_log
 DELETE /unified-workflows/{id} delete_unified_workflow
@@ -637,6 +639,7 @@ GET /ui-bridge/control/idle-status/{signal} ui_bridge_get_idle_signal_handler
 GET /ui-bridge/control/intents ui_bridge_get_intents_handler
 GET /ui-bridge/control/interaction-metrics ui_bridge_get_interaction_metrics_handler
 GET /ui-bridge/control/keyboard-shortcuts ui_bridge_get_keyboard_shortcuts_handler
+GET /ui-bridge/control/media/override ui_bridge_media_override_list_handler
 GET /ui-bridge/control/metrics ui_bridge_get_interaction_metrics_handler
 GET /ui-bridge/control/network-chains ui_bridge_get_network_chains_handler
 GET /ui-bridge/control/network-request/{id} ui_bridge_get_network_request_handler
@@ -745,6 +748,7 @@ GET /ui-bridge/sdk/control/forms handle_forms
 GET /ui-bridge/sdk/control/health handle_console_health
 GET /ui-bridge/sdk/control/idle-status handle_idle_status
 GET /ui-bridge/sdk/control/idle-status/{signal} handle_idle_status_signal
+GET /ui-bridge/sdk/control/media/override handle_media_override_list
 GET /ui-bridge/sdk/control/network-chains handle_console_network_chains
 GET /ui-bridge/sdk/control/network-request/{id} handle_network_request
 GET /ui-bridge/sdk/control/network-requests handle_network_requests
@@ -925,6 +929,7 @@ MERGE layer_observer::routes
 MERGE log_sources::routes
 MERGE macros::routes
 MERGE mcp_servers::routes
+MERGE media_override::routes
 MERGE memory_consolidation_api::routes
 MERGE meta_optimizer_api::routes
 MERGE misc::routes
@@ -1453,6 +1458,7 @@ POST /ui-bridge/control/intents/execute ui_bridge_execute_intent_handler
 POST /ui-bridge/control/intents/execute-from-query ui_bridge_execute_intent_from_query_handler
 POST /ui-bridge/control/intents/find ui_bridge_find_intent_handler
 POST /ui-bridge/control/key ui_bridge_dispatch_key_handler
+POST /ui-bridge/control/media/override ui_bridge_media_override_handler
 POST /ui-bridge/control/navigate-and-wait ui_bridge_navigate_and_wait_handler
 POST /ui-bridge/control/navigate-tab ui_bridge_navigate_tab_handler
 POST /ui-bridge/control/network-requests/wait ui_bridge_wait_for_network_request_handler
@@ -1610,6 +1616,7 @@ POST /ui-bridge/sdk/control/fill handle_fill_form
 POST /ui-bridge/sdk/control/find handle_discover
 POST /ui-bridge/sdk/control/forms/diff handle_diff_forms
 POST /ui-bridge/sdk/control/forms/snapshot handle_snapshot_forms
+POST /ui-bridge/sdk/control/media/override handle_media_override
 POST /ui-bridge/sdk/control/network-requests/wait handle_wait_for_network_request
 POST /ui-bridge/sdk/control/page-evaluate handle_page_evaluate
 POST /ui-bridge/sdk/control/page/back handle_page_go_back
