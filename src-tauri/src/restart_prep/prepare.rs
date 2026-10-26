@@ -481,6 +481,32 @@ pub fn release_settled(outcome: &str, coord_hold_confirmed: bool) -> bool {
         || outcome.starts_with("already released: ")
 }
 
+/// The release of `rec` SETTLED BY EXPIRY, or `None`: a release that did not
+/// settle (`outcome`, [`release_settled`] false) on a runner that `restarted`
+/// since the prepare, once the hold's `until` has passed at `now_ms`. Coord's
+/// drain expires on its own at that `until`, so there is nothing left to
+/// release — and refusing to settle would leave the record in its window,
+/// where it refuses every new prepare ([`RestartPrep::prepare`]) and its
+/// cohort is never restored, for as long as coord stays unreachable or keeps
+/// answering `route_absent` to a hold it once confirmed. A runner that has
+/// NOT restarted keeps its sessions running and the prepare in force: its
+/// expired hold is renewed by Extend or ended by a release coord answers.
+fn expired_release(
+    rec: &PrepareRecord,
+    restarted: bool,
+    now_ms: i64,
+    outcome: &str,
+) -> Option<String> {
+    (restarted && rec.hold_expired(now_ms)).then(|| {
+        let until = rec
+            .hold_until
+            .clone()
+            .or_else(|| rec.hold_until_ms.map(rfc3339))
+            .unwrap_or_default();
+        format!("expired: {until} (the release answered {outcome})")
+    })
+}
+
 /// Whether coord ever confirmed a hold for `rec` (see
 /// [`PrepareRecord::coord_hold_confirmed`]); a record whose hold reads
 /// `confirmed` now has, whatever the flag says.
@@ -1112,17 +1138,27 @@ impl RestartPrep {
     /// with a boot release that did not settle, or on the same build),
     /// `restoring`: the cohort is restored by hand, never auto-restored at once. A release that does not SETTLE ([`release_settled`]) leaves the
     /// prepare in force — the hold still stands — records the attempt, and
-    /// errs, so the operator can try again.
+    /// errs, so the operator can try again. Except on a restarted runner
+    /// whose hold has expired: coord's drain ended by itself, so the release
+    /// settles as `expired: <until>` ([`expired_release`]).
     pub async fn cancel(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
         let _op = self.ops.lock().await;
         let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
             return Err("no prepare is in progress — nothing to cancel".to_string());
         };
-        let (report, read) = self
+        let (mut report, read) = self
             .release_hold(door, &rec, ReleaseTrigger::Cancel, now_ms, running_build())
             .await;
-        let outcome = report.outcome.clone();
-        let settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
+        let rebuilt = rec.restarted_since() || self.same_build_restart();
+        let mut outcome = report.outcome.clone();
+        let mut settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
+        if !settled {
+            if let Some(expired) = expired_release(&rec, rebuilt, now_ms, &outcome) {
+                outcome = expired;
+                report.outcome = outcome.clone();
+                settled = true;
+            }
+        }
         // On a REBUILT runner — the boot step could not settle its release, so
         // the record stayed in its window — the release the operator pressed
         // is the one the boot step owed: the cohort moves to `restoring`, as
@@ -1133,8 +1169,8 @@ impl RestartPrep {
         // prepared restart. Only a cancel before any restart — the sessions
         // still running — is a true cancel.
         // Answered by the record itself (`restarted_since`), so a Release
-        // pressed before the boot step has run is judged the same way.
-        let rebuilt = rec.restarted_since() || self.same_build_restart();
+        // pressed before the boot step has run is judged the same way
+        // (`rebuilt`, above — which also lets an expired hold settle).
         let rec = self.update(&rec.prepare_id, |r| {
             if settled {
                 r.hold = HoldStatus::ReleaseSent {
@@ -1180,11 +1216,20 @@ impl RestartPrep {
             return BootStep::NotInWindow(rec.state);
         }
         if rec.prepared_build != build {
-            let (report, read) = self
+            let (mut report, read) = self
                 .release_hold(door, &rec, ReleaseTrigger::Rebuild, now_ms, build)
                 .await;
-            let outcome = report.outcome.clone();
-            let settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
+            let mut outcome = report.outcome.clone();
+            let mut settled = release_settled(&outcome, coord_hold_was_confirmed(&rec));
+            // A rebuilt runner has restarted by definition: an expired hold
+            // settles here as it does on Release hold ([`expired_release`]).
+            if !settled {
+                if let Some(expired) = expired_release(&rec, true, now_ms, &outcome) {
+                    outcome = expired;
+                    report.outcome = outcome.clone();
+                    settled = true;
+                }
+            }
             let applied = self.update(&rec.prepare_id, |r| {
                 if settled {
                     r.hold = HoldStatus::ReleaseSent {
@@ -2653,6 +2698,132 @@ mod tests {
         ctl.prepare(&*door, "next", T0 + 3, || async { Ok(cohort(&["n"])) })
             .await
             .expect("a new prepare");
+    }
+
+    /// Review round 3: a restarted runner's release that coord cannot settle
+    /// — unreachable, or `route_absent` for a hold it once confirmed — settles
+    /// as `expired: <until>` once the hold's `until` has passed, because
+    /// coord's drain expired by itself. The record restores (or is `done` with
+    /// nothing to restore, so a new prepare may start), and the drain lifts
+    /// only after the record moved. A runner that has NOT restarted keeps the
+    /// prepare in force.
+    #[tokio::test]
+    async fn restart_prep_an_expired_hold_on_a_restarted_runner_settles_its_release() {
+        let until = T0 + 1_000;
+        let unreachable = || ReleaseCall::Unreachable {
+            cause: "timed out".to_string(),
+        };
+
+        // Same-build restart, coord unreachable: Release hold restores.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            running_build(),
+            HoldStatus::Unconfirmed {
+                cause: "coord_unreachable: x".to_string(),
+            },
+            until,
+        );
+        let door = MockDoor::primary();
+        *door.record_at.lock().unwrap() = Some(ctl.path.clone());
+        *door.release_reply.lock().unwrap() = Some(unreachable());
+        *door.drain.lock().unwrap() = Err("coord unreachable".to_string());
+        ctl.on_boot(&*door, running_build(), until + 1).await;
+        let rec = ctl
+            .cancel(&*door, until + 2)
+            .await
+            .expect("settled by expiry");
+        assert_eq!(rec.state, PrepState::Restoring);
+        let outcome = &rec.release.as_ref().unwrap().outcome;
+        assert!(
+            outcome.starts_with(&format!("expired: {}", rfc3339(until))),
+            "{outcome}"
+        );
+        assert!(outcome.contains("coord_unreachable"), "{outcome}");
+        assert_eq!(
+            door.published.lock().unwrap().last().map(|p| p.1.clone()),
+            Some(Some(PrepState::Restoring)),
+            "the read is published only after the record restores"
+        );
+        // No longer refused as a restarted runner's prepare — only by the
+        // cohort waiting to be restored.
+        let err = ctl
+            .prepare(&*door, "next", until + 3, || async { Ok(cohort(&["n"])) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("waiting to be restored"), "{err}");
+
+        // Nothing to restore: `done`, and the next prepare is allowed.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            running_build(),
+            HoldStatus::Unconfirmed {
+                cause: "coord_unreachable: x".to_string(),
+            },
+            until,
+        );
+        ctl.update("prep-boot", |r| {
+            for row in &mut r.cohort.rows {
+                row.left_capture_at = Some(T0 + 10);
+                row.left_capture_reason = Some("explicit".to_string());
+            }
+        })
+        .unwrap();
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(unreachable());
+        ctl.on_boot(&*door, running_build(), until + 1).await;
+        assert_eq!(
+            ctl.cancel(&*door, until + 2).await.unwrap().state,
+            PrepState::Done
+        );
+        *door.release_reply.lock().unwrap() = None;
+        ctl.prepare(&*door, "next", until + 3, || async { Ok(cohort(&["n"])) })
+            .await
+            .expect("a new prepare");
+
+        // Rebuilt runner, a CONFIRMED hold whose release answers 404: the boot
+        // step settles it by expiry.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(&dir, "an-older-build", HoldStatus::Confirmed, until);
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(parse_release_reply(404, ""));
+        let step = ctl.on_boot(&*door, running_build(), until + 1).await;
+        assert!(
+            matches!(&step, BootStep::ReleasedForRebuild { outcome }
+                if outcome.starts_with("expired: ") && outcome.contains("route_absent")),
+            "{step:?}"
+        );
+        assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Restoring);
+
+        // Before the hold expires, the same release does not settle.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(&dir, "an-older-build", HoldStatus::Confirmed, until);
+        let door = MockDoor::primary();
+        *door.release_reply.lock().unwrap() = Some(unreachable());
+        assert!(matches!(
+            ctl.on_boot(&*door, running_build(), until - 1).await,
+            BootStep::ReleaseFailed { .. }
+        ));
+        assert!(ctl.cancel(&*door, until - 1).await.is_err());
+        // Once it has, Release hold settles it.
+        assert_eq!(
+            ctl.cancel(&*door, until).await.unwrap().state,
+            PrepState::Restoring
+        );
+
+        // A runner that has NOT restarted keeps the prepare in force.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        prepare(&ctl, &door).await;
+        *door.release_reply.lock().unwrap() = Some(unreachable());
+        let err = ctl
+            .cancel(&*door, T0 + DEFAULT_HOLD_MS + 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains("coord_unreachable"), "{err}");
+        assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Preparing);
     }
 
     #[tokio::test]

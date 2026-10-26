@@ -783,30 +783,53 @@ pub const HTTP_CLOSE_REASON: &str = "explicit";
 ///
 /// The order is the point. Ending the pane fires the tab's own exit close
 /// (`pty-exit`) — or, with no webview attached, the lifecycle poll's
-/// `poll-dead` / `no-terminal` — and those are restart-shaped closes, which
-/// would leave a session an agent or the operator closed on purpose looking
-/// like one that died with the runner. The store closes a record once
-/// (`record_close_checked` resolves only OPEN rows; a repeat close is
-/// `AlreadyClosed`), so the reason recorded first is the one that stays.
+/// `poll-dead` — and those two are the restart-shaped closes
+/// (`restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS`), which would leave
+/// a session an agent or the operator closed on purpose looking like one that
+/// died with the runner. (The poll's `no-terminal` orphan close is NOT
+/// restart-shaped; recorded first it would only name the wrong reason.)
+/// The store closes a record once (`record_close_checked` resolves only OPEN
+/// rows; a repeat close is `AlreadyClosed`), so the reason recorded first is
+/// the one that stays.
+///
+/// EVERY open row on the terminal is closed, not just one: the store can hold
+/// more than one open row on a terminal (a phantom sibling no supersede rule
+/// retired), and `find_open_by_terminal` returns an arbitrary one of them. The
+/// loop stops at the first id that comes back after its close — a close that
+/// did not take effect — and is bounded by [`MAX_DELIBERATE_CLOSES`].
 fn close_deliberately<T, E>(
     store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
     terminal_id: &str,
     deliberate: bool,
     close: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    if deliberate {
-        if let Some(rec) = store.and_then(|s| s.find_open_by_terminal(terminal_id)) {
-            if let Some(store) = store {
-                store.record_close_checked(
-                    &rec.claude_session_id,
-                    Some(terminal_id),
-                    HTTP_CLOSE_REASON,
+    if let (true, Some(store)) = (deliberate, store) {
+        let mut closed = std::collections::HashSet::new();
+        while closed.len() < MAX_DELIBERATE_CLOSES {
+            let Some(rec) = store.find_open_by_terminal(terminal_id) else {
+                break;
+            };
+            if !closed.insert(rec.claude_session_id.clone()) {
+                warn!(
+                    terminal_id = %terminal_id,
+                    claude_session_id = %rec.claude_session_id,
+                    "HTTP close: a deliberate close did not take effect — not retrying it"
                 );
+                break;
             }
+            store.record_close_checked(
+                &rec.claude_session_id,
+                Some(terminal_id),
+                HTTP_CLOSE_REASON,
+            );
         }
     }
     close()
 }
+
+/// The most open rows [`close_deliberately`] closes on one terminal — a bound
+/// on the loop, far above the one or two rows a terminal ever carries.
+const MAX_DELIBERATE_CLOSES: usize = 16;
 
 /// Close a terminal session. A deliberate close: the session it hosts is
 /// recorded closed [`HTTP_CLOSE_REASON`] before its process ends
@@ -1319,6 +1342,46 @@ mod tests {
         let _: Result<(), String> =
             close_deliberately(Some(&store), &format!("term-{other}"), false, || Ok(()));
         assert_eq!(store.get(other).unwrap().state, "open");
+    }
+
+    /// Review round 3: two OPEN rows on one terminal (the store allows it — a
+    /// sibling no supersede rule retired) are BOTH closed `explicit`, not one
+    /// arbitrary row, so neither is left for the pane's exit close to record
+    /// as restart-shaped.
+    #[test]
+    fn an_http_close_closes_every_open_row_on_the_terminal() {
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let terminal = "term-shared";
+        let ids = [
+            "2f4b3c2a-1d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "3f4b3c2a-1d5e-4f60-8a7b-9c0d1e2f3a4b",
+        ];
+        for id in ids {
+            let mut rec = test_open_record(id);
+            rec.terminal_id = terminal.to_string();
+            store.record_open(rec);
+        }
+        for id in ids {
+            assert_eq!(store.get(id).unwrap().state, "open", "both rows open first");
+        }
+        let _: Result<(), String> = close_deliberately(Some(&store), terminal, true, || {
+            for id in ids {
+                store.record_close(id, "pty-exit");
+            }
+            Ok(())
+        });
+        for id in ids {
+            let rec = store.get(id).unwrap();
+            assert_eq!(rec.state, "closed");
+            assert_eq!(
+                rec.close_reason.as_deref(),
+                Some(HTTP_CLOSE_REASON),
+                "{id} is closed deliberately"
+            );
+        }
+        assert!(store.find_open_by_terminal(terminal).is_none());
     }
 
     /// F: the HTTP close door goes through [`close_deliberately`].
