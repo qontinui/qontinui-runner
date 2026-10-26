@@ -1016,6 +1016,19 @@ pub(crate) static SESSION_RUN_DROPPED_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 /// conflict is never a silent drop. `GET /health` `sessionRuns.drainDropped.conflict`.
 pub(crate) static SESSION_RUN_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
+/// `session_run` rows ACK-dropped on a 401 whose request carried NO bearer
+/// (nothing to wait for). `GET /health` `sessionRuns.drainDropped.noCredential`.
+pub(crate) static SESSION_RUN_DROPPED_NO_CREDENTIAL: AtomicU64 = AtomicU64::new(0);
+
+/// `session_run` rows ACK-dropped after a 401 credential wait outlived
+/// [`SESSION_RUN_CREDENTIAL_WAIT_MAX_MS`]. `GET /health`
+/// `sessionRuns.drainDropped.credentialWaitExpired`.
+pub(crate) static SESSION_RUN_DROPPED_CREDENTIAL_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// The longest a `session_run` row waits on a 401 credential before it is
+/// dropped (its age, from the outbox's `recorded_at`).
+const SESSION_RUN_CREDENTIAL_WAIT_MAX_MS: i64 = 24 * 3600 * 1000;
+
 /// Marks a retried failure that waits on this device's CREDENTIAL (a 401 on a
 /// `session_run` row) — kept and retried on the lane's backoff, and never
 /// counted toward quarantine.
@@ -1778,6 +1791,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         }
     }
 
+    // Whether the `session_run` arm's request carried a bearer — a 401 is a
+    // credential WAIT only when one was presented (W1).
+    let mut session_run_authed = false;
     let result = match kind {
         "started" => {
             // POST /sessions with the full create body. The runner
@@ -2057,9 +2073,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 crate::session::run_record_emitter::SESSION_RUNS_ROUTE
             );
             let body = rec.payload.get("body").cloned().unwrap_or(JsonValue::Null);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-                .send()
-                .await
+            match crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .build()
+            {
+                Ok(req) => {
+                    session_run_authed = req.headers().contains_key(reqwest::header::AUTHORIZATION);
+                    inner.http.execute(req).await
+                }
+                Err(e) => Err(e),
+            }
         }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
@@ -2184,6 +2206,33 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     seq = rec.seq,
                     body = %snippet(&detail),
                     "coord_sync: coord refused a session run row as conflicting (409) — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run" && status == StatusCode::UNAUTHORIZED && !session_run_authed {
+                // No bearer was presented at all (an unresolved tenant on a
+                // multi-bound device fails soft to unauthenticated): no retry
+                // can change that answer — ACK-drop, counted.
+                SESSION_RUN_DROPPED_NO_CREDENTIAL.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    "coord_sync: session run row refused 401 with NO credential presented — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run"
+                && status == StatusCode::UNAUTHORIZED
+                && chrono::Utc::now().signed_duration_since(rec.recorded_at)
+                    > chrono::Duration::milliseconds(SESSION_RUN_CREDENTIAL_WAIT_MAX_MS)
+            {
+                // A credential that has not recovered in a day will not: cap
+                // the wait, drop, count.
+                SESSION_RUN_DROPPED_CREDENTIAL_WAIT.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    "coord_sync: session run row still refused 401 after the credential-wait cap — dropped, counted"
                 );
                 return PushOutcome::Acked;
             }
@@ -4047,6 +4096,8 @@ mod tests {
         /// Answered (front first) before `session_runs_status` applies — a
         /// scripted sequence, e.g. two 5xx then success.
         session_runs_script: std::collections::VecDeque<u16>,
+        /// The `Authorization` header each `/coord/session-runs` POST carried.
+        session_run_auth: Vec<Option<String>>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -4433,9 +4484,16 @@ mod tests {
                 "/coord/session-runs",
                 post(
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     headers: axum::http::HeaderMap,
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
                         g.session_runs.push(body.clone());
+                        g.session_run_auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
                         let code = g.session_runs_script.pop_front().or(g.session_runs_status);
                         let status = code
                             .and_then(|c| AxumStatus::from_u16(c).ok())
@@ -4940,6 +4998,22 @@ mod tests {
         CoordSync,
         tempfile::TempDir,
     ) {
+        start_session_run_drain_for(rows, script, status, None).await
+    }
+
+    /// [`start_session_run_drain`] for rows owned by `tenant` (whose bearer
+    /// the drain then presents, when the test installed one).
+    async fn start_session_run_drain_for(
+        rows: usize,
+        script: &[u16],
+        status: Option<u16>,
+        tenant: Option<Uuid>,
+    ) -> (
+        Arc<OutboxWriter>,
+        Arc<TokMutex<CoordRecorder>>,
+        CoordSync,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -4957,22 +5031,48 @@ mod tests {
         let ccsid = "0b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d10";
         let machine = Uuid::new_v4();
         for n in 0..rows {
+            let mut payload = json!({"body": {
+                "claude_code_session_id": ccsid,
+                "run_seq": n + 1,
+                "event": "start",
+                "started_at": "2026-10-26T00:00:00.000Z",
+                "facts": {},
+            }});
+            if let Some(t) = tenant {
+                payload["tenant_id"] = json!(t);
+            }
             outbox
                 .record(
                     machine,
                     crate::session::run_record_emitter::run_lane(ccsid),
                     SessionEventKind::SessionRun,
-                    json!({"body": {
-                        "claude_code_session_id": ccsid,
-                        "run_seq": n + 1,
-                        "event": "start",
-                        "started_at": "2026-10-26T00:00:00.000Z",
-                        "facts": {},
-                    }}),
+                    payload,
                 )
                 .unwrap();
         }
         (outbox, rec, coord, dir)
+    }
+
+    /// Give the device ONE binding with a stored device JWT, so the drain
+    /// presents a bearer for rows owned by the returned tenant.
+    fn install_one_tenant_bearer(amb: &crate::test_env::IsolatedAmbient) -> Uuid {
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let t = Uuid::now_v7();
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": t, "bindings": [{ "tenant_id": t }]}).to_string(),
+        )
+        .unwrap();
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&t, &device_jwt_for(&t))
+            .expect("T's credential slot");
+        t
     }
 
     /// A 401 is this device's CREDENTIAL state, not coord refusing the row: the
@@ -4980,7 +5080,10 @@ mod tests {
     /// hot loop (a handful of attempts in seconds, not hundreds).
     #[tokio::test]
     async fn session_run_refused_401_does_not_loop() {
-        let (outbox, rec, coord, _dir) = start_session_run_drain(1, &[], Some(401)).await;
+        let amb = crate::test_env::isolated_ambient();
+        let t = install_one_tenant_bearer(&amb);
+        let (outbox, rec, coord, _dir) =
+            start_session_run_drain_for(1, &[], Some(401), Some(t)).await;
         let _registry = build_registry(coord.clone());
         let _drain = coord.start_drain_task();
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -4995,6 +5098,26 @@ mod tests {
             1,
             "a 401 keeps the row for retry"
         );
+        assert!(
+            rec.lock()
+                .await
+                .session_run_auth
+                .iter()
+                .all(|a| a.is_some()),
+            "the retried requests carried a bearer"
+        );
+    }
+
+    /// A row that can NEVER succeed — refused 401 with no credential presented
+    /// (the test process holds none) — is ACK-dropped and counted, never
+    /// retried.
+    #[tokio::test]
+    async fn session_run_401_with_no_credential_is_dropped_and_counted() {
+        let _amb = crate::test_env::isolated_ambient();
+        let before = SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed);
+        let posted = drain_one_session_run(Some(401)).await;
+        assert_eq!(posted.len(), 1, "one attempt, then dropped");
+        assert!(SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed) > before);
     }
 
     /// A 5xx keeps the row and retries it, and the lane's rows still arrive IN

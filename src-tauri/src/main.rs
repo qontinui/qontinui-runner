@@ -4531,12 +4531,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     lifecycle_store.attach_run_record_emitter(run_record_emitter.clone());
                     ai_coord_registrar.attach_run_record_emitter(run_record_emitter.clone());
-                    // The agentic plane's process-exit hook (a `ClaudeSession`
-                    // waiter thread) reaches it through the global.
                     // Boot sweep: agentic runs the previous process left open
                     // ended when it stopped (`runner-stopped`, at their last
                     // known activity) — before any session re-registers.
                     run_record_emitter.end_previous_process_agentic_runs();
+                    // The agentic plane's process-exit hook (a `ClaudeSession`
+                    // waiter thread) reaches it through the global.
                     session::run_record_emitter::install_global(run_record_emitter);
                 }
 

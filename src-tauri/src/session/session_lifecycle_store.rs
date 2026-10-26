@@ -3890,8 +3890,10 @@ impl SessionLifecycleStore {
         // whole map, so it is O(N) by construction — fold straight into a fresh
         // snapshot rather than appending N `Remove` deltas. Runs on the slow
         // liveness poll, never on the spawn path.
-        self.compact();
+        // The ends go out BEFORE the deletion is persisted, so a crash between
+        // the two can never lose an end whose row is already gone.
         self.emit_run_ends(run_ends.iter());
+        self.compact();
     }
 
     /// One-time boot repair for the P4 registry corruption (plan

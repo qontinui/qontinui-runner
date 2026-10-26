@@ -2478,6 +2478,12 @@ async fn health(
                 // 409s from coord's upsert (ACKed, counted, logged).
                 "conflict": crate::session::coord_sync::SESSION_RUN_CONFLICTS
                     .load(Ordering::Relaxed),
+                // 401s with NO credential presented (nothing to wait for).
+                "noCredential": crate::session::coord_sync::SESSION_RUN_DROPPED_NO_CREDENTIAL
+                    .load(Ordering::Relaxed),
+                // 401 credential waits past their 24 h cap.
+                "credentialWaitExpired": crate::session::coord_sync::SESSION_RUN_DROPPED_CREDENTIAL_WAIT
+                    .load(Ordering::Relaxed),
             },
         },
         // The coord session outbox drain (qontinui-runner manual-test-loop
