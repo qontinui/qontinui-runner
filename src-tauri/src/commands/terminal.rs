@@ -1623,13 +1623,33 @@ pub fn terminal_session_record_close(
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    // The pane's own exit, reported while this runner is alive and not
-    // shutting down, is a `claude` that ended under it — not a restart's
-    // kill (`claude-ended`, never auto-resumed). During a shutdown it keeps
-    // its restart-shaped reason.
+    // The pane's own exit is a deliberate end (`claude-ended`, never
+    // auto-resumed) only when its process exited on its own with status 0 —
+    // what `claude` does on `/exit` — while this runner is alive and not
+    // shutting down. A signal death, a non-zero status, a runner-requested
+    // close or an exit with no recorded status (a PTY holder that died) keeps
+    // the restart-shaped reason: those are not the user ending the session.
+    let cause = terminal_id
+        .as_deref()
+        .and_then(|tid| {
+            use tauri::Manager;
+            let app = crate::tauri_app_handle::current()?;
+            let tm = app.try_state::<Arc<crate::terminal::TerminalManager>>()?;
+            tm.get(tid)?.exit_snapshot()
+        })
+        .map_or(
+            crate::session::session_lifecycle_store::ExitCause::Unknown,
+            |(facts, _)| {
+                crate::session::session_lifecycle_store::ExitCause::of_pane_exit(
+                    facts.code,
+                    facts.close_requested,
+                )
+            },
+        );
     let reason = crate::session::session_lifecycle_store::witnessed_close_reason(
         &reason,
         crate::commands::terminal_windows::is_app_quitting(),
+        cause,
     );
     let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), reason);
     Ok(close_outcome_response(&outcome))

@@ -5082,6 +5082,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                             &rec.claude_session_id,
                                         );
                                     }
+                                    if claude_present {
+                                        // Seen alive here: a later "no claude"
+                                        // under this living shell is its end.
+                                        session::claude_ended_watch::note_claude_seen(
+                                            &rec.terminal_id,
+                                        );
+                                    }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
@@ -5106,13 +5113,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // unresumable record, recreating the same
                                     // blank terminal forever. See
                                     // `close_reason_for_dead_shell`.
-                                    // Seen by this LIVE poll: a `claude` that
-                                    // ended under a living shell is
-                                    // `claude-ended`, not restart-shaped,
-                                    // unless the runner is shutting down.
+                                    // `claude-ended` (not restorable) only
+                                    // when claude is gone from a LIVING shell
+                                    // in which this process saw it alive
+                                    // (review S4): a false "no claude" (an
+                                    // adopted pane under the PID-reuse guard,
+                                    // a root whose comm is not `claude`) on a
+                                    // pane never seen alive keeps `poll-dead`,
+                                    // as does a dead PTY (its own exit decides)
+                                    // and anything during shutdown.
+                                    let cause = session::session_lifecycle_store::poll_exit_cause(
+                                        live_is_alive,
+                                        session::claude_ended_watch::claude_seen(&rec.terminal_id),
+                                    );
                                     let reason = session::session_lifecycle_store::witnessed_close_reason(
                                         close_reason_for_dead_shell(rec.restore_tier.as_deref()),
                                         commands::terminal_windows::is_app_quitting(),
+                                        cause,
                                     );
                                     poll_lifecycle_store
                                         .record_close(&rec.claude_session_id, reason);

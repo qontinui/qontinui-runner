@@ -3981,6 +3981,14 @@ pub const RESTORABLE_CLOSE_REASONS: [&str; 2] = ["pty-exit", "poll-dead"];
 /// How long after its close a record closed with `reason` stays restorable;
 /// `None` for every reason outside [`RESTORABLE_CLOSE_REASONS`]. The ONE map
 /// from the restorable list to its grace windows.
+///
+/// Since [`witnessed_close_reason`], a `pty-exit` / `poll-dead` close carries
+/// these grace windows only for deaths that were NOT a deliberate end the live
+/// runner witnessed: deaths during shutdown, deaths found at boot (the record
+/// still open from the previous process), deaths with an abnormal or unknown
+/// cause (a holder gone, a signal or OOM kill), and a `poll-dead` for a pane
+/// whose `claude` this process never saw alive, or whose shell is itself dead.
+/// A deliberate end is `claude-ended` and has none.
 fn restorable_grace_ms(reason: &str) -> Option<i64> {
     match reason {
         "pty-exit" => Some(RESTORABLE_PTY_EXIT_MS),
@@ -3999,14 +4007,71 @@ fn restorable_grace_ms(reason: &str) -> Option<i64> {
 /// the runner's own observation is the only signal.
 pub const CLAUDE_ENDED_CLOSE_REASON: &str = "claude-ended";
 
-/// PURE: the reason a close OBSERVED by the live runner is recorded with. A
-/// restart-shaped observation (`pty-exit`, `poll-dead`) made while the runner
-/// is NOT shutting down is a death it witnessed with itself alive:
-/// [`CLAUDE_ENDED_CLOSE_REASON`]. During shutdown (`quitting`) the same
-/// observation is the restart killing the pane and stays restart-shaped; any
-/// other reason passes through unchanged.
-pub fn witnessed_close_reason(observed: &str, quitting: bool) -> &str {
-    if !quitting && RESTORABLE_CLOSE_REASONS.contains(&observed) {
+/// How the observed death came about, as far as the observer can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCause {
+    /// The pane's own process exited on its own with status 0 — what `claude`
+    /// does on `/exit`.
+    CleanExit,
+    /// `claude` vanished from a pane whose shell is still alive, and this
+    /// process had seen `claude` alive in that pane before — what `/exit` in a
+    /// shell-hosted pane looks like.
+    ClaudeGoneUnderLiveShell,
+    /// A non-zero status, a signal death, or an exit the runner itself
+    /// requested (its kill, a migration hand-off).
+    Abnormal,
+    /// No usable fact: a failed wait, a holder that died without reporting the
+    /// exit, a pane whose `claude` was never seen alive here, or no pane at all.
+    Unknown,
+}
+
+impl ExitCause {
+    /// The cause a pane exit's recorded facts support. Only a status-0 exit
+    /// the runner did not request is a clean one; a runner-requested close, a
+    /// non-zero status (a signal death reads as non-zero) is abnormal; no
+    /// status at all (a failed wait, a PTY holder that died without
+    /// reporting) is unknown.
+    pub fn of_pane_exit(code: Option<i32>, runner_requested: bool) -> Self {
+        match (code, runner_requested) {
+            (_, true) => ExitCause::Abnormal,
+            (Some(0), false) => ExitCause::CleanExit,
+            (Some(_), false) => ExitCause::Abnormal,
+            (None, false) => ExitCause::Unknown,
+        }
+    }
+}
+
+/// PURE: the cause the lifecycle poll's dead-shell close (`poll-dead`) can
+/// claim. Only a LIVING shell (`live_is_alive == Some(true)`) whose `claude`
+/// this process saw alive before (`seen_alive`) is a `claude` that ended under
+/// it; a pane never seen alive — a false "no claude" from the PID-reuse guard
+/// on an adopted pane, a root whose `comm` is not `claude` — or a dead PTY is
+/// [`ExitCause::Unknown`], which keeps `poll-dead` restorable.
+pub fn poll_exit_cause(live_is_alive: Option<bool>, seen_alive: bool) -> ExitCause {
+    if live_is_alive == Some(true) && seen_alive {
+        ExitCause::ClaudeGoneUnderLiveShell
+    } else {
+        ExitCause::Unknown
+    }
+}
+
+/// PURE: the reason a close OBSERVED by the live runner is recorded with.
+///
+/// [`CLAUDE_ENDED_CLOSE_REASON`] — not restorable — ONLY for a restart-shaped
+/// observation (`pty-exit`, `poll-dead`) made while the runner is not shutting
+/// down AND whose cause is a deliberate end: a clean (status 0) exit of the
+/// pane's own process, or `claude` gone from under a living shell after this
+/// process saw it alive. Everything else keeps its restart-shaped reason and
+/// stays restorable: a death during shutdown, and any death with an abnormal
+/// or unknown cause — a PTY holder that died, an OOM or out-of-band kill, a
+/// cgroup kill racing the quit mark, a signal death — because those are not
+/// the user ending the session. Any other reason passes through unchanged.
+pub fn witnessed_close_reason(observed: &str, quitting: bool, cause: ExitCause) -> &str {
+    let deliberate = matches!(
+        cause,
+        ExitCause::CleanExit | ExitCause::ClaudeGoneUnderLiveShell
+    );
+    if !quitting && deliberate && RESTORABLE_CLOSE_REASONS.contains(&observed) {
         CLAUDE_ENDED_CLOSE_REASON
     } else {
         observed
@@ -7474,24 +7539,47 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 
-    /// D: a `claude` the live runner saw end (any `/exit`, or its process
-    /// gone under a living shell) is recorded `claude-ended` — not
-    /// restorable, not restart-shaped. A pane killed during a shutdown keeps
-    /// its restart-shaped reason and stays restorable; a record found open at
-    /// boot (the runner never saw it end) stays restorable as before.
+    /// D / review S3: only a DELIBERATE end the live runner witnessed is
+    /// `claude-ended` (not restorable): a clean exit of the pane's process, or
+    /// `claude` gone from under a living shell after it was seen alive. A
+    /// holder-gone or signal death, a runner-requested close, a death during
+    /// shutdown, and a record found open at boot all stay restorable.
     #[test]
     fn a_claude_end_witnessed_while_alive_is_not_restorable() {
+        use ExitCause::*;
+        let clean = ExitCause::of_pane_exit(Some(0), false);
+        assert_eq!(clean, CleanExit);
+        // A signal death reads as a non-zero status (in-process and holder
+        // panes alike — `daemon_pane_io::SIGNAL_EXIT_CODE`).
+        assert_eq!(ExitCause::of_pane_exit(Some(137), false), Abnormal);
+        // A PTY holder that died without reporting: no status.
+        assert_eq!(ExitCause::of_pane_exit(None, false), Unknown);
+        // The runner's own kill / hand-off.
+        assert_eq!(ExitCause::of_pane_exit(Some(0), true), Abnormal);
+
         assert_eq!(
-            witnessed_close_reason("pty-exit", false),
+            witnessed_close_reason("pty-exit", false, CleanExit),
             CLAUDE_ENDED_CLOSE_REASON
         );
         assert_eq!(
-            witnessed_close_reason("poll-dead", false),
+            witnessed_close_reason("poll-dead", false, ClaudeGoneUnderLiveShell),
             CLAUDE_ENDED_CLOSE_REASON
         );
-        assert_eq!(witnessed_close_reason("pty-exit", true), "pty-exit");
-        assert_eq!(witnessed_close_reason("poll-dead", true), "poll-dead");
-        assert_eq!(witnessed_close_reason("explicit", false), "explicit");
+        for cause in [Abnormal, Unknown] {
+            assert_eq!(witnessed_close_reason("pty-exit", false, cause), "pty-exit");
+            assert_eq!(
+                witnessed_close_reason("poll-dead", false, cause),
+                "poll-dead"
+            );
+        }
+        assert_eq!(
+            witnessed_close_reason("pty-exit", true, CleanExit),
+            "pty-exit"
+        );
+        assert_eq!(
+            witnessed_close_reason("explicit", false, CleanExit),
+            "explicit"
+        );
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
@@ -7501,13 +7589,14 @@ mod tests {
             r.terminal_id = format!("term-{id}");
             store.record_open(r);
         };
-        open("ended-live");
-        store.record_close("ended-live", witnessed_close_reason("pty-exit", false));
-        open("killed-in-shutdown");
-        store.record_close(
-            "killed-in-shutdown",
-            witnessed_close_reason("pty-exit", true),
-        );
+        let close = |id: &str, observed: &str, quitting: bool, cause: ExitCause| {
+            open(id);
+            store.record_close(id, witnessed_close_reason(observed, quitting, cause));
+        };
+        close("exited-clean", "pty-exit", false, CleanExit);
+        close("holder-gone", "pty-exit", false, Unknown);
+        close("signal-death", "pty-exit", false, Abnormal);
+        close("killed-in-shutdown", "pty-exit", true, CleanExit);
         open("open-at-boot"); // never closed: the runner died under it
         let mut restorable: Vec<String> = store
             .restorable_records(None, true)
@@ -7515,13 +7604,34 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         restorable.sort();
-        assert_eq!(restorable, ["killed-in-shutdown", "open-at-boot"]);
         assert_eq!(
-            store.get("ended-live").unwrap().close_reason.as_deref(),
+            restorable,
+            [
+                "holder-gone",
+                "killed-in-shutdown",
+                "open-at-boot",
+                "signal-death"
+            ]
+        );
+        assert_eq!(
+            store.get("exited-clean").unwrap().close_reason.as_deref(),
             Some(CLAUDE_ENDED_CLOSE_REASON)
         );
         assert!(!crate::restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS
             .contains(&CLAUDE_ENDED_CLOSE_REASON));
+    }
+
+    /// Review S4: the lifecycle poll's dead-shell close is `claude-ended` only
+    /// for a living shell whose `claude` this process saw alive; never seen
+    /// (a false negative on an adopted pane) or a dead PTY keeps `poll-dead`.
+    #[test]
+    fn the_polls_close_is_claude_ended_only_after_claude_was_seen_alive() {
+        let reason =
+            |alive, seen| witnessed_close_reason("poll-dead", false, poll_exit_cause(alive, seen));
+        assert_eq!(reason(Some(true), true), CLAUDE_ENDED_CLOSE_REASON);
+        assert_eq!(reason(Some(true), false), "poll-dead");
+        assert_eq!(reason(Some(false), true), "poll-dead");
+        assert_eq!(reason(None, true), "poll-dead");
     }
 
     /// Nit 4: exactly the listed reasons have a restore grace window.
