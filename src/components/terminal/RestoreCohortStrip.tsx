@@ -22,7 +22,13 @@ import { RotateCcw, X } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { bulkEligible, cohortStripText } from "./restorePlaceholders";
 import { useRestoreCohortRefresh } from "./useRestorePlaceholderBinding";
-import { dismissRestoreCohort, useBulkRestore, useRestoreCohort } from "./useRestoreQueue";
+import {
+  bulkNoteText,
+  dismissRestoreCohort,
+  previewBulk,
+  useBulkRestore,
+  useRestoreCohort,
+} from "./useRestoreQueue";
 import { loadKnownPageIds } from "./useTerminalPages";
 import { drainBannerModel } from "./RunnerDrainBanner";
 import { useCoordDrainState } from "@/hooks/useCoordDrainState";
@@ -83,6 +89,7 @@ export function RestoreCohortStrip({ notify }: { notify: (message: string) => vo
   });
 
   if (text === null) return null;
+  const note = bulkNoteText(previewBulk(cohort.rows));
   return (
     <div
       data-ui-bridge-id="terminal.restore-cohort-strip"
@@ -101,6 +108,16 @@ export function RestoreCohortStrip({ notify }: { notify: (message: string) => vo
         <RotateCcw className="w-3 h-3" />
         Restore all ({eligible})
       </button>
+      {note && (
+        <span
+          data-ui-bridge-id="terminal.restore-cohort-note"
+          role="status"
+          className="text-[10px] text-[#e0af68] truncate max-w-[14rem]"
+          title={note}
+        >
+          {note}
+        </span>
+      )}
       <button
         type="button"
         data-ui-bridge-id="terminal.restore-cohort-dismiss"

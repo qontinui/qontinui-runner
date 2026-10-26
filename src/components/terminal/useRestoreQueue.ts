@@ -112,6 +112,49 @@ export function bulkSkipNotice(r: BulkResult): string | null {
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
+/**
+ * PURE: what a bulk click on `rows` would restore and skip, without enqueueing
+ * anything — the same buckets {@link RestoreQueue.enqueueBulk} uses, with
+ * `enqueued` = how many it would enqueue.
+ */
+export function previewBulk(rows: readonly RestorePlaceholder[]): BulkResult {
+  const r: BulkResult = {
+    enqueued: 0,
+    skippedHeld: 0,
+    skippedFinished: 0,
+    skippedBlocked: 0,
+    skippedLimitHit: 0,
+  };
+  for (const row of rows) {
+    const bucket = cohortBucket(row);
+    if (bucket === "finished") r.skippedFinished++;
+    else if (bucket === "blocked") r.skippedBlocked++;
+    else if (bucket === "limitHit") r.skippedLimitHit++;
+    else if (!bulkEligible(row)) r.skippedHeld++;
+    else r.enqueued++;
+  }
+  return r;
+}
+
+/**
+ * PURE: the standing note beside a bulk button — what it skips, shown BEFORE
+ * any click and whether or not the button is enabled, so a page whose every
+ * row is held or usage-limited still says why nothing restores. `null` when
+ * nothing is skipped.
+ */
+export function bulkNoteText(r: BulkResult): string | null {
+  const parts: string[] = [];
+  if (r.skippedHeld > 0) parts.push(`${r.skippedHeld} held`);
+  if (r.skippedLimitHit > 0) parts.push(`${r.skippedLimitHit} usage-limited`);
+  if (r.skippedFinished > 0) parts.push(`${r.skippedFinished} finished`);
+  if (r.skippedBlocked > 0) parts.push(`${r.skippedBlocked} not restorable yet`);
+  if (parts.length === 0) return null;
+  const list = parts.join(", ");
+  return r.enqueued === 0
+    ? `Nothing to restore — ${list} (restore those by hand)`
+    : `Skips ${list} (restore those by hand)`;
+}
+
 /** PURE: `operator_resume_sessions`' `DoorReply` for one id, as a {@link ResumeVerdict}. */
 export function verdictFromReply(reply: unknown, claudeSessionId: string): ResumeVerdict {
   const r = reply as { status?: unknown; body?: unknown } | null;

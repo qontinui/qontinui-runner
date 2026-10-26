@@ -13,7 +13,7 @@
 import { RotateCcw } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { bulkEligible, type RestorePlaceholder } from "./restorePlaceholders";
-import { useBulkRestore, useRestoreCohort } from "./useRestoreQueue";
+import { bulkNoteText, previewBulk, useBulkRestore, useRestoreCohort } from "./useRestoreQueue";
 import { loadKnownPageIds } from "./useTerminalPages";
 
 /** PURE: this page's placeholders and how many a bulk click restores. */
@@ -28,6 +28,11 @@ export function pageRestoreModel(
 
 export function restorePageId(pageId: string): string {
   return `terminal.restore-page-${pageId}`;
+}
+
+/** The UI Bridge id of the page's standing skip note. */
+export function restorePageNoteId(pageId: string): string {
+  return `terminal.restore-page-note-${pageId}`;
 }
 
 export function RestorePageBar({
@@ -66,6 +71,7 @@ export function RestorePageBar({
   });
 
   if (!model) return null;
+  const note = bulkNoteText(previewBulk(model.rows));
   return (
     <div className="flex items-center gap-2 px-3 py-1 border-b border-[#2a2d3d] bg-[#1a1b26] text-[11px] text-[#a9b1d6]">
       <span className="flex-1 min-w-0 truncate">
@@ -81,6 +87,16 @@ export function RestorePageBar({
         <RotateCcw className="w-3 h-3" />
         Restore all on this page ({model.eligible})
       </button>
+      {note && (
+        <span
+          data-ui-bridge-id={restorePageNoteId(pageId)}
+          role="status"
+          className="text-[10px] text-[#e0af68] truncate max-w-[18rem]"
+          title={note}
+        >
+          {note}
+        </span>
+      )}
     </div>
   );
 }
