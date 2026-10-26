@@ -428,8 +428,11 @@ fn kill_child_tree(child: &mut std::process::Child) {
             "tree kill of pi pid {} failed ({e}); falling back to plain kill",
             child.id()
         );
-        let _ = child.kill();
     }
+    // Unconditional: harmless after a successful tree kill (the Child is
+    // unwaited, so the pid is still ours), and it makes the reap below a
+    // reap of a process this function just killed, on every path.
+    let _ = child.kill();
     let _ = child.wait();
 }
 
