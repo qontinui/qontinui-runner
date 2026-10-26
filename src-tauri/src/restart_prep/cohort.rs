@@ -172,7 +172,10 @@ pub struct CohortRow {
 /// exited (`pty-exit` — a graceful stop fires it on every live pane), or the
 /// liveness poll closed a shell that went idle (`poll-dead`). The same two the
 /// restore set grants a grace window (`restorable_records`).
-pub const RESTART_SHAPED_CLOSE_REASONS: [&str; 2] = ["pty-exit", "poll-dead"];
+/// One list with the boot restore's own (`session_lifecycle_store`): a
+/// session the user ended with `/exit` closes `user-exit`, which is in neither.
+pub const RESTART_SHAPED_CLOSE_REASONS: [&str; 2] =
+    crate::session::session_lifecycle_store::RESTORABLE_CLOSE_REASONS;
 
 impl CohortRow {
     /// The name the panel and the verdict show: the session name, else the
