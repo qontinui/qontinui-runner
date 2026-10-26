@@ -397,11 +397,14 @@ fn copy_transcript_keeps_the_destination_sidecar_when_the_destination_ran_last()
     )
     .unwrap();
 
-    let carried = copy_transcript(
+    // The respawn's mode (`ExtendPrefix`): a migration (`LiveSourceWins`)
+    // would instead move this larger destination aside — the live source wins.
+    let carried = carry_session(
         src_cfg.to_str().unwrap(),
         dst_cfg.to_str().unwrap(),
         working_dir,
         sid,
+        MainTranscript::ExtendPrefix,
     )
     .expect("copy should succeed");
     assert_eq!(carried.session_dir.skipped_present, 1);
@@ -1092,10 +1095,96 @@ fn extend_prefix_keeps_a_diverged_main_transcript() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// W2 — the destination ran the session last (its main transcript is the
-/// larger), so the carry keeps its in-place `custom-title.json`. When the
-/// older source side rewrites its own copy before the delta sync, the sync
-/// must not overwrite the destination's either.
+/// On a migration the live source wins WHATEVER the sizes: a destination
+/// LARGER than the source whose bytes are not the source's (a stale fork that
+/// grew past the live one) is moved aside, and the destination then holds the
+/// source's bytes — previously it read as current, was resumed, and the live
+/// conversation was dropped. The live side's in-place sidecar follows.
+#[test]
+fn a_migration_moves_a_larger_diverged_main_transcript_aside() {
+    let tmp = scratch("diverged-larger");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+    let larger_fork: &[u8] = b"{\"type\":\"user\"}\n{\"fork\":\"a stale fork that kept running and grew past the live one\"}\n";
+    assert!(larger_fork.len() > SRC_MAIN.len());
+    write_main(&dst, larger_fork);
+
+    let carried = carry(&src, &dst);
+    let MainCarry::DivergedPreserved { backup } = &carried.main else {
+        panic!("expected the larger fork preserved, got {:?}", carried.main);
+    };
+    assert_eq!(std::fs::read(backup).unwrap(), larger_fork);
+    assert_eq!(diverged_backups(&dst), vec![backup.clone()]);
+    assert_eq!(read_main(&dst), SRC_MAIN, "the live conversation resumes");
+    assert_eq!(
+        std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"src"}"#,
+        "the live side's in-place sidecar follows the live transcript"
+    );
+    let title = carried
+        .files
+        .iter()
+        .find(|f| f.rel == Path::new("custom-title.json"))
+        .unwrap();
+    assert!(!title.kept_destination_newer, "{title:?}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A destination the SAME size as the source but with other bytes is a fork
+/// too: a size check alone would call it current.
+#[test]
+fn a_migration_moves_a_same_size_different_bytes_main_transcript_aside() {
+    let tmp = scratch("diverged-same-size");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+    // Same length as SRC_MAIN, one byte different near the end.
+    let mut same_size = SRC_MAIN.to_vec();
+    let at = same_size.len() - 3;
+    same_size[at] = b'X';
+    assert_ne!(same_size, SRC_MAIN);
+    write_main(&dst, &same_size);
+
+    let carried = carry(&src, &dst);
+    let MainCarry::DivergedPreserved { backup } = &carried.main else {
+        panic!(
+            "expected the same-size fork preserved, got {:?}",
+            carried.main
+        );
+    };
+    assert_eq!(std::fs::read(backup).unwrap(), same_size);
+    assert_eq!(diverged_backups(&dst), vec![backup.clone()]);
+    assert_eq!(read_main(&dst), SRC_MAIN);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A destination byte-identical to the source is left untouched: `Present`,
+/// no backup file, the same bytes and the same modification time.
+#[test]
+fn a_migration_leaves_a_byte_identical_main_transcript_untouched() {
+    let tmp = scratch("identical");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+    write_main(&dst, SRC_MAIN);
+    let dst_main = crate::terminal::transcript::session_transcript_path(&dst, WD, SID);
+    let mtime_before = std::fs::metadata(&dst_main).unwrap().modified().unwrap();
+
+    let carried = carry(&src, &dst);
+    assert_eq!(carried.main, MainCarry::Present);
+    assert!(diverged_backups(&dst).is_empty(), "no backup file");
+    assert_eq!(read_main(&dst), SRC_MAIN);
+    assert_eq!(
+        std::fs::metadata(&dst_main).unwrap().modified().unwrap(),
+        mtime_before,
+        "the destination was not rewritten"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W2 — outside a migration ([`MainTranscript::ExtendPrefix`], a respawn
+/// topping up from an older holder) the destination ran the session last (its
+/// main transcript is the larger), so the carry keeps its in-place
+/// `custom-title.json`. When the older source side rewrites its own copy
+/// before the delta sync, the sync must not overwrite the destination's either.
 #[test]
 fn delta_sync_never_overwrites_a_sidecar_the_carry_kept_as_newer() {
     let tmp = scratch("delta-kept-newer");
@@ -1114,7 +1203,14 @@ fn delta_sync_never_overwrites_a_sidecar_the_carry_kept_as_newer() {
     );
     write_main(&dst, b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
 
-    let carried = carry(&src, &dst);
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
     assert_eq!(carried.main, MainCarry::Present);
     let title = carried
         .files
