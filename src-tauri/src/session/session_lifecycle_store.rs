@@ -1827,7 +1827,13 @@ impl SessionLifecycleStore {
         // nothing. Read-only here — the register entry is consumed only by the
         // close itself.
         if let Some(t) = expect {
-            if self.superseded_terminals.lock().ok()?.contains(t) {
+            // A poisoned register reads "not superseded", as the close does.
+            if self
+                .superseded_terminals
+                .lock()
+                .map(|s| s.contains(t))
+                .unwrap_or(false)
+            {
                 return None;
             }
         }
@@ -7732,13 +7738,18 @@ mod tests {
             live,
             "prompt_input_exit"
         ));
-        let target = store.close_target("stale-id", Some("term-abc"));
+        // A marker on the stale id too: the redirect still names the live
+        // record, so the live record's marker is the one that is read.
+        let stale = "0d1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6";
+        assert!(crate::session::claude_ended_watch::record_session_end(
+            stale,
+            "prompt_input_exit"
+        ));
+        let target = store.close_target(stale, Some("term-abc"));
         assert_eq!(target.as_deref(), Some(live));
         assert!(target.is_some_and(|t| crate::session::claude_ended_watch::deliberate_end(&t)));
-        assert!(!crate::session::claude_ended_watch::deliberate_end(
-            "stale-id"
-        ));
         crate::session::claude_ended_watch::forget_session_end(live);
+        crate::session::claude_ended_watch::forget_session_end(stale);
     }
 
     /// Nit 4: exactly the listed reasons have a restore grace window.
