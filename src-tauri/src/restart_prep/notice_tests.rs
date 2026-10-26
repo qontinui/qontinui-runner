@@ -1189,9 +1189,14 @@ fn restart_prep_the_notice_is_one_fixed_paragraph() {
         "background shells or watchers",
         "wait",
         "finished",
+        "push ONLY a branch you created yourself",
+        "never another session's branch or a shared checkout's branch",
     ] {
         assert!(n.contains(needed), "{needed}");
     }
+    // v2's unscoped "commit and push your work" made a session push a branch
+    // it did not own; the push must never be asked for unscoped again.
+    assert!(!n.contains("commit and push"), "unscoped push: {n}");
     assert!(!resume_text("abc").contains('\n'));
     assert!(resume_text("abc").contains("cancelled"));
 }

@@ -84,7 +84,7 @@ use crate::session::tracking_health::{SessionWorkStatus, TrackingHealthReport};
 
 /// Bumped when the notice wording changes, so a transcript can be matched to
 /// the template that produced it.
-pub const NOTICE_TEMPLATE_VERSION: u32 = 2;
+pub const NOTICE_TEMPLATE_VERSION: u32 = 3;
 
 /// The notice loop's cadence while a prepare is in its window.
 pub const TICK: Duration = Duration::from_secs(15);
@@ -94,15 +94,21 @@ pub const RESUME_NOTICE_WINDOW_MS: i64 = 30 * 60 * 1000;
 
 /// The fixed save-and-pause notice (D2). One paragraph, no secrets, the
 /// prepare id so the transcript names which prepare asked.
+///
+/// v3: the push is scoped to branches the session itself created. v2 said
+/// "commit and push your work now", and an end-to-end run showed a session
+/// read that as licence to push a branch it did not own (served policy
+/// `git-operations` `own-artifact-lifecycle` / `shared-checkout-route-around`:
+/// another session's branch and a shared checkout's branch are never yours).
 pub fn notice_text(prepare_id: &str) -> String {
     format!(
         "[runner restart prep {prepare_id}, notice v{NOTICE_TEMPLATE_VERSION}] The operator is \
-         preparing to restart this runner. Please commit and push your work now (or WIP-save it if \
-         it is not ready to push), write a one-paragraph note here saying where you are and what \
-         comes next, stop any background shells or watchers you started, then end your turn and \
-         wait: do not start any new long task. This session \
-         will be resumed with this conversation after the restart, so do not mark yourself \
-         finished unless your work really is finished."
+         preparing to restart this runner. Please commit your work now (or WIP-save it); push \
+         ONLY a branch you created yourself, never another session's branch or a shared checkout's \
+         branch. Then write a one-paragraph note here saying where you are and what comes next, \
+         stop any background shells or watchers you started, end your turn and wait: do not \
+         start any new task. This session will be resumed with this conversation after the \
+         restart, so do not mark yourself finished unless your work really is finished."
     )
 }
 
