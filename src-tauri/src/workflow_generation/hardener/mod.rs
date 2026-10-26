@@ -1360,8 +1360,8 @@ endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 2
 
 **Specific endpoint guidance:**
 
-- **`POST /ui-bridge/sdk/ai/search`**: The response is `{"results": [...], "total": N}`.
-  When `total` is 0, the search found NOTHING — but curl still succeeds!
+- **`POST /ui-bridge/sdk/ai/search`**: The response is `{"success": true, "data": {"results": [...], ...}}`.
+  When `data.results` is empty, the search found NOTHING — but curl still succeeds!
   **FIX:** Pipe to `grep` with the expected element text (e.g., `| grep "Settings"`).
 
 - **`GET /ui-bridge/sdk/elements`** or **`GET /ui-bridge/sdk/elements?contentOnly=true`**:

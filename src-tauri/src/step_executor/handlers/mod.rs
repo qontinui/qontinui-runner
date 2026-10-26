@@ -1042,7 +1042,7 @@ Inspect the connected application's UI state:
 curl -s "http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true"
 
 # Search for specific elements by text or attribute
-curl -s "http://localhost:9876/ui-bridge/sdk/ai/search?q=<search_term>"
+curl -s -X POST "http://localhost:9876/ui-bridge/sdk/ai/search" -H "Content-Type: application/json" -d '{{"text": "<search_term>"}}'
 
 # Get full element tree (more detailed, larger response)
 curl -s "http://localhost:9876/ui-bridge/sdk/elements"
