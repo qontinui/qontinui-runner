@@ -68,9 +68,9 @@ src/components/terminal/RestartPrepPanel.tsx:585	literal	component	dismiss	schem
 src/components/terminal/RestoreCohortStrip.tsx:56	literal	component	restore-all	schema=no	arity=0	effect=destructive
 src/components/terminal/RestoreCohortStrip.tsx:67	literal	component	dismiss	schema=no	arity=0	effect=destructive
 src/components/terminal/RestorePageBar.tsx:53	literal	component	restore-all	schema=no	arity=0	effect=destructive
-src/components/terminal/RestorePlaceholderPane.tsx:80	literal	component	restore	schema=no	arity=0	effect=destructive
-src/components/terminal/RestorePlaceholderPane.tsx:91	literal	component	finish	schema=no	arity=0	effect=write
-src/components/terminal/RestorePlaceholderPane.tsx:101	literal	component	toggle-held	schema=no	arity=0	effect=write
+src/components/terminal/RestorePlaceholderPane.tsx:81	literal	component	restore	schema=no	arity=0	effect=destructive
+src/components/terminal/RestorePlaceholderPane.tsx:92	literal	component	finish	schema=no	arity=0	effect=write
+src/components/terminal/RestorePlaceholderPane.tsx:102	literal	component	toggle-held	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx:344	literal	component	resume-selected	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:355	literal	component	capture-now	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx:365	literal	component	refresh	schema=no	arity=0	effect=read

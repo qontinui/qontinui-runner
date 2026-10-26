@@ -96,6 +96,8 @@ export interface BulkResult {
   skippedFinished: number;
   /** Rows the backend says cannot restore yet (`blocker`). */
   skippedBlocked: number;
+  /** Rows whose account hit its usage limit during the prepare: hand restore only. */
+  skippedLimitHit: number;
 }
 
 /** PURE: the operator-facing note for a bulk click, or `null` when nothing was skipped. */
@@ -104,6 +106,9 @@ export function bulkSkipNotice(r: BulkResult): string | null {
   if (r.skippedHeld > 0) parts.push(`skipped ${r.skippedHeld} held`);
   if (r.skippedFinished > 0) parts.push(`skipped ${r.skippedFinished} finished`);
   if (r.skippedBlocked > 0) parts.push(`skipped ${r.skippedBlocked} not restorable yet`);
+  if (r.skippedLimitHit > 0) {
+    parts.push(`skipped ${r.skippedLimitHit} usage-limited (restore by hand)`);
+  }
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
@@ -213,11 +218,13 @@ export class RestoreQueue {
     let skippedHeld = 0;
     let skippedFinished = 0;
     let skippedBlocked = 0;
+    let skippedLimitHit = 0;
     const eligible: RestorePlaceholder[] = [];
     for (const row of rows) {
       const bucket = cohortBucket(row);
       if (bucket === "finished") skippedFinished++;
       else if (bucket === "blocked") skippedBlocked++;
+      else if (bucket === "limitHit") skippedLimitHit++;
       else if (!bulkEligible(row)) skippedHeld++;
       else eligible.push(row);
     }
@@ -231,7 +238,13 @@ export class RestoreQueue {
         a.pageId.localeCompare(b.pageId) ||
         a.zoneIndex - b.zoneIndex,
     );
-    return { enqueued: this.enqueue(eligible), skippedHeld, skippedFinished, skippedBlocked };
+    return {
+      enqueued: this.enqueue(eligible),
+      skippedHeld,
+      skippedFinished,
+      skippedBlocked,
+      skippedLimitHit,
+    };
   }
 
   /**

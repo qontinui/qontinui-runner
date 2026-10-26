@@ -296,6 +296,11 @@ struct CohortMember {
     effort: Option<String>,
     /// Held for a hand restore (D6): only the operator origin restores it.
     held: bool,
+    /// `Some(reset)` for a row that hit its account's usage limit during the
+    /// prepare (`reset` = when that account resets, if known): the resumed
+    /// pane gets the stale-limit guard so its repainted limit text cannot
+    /// migrate it off the account the restore deliberately kept (D3).
+    limit_hit: Option<Option<i64>>,
     /// Whether the restore set withheld THIS row from the webview's boot
     /// restore by serving it as a placeholder
     /// ([`crate::restart_prep::restore::placeholder_served`]). Until it has,
@@ -324,6 +329,7 @@ fn cohort_member(
         terminal_blocker: rec.and_then(|r| terminal_blocker(&r.terminal_id)),
         effort: target.effort.clone(),
         held: target.held,
+        limit_hit: target.limit_hit.then_some(target.limit_reset_at),
         placeholder_served,
         boot_owned: false,
     })
@@ -932,7 +938,18 @@ async fn resume_one(
         .await
     };
     let terminal_id = match spawn {
-        Ok(Ok((terminal_id, _coord_id))) => terminal_id,
+        Ok(Ok((terminal_id, _coord_id))) => {
+            // Armed BEFORE the verify below: the resume repaints the old limit
+            // line within ~2 s, well inside the verification window.
+            if let Some(reset) = cand.cohort.as_ref().and_then(|m| m.limit_hit) {
+                crate::terminal::usage_limit::guard_restored_limit_hit(
+                    &terminal_id,
+                    reset,
+                    chrono::Utc::now().timestamp_millis(),
+                );
+            }
+            terminal_id
+        }
         // Refused before anything started: the box is busy, retry later. The
         // seam's gate can still refuse after the pre-check passed (the box
         // crossed its limit in between); that slot is handed back too.

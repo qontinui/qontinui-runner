@@ -174,6 +174,13 @@ pub struct RestoreTarget {
     pub effort: Option<String>,
     /// Held for a hand restore (D6): only the operator restores it.
     pub held: bool,
+    /// The row hit its account's usage limit during the prepare (D3): the
+    /// restore keeps it on that account, so the resumed pane's repainted
+    /// limit text must not migrate it
+    /// ([`crate::terminal::usage_limit::guard_restored_limit_hit`]).
+    pub limit_hit: bool,
+    /// When that account's exhausted window resets (unix millis), if known.
+    pub limit_reset_at: Option<i64>,
 }
 
 /// The level a row is resumed at: the effort it RAN at, when that was read
@@ -240,6 +247,9 @@ impl RestoringCohort {
                         RestoreTarget {
                             effort: effort_to_apply(row),
                             held: row.held,
+                            limit_hit: row.state_at_prepare
+                                == super::cohort::StateAtPrepare::LimitHit,
+                            limit_reset_at: row.limit_reset_at,
                         },
                     )
                 })

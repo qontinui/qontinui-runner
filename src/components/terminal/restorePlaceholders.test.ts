@@ -20,6 +20,7 @@ import {
   onPlaceholderEvent,
   parsePlaceholderSet,
   placeholderSessionIdOf,
+  restoreButtonLabel,
   restorePlaceholderTabId,
   setPlaceholderFinished,
   setPlaceholderHeld,
@@ -155,11 +156,60 @@ describe("the strip", () => {
       { ...placeholder({ claudeSessionId: "e" }), finished: true },
       { ...placeholder({ claudeSessionId: "f" }), blocker: "boot_restore_owns_row" },
     ];
-    expect(cohortCounts(rows)).toEqual({ waiting: 2, held: 2, finished: 1, blocked: 1 });
+    expect(cohortCounts(rows)).toEqual({
+      waiting: 2,
+      held: 2,
+      finished: 1,
+      blocked: 1,
+      limitHit: 0,
+    });
     expect(rows.filter(bulkEligible).map((r) => r.claudeSessionId)).toEqual(["a", "b"]);
     expect(cohortStripText(rows, null)).toBe(
       "Restart cohort from an earlier prepare: 2 waiting · 2 held · 1 blocked · 1 finished",
     );
+  });
+});
+
+describe("a usage-limited (limit_hit) row", () => {
+  const NOW = Date.parse("2026-10-26T06:00:00Z");
+  const limited = (o: Partial<RestorePlaceholder> = {}): RestorePlaceholder => ({
+    ...placeholder({ claudeSessionId: "lim" }),
+    stateAtPrepare: "limit_hit",
+    accountLabel: "ben",
+    limitResetAt: NOW + 3_600_000,
+    ...o,
+  });
+
+  it("is never bulk-eligible, and the strip counts it apart", () => {
+    const rows = [placeholder({ claudeSessionId: "a" }), limited()];
+    expect(rows.filter(bulkEligible).map((r) => r.claudeSessionId)).toEqual(["a"]);
+    expect(cohortCounts(rows)).toEqual({
+      waiting: 1,
+      held: 0,
+      finished: 0,
+      blocked: 0,
+      limitHit: 1,
+    });
+    expect(cohortStripText(rows, null)).toBe(
+      "Restart cohort from an earlier prepare: 1 waiting · 0 held · 1 usage-limited",
+    );
+    // An unheld limit_hit row is still not bulk-eligible.
+    expect(bulkEligible(limited({ held: false }))).toBe(false);
+  });
+
+  it("labels its Restore with the account and its reset time", () => {
+    expect(restoreButtonLabel(limited(), NOW)).toMatch(/^Account ben resets at /);
+    expect(restoreButtonLabel(limited({ limitResetAt: null }), NOW)).toBe(
+      "Account ben · reset time unknown",
+    );
+    expect(restoreButtonLabel(limited({ accountLabel: null, configDir: "/cfg/x" }), NOW)).toMatch(
+      /^Account \/cfg\/x resets at /,
+    );
+    // Past the recorded reset: an ordinary Restore that still names the account.
+    expect(restoreButtonLabel(limited({ limitResetAt: NOW - 1 }), NOW)).toMatch(
+      /^Restore \(account ben reset at /,
+    );
+    expect(restoreButtonLabel(placeholder(), NOW)).toBe("Restore");
   });
 });
 

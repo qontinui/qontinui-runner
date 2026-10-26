@@ -127,7 +127,7 @@ describe("RestoreQueue", () => {
     expect(h.calls).toEqual(["a", "a"]);
   });
 
-  it("bulk skips held, finished and blocked rows and says how many", () => {
+  it("bulk skips held, finished, blocked and usage-limited rows and says how many", () => {
     const h = harness();
     const r = h.queue.enqueueBulk([
       row("a"),
@@ -135,13 +135,27 @@ describe("RestoreQueue", () => {
       row("unread", { held: null }),
       row("done", { finished: true }),
       row("blocked", { blocker: "boot_restore_owns_row" }),
+      row("limited", { stateAtPrepare: "limit_hit", limitResetAt: Date.now() + 3_600_000 }),
     ]);
-    expect(r).toEqual({ enqueued: 1, skippedHeld: 2, skippedFinished: 1, skippedBlocked: 1 });
+    expect(r).toEqual({
+      enqueued: 1,
+      skippedHeld: 2,
+      skippedFinished: 1,
+      skippedBlocked: 1,
+      skippedLimitHit: 1,
+    });
     expect(bulkSkipNotice(r)).toBe(
-      "skipped 2 held · skipped 1 finished · skipped 1 not restorable yet",
+      "skipped 2 held · skipped 1 finished · skipped 1 not restorable yet · " +
+        "skipped 1 usage-limited (restore by hand)",
     );
     expect(
-      bulkSkipNotice({ enqueued: 3, skippedHeld: 0, skippedFinished: 0, skippedBlocked: 0 }),
+      bulkSkipNotice({
+        enqueued: 3,
+        skippedHeld: 0,
+        skippedFinished: 0,
+        skippedBlocked: 0,
+        skippedLimitHit: 0,
+      }),
     ).toBeNull();
     expect(h.calls).toEqual(["a"]);
   });

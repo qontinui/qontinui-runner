@@ -229,36 +229,64 @@ export function stateAtPrepareText(p: RestorePlaceholder): string {
 }
 
 /**
+ * Whether the row's account ran out of usage during the prepare (D3). Such a
+ * row is restored by hand only: a restore keeps it on that same account, so a
+ * bulk click must never resume it onto an account that may still be
+ * exhausted.
+ */
+export function isLimitHit(p: RestorePlaceholder): boolean {
+  return p.stateAtPrepare === "limit_hit";
+}
+
+/**
  * Whether a bulk button restores this row: unheld (read, not unknown),
- * unfinished, and not blocked — a blocked row's restore can only be refused.
+ * unfinished, not usage-limited, and not blocked — a blocked row's restore can
+ * only be refused.
  */
 export function bulkEligible(p: RestorePlaceholder): boolean {
-  return p.held === false && !p.finished && p.blocker === null;
+  return p.held === false && !p.finished && p.blocker === null && !isLimitHit(p);
 }
 
 /**
  * The strip's counts, each row in exactly one: finished, else blocked, else
- * held (a hold not read yet counts as held), else waiting.
+ * usage-limited, else held (a hold not read yet counts as held), else waiting.
  */
 export interface CohortCounts {
   waiting: number;
   held: number;
   finished: number;
   blocked: number;
+  limitHit: number;
 }
 
 /** PURE: which count a row falls in (see {@link CohortCounts}). */
 export function cohortBucket(p: RestorePlaceholder): keyof CohortCounts {
   if (p.finished) return "finished";
   if (p.blocker !== null) return "blocked";
+  if (isLimitHit(p)) return "limitHit";
   if (p.held !== false) return "held";
   return "waiting";
 }
 
 export function cohortCounts(rows: readonly RestorePlaceholder[]): CohortCounts {
-  const c: CohortCounts = { waiting: 0, held: 0, finished: 0, blocked: 0 };
+  const c: CohortCounts = { waiting: 0, held: 0, finished: 0, blocked: 0, limitHit: 0 };
   for (const r of rows) c[cohortBucket(r)]++;
   return c;
+}
+
+/**
+ * The placeholder's Restore button label. A usage-limited row names its
+ * account and when it resets (D3: "Account <label> resets at <time>"), so a
+ * click is a deliberate choice to resume it on that account anyway; once the
+ * recorded reset has passed it reads as an ordinary Restore that still names
+ * the account. An unknown reset reads UNKNOWN, never a guessed time.
+ */
+export function restoreButtonLabel(p: RestorePlaceholder, nowMs: number = Date.now()): string {
+  if (!isLimitHit(p)) return "Restore";
+  const account = p.accountLabel ?? p.configDir ?? "(account unknown)";
+  if (p.limitResetAt === null) return `Account ${account} · reset time unknown`;
+  if (p.limitResetAt > nowMs) return `Account ${account} resets at ${formatTime(p.limitResetAt)}`;
+  return `Restore (account ${account} reset at ${formatTime(p.limitResetAt)})`;
 }
 
 /**
@@ -278,6 +306,7 @@ export function cohortStripText(
   if (rows.length === 0) return `Restart cohort from ${from}: nothing waiting to restore`;
   const c = cohortCounts(rows);
   const parts = [`${c.waiting} waiting`, `${c.held} held`];
+  if (c.limitHit > 0) parts.push(`${c.limitHit} usage-limited`);
   if (c.blocked > 0) parts.push(`${c.blocked} blocked`);
   if (c.finished > 0) parts.push(`${c.finished} finished`);
   return `Restart cohort from ${from}: ${parts.join(" · ")}`;

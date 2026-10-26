@@ -27,6 +27,7 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import {
   effortBadgeText,
   placeholderSessionIdOf,
+  restoreButtonLabel,
   setPlaceholderFinished,
   setPlaceholderHeld,
   stateAtPrepareText,
@@ -79,7 +80,7 @@ export function RestorePlaceholderPane({ tabId }: { tabId: string }) {
     actions: [
       {
         id: "restore",
-        label: "Restore",
+        label: row ? restoreButtonLabel(row) : "Restore",
         description: "Queue this session for a verified backend resume under its own account.",
         // `destructive` — starts a `claude --resume` process (as
         // `since-restart.resume-selected`).
@@ -166,7 +167,7 @@ export function RestorePlaceholderPane({ tabId }: { tabId: string }) {
           className="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] bg-[#7aa2f7]/20 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 disabled:opacity-50"
         >
           <RotateCcw className="w-3 h-3" />
-          {phase?.phase === "failed" ? "Retry" : "Restore"}
+          {phase?.phase === "failed" ? "Retry" : restoreButtonLabel(row)}
         </button>
         <button
           type="button"
