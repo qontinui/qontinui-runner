@@ -708,7 +708,7 @@ async fn materialize(
 
     // 4. The transcript, into the TARGET account's project dir.
     // On the blocking pool: the copy can be a whole `<sid>/` tree from several
-    // account dirs (up to ~125 MB per session measured 2026-10-12).
+    // account dirs, which for a long fan-out is many megabytes.
     let mut have_transcript = {
         let (config_dir, working_dir, claude_session_id) = (
             config_dir.clone(),

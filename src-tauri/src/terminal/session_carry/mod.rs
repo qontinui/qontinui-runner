@@ -154,8 +154,8 @@ pub(crate) struct DeltaSync {
     pub failed: usize,
 }
 
-/// Nesting bound for the `<sid>/` carry. Measured 2026-10-12, Claude Code
-/// writes one level of directories under `<sid>/` (`subagents/`,
+/// Nesting bound for the `<sid>/` carry. The session directories seen so far
+/// hold one level of directories under `<sid>/` (`subagents/`,
 /// `tool-results/`) plus top-level files such as `custom-title.json`; the bound
 /// only stops a pathological tree.
 const SESSION_DIR_MAX_DEPTH: usize = 8;
@@ -883,12 +883,15 @@ where
     }
     let partial = write_partial(from, to)?;
     // Not `rename_with_retry`: the stamp is checked again before the one
-    // retry, never assumed unchanged across the pause. An open handle does
-    // NOT protect the destination: on Windows `std::fs::rename` replaces with
-    // POSIX semantics and node opens files with `FILE_SHARE_DELETE`, so a live
-    // writer's handle does not stop the replace. A `PermissionDenied` is more
-    // likely a transient filter (antivirus, indexer) or an opener without
-    // share-delete — and whatever caused it, the destination may have moved on.
+    // retry, never assumed unchanged across the pause. On Windows the
+    // toolchain's `std::fs::rename` calls `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING` and, on `ERROR_ACCESS_DENIED`, retries as a
+    // `FileRenameInfoEx` rename with `FILE_RENAME_FLAG_POSIX_SEMANTICS`. A
+    // writer holding the destination WITHOUT `FILE_SHARE_DELETE` makes the
+    // rename fail; so can a transient filter (antivirus, indexer). The one
+    // `PermissionDenied` retry below and the back-out after it handle that —
+    // the partial is removed and nothing is replaced — and whatever caused
+    // the failure, the destination may have moved on.
     let mut attempt = 0;
     let outcome = loop {
         if FileStamp::of(to) != expected {
