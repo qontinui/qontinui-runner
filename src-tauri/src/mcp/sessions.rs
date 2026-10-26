@@ -1589,6 +1589,29 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
     }))
 }
 
+/// `POST /sessions/{id}/session-end` — the Claude Code `SessionEnd` hook's
+/// landing pad (review round 12 S1; script `claude_session_end_hook.sh`).
+/// `{id}` is the terminal id the hook sends and is informational only: the
+/// deliberate-end marker is keyed by the payload's own `session_id` (the
+/// Claude session id the lifecycle records carry). Body = the raw payload,
+/// parsed leniently. Always 200 — the hook ignores the answer and must never
+/// hold up an exit; `recorded` says whether a marker was written (only for
+/// reason `prompt_input_exit`, see `claude_ended_watch::DELIBERATE_END_REASONS`).
+async fn session_end(Path(id): Path<String>, body: axum::body::Bytes) -> Json<serde_json::Value> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let recorded = crate::session::claude_ended_watch::record_session_end_payload(&payload);
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    tracing::info!(
+        terminal = %id,
+        claude_session = %payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("?"),
+        reason,
+        recorded,
+        "SessionEnd hook report"
+    );
+    Json(serde_json::json!({ "recorded": recorded, "reason": reason, "terminal": id }))
+}
+
 // =============================================================================
 // /sessions/<id>/notification
 // =============================================================================
@@ -2507,6 +2530,30 @@ mod tests {
         let req: SpawnSessionRequest = serde_json::from_str(r#"{"task_name":"t"}"#).unwrap();
         assert!(req.cwd.is_none());
     }
+
+    /// Review round 12 S1: the SessionEnd hook's POST records the
+    /// deliberate-end marker for the payload's session — and only for `/exit`.
+    #[tokio::test]
+    async fn a_session_end_hook_post_records_the_marker() {
+        let id = "sessions-route-session-end-marker";
+        let other = session_end(
+            Path("term-x".to_string()),
+            axum::body::Bytes::from(format!(r#"{{"session_id":"{id}","reason":"other"}}"#)),
+        )
+        .await;
+        assert_eq!(other.0["recorded"], false);
+        assert!(!crate::session::claude_ended_watch::deliberate_end(id));
+        let exit = session_end(
+            Path("term-x".to_string()),
+            axum::body::Bytes::from(format!(
+                r#"{{"session_id":"{id}","reason":"prompt_input_exit"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(exit.0["recorded"], true);
+        assert!(crate::session::claude_ended_watch::deliberate_end(id));
+        crate::session::claude_ended_watch::forget_session_end(id);
+    }
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -2523,6 +2570,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(continuation_verdict),
         )
         .route("/sessions/{id}/context-low", post(context_low))
+        .route("/sessions/{id}/session-end", post(session_end))
         .route(
             "/sessions/{id}/notification",
             post(operator_touch_notification),

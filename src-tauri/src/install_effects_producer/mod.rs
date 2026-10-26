@@ -289,6 +289,10 @@ async fn post_session_open(
     match store {
         Some(store) => {
             record_session_open_into(&store, &req, &provider);
+            // A (re)started session carries no earlier run's `/exit` report:
+            // a resume of the same id (boot restore, account migration) must
+            // not be closed `claude-ended` on its own later crash.
+            crate::session::claude_ended_watch::forget_session_end(&req.session_id);
             info!(
                 terminal_id = %req.terminal_id,
                 session_id = %req.session_id,

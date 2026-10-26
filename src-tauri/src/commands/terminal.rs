@@ -1624,34 +1624,48 @@ pub fn terminal_session_record_close(
     reason: String,
 ) -> Result<CommandResponse, String> {
     // The pane's own exit is a deliberate end (`claude-ended`, never
-    // auto-resumed) only when its process exited on its own with status 0 —
-    // what `claude` does on `/exit` — while this runner is alive and not
-    // shutting down. A signal death, a non-zero status, a runner-requested
-    // close or an exit with no recorded status (a PTY holder that died) keeps
-    // the restart-shaped reason: those are not the user ending the session.
-    let cause = terminal_id
-        .as_deref()
-        .and_then(|tid| {
-            use tauri::Manager;
-            let app = crate::tauri_app_handle::current()?;
+    // auto-resumed) only when the session REPORTED one (its `SessionEnd` hook,
+    // reason `prompt_input_exit`) and the runner did not request the exit,
+    // while this runner is alive and not shutting down. A status 0 alone is
+    // not enough (Claude Code also exits 0 on SIGINT and on its orphan check);
+    // a signal death, a non-zero status or no recorded status (a PTY holder
+    // that died) keeps the restart-shaped reason.
+    //
+    // The exit facts come from the live session, else from the waiter's
+    // record of them (taken before it emitted the exit): a session already
+    // removed by `close_after_graceful_exit` must not read as unknown, which
+    // would drop its `close_requested` (review round 12 N3).
+    let deliberate = crate::session::claude_ended_watch::deliberate_end(&claude_session_id);
+    let facts = terminal_id.as_deref().and_then(|tid| {
+        use tauri::Manager;
+        let live = crate::tauri_app_handle::current().and_then(|app| {
             let tm = app.try_state::<Arc<crate::terminal::TerminalManager>>()?;
-            tm.get(tid)?.exit_snapshot()
-        })
-        .map_or(
-            crate::session::session_lifecycle_store::ExitCause::Unknown,
-            |(facts, _)| {
-                crate::session::session_lifecycle_store::ExitCause::of_pane_exit(
-                    facts.code,
-                    facts.close_requested,
-                )
-            },
-        );
+            tm.get(tid)?.exit_snapshot().map(|(facts, _)| facts)
+        });
+        live.or_else(|| crate::terminal::session::recent_exit_facts(tid))
+    });
+    let cause = match facts {
+        Some(facts) => crate::session::session_lifecycle_store::ExitCause::of_pane_exit(
+            facts.code,
+            facts.close_requested,
+            deliberate,
+        ),
+        None => crate::session::session_lifecycle_store::ExitCause::of_pane_exit(
+            None, false, deliberate,
+        ),
+    };
     let reason = crate::session::session_lifecycle_store::witnessed_close_reason(
         &reason,
         crate::commands::terminal_windows::is_app_quitting(),
         cause,
     );
     let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), reason);
+    if matches!(
+        outcome,
+        crate::session::session_lifecycle_store::CloseOutcome::Closed { .. }
+    ) {
+        crate::session::claude_ended_watch::forget_session_end(&claude_session_id);
+    }
     Ok(close_outcome_response(&outcome))
 }
 

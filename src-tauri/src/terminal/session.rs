@@ -1445,6 +1445,39 @@ impl PaneExitFacts {
     }
 }
 
+/// How long [`recent_exit_facts`] keeps a pane's exit facts after it exited.
+const RECENT_EXIT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Each pane's exit facts, recorded by its waiter BEFORE it emits the exit
+/// (review round 12 N3): the close the frontend records in answer to that exit
+/// may arrive after the session was already removed from the manager
+/// (`close_after_graceful_exit`), when [`TerminalSession::exit_snapshot`] can
+/// no longer be reached. Pruned past [`RECENT_EXIT_TTL`] on every insert.
+static RECENT_EXITS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (PaneExitFacts, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// Record `terminal_id`'s exit facts (the waiter, before it emits the exit).
+pub(crate) fn note_recent_exit(terminal_id: &str, facts: PaneExitFacts) {
+    let now = std::time::Instant::now();
+    let mut guard = RECENT_EXITS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|_, (_, at)| now.duration_since(*at) < RECENT_EXIT_TTL);
+    map.insert(terminal_id.to_string(), (facts, now));
+}
+
+/// The exit facts `terminal_id`'s waiter recorded, if it exited within
+/// [`RECENT_EXIT_TTL`] — whether or not the session is still registered.
+pub fn recent_exit_facts(terminal_id: &str) -> Option<PaneExitFacts> {
+    RECENT_EXITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(terminal_id)
+        .filter(|(_, at)| at.elapsed() < RECENT_EXIT_TTL)
+        .map(|(facts, _)| *facts)
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -2432,6 +2465,9 @@ impl TerminalSession {
                 if let Ok(mut snap) = waiter_exit_snapshot.lock() {
                     *snap = Some((exit_facts, std::time::Instant::now()));
                 }
+                // Kept past the session's removal, for the close the frontend
+                // records in answer to the exit emitted below.
+                note_recent_exit(&waiter_id, exit_facts);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -5887,6 +5923,19 @@ pub(crate) mod tests {
     /// frozen snapshot is never rewritten by a later close of the dead tab, and
     /// `agent_exit_code` keeps the operator-touch semantics of
     /// `on_exit_hook_code`.
+    /// Review round 12 N3: the exit facts survive the session's removal, so
+    /// the close recorded after a graceful-exit removal keeps its cause.
+    #[test]
+    fn recent_exit_facts_outlive_the_session() {
+        let facts = PaneExitFacts {
+            code: Some(0),
+            close_requested: true,
+        };
+        assert_eq!(recent_exit_facts("recent-exit-test-pane"), None);
+        note_recent_exit("recent-exit-test-pane", facts);
+        assert_eq!(recent_exit_facts("recent-exit-test-pane"), Some(facts));
+    }
+
     #[test]
     fn exit_snapshot_is_frozen_and_agent_exit_code_hides_runner_kills() {
         let s = make_test_session(Arc::new(Mutex::new(Vec::new())));

@@ -1,20 +1,24 @@
-//! Prompt detection of a `claude` that ended under a living shell.
+//! Prompt detection of a `claude` that the user ended under a living shell.
 //!
 //! When the user types `/exit` in a pane whose shell outlives `claude`, the
-//! PTY does not exit, so the only signal is `claude` disappearing from the
-//! pane's process tree. The 45 s lifecycle poll debounces that for several
-//! ticks (`LIVE_SHELL_DEAD_TICKS`), so such a record stayed `open` for two to
-//! three minutes — and a runner killed in that window brought the session back
-//! at its next boot (E2E, round 10). This watch closes it in seconds instead,
-//! as [`CLAUDE_ENDED_CLOSE_REASON`]: the live runner saw it end, so it is not a
-//! restart's death and is never auto-resumed.
+//! PTY does not exit, so the runner sees only `claude` disappearing from the
+//! pane's process tree. That alone cannot tell `/exit` from an OOM kill, a
+//! SIGKILL or a crash: `claude` is the shell's child, so its exit status is
+//! invisible. The positive evidence is Claude Code's own `SessionEnd` hook
+//! (delivered by `session::claude_hook`), which fires on `/exit` with reason
+//! `prompt_input_exit` and does not fire on a SIGKILL or OOM kill. It reports
+//! to `POST /sessions/{id}/session-end`, which records a per-session
+//! deliberate-end marker here ([`record_session_end`]).
 //!
-//! It closes a record ONLY after it has itself seen that pane's `claude`
-//! alive and then missing for [`MISSES_TO_CLOSE`] consecutive ticks — never a
-//! pane whose `claude` it has not yet seen start (a boot restore still typing
-//! `claude --resume`, a freshly spawned pane). It never acts while the runner
-//! is shutting down, on an unreadable process table, or on a record held for
-//! a restore or an account choice.
+//! This watch then closes such a record in seconds (the 45 s lifecycle poll
+//! debounces for minutes, and a runner killed in that window brought the
+//! session back at boot — E2E, round 10) as [`CLAUDE_ENDED_CLOSE_REASON`]:
+//! never auto-resumed. It closes a record ONLY with the marker, and only after
+//! it has itself seen that pane's `claude` alive and then missing for
+//! [`MISSES_TO_CLOSE`] consecutive ticks. Without the marker, `claude` gone is
+//! left to the poll, which closes it `poll-dead` — restorable. It never acts
+//! while the runner is shutting down, on an unreadable process table, or on a
+//! record held for a restore or an account choice.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -31,40 +35,96 @@ pub const TICK: Duration = Duration::from_secs(5);
 /// before the record is closed.
 pub const MISSES_TO_CLOSE: u32 = 2;
 
-/// Terminals in which this process has SEEN a `claude` alive — by this watch
-/// or by the 45 s lifecycle poll. A `claude` missing from a pane only counts as
-/// having ENDED there (a deliberate end, `claude-ended`) when it was seen alive
-/// in it first; a pane whose `claude` was never seen — an adopted pane under
-/// the PID-reuse guard, a root whose `comm` is not `claude`, a boot restore
-/// still typing the resume — keeps the restart-shaped close.
-static SEEN_ALIVE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The `SessionEnd` reasons that are POSITIVE evidence the user ended the
+/// session on purpose. Claude Code sends one of `clear`, `resume`, `logout`,
+/// `prompt_input_exit`, `other` (read off the 2.1.304 bundle's own list):
+///
+/// * `prompt_input_exit` — the input box's exit: `/exit`, a double Ctrl-D, the
+///   "exit to background" dialog. The only deliberate END.
+/// * `clear` / `resume` — `/clear` and `/resume` end one session id and carry
+///   on in the same process: the pane's `claude` did not end.
+/// * `logout` — the user logged out; the session is not finished, and a resume
+///   after logging back in is wanted. Not counted (conservative: restorable).
+/// * `other` — every other graceful shutdown, which in that bundle is where
+///   SIGINT (`shutdown(0)`), SIGTERM (`shutdown(143)`), SIGHUP (`shutdown(129)`)
+///   and the orphan check (its parent / terminal gone, `shutdown(0)`) land.
+///   Those are a restart's deaths, so never a marker.
+///
+/// A SIGKILL / OOM kill / crash fires no `SessionEnd` at all, so it leaves no
+/// marker — which is the point: no marker, no `claude-ended`.
+pub const DELIBERATE_END_REASONS: [&str; 1] = ["prompt_input_exit"];
 
-/// Record that `terminal_id`'s pane hosts a live `claude` right now.
-pub fn note_claude_seen(terminal_id: &str) {
-    SEEN_ALIVE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashSet::new)
-        .insert(terminal_id.to_string());
+/// Most markers kept: a marker is consumed when its record closes, so the map
+/// stays small; this only bounds sessions whose record closed elsewhere.
+const MAX_MARKERS: usize = 1024;
+
+/// Claude sessions whose `SessionEnd` hook reported a deliberate end
+/// ([`DELIBERATE_END_REASONS`]), keyed by the CLAUDE session id the hook
+/// payload carries (so a second session in the same terminal never inherits
+/// it), valued by when it was recorded (for the bound's eviction).
+static DELIBERATE_ENDS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Whether this process has seen a `claude` alive in `terminal_id`'s pane.
-pub fn claude_seen(terminal_id: &str) -> bool {
-    SEEN_ALIVE
+/// The `SessionEnd` hook's report for `claude_session_id`: records the
+/// deliberate-end marker when `reason` is one of [`DELIBERATE_END_REASONS`].
+/// `true` when a marker was recorded.
+pub fn record_session_end(claude_session_id: &str, reason: &str) -> bool {
+    let id = claude_session_id.trim();
+    if id.is_empty() || !DELIBERATE_END_REASONS.contains(&reason) {
+        return false;
+    }
+    let mut guard = DELIBERATE_ENDS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= MAX_MARKERS && !map.contains_key(id) {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(id.to_string(), now_ms());
+    true
+}
+
+/// [`record_session_end`] over the hook's raw payload (`{session_id, reason,
+/// ...}`): what `POST /sessions/{id}/session-end` does with its body.
+pub fn record_session_end_payload(payload: &serde_json::Value) -> bool {
+    match (
+        payload.get("session_id").and_then(|v| v.as_str()),
+        payload.get("reason").and_then(|v| v.as_str()),
+    ) {
+        (Some(id), Some(reason)) => record_session_end(id, reason),
+        _ => false,
+    }
+}
+
+/// Whether `claude_session_id` reported a deliberate end.
+pub fn deliberate_end(claude_session_id: &str) -> bool {
+    DELIBERATE_ENDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|s| s.contains(terminal_id))
+        .is_some_and(|m| m.contains_key(claude_session_id))
 }
 
-/// Forget a pane (its terminal is gone, or its record was closed).
-pub fn forget_pane(terminal_id: &str) {
-    if let Some(s) = SEEN_ALIVE
+/// Drop `claude_session_id`'s marker: its record closed (consumed), or the
+/// session (re)started — a resume of the same id after an account migration
+/// or a boot restore must not inherit the previous run's `/exit`.
+pub fn forget_session_end(claude_session_id: &str) {
+    if let Some(m) = DELIBERATE_ENDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
     {
-        s.remove(terminal_id);
+        m.remove(claude_session_id);
     }
 }
 
@@ -118,7 +178,7 @@ impl EndedWatch {
 /// table snapshot is a cheap `/proc` walk there; on Windows the same snapshot
 /// is a PowerShell + WMI query (seconds of CPU), too heavy every 5 s. Windows
 /// keeps the 45 s lifecycle poll's witnessed rule instead (slower, but the
-/// same decision), which also feeds [`note_claude_seen`].
+/// same decision).
 pub fn spawn() {
     if !cfg!(unix) {
         return;
@@ -197,16 +257,17 @@ async fn tick_live(watch: &mut EndedWatch) {
                 })
             });
     }
-    for (terminal_id, present) in &present_by_terminal {
-        if *present == Some(true) {
-            note_claude_seen(terminal_id);
-        }
-    }
     for (id, terminal_id, _) in candidates {
         let Some(present) = present_by_terminal.get(&terminal_id).copied().flatten() else {
             continue; // the shell itself is gone: the PTY exit decides
         };
+        // Gone from a living pane is `claude-ended` only with the session's
+        // own deliberate-end report (`SessionEnd` `prompt_input_exit`): `claude`
+        // is the shell's child, so its exit status is invisible here, and a
+        // SIGKILL / OOM kill / crash looks exactly like `/exit` without it.
+        // Without the marker the 45 s poll closes it `poll-dead` (restorable).
         if watch.observe(&terminal_id, &id, present)
+            && deliberate_end(&id)
             && !crate::commands::terminal_windows::is_app_quitting()
         {
             info!(
@@ -215,6 +276,7 @@ async fn tick_live(watch: &mut EndedWatch) {
                 "claude-ended watch: claude is gone from a living pane — closing {CLAUDE_ENDED_CLOSE_REASON}"
             );
             store.record_close_checked(&id, Some(&terminal_id), CLAUDE_ENDED_CLOSE_REASON);
+            forget_session_end(&id);
         }
     }
 }
@@ -287,13 +349,40 @@ mod tests {
         assert!(w.observe("kept", "s", false));
     }
 
+    /// Review round 12 S1: only `prompt_input_exit` is a marker; a signal's
+    /// graceful shutdown (`other`), `/clear`, `/resume` and `logout` are not.
+    /// Keyed per CLAUDE session, and forgotten on close or restart.
     #[test]
-    fn the_seen_alive_register_is_per_terminal() {
-        let t = "claude-ended-watch-seen-register";
-        assert!(!claude_seen(t));
-        note_claude_seen(t);
-        assert!(claude_seen(t));
-        forget_pane(t);
-        assert!(!claude_seen(t));
+    fn only_a_prompt_input_exit_records_the_deliberate_end_marker() {
+        let id = "claude-ended-watch-marker-a";
+        for reason in ["other", "clear", "resume", "logout", ""] {
+            assert!(!record_session_end(id, reason), "{reason}");
+            assert!(!deliberate_end(id), "{reason}");
+        }
+        assert!(record_session_end(id, "prompt_input_exit"));
+        assert!(deliberate_end(id));
+        assert!(
+            !deliberate_end("claude-ended-watch-marker-b"),
+            "per session"
+        );
+        forget_session_end(id);
+        assert!(!deliberate_end(id));
+    }
+
+    /// A hook POST body records the marker (what the route does with it).
+    #[test]
+    fn a_session_end_payload_records_the_marker() {
+        let id = "claude-ended-watch-marker-payload";
+        assert!(!record_session_end_payload(
+            &serde_json::json!({"session_id": id, "reason": "other"})
+        ));
+        assert!(!record_session_end_payload(
+            &serde_json::json!({"reason": "prompt_input_exit"})
+        ));
+        assert!(record_session_end_payload(&serde_json::json!({
+            "session_id": id, "reason": "prompt_input_exit", "hook_event_name": "SessionEnd"
+        })));
+        assert!(deliberate_end(id));
+        forget_session_end(id);
     }
 }

@@ -8,8 +8,8 @@
 //! Phase-0 probe PROVED that a `SessionStart` hook supplied ONLY via
 //! `claude --settings <file>` fires on both, additively — Claude MERGES the
 //! `--settings` file's hooks on top of any `~/.claude` config WITHOUT writing
-//! to it. So the entire delivery is FIVE runner-owned files in the runner's OWN
-//! app-data dir (`~/.qontinui/runner/session-restore/`) — four bundled scripts
+//! to it. So the entire delivery is SIX runner-owned files in the runner's OWN
+//! app-data dir (`~/.qontinui/runner/session-restore/`) — five bundled scripts
 //! and the one `--settings` carrier that registers them ([`hook_files`] is the
 //! roster):
 //!
@@ -21,6 +21,9 @@
 //!     the substitution to key on the placeholder, not the event).
 //!   * `claude_precompact_hook.sh` — the context-exhaustion signal.
 //!     `PreCompact`, unconditional.
+//!   * `claude_session_end_hook.sh` — the deliberate-end report (`/exit` is
+//!     reason `prompt_input_exit`) the boot restore keys on to tell a session
+//!     the user ended from one a kill ended. `SessionEnd`, unconditional.
 //!   * `claude_stop_hook.sh` — the continuation verdict. `Stop`, and the ONLY
 //!     one whose REGISTRATION is gated.
 //!   * `claude_hook_settings.json` / `claude_hook_settings-nostop.json` —
@@ -68,7 +71,7 @@
 //! ## Materialization
 //!
 //! [`materialize`] is idempotent, and CACHED: the first call in a process
-//! writes all five files (cheap, a few hundred bytes each) and every later call
+//! writes all six files (cheap, a few hundred bytes each) and every later call
 //! for the same (`base_dir`, variant) costs one `stat` per file — see
 //! [`cached_materialization`]. A runner upgrade that ships a newer template
 //! still refreshes them because it is a NEW PROCESS, not because each call
@@ -111,6 +114,14 @@ const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/cla
 /// session is behaviorally inert until the flag is armed.
 const PRECOMPACT_HOOK_SCRIPT: &str =
     include_str!("../../resources/session-restore/claude_precompact_hook.sh");
+/// SessionEnd-hook script template (bundled) — the deliberate-end report
+/// (review round 12 S1). A dumb, bounded curl (1 s connect, 2 s total, always
+/// exit 0) forwarding the `SessionEnd` payload to the runner's
+/// `POST /sessions/{id}/session-end`; which reasons count as a deliberate end
+/// is decided there (`session::claude_ended_watch`). Registered
+/// unconditionally, like PreCompact.
+const SESSION_END_HOOK_SCRIPT: &str =
+    include_str!("../../resources/session-restore/claude_session_end_hook.sh");
 /// Policy-injection hook script template (bundled) — the SECOND `SessionStart`
 /// command (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1). It rides
 /// the same `SessionStart` block as [`HOOK_SCRIPT`] rather than extending it,
@@ -151,6 +162,8 @@ const HOOK_SCRIPT_NAME: &str = "claude_session_hook.sh";
 const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
 /// File name of the materialized PreCompact-hook script.
 const PRECOMPACT_HOOK_SCRIPT_NAME: &str = "claude_precompact_hook.sh";
+/// File name of the materialized SessionEnd-hook script.
+const SESSION_END_HOOK_SCRIPT_NAME: &str = "claude_session_end_hook.sh";
 /// File name of the materialized SessionStart policy-injection script.
 const POLICY_HOOK_SCRIPT_NAME: &str = "claude_policy_hook.sh";
 /// File name of the materialized `--settings` file for the ARMED variant
@@ -178,6 +191,7 @@ const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-nostop.json";
 const HOOK_SCRIPT_PLACEHOLDER: &str = "@@HOOK_SCRIPT@@";
 const STOP_HOOK_SCRIPT_PLACEHOLDER: &str = "@@STOP_HOOK_SCRIPT@@";
 const PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER: &str = "@@PRECOMPACT_HOOK_SCRIPT@@";
+const SESSION_END_HOOK_SCRIPT_PLACEHOLDER: &str = "@@SESSION_END_HOOK_SCRIPT@@";
 const POLICY_HOOK_SCRIPT_PLACEHOLDER: &str = "@@POLICY_HOOK_SCRIPT@@";
 
 /// Whether the delivered settings registers the `Stop` continuation hook.
@@ -414,6 +428,15 @@ fn materialize_from_template(
     }
     set_executable(&policy_script_path);
 
+    // SessionEnd deliberate-end report (review round 12 S1) — same carrier,
+    // same fail-open posture.
+    let session_end_script_path = base_dir.join(SESSION_END_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(&session_end_script_path, SESSION_END_HOOK_SCRIPT.as_bytes()) {
+        tracing::warn!(error = %e, path = %session_end_script_path.display(), "session-restore: claude session-end-hook script write failed");
+        return None;
+    }
+    set_executable(&session_end_script_path);
+
     // Build the settings by parsing the template, resolving each `command`'s
     // OWN `@@…@@` placeholder to that script's absolute path, and (when dark)
     // dropping the `Stop` key entirely. serde_json does the JSON escaping, so a
@@ -424,6 +447,7 @@ fn materialize_from_template(
         &stop_script_path,
         &precompact_script_path,
         &policy_script_path,
+        &session_end_script_path,
         stop,
     ) {
         Some(s) => s,
@@ -520,6 +544,7 @@ fn build_settings(
     stop: &Path,
     precompact: &Path,
     policy: &Path,
+    session_end: &Path,
     reg: StopHookRegistration,
 ) -> Option<String> {
     let mut root: serde_json::Value = serde_json::from_str(template).ok()?;
@@ -567,6 +592,7 @@ fn build_settings(
                 (STOP_HOOK_SCRIPT_PLACEHOLDER, stop),
                 (PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER, precompact),
                 (POLICY_HOOK_SCRIPT_PLACEHOLDER, policy),
+                (SESSION_END_HOOK_SCRIPT_PLACEHOLDER, session_end),
             ],
         )?;
     }
@@ -583,7 +609,7 @@ static MATERIALIZED: once_cell::sync::Lazy<
 
 /// Every file a [`materialize`] under `reg` is responsible for, in `base_dir`.
 ///
-/// The four SCRIPTS are variant-INDEPENDENT (they are written unconditionally
+/// The five SCRIPTS are variant-INDEPENDENT (they are written unconditionally
 /// — registration is gated, materialization is not), so both variants leave all
 /// four on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
 /// check below validates the file this variant actually delivers rather than
@@ -594,18 +620,19 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// after a flag flip). That is fine and harmless — every instance's spawn
 /// points `--settings` at its own name — so DO NOT "clean it up": deleting the
 /// other variant's file would be reaching into another live process's delivery.
-fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
+fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 6] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
+        base_dir.join(SESSION_END_HOOK_SCRIPT_NAME),
         settings_path(base_dir, reg),
     ]
 }
 
 /// The settings path for `base_dir` if this process already materialized it
-/// UNDER THE WANTED VARIANT and all five files are still present. `None` (⇒
+/// UNDER THE WANTED VARIANT and all six files are still present. `None` (⇒
 /// full rewrite) otherwise, so an operator who deletes the dir gets it back on
 /// the next spawn — and a variant change rewrites rather than serving a file
 /// whose bytes were produced under the other flag state.
@@ -741,6 +768,31 @@ mod tests {
         assert!(precompact_text.contains("/context-low"));
         assert!(precompact_text.contains("QONTINUI_RUNNER_API_PORT"));
         assert!(precompact_text.contains("QONTINUI_TERMINAL_ID"));
+
+        // Review round 12 S1: the SessionEnd deliberate-end report rides BOTH
+        // variants (never gated), pointing at its materialized script, with a
+        // bounded timeout; the script POSTs to the session-end route, is
+        // bounded and always exits 0 (an absent runner never holds up `/exit`).
+        let session_end_script_path = tmp.join(SESSION_END_HOOK_SCRIPT_NAME);
+        assert!(
+            session_end_script_path.exists(),
+            "session-end script materialized"
+        );
+        assert!(!settings_text.contains(SESSION_END_HOOK_SCRIPT_PLACEHOLDER));
+        let session_end = &v["hooks"]["SessionEnd"][0]["hooks"][0];
+        assert!(
+            session_end["command"]
+                .as_str()
+                .expect("SessionEnd registered")
+                .contains(&session_end_script_path.display().to_string()),
+            "SessionEnd runs our session-end script"
+        );
+        assert!(session_end["timeout"].as_u64().is_some_and(|t| t <= 5));
+        let session_end_text = std::fs::read_to_string(&session_end_script_path).unwrap();
+        assert!(session_end_text.contains("/session-end"));
+        assert!(session_end_text.contains("--max-time 2"));
+        assert!(session_end_text.contains("--connect-timeout 1"));
+        assert!(session_end_text.trim_end().ends_with("exit 0"));
 
         // The SAME settings file registers the SessionStart POLICY-INJECTION
         // hook (runner-enforced-policy-pull Phase 1) as a SECOND command inside
@@ -1176,7 +1228,7 @@ mod tests {
                 StopHookRegistration::Omitted,
             ] {
                 assert!(
-                    build_settings(template, p, p, p, p, reg).is_none(),
+                    build_settings(template, p, p, p, p, p, reg).is_none(),
                     "{name} ({reg:?}) must fail open with None, not panic or partial output"
                 );
             }
@@ -1197,10 +1249,10 @@ mod tests {
         ];
         for (name, template) in bad_stop_only {
             assert!(
-                build_settings(template, p, p, p, p, StopHookRegistration::Registered).is_none(),
+                build_settings(template, p, p, p, p, p, StopHookRegistration::Registered).is_none(),
                 "{name} must fail open when the Stop hook is being registered"
             );
-            let out = build_settings(template, p, p, p, p, StopHookRegistration::Omitted)
+            let out = build_settings(template, p, p, p, p, p, StopHookRegistration::Omitted)
                 .unwrap_or_else(|| panic!("{name}: a dropped Stop key is not a build failure"));
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
@@ -1231,6 +1283,7 @@ mod tests {
             session,
             stop,
             precompact,
+            policy,
             policy,
             StopHookRegistration::Omitted,
         )
@@ -1270,6 +1323,7 @@ mod tests {
                 stop,
                 precompact,
                 policy,
+                policy,
                 StopHookRegistration::Registered
             )
             .is_none(),
@@ -1279,20 +1333,23 @@ mod tests {
 
     /// FIX 5(c) — the substitution→parse/serialize rewrite is exactly the change
     /// a snapshot guards. Assert on PARSED values (key order and whitespace are
-    /// irrelevant): the armed output registers EXACTLY the three events, each
-    /// pointing at its own script, with `permissions.allow` intact.
+    /// irrelevant): the armed output registers EXACTLY the four events (the
+    /// fourth, `SessionEnd`, since review round 12 S1), each pointing at its own
+    /// script, with `permissions.allow` intact.
     #[test]
-    fn armed_settings_registers_exactly_the_three_events_with_the_expected_commands() {
+    fn armed_settings_registers_exactly_the_four_events_with_the_expected_commands() {
         let session = Path::new("/x/claude_session_hook.sh");
         let stop = Path::new("/x/claude_stop_hook.sh");
         let precompact = Path::new("/x/claude_precompact_hook.sh");
         let policy = Path::new("/x/claude_policy_hook.sh");
+        let session_end = Path::new("/x/claude_session_end_hook.sh");
         let out = build_settings(
             HOOK_SETTINGS,
             session,
             stop,
             precompact,
             policy,
+            session_end,
             StopHookRegistration::Registered,
         )
         .expect("the bundled template builds when armed");
@@ -1303,8 +1360,8 @@ mod tests {
         events.sort_unstable();
         assert_eq!(
             events,
-            ["PreCompact", "SessionStart", "Stop"],
-            "exactly the three events, no more and no fewer"
+            ["PreCompact", "SessionEnd", "SessionStart", "Stop"],
+            "exactly the four events, no more and no fewer"
         );
 
         // Command COUNT per event, stated explicitly. `SessionStart` carries
@@ -1313,7 +1370,12 @@ mod tests {
         // blanket "one command per event" would have been true before
         // `2026-08-08-runner-enforced-policy-pull` Phase 1 and is now exactly
         // the assumption this module must not make.
-        for (event, commands) in [("SessionStart", 2), ("Stop", 1), ("PreCompact", 1)] {
+        for (event, commands) in [
+            ("SessionStart", 2),
+            ("Stop", 1),
+            ("PreCompact", 1),
+            ("SessionEnd", 1),
+        ] {
             let blocks = hooks[event].as_array().unwrap();
             assert_eq!(blocks.len(), 1, "{event}: one matcher block");
             let inner = blocks[0]["hooks"].as_array().unwrap();
@@ -1331,6 +1393,7 @@ mod tests {
             ("SessionStart", 1, policy),
             ("Stop", 0, stop),
             ("PreCompact", 0, precompact),
+            ("SessionEnd", 0, session_end),
         ] {
             assert_eq!(
                 hooks[event][0]["hooks"][index]["command"].as_str(),
@@ -1381,6 +1444,7 @@ mod tests {
             session,
             stop,
             precompact,
+            policy,
             policy,
             StopHookRegistration::Registered,
         )
@@ -1475,7 +1539,7 @@ mod tests {
             StopHookRegistration::Omitted,
         ] {
             assert!(
-                build_settings(HOOK_SETTINGS, p, p, p, p, reg).is_some(),
+                build_settings(HOOK_SETTINGS, p, p, p, p, p, reg).is_some(),
                 "the bundled template builds under {reg:?}"
             );
         }
@@ -1556,6 +1620,7 @@ mod tests {
             (HOOK_SCRIPT_NAME, HOOK_SCRIPT),
             (PRECOMPACT_HOOK_SCRIPT_NAME, PRECOMPACT_HOOK_SCRIPT),
             (POLICY_HOOK_SCRIPT_NAME, POLICY_HOOK_SCRIPT),
+            (SESSION_END_HOOK_SCRIPT_NAME, SESSION_END_HOOK_SCRIPT),
         ] {
             // Checked separately, NOT by a single `contains` on the shorter
             // name: `claude_hook_settings-nostop.json` does not contain

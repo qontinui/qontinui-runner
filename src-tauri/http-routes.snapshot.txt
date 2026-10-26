@@ -1267,6 +1267,7 @@ POST /sessions/{id}/continuation-verdict continuation_verdict
 POST /sessions/{id}/finish finish_session
 POST /sessions/{id}/message send_message
 POST /sessions/{id}/notification operator_touch_notification
+POST /sessions/{id}/session-end session_end
 POST /sessions/{session_id}/commit-progress commit_session_progress_handler
 POST /sessions/{session_id}/promote-to-worktree promote_session_to_worktree_handler
 POST /sessions/{session_id}/review/insert insert_handler
