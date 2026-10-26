@@ -1016,14 +1016,29 @@ pub(crate) static SESSION_RUN_DROPPED_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 /// conflict is never a silent drop. `GET /health` `sessionRuns.drainDropped.conflict`.
 pub(crate) static SESSION_RUN_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
-/// `session_run` rows ACK-dropped on a 401 whose request carried NO bearer
-/// (nothing to wait for). `GET /health` `sessionRuns.drainDropped.noCredential`.
+/// `session_run` rows ACK-dropped on a 401 sent with NO bearer because the
+/// owning tenant is unresolved on a multi-bound device — the one no-bearer
+/// cause that cannot change. `GET /health` `sessionRuns.drainDropped.noCredential`.
 pub(crate) static SESSION_RUN_DROPPED_NO_CREDENTIAL: AtomicU64 = AtomicU64::new(0);
 
 /// `session_run` rows ACK-dropped after a 401 credential wait outlived
 /// [`SESSION_RUN_CREDENTIAL_WAIT_MAX_MS`]. `GET /health`
 /// `sessionRuns.drainDropped.credentialWaitExpired`.
 pub(crate) static SESSION_RUN_DROPPED_CREDENTIAL_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a `session_run` row's missing bearer is PERMANENT: the drain's
+/// resolver refused an unresolved owning tenant on a multi-bound device, which
+/// no credential refresh can change. Re-asks the same cause-carrying resolver
+/// the request path used (`auth::presented_tenant`); called only on a 401 sent
+/// with no bearer, so its slot reads are off the hot path.
+fn session_run_credential_can_never_resolve(scope: crate::auth::TenantScope) -> bool {
+    matches!(
+        crate::auth::presented_tenant(scope),
+        crate::auth::PresentedTenant::Anonymous(
+            crate::auth::NoCredential::UnresolvedOnMultiBound { .. }
+        )
+    )
+}
 
 /// The longest a `session_run` row waits on a 401 credential before it is
 /// dropped (its age, from the outbox's `recorded_at`).
@@ -2209,10 +2224,17 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 );
                 return PushOutcome::Acked;
             }
-            if kind == "session_run" && status == StatusCode::UNAUTHORIZED && !session_run_authed {
-                // No bearer was presented at all (an unresolved tenant on a
-                // multi-bound device fails soft to unauthenticated): no retry
-                // can change that answer — ACK-drop, counted.
+            if kind == "session_run"
+                && status == StatusCode::UNAUTHORIZED
+                && !session_run_authed
+                && session_run_credential_can_never_resolve(scope)
+            {
+                // No bearer was presented, and for the ONE cause that cannot
+                // change: an unresolved owning tenant on a multi-bound device
+                // (the resolver refuses before reading any slot). Every other
+                // no-bearer cause — an expired or not-yet-minted device JWT, a
+                // slot miss on an unpaired device — can recover, so it takes
+                // the bounded credential wait below instead.
                 SESSION_RUN_DROPPED_NO_CREDENTIAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     session = %rec.session_id,
@@ -5108,16 +5130,101 @@ mod tests {
         );
     }
 
-    /// A row that can NEVER succeed — refused 401 with no credential presented
-    /// (the test process holds none) — is ACK-dropped and counted, never
-    /// retried.
+    /// A row that can NEVER succeed — its owning tenant is unresolved on a
+    /// MULTI-bound device, so the resolver refuses to present any credential —
+    /// is ACK-dropped and counted on its 401, never retried.
     #[tokio::test]
-    async fn session_run_401_with_no_credential_is_dropped_and_counted() {
-        let _amb = crate::test_env::isolated_ambient();
+    async fn session_run_401_unresolved_on_a_multi_bound_device_is_dropped_and_counted() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": a, "bindings": [{ "tenant_id": a }, { "tenant_id": b }]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(crate::auth::device_binding_count(), 2);
         let before = SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed);
-        let posted = drain_one_session_run(Some(401)).await;
-        assert_eq!(posted.len(), 1, "one attempt, then dropped");
+        // No `tenant_id` on the row: the scope is Unresolved.
+        let (outbox, rec, coord, _dir) = start_session_run_drain(1, &[], Some(401)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(outbox.pending().unwrap().is_empty(), "dropped");
+        let g = rec.lock().await;
+        assert_eq!(g.session_runs.len(), 1, "one attempt, then dropped");
+        assert!(
+            g.session_run_auth.iter().all(|a| a.is_none()),
+            "sent unauthenticated"
+        );
         assert!(SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed) > before);
+    }
+
+    /// An EXPIRED device JWT also sends no bearer — but it recovers when the
+    /// refresher re-mints, so the row is RETAINED on the bounded credential
+    /// wait, not dropped.
+    #[tokio::test]
+    async fn session_run_401_with_an_expired_slot_is_retained() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let t = Uuid::now_v7();
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": t, "bindings": [{ "tenant_id": t }]}).to_string(),
+        )
+        .unwrap();
+        let expired = {
+            use base64::Engine as _;
+            let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let exp = chrono::Utc::now().timestamp() - 3600;
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none","typ":"JWT"}"#),
+                enc(format!(r#"{{"tenant_id":"{t}","exp":{exp}}}"#).as_bytes())
+            )
+        };
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&t, &expired)
+            .expect("T's (expired) credential slot");
+        let before = SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed);
+        let (outbox, rec, coord, _dir) =
+            start_session_run_drain_for(1, &[], Some(401), Some(t)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let g = rec.lock().await;
+        assert!(!g.session_runs.is_empty(), "attempted");
+        assert!(
+            g.session_run_auth.iter().all(|a| a.is_none()),
+            "an expired slot presents nothing"
+        );
+        drop(g);
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "retained for the credential wait"
+        );
+        assert_eq!(
+            SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed),
+            before,
+            "not counted as a permanent drop"
+        );
     }
 
     /// A 5xx keeps the row and retries it, and the lane's rows still arrive IN
