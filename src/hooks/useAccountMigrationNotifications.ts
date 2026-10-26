@@ -21,7 +21,11 @@ import type { ShowToastFn, ToastType } from "./useToast";
 export interface SessionDirCarry {
   copied?: number;
   skippedPresent?: number;
-  /** Entries NOT followed: a link, a leftover `*.partial`, a refused root. */
+  /**
+   * Entries NOT followed: a link, a leftover `*.partial`, an earlier
+   * migration's `*.diverged-*` backup (it stays with the account that forked),
+   * a directory past the nesting depth bound, a refused root.
+   */
   skippedOther?: number;
   /**
    * Subagent transcripts the target held in a DIVERGED form: each fork was kept

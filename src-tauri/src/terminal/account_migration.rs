@@ -64,10 +64,17 @@
 //! outlives it by up to its writer-exit wait plus the copy. That is
 //! deliberate: a fast second hop is legitimate (the target account can run
 //! dry too), and holding the guard through the sync would refuse it. Nor does
-//! the sync need it: it writes only a destination file still exactly as its
-//! own carry left it, so it backs off anything the resumed pane or a second
-//! hop's carry has touched, and a second hop's own delta sync tops ITS
-//! destination up from whatever the first sync left in its source.
+//! the sync need it for safety: it writes only a destination file still
+//! exactly as its own carry left it, so it backs off anything the resumed
+//! pane has touched. (A second hop's carry never writes the first sync's
+//! destination — it reads it as its own source.)
+//!
+//! What the sync does NOT give is convergence across a fast second hop.
+//! Nothing orders the first hop's sync (A→B) against the second hop's carry
+//! and sync (B→C). The first sync's late writes reach C only if they land in
+//! B before the second hop's carry or sync walks B; otherwise they stay on B —
+//! not lost, just not forwarded — and a later migration or respawn picks them
+//! up from there.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1097,8 +1104,11 @@ fn resume_respawn_extra_required(
 /// [`migrate_session`] starts and returns without awaiting: it is released
 /// while that sync may still be waiting for the old writer to exit. A fast
 /// second hop is legitimate (the target can run dry too), and the sync needs
-/// no guard — it only writes a destination still exactly as its carry left it,
-/// and a second hop's own sync converges from there. See the module doc.
+/// no guard for safety — it only writes a destination still exactly as its
+/// carry left it. It does not make a fast second hop converge: its late writes
+/// reach the next account only if they land before that hop's carry or sync
+/// walks its source, and otherwise stay on the intermediate account until a
+/// later migration or respawn picks them up. See the module doc.
 pub(crate) async fn migrate_session_off_runtime(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
