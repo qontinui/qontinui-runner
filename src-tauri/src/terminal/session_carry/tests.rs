@@ -1319,6 +1319,38 @@ fn a_failed_rename_aside_fails_the_carry_and_overwrites_nothing() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// A rename-aside of the main transcript that MOVED the fork and then reported
+/// an error still fails the carry, and its error names where the fork now is
+/// rather than claiming nothing moved.
+#[test]
+fn a_main_rename_aside_that_moves_the_fork_then_errors_names_its_backup() {
+    let tmp = scratch("diverged-rename-moved-then-err");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+
+    let err = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| {
+            std::fs::rename(from, to)?;
+            Err(std::io::Error::other("moved, then reported failure"))
+        },
+        || {},
+    )
+    .unwrap_err();
+    let backups = diverged_backups(&dst);
+    assert_eq!(backups.len(), 1, "the fork sits at its backup: {backups:?}");
+    assert!(
+        err.contains("reported an error but moved it") && err.contains("preserved at"),
+        "got: {err}"
+    );
+    assert!(!err.contains("nothing overwritten"), "got: {err}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Outside a migration ([`MainTranscript::ExtendPrefix`], the respawn's mode
 /// for an absent target) a diverged main transcript is KEPT, as before: no
 /// backup, and the fork keeps its in-place sidecar.
