@@ -2220,9 +2220,12 @@ pub async fn terminal_migrate_session_account(
     let outcome =
         crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
             .await
-            .inspect_err(|_| {
+            .map_err(|e| {
                 // The session never reached `dst`: it must not count as a handoff.
                 crate::ai_provider::unrecord_handoff(&dst);
+                // A refusal (already migrating / already moved / gone) reads
+                // as its own sentence, exactly as before the typed error.
+                e.to_string()
             })?;
     Ok(CommandResponse {
         success: true,

@@ -52,9 +52,22 @@
 //! dry), one migration in flight per session ([`begin_migration`], which also
 //! refuses a session that already moved), settings kill-switch
 //! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
-//! than two configured accounts. The manual Tauri command
-//! (`terminal_migrate_session_account`) reuses step 4 directly — an operator
-//! click is its own confirmation.
+//! than two configured accounts. A refusal by [`begin_migration`] is not a
+//! failure: the automatic path logs it, reports nothing to the UI and gives
+//! back the cap slot it took ([`settle_hint_migration`]). The manual Tauri
+//! command (`terminal_migrate_session_account`) reuses step 4 directly — an
+//! operator click is its own confirmation.
+//!
+//! The in-flight guard covers the migration itself — carry, trust, respawn,
+//! close — and NOT the detached step-4b delta sync
+//! ([`crate::terminal::session_carry::spawn_delta_sync_after_exit`]), which
+//! outlives it by up to its writer-exit wait plus the copy. That is
+//! deliberate: a fast second hop is legitimate (the target account can run
+//! dry too), and holding the guard through the sync would refuse it. Nor does
+//! the sync need it: it writes only a destination file still exactly as its
+//! own carry left it, so it backs off anything the resumed pane or a second
+//! hop's carry has touched, and a second hop's own delta sync tops ITS
+//! destination up from whatever the first sync left in its source.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -66,7 +79,9 @@ use tracing::{info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::graceful_exit::ProcIdentity;
-use crate::terminal::session_carry::{copy_transcript, CarriedSubagent, DeltaSyncOutcome};
+use crate::terminal::session_carry::{
+    copy_transcript, CarriedSubagent, DeltaSyncOutcome, TranscriptCopy,
+};
 
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
@@ -99,12 +114,48 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
+/// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
+/// migration that never ran (refused by [`begin_migration`]). Removes exactly
+/// one entry with that stamp under the history lock, so two hints that took
+/// slots in the same millisecond still leave the count right; a stamp already
+/// aged out of the window is a no-op.
+fn refund_migration_cap(claude_session_id: &str, stamp: i64) {
+    let mut hist = MIGRATION_HISTORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = hist.as_mut().and_then(|m| m.get_mut(claude_session_id)) {
+        if let Some(i) = entry.iter().position(|t| *t == stamp) {
+            entry.remove(i);
+        }
+    }
+}
+
+/// Why [`migrate_session_off_runtime`] did not migrate.
+#[derive(Debug)]
+pub(crate) enum MigrateError {
+    /// [`begin_migration`] refused before anything was read or written: the
+    /// session is already migrating, has already moved, or is gone. Nothing
+    /// failed and nothing changed.
+    Refused(MigrationRefusal),
+    /// The migration ran and failed; the old pane is left in place.
+    Failed(String),
+}
+
+impl std::fmt::Display for MigrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => refusal.fmt(f),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Claude session ids with a migration in flight, for [`begin_migration`].
 static MIGRATIONS_IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Why [`begin_migration`] refused to start a migration. `Display` is the
-/// error string the caller returns and the `session-account-migration-skipped`
-/// event carries.
+/// error string the manual Tauri command returns to the UI; the automatic
+/// path only logs it ([`settle_hint_migration`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MigrationRefusal {
     /// Another migration of the same session is still running.
@@ -313,8 +364,8 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     crate::ai_provider::mark_account_rate_limited_with_duration(&src, cooldown);
     crate::ai_provider::pick_best_account();
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    if !migration_cap_permits(&record.claude_session_id, now_ms) {
+    let cap_stamp = chrono::Utc::now().timestamp_millis();
+    if !migration_cap_permits(&record.claude_session_id, cap_stamp) {
         warn!(
             session = %record.claude_session_id,
             cap = MIGRATION_CAP,
@@ -348,25 +399,63 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    match migrate_session_off_runtime(&app, &record, &src, &dst).await {
-        Ok(outcome) => {
+    let result = migrate_session_off_runtime(&app, &record, &src, &dst).await;
+    settle_hint_migration(
+        &record.claude_session_id,
+        cap_stamp,
+        result,
+        || crate::ai_provider::unrecord_handoff(&dst),
+        |reason| emit_skipped(&app, &record, &src, reason),
+    );
+}
+
+/// The automatic path's answer to the migration's result.
+///
+/// - Migrated: logged.
+/// - [`MigrateError::Refused`]: another migration of this session holds its
+///   slot, or already moved it (or its record is gone). Nothing failed, so it
+///   is logged at info and NOT reported as `session-account-migration-skipped`
+///   — the UI would otherwise toast a "migration failed" for a session that
+///   is migrating or has migrated. The cap slot this hint took at
+///   `cap_stamp` is given back ([`refund_migration_cap`]) since no migration
+///   ran; the refund, not a pre-check, because only the guard inside
+///   [`begin_migration`] decides a refusal race-free.
+/// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`.
+///
+/// Refused and Failed both `unrecord_handoff`: the session never reached the
+/// target this hint picked, so it must not count as a handoff to it.
+fn settle_hint_migration(
+    claude_session_id: &str,
+    cap_stamp: i64,
+    result: Result<MigrationOutcome, MigrateError>,
+    unrecord_handoff: impl FnOnce(),
+    emit_skipped: impl FnOnce(&str),
+) {
+    match result {
+        Ok(outcome) => info!(
+            session = %claude_session_id,
+            new_terminal = %outcome.new_terminal_id,
+            from = %outcome.from_config_dir,
+            to = %outcome.to_config_dir,
+            "session migrated"
+        ),
+        Err(MigrateError::Refused(refusal)) => {
             info!(
-                session = %record.claude_session_id,
-                new_terminal = %outcome.new_terminal_id,
-                from = %outcome.from_config_dir,
-                to = %outcome.to_config_dir,
-                "session migrated"
+                session = %claude_session_id,
+                %refusal,
+                "usage-limit migration not started — the session is already migrating or has moved; nothing to report"
             );
+            unrecord_handoff();
+            refund_migration_cap(claude_session_id, cap_stamp);
         }
-        Err(e) => {
+        Err(MigrateError::Failed(e)) => {
             warn!(
-                session = %record.claude_session_id,
+                session = %claude_session_id,
                 error = %e,
                 "session migration failed"
             );
-            // The session never reached `dst`: it must not count as a handoff.
-            crate::ai_provider::unrecord_handoff(&dst);
-            emit_skipped(&app, &record, &src, &format!("migration-failed: {e}"));
+            unrecord_handoff();
+            emit_skipped(&format!("migration-failed: {e}"));
         }
     }
 }
@@ -501,17 +590,33 @@ impl ReadyDebounce {
 /// itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
 /// blocking pool) — the nudge then goes first, and the log says the sync had
 /// not reported. See [`run_continue_nudge`].
+///
+/// The subagents the nudge names are recomputed once that wait is over
+/// ([`crate::terminal::session_carry::resumable_subagents_now`]), so one the
+/// sync first copied is named and one still missing is not; the carry-time
+/// list is the fallback when that recompute fails.
 fn spawn_continue_nudge(
     terminal_id: String,
-    subagents: &[CarriedSubagent],
+    carried: TranscriptCopy,
     sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
 ) {
-    let prompt = continue_nudge(subagents);
+    let fallback = carried.subagents.clone();
     tauri::async_runtime::spawn(run_continue_nudge(
         terminal_id.clone(),
         sync_done,
         NUDGE_SYNC_WAIT,
-        move || prompt_when_idle(terminal_id, prompt, "continue-nudge"),
+        fallback,
+        move || async move {
+            // A directory listing plus a few stats: still disk I/O, so off
+            // the async workers.
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                crate::terminal::session_carry::resumable_subagents_now(&carried)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("subagent recompute task did not complete: {e}"))?
+        },
+        move |prompt| prompt_when_idle(terminal_id, prompt, "continue-nudge"),
     ));
 }
 
@@ -554,16 +659,22 @@ async fn await_delta_sync(
 }
 
 /// The continue nudge's body: wait for the delta sync (bounded by
-/// `deadline`), log what it heard, then `deliver` the prompt. A sync that
-/// times out, fails or never reports holds the nudge no longer than
-/// `deadline`; the nudge still goes, and the log says why.
-async fn run_continue_nudge<D, DF>(
+/// `deadline`), log what it heard, then `recompute` the resumable subagents
+/// and `deliver` the [`continue_nudge`] naming them. A sync that times out,
+/// fails or never reports holds the nudge no longer than `deadline`; the
+/// nudge still goes, and the log says why. A failed recompute falls back to
+/// `carry_time_subagents`, the list the carry produced.
+async fn run_continue_nudge<R, RF, D, DF>(
     terminal_id: String,
     sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
     deadline: std::time::Duration,
+    carry_time_subagents: Vec<CarriedSubagent>,
+    recompute: R,
     deliver: D,
 ) where
-    D: FnOnce() -> DF,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<Vec<CarriedSubagent>, String>>,
+    D: FnOnce(String) -> DF,
     DF: std::future::Future<Output = ()>,
 {
     match await_delta_sync(sync_done, deadline).await {
@@ -583,7 +694,18 @@ async fn run_continue_nudge<D, DF>(
             "continue-nudge: the delta sync did not report within its deadline — nudging anyway"
         ),
     }
-    deliver().await;
+    let subagents = match recompute().await {
+        Ok(now) => now,
+        Err(e) => {
+            warn!(
+                terminal_id,
+                error = %e,
+                "continue-nudge: could not recompute the resumable subagents — naming the carry-time list"
+            );
+            carry_time_subagents
+        }
+    };
+    deliver(continue_nudge(&subagents)).await;
 }
 
 /// How many carried subagents [`continue_nudge`] names before summarising the
@@ -948,41 +1070,82 @@ fn resume_respawn_extra_required(
 ///
 /// The whole migration runs under the session's in-flight guard
 /// ([`begin_migration`]): a second concurrent migration of the same session,
-/// or one whose view of the session is stale, is refused before anything is
-/// read or written. The guard moves into the blocking task, so it is released
-/// when the migration itself ends — on success, on error, or on a panic —
-/// even if this future is dropped first.
-pub async fn migrate_session_off_runtime(
+/// or one whose view of the session is stale, is refused
+/// ([`MigrateError::Refused`]) before anything is read or written. The guard
+/// moves into the blocking task, so it is released when the migration itself
+/// ends — on success, on error, or on a panic — even if this future is
+/// dropped first; and a future dropped BEFORE the blocking task is spawned
+/// drops the guard with it ([`run_migration_guarded`]).
+///
+/// The guard does NOT cover the detached step-4b delta sync that
+/// [`migrate_session`] starts and returns without awaiting: it is released
+/// while that sync may still be waiting for the old writer to exit. A fast
+/// second hop is legitimate (the target can run dry too), and the sync needs
+/// no guard — it only writes a destination still exactly as its carry left it,
+/// and a second hop's own sync converges from there. See the module doc.
+pub(crate) async fn migrate_session_off_runtime(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
-) -> Result<MigrationOutcome, String> {
+) -> Result<MigrationOutcome, MigrateError> {
     use tauri::Manager;
     let store = app
         .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-        .ok_or("SessionLifecycleStore not managed")?
+        .ok_or_else(|| MigrateError::Failed("SessionLifecycleStore not managed".to_string()))?
         .inner()
         .clone();
-    let in_flight = begin_migration(record, src_config_dir, || {
-        store.get(&record.claude_session_id)
-    })
-    .map_err(|refusal| {
-        warn!(session = %record.claude_session_id, %refusal, "session migration refused");
-        refusal.to_string()
-    })?;
-    // The old pane's `claude`, identified BEFORE anything is closed: the
-    // detached delta sync waits for exactly this process to leave the table.
-    // Taken here because the snapshot is async and `migrate_session` is not.
-    let old_writer = old_pane_claude(app, &record.terminal_id).await;
-    let (app, record) = (app.clone(), record.clone());
+    let (app_owned, record_owned) = (app.clone(), record.clone());
     let (src, dst) = (src_config_dir.to_string(), dst_config_dir.to_string());
+    run_migration_guarded(
+        || {
+            begin_migration(record, src_config_dir, || {
+                store.get(&record.claude_session_id)
+            })
+        },
+        // The old pane's `claude`, identified BEFORE anything is closed: the
+        // detached delta sync waits for exactly this process to leave the
+        // table. Taken here because the snapshot is async and
+        // `migrate_session` is not.
+        || old_pane_claude(app, &record.terminal_id),
+        move |old_writer| migrate_session(&app_owned, &record_owned, &src, &dst, old_writer),
+    )
+    .await
+    .inspect_err(|e| {
+        if let MigrateError::Refused(refusal) = e {
+            info!(session = %record.claude_session_id, %refusal, "session migration refused");
+        }
+    })
+}
+
+/// The guard-holding shape of [`migrate_session_off_runtime`], free of the app
+/// handle so it is testable: take the in-flight slot (`begin`), run the async
+/// `prepare`, then run `work` on the blocking pool with the guard moved into
+/// it. The guard is a local of this future until that spawn, so dropping the
+/// future at any await before it releases the slot; after it, the blocking
+/// task owns the guard and releases it when `work` ends.
+async fn run_migration_guarded<B, P, PF, W, T>(
+    begin: B,
+    prepare: P,
+    work: W,
+) -> Result<T, MigrateError>
+where
+    B: FnOnce() -> Result<MigrationInFlight, MigrationRefusal>,
+    P: FnOnce() -> PF,
+    PF: std::future::Future,
+    PF::Output: Send + 'static,
+    W: FnOnce(PF::Output) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let in_flight = begin().map_err(MigrateError::Refused)?;
+    let prepared = prepare().await;
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let _in_flight = in_flight;
-        migrate_session(&app, &record, &src, &dst, old_writer)
+        work(prepared)
     })
     .await
-    .map_err(|e| format!("migration task did not complete: {e}"))?
+    .map_err(|e| MigrateError::Failed(format!("migration task did not complete: {e}")))?
+    .map_err(MigrateError::Failed)
 }
 
 /// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
@@ -1277,7 +1440,7 @@ pub fn migrate_session(
         .claude_cli
         .auto_continue_after_migration
     {
-        spawn_continue_nudge(new_terminal_id.clone(), &carried.subagents, sync_done);
+        spawn_continue_nudge(new_terminal_id.clone(), carried.clone(), sync_done);
     }
 
     let outcome = MigrationOutcome {
@@ -1609,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn the_in_flight_slot_is_released_on_every_exit_path() {
+    fn the_in_flight_slot_is_released_after_an_error_return_a_panic_and_a_moved_refusal() {
         let sid = "test/account_migration/release";
         let rec = session_record(sid, "t-1", Some("C:/a"));
         // An early error return (`?`) while the guard is held.
@@ -1662,6 +1825,177 @@ mod tests {
         assert!(begin_migration(&seen, "C:/a", || Some(seen.clone())).is_ok());
         let unpinned = session_record(sid, "t-1", None);
         assert!(begin_migration(&unpinned, "C:/a", || Some(unpinned.clone())).is_ok());
+    }
+
+    // ---- the guard's async shape (S6) ---------------------------------------
+
+    /// The migration future dropped while it is still in its async prepare
+    /// step — before the blocking task that would take over the guard was
+    /// spawned — releases the slot with it.
+    #[tokio::test]
+    async fn dropping_the_migration_before_its_blocking_spawn_releases_the_slot() {
+        use std::future::Future;
+        let sid = "test/account_migration/dropped-before-spawn";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let mut migration = Box::pin(run_migration_guarded(
+            || begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            // `old_pane_claude`'s stand-in: never completes.
+            std::future::pending::<()>,
+            |()| -> Result<(), String> { unreachable!("the blocking work is never spawned") },
+        ));
+        // One poll: the guard is taken, then the future parks in `prepare`.
+        std::future::poll_fn(|cx| {
+            assert!(migration.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            matches!(
+                begin_migration(&rec, "C:/a", || Some(rec.clone())),
+                Err(MigrationRefusal::InFlight { .. })
+            ),
+            "the parked migration holds the slot"
+        );
+        drop(migration);
+        assert!(
+            begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok(),
+            "dropping it before the blocking spawn released the slot"
+        );
+    }
+
+    /// Held through the blocking work, released when it ends; a failure and a
+    /// refusal are typed apart, and a refusal prepares and runs nothing.
+    #[tokio::test]
+    async fn the_guarded_migration_holds_the_slot_through_its_work_and_types_a_refusal() {
+        let sid = "test/account_migration/guarded";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let probe = rec.clone();
+        let out = run_migration_guarded(
+            || begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            || std::future::ready(7),
+            move |prepared| {
+                let refused = matches!(
+                    begin_migration(&probe, "C:/a", || Some(probe.clone())),
+                    Err(MigrationRefusal::InFlight { .. })
+                );
+                Ok((prepared, refused))
+            },
+        )
+        .await
+        .expect("the migration runs");
+        assert_eq!(
+            out,
+            (7, true),
+            "prepare's output reaches the work, under the guard"
+        );
+        assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
+
+        let failed = run_migration_guarded(
+            || begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            || std::future::ready(()),
+            |()| -> Result<(), String> { Err("the carry failed".to_string()) },
+        )
+        .await;
+        assert!(matches!(failed, Err(MigrateError::Failed(ref e)) if e == "the carry failed"));
+        assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
+
+        let refused = run_migration_guarded(
+            || begin_migration(&rec, "C:/stale", || Some(rec.clone())),
+            || async { panic!("a refused migration prepares nothing") },
+            |()| -> Result<(), String> { unreachable!() },
+        )
+        .await;
+        let Err(MigrateError::Refused(refusal)) = refused else {
+            panic!("expected a refusal, got {refused:?}");
+        };
+        assert_eq!(
+            MigrateError::Refused(refusal.clone()).to_string(),
+            refusal.to_string(),
+            "the manual command's UI string is the refusal's own sentence"
+        );
+    }
+
+    // ---- the auto path's answer to a refusal (W1) ----------------------------
+
+    /// What `settle_hint_migration` did: (unrecorded, skipped reason).
+    fn settle(
+        sid: &str,
+        stamp: i64,
+        result: Result<MigrationOutcome, MigrateError>,
+    ) -> (bool, Option<String>) {
+        let mut unrecorded = false;
+        let mut skipped = None;
+        settle_hint_migration(
+            sid,
+            stamp,
+            result,
+            || unrecorded = true,
+            |reason| skipped = Some(reason.to_string()),
+        );
+        (unrecorded, skipped)
+    }
+
+    /// How many more migrations the cap admits for `sid` at `now` (consumes
+    /// them).
+    fn cap_left(sid: &str, now: i64) -> usize {
+        (0..=MIGRATION_CAP)
+            .take_while(|i| migration_cap_permits(sid, now + *i as i64))
+            .count()
+    }
+
+    #[test]
+    fn a_refused_auto_migration_reports_nothing_and_gives_its_cap_slot_back() {
+        let base = 1_760_000_000_000i64;
+        for (i, refusal) in [
+            MigrationRefusal::InFlight {
+                session: "s".to_string(),
+            },
+            MigrationRefusal::AlreadyMoved {
+                to: "C:/b".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = format!("test/account_migration/refused-{i}");
+            assert!(migration_cap_permits(&sid, base), "the hint takes a slot");
+            let (unrecorded, skipped) = settle(&sid, base, Err(MigrateError::Refused(refusal)));
+            assert!(unrecorded, "the picked target must not count as a handoff");
+            assert_eq!(skipped, None, "no session-account-migration-skipped");
+            assert_eq!(
+                cap_left(&sid, base + 10),
+                MIGRATION_CAP,
+                "the refused hint's slot was given back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_auto_migration_is_reported_and_keeps_its_cap_slot() {
+        let base = 1_760_000_000_000i64;
+        let sid = "test/account_migration/failed";
+        assert!(migration_cap_permits(sid, base));
+        let (unrecorded, skipped) = settle(
+            sid,
+            base,
+            Err(MigrateError::Failed("respawn failed".to_string())),
+        );
+        assert!(unrecorded);
+        assert_eq!(skipped.as_deref(), Some("migration-failed: respawn failed"));
+        assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
+    }
+
+    /// Two hints that took slots in the same millisecond: refunding one leaves
+    /// the other's.
+    #[test]
+    fn a_refund_gives_back_exactly_one_slot() {
+        let base = 1_760_000_000_000i64;
+        let sid = "test/account_migration/refund-one";
+        assert!(migration_cap_permits(sid, base));
+        assert!(migration_cap_permits(sid, base));
+        refund_migration_cap(sid, base);
+        assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
+        refund_migration_cap("test/account_migration/never-capped", base);
     }
 
     #[test]
@@ -1762,14 +2096,19 @@ mod tests {
 
     fn delivery_flag() -> (
         Arc<AtomicBool>,
-        impl FnOnce() -> std::future::Ready<()> + Send + 'static,
+        impl FnOnce(String) -> std::future::Ready<()> + Send + 'static,
     ) {
         let delivered = Arc::new(AtomicBool::new(false));
         let flag = delivered.clone();
-        (delivered, move || {
+        (delivered, move |_prompt| {
             flag.store(true, Ordering::SeqCst);
             std::future::ready(())
         })
+    }
+
+    /// A recompute that finds no subagent.
+    fn no_subagents() -> std::future::Ready<Result<Vec<CarriedSubagent>, String>> {
+        std::future::ready(Ok(Vec::new()))
     }
 
     /// The nudge is not delivered while the delta sync is still running — not
@@ -1783,6 +2122,8 @@ mod tests {
             "t-1".to_string(),
             Some(rx),
             NUDGE_SYNC_WAIT,
+            Vec::new(),
+            no_subagents,
             deliver,
         ));
         tokio::time::sleep(NUDGE_SYNC_WAIT - Duration::from_secs(1)).await;
@@ -1809,7 +2150,15 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         let (delivered, deliver) = delivery_flag();
         let started = tokio::time::Instant::now();
-        run_continue_nudge("t-2".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
+        run_continue_nudge(
+            "t-2".to_string(),
+            Some(rx),
+            NUDGE_SYNC_WAIT,
+            Vec::new(),
+            no_subagents,
+            deliver,
+        )
+        .await;
         assert!(delivered.load(Ordering::SeqCst));
         assert!(started.elapsed() >= NUDGE_SYNC_WAIT);
         assert!(started.elapsed() < NUDGE_SYNC_WAIT + Duration::from_secs(1));
@@ -1850,10 +2199,17 @@ mod tests {
         let (delivered, deliver) = delivery_flag();
         let delivered_at = Arc::new(std::sync::Mutex::new(None));
         let at = delivered_at.clone();
-        run_continue_nudge("t-4".to_string(), Some(rx), NUDGE_SYNC_WAIT, move || {
-            *at.lock().unwrap() = Some(tokio::time::Instant::now());
-            deliver()
-        })
+        run_continue_nudge(
+            "t-4".to_string(),
+            Some(rx),
+            NUDGE_SYNC_WAIT,
+            Vec::new(),
+            no_subagents,
+            move |prompt| {
+                *at.lock().unwrap() = Some(tokio::time::Instant::now());
+                deliver(prompt)
+            },
+        )
         .await;
         sync.await.unwrap();
         assert!(delivered.load(Ordering::SeqCst));
@@ -1874,7 +2230,15 @@ mod tests {
     async fn with_no_delta_sync_to_wait_for_the_nudge_goes_at_once() {
         let started = tokio::time::Instant::now();
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge("t-3".to_string(), None, NUDGE_SYNC_WAIT, deliver).await;
+        run_continue_nudge(
+            "t-3".to_string(),
+            None,
+            NUDGE_SYNC_WAIT,
+            Vec::new(),
+            no_subagents,
+            deliver,
+        )
+        .await;
         assert!(delivered.load(Ordering::SeqCst));
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
@@ -1886,8 +2250,67 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge("t-3b".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
+        run_continue_nudge(
+            "t-3b".to_string(),
+            Some(rx),
+            NUDGE_SYNC_WAIT,
+            Vec::new(),
+            no_subagents,
+            deliver,
+        )
+        .await;
         assert!(delivered.load(Ordering::SeqCst));
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    // ---- the nudge names the subagents as they are after the sync (S4) -------
+
+    /// Run the nudge with the sync already reported; returns the typed prompt.
+    async fn nudge_text(
+        carry_time: Vec<CarriedSubagent>,
+        recomputed: Result<Vec<CarriedSubagent>, String>,
+    ) -> String {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(DeltaSyncOutcome::Synced(DeltaSync::default()))
+            .unwrap();
+        let typed = Arc::new(std::sync::Mutex::new(None));
+        let sink = typed.clone();
+        run_continue_nudge(
+            "t-5".to_string(),
+            Some(rx),
+            NUDGE_SYNC_WAIT,
+            carry_time,
+            move || std::future::ready(recomputed),
+            move |prompt| {
+                *sink.lock().unwrap() = Some(prompt);
+                std::future::ready(())
+            },
+        )
+        .await;
+        let text = typed.lock().unwrap().take().expect("delivered");
+        text
+    }
+
+    /// The carry-time list named `a1` and missed `n9` (written by the old pane
+    /// after the carry, first copied by the delta sync); the recompute after
+    /// the sync names `n9` and not `a1` (no longer resumable at the
+    /// destination). A failed recompute falls back to the carry-time list.
+    #[tokio::test]
+    async fn the_nudge_names_the_subagents_recomputed_after_the_sync() {
+        let text = nudge_text(vec![agent("a1", None)], Ok(vec![agent("n9", None)])).await;
+        assert!(
+            text.ends_with("resumable with SendMessage to their agent id: n9."),
+            "{text}"
+        );
+        assert!(!text.contains("a1"), "{text}");
+
+        let text = nudge_text(vec![agent("a1", None)], Err("unreadable".to_string())).await;
+        assert!(
+            text.ends_with("resumable with SendMessage to their agent id: a1."),
+            "{text}"
+        );
+
+        let text = nudge_text(vec![agent("a1", None)], Ok(Vec::new())).await;
+        assert_eq!(text, CONTINUE_NUDGE, "nothing resumable now: nothing named");
     }
 }
