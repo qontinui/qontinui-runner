@@ -60,6 +60,49 @@ describe("migratedToast", () => {
     expect(toast.type).toBe("error");
   });
 
+  it("names diverged subagent transcripts as preserved, not as entries not followed", () => {
+    const toast = migratedToast({
+      ...base,
+      mainTranscript: "present",
+      sessionDirCarry: {
+        copied: 0,
+        skippedPresent: 0,
+        skippedOther: 0,
+        subagentsDivergedPreserved: 2,
+        subagentsDivergedKept: 0,
+        failed: 0,
+      },
+    });
+    expect(toast.message).toContain("2 subagent transcript(s) on the target had DIVERGED");
+    expect(toast.message).toContain("*.diverged-*");
+    expect(toast.message).toContain("live one carried");
+    expect(toast.message).not.toContain("session directory was NOT carried");
+    expect(toast.message).not.toContain("not followed");
+    expect(toast.type).toBe("info");
+  });
+
+  it("is an error when diverged subagent transcripts were kept instead of the live ones", () => {
+    const toast = migratedToast({
+      ...base,
+      mainTranscript: "present",
+      sessionDirCarry: { copied: 1, skippedOther: 0, subagentsDivergedKept: 1, failed: 0 },
+    });
+    expect(toast.message).toContain("kept INSTEAD of the live ones");
+    expect(toast.message).not.toContain("session directory was NOT carried");
+    expect(toast.type).toBe("error");
+  });
+
+  it("keeps a failed carry an error and still names the preserved forks", () => {
+    const toast = migratedToast({
+      ...base,
+      mainTranscript: "present",
+      sessionDirCarry: { copied: 1, subagentsDivergedPreserved: 1, failed: 1 },
+    });
+    expect(toast.message).toContain("could NOT be carried");
+    expect(toast.message).toContain("1 subagent transcript(s) on the target had DIVERGED");
+    expect(toast.type).toBe("error");
+  });
+
   it("tolerates an older build's payload with neither new field", () => {
     const toast = migratedToast(base);
     expect(toast.message).toBe(
