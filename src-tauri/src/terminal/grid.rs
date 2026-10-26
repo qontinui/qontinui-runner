@@ -466,7 +466,7 @@ impl Grid {
         if existing.attrs & ATTR_WIDE_LEFT != 0 && col + 1 < self.cols {
             let right = self.idx(row, col + 1);
             if self.cells[right].attrs & ATTR_WIDE_RIGHT != 0 {
-                self.cells[right] = Cell::default();
+                self.cells[right] = self.blank_cell();
             }
         }
         // ...but not when this IS the right half of the glyph just written
@@ -474,19 +474,51 @@ impl Grid {
         if existing.attrs & ATTR_WIDE_RIGHT != 0 && cell.attrs & ATTR_WIDE_RIGHT == 0 && col > 0 {
             let left = self.idx(row, col - 1);
             if self.cells[left].attrs & ATTR_WIDE_LEFT != 0 {
-                self.cells[left] = Cell::default();
+                self.cells[left] = self.blank_cell();
             }
         }
         self.cells[i] = cell;
         self.dirty = true;
     }
 
+    /// The blank a destroyed wide-glyph half becomes: a space in the current
+    /// pen's background, as xterm leaves it.
+    fn blank_cell(&self) -> Cell {
+        Cell {
+            bg: self.cur_bg,
+            ..Cell::default()
+        }
+    }
+
     fn clear_row_range(&mut self, row: u16, start_col: u16, end_col_exclusive: u16) {
         if row >= self.rows {
             return;
         }
-        let start = self.idx(row, start_col.min(self.cols));
-        let end = self.idx(row, end_col_exclusive.min(self.cols));
+        let start_col = start_col.min(self.cols);
+        let end_col = end_col_exclusive.min(self.cols);
+        // An erase (EL / ED) that starts on a wide glyph's right half, or ends
+        // on its left half, destroys the whole glyph: blank the half outside
+        // the range too, or it would be left orphaned (see `put_cell`).
+        if start_col > 0 && start_col < end_col {
+            let first = self.idx(row, start_col);
+            let before = self.idx(row, start_col - 1);
+            if self.cells[first].attrs & ATTR_WIDE_RIGHT != 0
+                && self.cells[before].attrs & ATTR_WIDE_LEFT != 0
+            {
+                self.cells[before] = self.blank_cell();
+            }
+        }
+        if end_col < self.cols && start_col < end_col {
+            let last = self.idx(row, end_col - 1);
+            let after = self.idx(row, end_col);
+            if self.cells[last].attrs & ATTR_WIDE_LEFT != 0
+                && self.cells[after].attrs & ATTR_WIDE_RIGHT != 0
+            {
+                self.cells[after] = self.blank_cell();
+            }
+        }
+        let start = self.idx(row, start_col);
+        let end = self.idx(row, end_col);
         for cell in &mut self.cells[start..end] {
             *cell = Cell::default();
         }
@@ -1446,6 +1478,38 @@ mod tests {
         let mut g2 = Grid::new(10, 1);
         feed(&mut g2, "日本\x1b[1;1H中".as_bytes());
         assert_eq!(g2.row_text(0), "中本");
+    }
+
+    /// Nit 1: an erase that cuts a wide glyph in half blanks the other half.
+    #[test]
+    fn an_erase_that_splits_a_wide_glyph_blanks_its_other_half() {
+        // EL 0 from the glyph's right half (column 1).
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "日x\x1b[1;2H\x1b[K".as_bytes());
+        assert!(
+            g.snapshot().cells[0].attrs & ATTR_WIDE_LEFT == 0,
+            "left half blanked"
+        );
+        assert_eq!(g.row_text(0), "");
+        // EL 1 up to the glyph's left half (column 2) leaves no orphan at 3.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "ab日c\x1b[1;3H\x1b[1K".as_bytes());
+        assert!(
+            g.snapshot().cells[3].attrs & ATTR_WIDE_RIGHT == 0,
+            "right half blanked"
+        );
+        assert_eq!(g.row_text(0), "    c");
+    }
+
+    /// Nit 2: the blank takes the current pen's background.
+    #[test]
+    fn a_destroyed_wide_half_takes_the_pen_background() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "日\x1b[1;1H\x1b[41ma".as_bytes());
+        let right = g.snapshot().cells[1];
+        assert_eq!(right.ch, ' ');
+        assert_eq!(right.attrs & ATTR_WIDE_RIGHT, 0);
+        assert_ne!(right.bg, COLOR_DEFAULT, "the pen's red background");
     }
 
     #[test]
