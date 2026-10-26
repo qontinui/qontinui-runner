@@ -84,6 +84,11 @@ pub enum EffortSource {
     /// An `/effort` command's record in the session's transcript: a level the
     /// operator (or the session) SET, durable across repaints and resumes.
     Transcript,
+    /// The transcript's LAST `/effort` record set a level this runner does
+    /// not recognise (a reset, a value a newer CLI adds). The level is absent:
+    /// the session's effort is UNKNOWN, and an earlier explicit reading is
+    /// stale — a re-capture replaces it with this, never keeps it.
+    TranscriptUnrecognised,
     /// The pane's own status row (transient on 2.1.310, and painted for a
     /// default level too — so not proof of an explicit choice).
     Screen,
@@ -96,7 +101,8 @@ pub enum EffortSource {
 /// A session's effort: `{level, source}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Effort {
-    /// One of [`EFFORT_LEVELS`]; `None` exactly when `source` is `unknown`.
+    /// One of [`EFFORT_LEVELS`]; `None` exactly when `source` is `unknown` or
+    /// `transcript_unrecognised`.
     pub level: Option<String>,
     pub source: EffortSource,
 }
@@ -181,15 +187,38 @@ pub fn parse_screen(lines: &[String]) -> Option<&'static str> {
 /// new sessions): …`.
 const TRANSCRIPT_EFFORT_PREFIX: &str = "<local-command-stdout>Set effort level to ";
 
-/// The level the LAST `/effort` record in a transcript set, from the JSONL's
-/// text. Only a real record counts: a `type: "user"` line whose
-/// `message.content` (a string, or a text part) STARTS with the local-command
-/// stdout — so the phrase quoted inside a tool result, an assistant message or
-/// a pasted log is never mistaken for one. A later record whose level is not
-/// one of [`EFFORT_LEVELS`] (a reset, a value a newer CLI adds) clears the
-/// earlier one: the session's effort is then UNKNOWN, never the stale level.
-pub fn transcript_effort_level_in(jsonl: &str) -> Option<&'static str> {
-    let mut level: Option<&'static str> = None;
+/// What a transcript's `/effort` records say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptEffort {
+    /// No `/effort` record (or no readable transcript).
+    #[default]
+    NoRecord,
+    /// The last record set this level.
+    Level(&'static str),
+    /// The last record set something that is not one of [`EFFORT_LEVELS`].
+    Unrecognised,
+}
+
+impl TranscriptEffort {
+    /// The level, when the last record set a recognised one.
+    pub fn level(self) -> Option<&'static str> {
+        match self {
+            TranscriptEffort::Level(l) => Some(l),
+            _ => None,
+        }
+    }
+}
+
+/// What the LAST `/effort` record in a transcript set, from the JSONL's text.
+/// Only a real record counts: a `type: "user"` line whose `message.content`
+/// (a string, or a text part) STARTS with the local-command stdout — so the
+/// phrase quoted inside a tool result, an assistant message or a pasted log is
+/// never mistaken for one. A later record whose level is not one of
+/// [`EFFORT_LEVELS`] (a reset, a value a newer CLI adds) is
+/// [`TranscriptEffort::Unrecognised`]: the session's effort is then UNKNOWN,
+/// never the stale earlier level.
+pub fn transcript_effort_in(jsonl: &str) -> TranscriptEffort {
+    let mut last = TranscriptEffort::NoRecord;
     for line in jsonl.lines() {
         // Cheap pre-filter: a transcript can be tens of MB.
         if !line.contains("Set effort level to ") {
@@ -220,16 +249,15 @@ pub fn transcript_effort_level_in(jsonl: &str) -> Option<&'static str> {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric())
             .collect();
-        level = canonical(&word);
+        last = canonical(&word).map_or(TranscriptEffort::Unrecognised, TranscriptEffort::Level);
     }
-    level
+    last
 }
 
-/// [`transcript_effort_level_in`] over the transcript file at `path`. An
-/// unreadable file reads `None` (UNKNOWN).
-pub fn transcript_effort_level(path: &Path) -> Option<&'static str> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    transcript_effort_level_in(&raw)
+/// The level the last `/effort` record set, when it is a recognised one
+/// ([`transcript_effort_in`]`.level()`).
+pub fn transcript_effort_level_in(jsonl: &str) -> Option<&'static str> {
+    transcript_effort_in(jsonl).level()
 }
 
 /// `<config_dir>/settings.json` `effortLevel`, when it holds a level. An
@@ -249,18 +277,26 @@ fn settings_effort_level_in(raw: &str) -> Option<String> {
 
 /// The session's effort: its transcript's last `/effort` record first, then
 /// the screen, then the account default, else unknown.
+///
+/// A transcript whose last record is unrecognised is
+/// [`EffortSource::TranscriptUnrecognised`] with no level, whatever the screen
+/// or the account say: the session overrode the default to something unread.
 pub fn effort_from_sources(
-    transcript_level: Option<&str>,
+    transcript: TranscriptEffort,
     screen_level: Option<&str>,
     settings_level: Option<&str>,
 ) -> Effort {
-    if let Some(level) = transcript_level.and_then(canonical) {
-        return Effort {
+    match transcript {
+        TranscriptEffort::Level(level) => Effort {
             level: Some(level.to_string()),
             source: EffortSource::Transcript,
-        };
+        },
+        TranscriptEffort::Unrecognised => Effort {
+            level: None,
+            source: EffortSource::TranscriptUnrecognised,
+        },
+        TranscriptEffort::NoRecord => effort_from(screen_level, settings_level),
     }
-    effort_from(screen_level, settings_level)
 }
 
 /// The session's effort with no transcript reading: the screen first, then
@@ -455,8 +491,8 @@ mod tests {
     }
 
     /// An explicit (transcript) level.
-    fn set(level: &str) -> Effort {
-        effort_from_sources(Some(level), None, None)
+    fn set(level: &'static str) -> Effort {
+        effort_from_sources(TranscriptEffort::Level(level), None, None)
     }
 
     #[test]
@@ -520,6 +556,16 @@ mod tests {
             None,
             "a later level that is not one of ours is UNKNOWN, not the stale max"
         );
+        assert_eq!(
+            transcript_effort_in(&format!("{MAX_RECORD}\n{reset}")),
+            TranscriptEffort::Unrecognised,
+            "and it says so, distinct from no record at all"
+        );
+        assert_eq!(transcript_effort_in(""), TranscriptEffort::NoRecord);
+        assert_eq!(
+            transcript_effort_in(MAX_RECORD),
+            TranscriptEffort::Level("max")
+        );
     }
 
     #[test]
@@ -546,26 +592,17 @@ mod tests {
     }
 
     #[test]
-    fn the_transcript_file_is_read_and_a_missing_one_is_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.jsonl");
-        std::fs::write(&path, MAX_RECORD).unwrap();
-        assert_eq!(transcript_effort_level(&path), Some("max"));
-        assert_eq!(
-            transcript_effort_level(&dir.path().join("none.jsonl")),
-            None
-        );
-    }
-
-    #[test]
     fn the_transcript_comes_before_the_screen_and_the_account() {
-        let e = effort_from_sources(Some("max"), Some("high"), Some("low"));
+        let e = effort_from_sources(TranscriptEffort::Level("max"), Some("high"), Some("low"));
         assert_eq!(e.level.as_deref(), Some("max"));
         assert_eq!(e.source, EffortSource::Transcript);
-        let e = effort_from_sources(None, Some("high"), Some("low"));
+        let e = effort_from_sources(TranscriptEffort::NoRecord, Some("high"), Some("low"));
         assert_eq!(e.source, EffortSource::Screen);
-        let e = effort_from_sources(Some("turbo"), None, Some("low"));
-        assert_eq!(e.source, EffortSource::AccountDefault);
+        // An unrecognised last record: UNKNOWN, never the screen or default.
+        let e = effort_from_sources(TranscriptEffort::Unrecognised, Some("high"), Some("low"));
+        assert_eq!(e.source, EffortSource::TranscriptUnrecognised);
+        assert_eq!(e.level, None);
+        assert!(!e.source.is_explicit());
         assert_eq!(
             serde_json::to_value(EffortSource::Transcript).unwrap(),
             serde_json::json!("transcript")

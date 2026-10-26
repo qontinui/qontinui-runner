@@ -223,9 +223,9 @@ pub struct RowFacts {
     pub model: Option<String>,
     /// The account's `settings.json` `effortLevel`.
     pub settings_effort: Option<String>,
-    /// The level the transcript's last `/effort` record set
-    /// ([`effort::transcript_effort_level`]) — the durable source.
-    pub transcript_effort: Option<String>,
+    /// What the transcript's last `/effort` record set
+    /// ([`effort::transcript_effort_in`]) — the durable source.
+    pub transcript_effort: effort::TranscriptEffort,
     /// The lifecycle record's provider.
     pub provider: Option<String>,
 }
@@ -262,8 +262,7 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         .as_ref()
         .and_then(|s| effort::parse_screen(&s.lines));
     let settings = facts.settings_effort.as_deref();
-    let effort =
-        effort::effort_from_sources(facts.transcript_effort.as_deref(), screen_level, settings);
+    let effort = effort::effort_from_sources(facts.transcript_effort, screen_level, settings);
     let baseline = effort::baseline_from(settings, effort::CLI_DEFAULT_EFFORT);
     let held = effort::is_above(&effort, &baseline);
     CohortRow {
@@ -345,8 +344,11 @@ pub fn merge_recapture(
                 // prepare recorded — an earlier screen/default reading, or a
                 // `/effort` the session ran since. A reading is never replaced
                 // by a weaker one.
-                let fresh_explicit =
-                    fresh_row.effort.source.is_explicit() && fresh_row.effort != row.effort;
+                // An unrecognised last `/effort` record makes a stale
+                // explicit level UNKNOWN rather than keeping it.
+                let fresh_explicit = (fresh_row.effort.source.is_explicit()
+                    || fresh_row.effort.source == effort::EffortSource::TranscriptUnrecognised)
+                    && fresh_row.effort != row.effort;
                 if (row.effort.source == effort::EffortSource::Unknown
                     && fresh_row.effort.source != effort::EffortSource::Unknown)
                     || fresh_explicit
@@ -418,6 +420,19 @@ pub fn capture_cohort(
     )
 }
 
+/// The model and the `/effort` reading of one transcript, from ONE read of
+/// the file (each capture re-reads every cohort transcript, every tick). An
+/// unreadable file reads neither.
+pub fn transcript_facts(path: &Path) -> (Option<String>, effort::TranscriptEffort) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => (
+            crate::terminal::account_migration::transcript_last_model_in(&text),
+            effort::transcript_effort_in(&text),
+        ),
+        Err(_) => (None, effort::TranscriptEffort::NoRecord),
+    }
+}
+
 /// The live reads: the pane's grid from the terminal manager, the finish mark
 /// from the lifecycle store, the model from the transcript under the account
 /// the session ran on, and the account's `settings.json`.
@@ -454,13 +469,10 @@ impl CohortProbe for LiveCohortProbe {
             }
             _ => None,
         };
-        let model = transcript
+        let (model, transcript_effort) = transcript
             .as_deref()
-            .and_then(crate::terminal::account_migration::transcript_last_model);
-        let transcript_effort = transcript
-            .as_deref()
-            .and_then(effort::transcript_effort_level)
-            .map(str::to_string);
+            .map(transcript_facts)
+            .unwrap_or_default();
         let settings_effort = config_dir.and_then(|c| effort::settings_effort_level(Path::new(c)));
         RowFacts {
             screen,
@@ -582,7 +594,7 @@ mod tests {
                     finished: Some(false),
                     model: Some("claude-opus-5-5".to_string()),
                     settings_effort: None,
-                    transcript_effort: None,
+                    transcript_effort: effort::TranscriptEffort::NoRecord,
                     provider: None,
                 },
             )]),
@@ -616,7 +628,7 @@ mod tests {
                     "a",
                     RowFacts {
                         screen: Some(busy_at("◉ max · /effort")),
-                        transcript_effort: Some("max".to_string()),
+                        transcript_effort: effort::TranscriptEffort::Level("max"),
                         finished: Some(false),
                         ..Default::default()
                     },
@@ -708,7 +720,7 @@ mod tests {
                     RowFacts {
                         // A finished-turn screen with no effort row on it.
                         screen: Some(idle_at("✻ Cogitated for 9m 42s · done 6:36 AM")),
-                        transcript_effort: Some("max".to_string()),
+                        transcript_effort: effort::TranscriptEffort::Level("max"),
                         finished: Some(false),
                         ..Default::default()
                     },
@@ -771,7 +783,7 @@ mod tests {
             &fixed(vec![(
                 "a",
                 RowFacts {
-                    transcript_effort: Some("max".to_string()),
+                    transcript_effort: effort::TranscriptEffort::Level("max"),
                     finished: Some(false),
                     ..Default::default()
                 },
@@ -796,6 +808,67 @@ mod tests {
         let again = merge_recapture(&merged, weaker, 2_000, &|_| None);
         assert_eq!(again.rows[0].effort.source, EffortSource::Transcript);
         assert_eq!(again.rows[0].effort.level.as_deref(), Some("max"));
+    }
+
+    /// Review nit c: a later `/effort` the runner does not recognise must not
+    /// leave the earlier explicit level (and its hold) standing.
+    #[test]
+    fn a_recapture_clears_a_stale_explicit_level_on_an_unrecognised_record() {
+        let pinned = build_cohort(
+            ledger(&["a"]),
+            &fixed(vec![(
+                "a",
+                RowFacts {
+                    transcript_effort: effort::TranscriptEffort::Level("max"),
+                    finished: Some(false),
+                    ..Default::default()
+                },
+            )]),
+        );
+        assert!(pinned.rows[0].held);
+        let fresh = build_cohort(
+            ledger(&["a"]),
+            &fixed(vec![(
+                "a",
+                RowFacts {
+                    transcript_effort: effort::TranscriptEffort::Unrecognised,
+                    finished: Some(false),
+                    ..Default::default()
+                },
+            )]),
+        );
+        let merged = merge_recapture(&pinned, fresh, 1_000, &|_| None);
+        let r = &merged.rows[0];
+        assert_eq!(r.effort.source, EffortSource::TranscriptUnrecognised);
+        assert_eq!(r.effort.level, None);
+        assert!(!r.held, "an unknown effort holds nothing");
+    }
+
+    /// Review nit d: one read of the transcript yields both fields.
+    #[test]
+    fn transcript_facts_reads_model_and_effort_from_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":[]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to max (this session only): x</local-command-stdout>"}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_facts(&path),
+            (
+                Some("claude-opus-5-5".to_string()),
+                effort::TranscriptEffort::Level("max")
+            )
+        );
+        assert_eq!(
+            transcript_facts(&dir.path().join("missing.jsonl")),
+            (None, effort::TranscriptEffort::NoRecord)
+        );
     }
 
     #[test]
@@ -833,7 +906,7 @@ mod tests {
         };
         let read_max = || RowFacts {
             screen: Some(idle_at("◉ max · /effort")),
-            transcript_effort: Some("max".to_string()),
+            transcript_effort: effort::TranscriptEffort::Level("max"),
             finished: Some(false),
             ..Default::default()
         };
@@ -880,7 +953,7 @@ mod tests {
                     "a",
                     RowFacts {
                         screen: Some(idle_at("◉ max · /effort")),
-                        transcript_effort: Some("max".to_string()),
+                        transcript_effort: effort::TranscriptEffort::Level("max"),
                         finished: Some(false),
                         ..Default::default()
                     },

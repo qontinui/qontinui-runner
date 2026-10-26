@@ -418,7 +418,12 @@ impl HintEffects for LiveHintEffects {
 /// is unreadable or records no real model (synthetic error turns are
 /// skipped) — the respawn then omits `--model` and the CLI default applies.
 pub(crate) fn transcript_last_model(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    transcript_last_model_in(&std::fs::read_to_string(path).ok()?)
+}
+
+/// [`transcript_last_model`] over the transcript's text, for a caller that has
+/// already read the file for another field.
+pub(crate) fn transcript_last_model_in(content: &str) -> Option<String> {
     for line in content.lines().rev() {
         // Cheap pre-filter before parsing multi-KB JSONL lines.
         if !line.contains("\"assistant\"") || !line.contains("\"model\"") {

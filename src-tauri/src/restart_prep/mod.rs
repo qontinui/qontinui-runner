@@ -498,7 +498,7 @@ mod tests {
                 finished: Some(finished),
                 model: Some("claude-opus-5-5".to_string()),
                 settings_effort: None,
-                transcript_effort: None,
+                transcript_effort: Default::default(),
                 provider: Some("claude".to_string()),
             },
         )
