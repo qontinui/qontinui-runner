@@ -614,8 +614,14 @@ pub enum BootStep {
         expired: bool,
     },
     /// Another runner process on the same instance root holds the record
-    /// (its ownership lock): this process changed nothing.
+    /// (its ownership lock): this process changed nothing. The boot step is
+    /// then OWED ([`RestartPrep::boot_owed`]) and runs in whichever path wins
+    /// the record first.
     NotOwner,
+    /// The ownership lock could not be taken this time for a reason that is
+    /// NOT another process (a filesystem error, retried): nothing changed, and
+    /// the boot step is owed exactly as for [`Self::NotOwner`].
+    LockUnavailable,
     /// The record was prepared by this very process: no restart happened, and
     /// nothing changed.
     PreparedHere,
@@ -654,6 +660,27 @@ pub struct RestartPrep {
     /// transient error does not end the lock's protection for the process's
     /// life.
     owner_lock_errors: std::sync::atomic::AtomicU32,
+    /// The boot step this process skipped because it did not own the record
+    /// (`Some(build)` — the build it ran as), owed to whichever path wins the
+    /// record first: the notice loop's late claim, or a control call
+    /// (prepare / extend / cancel) whose own claim wins it (review round 11
+    /// M1). Separate from "lock held": a control call can win the lock, after
+    /// which a late claim alone would never see a newly-won lock again.
+    boot_owed: Mutex<Option<String>>,
+    /// Serializes paying the owed boot step, so a late claim and a control
+    /// call that win together run it once, and the control call proceeds only
+    /// after it — against the state it produced.
+    boot_gate: tokio::sync::Mutex<()>,
+}
+
+/// Why [`RestartPrep::claim`] did not yield ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    Owned,
+    /// Another runner process holds the record's lock.
+    OtherProcess,
+    /// The lock could not be taken this time (not another process).
+    LockError,
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -691,6 +718,8 @@ impl RestartPrep {
             owner_lock: Mutex::new(None),
             owner_lock_unavailable: AtomicBool::new(false),
             owner_lock_errors: std::sync::atomic::AtomicU32::new(0),
+            boot_owed: Mutex::new(None),
+            boot_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1051,7 +1080,7 @@ impl RestartPrep {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Cohort, String>>,
     {
-        self.require_ownership()?;
+        self.require_ownership(door, now_ms).await?;
         let _op = self.ops.lock().await;
         // A prepare still in its window on a runner that restarted since —
         // rebuilt, or the same build — is owed a release, which moves its
@@ -1125,7 +1154,7 @@ impl RestartPrep {
     /// `until`. Errs when no prepare is in its window or the hold is already
     /// at the ceiling.
     pub async fn extend(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
-        self.require_ownership()?;
+        self.require_ownership(door, now_ms).await?;
         let _op = self.ops.lock().await;
         let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
             return Err("no prepare is in progress — nothing to extend".to_string());
@@ -1187,7 +1216,7 @@ impl RestartPrep {
     /// whose hold has expired: coord's drain ended by itself, so the release
     /// settles as `expired: <until>` ([`expired_release`]).
     pub async fn cancel(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
-        self.require_ownership()?;
+        self.require_ownership(door, now_ms).await?;
         let _op = self.ops.lock().await;
         let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
             return Err("no prepare is in progress — nothing to cancel".to_string());
@@ -1269,9 +1298,13 @@ impl RestartPrep {
     /// to the pre-lock behaviour (this process acts) rather than leaving the
     /// record's hold unreleasable for its whole life.
     pub fn claim_ownership(&self) -> bool {
+        self.claim() == Claim::Owned
+    }
+
+    fn claim(&self) -> Claim {
         let mut held = self.owner_lock.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_some() || self.owner_lock_unavailable.load(Ordering::SeqCst) {
-            return true;
+            return Claim::Owned;
         }
         let path = self.path.with_extension("lock");
         if let Some(dir) = path.parent() {
@@ -1290,20 +1323,46 @@ impl RestartPrep {
             Ok(()) => {
                 self.owner_lock_errors.store(0, Ordering::SeqCst);
                 *held = Some(file);
-                // Just won: the record in memory was loaded when this process
-                // started, and the previous owner may have written it since (a
-                // cancel, a finished restore). Act on what is on disk now.
-                *self.lock() = super::load_from(&self.path);
-                true
+                drop(held);
+                self.reload_on_win();
+                Claim::Owned
             }
-            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::WouldBlock) => Claim::OtherProcess,
             Err(std::fs::TryLockError::Error(e)) => self.lock_unavailable(&path, &e.to_string()),
+        }
+    }
+
+    /// Just won the lock: the record in memory was loaded when this process
+    /// started, and the previous owner may have written it since (a cancel, a
+    /// finished restore). Act on what is on disk now — and announce it, so the
+    /// UI shows the record this process now acts on (review round 11 N1). A
+    /// read that FAILS (anything but "no such file") keeps the in-memory copy:
+    /// a transient error is not evidence the record is gone.
+    fn reload_on_win(&self) {
+        match super::load_result(&self.path) {
+            Ok(disk) => {
+                let changed = {
+                    let mut mem = self.lock();
+                    let changed = *mem != disk;
+                    *mem = disk.clone();
+                    changed
+                };
+                if let (true, Some(rec)) = (changed, disk.as_ref()) {
+                    self.emit(rec);
+                }
+            }
+            Err(e) => warn!(
+                path = %self.path.display(),
+                error = %e,
+                "restart_prep: won the record's lock but could not re-read it — acting on the \
+                 copy in memory"
+            ),
         }
     }
 
     /// The ownership lock could not be taken for a reason other than another
     /// holder: log it distinctly, once, and fall back to acting.
-    fn lock_unavailable(&self, path: &std::path::Path, why: &str) -> bool {
+    fn lock_unavailable(&self, path: &std::path::Path, why: &str) -> Claim {
         let errors = self.owner_lock_errors.fetch_add(1, Ordering::SeqCst) + 1;
         if errors < LOCK_UNAVAILABLE_ATTEMPTS {
             warn!(
@@ -1313,7 +1372,7 @@ impl RestartPrep {
                 "restart_prep: the record's ownership lock could not be taken this time (NOT \
                  another runner process) — retrying before falling back"
             );
-            return false;
+            return Claim::LockError;
         }
         if !self.owner_lock_unavailable.swap(true, Ordering::SeqCst) {
             warn!(
@@ -1324,7 +1383,7 @@ impl RestartPrep {
                  without it, as before the lock existed"
             );
         }
-        true
+        Claim::Owned
     }
 
     /// Refuse a control call (prepare, extend, cancel / release) in a process
@@ -1333,12 +1392,43 @@ impl RestartPrep {
     /// with a stale one, and a prepare it took would later be mistaken by its
     /// own late claim for a same-build restart. Refusing with a clear error is
     /// the honest answer — the operator acts in the runner that owns it.
-    pub fn require_ownership(&self) -> Result<(), String> {
-        if self.claim_ownership() {
-            Ok(())
-        } else {
-            Err(NOT_OWNER_ERROR.to_string())
+    ///
+    /// Winning the record here pays a boot step this process still owes
+    /// ([`Self::boot_owed`]) BEFORE the control call acts, so the call then
+    /// decides against the state the boot step produced (a rebuilt runner's
+    /// release has moved the cohort to `restoring`: a cancel then finds no
+    /// prepare in progress) rather than the stale one it was loaded with.
+    pub async fn require_ownership(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<(), String> {
+        match self.claim() {
+            Claim::Owned => {
+                self.pay_owed_boot(door, now_ms).await;
+                Ok(())
+            }
+            Claim::OtherProcess => Err(NOT_OWNER_ERROR.to_string()),
+            Claim::LockError => Err(LOCK_ERROR.to_string()),
         }
+    }
+
+    /// Run the boot step this process owes, once, if it owes one. Call only
+    /// once ownership is won. `None` when nothing was owed.
+    async fn pay_owed_boot(&self, door: &dyn HoldDoor, now_ms: i64) -> Option<BootStep> {
+        let _gate = self.boot_gate.lock().await;
+        let build = self
+            .boot_owed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        let step = self.on_boot(door, &build, now_ms).await;
+        info!(step = ?step, "restart_prep: record won — the owed boot step ran now");
+        Some(step)
+    }
+
+    /// Whether this process skipped its boot step and still owes it.
+    pub fn boot_owed(&self) -> bool {
+        self.boot_owed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Whether this process owns the record (see [`Self::claim_ownership`]).
@@ -1357,18 +1447,15 @@ impl RestartPrep {
     /// wait to exit — keeps trying from its notice loop. When it finally wins
     /// the lock it runs the boot step it skipped, so the hold is released and
     /// the cohort moves to `restoring` instead of spawns staying deferred until
-    /// the hold expires. `None` when this process already owned the record
-    /// (nothing to do) or still cannot claim it.
-    pub async fn claim_late(
-        &self,
-        door: &dyn HoldDoor,
-        build: &str,
-        now_ms: i64,
-    ) -> Option<BootStep> {
-        if self.owns_record() || !self.claim_ownership() {
+    /// the hold expires. `None` when no boot step is owed (it ran, or was
+    /// already paid by a control call that won the record first) or the record
+    /// still cannot be claimed. Keyed on the OWED step, not on "lock newly
+    /// won", so a control call winning the lock first cannot lose it.
+    pub async fn claim_late(&self, door: &dyn HoldDoor, now_ms: i64) -> Option<BootStep> {
+        if !self.boot_owed() || !self.claim_ownership() {
             return None;
         }
-        Some(self.on_boot(door, build, now_ms).await)
+        self.pay_owed_boot(door, now_ms).await
     }
 
     /// The boot step: a rebuilt runner releases the hold and starts restoring;
@@ -1376,8 +1463,14 @@ impl RestartPrep {
     /// process that owns the record ([`Self::claim_ownership`]); any other
     /// returns [`BootStep::NotOwner`] having changed nothing.
     pub async fn on_boot(&self, door: &dyn HoldDoor, build: &str, now_ms: i64) -> BootStep {
-        if !self.claim_ownership() {
-            return BootStep::NotOwner;
+        let skipped = match self.claim() {
+            Claim::Owned => None,
+            Claim::OtherProcess => Some(BootStep::NotOwner),
+            Claim::LockError => Some(BootStep::LockUnavailable),
+        };
+        if let Some(step) = skipped {
+            *self.boot_owed.lock().unwrap_or_else(|e| e.into_inner()) = Some(build.to_string());
+            return step;
         }
         let _op = self.ops.lock().await;
         let Some(rec) = self.record() else {
@@ -1560,12 +1653,18 @@ pub async fn on_boot() {
     // lock is waited out by the notice loop instead: its first tick runs right
     // after the boot read and every tick re-tries (`RestartPrep::claim_late`).
     let step = ctl.on_boot(&LiveDoor, running_build(), now_ms()).await;
-    if step == BootStep::NotOwner {
-        warn!(
+    match step {
+        BootStep::NotOwner => warn!(
             "restart_prep: another runner process owns this instance's restart record — boot \
              step skipped for now; the notice loop claims the record and runs it if that \
              process exits"
-        );
+        ),
+        BootStep::LockUnavailable => warn!(
+            "restart_prep: the restart record's ownership lock could not be taken (a filesystem \
+             error, NOT another runner process) — boot step skipped for now; the notice loop \
+             retries it"
+        ),
+        _ => {}
     }
     info!(step = ?step, "restart_prep: boot step");
 }
@@ -1578,10 +1677,15 @@ const LOCK_UNAVAILABLE_ATTEMPTS: u32 = 3;
 pub const NOT_OWNER_ERROR: &str = "another runner process on this instance owns the restart \
      record — act in that runner (this process would overwrite its newer record)";
 
+/// What a control call answers when the ownership lock could not be taken for
+/// a reason that is NOT another process (review round 11 N2).
+pub const LOCK_ERROR: &str = "the restart record's ownership lock could not be taken (a \
+     filesystem error, not another runner process) — try again";
+
 /// The late claim on the live controller ([`RestartPrep::claim_late`]), run by
 /// each notice-loop tick until this process owns the record.
 pub async fn claim_late_live(ctl: &RestartPrep) {
-    if let Some(step) = ctl.claim_late(&LiveDoor, running_build(), now_ms()).await {
+    if let Some(step) = ctl.claim_late(&LiveDoor, now_ms()).await {
         info!(step = ?step, "restart_prep: record claimed late — boot step run now");
     }
 }
@@ -2440,24 +2544,105 @@ mod tests {
             BootStep::NotOwner
         );
         // Still held by the old process: nothing yet.
-        assert_eq!(
-            serving.claim_late(&*door, "a-newer-build", T0 + 3).await,
-            None
-        );
+        assert_eq!(serving.claim_late(&*door, T0 + 3).await, None);
         assert_eq!(serving.record().unwrap().state, PrepState::Preparing);
         drop(old);
         assert_eq!(
-            serving.claim_late(&*door, "a-newer-build", T0 + 4).await,
+            serving.claim_late(&*door, T0 + 4).await,
             Some(BootStep::ReleasedForRebuild {
                 outcome: "local".to_string()
             })
         );
         assert_eq!(serving.record().unwrap().state, PrepState::Restoring);
         // Owned now: later ticks do nothing.
+        assert_eq!(serving.claim_late(&*door, T0 + 5).await, None);
+    }
+
+    /// Review round 11 M1: the boot step skipped at `NotOwner` is OWED, not
+    /// tied to "the late claim newly won the lock". A control call (here a
+    /// cancel) that wins the record first pays it before acting — the rebuilt
+    /// runner's release moves the cohort to `restoring` — and then decides
+    /// against that state (nothing left to cancel). The step runs exactly once:
+    /// the late claim afterwards has nothing to do.
+    #[tokio::test]
+    async fn restart_prep_a_control_call_that_wins_the_record_pays_the_owed_boot_step_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = controller(&dir);
+        let door = MockDoor::primary();
+        prepare(&old, &door).await;
+        assert!(old.claim_ownership());
+        let serving = RestartPrep::load(dir.path().join(super::super::RECORD_FILE), None);
         assert_eq!(
-            serving.claim_late(&*door, "a-newer-build", T0 + 5).await,
-            None
+            serving.on_boot(&*door, "a-newer-build", T0 + 2).await,
+            BootStep::NotOwner
         );
+        assert!(serving.boot_owed());
+        drop(old);
+        let releases_before = door.release_count();
+        let cancelled = serving.cancel(&*door, T0 + 3).await;
+        assert_eq!(
+            cancelled.unwrap_err(),
+            "no prepare is in progress — nothing to cancel",
+            "the cancel decided against the state the boot step produced"
+        );
+        assert_eq!(serving.record().unwrap().state, PrepState::Restoring);
+        assert!(!serving.boot_owed());
+        assert_eq!(door.release_count(), releases_before + 1, "released once");
+        assert_eq!(serving.claim_late(&*door, T0 + 4).await, None);
+        assert_eq!(door.release_count(), releases_before + 1, "and only once");
+    }
+
+    /// Review round 11 N2: a lock error is reported as such, never as another
+    /// runner process — and leaves the boot step owed, like `NotOwner`.
+    #[tokio::test]
+    async fn restart_prep_a_lock_error_is_not_reported_as_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let ctl = RestartPrep::load(not_a_dir.join(super::super::RECORD_FILE), None);
+        let door = MockDoor::new(HoldRole::Secondary);
+        assert_eq!(
+            ctl.on_boot(&*door, "a-newer-build", T0).await,
+            BootStep::LockUnavailable
+        );
+        assert!(ctl.boot_owed());
+        assert_eq!(ctl.cancel(&*door, T0 + 1).await.unwrap_err(), LOCK_ERROR);
+    }
+
+    /// Review round 11 N1: winning the lock re-reads the record — but a read
+    /// that FAILS (not "no such file") keeps the good in-memory copy, and a
+    /// re-read that changed it is announced.
+    #[test]
+    fn restart_prep_winning_the_lock_keeps_memory_on_a_failed_read_and_announces_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::super::RECORD_FILE);
+        let rec = PrepareRecord::new("prep-reload".to_string(), T0, cohort(&["s1"]));
+        crate::restart_prep::persist_to(&path, &rec).unwrap();
+        let ctl = RestartPrep::load(path.clone(), None);
+        assert!(ctl.record().is_some());
+        // The record path becomes unreadable (a directory): a read error.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(ctl.claim_ownership());
+        assert_eq!(ctl.record(), Some(rec.clone()), "kept on a failed read");
+
+        // A changed record on disk is announced on the win.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join(super::super::RECORD_FILE);
+        crate::restart_prep::persist_to(&path2, &rec).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<PrepState>::new()));
+        let sink = seen.clone();
+        let ctl2 = RestartPrep::load(
+            path2.clone(),
+            Some(Box::new(move |c: &PrepChanged| {
+                sink.lock().unwrap().push(c.record.state)
+            })),
+        );
+        let mut newer = rec.clone();
+        newer.state = PrepState::Cancelled;
+        crate::restart_prep::persist_to(&path2, &newer).unwrap();
+        assert!(ctl2.claim_ownership());
+        assert_eq!(*seen.lock().unwrap(), vec![PrepState::Cancelled]);
     }
 
     /// Nit 6: a lock that cannot be taken at all (here: its directory is a
@@ -2518,7 +2703,7 @@ mod tests {
         old.cancel(&*door, T0 + 3).await.unwrap();
         drop(old);
         assert_eq!(
-            serving.claim_late(&*door, "a-newer-build", T0 + 4).await,
+            serving.claim_late(&*door, T0 + 4).await,
             Some(BootStep::NotInWindow(PrepState::Cancelled))
         );
         assert_eq!(serving.record().unwrap().state, PrepState::Cancelled);

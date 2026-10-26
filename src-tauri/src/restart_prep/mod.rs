@@ -318,8 +318,23 @@ pub fn persist_to(path: &Path, record: &PrepareRecord) -> std::io::Result<()> {
 /// `record_version` this build does not know — an unreadable record is absent,
 /// never half-parsed.
 pub fn load_from(path: &Path) -> Option<PrepareRecord> {
-    let raw = std::fs::read(path).ok()?;
-    match serde_json::from_slice::<PrepareRecord>(&raw) {
+    load_result(path).unwrap_or_else(|e| {
+        warn!(error = %e, path = %path.display(), "restart_prep: record unreadable — treated as absent");
+        None
+    })
+}
+
+/// [`load_from`], telling a record that is ABSENT (no such file: `Ok(None)`)
+/// from one that could not be READ this time (`Err`) — which a caller holding
+/// a good in-memory copy must not take as absence. An unparseable or
+/// unrecognised record is `Ok(None)`, as in [`load_from`].
+pub fn load_result(path: &Path) -> std::io::Result<Option<PrepareRecord>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(match serde_json::from_slice::<PrepareRecord>(&raw) {
         Ok(r) if r.record_version == RECORD_VERSION => Some(r),
         Ok(r) => {
             warn!(
@@ -333,7 +348,7 @@ pub fn load_from(path: &Path) -> Option<PrepareRecord> {
             warn!(error = %e, path = %path.display(), "restart_prep: record unparseable — treated as absent");
             None
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
