@@ -198,7 +198,7 @@ pub struct SectionPlan {
     /// what provably matches, so "this box is at canonical for `rustc`" can be
     /// ANSWERED rather than inferred from `rustc` not appearing in `changes` —
     /// an inference that also holds when neither capture contains `rustc` at
-    /// all. Consumers that gate on being at canonical (`ci_node::canonical`)
+    /// all. Consumers that gate on being at canonical (`qontinui_ci_exec::canonical`)
     /// must read this, not the absence of a change row.
     pub agreed: BTreeMap<String, String>,
 }
