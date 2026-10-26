@@ -743,6 +743,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

@@ -3144,6 +3144,8 @@ mod tests {
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
+                spawn: None,
+                run: Default::default(),
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());

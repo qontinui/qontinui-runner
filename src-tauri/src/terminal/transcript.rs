@@ -1638,6 +1638,82 @@ fn strip_xml_tags(text: &str) -> String {
     result
 }
 
+/// What one raw transcript line says about the session's FIRST slash command
+/// (run ledger, plan
+/// `2026-10-23-session-duration-by-work-type-and-per-device-session-load` D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FirstCommandObservation {
+    /// Not the session's first operator prompt — a non-`user` record, a
+    /// machine-authored one, a `tool_result`, or harness noise (a caveat, a
+    /// system reminder). Keep looking.
+    NotAPrompt,
+    /// The first operator prompt is a `<command-name>/x</command-name>` block
+    /// naming `x`. The RAW name (leading `/` kept) — the caller validates it
+    /// (`run_record_emitter::valid_first_command`) and drops anything else.
+    Command(String),
+    /// The first operator prompt is not a slash command (or carries no
+    /// readable name). Decided: the session has no first command.
+    NotACommand,
+}
+
+/// Classify one raw transcript line for [`FirstCommandObservation`]. Reads only
+/// the `<command-name>` tag — never `<command-args>` or prompt text, which
+/// never leave this function.
+pub(crate) fn first_command_of_line(line: &str) -> FirstCommandObservation {
+    let line = line.trim();
+    if line.is_empty() || !line.contains("\"user\"") {
+        return FirstCommandObservation::NotAPrompt;
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return FirstCommandObservation::NotAPrompt;
+    };
+    if record.get("type").and_then(|t| t.as_str()) != Some("user")
+        || is_machine_authored_user_record(&record)
+    {
+        return FirstCommandObservation::NotAPrompt;
+    }
+    let Some(content) = record.get("message").and_then(|m| m.get("content")) else {
+        return FirstCommandObservation::NotAPrompt;
+    };
+    let text = if let Some(s) = content.as_str() {
+        s.to_string()
+    } else if let Some(arr) = content.as_array() {
+        match arr
+            .iter()
+            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            Some(t) => t.to_string(),
+            // Only tool_result blocks — a tool round-trip, not a prompt.
+            None => return FirstCommandObservation::NotAPrompt,
+        }
+    } else {
+        return FirstCommandObservation::NotAPrompt;
+    };
+    let t = text.trim();
+    if t.starts_with("<command-name>") || t.starts_with("<command-message>") {
+        const OPEN: &str = "<command-name>";
+        const CLOSE: &str = "</command-name>";
+        let name = t
+            .find(OPEN)
+            .map(|i| i + OPEN.len())
+            .and_then(|start| {
+                let rest = t.get(start..)?;
+                rest.find(CLOSE).and_then(|end| rest.get(..end))
+            })
+            .map(|n| n.trim().to_string());
+        return match name {
+            Some(n) if !n.is_empty() => FirstCommandObservation::Command(n),
+            _ => FirstCommandObservation::NotACommand,
+        };
+    }
+    if is_system_or_noise(t) {
+        return FirstCommandObservation::NotAPrompt;
+    }
+    FirstCommandObservation::NotACommand
+}
+
 /// Check if a user message is system-generated or uninformative.
 fn is_system_or_noise(text: &str) -> bool {
     let t = text.trim();
@@ -2192,6 +2268,111 @@ pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeSca
 
 #[cfg(test)]
 mod tests {
+    // ── First slash command (run ledger, plan 2026-10-23 D3) ───────────────
+
+    fn user_line(content: serde_json::Value) -> String {
+        serde_json::json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": content}})
+            .to_string()
+    }
+
+    #[test]
+    fn first_command_reads_the_command_name_and_never_the_args() {
+        let line = user_line(serde_json::json!(
+            "<command-message>vet-imp is running…</command-message>\n<command-name>/vet-imp</command-name>\n<command-args>plans/secret-plan.md --token abc</command-args>"
+        ));
+        let obs = first_command_of_line(&line);
+        assert_eq!(
+            obs,
+            FirstCommandObservation::Command("/vet-imp".to_string())
+        );
+        // Validated by the run ledger: the leading slash is stripped, the args
+        // are never part of what was extracted.
+        let FirstCommandObservation::Command(raw) = obs else {
+            unreachable!()
+        };
+        assert_eq!(
+            crate::session::run_record_emitter::valid_first_command(&raw).as_deref(),
+            Some("vet-imp")
+        );
+        assert!(!raw.contains("secret") && !raw.contains("token"));
+    }
+
+    #[test]
+    fn first_command_array_content_and_name_first_layout() {
+        let line = user_line(serde_json::json!([
+            {"type": "text", "text": "<command-name>/implement-phase</command-name>\n<command-args>x</command-args>"}
+        ]));
+        assert_eq!(
+            first_command_of_line(&line),
+            FirstCommandObservation::Command("/implement-phase".to_string())
+        );
+    }
+
+    #[test]
+    fn first_command_plain_prompt_is_decided_not_a_command() {
+        let line = user_line(serde_json::json!("please fix the failing test"));
+        assert_eq!(
+            first_command_of_line(&line),
+            FirstCommandObservation::NotACommand
+        );
+        // An unreadable name is decided too — never guessed.
+        let broken = user_line(serde_json::json!("<command-name>/vet-imp"));
+        assert_eq!(
+            first_command_of_line(&broken),
+            FirstCommandObservation::NotACommand
+        );
+    }
+
+    #[test]
+    fn first_command_skips_noise_meta_and_non_user_records() {
+        let caveat = user_line(serde_json::json!(
+            "<local-command-caveat>Caveat…</local-command-caveat>"
+        ));
+        assert_eq!(
+            first_command_of_line(&caveat),
+            FirstCommandObservation::NotAPrompt
+        );
+        let meta = serde_json::json!({"type": "user", "isMeta": true, "uuid": "u",
+            "message": {"content": "<command-name>/x</command-name>"}})
+        .to_string();
+        assert_eq!(
+            first_command_of_line(&meta),
+            FirstCommandObservation::NotAPrompt
+        );
+        let tool_result = user_line(serde_json::json!([{"type": "tool_result", "content": "ok"}]));
+        assert_eq!(
+            first_command_of_line(&tool_result),
+            FirstCommandObservation::NotAPrompt
+        );
+        let assistant =
+            serde_json::json!({"type": "assistant", "message": {"content": "user"}}).to_string();
+        assert_eq!(
+            first_command_of_line(&assistant),
+            FirstCommandObservation::NotAPrompt
+        );
+        assert_eq!(
+            first_command_of_line("not json \"user\""),
+            FirstCommandObservation::NotAPrompt
+        );
+    }
+
+    #[test]
+    fn first_command_invalid_names_are_dropped_by_validation() {
+        for raw in ["/Vet-Imp", "/vet imp", "/../../etc", "/a;rm -rf"] {
+            let line = user_line(serde_json::json!(format!(
+                "<command-name>{raw}</command-name>"
+            )));
+            let FirstCommandObservation::Command(n) = first_command_of_line(&line) else {
+                panic!("{raw}: expected a raw command");
+            };
+            assert_eq!(
+                crate::session::run_record_emitter::valid_first_command(&n),
+                None,
+                "{raw} must be dropped, not truncated"
+            );
+        }
+    }
+
     use super::*;
 
     /// Transcript-sourced titles can carry raw SGR/OSC escapes (a `/rename`

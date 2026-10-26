@@ -246,6 +246,10 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the terminal exists.
+    let facts_app = app_handle.clone();
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let info = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
         create_manager.create(
@@ -266,6 +270,17 @@ pub async fn terminal_create(
     })
     .await
     .map_err(|e| format!("terminal spawn task failed: {e}"))??;
+
+    // Run ledger: the runner UI's own "new terminal". A claude the operator
+    // launches in it inherits these facts onto its own record.
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        &facts_app,
+        &info.id,
+        crate::session::run_record_emitter::SpawnFacts::new(
+            crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+        ),
+        spawn_since,
+    );
 
     // Park the isolated edit context on the terminal session so its
     // heartbeat + claim live as long as the PTY. Cleared in `close()`.
@@ -1383,6 +1398,8 @@ pub fn terminal_session_record_open(
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
+        spawn: None,
+        run: Default::default(),
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2981,6 +2998,8 @@ async fn poll_and_record_session<F>(
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
+                spawn: None,
+                run: Default::default(),
             };
             store.record_open(record);
             info!(
@@ -3082,6 +3101,8 @@ pub(crate) fn record_pinned_session_open(
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
+        spawn: None,
+        run: Default::default(),
     });
     info!(
         terminal_id = %terminal_id,
@@ -3394,6 +3415,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

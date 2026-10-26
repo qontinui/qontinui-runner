@@ -1249,6 +1249,11 @@ async fn start_steward(
         spec.skill, mode, interval
     );
 
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the terminal exists, and an
+    // AppHandle kept back from the one `create` consumes.
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
+    let facts_app = app_handle.clone();
     match terminal_manager.create(
         Some(spec.skill.to_string()),
         None, // working_dir — default to workspace root
@@ -1279,6 +1284,20 @@ async fn start_steward(
     ) {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);
+            // Run ledger: a steward session, its skill named, under the origin
+            // the caller stated (`Steward`, or `OperatorTerminal` from the
+            // runner UI). The claude the steward command launches in this shell
+            // inherits the facts.
+            crate::session::run_record_emitter::stamp_spawn_facts(
+                &facts_app,
+                &info.id,
+                crate::session::run_record_emitter::SpawnFacts::new(origin)
+                    .spawn_kind(spec.kind)
+                    .skill(crate::session::run_record_emitter::valid_first_command(
+                        spec.skill,
+                    )),
+                spawn_since,
+            );
 
             // Recording the terminal id is what makes this steward reachable
             // by `status` and `stop`. If it fails we must NOT leave the PTY
