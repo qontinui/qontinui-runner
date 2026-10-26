@@ -294,14 +294,20 @@ pub(crate) fn copy_transcript(
 
 /// Copy the session transcript from the source account's project dir into
 /// the target account's matching project dir. The source file is never
-/// modified or removed. Outside a migration, skips the copy when the
-/// destination already exists and is at least as large (idempotent retry), and
-/// keeps a smaller one whose bytes are not a prefix of the source's (a fork;
-/// [`MainCarry::KeptExisting`], warned). On a migration
-/// ([`MainTranscript::LiveSourceWins`]) only a byte-identical destination is
-/// skipped; every other non-prefix destination is renamed aside and the source
-/// copied ([`MainCarry::DivergedPreserved`]). `main` can also forbid replacing
-/// an existing destination at all.
+/// modified or removed. What happens to an existing destination depends on
+/// `main`:
+///
+/// - [`MainTranscript::ExtendPrefix`]: skipped when it is at least as large
+///   (idempotent retry); replaced when it is a smaller strict byte-prefix of
+///   the source's; otherwise kept (a fork; [`MainCarry::KeptExisting`],
+///   warned).
+/// - [`MainTranscript::KeepExisting`]: never replaced — skipped when at least
+///   as large, and kept when smaller ([`MainCarry::KeptExisting`]), whether or
+///   not its bytes are a prefix of the source's.
+/// - [`MainTranscript::LiveSourceWins`] (a migration): skipped only when
+///   byte-identical, extended when a strict byte-prefix, and otherwise renamed
+///   aside with the source copied in its place
+///   ([`MainCarry::DivergedPreserved`]).
 ///
 /// Then carries the session's sibling directory `<sid>/` file by file. Claude
 /// Code keeps each subagent's transcript there
