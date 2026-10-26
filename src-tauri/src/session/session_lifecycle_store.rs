@@ -4035,6 +4035,15 @@ impl ExitCause {
     /// a restart's death), so it reads [`ExitCause::Unknown`]. A non-zero
     /// status (a signal death reads as non-zero) is abnormal; no status at all
     /// (a failed wait, a PTY holder that died without reporting) is unknown.
+    ///
+    /// TRANSITIONAL COST, accepted (review round 13 S2): a pane whose `claude`
+    /// was started before this runner shipped the `SessionEnd` hook — a pane
+    /// adopted across a runner upgrade, or one whose `--settings` carrier failed
+    /// to materialize — never reports, so its `/exit` reads
+    /// [`ExitCause::Unknown`] and the session is restored at the next boot. That
+    /// fails in the safe direction (a session brought back, never one lost), and
+    /// there is deliberately no status-0 fallback to recover it: status 0 is
+    /// also what SIGINT and the orphan check produce.
     pub fn of_pane_exit(code: Option<i32>, runner_requested: bool, deliberate_end: bool) -> Self {
         match (code, runner_requested, deliberate_end) {
             (_, true, _) => ExitCause::Abnormal,
@@ -4051,7 +4060,9 @@ impl ExitCause {
 /// reported a deliberate end (`deliberate_end`) is a `claude` that ended on
 /// purpose; `claude` merely gone from a living shell is equally an OOM kill, a
 /// SIGKILL or a crash, and a dead PTY is decided by its own exit — both
-/// [`ExitCause::Unknown`], which keeps `poll-dead` restorable.
+/// [`ExitCause::Unknown`], which keeps `poll-dead` restorable. A pane with no
+/// `SessionEnd` hook (adopted across a runner upgrade) never has the marker:
+/// the accepted transitional cost described on [`ExitCause::of_pane_exit`].
 pub fn poll_exit_cause(live_is_alive: Option<bool>, deliberate_end: bool) -> ExitCause {
     if live_is_alive == Some(true) && deliberate_end {
         ExitCause::DeliberateEnd

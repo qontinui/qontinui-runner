@@ -1591,25 +1591,68 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 
 /// `POST /sessions/{id}/session-end` — the Claude Code `SessionEnd` hook's
 /// landing pad (review round 12 S1; script `claude_session_end_hook.sh`).
-/// `{id}` is the terminal id the hook sends and is informational only: the
-/// deliberate-end marker is keyed by the payload's own `session_id` (the
-/// Claude session id the lifecycle records carry). Body = the raw payload,
-/// parsed leniently. Always 200 — the hook ignores the answer and must never
-/// hold up an exit; `recorded` says whether a marker was written (only for
-/// reason `prompt_input_exit`, see `claude_ended_watch::DELIBERATE_END_REASONS`).
-async fn session_end(Path(id): Path<String>, body: axum::body::Bytes) -> Json<serde_json::Value> {
+/// `{id}` is the terminal id the hook sends (`QONTINUI_TERMINAL_ID`); body =
+/// the raw payload, parsed leniently. The marker is recorded only for a
+/// UUID-shaped `session_id` whose OPEN lifecycle record is hosted on that
+/// terminal, and only for reason `prompt_input_exit`
+/// (`claude_ended_watch::report_session_end`; review round 13 S1):
+/// 200 `recorded:true|false` for a well-formed report, 400 for a missing or
+/// malformed session id, 409 when no open record for it lives on that
+/// terminal, 503 with no lifecycle store. The hook ignores the answer either
+/// way and never holds up an exit.
+async fn session_end(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use tauri::Manager;
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    session_end_with(store.as_deref(), &id, &body)
+}
+
+/// [`session_end`] over an explicit store — the testable half.
+fn session_end_with(
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    terminal_id: &str,
+    body: &[u8],
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::session::claude_ended_watch::{report_session_end, SessionEndVerdict};
     let payload: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let recorded = crate::session::claude_ended_watch::record_session_end_payload(&payload);
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let Some(store) = store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "recorded": false, "verdict": "no_store" })),
+        );
+    };
+    let verdict = report_session_end(store, terminal_id, &payload);
+    // Every id and the reason are caller-supplied: logged with `?` (Debug —
+    // escaped and quoted), never raw, so a forged value cannot inject lines.
     tracing::info!(
-        terminal = %id,
-        claude_session = %payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("?"),
-        reason,
-        recorded,
+        terminal = ?terminal_id,
+        claude_session = ?payload.get("session_id").and_then(|v| v.as_str()),
+        reason = ?payload.get("reason").and_then(|v| v.as_str()),
+        verdict = ?verdict,
         "SessionEnd hook report"
     );
-    Json(serde_json::json!({ "recorded": recorded, "reason": reason, "terminal": id }))
+    let (status, name) = match verdict {
+        SessionEndVerdict::Recorded => (StatusCode::OK, "recorded"),
+        SessionEndVerdict::NotDeliberate => (StatusCode::OK, "not_deliberate"),
+        SessionEndVerdict::BadSessionId => (StatusCode::BAD_REQUEST, "bad_session_id"),
+        SessionEndVerdict::NoOpenRecordOnTerminal => {
+            (StatusCode::CONFLICT, "no_open_record_on_terminal")
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "recorded": verdict == SessionEndVerdict::Recorded,
+            "verdict": name,
+        })),
+    )
 }
 
 // =============================================================================
@@ -2531,26 +2574,47 @@ mod tests {
         assert!(req.cwd.is_none());
     }
 
-    /// Review round 12 S1: the SessionEnd hook's POST records the
-    /// deliberate-end marker for the payload's session — and only for `/exit`.
-    #[tokio::test]
-    async fn a_session_end_hook_post_records_the_marker() {
-        let id = "sessions-route-session-end-marker";
-        let other = session_end(
-            Path("term-x".to_string()),
-            axum::body::Bytes::from(format!(r#"{{"session_id":"{id}","reason":"other"}}"#)),
+    /// Review round 12 S1 / round 13 S1: the SessionEnd hook's POST records
+    /// the marker for the session open on the reporting terminal — and only
+    /// for `/exit`; a non-UUID id or a mismatched terminal records nothing.
+    #[test]
+    fn a_session_end_hook_post_records_the_marker() {
+        let id = "7f6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            dir.path().join("terminal-sessions.json"),
         )
-        .await;
-        assert_eq!(other.0["recorded"], false);
+        .unwrap();
+        let mut rec = crate::session::session_lifecycle_store::test_open_record(id);
+        rec.terminal_id = "term-x".to_string();
+        store.record_open(rec);
+        let post = |terminal: &str, body: String| {
+            let (status, Json(v)) = session_end_with(Some(&store), terminal, body.as_bytes());
+            (status, v)
+        };
+        let body =
+            |sid: &str, reason: &str| format!(r#"{{"session_id":"{sid}","reason":"{reason}"}}"#);
+
+        let (status, v) = post("term-x", body(id, "other"));
+        assert_eq!(
+            (status, v["recorded"].clone()),
+            (StatusCode::OK, false.into())
+        );
+        let (status, _) = post("term-x", body("not-a-uuid", "prompt_input_exit"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post("term-elsewhere", body(id, "prompt_input_exit"));
+        assert_eq!(status, StatusCode::CONFLICT);
         assert!(!crate::session::claude_ended_watch::deliberate_end(id));
-        let exit = session_end(
-            Path("term-x".to_string()),
-            axum::body::Bytes::from(format!(
-                r#"{{"session_id":"{id}","reason":"prompt_input_exit"}}"#
-            )),
-        )
-        .await;
-        assert_eq!(exit.0["recorded"], true);
+        assert_eq!(
+            session_end_with(None, "term-x", body(id, "prompt_input_exit").as_bytes()).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let (status, v) = post("term-x", body(id, "prompt_input_exit"));
+        assert_eq!(
+            (status, v["recorded"].clone()),
+            (StatusCode::OK, true.into())
+        );
         assert!(crate::session::claude_ended_watch::deliberate_end(id));
         crate::session::claude_ended_watch::forget_session_end(id);
     }

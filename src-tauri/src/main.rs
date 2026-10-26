@@ -5126,9 +5126,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                         commands::terminal_windows::is_app_quitting(),
                                         cause,
                                     );
-                                    poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, reason);
-                                    session::claude_ended_watch::forget_session_end(
+                                    let outcome = poll_lifecycle_store.record_close_checked(
+                                        &rec.claude_session_id,
+                                        None,
+                                        reason,
+                                    );
+                                    // Consumed only by a close that landed.
+                                    session::claude_ended_watch::consume_marker_after(
+                                        &outcome,
                                         &rec.claude_session_id,
                                     );
                                     consecutive_dead.remove(&rec.claude_session_id);

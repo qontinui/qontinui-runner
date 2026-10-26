@@ -29,25 +29,29 @@
 # Env (injected by the runner at PTY spawn — the identity seam):
 #   QONTINUI_RUNNER_API_PORT         the runner's :9876 loopback API port
 #   QONTINUI_INSTALL_INTERCEPT_PORT  fallback port (same server by default)
-#   QONTINUI_TERMINAL_ID             the per-PTY terminal id (informational:
-#                                    the runner keys the report by the payload's
-#                                    own `session_id`)
+#   QONTINUI_TERMINAL_ID             the per-PTY terminal id: the runner
+#                                    records the report only when the payload's
+#                                    `session_id` is OPEN on this terminal
 set -u
 
 # Drain stdin with a BUILTIN, not `cat` (see `claude_session_hook.sh`).
 payload=""
 IFS= read -r -t 1 -d '' payload || true
 port="${QONTINUI_RUNNER_API_PORT:-${QONTINUI_INSTALL_INTERCEPT_PORT:-}}"
-[ -z "$port" ] && exit 0
+# The port goes into the URL: digits only, else nothing is sent.
+case "$port" in
+  "" | *[!0-9]*) exit 0 ;;
+esac
 [ -z "$payload" ] && exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 
-# The terminal id becomes a URL PATH SEGMENT: keep it to the id alphabet (no
-# `/`, `?`, `#` or dot segments), else use a constant placeholder — the runner
-# does not need it.
+# The terminal id is REQUIRED: the runner records the report only for the
+# session OPEN on that terminal. It becomes a URL PATH SEGMENT, so it is kept
+# to the id alphabet (no `/`, `?`, `#` or dot segments); anything else, or no
+# id at all, sends nothing.
 term="${QONTINUI_TERMINAL_ID:-}"
 case "$term" in
-  "" | "." | ".." | *..* | */.* | *[!A-Za-z0-9._-]*) term="unknown" ;;
+  "" | "." | ".." | *..* | */.* | *[!A-Za-z0-9._-]*) exit 0 ;;
 esac
 
 printf '%s' "$payload" | curl -fsS --connect-timeout 1 --max-time 2 \

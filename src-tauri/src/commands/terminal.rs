@@ -1660,12 +1660,7 @@ pub fn terminal_session_record_close(
         cause,
     );
     let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), reason);
-    if matches!(
-        outcome,
-        crate::session::session_lifecycle_store::CloseOutcome::Closed { .. }
-    ) {
-        crate::session::claude_ended_watch::forget_session_end(&claude_session_id);
-    }
+    crate::session::claude_ended_watch::consume_marker_after(&outcome, &claude_session_id);
     Ok(close_outcome_response(&outcome))
 }
 

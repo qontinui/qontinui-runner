@@ -793,6 +793,10 @@ mod tests {
         assert!(session_end_text.contains("--max-time 2"));
         assert!(session_end_text.contains("--connect-timeout 1"));
         assert!(session_end_text.trim_end().ends_with("exit 0"));
+        // Review round 13 S1: the port is digits-only and the REAL terminal id
+        // is sent (no placeholder): the runner matches it to the open record.
+        assert!(session_end_text.contains("*[!0-9]*) exit 0"));
+        assert!(!session_end_text.contains("term=\"unknown\""));
 
         // The SAME settings file registers the SessionStart POLICY-INJECTION
         // hook (runner-enforced-policy-pull Phase 1) as a SECOND command inside
