@@ -58,7 +58,8 @@ pub const PROMPT_MARKER: char = '❯';
 ///
 /// 1. NO processing-indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]).
-/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted).
+/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), save on
+///    the static completed-turn line ([`is_completed_turn_line`]).
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
@@ -73,8 +74,12 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy.
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy — except on the static
+    // completed-turn line Claude Code leaves under a finished turn.
     for line in lines {
+        if is_completed_turn_line(line) {
+            continue;
+        }
         for ch in line.chars() {
             if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
                 return false;
@@ -90,6 +95,89 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 
     // (4) cursor in the input area (at/below the prompt row).
     (cursor_row as usize) >= prompt_row
+}
+
+/// Is `line` the static line Claude Code leaves on screen once a turn has
+/// FINISHED — `✻ Cogitated for 9m 42s · done 6:36 AM`,
+/// `✻ Churned for 1m 31s · done 7:49 AM` (2.1.310; shape
+/// `<glyph> <Verb>ed for <duration>[ · done <time>]`)?
+///
+/// It carries the same glyph as the live spinner, so a glyph-only veto read
+/// every finished session as busy for as long as the line stayed painted —
+/// i.e. forever, until the next turn. The live spinner line differs in shape,
+/// never only in glyph: a present-tense verb with an ellipsis and an elapsed
+/// counter in parentheses (`✻ Cogitating… (12s · ↑ 1.2k tokens · esc to
+/// interrupt)`). So this accepts ONLY the exact completed shape:
+///
+/// * a spinner glyph, then ONE alphabetic word (the verb — not checked for an
+///   `-ed` ending, because Claude Code's verb list includes irregular forms),
+/// * then `for` and a duration made solely of `<digits><unit>` tokens
+///   (`h`/`m`/`s`, e.g. `9m 42s`, `45s`, `1h 2m 3s`),
+/// * then nothing, or `· done` followed by the clock time.
+///
+/// Any ellipsis, parenthesis or other text anywhere on the line rejects it, so
+/// a live spinner can never match. Conservative: a line that is not exactly
+/// this shape keeps vetoing idle as before.
+pub fn is_completed_turn_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('│').trim();
+    if trimmed.contains('…') || trimmed.contains("...") || trimmed.contains('(') {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let Some(glyph) = chars.next() else {
+        return false;
+    };
+    if glyph == '·' || !SPINNER_GLYPHS.contains(&glyph) {
+        return false;
+    }
+    let rest = chars.as_str();
+    // Split off an optional `· done <time>` tail.
+    let (head, tail) = match rest.split_once('·') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    if let Some(tail) = tail {
+        let mut words = tail.split_whitespace();
+        if words.next() != Some("done") {
+            return false;
+        }
+        // The clock time: `6:36 AM`, `18:02`. Digits, colons and an AM/PM.
+        let mut saw_time = false;
+        for w in words {
+            let is_clock = w.contains(':') && w.chars().all(|c| c.is_ascii_digit() || c == ':');
+            let is_meridiem = matches!(w.to_ascii_uppercase().as_str(), "AM" | "PM");
+            if is_clock {
+                saw_time = true;
+            } else if !is_meridiem {
+                return false;
+            }
+        }
+        if !saw_time {
+            return false;
+        }
+    }
+    let mut words = head.split_whitespace();
+    let verb_ok = words
+        .next()
+        .is_some_and(|v| !v.is_empty() && v.chars().all(char::is_alphabetic));
+    if !verb_ok || words.next() != Some("for") {
+        return false;
+    }
+    let mut saw_duration = false;
+    for w in words {
+        let Some(unit) = w.chars().last() else {
+            return false;
+        };
+        let digits = w.strip_suffix(unit).unwrap_or_default();
+        if !matches!(unit, 'h' | 'm' | 's')
+            || digits.is_empty()
+            || !digits.chars().all(|c| c.is_ascii_digit())
+        {
+            return false;
+        }
+        saw_duration = true;
+    }
+    saw_duration
 }
 
 /// Context-low grid markers. The percentage form
@@ -196,6 +284,64 @@ mod tests {
         assert!(!snapshot_looks_idle(&lines(&["✶", "❯ "]), 1));
         // A bare middot in static UI must NOT veto (it is everywhere).
         assert!(snapshot_looks_idle(&lines(&["a · b", "❯ "]), 1));
+    }
+
+    /// The 2.1.310 finished-turn screen: the completed-turn line stays painted
+    /// above the input box after every finished turn, with the same `✻` glyph
+    /// the live spinner uses. It must read idle, or no session ever pauses.
+    #[test]
+    fn completed_turn_line_does_not_veto_idle() {
+        for done in [
+            "✻ Cogitated for 9m 42s · done 6:36 AM",
+            "✻ Churned for 1m 31s · done 7:49 AM",
+            "✻ Worked for 45s · done 18:02",
+            "✻ Baked for 1h 2m 3s",
+            "  ✻ Sautéed for 12s · done 9:01 pm",
+        ] {
+            let grid = lines(&[
+                "● Done — the change is committed.",
+                "",
+                done,
+                "",
+                "────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]);
+            assert!(is_completed_turn_line(done), "completed shape: {done:?}");
+            assert!(snapshot_looks_idle(&grid, 5), "must be idle with: {done:?}");
+        }
+    }
+
+    /// The live spinner keeps vetoing idle — with or without the
+    /// `esc to interrupt` text — and so does anything that merely resembles
+    /// the completed line.
+    #[test]
+    fn live_spinner_shapes_still_veto_idle() {
+        for busy in [
+            "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)",
+            "✻ Cogitating… (2m 3s · ↓ 4.5k tokens)",
+            "✶ Pondering…",
+            "✢ Reticulating... (5s)",
+            "✻ Cogitated for 9m 42s · done 6:36 AM (esc to interrupt)",
+            "✻ Cogitated for a while",
+            "✻ Cogitated for 9m 42s · still going",
+            "✻ Cogitated for",
+            "✻ working",
+            "✻ Thinking for 3s…",
+        ] {
+            assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
+            let grid = lines(&[busy, "❯ "]);
+            assert!(!snapshot_looks_idle(&grid, 1), "must be busy: {busy:?}");
+        }
+        // A completed line from the last turn does not hide a live spinner
+        // painted for the next one.
+        let grid = lines(&[
+            "✻ Cogitated for 9m 42s · done 6:36 AM",
+            "✶ Pondering… (3s)",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 2));
     }
 
     #[test]
