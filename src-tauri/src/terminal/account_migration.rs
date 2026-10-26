@@ -580,6 +580,8 @@ to its agent id instead of spawning a replacement (cancel any resume gate you bo
 first), and only if SendMessage reports \"No transcript found\" fall back to its checkpoint or \
 worktree.";
 
+/// What one grid read tells the idle watcher.
+///
 /// How the watcher decides the resumed CLI is ready for input:
 /// [`crate::terminal::graceful_exit::input_prompt_ready`], the predicate the
 /// session message poller already pastes through (`❯` on the cursor row, an
@@ -598,11 +600,9 @@ worktree.";
 /// it would have overridden every refusal (a draft, a dialog) the shared
 /// predicate makes, and a default-mode v2 pane draws `❯` as well.
 ///
-/// Painted while Claude is mid-turn — if visible, the session already picked
-/// itself up (or the operator beat us to it) and no nudge is needed.
-const BUSY_MARKER: &str = "esc to interrupt";
-
-/// What one grid read tells the idle watcher.
+/// A pane mid-turn (the spinner's `esc to interrupt` in its bottom rows,
+/// [`super::usage_limit::screen_shows_turn`]) already picked itself up (or the
+/// operator beat us to it), so no nudge is needed.
 #[derive(Debug, PartialEq, Eq)]
 enum IdlePromptProbe {
     /// Claude is mid-turn: the session picked itself up, no prompt is needed.
@@ -615,10 +615,12 @@ enum IdlePromptProbe {
 }
 
 /// Classify one rendered screen. Busy wins over ready, as before: a pane
-/// showing `esc to interrupt` never receives the prompt.
+/// showing `esc to interrupt` IN ITS BOTTOM ROWS never receives the prompt.
+/// The marker merely quoted higher up the conversation is not a turn
+/// (2026-10-23 review fix 6) — the same rule the usage-limit watcher's
+/// [`super::usage_limit::screen_shows_turn`] applies.
 fn probe_idle_prompt(screen: &crate::terminal::graceful_exit::ScreenText) -> IdlePromptProbe {
-    let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
-    if normalized.contains(BUSY_MARKER) {
+    if super::usage_limit::screen_shows_turn(&screen.lines.join("\n")) {
         return IdlePromptProbe::Busy;
     }
     match crate::terminal::graceful_exit::input_prompt_ready(screen) {
@@ -1900,6 +1902,35 @@ mod tests {
             2,
         );
         assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Busy);
+    }
+
+    /// 2b review fix 6: the marker QUOTED high up the conversation is not a
+    /// turn, so the nudge does not stand down as `AlreadyBusy` on it. (The
+    /// shared idle predicate still declines such a screen, so the watcher
+    /// keeps reading — `NotYet` — rather than submitting.)
+    ///
+    /// Mutation check: reading the whole screen for the marker again makes
+    /// this `Busy`.
+    #[test]
+    fn a_marker_quoted_in_history_is_not_busy() {
+        let rule = "─".repeat(75);
+        let mut rows: Vec<String> =
+            vec!["● the spinner reads `esc to interrupt` while it works".to_string()];
+        rows.extend((0..12).map(|i| format!("  line {i}")));
+        rows.extend([
+            rule.clone(),
+            "❯\u{a0}".to_string(),
+            rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+        ]);
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let prompt_row = refs.len() - 3;
+        let s = v2_screen(&refs, prompt_row as u16, 2);
+        assert!(
+            matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)),
+            "{:?}",
+            probe_idle_prompt(&s)
+        );
     }
 
     /// An operator draft on the input line must never receive the prompt
