@@ -170,11 +170,14 @@ mod tests {
         }
     }
 
-    fn rt() -> tokio::runtime::Runtime {
+    /// Run `f` to completion on a fresh current-thread runtime (built
+    /// inline: clippy.toml disallows naming an owned `Runtime`).
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
+            .block_on(f)
     }
 
     /// Kill a test's own tree and reap its root, bounded.
@@ -199,7 +202,7 @@ mod tests {
         ];
         track_ai_pid(&tracker, a.id());
         track_ai_pid(&tracker, b.id());
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "T8"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "T8"));
         assert_eq!(tally.killed, 2, "{tally:?}");
         assert!(lock_tracker(&tracker).is_empty());
         a.wait().unwrap();
@@ -224,7 +227,7 @@ mod tests {
         let reaped_pid = reaped.id();
         drop(reaped.stdin.take());
         reaped.wait().unwrap();
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "T9"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "T9"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         assert_eq!(tally.already_exited, 0, "{tally:?}");
         assert!(
@@ -252,7 +255,7 @@ mod tests {
             assert!(Instant::now() < deadline, "sh did not exit on EOF");
             std::thread::sleep(Duration::from_millis(20));
         }
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "T9b"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "T9b"));
         assert_eq!(tally.killed, 0, "{tally:?}");
         assert_eq!(tally.already_exited, 1, "{tally:?}");
         child.wait().unwrap();
@@ -262,7 +265,7 @@ mod tests {
     fn kill_tracked_on_an_empty_tracker_kills_nothing_repeatedly() {
         let tracker = Mutex::new(Vec::new());
         for _ in 0..2 {
-            let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(1), "T10"));
+            let tally = block_on(kill_tracked(&tracker, Duration::from_secs(1), "T10"));
             assert_eq!(tally, KillTally::default());
         }
     }
@@ -292,7 +295,7 @@ mod tests {
         let b_ids = [identity(b.id()), identity(gb)];
         let ta = track_ai_pid(&tracker, a.id());
         track_ai_pid(&tracker, b.id());
-        let tally = rt().block_on(kill_tracked_subset(
+        let tally = block_on(kill_tracked_subset(
             &tracker,
             &[(a.id(), ta)],
             Duration::from_secs(5),
@@ -308,7 +311,7 @@ mod tests {
         for id in b_ids {
             assert!(is_running(id), "task B's {id:?} was killed or left stopped");
         }
-        let tally = rt().block_on(kill_tracked(
+        let tally = block_on(kill_tracked(
             &tracker,
             Duration::from_secs(5),
             "T15 cleanup",
@@ -327,7 +330,7 @@ mod tests {
         let ids = [identity(b.id()), identity(gb)];
         track_ai_pid(&tracker, b.id());
         let stale = Some("linux:1".to_string());
-        let tally = rt().block_on(kill_tracked_subset(
+        let tally = block_on(kill_tracked_subset(
             &tracker,
             &[(b.id(), stale)],
             Duration::from_secs(5),
@@ -346,7 +349,7 @@ mod tests {
         for id in ids {
             assert!(is_running(id), "{id:?} was killed or left stopped");
         }
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         cleanup(b);
     }
@@ -363,7 +366,7 @@ mod tests {
         let tally = kill_tracked_with_deadline(&tracker, "finding 7", || None);
         assert_eq!(tally.refused.len(), 1, "{tally:?}");
         assert_eq!(*lock_tracker(&tracker), vec![a.id()]);
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "retry"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "retry"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         a.wait().unwrap();
         for id in ids {
@@ -425,7 +428,7 @@ mod tests {
         let ta = track_ai_pid(&tracker, a.id());
         let tb = track_ai_pid(&tracker, b.id());
         let rows = Rows(vec![("A", a.id(), ta), ("B", b.id(), tb)]);
-        let none = rt().block_on(stop_task_run_trees(
+        let none = block_on(stop_task_run_trees(
             None,
             &tracker,
             "A",
@@ -435,7 +438,7 @@ mod tests {
         assert_eq!(none, TaskStop::NoSessionRegistry);
         assert!(none.summary().contains("nothing was signalled"));
         assert_eq!(lock_tracker(&tracker).len(), 2);
-        let stop = rt().block_on(stop_task_run_trees(
+        let stop = block_on(stop_task_run_trees(
             Some(&rows as &dyn TaskPids),
             &tracker,
             "A",
@@ -455,7 +458,7 @@ mod tests {
         for id in b_ids {
             assert!(is_running(id), "task B's {id:?} was killed or left stopped");
         }
-        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
+        let tally = block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         cleanup(b);
     }
