@@ -121,6 +121,10 @@ struct RegisterOverrides {
     decided_tenant: Option<NewSessionTenant>,
     /// Resume parameters stamped on a FRESH `Started` row.
     resume: ResumeParams,
+    /// The launcher's spawn facts for the agentic plane's run `start` (run
+    /// ledger, Phase 4). `None` ⇒ the run is emitted with no origin, which
+    /// coord classifies `unknown`.
+    spawn: Option<crate::session::run_record_emitter::SpawnFacts>,
 }
 
 /// The parameters a later `claude --resume` must be pinned to: which account's
@@ -229,6 +233,14 @@ struct Inner {
     /// constructible without one (tests, ephemeral registrars). Unattached →
     /// the arm misses.
     terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
+    /// The session RUN emitter (plan
+    /// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+    /// Phase 4) — the agentic plane's half of the run ledger. A pinned
+    /// (agentic) registration emits a run `start`, its [`AiCoordRegistrar::close_session`]
+    /// the `end`, UNLESS the lifecycle store holds a CONFIRMED record for the
+    /// same id: that record is a counted run the store already emits.
+    /// Unattached (tests, ephemeral registrars) → no run rows.
+    run_emitter: OnceLock<Arc<crate::session::run_record_emitter::RunRecordEmitter>>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -309,6 +321,7 @@ impl AiCoordRegistrar {
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
+                run_emitter: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -327,6 +340,34 @@ impl AiCoordRegistrar {
         if self.inner.lifecycle_store.set(store).is_err() {
             warn!("ai_coord_register: lifecycle store already attached — ignoring");
         }
+    }
+
+    /// Attach the session RUN emitter (once, at startup). See
+    /// [`Inner::run_emitter`].
+    pub fn attach_run_record_emitter(
+        &self,
+        emitter: Arc<crate::session::run_record_emitter::RunRecordEmitter>,
+    ) {
+        if self.inner.run_emitter.set(emitter).is_err() {
+            warn!("ai_coord_register: run-record emitter already attached — ignoring");
+        }
+    }
+
+    /// Whether the agentic plane owns `claude_session_id`'s run accounting:
+    /// an emitter is attached and the lifecycle store holds no CONFIRMED
+    /// record for it (a confirmed record is a counted run the store emits).
+    fn agentic_run_emitter(
+        &self,
+        claude_session_id: &str,
+    ) -> Option<&Arc<crate::session::run_record_emitter::RunRecordEmitter>> {
+        let emitter = self.inner.run_emitter.get()?;
+        let store_owns = self
+            .inner
+            .lifecycle_store
+            .get()
+            .and_then(|s| s.get(claude_session_id))
+            .is_some_and(|r| r.confirmed_at.is_some());
+        (!store_owns).then_some(emitter)
     }
 
     /// Attach the terminal plane's harness-id → coord-id lookup (once, at
@@ -535,9 +576,25 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
         workdir: Option<&std::path::Path>,
+        // The run ledger's spawn facts. `Some` ⇒ this registration IS one run
+        // of a `ClaudeSession` pinned to `task_run_id` (its process exit ends
+        // the run); `None` ⇒ the registration is not a run of its own (a
+        // unified workflow's umbrella row, whose phases are the sessions).
+        spawn: Option<crate::session::run_record_emitter::SpawnFacts>,
     ) -> Option<Uuid> {
         let Some(workdir) = workdir else {
-            return self.register_session(task_run_id, purpose, repo);
+            return self
+                .register_inner(
+                    task_run_id,
+                    Some(task_run_id),
+                    purpose,
+                    repo,
+                    RegisterOverrides {
+                        spawn,
+                        ..RegisterOverrides::default()
+                    },
+                )
+                .ok();
         };
         if !registration_enabled() {
             return None;
@@ -550,6 +607,7 @@ impl AiCoordRegistrar {
             repo,
             RegisterOverrides {
                 decided_tenant: Some(decided),
+                spawn,
                 ..RegisterOverrides::default()
             },
         )
@@ -649,6 +707,9 @@ impl AiCoordRegistrar {
                 tenant,
                 resume,
                 decided_tenant: None,
+                // A transcript bind is a terminal session the lifecycle store
+                // counts itself — never an agentic run.
+                spawn: None,
             },
         )
     }
@@ -917,6 +978,22 @@ impl AiCoordRegistrar {
         // and the server-side rebind keyed on `claude_session_id` refreshes
         // `current_agent_session_id` on the existing handle row.
         self.spawn_handle_register(claude_session_id, session_id, task_run_id, name_alias);
+
+        // Run ledger, agentic plane: a FRESH pinned registration that states
+        // spawn facts is a run start (its `ClaudeSession`'s process exit ends
+        // it — `run_record_emitter::agentic_process_exited`). The sniffed plane
+        // is a terminal session the lifecycle store counts itself; an adoption
+        // binds a row that already exists.
+        if task_run_id.is_some() && adopt_coord_session.is_none() && overrides.spawn.is_some() {
+            if let Some(emitter) = self.agentic_run_emitter(claude_session_id) {
+                emitter.agentic_start(
+                    claude_session_id,
+                    overrides.spawn.clone(),
+                    tenant.map(|t| t.to_string()),
+                    Some(session_id),
+                );
+            }
+        }
 
         // A finished marker set while this session had no coord row in this
         // process (before its first registration, or before a runner restart
@@ -1514,6 +1591,12 @@ impl AiCoordRegistrar {
         // the R4 index.
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
         self.evict_tenant(session_id);
+
+        // Run ledger, agentic plane: the run ends here (a no-op for an id the
+        // agentic ledger holds no open run for — e.g. a sniffed session).
+        if let Some(emitter) = self.agentic_run_emitter(session_key) {
+            emitter.agentic_end(session_key, Some(session_id));
+        }
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
@@ -3472,6 +3555,8 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                spawn: None,
+                run: Default::default(),
             },
         );
         let finished_at = store
@@ -3574,6 +3659,8 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                spawn: None,
+                run: Default::default(),
             },
         );
         let coord_id = reg

@@ -1005,6 +1005,12 @@ pub(crate) static TRANSPORT_RUNG_DROPPED_404: AtomicU64 = AtomicU64::new(0);
 /// hoisting it out of the function changed nothing about the log cadence.
 pub(crate) static TRANSPORT_RUNG_DROPPED_405: AtomicU64 = AtomicU64::new(0);
 
+/// `session_run` rows ACK-dropped because the serving coord answered 404/405
+/// for `POST /coord/session-runs` (a build predating the route) since this
+/// process booted. Read by `GET /health` `sessionRuns.drainDropped`, so the
+/// under-count is visible without a log grep.
+pub(crate) static SESSION_RUN_DROPPED_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
+
 /// Rows Ack-dropped on any OTHER 4xx — a status the shared classifier
 /// ([`write_failure_outcome`]) maps to `PermanentFailure`, including a 429,
 /// which this kind does not special-case the way `output_chunk` does. The
@@ -2017,6 +2023,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "session_run" => {
+            // Session RUN ledger (plan
+            // 2026-10-23-session-duration-by-work-type-and-per-device-session-load,
+            // Phase 4). POST /coord/session-runs with `payload.body` forwarded
+            // verbatim — NOT the session-events ingest. Coord upserts on
+            // (tenant, claude_code_session_id, run_seq), so the outbox may
+            // replay freely. `payload.tenant_id` selected `scope` above and is
+            // not part of the body.
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING, same hazard as
+            // "coord-transport-rung": without it the kind falls to the `other`
+            // catch-all below, which ACKs and DROPS at debug level, and the
+            // run ledger would read a clean, wrong zero. See
+            // `every_session_outbox_kind_has_a_dispatch_arm` and
+            // `session_run_posts_its_body_to_the_session_runs_route`.
+            let url = format!(
+                "{base}{}",
+                crate::session::run_record_emitter::SESSION_RUNS_ROUTE
+            );
+            let body = rec.payload.get("body").cloned().unwrap_or(JsonValue::Null);
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
             // pushed yet. Quietly ACK so the file doesn't grow.
@@ -2101,6 +2131,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 // counts it.
                 let detail = resp.text().await.unwrap_or_default();
                 return PushOutcome::Transport(format!("{status}: {detail}"));
+            }
+            if kind == "session_run"
+                && matches!(
+                    status,
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                )
+            {
+                // A coord build that predates `/coord/session-runs` — the
+                // restore-record precedent: best-effort observability, so
+                // ACK-drop rather than error-spam the PermanentFailure path.
+                // A route-wide fact (every row 404s until coord ships it), so
+                // logged on the first drop and every 1000th, with the total;
+                // `GET /health` `sessionRuns.drainDropped` carries the count.
+                let n = SESSION_RUN_DROPPED_NO_ROUTE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 1000 == 0 {
+                    tracing::info!(
+                        dropped_total = n,
+                        status = %status,
+                        "coord_sync: coord has no /coord/session-runs route — \
+                         dropping session run rows (the run ledger under-counts \
+                         until coord ships it)"
+                    );
+                }
+                return PushOutcome::Acked;
             }
             if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
@@ -3751,6 +3805,7 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
+            SessionEventKind::SessionRun,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -3942,6 +3997,11 @@ mod tests {
         events_status: Option<u16>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
+        /// Bodies POSTed to `/coord/session-runs` (run ledger, Phase 4).
+        session_runs: Vec<JsonValue>,
+        /// When set, `/coord/session-runs` answers this status instead of
+        /// 200 — a coord build that predates the route (404/405).
+        session_runs_status: Option<u16>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -4321,6 +4381,21 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/session-runs",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.session_runs.push(body.clone());
+                        let status = g
+                            .session_runs_status
+                            .and_then(|c| AxumStatus::from_u16(c).ok())
+                            .unwrap_or(AxumStatus::OK);
+                        (status, Json(json!({ "ok": status.is_success() }))).into_response()
                     },
                 ),
             )
@@ -4719,6 +4794,101 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// Drain one `session_run` row into a fake coord whose
+    /// `/coord/session-runs` answers `status`; returns the POSTed bodies once
+    /// the row is ACKed (removed from the outbox).
+    async fn drain_one_session_run(status: Option<u16>) -> Vec<JsonValue> {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.session_runs_status = status;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let ccsid = "0b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d10";
+        outbox
+            .record(
+                Uuid::new_v4(),
+                crate::session::run_record_emitter::run_lane(ccsid),
+                SessionEventKind::SessionRun,
+                json!({
+                    "tenant_id": "4f8c1c1e-1111-4222-8333-444455556666",
+                    "body": {
+                        "claude_code_session_id": ccsid,
+                        "run_seq": 1,
+                        "event": "end",
+                        "started_at": "2026-10-26T00:00:00.000Z",
+                        "ended_at": "2026-10-26T01:00:00.000Z",
+                        "close_reason": "pty-exit",
+                        "facts": {"spawn_origin": "gate_continuation"},
+                    },
+                }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the row must be ACKed (delivered or dropped), never retried forever"
+        );
+        let g = rec.lock().await;
+        assert!(
+            g.events.is_empty(),
+            "session_run must NOT ride /sessions/:id/events"
+        );
+        g.session_runs.clone()
+    }
+
+    /// The `session_run` arm POSTs `payload.body` VERBATIM to
+    /// `/coord/session-runs` — the envelope's `tenant_id` only picks the
+    /// credential slot and never reaches the body. An empty recording means
+    /// push_record lost its arm and the catch-all ACK-dropped the row.
+    #[tokio::test]
+    async fn session_run_posts_its_body_to_the_session_runs_route() {
+        let posted = drain_one_session_run(None).await;
+        assert_eq!(posted.len(), 1, "exactly one POST /coord/session-runs");
+        let body = &posted[0];
+        assert_eq!(body["event"], json!("end"));
+        assert_eq!(body["run_seq"], json!(1));
+        assert_eq!(body["close_reason"], json!("pty-exit"));
+        assert_eq!(body["facts"]["spawn_origin"], json!("gate_continuation"));
+        assert!(
+            body.get("tenant_id").is_none(),
+            "the envelope is not the body"
+        );
+        assert!(body.get("body").is_none(), "the body is unwrapped");
+    }
+
+    /// A coord that predates the route (404 / 405) ACK-drops the row — the
+    /// restore-record precedent — and counts it for `/health`.
+    #[tokio::test]
+    async fn session_run_on_a_coord_without_the_route_is_ack_dropped() {
+        for status in [404u16, 405] {
+            let before = SESSION_RUN_DROPPED_NO_ROUTE.load(Ordering::Relaxed);
+            let posted = drain_one_session_run(Some(status)).await;
+            assert_eq!(posted.len(), 1, "{status}: attempted once, not retried");
+            assert!(
+                SESSION_RUN_DROPPED_NO_ROUTE.load(Ordering::Relaxed) > before,
+                "{status}: the drop is counted"
+            );
+        }
+    }
+
+    /// A 401 is a 4xx coord refusal: ACK-dropped through the shared classifier
+    /// (as for restore-record), never an infinite retry loop.
+    #[tokio::test]
+    async fn session_run_refused_401_does_not_loop() {
+        let posted = drain_one_session_run(Some(401)).await;
+        assert_eq!(posted.len(), 1, "one attempt, then dropped");
     }
 
     /// The three drop counters are process-wide and each test below asserts

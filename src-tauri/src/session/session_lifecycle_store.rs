@@ -59,6 +59,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
+use crate::session::run_record_emitter::{
+    begin_run_if_due, boot_restore_boundary, end_run_if_due, process_boot_ms, valid_first_command,
+    BootBoundary, RunAccounting, RunEvent, RunRecordEmitter, SpawnFacts,
+};
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
 /// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
@@ -834,6 +838,23 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Why this session was launched, as the launcher knew it — the run
+    /// ledger's raw spawn facts (plan
+    /// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+    /// Phase 4 / D2). Stamped by the launch site through
+    /// [`SessionLifecycleStore::record_spawn_facts`] right after its terminal
+    /// is created; a brand-new record binding a terminal inherits the facts an
+    /// open record on that terminal already carries (the account launcher's
+    /// typed `claude --session-id` row inherits the seam row's facts, as it
+    /// inherits [`Self::spawn_device_default`]). `None` = no launcher stated
+    /// one, which coord classifies `unknown` — never a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnFacts>,
+    /// The record's run counter (same plan). Every open→close interval that
+    /// is confirmed is one run; a re-open after a close is `seq + 1`.
+    /// Persisted so `seq` survives a restart. See [`RunAccounting`].
+    #[serde(default, skip_serializing_if = "RunAccounting::is_empty")]
+    pub run: RunAccounting,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -966,6 +987,17 @@ pub struct SessionLifecycleStore {
     /// registry write on the network (the drain loop does the pushing).
     /// Unattached (tests, ephemeral fallbacks) → no-op.
     restore_emitter: OnceLock<Arc<RestoreRecordEmitter>>,
+    /// Optional session RUN emitter (plan
+    /// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+    /// Phase 4). When attached, every transition that begins a run (an open
+    /// confirmed record — [`Self::record_open`], [`Self::confirm_session`]),
+    /// every fact learned mid-run ([`Self::record_spawn_facts`],
+    /// [`Self::note_first_command`]) and every close of a counted run (the
+    /// explicit / pty-exit / poll-dead close, `record_open`'s supersede arms,
+    /// the boot collision repair) hands the record to the emitter, which gates,
+    /// debounces and enqueues a `session_run` outbox row. Emitted AFTER the
+    /// durable local write and outside the map lock. Unattached → no-op.
+    run_emitter: OnceLock<Arc<RunRecordEmitter>>,
     /// Optional transcript-existence probe. Read at two points: write time, to
     /// stamp every snapshot-history entry ([`SnapshotSession::restorable`] /
     /// `transcript_exists`), and list time, by callers going through
@@ -1203,6 +1235,9 @@ impl SessionLifecycleStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Pin this process's run-accounting boot instant now, at boot, before
+        // any restore reads it.
+        let _ = process_boot_ms();
         let wal_path = wal_path_for(&path);
         let mut map = load_map(&path);
         let replay = replay_wal(&wal_path, &mut map);
@@ -1218,6 +1253,7 @@ impl SessionLifecycleStore {
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
+            run_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
@@ -1287,6 +1323,48 @@ impl SessionLifecycleStore {
     pub fn attach_restore_record_emitter(&self, emitter: Arc<RestoreRecordEmitter>) {
         if self.restore_emitter.set(emitter).is_err() {
             warn!("session_lifecycle_store: restore-record emitter already attached — ignoring");
+        }
+    }
+
+    /// Attach the session RUN emitter (once, at startup). Without one every
+    /// run hook is a no-op — the store works standalone.
+    pub fn attach_run_record_emitter(&self, emitter: Arc<RunRecordEmitter>) {
+        if self.run_emitter.set(emitter).is_err() {
+            warn!("session_lifecycle_store: run-record emitter already attached — ignoring");
+        }
+    }
+
+    /// Hand one record's run event to the attached emitter, if any. Called
+    /// AFTER the durable write, outside the map lock; best-effort by
+    /// construction.
+    fn emit_run(&self, rec: &TerminalSessionRecord, event: RunEvent) {
+        if let Some(emitter) = self.run_emitter.get() {
+            emitter.emit(rec, event);
+        }
+    }
+
+    /// Emit the END of each record in `ended` — the records whose close made
+    /// [`end_run_if_due`] answer `true` under the map lock.
+    fn emit_run_ends<'a>(&self, ended: impl IntoIterator<Item = &'a TerminalSessionRecord>) {
+        for rec in ended {
+            self.emit_run(rec, RunEvent::End);
+        }
+    }
+
+    /// Apply a boot-restore run boundary to `rec` (in-lock) — see
+    /// [`boot_restore_boundary`].
+    fn boot_boundary(rec: &mut TerminalSessionRecord, resumes: bool, now: i64) -> BootBoundary {
+        boot_restore_boundary(rec, resumes, process_boot_ms(), now)
+    }
+
+    /// Emit what a boot boundary decided: the previous run's end, then the new
+    /// run's start.
+    fn emit_boot_boundary(&self, boundary: &BootBoundary, rec: &TerminalSessionRecord) {
+        if let Some(ended) = boundary.ended.as_ref() {
+            self.emit_run(ended, RunEvent::End);
+        }
+        if boundary.began {
+            self.emit_run(rec, RunEvent::Start);
         }
     }
 
@@ -1509,7 +1587,7 @@ impl SessionLifecycleStore {
         // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
-        let (merged, superseded) = {
+        let (merged, superseded, run_began, run_ends) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1535,12 +1613,40 @@ impl SessionLifecycleStore {
             } else {
                 None
             };
+            // Same inheritance for the launcher's spawn facts (run ledger,
+            // Phase 4): the launch site stamps the seam's provisional row, and
+            // the account launcher's own typed row is the one that runs.
+            let inherited_spawn =
+                if is_new_record && rec.spawn.is_none() && !new_terminal_id.trim().is_empty() {
+                    m.values()
+                        .filter(|o| o.state == "open" && o.terminal_id == new_terminal_id)
+                        .find_map(|o| o.spawn.clone())
+                } else {
+                    None
+                };
+            // Whether this write RE-OPENS a closed record — a new open
+            // interval, so a new run once confirmed (D1: `run_seq + 1`).
+            let reopening = m
+                .get(&rec.claude_session_id)
+                .is_some_and(|e| e.state != "open");
             let entry =
                 m.entry(rec.claude_session_id.clone())
                     .or_insert_with(|| TerminalSessionRecord {
                         opened_at: now,
+                        // The run counter is the store's, never the caller's.
+                        run: RunAccounting::default(),
                         ..rec.clone()
                     });
+            if is_new_record || reopening {
+                entry.run.note_opened(now);
+            }
+            // A launcher that states facts wins (it is THIS launch's); absent
+            // ⇒ keep, or inherit onto a brand-new record.
+            if rec.spawn.is_some() {
+                entry.spawn = rec.spawn.clone();
+            } else if entry.spawn.is_none() {
+                entry.spawn = inherited_spawn;
+            }
             // Preserve opened_at on an existing record; refresh everything
             // else and re-open.
             // config_dir is STICKY (like the `confirmed_at` monotonic guard
@@ -1646,6 +1752,7 @@ impl SessionLifecycleStore {
                 entry.awaiting_account_since = None;
             }
             entry.last_seen_at = now;
+            let run_began = begin_run_if_due(entry);
             let merged = entry.clone();
 
             // Single-tenant-terminal invariant: a PTY terminal hosts at most
@@ -1686,6 +1793,7 @@ impl SessionLifecycleStore {
             //     confirmed sibling — an authoritative-but-UNCONFIRMED incoming
             //     (itself not yet proven) must NOT evict a confirmed row.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
+            let mut run_ends: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
                 for other in m.values_mut() {
                     // A row held for an account choice is never a sibling: the
@@ -1700,6 +1808,8 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded".to_string());
+                        // Unconfirmed ⇒ never a counted run (`confirmed_at`
+                        // is monotonic), so no run end is due here.
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -1711,9 +1821,16 @@ impl SessionLifecycleStore {
                             "session-restore: evicted unconfirmed phantom sibling — new authoritative session bound the terminal"
                         );
                     } else if new_is_confirmed {
+                        // Count a confirmed-but-uncounted prior run before it
+                        // closes, so its end still reaches the run ledger.
+                        begin_run_if_due(other);
+                        let end_due = end_run_if_due(other);
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        if end_due {
+                            run_ends.push(other.clone());
+                        }
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -1737,8 +1854,14 @@ impl SessionLifecycleStore {
                 rec: Box::new(r.clone()),
             }));
             self.persist(m, &deltas);
-            (merged, superseded)
+            (merged, superseded, run_began, run_ends)
         };
+        // Run ledger — the superseded tenants' runs end before the new one
+        // starts, the order they happened in on this terminal.
+        self.emit_run_ends(run_ends.iter());
+        if run_began {
+            self.emit_run(&merged, RunEvent::Start);
+        }
         self.snapshot_change(std::iter::once(merged.clone()).chain(superseded));
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
@@ -1904,7 +2027,7 @@ impl SessionLifecycleStore {
                 };
             }
         }
-        let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use) = {
+        let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use, run_end_due) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1960,17 +2083,22 @@ impl SessionLifecycleStore {
 
             let closed = match m.get_mut(target.as_str()) {
                 Some(rec) if rec.state == "open" => {
+                    // Count an open+confirmed record that predates run
+                    // accounting before it closes (no-op for a counted run).
+                    begin_run_if_due(rec);
+                    let end_due = end_run_if_due(rec);
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
                     // A closed record's restore can never be retried — see
                     // `reap_restore_marker_on_close`.
                     reap_restore_marker_on_close(rec);
-                    rec.clone()
+                    (rec.clone(), end_due)
                 }
                 // Unreachable: `resolve_close_target` only names OPEN rows.
                 _ => return outcome,
             };
+            let (closed, run_end_due) = closed;
             let workdir = closed.working_dir.clone();
             // Answered under the lock rather than off a full-map clone — the
             // clone existed only to serve this one query.
@@ -1984,8 +2112,12 @@ impl SessionLifecycleStore {
                     rec: Box::new(closed.clone()),
                 }],
             );
-            (outcome, target, closed, workdir, still_in_use)
+            (outcome, target, closed, workdir, still_in_use, run_end_due)
         };
+        // Run ledger: the store's own close time and RAW close reason.
+        if run_end_due {
+            self.emit_run(&closed, RunEvent::End);
+        }
         self.snapshot_change(std::iter::once(closed));
         // Fabric Phase 3 (review W2): notify AFTER the durable local write,
         // outside the map lock, and only on a REAL open→closed transition
@@ -2401,25 +2533,32 @@ impl SessionLifecycleStore {
                 return;
             }
         };
-        let changed = match m.get_mut(claude_session_id) {
+        let (changed, boundary) = match m.get_mut(claude_session_id) {
             Some(rec) if boot => {
                 rec.restore_pending_at = Some(now);
                 rec.restored_from_boot_at = Some(now);
                 rec.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
-                rec.clone()
+                // The resume half of a boot restore: the previous runner's run
+                // ended, and a new claude process resumes the conversation —
+                // a new run (`run_seq + 1`, origin `boot_resume`).
+                let boundary = Self::boot_boundary(rec, true, now);
+                (rec.clone(), boundary)
             }
+            // An operator resume is not a boot restore: the run the row holds
+            // continues, so no boundary is drawn.
             Some(rec) if rec.state == "open" => {
                 rec.restore_pending_at = Some(now);
-                rec.clone()
+                (rec.clone(), BootBoundary::default())
             }
             _ => return,
         };
         self.persist(
             m,
             &[LifecycleDelta::Upsert {
-                rec: Box::new(changed),
+                rec: Box::new(changed.clone()),
             }],
         );
+        self.emit_boot_boundary(&boundary, &changed);
     }
 
     /// Mark a session FINISHED, or unmark it — the WORK axis, orthogonal to
@@ -2705,7 +2844,7 @@ impl SessionLifecycleStore {
     /// auto-resume vs treat-as-plain-shell; this method just records the signal.
     pub fn confirm_session(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
-        let confirmed = {
+        let (confirmed, run_began) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -2713,10 +2852,12 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let confirmed = match m.get_mut(claude_session_id) {
+            let (confirmed, run_began) = match m.get_mut(claude_session_id) {
                 Some(rec) if rec.confirmed_at.is_none() => {
                     rec.confirmed_at = Some(now);
-                    rec.clone()
+                    // Confirmation is what makes an open record a run.
+                    let began = begin_run_if_due(rec);
+                    (rec.clone(), began)
                 }
                 _ => return, // absent or already confirmed — nothing to flush
             };
@@ -2726,8 +2867,11 @@ impl SessionLifecycleStore {
                     rec: Box::new(confirmed.clone()),
                 }],
             );
-            confirmed
+            (confirmed, run_began)
         };
+        if run_began {
+            self.emit_run(&confirmed, RunEvent::Start);
+        }
         self.snapshot_change(std::iter::once(confirmed.clone()));
         // Phase 4 cloud mirror — a confirmation flip changes the record's
         // honest restore tier (terminal_only → full for a Full-tier
@@ -2944,6 +3088,105 @@ impl SessionLifecycleStore {
         true
     }
 
+    /// Stamp the launcher's [`SpawnFacts`] on the open record a spawn just
+    /// created on `terminal_id` (run ledger, plan
+    /// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`
+    /// Phase 4). Called by every launch site right after its terminal exists —
+    /// the `runner_spawn_sites` guard checks that each declared site does.
+    ///
+    /// Written only onto a record whose CURRENT open interval began at or after
+    /// `spawned_since_ms` (taken by the caller before the spawn): a record that
+    /// merely moved onto this terminal (an account migration of a live session)
+    /// keeps the facts of the launch that started it. When the run is already
+    /// counted the change is mirrored as a `merge`. Returns whether a record
+    /// took the facts.
+    pub fn record_spawn_facts(
+        &self,
+        terminal_id: &str,
+        facts: SpawnFacts,
+        spawned_since_ms: i64,
+    ) -> bool {
+        if terminal_id.trim().is_empty() {
+            return false;
+        }
+        let changed = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on record_spawn_facts");
+                    return false;
+                }
+            };
+            let Some(rec) = m.values_mut().find(|r| {
+                r.state == "open"
+                    && r.terminal_id == terminal_id
+                    && r.run.opened_at.unwrap_or(r.opened_at) >= spawned_since_ms
+            }) else {
+                debug!(
+                    terminal_id,
+                    "session_lifecycle_store: no record this spawn opened on the terminal — spawn facts dropped"
+                );
+                return false;
+            };
+            if rec.spawn.as_ref() == Some(&facts) {
+                return true;
+            }
+            rec.spawn = Some(facts);
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        };
+        if changed.run.started && !changed.run.ended {
+            self.emit_run(&changed, RunEvent::Merge);
+        }
+        true
+    }
+
+    /// Record the session's FIRST slash command, read from its transcript's
+    /// first operator `user` record (plan D3). `raw` is validated with
+    /// [`valid_first_command`]; an invalid name is dropped, never truncated.
+    /// Set once — a session keeps its first type. Mirrored as a `merge` when
+    /// the run is already counted; otherwise the run's `start` carries it.
+    /// Returns whether it was recorded.
+    pub fn note_first_command(&self, claude_session_id: &str, raw: &str) -> bool {
+        let Some(name) = valid_first_command(raw) else {
+            return false;
+        };
+        let changed = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on note_first_command");
+                    return false;
+                }
+            };
+            let Some(rec) = m.get_mut(claude_session_id) else {
+                return false;
+            };
+            if rec.run.first_command.is_some() {
+                return false;
+            }
+            rec.run.first_command = Some(name);
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        };
+        if changed.run.started && !changed.run.ended {
+            self.emit_run(&changed, RunEvent::Merge);
+        }
+        true
+    }
+
     /// Stamp the boot-restore markers on a present record: `restored_from_boot_at`
     /// = now and `restore_tier` = `tier` (one of [`RESTORE_TIER_RESUMED`],
     /// [`RESTORE_TIER_TERMINAL_ONLY`], [`RESTORE_TIER_FAILED`]).
@@ -2983,6 +3226,11 @@ impl SessionLifecycleStore {
             };
             rec.restored_from_boot_at = Some(now);
             rec.restore_tier = Some(tier.to_string());
+            // The previous runner's run ended when it stopped. A RESUMED tier
+            // was already split by `mark_restore_pending` (idempotent here); a
+            // terminal-only or failed restore runs no conversation, so it only
+            // ends the old run.
+            let boundary = Self::boot_boundary(rec, false, now);
             let changed = rec.clone();
             self.persist(
                 m,
@@ -2990,8 +3238,10 @@ impl SessionLifecycleStore {
                     rec: Box::new(changed.clone()),
                 }],
             );
-            changed
+            (changed, boundary)
         };
+        let (changed, boundary) = changed;
+        self.emit_boot_boundary(&boundary, &changed);
         info!(
             claude_session_id,
             tier, "session-restore: record marked as restored from boot"
@@ -3607,7 +3857,7 @@ impl SessionLifecycleStore {
     /// actually accumulates.
     pub fn repair_terminal_id_collisions(&self) -> usize {
         let now = Utc::now().timestamp_millis();
-        let (closed_recs, closed) = {
+        let (closed_recs, closed, run_ends) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -3627,6 +3877,7 @@ impl SessionLifecycleStore {
             }
             let mut closed = 0usize;
             let mut closed_recs: Vec<TerminalSessionRecord> = Vec::new();
+            let mut run_ends: Vec<TerminalSessionRecord> = Vec::new();
             for (_terminal, ids) in by_terminal {
                 if ids.len() < 2 {
                     continue; // no collision on this terminal
@@ -3660,12 +3911,19 @@ impl SessionLifecycleStore {
                 });
                 for id in ranked.into_iter().skip(1) {
                     if let Some(rec) = m.get_mut(id.as_str()) {
+                        // Boot repair is a close path too: count an uncounted
+                        // confirmed run so its end reaches the run ledger.
+                        begin_run_if_due(rec);
+                        let end_due = end_run_if_due(rec);
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
                         rec.close_reason = Some("superseded-terminal-reuse".to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
+                        if end_due {
+                            run_ends.push(rec.clone());
+                        }
                         closed_recs.push(rec.clone());
                         closed += 1;
                     }
@@ -3674,10 +3932,11 @@ impl SessionLifecycleStore {
             if closed == 0 {
                 return 0; // nothing collapsed — skip the write
             }
-            (closed_recs, closed)
+            (closed_recs, closed, run_ends)
         };
         // Boot-time bulk repair — one compaction rather than N deltas.
         self.compact();
+        self.emit_run_ends(run_ends.iter());
         self.snapshot_change(closed_recs);
         closed
     }
@@ -5202,6 +5461,8 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        spawn: None,
+        run: Default::default(),
     }
 }
 
@@ -5430,6 +5691,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 
@@ -9273,6 +9536,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

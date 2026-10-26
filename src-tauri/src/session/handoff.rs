@@ -1355,6 +1355,16 @@ fn registry_record_from_restore_payload(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-
+        // device-session-load, Phase 4): a session coord handed to this device.
+        // Its run begins when the restore flow resumes it here.
+        spawn: Some(
+            crate::session::run_record_emitter::SpawnFacts::new(
+                crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+            )
+            .spawn_kind("handoff"),
+        ),
+        run: Default::default(),
     }
 }
 

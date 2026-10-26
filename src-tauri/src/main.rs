@@ -4059,6 +4059,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // attached to the lifecycle store below (plan 2026-07-09
                 // §3.4, Phase 4).
                 let restore_record_outbox = registrar_outbox.clone();
+                // ... and for the session RUN emitter (plan
+                // 2026-10-23-session-duration-by-work-type-and-per-device-
+                // session-load, Phase 4), attached to the same store below.
+                let run_record_outbox = registrar_outbox.clone();
 
                 // Transcript cloud sync (plan 2026-07-09-runner-session-
                 // history-cloud-sync, Phase 2) — durable mirror of AI
@@ -4504,6 +4508,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     );
                     lifecycle_store.attach_restore_record_emitter(restore_record_emitter);
+                }
+
+                // Session RUN ledger (plan 2026-10-23-session-duration-by-work-
+                // type-and-per-device-session-load, Phase 4) — every counted
+                // open→close interval of a lifecycle record becomes a durable
+                // coord.session_runs row: `start` / `merge` / `end` rows ride the
+                // SAME outbox to `POST /coord/session-runs`, gated on
+                // Settings.session_metadata_sync_enabled like the restore mirror.
+                // The agentic plane (AiCoordRegistrar) shares the emitter so a
+                // session both planes see lands on one (ccsid, run_seq) row.
+                {
+                    let tm = term_for_session.clone();
+                    let run_record_emitter = std::sync::Arc::new(
+                        session::run_record_emitter::RunRecordEmitter::new(
+                            run_record_outbox,
+                            machine_id,
+                            Box::new(move |terminal_id: &str| {
+                                tm.get(terminal_id).and_then(|s| s.coord_session_id())
+                            }),
+                        ),
+                    );
+                    lifecycle_store.attach_run_record_emitter(run_record_emitter.clone());
+                    ai_coord_registrar.attach_run_record_emitter(run_record_emitter.clone());
+                    // The agentic plane's process-exit hook (a `ClaudeSession`
+                    // waiter thread) reaches it through the global.
+                    session::run_record_emitter::install_global(run_record_emitter);
                 }
 
                 let poll_lifecycle_store = lifecycle_store.clone();

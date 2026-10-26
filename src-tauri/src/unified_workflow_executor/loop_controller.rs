@@ -192,6 +192,11 @@ impl LoopController {
                 &format!("unified workflow: {}", config.workflow_name),
                 None,
                 config.project_path.as_deref().map(std::path::Path::new),
+                // Run ledger (plan 2026-10-23-session-duration-…, Phase 4):
+                // NOT a run. This umbrella row names the workflow, not a
+                // Claude process; its phase sessions are the processes, and
+                // they run under CLI-generated ids the runner never learns.
+                None,
             )
             .await;
         }

@@ -401,6 +401,8 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
+    let facts_app = app_handle.clone();
     match terminal_manager.create(
         request.title,
         working_dir,
@@ -425,6 +427,18 @@ pub async fn create_terminal_handler(
         spawn_tenant,
     ) {
         Ok(info) => {
+            // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+            // session-load, Phase 4). An HTTP / relay door: the caller's reason is not
+            // this runner's to name, so the origin is `unknown` — the kind says which door.
+            crate::session::run_record_emitter::stamp_spawn_facts(
+                &facts_app,
+                &info.id,
+                crate::session::run_record_emitter::SpawnFacts::new(
+                    crate::coord_drain_state::SpawnOrigin::Unknown,
+                )
+                .spawn_kind("http_terminals"),
+                spawn_since,
+            );
             if let Some(ctx) = isolated_ctx {
                 if let Some(session) = terminal_manager.get(&info.id) {
                     session.set_isolated_edit_ctx(ctx);

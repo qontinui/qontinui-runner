@@ -346,6 +346,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant_key.as_deref(),
             );
 
+            let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
             match tm.create(
                 a.title,
                 working_dir,
@@ -371,6 +372,18 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant,
             ) {
                 Ok(info) => {
+                    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+                    // session-load, Phase 4). An HTTP / relay door: the caller's reason is not
+                    // this runner's to name, so the origin is `unknown` — the kind says which door.
+                    crate::session::run_record_emitter::stamp_spawn_facts(
+                        &state.app_handle,
+                        &info.id,
+                        crate::session::run_record_emitter::SpawnFacts::new(
+                            crate::coord_drain_state::SpawnOrigin::Unknown,
+                        )
+                        .spawn_kind("tauri_proxy_terminal_create"),
+                        spawn_since,
+                    );
                     if let Some(ctx) = isolated_ctx {
                         if let Some(session) = tm.get(&info.id) {
                             session.set_isolated_edit_ctx(ctx);

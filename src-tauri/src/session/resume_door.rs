@@ -601,6 +601,9 @@ async fn resume_one(
         return ResumeRow::skipped(&cand.id, why);
     }
 
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the pane exists.
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let spawn = {
         let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
         tokio::task::spawn_blocking(move || {
@@ -644,6 +647,15 @@ async fn resume_one(
         Ok(Err(e)) => return ResumeRow::failed(&cand.id, format!("spawn: {e}"), None),
         Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
     };
+    // Run ledger: a closed unfinished session resumed here — the closed record
+    // re-opens, so this is its next run (`run_seq + 1`).
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        app,
+        &terminal_id,
+        crate::session::run_record_emitter::SpawnFacts::new(SpawnOrigin::Respawn)
+            .spawn_kind("resume_door"),
+        spawn_since,
+    );
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => ResumeRow::resumed(&cand.id, ev),
         Err(reason) => ResumeRow::failed(
@@ -855,6 +867,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

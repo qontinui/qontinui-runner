@@ -397,6 +397,8 @@ fn bind_record(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        spawn: None,
+        run: Default::default(),
     }
 }
 
@@ -1612,6 +1614,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 
@@ -2030,6 +2034,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         };
         store.record_open(phantom);
 
@@ -2199,6 +2205,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -2288,6 +2296,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
