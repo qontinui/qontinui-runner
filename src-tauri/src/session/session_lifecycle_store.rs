@@ -946,6 +946,15 @@ pub struct SessionLifecycleStore {
     /// runner restart re-spawns every PTY, and each restored provider fires its
     /// hook again. LOCK ORDER — `map` then this, never the reverse.
     session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
+    /// claude session id → unix millis this process last saw its record go
+    /// from absent / closed to open: when the CURRENT pane started hosting it.
+    /// `opened_at` cannot say — it is preserved across a close and a reopen
+    /// (a resume) on purpose. Read by the `/exit` check of a restart-shaped
+    /// close ([`Self::deliberate_exit_reason`]): an `/exit` older than the
+    /// current pane belongs to an earlier pane. Process-local: a session
+    /// adopted from a previous process falls back to `opened_at`. LOCK ORDER —
+    /// never held with `map`.
+    pane_opened_at: Mutex<HashMap<String, i64>>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
     /// shim-fix plan). When attached, every layout-meaningful mutation
@@ -1216,6 +1225,7 @@ impl SessionLifecycleStore {
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
+            pane_opened_at: Mutex::new(HashMap::new()),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
@@ -1509,6 +1519,7 @@ impl SessionLifecycleStore {
         // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
+        let mut reopened = false;
         let (merged, superseded) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1525,6 +1536,9 @@ impl SessionLifecycleStore {
             // the value the spawn recorded. A record that already EXISTED (a
             // resume/restore) never inherits: its spawn was not this terminal's.
             let is_new_record = !m.contains_key(&rec.claude_session_id);
+            reopened = m
+                .get(&rec.claude_session_id)
+                .is_none_or(|r| r.state != "open");
             let inherited_spawn_default = if is_new_record
                 && rec.spawn_device_default.is_none()
                 && !new_terminal_id.trim().is_empty()
@@ -1739,6 +1753,12 @@ impl SessionLifecycleStore {
             self.persist(m, &deltas);
             (merged, superseded)
         };
+        if reopened {
+            self.pane_opened_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(new_id.clone(), now);
+        }
         self.snapshot_change(std::iter::once(merged.clone()).chain(superseded));
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
@@ -1810,11 +1830,37 @@ impl SessionLifecycleStore {
                 &rec.claude_session_id,
             ))
         });
-        if path
-            .as_deref()
-            .and_then(read_transcript_tail)
-            .is_some_and(|tail| transcript_ends_with_user_exit(&tail))
-        {
+        // The `/exit` must belong to THIS pane: written at or after the
+        // record opened. A session `/exit`ed in an earlier pane, then resumed
+        // here and left idle (a resume writes nothing until there is input),
+        // still ends its transcript with that old `/exit` — and a crash now is
+        // restart-shaped. The record's own `timestamp` decides; the file's
+        // mtime only when the record carries none.
+        let opened_at = target.as_ref().map_or(i64::MAX, |r| {
+            self.pane_opened_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&r.claude_session_id)
+                .copied()
+                .unwrap_or(r.opened_at)
+        });
+        let exit_in_this_pane = path.as_deref().is_some_and(|p| {
+            let Some(exit) = read_transcript_tail(p).and_then(|t| transcript_user_exit(&t)) else {
+                return false;
+            };
+            match exit {
+                Some(at) => at >= opened_at,
+                // No timestamp on the record: the file's mtime, which the
+                // kernel stamps from a coarse clock — allow it that slack.
+                None => std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    .is_some_and(|at| at >= opened_at.saturating_sub(MTIME_SLACK_MS)),
+            }
+        });
+        if exit_in_this_pane {
             info!(
                 claude_session_id = %claude_session_id,
                 observed = %reason,
@@ -4040,14 +4086,20 @@ pub enum CloseOutcome {
     },
 }
 
-/// Resolve WHICH record a close is actually about, under the map lock.
-///
-/// Returns `(target claude_session_id to close, typed outcome)`. A `None`
-/// target means nothing is mutated. Pure over the map — every mutation, log and
-/// side effect belongs to the caller.
 /// The close reasons a session dies with when its runner (or its process)
 /// stops without the user asking: restorable within their grace windows.
 pub const RESTORABLE_CLOSE_REASONS: [&str; 2] = ["pty-exit", "poll-dead"];
+
+/// How long after its close a record closed with `reason` stays restorable;
+/// `None` for every reason outside [`RESTORABLE_CLOSE_REASONS`]. The ONE map
+/// from the restorable list to its grace windows.
+fn restorable_grace_ms(reason: &str) -> Option<i64> {
+    match reason {
+        "pty-exit" => Some(RESTORABLE_PTY_EXIT_MS),
+        "poll-dead" => Some(RESTORABLE_POLL_DEAD_MS),
+        _ => None,
+    }
+}
 
 /// The close reason of a session the user ended with `/exit`: deliberate, so
 /// never auto-resumed and never restart-shaped.
@@ -4056,6 +4108,12 @@ pub const USER_EXIT_CLOSE_REASON: &str = "user-exit";
 /// How much of a transcript's END is read to find its last command: far more
 /// than the few records after an `/exit` (its stdout, a `last-prompt` marker).
 const EXIT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The slack an `/exit` judged by the transcript FILE's mtime (a record with
+/// no `timestamp`) gets against the pane's open time: the kernel stamps mtimes
+/// from a coarse clock, so a write just after the open can read slightly
+/// before it.
+const MTIME_SLACK_MS: i64 = 1_000;
 
 /// The last [`EXIT_TAIL_BYTES`] of `path` (lossy UTF-8), or `None` when it
 /// cannot be read.
@@ -4077,6 +4135,14 @@ fn read_transcript_tail(path: &Path) -> Option<String> {
 /// first `user` or `assistant` record: a message, a tool result or any other
 /// command after the `/exit` means the session went on (it was resumed).
 pub(crate) fn transcript_ends_with_user_exit(tail: &str) -> bool {
+    transcript_user_exit(tail).is_some()
+}
+
+/// [`transcript_ends_with_user_exit`], with WHEN: `Some(timestamp)` (unix
+/// millis from the `/exit` record's own `timestamp`, `None` inside when the
+/// record has none or it does not parse) when the tail ends with the user's
+/// `/exit`; `None` when it does not.
+pub(crate) fn transcript_user_exit(tail: &str) -> Option<Option<i64>> {
     for line in tail.lines().rev() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -4089,23 +4155,37 @@ pub(crate) fn transcript_ends_with_user_exit(tail: &str) -> bool {
             continue;
         }
         if kind == Some("assistant") {
-            return false;
+            return None;
         }
         let content = v.get("message").and_then(|m| m.get("content"));
         let Some(text) = content.and_then(|c| c.as_str()) else {
             // A tool result or a structured user message: the conversation.
-            return false;
+            return None;
         };
         if text.starts_with("<local-command-stdout>") || text.starts_with("<local-command-stderr>")
         {
             continue;
         }
-        return text.starts_with("<command-name>/exit</command-name>")
+        let is_exit = text.starts_with("<command-name>/exit</command-name>")
             || text.starts_with("<command-name>/quit</command-name>");
+        if !is_exit {
+            return None;
+        }
+        let at = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp_millis());
+        return Some(at);
     }
-    false
+    None
 }
 
+/// Resolve WHICH record a close is actually about, under the map lock.
+///
+/// Returns `(target claude_session_id to close, typed outcome)`. A `None`
+/// target means nothing is mutated. Pure over the map — every mutation, log and
+/// side effect belongs to the caller.
 fn resolve_close_target(
     m: &HashMap<String, TerminalSessionRecord>,
     claude_session_id: &str,
@@ -4498,10 +4578,8 @@ fn restore_admissible(r: &TerminalSessionRecord, anchors: &RestoreAnchors, now_m
         };
     }
     if r.state == "closed" {
-        let grace = match r.close_reason.as_deref() {
-            Some("pty-exit") => RESTORABLE_PTY_EXIT_MS,
-            Some("poll-dead") => RESTORABLE_POLL_DEAD_MS,
-            _ => return false,
+        let Some(grace) = r.close_reason.as_deref().and_then(restorable_grace_ms) else {
+            return false;
         };
         return match r.closed_at {
             Some(closed_at) => anchors
@@ -7614,6 +7692,66 @@ mod tests {
                 "{id}"
             );
         }
+        // Review 4: /exit-ed, later RESUMED in a new pane and left idle (a
+        // resume writes nothing to the transcript until there is input), then
+        // killed by a runner restart. The tail still ends with the old /exit,
+        // which belongs to the earlier pane: restart-shaped, restored.
+        open("exit-resumed-idle");
+        write("exit-resumed-idle", EXIT);
+        store.record_close("exit-resumed-idle", "pty-exit");
+        assert_eq!(
+            store
+                .get("exit-resumed-idle")
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some(USER_EXIT_CLOSE_REASON),
+            "the first pane's /exit"
+        );
+        // Past the mtime slack: the resume comes well after that /exit.
+        std::thread::sleep(std::time::Duration::from_millis(
+            MTIME_SLACK_MS as u64 + 200,
+        ));
+        open("exit-resumed-idle"); // the resume: a new pane, nothing written
+        store.record_close("exit-resumed-idle", "pty-exit");
+        assert_eq!(
+            store
+                .get("exit-resumed-idle")
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some("pty-exit"),
+            "an /exit older than the current pane is not this pane's"
+        );
+        // The record's own timestamp decides when it has one.
+        let stamped = |at: &str| {
+            EXIT.replace(
+                r#"<command-args></command-args>"}}"#,
+                &format!(r#"<command-args></command-args>"}},"timestamp":"{at}"}}"#),
+            )
+        };
+        open("exit-stamped-old");
+        write("exit-stamped-old", &stamped("2020-01-01T00:00:00.000Z"));
+        store.record_close("exit-stamped-old", "poll-dead");
+        open("exit-stamped-new");
+        write("exit-stamped-new", &stamped("2099-01-01T00:00:00.000Z"));
+        store.record_close("exit-stamped-new", "poll-dead");
+        assert_eq!(
+            store
+                .get("exit-stamped-old")
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some("poll-dead")
+        );
+        assert_eq!(
+            store
+                .get("exit-stamped-new")
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some(USER_EXIT_CLOSE_REASON)
+        );
         // Resumed after the /exit and then crashed: restart-shaped as before.
         open("exit-then-resumed");
         write(
@@ -7642,10 +7780,35 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         restorable.sort();
-        assert_eq!(restorable, ["exit-then-resumed", "no-transcript"]);
+        assert_eq!(
+            restorable,
+            [
+                "exit-resumed-idle",
+                "exit-stamped-old",
+                "exit-then-resumed",
+                "no-transcript"
+            ]
+        );
         // ...and a restart-prep cohort row closed so is no restore candidate.
         assert!(!crate::restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS
             .contains(&USER_EXIT_CLOSE_REASON));
+    }
+
+    /// Nit 4: exactly the listed reasons have a restore grace window.
+    #[test]
+    fn the_restorable_list_and_its_grace_windows_agree() {
+        for r in RESTORABLE_CLOSE_REASONS {
+            assert!(restorable_grace_ms(r).is_some(), "{r}");
+        }
+        for r in [
+            USER_EXIT_CLOSE_REASON,
+            "explicit",
+            "user-close",
+            "no-terminal",
+            "superseded",
+        ] {
+            assert!(restorable_grace_ms(r).is_none(), "{r}");
+        }
     }
 
     #[test]
