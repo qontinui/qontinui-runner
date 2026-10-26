@@ -160,11 +160,28 @@ mod tests {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
-                child();
+                // A panic in the child must never unwind into the forked copy
+                // of the test harness: it ends the child with a status the
+                // parent's assertions cannot mistake for a pass.
+                if std::panic::catch_unwind(child).is_err() {
+                    libc::_exit(99);
+                }
                 libc::_exit(7);
             }
             let mut status = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            loop {
+                let r = libc::waitpid(pid, &mut status, 0);
+                if r == pid {
+                    break;
+                }
+                assert!(
+                    r == -1
+                        && std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted,
+                    "waitpid failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
             status
         }
     }

@@ -5919,10 +5919,6 @@ pub(crate) mod tests {
         )
     }
 
-    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`: the
-    /// frozen snapshot is never rewritten by a later close of the dead tab, and
-    /// `agent_exit_code` keeps the operator-touch semantics of
-    /// `on_exit_hook_code`.
     /// Review round 12 N3: the exit facts survive the session's removal, so
     /// the close recorded after a graceful-exit removal keeps its cause.
     #[test]
@@ -5936,6 +5932,10 @@ pub(crate) mod tests {
         assert_eq!(recent_exit_facts("recent-exit-test-pane"), Some(facts));
     }
 
+    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`: the
+    /// frozen snapshot is never rewritten by a later close of the dead tab, and
+    /// `agent_exit_code` keeps the operator-touch semantics of
+    /// `on_exit_hook_code`.
     #[test]
     fn exit_snapshot_is_frozen_and_agent_exit_code_hides_runner_kills() {
         let s = make_test_session(Arc::new(Mutex::new(Vec::new())));
