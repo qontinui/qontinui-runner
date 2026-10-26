@@ -118,22 +118,36 @@ export function bulkSkipNotice(r: BulkResult): string | null {
  * `enqueued` = how many it would enqueue.
  */
 export function previewBulk(rows: readonly RestorePlaceholder[]): BulkResult {
-  const r: BulkResult = {
+  return classifyBulk(rows).result;
+}
+
+/**
+ * PURE: the ONE bulk classifier — which rows a bulk click enqueues and how
+ * many of each kind it skips. {@link previewBulk} and
+ * {@link RestoreQueue.enqueueBulk} both read it.
+ */
+export function classifyBulk(rows: readonly RestorePlaceholder[]): {
+  eligible: RestorePlaceholder[];
+  result: BulkResult;
+} {
+  const result: BulkResult = {
     enqueued: 0,
     skippedHeld: 0,
     skippedFinished: 0,
     skippedBlocked: 0,
     skippedLimitHit: 0,
   };
+  const eligible: RestorePlaceholder[] = [];
   for (const row of rows) {
     const bucket = cohortBucket(row);
-    if (bucket === "finished") r.skippedFinished++;
-    else if (bucket === "blocked") r.skippedBlocked++;
-    else if (bucket === "limitHit") r.skippedLimitHit++;
-    else if (!bulkEligible(row)) r.skippedHeld++;
-    else r.enqueued++;
+    if (bucket === "finished") result.skippedFinished++;
+    else if (bucket === "blocked") result.skippedBlocked++;
+    else if (bucket === "limitHit") result.skippedLimitHit++;
+    else if (!bulkEligible(row)) result.skippedHeld++;
+    else eligible.push(row);
   }
-  return r;
+  result.enqueued = eligible.length;
+  return { eligible, result };
 }
 
 /**
@@ -258,19 +272,7 @@ export class RestoreQueue {
    * `pageOrder` is the page strip's order; a page not in it sorts last.
    */
   enqueueBulk(rows: readonly RestorePlaceholder[], pageOrder: readonly string[] = []): BulkResult {
-    let skippedHeld = 0;
-    let skippedFinished = 0;
-    let skippedBlocked = 0;
-    let skippedLimitHit = 0;
-    const eligible: RestorePlaceholder[] = [];
-    for (const row of rows) {
-      const bucket = cohortBucket(row);
-      if (bucket === "finished") skippedFinished++;
-      else if (bucket === "blocked") skippedBlocked++;
-      else if (bucket === "limitHit") skippedLimitHit++;
-      else if (!bulkEligible(row)) skippedHeld++;
-      else eligible.push(row);
-    }
+    const { eligible, result } = classifyBulk(rows);
     const rank = (pageId: string) => {
       const i = pageOrder.indexOf(pageId);
       return i < 0 ? Number.MAX_SAFE_INTEGER : i;
@@ -281,13 +283,7 @@ export class RestoreQueue {
         a.pageId.localeCompare(b.pageId) ||
         a.zoneIndex - b.zoneIndex,
     );
-    return {
-      enqueued: this.enqueue(eligible),
-      skippedHeld,
-      skippedFinished,
-      skippedBlocked,
-      skippedLimitHit,
-    };
+    return { ...result, enqueued: this.enqueue(eligible) };
   }
 
   /**
