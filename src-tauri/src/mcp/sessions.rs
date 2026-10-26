@@ -818,7 +818,12 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    apply_finish(store.inner(), &id, req).map(Json)
+    let finished = req.finished.unwrap_or(true);
+    let body = apply_finish(store.inner(), &id, req)?;
+    // The restart cohort row follows, as on the Tauri door: a restoring cohort
+    // is not re-read by the notice loop.
+    crate::restart_prep::restore::carry_finish_onto_cohort(&id, finished);
+    Ok(Json(body))
 }
 
 /// The finish route's body, minus axum — pure over the store so the response

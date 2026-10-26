@@ -640,13 +640,36 @@ pub async fn note_finished(claude_session_id: &str, finished: bool) {
         >>()?;
         store.get(id).map(|r| r.finished_at.is_some())
     };
-    if let Err(e) = note_finished_on(ctl, claude_session_id, finished, &store_finished).await {
-        warn!(
+    match note_finished_on(ctl, claude_session_id, finished, &store_finished).await {
+        // One line either way, so a row that keeps a stale state after an
+        // un-finish says which: never reached, no row / nothing to change, or
+        // carried.
+        Ok(changed) => tracing::info!(
+            session = claude_session_id,
+            requested = finished,
+            store_finished = ?store_finished(claude_session_id),
+            changed,
+            "restart_prep: finish mark carried onto the cohort row"
+        ),
+        Err(e) => warn!(
             session = claude_session_id,
             error = %e,
             "restart_prep: finish mark not carried onto the cohort row"
-        );
+        ),
     }
+}
+
+/// Carry a finish / un-finish made through ANY door onto the restart cohort
+/// row: spawned, because it waits for an in-flight notice tick (`ops`). Every
+/// door that sets the lifecycle store's finish mark calls this — the Tauri
+/// `terminal_session_set_finished` (the placeholder's Finish / Unfinish) and
+/// `POST /sessions/{id}/finish` (the agent and CLI door) — so no door leaves
+/// a restoring cohort row reading `finished` after an un-finish.
+pub fn carry_finish_onto_cohort(claude_session_id: &str, finished: bool) {
+    let id = claude_session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        note_finished(&id, finished).await;
+    });
 }
 
 /// [`set_held_on`] on the live controller (the Tauri `restart_prep_set_held`).
@@ -918,6 +941,35 @@ mod tests {
                 effort_to_apply(&row).as_deref(),
                 *want,
                 "{level:?} from {source:?} over baseline {baseline:?}"
+            );
+        }
+    }
+
+    /// The body of the function `fn_sig` in `src`, up to its closing `\n}\n`.
+    fn fn_body<'a>(src: &'a str, fn_sig: &str) -> &'a str {
+        let (_, rest) = src.split_once(fn_sig).expect("function present");
+        rest.split_once("\n}\n").expect("function ends").0
+    }
+
+    /// E2E re-run: an un-finish after the restart left the cohort row at
+    /// `pause_state: finished`. Every door that sets the lifecycle finish mark
+    /// must carry it onto the cohort row — the placeholder's Tauri command and
+    /// the HTTP finish route alike (they need a running app, so this reads
+    /// their source).
+    #[test]
+    fn every_finish_door_carries_the_mark_onto_the_cohort_row() {
+        let tauri_door = fn_body(
+            include_str!("../commands/terminal.rs"),
+            "pub fn terminal_session_set_finished(",
+        );
+        let http_door = fn_body(
+            include_str!("../mcp/sessions.rs"),
+            "async fn finish_session(",
+        );
+        for (name, body) in [("tauri", tauri_door), ("http", http_door)] {
+            assert!(
+                body.contains("carry_finish_onto_cohort("),
+                "the {name} finish door does not carry the mark onto the cohort row"
             );
         }
     }

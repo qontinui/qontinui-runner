@@ -1661,11 +1661,7 @@ pub fn terminal_session_set_finished(
         Ok(outcome) => {
             // A restart cohort row's work axis follows at once: a restoring
             // cohort is not re-read by the notice loop.
-            // Async: it waits for an in-flight notice tick (`ops`).
-            let id = claude_session_id.clone();
-            tauri::async_runtime::spawn(async move {
-                crate::restart_prep::restore::note_finished(&id, finished).await;
-            });
+            crate::restart_prep::restore::carry_finish_onto_cohort(&claude_session_id, finished);
             Ok(CommandResponse {
                 success: true,
                 message: None,
