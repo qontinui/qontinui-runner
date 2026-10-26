@@ -40,16 +40,25 @@ mod imp {
     }
 
     fn reraise_default(sig: libc::c_int) {
-        // SAFETY: `SA_RESETHAND` already restored `SIG_DFL`; re-raising the
-        // signal (blocked while this handler runs) delivers the default
-        // action as the handler returns — the process ends exactly as it did
-        // with no handler.
+        // SAFETY: `sigaction` and `raise` are async-signal-safe. The default
+        // disposition is set EXPLICITLY before re-raising, not left to
+        // `SA_RESETHAND` alone: a component that later chains to this handler
+        // (signal-hook registering over it and calling the previous action)
+        // would otherwise re-enter it with the disposition still pointing at
+        // the chain, and re-raise into itself forever (review round 12 N2).
+        // The re-raised signal is blocked while the handler runs and delivered
+        // with the default action as it returns — the process ends exactly as
+        // it did with no handler.
         unsafe {
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut dfl.sa_mask);
+            libc::sigaction(sig, &dfl, std::ptr::null_mut());
             libc::raise(sig);
         }
     }
 
-    extern "C" fn on_signal(sig: libc::c_int) {
+    pub(super) extern "C" fn on_signal(sig: libc::c_int) {
         handle(
             sig,
             crate::commands::terminal_windows::mark_app_quitting,
@@ -90,6 +99,18 @@ pub fn install() {
     imp::install();
 }
 
+/// Test-only: the handler's address, for a child that chains to it.
+#[cfg(all(test, unix))]
+fn handler_for_test() -> libc::sighandler_t {
+    imp::on_signal as *const () as libc::sighandler_t
+}
+
+/// Test-only: install into a forked child.
+#[cfg(all(test, unix))]
+fn install_for_test() {
+    imp::install();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::imp::*;
@@ -126,6 +147,103 @@ mod tests {
         assert!(
             MARKED_AT_RAISE.load(Ordering::SeqCst),
             "mark precedes the re-raise"
+        );
+    }
+
+    /// Run `child` in a forked process and return its wait status. The child
+    /// only makes async-signal-safe calls and always ends with `_exit`, so it
+    /// never returns into the test harness.
+    fn in_child(child: fn()) -> libc::c_int {
+        // SAFETY: fork in a test; the child runs only `child` (sigaction,
+        // sigprocmask, kill, an atomic store) and then `_exit`s.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                child();
+                libc::_exit(7);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            status
+        }
+    }
+
+    fn unblock_sigterm() {
+        // SAFETY: async-signal-safe mask edit in the forked child.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+    }
+
+    fn set_disposition(handler: libc::sighandler_t) {
+        // SAFETY: async-signal-safe disposition change in the forked child.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        }
+    }
+
+    /// Review round 12 N4: a real SIGTERM still kills the process BY that
+    /// signal once the marker is installed (the handler re-raises with the
+    /// default action), and an inherited `SIG_IGN` is still honoured.
+    #[test]
+    fn a_real_sigterm_still_ends_the_process_by_that_signal() {
+        let status = in_child(|| {
+            unblock_sigterm();
+            set_disposition(libc::SIG_DFL);
+            super::install_for_test();
+            // SAFETY: signalling ourselves.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+        });
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+
+        let status = in_child(|| {
+            unblock_sigterm();
+            set_disposition(libc::SIG_IGN);
+            super::install_for_test();
+            // SAFETY: signalling ourselves.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+        });
+        assert!(
+            libc::WIFEXITED(status),
+            "ignored SIGTERM: status {status:#x}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+    }
+
+    /// Review round 12 N2: a handler invoked WITHOUT `SA_RESETHAND` — as when
+    /// another component (signal-hook) registers later and chains to it — must
+    /// still end the process by the signal, not re-raise into itself forever.
+    /// A 2 s alarm turns a regression's loop into a SIGALRM death instead of a
+    /// hung test.
+    #[test]
+    fn a_chained_invocation_still_ends_by_the_signal() {
+        let status = in_child(|| {
+            unblock_sigterm();
+            // The handler as a chain would leave it: installed, no RESETHAND.
+            set_disposition(super::handler_for_test());
+            // SAFETY: a bounded alarm and a signal to ourselves.
+            unsafe {
+                libc::alarm(2);
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+        });
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGTERM,
+            "the handler looped until the alarm"
         );
     }
 }
