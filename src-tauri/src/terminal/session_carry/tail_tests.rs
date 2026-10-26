@@ -83,7 +83,7 @@ fn the_incident_tail_yields_the_one_failed_agent_notification() {
     assert_eq!(
         scan.items,
         vec![CatchUpItem::TaskNotification {
-            task_id: Some("a48b10a51f491857f".to_string()),
+            task_ids: vec!["a48b10a51f491857f".to_string()],
             status: Some("failed".to_string()),
             summary: Some(
                 "Agent \"Phase 3 wiring stacked on Phase 2\" failed: Agent terminated early due to an API error: You've hit your weekly limit · resets 6pm (Europe/Berlin)".to_string()
@@ -277,12 +277,159 @@ fn append(path: &Path, bytes: &[u8]) {
     f.write_all(bytes).unwrap();
 }
 
+/// Fixes 7 and 11: the offset is the copied bytes' last LINE BOUNDARY, not
+/// the source's size. The source here ends mid-line (the old writer was
+/// half-way through an append when the carry copied it), so the offset (16)
+/// differs from the stat (20) — a stat-based offset fails this test. After
+/// the writer finishes the line, the rescued tail is that line WHOLE.
+///
+/// Mutation checks: using the source's stat (or the copy's length) as the
+/// offset fails the first assertion; dropping the `+ 1` past the `\n` fails
+/// it too.
 #[test]
-fn the_carry_records_the_copied_length_as_the_tail_offset() {
+fn the_carry_records_the_copys_last_line_boundary_as_the_tail_offset() {
     let root = scratch("offset");
-    let (_, _, carried) = seeded_carry(&root, b"{\"a\":1}\n{\"b\":2}\n");
-    assert_eq!(carried.transcript_offset, 16);
+    let (src, dst, carried) = seeded_carry(&root, b"{\"a\":1}\n{\"b\":2}\n{\"c\"");
+    assert_eq!(carried.transcript_offset, Some(16));
+    append(&literal_transcript(&src), b":3}\n");
+    match rescue(&src, &dst, &carried) {
+        TailRescue::Rescued { bytes, scan, .. } => {
+            assert_eq!(bytes, 8, "the whole torn line");
+            assert_eq!(scan.lines, 1);
+            assert_eq!(scan.unparseable, 0, "rescued whole, not as a fragment");
+        }
+        other => panic!("expected Rescued, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Fix 7: a copy holding no `\n` at all starts the tail at 0, and a boundary
+/// further back than one read chunk is still found.
+#[test]
+fn line_boundary_offset_finds_the_last_newline_or_zero() {
+    let root = scratch("no-newline");
+    let f = root.join("t.jsonl");
+    std::fs::write(&f, b"{\"partial\"").unwrap();
+    assert_eq!(super::super::line_boundary_offset(&f).unwrap(), 0);
+    std::fs::write(&f, b"").unwrap();
+    assert_eq!(super::super::line_boundary_offset(&f).unwrap(), 0);
+    let mut big = b"{\"x\":1}\n".to_vec();
+    big.extend(std::iter::repeat_n(b'y', 200 * 1024));
+    std::fs::write(&f, &big).unwrap();
+    assert_eq!(super::super::line_boundary_offset(&f).unwrap(), 8);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Fix 8: when the destination already held the transcript, the carry copied
+/// nothing and records NO offset; the rescue then reports UNKNOWN and writes
+/// nothing — even though the source has grown.
+///
+/// Mutation check: recording an offset for `MainCarry::Present` (a boundary or
+/// the source size) rescues the appended line instead.
+#[test]
+fn an_already_present_destination_leaves_the_tail_unknown() {
+    let root = scratch("present");
+    let (src, dst, _) = seeded_carry(&root, b"{\"a\":1}\n");
+    // A second carry (a retry): the destination already holds it all.
+    let again =
+        super::super::copy_transcript(src.to_str().unwrap(), dst.to_str().unwrap(), WD, SID)
+            .unwrap();
+    assert_eq!(again.transcript_offset, None);
+    append(&literal_transcript(&src), b"{\"b\":2}\n");
+    let got = rescue(&src, &dst, &again);
+    assert_eq!(got, TailRescue::OffsetUnknown);
+    assert_eq!(got.message(), None);
+    assert!(!dst
+        .join("projects")
+        .join("D--qontinui-root")
+        .join(SID)
+        .join(TAIL_DIR)
+        .exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A migration onto a destination that diverged moves the fork aside and
+/// copies the live source in its place, so the destination then equals the
+/// source and the offset is the copy's line boundary — the tail after it is
+/// rescued. A respawn top-up (`KeepExisting`) that keeps a shorter prefix in
+/// place copies nothing, so its offset is UNKNOWN.
+///
+/// Mutation checks: mapping `DivergedPreserved` to `None` fails the first
+/// assertion; mapping `KeptExisting` to a boundary fails the last.
+#[test]
+fn a_preserved_fork_records_the_copys_boundary_and_a_kept_prefix_none() {
+    let root = scratch("diverged");
+    let (src, dst) = (root.join(".claude-lukas"), root.join(".claude-niklas"));
+    let (src_t, dst_t) = (literal_transcript(&src), literal_transcript(&dst));
+    std::fs::create_dir_all(src_t.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(dst_t.parent().unwrap()).unwrap();
+    std::fs::write(&src_t, b"{\"a\":1}\n{\"b\"").unwrap();
+    std::fs::write(&dst_t, b"{\"fork\":1}\n{\"fork\":2}\n").unwrap();
+    let carried =
+        super::super::copy_transcript(src.to_str().unwrap(), dst.to_str().unwrap(), WD, SID)
+            .unwrap();
+    assert!(matches!(
+        carried.main,
+        super::super::MainCarry::DivergedPreserved { .. }
+    ));
+    assert_eq!(carried.transcript_offset, Some(8));
+    append(&src_t, b":2}\n");
+    match rescue(&src, &dst, &carried) {
+        TailRescue::Rescued { bytes, scan, .. } => {
+            assert_eq!(bytes, 8);
+            assert_eq!(scan.unparseable, 0);
+        }
+        other => panic!("expected Rescued, got {other:?}"),
+    }
+
+    let prefix_root = scratch("kept-prefix");
+    let (src, dst) = (
+        prefix_root.join(".claude-lukas"),
+        prefix_root.join(".claude-niklas"),
+    );
+    let (src_t, dst_t) = (literal_transcript(&src), literal_transcript(&dst));
+    std::fs::create_dir_all(src_t.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(dst_t.parent().unwrap()).unwrap();
+    std::fs::write(&src_t, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+    std::fs::write(&dst_t, b"{\"a\":1}\n").unwrap();
+    let kept = super::super::carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        super::super::MainTranscript::KeepExisting,
+    )
+    .unwrap();
+    assert_eq!(kept.main, super::super::MainCarry::KeptExisting);
+    assert_eq!(kept.transcript_offset, None);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&prefix_root);
+}
+
+/// Fix 12: a notification naming several tasks reports EVERY task id (a
+/// repeat once).
+///
+/// Mutation check: collecting only the first `<task-id>` fails.
+#[test]
+fn a_notification_naming_several_tasks_reports_every_id() {
+    let line = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content":
+            "<task-notification>\n<task-id>aaa</task-id>\n<task-id>bbb</task-id>\n<task-id>aaa</task-id>\n<status>failed</status>\n</task-notification>"},
+        "promptSource": "system",
+    })
+    .to_string();
+    let scan = scan_tail(format!("{line}\n").as_bytes());
+    assert_eq!(
+        scan.items,
+        vec![CatchUpItem::TaskNotification {
+            task_ids: vec!["aaa".to_string(), "bbb".to_string()],
+            status: Some("failed".to_string()),
+            summary: None,
+        }]
+    );
+    let msg = catch_up_message(&scan, Path::new("C:/t.jsonl")).unwrap();
+    assert!(msg.contains("task aaa, bbb failed"), "{msg}");
 }
 
 /// The live incident end to end on disk: the old writer appends its 5 lines

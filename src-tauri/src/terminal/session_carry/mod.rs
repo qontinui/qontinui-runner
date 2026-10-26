@@ -94,11 +94,21 @@ pub(crate) struct TranscriptCopy {
     /// The destination's `<sid>/` side-car dir the carry wrote into (beside
     /// [`Self::path`] — for a long cwd, the source's `<prefix>-<hash>` name).
     pub dst_session_dir: PathBuf,
-    /// How far into the SOURCE `<sid>.jsonl` the destination is known to
-    /// reach: the bytes this carry wrote, or the source's size when the
-    /// destination already held it. Everything the old writer appends past it
-    /// after the carry is the tail [`tail::rescue_tail`] rescues (Phase 2b).
-    pub transcript_offset: u64,
+    /// Where in the SOURCE `<sid>.jsonl` the tail starts: just past the last
+    /// `\n` in the bytes this carry copied (0 when they hold none), so a line
+    /// the old writer was half-way through appending during the copy is
+    /// rescued WHOLE rather than as an unparseable fragment (2026-10-23 review
+    /// fix 7). Everything past it is the tail [`tail::rescue_tail`] rescues
+    /// (Phase 2b). Recorded whenever this carry wrote the destination
+    /// ([`MainCarry::Copied`], [`MainCarry::ExtendedPrefix`], and
+    /// [`MainCarry::DivergedPreserved`], after which the destination equals the
+    /// source).
+    ///
+    /// `None` when this carry copied nothing because the destination already
+    /// held the transcript ([`MainCarry::Present`], [`MainCarry::KeptExisting`]
+    /// — a retry, or a respawn topping up): the carry read no source bytes, so
+    /// which lines are new is UNKNOWN and nothing is rescued (fix 8).
+    pub transcript_offset: Option<u64>,
     /// The session's sibling directory (`<sid>/`), carried best-effort.
     pub session_dir: SessionDirCarry,
     /// Every regular file under `<sid>/` the carry looked at, with the source's
@@ -698,14 +708,27 @@ where
         }
     };
     // Where the tail starts. When this carry wrote `dst`, the old writer may
-    // have appended between the stat above and the copy: the copied length,
-    // not the stat, is the offset. Nothing else writes `dst` yet — the respawn
-    // comes after the carry.
+    // have appended between the stat above and the copy, possibly part of a
+    // line: the copied bytes, not the stat, say where the tail starts — at
+    // their last line boundary. Nothing else writes `dst` yet — the respawn
+    // comes after the carry. A destination the carry did not write, or a
+    // boundary that cannot be read, leaves the offset UNKNOWN.
     let transcript_offset = match &main_carry {
         MainCarry::Copied | MainCarry::ExtendedPrefix | MainCarry::DivergedPreserved { .. } => {
-            std::fs::metadata(&dst).map_or(src_len, |meta| meta.len())
+            match line_boundary_offset(&dst) {
+                Ok(offset) => Some(offset),
+                Err(e) => {
+                    warn!(
+                        session = %claude_session_id,
+                        dst = %dst.display(),
+                        error = %e,
+                        "session transcript carry: could not read the copy's last line boundary — the tail rescue will report UNKNOWN"
+                    );
+                    None
+                }
+            }
         }
-        MainCarry::Present | MainCarry::KeptExisting => src_len,
+        MainCarry::Present | MainCarry::KeptExisting => None,
     };
     let live_source_wins = main == MainTranscript::LiveSourceWins;
     // A main transcript moved aside already kept the fork's
@@ -972,6 +995,31 @@ fn claim_diverged_backup_at(dst: &Path, mut stamp: u128) -> std::io::Result<Path
             Err(e) => return Err(e),
         }
     }
+}
+
+/// How far back from the end [`line_boundary_offset`] reads per step.
+const LINE_BOUNDARY_CHUNK: u64 = 64 * 1024;
+
+/// The offset just past the LAST `\n` in `path` (0 when it holds none) —
+/// read backwards from the end in [`LINE_BOUNDARY_CHUNK`] steps, so a
+/// transcript of any size costs one small read in the usual case (it ends in
+/// `\n`).
+pub(crate) fn line_boundary_offset(path: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut end = file.metadata()?.len();
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(LINE_BOUNDARY_CHUNK);
+        buf.resize(usize::try_from(end - start).unwrap_or(0), 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 /// Copy `from` to a temporary `<to>.<pid>.<seq>.partial` and return its path.

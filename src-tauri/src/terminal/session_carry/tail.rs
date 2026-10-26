@@ -78,7 +78,9 @@ pub(crate) enum CatchUpItem {
     /// A `type: user` line carrying a `<task-notification>` — a background
     /// task or subagent finished (or failed) after the move.
     TaskNotification {
-        task_id: Option<String>,
+        /// EVERY `<task-id>` the notification names, in order (2026-10-23
+        /// review fix 12) — one notification can report several tasks.
+        task_ids: Vec<String>,
         status: Option<String>,
         summary: Option<String>,
     },
@@ -134,7 +136,7 @@ fn catch_up_item(line: &serde_json::Value) -> Option<CatchUpItem> {
     let text = user_text(line.get("message")?.get("content")?)?;
     if text.contains("<task-notification>") {
         return Some(CatchUpItem::TaskNotification {
-            task_id: tag(&text, "task-id"),
+            task_ids: tags(&text, "task-id"),
             status: tag(&text, "status"),
             summary: tag(&text, "summary"),
         });
@@ -166,14 +168,32 @@ fn user_text(content: &serde_json::Value) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
-/// The trimmed text between `<name>` and `</name>`, when both are present.
+/// The trimmed text between the FIRST `<name>` and its `</name>`, when both
+/// are present and it is not blank.
 fn tag(text: &str, name: &str) -> Option<String> {
+    tags(text, name).into_iter().next()
+}
+
+/// The trimmed, non-blank text of EVERY `<name>…</name>` pair in `text`, in
+/// order, duplicates dropped.
+fn tags(text: &str, name: &str) -> Vec<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
-    let start = text.find(&open)? + open.len();
-    let len = text.get(start..)?.find(&close)?;
-    let value = text.get(start..start + len)?.trim();
-    (!value.is_empty()).then(|| value.to_string())
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    // `find` returns char boundaries, so every `get` below is `Some`; `get`
+    // rather than indexing keeps that a non-panicking fact.
+    while let Some(after) = rest.find(&open).and_then(|at| rest.get(at + open.len()..)) {
+        let Some(len) = after.find(&close) else {
+            break;
+        };
+        let value = after.get(..len).unwrap_or_default().trim();
+        if !value.is_empty() && !out.iter().any(|v| v == value) {
+            out.push(value.to_string());
+        }
+        rest = after.get(len + close.len()..).unwrap_or_default();
+    }
+    out
 }
 
 /// Collapse `s` to one line: control characters become spaces and runs of
@@ -202,15 +222,16 @@ fn bounded(s: &str, max: usize) -> String {
 fn describe(item: &CatchUpItem) -> String {
     match item {
         CatchUpItem::TaskNotification {
-            task_id,
+            task_ids,
             status,
             summary,
         } => {
-            let head = format!(
-                "task {} {}",
-                task_id.as_deref().unwrap_or("?"),
-                status.as_deref().unwrap_or("(no status)")
-            );
+            let ids = if task_ids.is_empty() {
+                "?".to_string()
+            } else {
+                task_ids.join(", ")
+            };
+            let head = format!("task {ids} {}", status.as_deref().unwrap_or("(no status)"));
             match summary {
                 Some(summary) => bounded(&format!("{head}: {summary}"), MAX_ITEM_CHARS),
                 None => bounded(&head, MAX_ITEM_CHARS),
@@ -312,6 +333,10 @@ pub(crate) enum TailRescue {
     /// The source is shorter than the carry's offset — UNKNOWN which lines
     /// are new, so nothing was written.
     SourceShorter { len: u64, offset: u64 },
+    /// The carry copied nothing (the destination already held at least the
+    /// source's length), so it recorded no offset: which source lines are new
+    /// is UNKNOWN, and nothing was written (2026-10-23 review fix 8).
+    OffsetUnknown,
     /// The tail was written to `path`.
     Rescued {
         path: PathBuf,
@@ -326,7 +351,7 @@ impl TailRescue {
     pub(crate) fn lines(&self) -> usize {
         match self {
             Self::Rescued { scan, .. } => scan.lines,
-            Self::Empty | Self::SourceShorter { .. } => 0,
+            Self::Empty | Self::SourceShorter { .. } | Self::OffsetUnknown => 0,
         }
     }
 
@@ -334,7 +359,7 @@ impl TailRescue {
     pub(crate) fn message(&self) -> Option<String> {
         match self {
             Self::Rescued { path, scan, .. } => catch_up_message(scan, path),
-            Self::Empty | Self::SourceShorter { .. } => None,
+            Self::Empty | Self::SourceShorter { .. } | Self::OffsetUnknown => None,
         }
     }
 }
@@ -354,7 +379,14 @@ pub(crate) fn rescue_tail(
     let src = since
         .src_session_dir
         .with_file_name(format!("{claude_session_id}.jsonl"));
-    let (bytes, truncated) = match read_tail(&src, since.transcript_offset)? {
+    let Some(offset) = since.transcript_offset else {
+        warn!(
+            session = %claude_session_id,
+            "session tail rescue: the carry recorded no offset (the destination already held the transcript) — which lines are new is UNKNOWN; nothing written"
+        );
+        return Ok(TailRescue::OffsetUnknown);
+    };
+    let (bytes, truncated) = match read_tail(&src, offset)? {
         TailRead::SourceShorter { len, offset } => {
             warn!(
                 session = %claude_session_id,
