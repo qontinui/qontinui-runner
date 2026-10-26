@@ -273,6 +273,13 @@ pub struct RunAccounting {
     /// run) can never emit a second, later end for it.
     #[serde(default)]
     pub ended: bool,
+    /// Run `seq`'s START has been emitted. A run that begins before its
+    /// launcher's facts land (the launch site stamps them right AFTER its
+    /// terminal exists) HOLDS its start until the stamp arrives — or until the
+    /// first liveness touch, so a run no launcher ever stamps is still visible
+    /// while it runs. See `SessionLifecycleStore::emit_start_or_hold`.
+    #[serde(default)]
+    pub start_emitted: bool,
     /// The session's first slash command, read from its transcript (plan D3).
     /// Already validated by [`valid_first_command`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,7 +297,25 @@ impl RunAccounting {
         self.opened_at = Some(now_ms);
         self.started = false;
         self.ended = false;
+        self.start_emitted = false;
     }
+}
+
+/// Whether the counted run's START is due NOW — claimed (marked emitted) when it
+/// is. A start is held while the record carries no launch facts yet, because
+/// the launch site stamps them right after its terminal exists and the start
+/// should carry them; `release_held` lets the first liveness touch release a
+/// run no launcher stamps (an operator's bare `claude`), so it is never
+/// invisible while it runs.
+pub fn claim_start(rec: &mut TerminalSessionRecord, release_held: bool) -> bool {
+    let due = rec.run.started
+        && !rec.run.start_emitted
+        && !rec.run.ended
+        && (rec.spawn.is_some() || release_held);
+    if due {
+        rec.run.start_emitted = true;
+    }
+    due
 }
 
 /// Mark the counted run's end as emitted. `true` exactly once per counted run
@@ -319,59 +344,81 @@ pub fn process_boot_ms() -> i64 {
     *BOOT_MS.get_or_init(|| Utc::now().timestamp_millis())
 }
 
-/// What a boot-restore boundary did to one record.
-#[derive(Debug, Default)]
-pub struct BootBoundary {
-    /// The previous runner's run, closed at `min(last_seen_at, boot)` with
-    /// [`RUNNER_STOPPED_CLOSE_REASON`] — emit [`RunEvent::End`] for it.
-    pub ended: Option<TerminalSessionRecord>,
-    /// A new run began on the record (resume) — emit [`RunEvent::Start`].
-    pub began: bool,
-}
-
 /// A boot restore is re-materializing `rec`, which a PREVIOUS runner process
 /// was running. That process's run ended when it stopped (D4 `runner_stopped`):
-/// end it — once — at the last moment that process saw it alive. When the
-/// restore RESUMES the conversation (`resumes`), a new claude process runs
-/// under the same id: a new open interval begins (`run_seq + 1`), its origin
-/// is `boot_resume` (the launch facts' other fields are kept — it continues
-/// the same work). A terminal-only restore starts no new run.
+/// end it — once — at the last moment that process saw it alive. Returns the
+/// ended snapshot to emit [`RunEvent::End`] for.
 ///
-/// Idempotent per boot: once the boundary ran, the record's run either opened
-/// after `boot_ms` or is already ended.
+/// It never STARTS the next run: a resume is a new run only once its handshake
+/// is verified (the provider's confirming hook re-asserting the record, or
+/// `clear_restore_pending`) — see [`begin_next_interval`]. A terminal-only
+/// restore starts none.
+///
+/// Idempotent per boot: once the boundary ran the run is ended, and an
+/// interval this process opened is never ended here.
 pub fn boot_restore_boundary(
     rec: &mut TerminalSessionRecord,
-    resumes: bool,
     boot_ms: i64,
-    now_ms: i64,
-) -> BootBoundary {
-    let mut out = BootBoundary::default();
-    if rec.state != "open" {
-        return out;
-    }
-    let run_opened = rec.run.opened_at.unwrap_or(rec.opened_at);
-    if run_opened >= boot_ms {
-        return out; // this process opened the current interval
+) -> Option<TerminalSessionRecord> {
+    if rec.state != "open" || rec.run.opened_at.unwrap_or(rec.opened_at) >= boot_ms {
+        return None;
     }
     // Count a confirmed-but-uncounted previous run so its end is not lost.
     begin_run_if_due(rec);
-    if end_run_if_due(rec) {
-        let mut ended = rec.clone();
-        ended.state = "closed".to_string();
-        ended.closed_at = Some(rec.last_seen_at.min(boot_ms));
-        ended.close_reason = Some(RUNNER_STOPPED_CLOSE_REASON.to_string());
-        out.ended = Some(ended);
+    if !end_run_if_due(rec) {
+        return None;
     }
-    if resumes {
-        rec.run.note_opened(now_ms);
-        if let Some(sp) = rec.spawn.as_mut() {
-            sp.spawn_origin = SpawnOrigin::BootResume;
-        } else {
-            rec.spawn = Some(SpawnFacts::new(SpawnOrigin::BootResume));
+    let mut ended = rec.clone();
+    ended.state = "closed".to_string();
+    ended.closed_at = Some(rec.last_seen_at.min(boot_ms));
+    ended.close_reason = Some(RUNNER_STOPPED_CLOSE_REASON.to_string());
+    Some(ended)
+}
+
+/// The end time to REPORT for a run closed now. A run a previous process
+/// opened, and that this process never saw alive (`last_seen_at` before the
+/// boot), ended at `min(last_seen_at, boot)` — not at the moment this process
+/// got round to closing it. `None` ⇒ the store's own `closed_at` stands.
+pub fn previous_process_end_ms(rec: &TerminalSessionRecord, boot_ms: i64) -> Option<i64> {
+    let opened = rec.run.opened_at.unwrap_or(rec.opened_at);
+    (opened < boot_ms && rec.last_seen_at < boot_ms).then(|| rec.last_seen_at.min(boot_ms))
+}
+
+/// Open the record's NEXT run interval on an OPEN record whose run already
+/// ended (a resume verified after a boot restore, or a resume typed into a
+/// terminal-only tile). The launch facts are this interval's: a boot-restored
+/// record keeps its work's facts under origin `boot_resume`; any other re-open
+/// drops the old facts so the launcher's stamp (or terminal inheritance) fills
+/// them. Returns whether a run began (it needs confirmation, as every run).
+pub fn begin_next_interval(rec: &mut TerminalSessionRecord, now_ms: i64, boot_ms: i64) -> bool {
+    if rec.state != "open" || !rec.run.ended {
+        return false;
+    }
+    rec.run.note_opened(now_ms);
+    if rec.restored_from_boot_at.is_some_and(|t| t >= boot_ms) {
+        match rec.spawn.as_mut() {
+            Some(sp) => sp.spawn_origin = SpawnOrigin::BootResume,
+            None => rec.spawn = Some(SpawnFacts::new(SpawnOrigin::BootResume)),
         }
-        out.began = begin_run_if_due(rec);
+    } else {
+        rec.spawn = None;
     }
-    out
+    begin_run_if_due(rec)
+}
+
+/// The wire spelling of a raw store close reason: kept when it matches
+/// `^[a-z0-9_:.-]{1,64}$`, else `other` — a free-text reason (the orchestration
+/// teardown's sentence, say) never rides the wire.
+pub fn wire_close_reason(raw: &str) -> &str {
+    let ok = (1..=64).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_:.-".contains(&b));
+    if ok {
+        raw
+    } else {
+        "other"
+    }
 }
 
 /// Count the record's current open interval as a run when it is due: open,
@@ -473,7 +520,12 @@ fn rfc3339(ms: i64) -> Option<String> {
         .map(|t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Build the binding wire body. Pure. `None` when the session id is not a
+/// Build the binding wire body. Pure.
+///
+/// Event ORDER does not matter to coord: its ingest is an idempotent upsert on
+/// `(tenant, device, claude_code_session_id, run_seq)` and every event is
+/// self-contained, so an `end` that overtakes its `start` (or a `merge`) still
+/// builds the same row. `None` when the session id is not a
 /// uuid (coord types the field `Uuid`) or a required timestamp is out of
 /// range.
 pub fn run_record_body(snap: &RunSnapshot, event: RunEvent) -> Option<JsonValue> {
@@ -516,7 +568,7 @@ pub fn run_record_body(snap: &RunSnapshot, event: RunEvent) -> Option<JsonValue>
         // nothing rather than invent one (coord's backstop owns that case).
         body["ended_at"] = json!(rfc3339(snap.ended_at_ms?)?);
         if let Some(r) = snap.close_reason.as_deref().filter(|r| !r.is_empty()) {
-            body["close_reason"] = json!(r);
+            body["close_reason"] = json!(wire_close_reason(r));
         }
     }
     Some(body)
@@ -532,12 +584,30 @@ pub fn run_record_body(snap: &RunSnapshot, event: RunEvent) -> Option<JsonValue>
 pub struct AgenticRun {
     pub seq: u32,
     pub opened_at: i64,
+    /// The run's last known activity (its start, then each operator
+    /// interaction the registrar reports). A run a previous process left open
+    /// is ended HERE, never at the moment a later process noticed.
+    #[serde(default)]
+    pub last_seen_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<i64>,
+    /// The raw close reason (`agentic-close`, or `runner-stopped` for a run a
+    /// previous process left open).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<SpawnFacts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+}
+
+/// `run` as a previous process left it, ended at its last known activity
+/// (clamped to the boot) with [`RUNNER_STOPPED_CLOSE_REASON`].
+fn close_previous_process_run(run: &AgenticRun, boot_ms: i64) -> AgenticRun {
+    let mut ended = run.clone();
+    ended.closed_at = Some(run.last_seen_at.max(run.opened_at).min(boot_ms));
+    ended.close_reason = Some(RUNNER_STOPPED_CLOSE_REASON.to_string());
+    ended
 }
 
 /// Closed agentic runs older than this are pruned from the ledger.
@@ -589,24 +659,37 @@ impl AgenticRunLedger {
     }
 
     /// Open a new run for `ccsid`: `seq + 1` of the last recorded run, or 1.
+    /// When the last run is still OPEN and a previous process opened it, that
+    /// run ended when the process stopped: it is closed first (`runner-stopped`
+    /// at its last known activity) and returned so its end is emitted. With no
+    /// facts given, the previous run's facts carry over (a re-registration of
+    /// the same work).
     pub fn open_run(
         &self,
         ccsid: &str,
         now_ms: i64,
+        boot_ms: i64,
         spawn: Option<SpawnFacts>,
         tenant_id: Option<String>,
-    ) -> AgenticRun {
+    ) -> (Option<AgenticRun>, AgenticRun) {
         let mut m = self
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let seq = m.get(ccsid).map(|r| r.seq).unwrap_or(0).saturating_add(1);
+        let prev = m.get(ccsid).cloned();
+        let ended = prev
+            .as_ref()
+            .filter(|r| r.closed_at.is_none() && r.opened_at < boot_ms)
+            .map(|r| close_previous_process_run(r, boot_ms));
+        let seq = prev.as_ref().map(|r| r.seq).unwrap_or(0).saturating_add(1);
         let run = AgenticRun {
             seq,
             opened_at: now_ms,
+            last_seen_at: now_ms,
             closed_at: None,
-            spawn,
-            tenant_id,
+            close_reason: None,
+            spawn: spawn.or_else(|| prev.as_ref().and_then(|r| r.spawn.clone())),
+            tenant_id: tenant_id.or_else(|| prev.as_ref().and_then(|r| r.tenant_id.clone())),
         };
         m.insert(ccsid.to_string(), run.clone());
         m.retain(|_, r| {
@@ -614,7 +697,7 @@ impl AgenticRunLedger {
                 .is_none_or(|c| now_ms - c <= AGENTIC_LEDGER_RETENTION_MS)
         });
         self.persist(&m);
-        run
+        (ended, run)
     }
 
     /// Close `ccsid`'s open run. `None` when it has no open run.
@@ -625,9 +708,45 @@ impl AgenticRunLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let run = m.get_mut(ccsid).filter(|r| r.closed_at.is_none())?;
         run.closed_at = Some(now_ms);
+        run.last_seen_at = run.last_seen_at.max(now_ms);
+        run.close_reason = Some(AGENTIC_CLOSE_REASON.to_string());
         let closed = run.clone();
         self.persist(&m);
         Some(closed)
+    }
+
+    /// Bump `ccsid`'s open run's last known activity. No write when it has none.
+    pub fn touch(&self, ccsid: &str, now_ms: i64) {
+        let mut m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(run) = m.get_mut(ccsid).filter(|r| r.closed_at.is_none()) {
+            run.last_seen_at = now_ms;
+            self.persist(&m);
+        }
+    }
+
+    /// End every run a PREVIOUS process left open (`runner-stopped`, at its
+    /// last known activity) — the boot sweep, so a session that is never
+    /// re-registered does not stay open on coord forever. Returns the
+    /// `(ccsid, ended run)` pairs to emit.
+    pub fn end_previous_process_runs(&self, boot_ms: i64) -> Vec<(String, AgenticRun)> {
+        let mut m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ended = Vec::new();
+        for (ccsid, run) in m.iter_mut() {
+            if run.closed_at.is_none() && run.opened_at < boot_ms {
+                *run = close_previous_process_run(run, boot_ms);
+                ended.push((ccsid.clone(), run.clone()));
+            }
+        }
+        if !ended.is_empty() {
+            self.persist(&m);
+        }
+        ended
     }
 
     #[cfg(test)]
@@ -747,13 +866,37 @@ impl RunRecordEmitter {
             return;
         }
         let now = Utc::now().timestamp_millis();
-        let run = self
-            .ledger
-            .open_run(claude_session_id, now, spawn, tenant_id);
+        let (ended, run) =
+            self.ledger
+                .open_run(claude_session_id, now, process_boot_ms(), spawn, tenant_id);
+        if let Some(prev) = ended {
+            self.emit_snapshot(
+                &agentic_snapshot(claude_session_id, &prev, None),
+                RunEvent::End,
+            );
+        }
         self.emit_snapshot(
             &agentic_snapshot(claude_session_id, &run, coord_session_id),
             RunEvent::Start,
         );
+    }
+
+    /// Agentic plane: an operator interaction with `claude_session_id` — its
+    /// open run's last known activity.
+    pub fn agentic_touch(&self, claude_session_id: &str) {
+        self.ledger
+            .touch(claude_session_id, Utc::now().timestamp_millis());
+    }
+
+    /// Boot sweep: end every agentic run a previous process left open. Called
+    /// once at startup, after the emitter is installed.
+    pub fn end_previous_process_agentic_runs(&self) {
+        if !(self.gate)() {
+            return;
+        }
+        for (ccsid, run) in self.ledger.end_previous_process_runs(process_boot_ms()) {
+            self.emit_snapshot(&agentic_snapshot(&ccsid, &run, None), RunEvent::End);
+        }
     }
 
     /// Agentic plane: the registrar closed the session. No-op when the ledger
@@ -851,10 +994,21 @@ pub fn agentic_process_exited(session_id: &str) {
 /// A HEADLESS child pinned to `session_id` started — a session with neither a
 /// lifecycle record nor a registrar registration, so its run rides the agentic
 /// ledger directly. Its exit is [`agentic_process_exited`].
-pub fn agentic_headless_start(session_id: &str, spawn: SpawnFacts) {
+pub fn agentic_headless_start(session_id: &str, spawn: SpawnFacts, tenant_id: Option<String>) {
     if let Some(emitter) = GLOBAL.get() {
-        emitter.agentic_start(session_id, Some(spawn), None, None);
+        emitter.agentic_start(session_id, Some(spawn), tenant_id, None);
     }
+}
+
+/// The tenant a headless launch in `workdir` is owned by, as the registrar
+/// would resolve it (workspace + repo, plan 2026-09-20 Phase 5) — carried on its
+/// run rows so the drain presents that tenant's credential. `None` when no
+/// tenant can be stated (the drain's device default then applies).
+pub async fn headless_run_tenant(workdir: &str) -> Option<String> {
+    super::resolve_new_session_tenant_in(Some(std::path::Path::new(workdir)))
+        .await
+        .tenant()
+        .map(|t| t.to_string())
 }
 
 fn agentic_snapshot(ccsid: &str, run: &AgenticRun, coord_session_id: Option<Uuid>) -> RunSnapshot {
@@ -863,8 +1017,8 @@ fn agentic_snapshot(ccsid: &str, run: &AgenticRun, coord_session_id: Option<Uuid
         run_seq: run.seq,
         started_at_ms: run.opened_at,
         ended_at_ms: run.closed_at,
-        close_reason: run.closed_at.map(|_| AGENTIC_CLOSE_REASON.to_string()),
-        last_seen_at_ms: Some(run.closed_at.unwrap_or(run.opened_at)),
+        close_reason: run.close_reason.clone(),
+        last_seen_at_ms: Some(run.last_seen_at.max(run.opened_at)),
         spawn: run.spawn.clone(),
         first_command: None,
         // The agentic plane pins `--session-id` to its task_run_id, so it
@@ -1133,6 +1287,192 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_agentic_run_a_previous_process_left_open_ends_at_its_last_activity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agentic.json");
+        let mut m = HashMap::new();
+        m.insert(
+            SID.to_string(),
+            AgenticRun {
+                seq: 1,
+                opened_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_060_000,
+                closed_at: None,
+                close_reason: None,
+                spawn: Some(SpawnFacts::new(SpawnOrigin::OperatorChat)),
+                tenant_id: None,
+            },
+        );
+        let other = "1b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d11";
+        m.insert(
+            other.to_string(),
+            AgenticRun {
+                seq: 4,
+                opened_at: 1_700_000_000_000,
+                last_seen_at: 0,
+                closed_at: None,
+                close_reason: None,
+                spawn: None,
+                tenant_id: None,
+            },
+        );
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let em = RunRecordEmitter::with_parts(
+            outbox.clone(),
+            Uuid::new_v4(),
+            Box::new(|_t: &str| None),
+            Box::new(|| true),
+            AgenticRunLedger::open(Some(path.clone())),
+        );
+        // A re-registration ends the stale run first, then starts run 2.
+        em.agentic_start(SID, None, None, None);
+        let b = bodies(&outbox);
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            (b[0]["event"].clone(), b[0]["run_seq"].clone()),
+            (json!("end"), json!(1))
+        );
+        assert_eq!(b[0]["close_reason"], RUNNER_STOPPED_CLOSE_REASON);
+        assert_eq!(
+            b[0]["ended_at"], "2023-11-14T22:14:20.000Z",
+            "its last activity, not now"
+        );
+        assert_eq!(
+            (b[1]["event"].clone(), b[1]["run_seq"].clone()),
+            (json!("start"), json!(2))
+        );
+        assert_eq!(
+            b[1]["facts"]["spawn_origin"], "operator_chat",
+            "facts carry over"
+        );
+        // The boot sweep ends every other open run a previous process left —
+        // at its opening when no activity was ever recorded — and only once.
+        em.end_previous_process_agentic_runs();
+        em.end_previous_process_agentic_runs();
+        let b = bodies(&outbox);
+        assert_eq!(b.len(), 3);
+        // Rows on different session lanes have no cross-lane order.
+        let swept: Vec<&JsonValue> = b
+            .iter()
+            .filter(|x| x["claude_code_session_id"] == other)
+            .collect();
+        assert_eq!(swept.len(), 1, "the sweep ends it exactly once");
+        assert_eq!(
+            (swept[0]["event"].clone(), swept[0]["run_seq"].clone()),
+            (json!("end"), json!(4))
+        );
+        assert_eq!(swept[0]["ended_at"], "2023-11-14T22:13:20.000Z");
+        // The current run (this process's) is untouched by the sweep.
+        assert!(em.ledger.get(SID).unwrap().closed_at.is_none());
+    }
+
+    #[test]
+    fn a_close_reason_outside_the_wire_charset_becomes_other() {
+        assert_eq!(wire_close_reason("pty-exit"), "pty-exit");
+        assert_eq!(
+            wire_close_reason("superseded-terminal-reuse"),
+            "superseded-terminal-reuse"
+        );
+        assert_eq!(wire_close_reason("a:b.c_d-1"), "a:b.c_d-1");
+        for bad in [
+            "orchestration dispatch could not bind the worker",
+            "Poll-Dead",
+            "",
+            &"x".repeat(65),
+            "x/y",
+        ] {
+            assert_eq!(wire_close_reason(bad), "other", "{bad:?}");
+        }
+        let mut r = rec(SID);
+        begin_run_if_due(&mut r);
+        r.state = "closed".to_string();
+        r.closed_at = Some(1_700_000_900_000);
+        r.close_reason = Some("orchestration dispatch could not bind the worker".to_string());
+        let body =
+            run_record_body(&RunSnapshot::from_record(&r, None).unwrap(), RunEvent::End).unwrap();
+        assert_eq!(body["close_reason"], "other");
+        assert!(!body.to_string().contains("orchestration dispatch"));
+    }
+
+    /// The body in coord's strict contract shape: every id a REAL uuid, every
+    /// timestamp RFC 3339, `run_seq` a positive integer, only the documented
+    /// keys at the top and in `facts`.
+    #[test]
+    fn the_wire_body_matches_coords_strict_contract() {
+        let gate = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let coord_session = Uuid::new_v4();
+        let mut r = rec(SID);
+        begin_run_if_due(&mut r);
+        r.spawn = Some(
+            SpawnFacts::new(SpawnOrigin::GateContinuation)
+                .gate_id(Some(gate.to_string()))
+                .agent_id(Some(agent.to_string()))
+                .skill(Some("vet-imp".into())),
+        );
+        r.state = "closed".to_string();
+        r.closed_at = Some(1_700_000_900_000);
+        r.close_reason = Some("pty-exit".to_string());
+        let body = run_record_body(
+            &RunSnapshot::from_record(&r, Some(coord_session)).unwrap(),
+            RunEvent::End,
+        )
+        .unwrap();
+        let top: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed_top = [
+            "claude_code_session_id",
+            "run_seq",
+            "event",
+            "started_at",
+            "ended_at",
+            "close_reason",
+            "last_seen_at",
+            "first_turn_at",
+            "active_seconds",
+            "facts",
+        ];
+        assert!(top.iter().all(|k| allowed_top.contains(k)), "{top:?}");
+        let allowed_facts = [
+            "spawn_origin",
+            "spawn_kind",
+            "gate_id",
+            "agent_id",
+            "coord_session_id",
+            "spawn_request_id",
+            "skill",
+            "first_command",
+            "bind_origin",
+            "account_label",
+            "provider",
+            "model",
+            "repo",
+            "work_unit_slug",
+        ];
+        let facts = body["facts"].as_object().unwrap();
+        assert!(
+            facts.keys().all(|k| allowed_facts.contains(&k.as_str())),
+            "{facts:?}"
+        );
+        for key in ["gate_id", "agent_id", "coord_session_id"] {
+            Uuid::parse_str(facts[key].as_str().unwrap()).unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
+        Uuid::parse_str(body["claude_code_session_id"].as_str().unwrap()).unwrap();
+        assert!(body["run_seq"].as_u64().unwrap() >= 1);
+        for key in ["started_at", "ended_at", "last_seen_at"] {
+            DateTime::parse_from_rfc3339(body[key].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
+        assert_eq!(body["event"], "end");
+        assert_eq!(facts["bind_origin"], "authoritative");
+    }
+
+    #[test]
     fn tenant_rides_the_envelope_not_the_body() {
         let (em, outbox, _d) = emitter(true);
         let mut r = rec(SID);
@@ -1181,9 +1521,10 @@ pub(crate) mod tests {
             events(&outbox).is_empty(),
             "a provisional record emits nothing"
         );
-        // Confirmation begins run 1.
+        // Confirmation begins run 1 — its start is HELD for the launch facts…
         store.confirm_session(SID);
-        // The launcher's facts arrive as a merge on the counted run.
+        assert!(events(&outbox).is_empty(), "start held until the stamp");
+        // …which the launcher's stamp releases, carrying them.
         assert!(store.record_spawn_facts(
             "term-1",
             SpawnFacts::new(SpawnOrigin::OperatorTerminal),
@@ -1192,23 +1533,99 @@ pub(crate) mod tests {
         assert!(store.note_first_command(SID, "/vet-imp"));
         store.record_close(SID, "pty-exit");
         store.record_close(SID, "pty-exit"); // repeat close: no second end
-                                             // Re-opening the closed record is run 2, persisted across a restart.
+                                             // Re-opening the closed record is run 2: the old facts are dropped,
+                                             // and its start waits for THIS launch's stamp.
         store.record_open(rec(SID));
         assert_eq!(store.get(SID).unwrap().run.seq, 2);
+        assert!(
+            store.get(SID).unwrap().spawn.is_none(),
+            "run 1's facts dropped"
+        );
+        assert!(store.record_spawn_facts(
+            "term-1",
+            SpawnFacts::new(SpawnOrigin::Respawn).spawn_kind("resume_door"),
+            0
+        ));
         assert_eq!(
             events(&outbox),
             vec![
                 ("start".to_string(), 1),
-                ("merge".to_string(), 1),
                 ("merge".to_string(), 1),
                 ("end".to_string(), 1),
                 ("start".to_string(), 2),
             ]
         );
         let b = bodies(&outbox);
-        assert_eq!(b[3]["close_reason"], "pty-exit", "raw store close reason");
-        assert_eq!(b[3]["facts"]["spawn_origin"], "operator_terminal");
-        assert_eq!(b[3]["facts"]["first_command"], "vet-imp");
+        assert_eq!(b[0]["facts"]["spawn_origin"], "operator_terminal");
+        assert_eq!(b[2]["close_reason"], "pty-exit", "raw store close reason");
+        assert_eq!(b[2]["facts"]["spawn_origin"], "operator_terminal");
+        assert_eq!(b[2]["facts"]["first_command"], "vet-imp");
+        assert_eq!(
+            b[3]["facts"]["spawn_origin"], "respawn",
+            "run 2 carries the NEW facts"
+        );
+        assert_eq!(b[3]["facts"]["spawn_kind"], "resume_door");
+    }
+
+    #[test]
+    fn a_run_no_launcher_stamps_is_released_by_the_first_touch() {
+        let (store, outbox, _d) = store_with_emitter();
+        store.record_open(rec(SID)); // confirmed, no facts: held
+        assert!(events(&outbox).is_empty());
+        store.touch(SID);
+        store.touch(SID);
+        assert_eq!(events(&outbox), vec![("start".to_string(), 1)]);
+        assert!(bodies(&outbox)[0]["facts"].get("spawn_origin").is_none());
+    }
+
+    #[test]
+    fn a_prune_of_a_stale_open_record_reports_its_end_at_its_last_sighting() {
+        let (store, outbox, dir) = store_with_emitter();
+        let path = dir.path().join("terminal-sessions.json");
+        store.record_open(rec(SID));
+        store.touch(SID); // release the held start
+        store.compact();
+        let raw = std::fs::read(&path).unwrap();
+        let mut m: HashMap<String, TerminalSessionRecord> = serde_json::from_slice(&raw).unwrap();
+        m.get_mut(SID).unwrap().last_seen_at = 1_700_000_060_000;
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        store.reload_from_disk().unwrap();
+        store.prune(Utc::now().timestamp_millis(), &HashSet::new());
+        assert!(store.get(SID).is_none(), "the stale row is pruned");
+        let b = bodies(&outbox);
+        let end = b.last().unwrap();
+        assert_eq!(end["event"], "end");
+        assert_eq!(end["ended_at"], "2023-11-14T22:14:20.000Z");
+        assert_eq!(
+            end["close_reason"],
+            crate::session::session_lifecycle_store::PRUNED_STALE_OPEN_CLOSE_REASON
+        );
+    }
+
+    #[test]
+    fn a_close_of_a_run_a_previous_process_opened_is_clamped_to_its_last_sighting() {
+        let (em, outbox, dir) = emitter(true);
+        let path = dir.path().join("terminal-sessions.json");
+        let mut r = rec(SID);
+        r.run = RunAccounting {
+            seq: 1,
+            opened_at: Some(1_700_000_000_000),
+            started: true,
+            ended: false,
+            start_emitted: true,
+            first_command: None,
+        };
+        let mut m = HashMap::new();
+        m.insert(SID.to_string(), r);
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.attach_run_record_emitter(Arc::new(em));
+        // The liveness poll finds it dead long after this process booted.
+        store.record_close(SID, "poll-dead");
+        let b = bodies(&outbox);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["ended_at"], "2023-11-14T22:14:20.000Z", "not now");
+        assert_eq!(b[0]["close_reason"], "poll-dead");
     }
 
     #[test]
@@ -1240,10 +1657,11 @@ pub(crate) mod tests {
         assert_eq!(end["close_reason"], "superseded-terminal-reuse");
     }
 
-    #[test]
-    fn a_boot_restore_ends_the_previous_runners_run_and_resumes_as_the_next() {
-        // A run counted by a PREVIOUS runner process: persisted on disk with an
-        // open interval that began long before this process's boot instant.
+    /// A record a PREVIOUS runner process was running, persisted with an open
+    /// interval that began long before this process's boot instant.
+    fn previous_process_store(
+        spawn: Option<SpawnFacts>,
+    ) -> (SessionLifecycleStore, Arc<OutboxWriter>, tempfile::TempDir) {
         let (em, outbox, dir) = emitter(true);
         let path = dir.path().join("terminal-sessions.json");
         let mut r = rec(SID);
@@ -1252,18 +1670,33 @@ pub(crate) mod tests {
             opened_at: Some(1_700_000_000_000),
             started: true,
             ended: false,
+            start_emitted: true,
             first_command: None,
         };
-        r.spawn = Some(SpawnFacts::new(SpawnOrigin::GateContinuation).gate_id(Some("g".into())));
+        r.spawn = spawn;
         let mut m = HashMap::new();
         m.insert(SID.to_string(), r);
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.attach_run_record_emitter(Arc::new(em));
+        (store, outbox, dir)
+    }
 
+    #[test]
+    fn a_boot_restore_ends_the_previous_run_and_starts_the_next_only_once_verified() {
+        let (store, outbox, _d) = previous_process_store(Some(
+            SpawnFacts::new(SpawnOrigin::GateContinuation).gate_id(Some("g".into())),
+        ));
         store.mark_restore_pending(SID);
         store.mark_restore_pending(SID); // a retry this boot is idempotent
-        store.mark_restored_from_boot(SID, "resumed"); // already split: no-op
+        assert_eq!(
+            events(&outbox),
+            vec![("end".to_string(), 1)],
+            "no run 2 before the resume is verified"
+        );
+        store.mark_restored_from_boot(SID, "resumed");
+        // The verified handshake starts run 2.
+        store.clear_restore_pending(SID);
         assert_eq!(
             events(&outbox),
             vec![("end".to_string(), 1), ("start".to_string(), 2)]
@@ -1277,26 +1710,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_terminal_only_restore_ends_the_run_once_and_never_again() {
-        let (em, outbox, dir) = emitter(true);
-        let path = dir.path().join("terminal-sessions.json");
-        let mut r = rec(SID);
-        r.run = RunAccounting {
-            seq: 1,
-            opened_at: Some(1_700_000_000_000),
-            started: true,
-            ended: false,
-            first_command: None,
-        };
-        let mut m = HashMap::new();
-        m.insert(SID.to_string(), r);
-        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        store.attach_run_record_emitter(Arc::new(em));
+    fn a_resume_typed_into_a_terminal_only_tile_is_the_next_run() {
+        let (store, outbox, _d) = previous_process_store(None);
         store.mark_restored_from_boot(SID, "terminal-only");
-        store.record_open(rec(SID)); // the frontend re-asserts the tile
-        store.record_close(SID, "pty-exit"); // the tile closes much later
+        // The frontend re-asserts the tile (unconfirmed): not a run.
+        let mut reassert = rec(SID);
+        reassert.confirmed_at = None;
+        store.record_open(reassert);
         assert_eq!(events(&outbox), vec![("end".to_string(), 1)]);
+        // The operator types `claude --resume` — its hook confirms the id.
+        store.record_open(rec(SID));
+        store.record_close(SID, "pty-exit");
+        store.record_close(SID, "pty-exit");
+        assert_eq!(
+            events(&outbox),
+            vec![
+                ("end".to_string(), 1),
+                ("start".to_string(), 2),
+                ("end".to_string(), 2),
+            ]
+        );
     }
 
     #[test]

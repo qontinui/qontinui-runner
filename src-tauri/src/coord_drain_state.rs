@@ -68,8 +68,8 @@ const ME_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a session is being spawned — the D7 vocabulary, stamped by the spawner
 /// rather than reconstructed later. The wire values ([`Self::as_wire`]) are the
-/// contract's `intent.spawn_origin` vocabulary (C2). Coord does NOT validate
-/// them (it has no `spawn_origin` validator; an earlier version of this comment
+/// contract's `intent.spawn_origin` vocabulary (C2). Coord checks only a
+/// value's SHAPE, not its vocabulary (an earlier version of this comment
 /// claimed it rejected anything else), so this enum is the only place the
 /// vocabulary is closed. The run ledger sends them as the `spawn_origin` fact
 /// of `POST /coord/session-runs` (plan

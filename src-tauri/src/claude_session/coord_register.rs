@@ -1264,6 +1264,11 @@ impl AiCoordRegistrar {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
         };
+        // Run ledger: the agentic run's last known activity, which is where a
+        // run a stopped runner left open is later ended.
+        if let Some(emitter) = self.inner.run_emitter.get() {
+            emitter.agentic_touch(task_run_id);
+        }
         let payload = self.stamp_tenant(
             session_id,
             json!({ "id": session_id, "at": chrono::Utc::now() }),

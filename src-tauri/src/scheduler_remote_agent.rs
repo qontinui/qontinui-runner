@@ -366,6 +366,7 @@ pub(crate) async fn launch(
         .skill(crate::session::run_record_emitter::skill_of_prompt(
             &spec.prompt,
         )),
+        crate::session::run_record_emitter::headless_run_tenant(&workdir_s).await,
     );
     let run_key = session_id.clone();
 

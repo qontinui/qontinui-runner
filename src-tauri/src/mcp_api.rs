@@ -2475,6 +2475,9 @@ async fn health(
             "drainDropped": {
                 "noRoute": crate::session::coord_sync::SESSION_RUN_DROPPED_NO_ROUTE
                     .load(Ordering::Relaxed),
+                // 409s from coord's upsert (ACKed, counted, logged).
+                "conflict": crate::session::coord_sync::SESSION_RUN_CONFLICTS
+                    .load(Ordering::Relaxed),
             },
         },
         // The coord session outbox drain (qontinui-runner manual-test-loop

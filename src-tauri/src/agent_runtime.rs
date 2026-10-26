@@ -8326,7 +8326,10 @@ async fn run_continuation_headless(
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
             // Run ledger: the pinned session runs from here to its exit.
             let run_key = pinned_session_id.to_string();
-            crate::session::run_record_emitter::agentic_headless_start(&run_key, run_facts);
+            let run_tenant = crate::session::run_record_emitter::headless_run_tenant(workdir).await;
+            crate::session::run_record_emitter::agentic_headless_start(
+                &run_key, run_facts, run_tenant,
+            );
             let exit = pump_subprocess(
                 agent_id,
                 &mut child,
@@ -9247,6 +9250,10 @@ async fn run_agent_subprocess(
                 // pinned session — a headless child with no lifecycle record,
                 // so its run rides the agentic ledger from here to its exit.
                 let run_key = session_pins.current().map(|id| id.to_string());
+                // The tenant the worktree is owned by, as the registrar would
+                // resolve it — the run rows present that tenant's credential.
+                let run_tenant =
+                    crate::session::run_record_emitter::headless_run_tenant(&primary_wt).await;
                 if let Some(key) = run_key.as_deref() {
                     crate::session::run_record_emitter::agentic_headless_start(
                         key,
@@ -9260,6 +9267,7 @@ async fn run_agent_subprocess(
                                 &payload.initial_prompt,
                             ),
                         ),
+                        run_tenant.clone(),
                     );
                 }
                 // Race the subprocess pump against an operator stop. On stop we

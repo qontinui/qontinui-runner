@@ -1011,6 +1011,16 @@ pub(crate) static TRANSPORT_RUNG_DROPPED_405: AtomicU64 = AtomicU64::new(0);
 /// under-count is visible without a log grep.
 pub(crate) static SESSION_RUN_DROPPED_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 
+/// `session_run` rows coord answered 409 for (its upsert holds a row this event
+/// contradicts) since this process booted — ACKed, but counted and logged, so a
+/// conflict is never a silent drop. `GET /health` `sessionRuns.drainDropped.conflict`.
+pub(crate) static SESSION_RUN_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a retried failure that waits on this device's CREDENTIAL (a 401 on a
+/// `session_run` row) — kept and retried on the lane's backoff, and never
+/// counted toward quarantine.
+const CREDENTIAL_WAIT_MARK: &str = "[credential-wait]";
+
 /// Rows Ack-dropped on any OTHER 4xx — a status the shared classifier
 /// ([`write_failure_outcome`]) maps to `PermanentFailure`, including a 429,
 /// which this kind does not special-case the way `output_chunk` does. The
@@ -1594,7 +1604,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
-        if serving && !rate_limited {
+        // Nor does a run row waiting on a credential (a 401 `session_run`
+        // keeps its row): that is this device's JWT state, not coord refusing
+        // the row, and quarantining it would stop the retry it exists for.
+        let credential_wait = err.contains(CREDENTIAL_WAIT_MARK);
+        if serving && !rate_limited && !credential_wait {
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
@@ -2155,6 +2169,34 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     );
                 }
                 return PushOutcome::Acked;
+            }
+            if kind == "session_run" && status == StatusCode::CONFLICT {
+                // Coord's upsert answered 409 — a row it holds for this
+                // (device, session, run_seq) disagrees with this event (e.g.
+                // an end older than the one it has: "an end never moves
+                // backwards"). Retrying cannot change coord's answer, so the
+                // row is ACKed — but never silently: counted for `/health`
+                // (`sessionRuns.drainDropped.conflict`) and logged with the body.
+                SESSION_RUN_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                let detail = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    body = %snippet(&detail),
+                    "coord_sync: coord refused a session run row as conflicting (409) — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run" && status == StatusCode::UNAUTHORIZED {
+                // A 401 is a CREDENTIAL state (an expired or not-yet-minted
+                // device JWT), not coord refusing the row's content: keep the
+                // row and retry on this lane's backoff, as a lifecycle 429 is
+                // — the drain's quarantine accounting never counts it, and the
+                // run lane holds only run rows, so nothing else waits on it.
+                let detail = resp.text().await.unwrap_or_default();
+                return PushOutcome::Transport(format!(
+                    "{status} {CREDENTIAL_WAIT_MARK}: {detail}"
+                ));
             }
             if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
@@ -4002,6 +4044,9 @@ mod tests {
         /// When set, `/coord/session-runs` answers this status instead of
         /// 200 — a coord build that predates the route (404/405).
         session_runs_status: Option<u16>,
+        /// Answered (front first) before `session_runs_status` applies — a
+        /// scripted sequence, e.g. two 5xx then success.
+        session_runs_script: std::collections::VecDeque<u16>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -4391,8 +4436,8 @@ mod tests {
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
                         g.session_runs.push(body.clone());
-                        let status = g
-                            .session_runs_status
+                        let code = g.session_runs_script.pop_front().or(g.session_runs_status);
+                        let status = code
                             .and_then(|c| AxumStatus::from_u16(c).ok())
                             .unwrap_or(AxumStatus::OK);
                         (status, Json(json!({ "ok": status.is_success() }))).into_response()
@@ -4883,12 +4928,106 @@ mod tests {
         }
     }
 
-    /// A 401 is a 4xx coord refusal: ACK-dropped through the shared classifier
-    /// (as for restore-record), never an infinite retry loop.
+    /// Record `rows` `session_run` rows on ONE run lane and start the drain
+    /// against a fake coord scripted with `script` then `status`.
+    async fn start_session_run_drain(
+        rows: usize,
+        script: &[u16],
+        status: Option<u16>,
+    ) -> (
+        Arc<OutboxWriter>,
+        Arc<TokMutex<CoordRecorder>>,
+        CoordSync,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.session_runs_status = status;
+            g.session_runs_script = script.iter().copied().collect();
+        }
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let ccsid = "0b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d10";
+        let machine = Uuid::new_v4();
+        for n in 0..rows {
+            outbox
+                .record(
+                    machine,
+                    crate::session::run_record_emitter::run_lane(ccsid),
+                    SessionEventKind::SessionRun,
+                    json!({"body": {
+                        "claude_code_session_id": ccsid,
+                        "run_seq": n + 1,
+                        "event": "start",
+                        "started_at": "2026-10-26T00:00:00.000Z",
+                        "facts": {},
+                    }}),
+                )
+                .unwrap();
+        }
+        (outbox, rec, coord, dir)
+    }
+
+    /// A 401 is this device's CREDENTIAL state, not coord refusing the row: the
+    /// row is KEPT and retried on the lane's backoff — not dropped, and not a
+    /// hot loop (a handful of attempts in seconds, not hundreds).
     #[tokio::test]
     async fn session_run_refused_401_does_not_loop() {
-        let posted = drain_one_session_run(Some(401)).await;
-        assert_eq!(posted.len(), 1, "one attempt, then dropped");
+        let (outbox, rec, coord, _dir) = start_session_run_drain(1, &[], Some(401)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let attempts = rec.lock().await.session_runs.len();
+        assert!(attempts >= 1, "the drain attempted the row");
+        assert!(
+            attempts <= 5,
+            "backed off between attempts, not a hot loop: {attempts} in 4s"
+        );
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "a 401 keeps the row for retry"
+        );
+    }
+
+    /// A 5xx keeps the row and retries it, and the lane's rows still arrive IN
+    /// ORDER once coord recovers — nothing dropped, nothing reordered.
+    #[tokio::test]
+    async fn session_run_5xx_is_kept_and_retried_in_order() {
+        let (outbox, rec, coord, _dir) = start_session_run_drain(2, &[503, 500], None).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(15), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(outbox.pending().unwrap().is_empty(), "both rows delivered");
+        let posted = rec.lock().await.session_runs.clone();
+        let seqs: Vec<u64> = posted
+            .iter()
+            .map(|b| b["run_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![1, 1, 1, 2],
+            "row 1 retried twice, then row 2 — in order"
+        );
+    }
+
+    /// A 409 from coord's upsert is ACKed but COUNTED (never a silent drop).
+    #[tokio::test]
+    async fn session_run_conflict_is_counted_not_silent() {
+        let before = SESSION_RUN_CONFLICTS.load(Ordering::Relaxed);
+        let posted = drain_one_session_run(Some(409)).await;
+        assert_eq!(posted.len(), 1);
+        assert!(SESSION_RUN_CONFLICTS.load(Ordering::Relaxed) > before);
     }
 
     /// The three drop counters are process-wide and each test below asserts
