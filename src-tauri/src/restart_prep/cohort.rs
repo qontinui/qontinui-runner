@@ -173,8 +173,9 @@ pub struct CohortRow {
 /// liveness poll closed a shell that went idle (`poll-dead`). The same two the
 /// restore set grants a grace window (`restorable_records`).
 /// One list with the boot restore's own (`session_lifecycle_store`): a
-/// session whose `claude` ended cleanly under a live runner (`/exit`, or a
-/// status-0 exit) closes `claude-ended`, which is in neither.
+/// session the user ended with `/exit` — reported by its own `SessionEnd`
+/// hook (`prompt_input_exit`) under a live runner — closes `claude-ended`,
+/// which is in neither. A status-0 exit alone does not.
 pub const RESTART_SHAPED_CLOSE_REASONS: [&str; 2] =
     crate::session::session_lifecycle_store::RESTORABLE_CLOSE_REASONS;
 

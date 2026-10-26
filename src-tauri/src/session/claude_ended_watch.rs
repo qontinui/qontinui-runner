@@ -606,6 +606,17 @@ mod tests {
         });
         assert!(!deliberate_end(other), "the redirected-to record's marker");
         assert!(deliberate_end(id), "not the requested id's");
+
+        // RedirectedAmbiguous: the same — the winner's marker goes.
+        assert!(record_session_end(other, "prompt_input_exit"));
+        consume_marker_after(&CloseOutcome::RedirectedAmbiguous {
+            requested: id.to_string(),
+            closed: other.to_string(),
+            terminal_id: "t".to_string(),
+            candidates: vec![other.to_string()],
+        });
+        assert!(!deliberate_end(other), "the ambiguous winner's marker");
+        assert!(deliberate_end(id), "not the requested id's");
         forget_session_end(id);
     }
 

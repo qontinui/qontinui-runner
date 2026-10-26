@@ -1638,7 +1638,9 @@ pub fn terminal_session_record_close(
     //
     // The marker read is the one of the record this close will actually
     // close: a close redirected to the terminal's open record is that record's
-    // end, not the requested id's (review round 14 nit 2).
+    // end, not the requested id's (review round 14 nit 2). The read and the
+    // close below are not atomic; that sub-ms race can only change the close
+    // REASON (a marker landing in between), never which record closes.
     let deliberate = store
         .close_target(&claude_session_id, terminal_id.as_deref())
         .is_some_and(|target| crate::session::claude_ended_watch::deliberate_end(&target));

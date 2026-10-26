@@ -1823,6 +1823,14 @@ impl SessionLifecycleStore {
         expect_terminal_id: Option<&str>,
     ) -> Option<String> {
         let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
+        // As `record_close_checked`: a superseded terminal's close closes
+        // nothing. Read-only here — the register entry is consumed only by the
+        // close itself.
+        if let Some(t) = expect {
+            if self.superseded_terminals.lock().ok()?.contains(t) {
+                return None;
+            }
+        }
         let m = self.map.lock().ok()?;
         resolve_close_target(&m, claude_session_id, expect).0
     }
@@ -7625,7 +7633,7 @@ mod tests {
             open(id);
             store.record_close(id, witnessed_close_reason(observed, quitting, cause));
         };
-        close("exited-clean", "pty-exit", false, DeliberateEnd);
+        close("reported-exit", "pty-exit", false, DeliberateEnd);
         close("holder-gone", "pty-exit", false, Unknown);
         close("signal-death", "pty-exit", false, Abnormal);
         close("killed-in-shutdown", "pty-exit", true, DeliberateEnd);
@@ -7646,7 +7654,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            store.get("exited-clean").unwrap().close_reason.as_deref(),
+            store.get("reported-exit").unwrap().close_reason.as_deref(),
             Some(CLAUDE_ENDED_CLOSE_REASON)
         );
         assert!(!crate::restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS
@@ -7689,6 +7697,48 @@ mod tests {
         );
         assert_eq!(store.close_target("stale-id", None), None);
         assert_eq!(store.get("live").unwrap().state, "open", "nothing closed");
+    }
+
+    /// Review round 15: a superseded terminal's close closes nothing, so
+    /// `close_target` names nothing — matching `record_close_checked` — and
+    /// reading it does not consume the register entry the close relies on.
+    #[test]
+    fn close_target_names_nothing_for_a_superseded_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("live"));
+        store.mark_terminal_superseded("term-abc", "term-new");
+        assert_eq!(store.close_target("live", Some("term-abc")), None);
+        assert_eq!(
+            store.close_target("live", Some("term-abc")),
+            None,
+            "not consumed"
+        );
+        assert!(matches!(
+            store.record_close_checked("live", Some("term-abc"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+    }
+
+    /// Review round 15: the pane close's marker read follows a redirect — a
+    /// marker recorded on the LIVE id is found through a stale requested id.
+    #[test]
+    fn a_redirected_close_reads_the_live_records_marker() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let live = "af6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+        store.record_open(rec(live));
+        assert!(crate::session::claude_ended_watch::record_session_end(
+            live,
+            "prompt_input_exit"
+        ));
+        let target = store.close_target("stale-id", Some("term-abc"));
+        assert_eq!(target.as_deref(), Some(live));
+        assert!(target.is_some_and(|t| crate::session::claude_ended_watch::deliberate_end(&t)));
+        assert!(!crate::session::claude_ended_watch::deliberate_end(
+            "stale-id"
+        ));
+        crate::session::claude_ended_watch::forget_session_end(live);
     }
 
     /// Nit 4: exactly the listed reasons have a restore grace window.
