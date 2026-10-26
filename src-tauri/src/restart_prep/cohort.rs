@@ -196,9 +196,19 @@ impl CohortRow {
     /// A row that left with no close reason read — its record was still open,
     /// or unreadable — stays a candidate: only a known non-restart close drops
     /// it.
+    ///
+    /// `claude-ended` (the live runner saw `claude` end) is no restart-shaped
+    /// close — the user ended the session — EXCEPT on a row declared finished:
+    /// the drain's wind-down executor closes finished rows exactly that way
+    /// (it types `/exit`), and D4 keeps a finished row one click from Restore.
     pub fn restore_candidate(&self) -> bool {
         match (&self.left_capture_at, self.left_capture_reason.as_deref()) {
-            (Some(_), Some(reason)) => RESTART_SHAPED_CLOSE_REASONS.contains(&reason),
+            (Some(_), Some(reason)) => {
+                RESTART_SHAPED_CLOSE_REASONS.contains(&reason)
+                    || (reason
+                        == crate::session::session_lifecycle_store::CLAUDE_ENDED_CLOSE_REASON
+                        && self.finished == Some(true))
+            }
             _ => true,
         }
     }
@@ -1042,6 +1052,22 @@ mod tests {
             &|_| None,
         );
         assert_eq!(read.rows[1].effort.level.as_deref(), Some("high"));
+    }
+
+    /// D: a session whose `claude` the live runner saw end during the prepare
+    /// (`claude-ended` — the user's `/exit`) is no restore candidate; a
+    /// FINISHED row closed that way is (the drain's wind-down closes finished
+    /// rows by typing `/exit`, and D4 keeps them one click from Restore).
+    #[test]
+    fn a_claude_ended_row_is_a_candidate_only_when_it_was_finished() {
+        let ended = crate::session::session_lifecycle_store::CLAUDE_ENDED_CLOSE_REASON;
+        let mut r = build_row(entry("e"), RowFacts::default());
+        r.left_capture_at = Some(5);
+        r.left_capture_reason = Some(ended.to_string());
+        r.finished = Some(false);
+        assert!(!r.restore_candidate(), "the user ended it");
+        r.finished = Some(true);
+        assert!(r.restore_candidate(), "wound down by the drain");
     }
 
     /// Finding 6 (review): a session the operator closed during the prepare

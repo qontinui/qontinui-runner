@@ -1623,7 +1623,15 @@ pub fn terminal_session_record_close(
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
+    // The pane's own exit, reported while this runner is alive and not
+    // shutting down, is a `claude` that ended under it — not a restart's
+    // kill (`claude-ended`, never auto-resumed). During a shutdown it keeps
+    // its restart-shaped reason.
+    let reason = crate::session::session_lifecycle_store::witnessed_close_reason(
+        &reason,
+        crate::commands::terminal_windows::is_app_quitting(),
+    );
+    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), reason);
     Ok(close_outcome_response(&outcome))
 }
 

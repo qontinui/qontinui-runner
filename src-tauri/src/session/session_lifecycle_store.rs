@@ -946,15 +946,6 @@ pub struct SessionLifecycleStore {
     /// runner restart re-spawns every PTY, and each restored provider fires its
     /// hook again. LOCK ORDER — `map` then this, never the reverse.
     session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
-    /// claude session id → unix millis this process last saw its record go
-    /// from absent / closed to open: when the CURRENT pane started hosting it.
-    /// `opened_at` cannot say — it is preserved across a close and a reopen
-    /// (a resume) on purpose. Read by the `/exit` check of a restart-shaped
-    /// close ([`Self::deliberate_exit_reason`]): an `/exit` older than the
-    /// current pane belongs to an earlier pane. Process-local: a session
-    /// adopted from a previous process falls back to `opened_at`. LOCK ORDER —
-    /// never held with `map`.
-    pane_opened_at: Mutex<HashMap<String, i64>>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
     /// shim-fix plan). When attached, every layout-meaningful mutation
@@ -1225,7 +1216,6 @@ impl SessionLifecycleStore {
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
-            pane_opened_at: Mutex::new(HashMap::new()),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
@@ -1519,7 +1509,6 @@ impl SessionLifecycleStore {
         // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
-        let mut reopened = false;
         let (merged, superseded) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1536,9 +1525,6 @@ impl SessionLifecycleStore {
             // the value the spawn recorded. A record that already EXISTED (a
             // resume/restore) never inherits: its spawn was not this terminal's.
             let is_new_record = !m.contains_key(&rec.claude_session_id);
-            reopened = m
-                .get(&rec.claude_session_id)
-                .is_none_or(|r| r.state != "open");
             let inherited_spawn_default = if is_new_record
                 && rec.spawn_device_default.is_none()
                 && !new_terminal_id.trim().is_empty()
@@ -1753,12 +1739,6 @@ impl SessionLifecycleStore {
             self.persist(m, &deltas);
             (merged, superseded)
         };
-        if reopened {
-            self.pane_opened_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(new_id.clone(), now);
-        }
         self.snapshot_change(std::iter::once(merged.clone()).chain(superseded));
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
@@ -1784,91 +1764,6 @@ impl SessionLifecycleStore {
     /// and when a sibling open session still shares the workdir.
     pub fn record_close(&self, claude_session_id: &str, reason: &str) {
         let _ = self.record_close_checked(claude_session_id, None, reason);
-    }
-
-    /// The reason a close is recorded with: `reason`, unless it is one of the
-    /// restart-shaped [`RESTORABLE_CLOSE_REASONS`] and the session's own
-    /// transcript ends with the user's `/exit` — then [`USER_EXIT_CLOSE_REASON`].
-    ///
-    /// Why: `/exit` ends `claude` in its pane, which the runner observes the
-    /// same way as a crash — the pane's process exiting (`pty-exit`) or the
-    /// lifecycle poll finding no `claude` under a shell that outlived it
-    /// (`poll-dead`). Both are restorable within their grace windows, so a
-    /// session the user deliberately closed was auto-resumed by the next boot
-    /// restore (and, when its account was exhausted, migrated off it), and a
-    /// restart-prep cohort read it as restart-shaped. The transcript is the
-    /// durable record of the user's intent: Claude Code writes the `/exit`
-    /// command as a local-command record (shape confirmed read-only on fleet
-    /// transcripts, 2.1.3xx).
-    fn deliberate_exit_reason(
-        &self,
-        claude_session_id: &str,
-        expect_terminal_id: Option<&str>,
-        reason: &str,
-    ) -> String {
-        if !RESTORABLE_CLOSE_REASONS.contains(&reason) {
-            return reason.to_string();
-        }
-        let target = match self.map.lock() {
-            Ok(m) => {
-                let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
-                resolve_close_target(&m, claude_session_id, expect)
-                    .0
-                    .and_then(|id| m.get(&id).cloned())
-            }
-            Err(_) => None,
-        };
-        let path = target.as_ref().and_then(|rec| {
-            let cfg = rec.config_dir.as_deref().filter(|c| !c.trim().is_empty())?;
-            let wd = rec
-                .working_dir
-                .as_deref()
-                .filter(|w| !w.trim().is_empty())?;
-            Some(crate::terminal::transcript::session_transcript_path(
-                Path::new(cfg),
-                wd,
-                &rec.claude_session_id,
-            ))
-        });
-        // The `/exit` must belong to THIS pane: written at or after the
-        // record opened. A session `/exit`ed in an earlier pane, then resumed
-        // here and left idle (a resume writes nothing until there is input),
-        // still ends its transcript with that old `/exit` — and a crash now is
-        // restart-shaped. The record's own `timestamp` decides; the file's
-        // mtime only when the record carries none.
-        let opened_at = target.as_ref().map_or(i64::MAX, |r| {
-            self.pane_opened_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&r.claude_session_id)
-                .copied()
-                .unwrap_or(r.opened_at)
-        });
-        let exit_in_this_pane = path.as_deref().is_some_and(|p| {
-            let Some(exit) = read_transcript_tail(p).and_then(|t| transcript_user_exit(&t)) else {
-                return false;
-            };
-            match exit {
-                Some(at) => at >= opened_at,
-                // No timestamp on the record: the file's mtime, which the
-                // kernel stamps from a coarse clock — allow it that slack.
-                None => std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_millis()).ok())
-                    .is_some_and(|at| at >= opened_at.saturating_sub(MTIME_SLACK_MS)),
-            }
-        });
-        if exit_in_this_pane {
-            info!(
-                claude_session_id = %claude_session_id,
-                observed = %reason,
-                "session-close: the conversation ended with the user's /exit — recorded {USER_EXIT_CLOSE_REASON}, not restart-shaped"
-            );
-            return USER_EXIT_CLOSE_REASON.to_string();
-        }
-        reason.to_string()
     }
 
     /// Record that `old_terminal_id`'s session now lives on `new_terminal_id`
@@ -1970,13 +1865,6 @@ impl SessionLifecycleStore {
         expect_terminal_id: Option<&str>,
         reason: &str,
     ) -> CloseOutcome {
-        // A restart-shaped close (`pty-exit`, `poll-dead`) of a session whose
-        // conversation ended with the user's own `/exit` is not restart-shaped:
-        // recorded as `user-exit`, it is never auto-resumed by the boot
-        // restore and never a restart-prep restore candidate. Decided before
-        // the close below takes the map lock (it reads the transcript tail).
-        let reason = self.deliberate_exit_reason(claude_session_id, expect_terminal_id, reason);
-        let reason = reason.as_str();
         let now = Utc::now().timestamp_millis();
         // An empty / whitespace terminal id is "no expectation": empty ids
         // are uncorrelatable and already excluded from every terminal-keyed
@@ -4101,84 +3989,28 @@ fn restorable_grace_ms(reason: &str) -> Option<i64> {
     }
 }
 
-/// The close reason of a session the user ended with `/exit`: deliberate, so
-/// never auto-resumed and never restart-shaped.
-pub const USER_EXIT_CLOSE_REASON: &str = "user-exit";
+/// The close reason of a session whose `claude` the LIVE runner saw end — the
+/// user's `/exit`, a crash of `claude` alone, a quit typed in its shell — while
+/// the runner itself was running and not shutting down. Not restart-shaped:
+/// boot restore exists to bring back sessions a RESTART killed, and this one
+/// ended with the runner alive, so it is never auto-resumed (a manual resume
+/// from Past Sessions stays available) and never a restart-prep restore
+/// candidate. Claude Code 2.1.310 writes no transcript record for `/exit`, so
+/// the runner's own observation is the only signal.
+pub const CLAUDE_ENDED_CLOSE_REASON: &str = "claude-ended";
 
-/// How much of a transcript's END is read to find its last command: far more
-/// than the few records after an `/exit` (its stdout, a `last-prompt` marker).
-const EXIT_TAIL_BYTES: u64 = 64 * 1024;
-
-/// The slack an `/exit` judged by the transcript FILE's mtime (a record with
-/// no `timestamp`) gets against the pane's open time: the kernel stamps mtimes
-/// from a coarse clock, so a write just after the open can read slightly
-/// before it.
-const MTIME_SLACK_MS: i64 = 1_000;
-
-/// The last [`EXIT_TAIL_BYTES`] of `path` (lossy UTF-8), or `None` when it
-/// cannot be read.
-fn read_transcript_tail(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(EXIT_TAIL_BYTES)))
-        .ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// PURE: whether the LAST conversational record in a transcript tail is the
-/// user's `/exit` (or `/quit`) command. Walks back over records that are not
-/// part of the conversation — meta caveats, local-command stdout (`Bye!`),
-/// `last-prompt` / `mode` markers, a partial first line — and answers on the
-/// first `user` or `assistant` record: a message, a tool result or any other
-/// command after the `/exit` means the session went on (it was resumed).
-pub(crate) fn transcript_ends_with_user_exit(tail: &str) -> bool {
-    transcript_user_exit(tail).is_some()
-}
-
-/// [`transcript_ends_with_user_exit`], with WHEN: `Some(timestamp)` (unix
-/// millis from the `/exit` record's own `timestamp`, `None` inside when the
-/// record has none or it does not parse) when the tail ends with the user's
-/// `/exit`; `None` when it does not.
-pub(crate) fn transcript_user_exit(tail: &str) -> Option<Option<i64>> {
-    for line in tail.lines().rev() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let kind = v.get("type").and_then(|t| t.as_str());
-        if !matches!(kind, Some("user") | Some("assistant")) {
-            continue;
-        }
-        if v.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
-            continue;
-        }
-        if kind == Some("assistant") {
-            return None;
-        }
-        let content = v.get("message").and_then(|m| m.get("content"));
-        let Some(text) = content.and_then(|c| c.as_str()) else {
-            // A tool result or a structured user message: the conversation.
-            return None;
-        };
-        if text.starts_with("<local-command-stdout>") || text.starts_with("<local-command-stderr>")
-        {
-            continue;
-        }
-        let is_exit = text.starts_with("<command-name>/exit</command-name>")
-            || text.starts_with("<command-name>/quit</command-name>");
-        if !is_exit {
-            return None;
-        }
-        let at = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| t.timestamp_millis());
-        return Some(at);
+/// PURE: the reason a close OBSERVED by the live runner is recorded with. A
+/// restart-shaped observation (`pty-exit`, `poll-dead`) made while the runner
+/// is NOT shutting down is a death it witnessed with itself alive:
+/// [`CLAUDE_ENDED_CLOSE_REASON`]. During shutdown (`quitting`) the same
+/// observation is the restart killing the pane and stays restart-shaped; any
+/// other reason passes through unchanged.
+pub fn witnessed_close_reason(observed: &str, quitting: bool) -> &str {
+    if !quitting && RESTORABLE_CLOSE_REASONS.contains(&observed) {
+        CLAUDE_ENDED_CLOSE_REASON
+    } else {
+        observed
     }
-    None
 }
 
 /// Resolve WHICH record a close is actually about, under the map lock.
@@ -7642,156 +7474,54 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 
-    /// E2E: a session the user closed with `/exit` was recorded `pty-exit` /
-    /// `poll-dead` — indistinguishable from a crash — so the next boot restore
-    /// resumed it (and, its account exhausted, migrated it). With the user's
-    /// `/exit` as the transcript's last command, the close is `user-exit`:
-    /// not restorable, not restart-shaped.
+    /// D: a `claude` the live runner saw end (any `/exit`, or its process
+    /// gone under a living shell) is recorded `claude-ended` — not
+    /// restorable, not restart-shaped. A pane killed during a shutdown keeps
+    /// its restart-shaped reason and stays restorable; a record found open at
+    /// boot (the runner never saw it end) stays restorable as before.
     #[test]
-    fn a_user_exit_close_is_neither_restorable_nor_restart_shaped() {
-        const EXIT: &str = concat!(
-            r#"{"type":"user","message":{"role":"user","content":"hi"},"uuid":"u1"}"#,
-            "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"uuid":"a1"}"#,
-            "\n",
-            r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat>"},"isMeta":true}"#,
-            "\n",
-            r#"{"type":"user","message":{"role":"user","content":"<command-name>/exit</command-name>\n            <command-message>exit</command-message>\n            <command-args></command-args>"}}"#,
-            "\n",
-            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Bye!</local-command-stdout>"}}"#,
-            "\n",
-            r#"{"type":"last-prompt","leafUuid":"x"}"#,
-            "\n"
+    fn a_claude_end_witnessed_while_alive_is_not_restorable() {
+        assert_eq!(
+            witnessed_close_reason("pty-exit", false),
+            CLAUDE_ENDED_CLOSE_REASON
         );
+        assert_eq!(
+            witnessed_close_reason("poll-dead", false),
+            CLAUDE_ENDED_CLOSE_REASON
+        );
+        assert_eq!(witnessed_close_reason("pty-exit", true), "pty-exit");
+        assert_eq!(witnessed_close_reason("poll-dead", true), "poll-dead");
+        assert_eq!(witnessed_close_reason("explicit", false), "explicit");
+
         let dir = tempdir().unwrap();
-        let cfg = dir.path().join("cfg");
-        let wd = "/home/u/proj";
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
-        let write = |id: &str, body: &str| {
-            let t = crate::terminal::transcript::session_transcript_path(&cfg, wd, id);
-            std::fs::create_dir_all(t.parent().unwrap()).unwrap();
-            std::fs::write(t, body).unwrap();
-        };
         let open = |id: &str| {
             let mut r = rec(id);
             r.terminal_id = format!("term-{id}");
-            r.config_dir = Some(cfg.to_string_lossy().into_owned());
-            r.working_dir = Some(wd.to_string());
             store.record_open(r);
         };
-        // /exit, then the pane's process ends (pty-exit) or the poll finds no
-        // claude under the shell (poll-dead): both are the user's exit.
-        for (id, observed) in [("exit-pty", "pty-exit"), ("exit-poll", "poll-dead")] {
-            open(id);
-            write(id, EXIT);
-            store.record_close(id, observed);
-            assert_eq!(
-                store.get(id).unwrap().close_reason.as_deref(),
-                Some(USER_EXIT_CLOSE_REASON),
-                "{id}"
-            );
-        }
-        // Review 4: /exit-ed, later RESUMED in a new pane and left idle (a
-        // resume writes nothing to the transcript until there is input), then
-        // killed by a runner restart. The tail still ends with the old /exit,
-        // which belongs to the earlier pane: restart-shaped, restored.
-        open("exit-resumed-idle");
-        write("exit-resumed-idle", EXIT);
-        store.record_close("exit-resumed-idle", "pty-exit");
-        assert_eq!(
-            store
-                .get("exit-resumed-idle")
-                .unwrap()
-                .close_reason
-                .as_deref(),
-            Some(USER_EXIT_CLOSE_REASON),
-            "the first pane's /exit"
+        open("ended-live");
+        store.record_close("ended-live", witnessed_close_reason("pty-exit", false));
+        open("killed-in-shutdown");
+        store.record_close(
+            "killed-in-shutdown",
+            witnessed_close_reason("pty-exit", true),
         );
-        // Past the mtime slack: the resume comes well after that /exit.
-        std::thread::sleep(std::time::Duration::from_millis(
-            MTIME_SLACK_MS as u64 + 200,
-        ));
-        open("exit-resumed-idle"); // the resume: a new pane, nothing written
-        store.record_close("exit-resumed-idle", "pty-exit");
-        assert_eq!(
-            store
-                .get("exit-resumed-idle")
-                .unwrap()
-                .close_reason
-                .as_deref(),
-            Some("pty-exit"),
-            "an /exit older than the current pane is not this pane's"
-        );
-        // The record's own timestamp decides when it has one.
-        let stamped = |at: &str| {
-            EXIT.replace(
-                r#"<command-args></command-args>"}}"#,
-                &format!(r#"<command-args></command-args>"}},"timestamp":"{at}"}}"#),
-            )
-        };
-        open("exit-stamped-old");
-        write("exit-stamped-old", &stamped("2020-01-01T00:00:00.000Z"));
-        store.record_close("exit-stamped-old", "poll-dead");
-        open("exit-stamped-new");
-        write("exit-stamped-new", &stamped("2099-01-01T00:00:00.000Z"));
-        store.record_close("exit-stamped-new", "poll-dead");
-        assert_eq!(
-            store
-                .get("exit-stamped-old")
-                .unwrap()
-                .close_reason
-                .as_deref(),
-            Some("poll-dead")
-        );
-        assert_eq!(
-            store
-                .get("exit-stamped-new")
-                .unwrap()
-                .close_reason
-                .as_deref(),
-            Some(USER_EXIT_CLOSE_REASON)
-        );
-        // Resumed after the /exit and then crashed: restart-shaped as before.
-        open("exit-then-resumed");
-        write(
-            "exit-then-resumed",
-            &format!(
-                "{EXIT}{}\n",
-                r#"{"type":"user","message":{"role":"user","content":"carry on"},"uuid":"u2"}"#
-            ),
-        );
-        store.record_close("exit-then-resumed", "pty-exit");
-        // No transcript at all: unchanged.
-        open("no-transcript");
-        store.record_close("no-transcript", "pty-exit");
-        // A deliberate reason is never rewritten.
-        open("explicit-close");
-        write("explicit-close", EXIT);
-        store.record_close("explicit-close", "explicit");
-        let reason = |id: &str| store.get(id).unwrap().close_reason;
-        assert_eq!(reason("exit-then-resumed").as_deref(), Some("pty-exit"));
-        assert_eq!(reason("no-transcript").as_deref(), Some("pty-exit"));
-        assert_eq!(reason("explicit-close").as_deref(), Some("explicit"));
-
+        open("open-at-boot"); // never closed: the runner died under it
         let mut restorable: Vec<String> = store
             .restorable_records(None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
         restorable.sort();
+        assert_eq!(restorable, ["killed-in-shutdown", "open-at-boot"]);
         assert_eq!(
-            restorable,
-            [
-                "exit-resumed-idle",
-                "exit-stamped-old",
-                "exit-then-resumed",
-                "no-transcript"
-            ]
+            store.get("ended-live").unwrap().close_reason.as_deref(),
+            Some(CLAUDE_ENDED_CLOSE_REASON)
         );
-        // ...and a restart-prep cohort row closed so is no restore candidate.
         assert!(!crate::restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS
-            .contains(&USER_EXIT_CLOSE_REASON));
+            .contains(&CLAUDE_ENDED_CLOSE_REASON));
     }
 
     /// Nit 4: exactly the listed reasons have a restore grace window.
@@ -7801,7 +7531,7 @@ mod tests {
             assert!(restorable_grace_ms(r).is_some(), "{r}");
         }
         for r in [
-            USER_EXIT_CLOSE_REASON,
+            CLAUDE_ENDED_CLOSE_REASON,
             "explicit",
             "user-close",
             "no-terminal",
@@ -7809,31 +7539,6 @@ mod tests {
         ] {
             assert!(restorable_grace_ms(r).is_none(), "{r}");
         }
-    }
-
-    #[test]
-    fn transcript_ends_with_user_exit_reads_only_the_last_conversational_record() {
-        assert!(!transcript_ends_with_user_exit(""));
-        let exit = r#"{"type":"user","message":{"role":"user","content":"<command-name>/exit</command-name>"}}"#;
-        let quit = r#"{"type":"user","message":{"role":"user","content":"<command-name>/quit</command-name>"}}"#;
-        let bye = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Bye!</local-command-stdout>"}}"#;
-        let other_cmd = r#"{"type":"user","message":{"role":"user","content":"<command-name>/effort</command-name>"}}"#;
-        let tool = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t"}]}}"#;
-        let asst = r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#;
-        assert!(transcript_ends_with_user_exit(&format!("{exit}\n{bye}\n")));
-        assert!(transcript_ends_with_user_exit(quit));
-        // A partial first line (the tail cut a record) is skipped.
-        assert!(transcript_ends_with_user_exit(&format!(
-            "ial\": 1}}\n{exit}"
-        )));
-        assert!(!transcript_ends_with_user_exit(&format!("{exit}\n{asst}")));
-        assert!(!transcript_ends_with_user_exit(&format!("{exit}\n{tool}")));
-        assert!(!transcript_ends_with_user_exit(&format!(
-            "{exit}\n{other_cmd}"
-        )));
-        // `/exit` quoted inside a message is not the command.
-        let quoted = r#"{"type":"user","message":{"role":"user","content":"type <command-name>/exit</command-name>"}}"#;
-        assert!(!transcript_ends_with_user_exit(quoted));
     }
 
     #[test]
