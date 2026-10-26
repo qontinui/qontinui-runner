@@ -61,8 +61,9 @@ use tracing::{debug, info, warn};
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::run_record_emitter::{
-    begin_run_if_due, boot_restore_boundary, end_run_if_due, process_boot_ms, valid_first_command,
-    BootBoundary, RunAccounting, RunEvent, RunRecordEmitter, SpawnFacts,
+    begin_next_interval, begin_run_if_due, boot_restore_boundary, claim_start, end_run_if_due,
+    previous_process_end_ms, process_boot_ms, valid_first_command, RunAccounting, RunEvent,
+    RunRecordEmitter, SpawnFacts,
 };
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
@@ -114,6 +115,10 @@ pub fn snapshot_history_path() -> PathBuf {
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
+
+/// The raw close reason the run ledger reports for a stale OPEN record the
+/// prune deletes (its end is its last sighting).
+pub const PRUNED_STALE_OPEN_CLOSE_REASON: &str = "pruned-stale-open";
 /// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
 /// runner restart firing `handleExit` on every live PTY) is still restorable
 /// when it closed within this long of the registry's LAST MOMENT OF LIFE (the
@@ -1593,27 +1598,20 @@ impl SessionLifecycleStore {
     }
 
     /// Emit the END of each record in `ended` — the records whose close made
-    /// [`end_run_if_due`] answer `true` under the map lock.
+    /// [`end_run_if_due`] answer `true` under the map lock. Every close path
+    /// reports through here, so each gets the same previous-process clamp: a
+    /// run a previous runner process opened and this one never saw alive ended
+    /// at `min(last_seen_at, boot)`, not when this process got round to it.
     fn emit_run_ends<'a>(&self, ended: impl IntoIterator<Item = &'a TerminalSessionRecord>) {
         for rec in ended {
-            self.emit_run(rec, RunEvent::End);
-        }
-    }
-
-    /// Apply a boot-restore run boundary to `rec` (in-lock) — see
-    /// [`boot_restore_boundary`].
-    fn boot_boundary(rec: &mut TerminalSessionRecord, resumes: bool, now: i64) -> BootBoundary {
-        boot_restore_boundary(rec, resumes, process_boot_ms(), now)
-    }
-
-    /// Emit what a boot boundary decided: the previous run's end, then the new
-    /// run's start.
-    fn emit_boot_boundary(&self, boundary: &BootBoundary, rec: &TerminalSessionRecord) {
-        if let Some(ended) = boundary.ended.as_ref() {
-            self.emit_run(ended, RunEvent::End);
-        }
-        if boundary.began {
-            self.emit_run(rec, RunEvent::Start);
+            match previous_process_end_ms(rec, process_boot_ms()) {
+                Some(at) => {
+                    let mut clamped = rec.clone();
+                    clamped.closed_at = Some(at);
+                    self.emit_run(&clamped, RunEvent::End);
+                }
+                None => self.emit_run(rec, RunEvent::End),
+            }
         }
     }
 
@@ -1867,19 +1865,32 @@ impl SessionLifecycleStore {
             // Same inheritance for the launcher's spawn facts (run ledger,
             // Phase 4): the launch site stamps the seam's provisional row, and
             // the account launcher's own typed row is the one that runs.
-            let inherited_spawn =
-                if is_new_record && rec.spawn.is_none() && !new_terminal_id.trim().is_empty() {
-                    m.values()
-                        .filter(|o| o.state == "open" && o.terminal_id == new_terminal_id)
-                        .find_map(|o| o.spawn.clone())
-                } else {
-                    None
-                };
             // Whether this write RE-OPENS a closed record — a new open
             // interval, so a new run once confirmed (D1: `run_seq + 1`).
             let reopening = m
                 .get(&rec.claude_session_id)
                 .is_some_and(|e| e.state != "open");
+            // Or a CONFIRMED write onto an OPEN record whose run already ended
+            // — a provider started again in it (a resume typed into a
+            // terminal-only-restored tile, a boot resume's verified
+            // handshake). An unconfirmed re-assert of such a tile is not one.
+            let reopen_ended = rec.confirmed_at.is_some()
+                && m.get(&rec.claude_session_id)
+                    .is_some_and(|e| e.state == "open" && e.run.ended);
+            let inherited_spawn = if (is_new_record || reopening || reopen_ended)
+                && rec.spawn.is_none()
+                && !new_terminal_id.trim().is_empty()
+            {
+                m.values()
+                    .filter(|o| {
+                        o.state == "open"
+                            && o.terminal_id == new_terminal_id
+                            && o.claude_session_id != rec.claude_session_id
+                    })
+                    .find_map(|o| o.spawn.clone())
+            } else {
+                None
+            };
             let entry =
                 m.entry(rec.claude_session_id.clone())
                     .or_insert_with(|| TerminalSessionRecord {
@@ -1890,13 +1901,18 @@ impl SessionLifecycleStore {
                     });
             if is_new_record || reopening {
                 entry.run.note_opened(now);
+                // The new interval's facts are THIS launch's: the old run's
+                // must not ride its start.
+                if reopening {
+                    entry.spawn = None;
+                }
             }
             // A launcher that states facts wins (it is THIS launch's); absent
-            // ⇒ keep, or inherit onto a brand-new record.
+            // ⇒ keep, or inherit onto a brand-new / re-opened record.
             if rec.spawn.is_some() {
                 entry.spawn = rec.spawn.clone();
             } else if entry.spawn.is_none() {
-                entry.spawn = inherited_spawn;
+                entry.spawn = inherited_spawn.clone();
             }
             // Preserve opened_at on an existing record; refresh everything
             // else and re-open.
@@ -2016,7 +2032,21 @@ impl SessionLifecycleStore {
                 entry.awaiting_account_since = None;
             }
             entry.last_seen_at = now;
-            let run_began = begin_run_if_due(entry);
+            if reopen_ended {
+                // The next interval on an open record (its facts reset by
+                // `begin_next_interval`, then this launch's applied).
+                begin_next_interval(entry, now, process_boot_ms());
+                if rec.spawn.is_some() {
+                    entry.spawn = rec.spawn.clone();
+                } else if entry.spawn.is_none() {
+                    entry.spawn = inherited_spawn;
+                }
+            } else {
+                begin_run_if_due(entry);
+            }
+            // The start goes out now when the run carries its launch facts,
+            // else it is HELD for the launcher's stamp (or the first touch).
+            let run_began = claim_start(entry, false);
             let merged = entry.clone();
 
             // Single-tenant-terminal invariant: a PTY terminal hosts at most
@@ -2380,7 +2410,7 @@ impl SessionLifecycleStore {
         };
         // Run ledger: the store's own close time and RAW close reason.
         if run_end_due {
-            self.emit_run(&closed, RunEvent::End);
+            self.emit_run_ends(std::iter::once(&closed));
         }
         self.snapshot_change(std::iter::once(closed));
         // Fabric Phase 3 (review W2): notify AFTER the durable local write,
@@ -2593,19 +2623,26 @@ impl SessionLifecycleStore {
                 return;
             }
         };
-        let touched = match m.get_mut(claude_session_id) {
+        let (touched, start) = match m.get_mut(claude_session_id) {
             Some(rec) => {
                 rec.last_seen_at = now;
-                rec.clone()
+                // The bound on a HELD start: the session is alive and no
+                // launcher stamped it, so it goes out without facts rather
+                // than staying invisible while it runs.
+                let start = claim_start(rec, true);
+                (rec.clone(), start)
             }
             None => return,
         };
         self.persist(
             m,
             &[LifecycleDelta::Upsert {
-                rec: Box::new(touched),
+                rec: Box::new(touched.clone()),
             }],
         );
+        if start {
+            self.emit_run(&touched, RunEvent::Start);
+        }
     }
 
     /// Update the persisted `title` of the OPEN record hosted by
@@ -2813,9 +2850,9 @@ impl SessionLifecycleStore {
                 rec.restored_from_boot_at = Some(now);
                 rec.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
                 // The resume half of a boot restore: the previous runner's run
-                // ended, and a new claude process resumes the conversation —
-                // a new run (`run_seq + 1`, origin `boot_resume`).
-                let boundary = Self::boot_boundary(rec, true, now);
+                // ended. The resumed run starts only once the resume is
+                // VERIFIED (its confirming hook, or `clear_restore_pending`).
+                let boundary = boot_restore_boundary(rec, process_boot_ms());
                 (rec.clone(), boundary)
             }
             // An operator resume is not a boot restore: the run the row holds
@@ -2832,7 +2869,9 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed.clone()),
             }],
         );
-        self.emit_boot_boundary(&boundary, &changed);
+        if let Some(ended) = boundary.as_ref() {
+            self.emit_run(ended, RunEvent::End);
+        }
     }
 
     /// Drop a CLOSED record's gate identity (`gate_id`,
@@ -3181,16 +3220,26 @@ impl SessionLifecycleStore {
                 {
                     rec.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
                 }
-                rec.clone()
+                // Run ledger: the resume handshake is VERIFIED — the resumed
+                // conversation is the record's next run (origin
+                // `boot_resume`). No-op when its confirming hook already
+                // started it.
+                begin_next_interval(rec, Utc::now().timestamp_millis(), process_boot_ms());
+                let start = claim_start(rec, false);
+                (rec.clone(), start)
             }
             _ => return, // absent or already clear — nothing to flush
         };
+        let (changed, start) = changed;
         self.persist(
             m,
             &[LifecycleDelta::Upsert {
-                rec: Box::new(changed),
+                rec: Box::new(changed.clone()),
             }],
         );
+        if start {
+            self.emit_run(&changed, RunEvent::Start);
+        }
     }
 
     /// Flip a present session from PROVISIONAL to CONFIRMED (a provider's
@@ -3215,7 +3264,8 @@ impl SessionLifecycleStore {
                 Some(rec) if rec.confirmed_at.is_none() => {
                     rec.confirmed_at = Some(now);
                     // Confirmation is what makes an open record a run.
-                    let began = begin_run_if_due(rec);
+                    begin_run_if_due(rec);
+                    let began = claim_start(rec, false);
                     (rec.clone(), began)
                 }
                 _ => return, // absent or already confirmed — nothing to flush
@@ -3492,7 +3542,18 @@ impl SessionLifecycleStore {
             if rec.spawn.as_ref() == Some(&facts) {
                 return true;
             }
+            let had_start = rec.run.start_emitted;
             rec.spawn = Some(facts);
+            // A start HELD for these facts goes out now, carrying them; an
+            // already-emitted start gets them as a merge.
+            let start = claim_start(rec, false);
+            let event = if start {
+                Some(RunEvent::Start)
+            } else if had_start && rec.run.started && !rec.run.ended {
+                Some(RunEvent::Merge)
+            } else {
+                None
+            };
             let changed = rec.clone();
             self.persist(
                 m,
@@ -3500,10 +3561,11 @@ impl SessionLifecycleStore {
                     rec: Box::new(changed.clone()),
                 }],
             );
-            changed
+            (changed, event)
         };
-        if changed.run.started && !changed.run.ended {
-            self.emit_run(&changed, RunEvent::Merge);
+        let (changed, event) = changed;
+        if let Some(event) = event {
+            self.emit_run(&changed, event);
         }
         true
     }
@@ -3542,7 +3604,8 @@ impl SessionLifecycleStore {
             );
             changed
         };
-        if changed.run.started && !changed.run.ended {
+        // A held start will carry it; only an emitted one needs the merge.
+        if changed.run.start_emitted && !changed.run.ended {
             self.emit_run(&changed, RunEvent::Merge);
         }
         true
@@ -3591,7 +3654,7 @@ impl SessionLifecycleStore {
             // was already split by `mark_restore_pending` (idempotent here); a
             // terminal-only or failed restore runs no conversation, so it only
             // ends the old run.
-            let boundary = Self::boot_boundary(rec, false, now);
+            let boundary = boot_restore_boundary(rec, process_boot_ms());
             let changed = rec.clone();
             self.persist(
                 m,
@@ -3602,7 +3665,9 @@ impl SessionLifecycleStore {
             (changed, boundary)
         };
         let (changed, boundary) = changed;
-        self.emit_boot_boundary(&boundary, &changed);
+        if let Some(ended) = boundary.as_ref() {
+            self.emit_run(ended, RunEvent::End);
+        }
         info!(
             claude_session_id,
             tier, "session-restore: record marked as restored from boot"
@@ -4254,6 +4319,10 @@ impl SessionLifecycleStore {
     /// (and rewrite) every closed row for the primary's whole uptime.
     /// Atomic-writes only if something changed.
     pub fn prune(&self, now: i64, live_terminal_ids: &HashSet<String>) {
+        // Run ledger: a stale OPEN record pruned here was never observed to
+        // close — its run's end is reported at its last sighting before the
+        // row is deleted, rather than left open on coord.
+        let mut run_ends: Vec<TerminalSessionRecord> = Vec::new();
         {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -4280,6 +4349,21 @@ impl SessionLifecycleStore {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
             let before = m.len();
+            for rec in m.values_mut() {
+                let stale_open = rec.state != "closed"
+                    && !live_terminal_ids.contains(&rec.terminal_id)
+                    && now - rec.last_seen_at > OPEN_STALE_MS;
+                if stale_open {
+                    begin_run_if_due(rec);
+                    if end_run_if_due(rec) {
+                        let mut ended = rec.clone();
+                        ended.state = "closed".to_string();
+                        ended.closed_at = Some(rec.last_seen_at);
+                        ended.close_reason = Some(PRUNED_STALE_OPEN_CLOSE_REASON.to_string());
+                        run_ends.push(ended);
+                    }
+                }
+            }
             m.retain(|_, rec| {
                 let terminal_live = live_terminal_ids.contains(&rec.terminal_id);
                 // A non-closed record whose terminal is STILL LIVE is never
@@ -4316,6 +4400,7 @@ impl SessionLifecycleStore {
         // snapshot rather than appending N `Remove` deltas. Runs on the slow
         // liveness poll, never on the spawn path.
         self.compact();
+        self.emit_run_ends(run_ends.iter());
     }
 
     /// One-time boot repair for the P4 registry corruption (plan
