@@ -1457,6 +1457,14 @@ pub async fn cancel_from_app() -> Result<PrepChanged, String> {
     Ok(changed_payload(ctl, rec))
 }
 
+#[cfg(test)]
+impl RestartPrep {
+    /// [`Self::update`] for tests outside this module; panics on a mismatch.
+    pub(crate) fn update_for_test(&self, prepare_id: &str, f: impl FnOnce(&mut PrepareRecord)) {
+        self.update(prepare_id, f).expect("update_for_test");
+    }
+}
+
 /// A controller over a temp record holding an ACTIVE prepare whose cohort
 /// carries `session_ids`, for the freeze tests of the callers
 /// (`account_migration`, `claude_session`). The prepare started at `now_ms`.

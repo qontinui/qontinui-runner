@@ -577,11 +577,16 @@ pub const UNFINISHED_SINCE_LAST_READ: &str =
 /// UNKNOWN-until-read (`None`, with [`UNFINISHED_SINCE_LAST_READ`]) rather
 /// than guessing what the session is doing now. `Ok(false)` when there is no
 /// record, no such row, or nothing changed.
-pub fn note_finished_on(
+///
+/// Serialized with the notice tick (`ops`), as [`set_held_on`] is: the tick
+/// replaces the whole cohort with the one it re-captured at its start, so a
+/// mark written while it ran would be overwritten by its stale copy.
+pub async fn note_finished_on(
     ctl: &RestartPrep,
     claude_session_id: &str,
     finished: bool,
 ) -> Result<bool, String> {
+    let _op = ctl.ops.lock().await;
     let Some(rec) = ctl.record() else {
         return Ok(false);
     };
@@ -616,11 +621,11 @@ pub fn note_finished_on(
 
 /// [`note_finished_on`] on the live controller. A failed write is logged: the
 /// lifecycle record, which the next re-capture reads, already holds the mark.
-pub fn note_finished(claude_session_id: &str, finished: bool) {
+pub async fn note_finished(claude_session_id: &str, finished: bool) {
     let Some(ctl) = super::prepare::install_live() else {
         return;
     };
-    if let Err(e) = note_finished_on(ctl, claude_session_id, finished) {
+    if let Err(e) = note_finished_on(ctl, claude_session_id, finished).await {
         warn!(
             session = claude_session_id,
             error = %e,
@@ -902,8 +907,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_unfinish_clears_a_stale_finished_pause_state() {
+    #[tokio::test]
+    async fn an_unfinish_clears_a_stale_finished_pause_state() {
         use crate::restart_prep::cohort::PauseState;
         let dir = tempfile::tempdir().unwrap();
         let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 0);
@@ -916,7 +921,7 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(note_finished_on(&ctl, "s1", false), Ok(true));
+        assert_eq!(note_finished_on(&ctl, "s1", false).await, Ok(true));
         let rec = ctl.record().unwrap();
         let s1 = &rec.cohort.rows[0];
         assert_eq!(s1.finished, Some(false));
@@ -924,10 +929,29 @@ mod tests {
         assert_eq!(s1.pause_reason.as_deref(), Some(UNFINISHED_SINCE_LAST_READ));
         // The other row is untouched; a repeat or an unknown row writes nothing.
         assert_eq!(rec.cohort.rows[1].pause_state, Some(PauseState::Finished));
-        assert_eq!(note_finished_on(&ctl, "s1", false), Ok(false));
-        assert_eq!(note_finished_on(&ctl, "nope", false), Ok(false));
+        assert_eq!(note_finished_on(&ctl, "s1", false).await, Ok(false));
+        assert_eq!(note_finished_on(&ctl, "nope", false).await, Ok(false));
         // Finishing again records the mark; the tick derives the state.
-        assert_eq!(note_finished_on(&ctl, "s1", true), Ok(true));
+        assert_eq!(note_finished_on(&ctl, "s1", true).await, Ok(true));
+        assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
+    }
+
+    /// A notice tick holds `ops` while it re-captures and replaces the whole
+    /// cohort: the finish mark must wait for it, not race it.
+    #[tokio::test]
+    async fn a_finish_mark_waits_for_an_in_flight_notice_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1"], 0);
+        let tick = ctl.ops.lock().await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            note_finished_on(&ctl, "s1", true),
+        )
+        .await;
+        assert!(blocked.is_err(), "wrote while the tick held ops");
+        assert_ne!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
+        drop(tick);
+        assert_eq!(note_finished_on(&ctl, "s1", true).await, Ok(true));
         assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
     }
 

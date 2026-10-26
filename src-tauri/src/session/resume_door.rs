@@ -983,9 +983,12 @@ async fn resume_one(
             // again: its finish mark is lifted now that the resume is proven,
             // so a refused or failed Restore never touches it.
             if cand.lift_finish {
-                if let Err(e) = store.set_finished(&cand.id, false, None) {
-                    warn!(id = %cand.id, error = ?e, "resume_door: resumed, but the finish mark could not be lifted");
-                }
+                lift_finish_mark(
+                    store,
+                    crate::restart_prep::prepare::install_live(),
+                    &cand.id,
+                )
+                .await;
             }
             use crate::restart_prep::restore as rp_restore;
             let argv = ev.cmdline.clone();
@@ -1032,6 +1035,26 @@ async fn resume_one(
             // The spawn carried the flag even though the resume did not land.
             row.effort_applied = effort;
             row
+        }
+    }
+}
+
+/// Lift a resumed FINISHED cohort row's finish mark, and carry the un-finish
+/// onto its cohort row as every other un-finish does
+/// ([`crate::restart_prep::restore::note_finished_on`]), so the row does not
+/// keep `finished` / `pause_state: finished` after it is live work again.
+async fn lift_finish_mark(
+    store: &SessionLifecycleStore,
+    ctl: Option<&crate::restart_prep::prepare::RestartPrep>,
+    id: &str,
+) {
+    if let Err(e) = store.set_finished(id, false, None) {
+        warn!(id = %id, error = ?e, "resume_door: resumed, but the finish mark could not be lifted");
+        return;
+    }
+    if let Some(ctl) = ctl {
+        if let Err(e) = crate::restart_prep::restore::note_finished_on(ctl, id, false).await {
+            warn!(id = %id, error = %e, "resume_door: finish mark lifted, but not carried onto the cohort row");
         }
     }
 }
@@ -1816,6 +1839,28 @@ mod tests {
         assert!(classify(ID, Some(&cohort_rec), Some(&member), true).is_ok());
     }
 
+    #[tokio::test]
+    async fn lifting_a_finish_mark_also_clears_the_cohort_rows_finished_state() {
+        use crate::restart_prep::cohort::PauseState;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("sessions.json")).unwrap();
+        store.record_open(rec("open"));
+        store.set_finished(ID, true, None).unwrap();
+        let prep_dir = tempfile::tempdir().unwrap();
+        let ctl =
+            crate::restart_prep::prepare::active_controller_for_test(prep_dir.path(), &[ID], 0);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        ctl.update_for_test(&prepare_id, |r| {
+            r.cohort.rows[0].finished = Some(true);
+            r.cohort.rows[0].pause_state = Some(PauseState::Finished);
+        });
+        lift_finish_mark(&store, Some(&ctl), ID).await;
+        assert!(store.get(ID).unwrap().finished_at.is_none());
+        let row = &ctl.record().unwrap().cohort.rows[0];
+        assert_eq!(row.finished, Some(false));
+        assert_eq!(row.pause_state, None);
+    }
+
     #[test]
     fn a_limit_hit_cohort_row_is_the_operators_to_restore() {
         let mut cohort_rec = rec("open");
@@ -1893,11 +1938,15 @@ mod tests {
             .split_once("async fn resume_one(")
             .expect("resume_one exists");
         let (body, _) = rest.split_once("\n}\n").expect("resume_one's body ends");
-        let lifts: Vec<_> = body.match_indices("set_finished(").collect();
+        let lifts: Vec<_> = body.match_indices("lift_finish_mark(").collect();
         assert_eq!(
             lifts.len(),
             1,
             "exactly one finish-mark write in resume_one"
+        );
+        assert!(
+            !body.contains("set_finished("),
+            "only through lift_finish_mark"
         );
         let (lift_at, _) = lifts[0];
         let (verified_at, _) = body
