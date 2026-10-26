@@ -179,11 +179,26 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let src_usage = usage.iter().find(|i| i.config_dir == src);
-    let confirmed = exhaustion_confirmed(
+    let confirmed = match hint_gate(
+        super::usage_limit::restored_marker(&terminal_id),
+        now_ms,
         crate::ai_provider::account_known_exhausted(&src),
         src_usage,
-        super::usage_limit::is_restored_limit_hit(&terminal_id),
-    );
+    ) {
+        // A hint dispatched before the terminal was marked (or one racing the
+        // mark) is re-judged here, after the probe: inside the window it is
+        // dropped like any hint the scan would not have fired.
+        HintGate::InsideWindow => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                "usage-limit hint on a hand-restored limit_hit terminal inside its reset \
+                 window — ignored"
+            );
+            return;
+        }
+        HintGate::Confirmed(confirmed) => confirmed,
+    };
     let verdict = decide_hint(
         &mut LiveHintEffects,
         HintFacts {
@@ -275,30 +290,46 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     }
 }
 
-/// Whether the re-probe CONFIRMS the session's account is exhausted.
+/// What a usage-limit hint may do once the account was re-probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintGate {
+    /// The terminal was hand-restored from a `limit_hit` row and its reset
+    /// window is still open: the hint is dropped.
+    InsideWindow,
+    /// Whether the re-probe CONFIRMS the account is exhausted.
+    Confirmed(bool),
+}
+
+/// PURE: the gate a hint passes after the re-probe, from the terminal's
+/// restored-limit-hit `marker` (`usage_limit::restored_marker`), the time, the
+/// fleet-wide `snapshot_exhausted` reading and this call's own probe result
+/// for the session's account.
 ///
-/// For an ordinary terminal this is the fleet-wide reading,
-/// `account_known_exhausted`, unchanged — which counts a FAILED probe (no
-/// token, a non-2xx, a network error) as exhausted on purpose
-/// (`commands::ai_settings::probe_result_exhausted`: a rejected probe means the
-/// account will not serve a request).
-///
-/// For a terminal hand-restored from a `limit_hit` cohort row
-/// (`usage_limit::is_restored_limit_hit`) only a SUCCESSFUL probe that reads
-/// exhausted confirms: the operator chose to keep that session on its
-/// account, and stale limit text on its screen plus a transient probe failure
-/// must not move it (plan
-/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3). A
-/// probe error, or no probe result for the account, is NotConfirmed there.
-pub(crate) fn exhaustion_confirmed(
+/// * No marker — an ordinary terminal: the fleet-wide reading,
+///   `account_known_exhausted`, unchanged. It counts a FAILED probe (no token,
+///   a non-2xx, a network error) as exhausted on purpose
+///   (`commands::ai_settings::probe_result_exhausted`: a rejected probe means
+///   the account will not serve a request).
+/// * A marker whose window is open: [`HintGate::InsideWindow`].
+/// * A marker past its window: confirmed ONLY by this call's own probe being
+///   SUCCESSFUL and reading exhausted — decided from `src_probe` alone, never
+///   from the shared snapshot a concurrent probe may have rewritten. The
+///   operator chose to keep that session on its account, so stale limit text
+///   plus a transient probe failure must not move it (plan
+///   `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3).
+pub(crate) fn hint_gate(
+    marker: Option<super::usage_limit::RestoredLimitHit>,
+    now_ms: i64,
     snapshot_exhausted: bool,
     src_probe: Option<&crate::commands::ai_settings::AccountUsageInfo>,
-    restored_limit_hit: bool,
-) -> bool {
-    if !restored_limit_hit {
-        return snapshot_exhausted;
+) -> HintGate {
+    match marker {
+        None => HintGate::Confirmed(snapshot_exhausted),
+        Some(m) if m.suppresses(now_ms) => HintGate::InsideWindow,
+        Some(_) => HintGate::Confirmed(src_probe.is_some_and(|p| {
+            p.error.is_none() && crate::commands::ai_settings::probe_result_exhausted(p)
+        })),
     }
-    snapshot_exhausted && src_probe.is_some_and(|p| p.error.is_none())
 }
 
 /// What [`decide_hint`] reads: the probe's verdict and the account's usage.
@@ -1319,11 +1350,38 @@ mod tests {
         );
     }
 
-    fn probe(error: Option<&str>) -> crate::commands::ai_settings::AccountUsageInfo {
+    /// A probe result for the session's account: `error` set = a FAILED probe;
+    /// otherwise `utilization` decides whether it reads exhausted.
+    fn probe(
+        error: Option<&str>,
+        utilization: f64,
+    ) -> crate::commands::ai_settings::AccountUsageInfo {
         crate::commands::ai_settings::AccountUsageInfo {
             config_dir: "/home/u/.claude-iris".to_string(),
             error: error.map(str::to_string),
+            utilization,
             ..Default::default()
+        }
+    }
+
+    /// A marker whose window ended long ago (rule 2 only).
+    fn past_window_marker() -> Option<super::super::usage_limit::RestoredLimitHit> {
+        Some(super::super::usage_limit::RestoredLimitHit::new(
+            Some(PREP_T0 - 86_400_000),
+            PREP_T0,
+        ))
+    }
+
+    fn verdict_of(gate: HintGate) -> HintVerdict {
+        let HintGate::Confirmed(confirmed) = gate else {
+            panic!("expected a probe verdict, got {gate:?}");
+        };
+        decide_hint(&mut Recorded::new(None), facts(confirmed))
+    }
+
+    fn migrate() -> HintVerdict {
+        HintVerdict::Migrate {
+            dst: "/home/u/.claude-other".to_string(),
         }
     }
 
@@ -1331,53 +1389,105 @@ mod tests {
     /// (which the fleet-wide reading counts as exhausted) does not migrate it.
     #[test]
     fn a_restored_limit_hit_terminal_does_not_migrate_on_a_probe_error() {
-        let failed = probe(Some("Network error: timed out"));
-        let confirmed = exhaustion_confirmed(true, Some(&failed), true);
-        assert!(!confirmed);
-        let mut fx = Recorded::new(None);
-        assert_eq!(
-            decide_hint(&mut fx, facts(confirmed)),
-            HintVerdict::NotConfirmed
-        );
-        assert_eq!(fx.target_calls, 0, "nothing migrated");
+        let failed = probe(Some("Network error: timed out"), 1.0);
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&failed));
+        assert_eq!(gate, HintGate::Confirmed(false));
+        assert_eq!(verdict_of(gate), HintVerdict::NotConfirmed);
         // No probe result for the account at all: not confirmed either.
-        assert!(!exhaustion_confirmed(true, None, true));
+        assert_eq!(
+            hint_gate(past_window_marker(), PREP_T0, true, None),
+            HintGate::Confirmed(false)
+        );
     }
 
     /// ...but a SUCCESSFUL probe that reads exhausted migrates it as usual.
     #[test]
     fn a_restored_limit_hit_terminal_migrates_on_a_successful_exhausted_probe() {
-        let ok = probe(None);
-        let confirmed = exhaustion_confirmed(true, Some(&ok), true);
-        assert!(confirmed);
-        let mut fx = Recorded::new(None);
+        let exhausted = probe(None, 1.0);
+        assert!(crate::commands::ai_settings::probe_result_exhausted(
+            &exhausted
+        ));
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&exhausted));
+        assert_eq!(verdict_of(gate), migrate());
+    }
+
+    /// Re-review S1: the verdict comes from this call's probe alone. A
+    /// successful probe reading NOT exhausted does not migrate, even when the
+    /// shared snapshot (possibly rewritten by a concurrent probe) says it is.
+    #[test]
+    fn a_restored_terminal_ignores_the_shared_snapshot() {
+        let fine = probe(None, 0.4);
+        assert!(!crate::commands::ai_settings::probe_result_exhausted(&fine));
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&fine));
+        assert_eq!(gate, HintGate::Confirmed(false));
+        assert_eq!(verdict_of(gate), HintVerdict::NotConfirmed);
+    }
+
+    /// Re-review S2: a hint that reaches the handler inside the window (it was
+    /// dispatched before the terminal was marked) is dropped there.
+    #[test]
+    fn a_hint_inside_the_window_is_dropped_by_the_handler_gate() {
+        let open = super::super::usage_limit::RestoredLimitHit::new(None, PREP_T0);
+        let exhausted = probe(None, 1.0);
         assert_eq!(
-            decide_hint(&mut fx, facts(confirmed)),
-            HintVerdict::Migrate {
-                dst: "/home/u/.claude-other".to_string()
-            }
+            hint_gate(Some(open), PREP_T0 + 2_000, true, Some(&exhausted)),
+            HintGate::InsideWindow
         );
-        // A successful probe that reads NOT exhausted: nothing.
-        assert!(!exhaustion_confirmed(false, Some(&ok), true));
+    }
+
+    /// Re-review N2: the handler composition — the marker is looked up by the
+    /// terminal id the hint names.
+    #[test]
+    fn the_gate_reads_the_marker_of_the_hints_own_terminal() {
+        let _l = super::super::usage_limit::marker_test_lock();
+        let tid = "account-migration-gate-terminal";
+        let now = chrono::Utc::now().timestamp_millis();
+        super::super::usage_limit::guard_restored_limit_hit(tid, None, now);
+        let failed = probe(Some("API error (500)"), 1.0);
+        assert_eq!(
+            hint_gate(
+                super::super::usage_limit::restored_marker(tid),
+                now + 1,
+                true,
+                Some(&failed)
+            ),
+            HintGate::InsideWindow
+        );
+        // Another terminal's hint is unaffected by this marker.
+        assert_eq!(
+            hint_gate(
+                super::super::usage_limit::restored_marker("account-migration-other"),
+                now + 1,
+                true,
+                Some(&failed)
+            ),
+            HintGate::Confirmed(true)
+        );
     }
 
     /// Any other terminal keeps the fleet-wide reading: a probe error still
     /// counts as exhausted (`probe_result_exhausted` is unchanged).
     #[test]
     fn an_ordinary_terminal_still_treats_a_probe_error_as_exhausted() {
-        let failed = probe(Some("API error (429): rate limited"));
-        assert!(exhaustion_confirmed(true, Some(&failed), false));
-        assert!(exhaustion_confirmed(true, None, false));
-        assert!(!exhaustion_confirmed(false, Some(&failed), false));
-        let mut fx = Recorded::new(None);
+        let failed = probe(Some("API error (429): rate limited"), 0.1);
+        assert!(crate::commands::ai_settings::probe_result_exhausted(
+            &failed
+        ));
         assert_eq!(
-            decide_hint(
-                &mut fx,
-                facts(exhaustion_confirmed(true, Some(&failed), false))
-            ),
-            HintVerdict::Migrate {
-                dst: "/home/u/.claude-other".to_string()
-            }
+            hint_gate(None, PREP_T0, true, Some(&failed)),
+            HintGate::Confirmed(true)
+        );
+        assert_eq!(
+            hint_gate(None, PREP_T0, true, None),
+            HintGate::Confirmed(true)
+        );
+        assert_eq!(
+            hint_gate(None, PREP_T0, false, Some(&failed)),
+            HintGate::Confirmed(false)
+        );
+        assert_eq!(
+            verdict_of(hint_gate(None, PREP_T0, true, Some(&failed))),
+            migrate()
         );
     }
 

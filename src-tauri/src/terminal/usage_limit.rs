@@ -157,11 +157,22 @@ fn should_fire(
 /// failure is exactly what cannot be told apart, and this session sits on the
 /// account the operator chose, so it only ever moves on a positive reading.
 /// A migration spawns a NEW terminal, which carries no marker. Dropped with
-/// the terminal (the scan's live-set retain).
+/// the terminal by the scan's live-set retain — but only a marker created
+/// BEFORE that pass's terminal snapshot: the resume core marks a new pane while
+/// a pass may be running, and that pane is not in the pass's snapshot yet
+/// ([`retain_restored_limit_hits`]).
+///
+/// **Known limitation:** markers live in this process only. A runner restart
+/// with a PTY-holder handoff adopts the pane in a new process with no marker,
+/// so an adopted pane reverts to ordinary usage-limit semantics (the probe
+/// still has to confirm before anything migrates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RestoredLimitHit {
     /// No hint fires for the terminal before this instant (unix millis).
     pub suppress_until_ms: i64,
+    /// When the marker was made, against which a scan pass's snapshot instant
+    /// is compared before the marker may be dropped.
+    pub created_at: Instant,
 }
 
 /// How long past the recorded reset hints stay suppressed: a usage endpoint
@@ -181,7 +192,13 @@ impl RestoredLimitHit {
                 Some(reset) => reset.saturating_add(RESTORED_LIMIT_GRACE_MS),
                 None => now_ms.saturating_add(RESTORED_LIMIT_MAX_MS),
             },
+            created_at: Instant::now(),
         }
+    }
+
+    /// Rule 1 for this marker at `now_ms`.
+    pub(crate) fn suppresses(&self, now_ms: i64) -> bool {
+        now_ms < self.suppress_until_ms
     }
 }
 
@@ -215,12 +232,16 @@ pub(crate) fn guard_restored_limit_hit(
     marker
 }
 
-/// Rule 1: whether no usage-limit hint may fire for `terminal_id` at `now_ms`.
-pub(crate) fn hint_suppressed(terminal_id: &str, now_ms: i64) -> bool {
+/// `terminal_id`'s marker, if it was hand-restored from a `limit_hit` row.
+pub(crate) fn restored_marker(terminal_id: &str) -> Option<RestoredLimitHit> {
     restored_limit_hits()
         .as_ref()
-        .and_then(|m| m.get(terminal_id))
-        .is_some_and(|r| now_ms < r.suppress_until_ms)
+        .and_then(|m| m.get(terminal_id).copied())
+}
+
+/// Rule 1: whether no usage-limit hint may fire for `terminal_id` at `now_ms`.
+pub(crate) fn hint_suppressed(terminal_id: &str, now_ms: i64) -> bool {
+    restored_marker(terminal_id).is_some_and(|r| r.suppresses(now_ms))
 }
 
 /// Rule 2: whether `terminal_id` was hand-restored from a `limit_hit` row, so
@@ -231,11 +252,27 @@ pub(crate) fn is_restored_limit_hit(terminal_id: &str) -> bool {
         .is_some_and(|m| m.contains_key(terminal_id))
 }
 
-/// Drop the markers of terminals that are gone.
-fn retain_restored_limit_hits(live: &HashSet<&String>) {
+/// Drop the markers of terminals that are gone: not in `live`, the terminal
+/// snapshot taken at `snapshot_at`. A marker created at or after that instant
+/// is kept whatever `live` says — its terminal may simply be newer than the
+/// snapshot (the resume core marks a pane while a pass runs); the next pass,
+/// whose snapshot is later, judges it.
+fn retain_restored_limit_hits(live: &HashSet<&String>, snapshot_at: Instant) {
     if let Some(m) = restored_limit_hits().as_mut() {
-        m.retain(|tid, _| live.contains(tid));
+        m.retain(|tid, r| live.contains(tid) || r.created_at >= snapshot_at);
     }
+}
+
+/// Serializes the tests that read or write the process-global marker map, so
+/// one test's retain cannot drop another's markers under parallel `cargo test`.
+#[cfg(test)]
+pub(crate) static MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`MARKER_TEST_LOCK`] taken under the test-lock hierarchy (`env_lock`
+/// first), as every shared test lock must be.
+#[cfg(test)]
+pub(crate) fn marker_test_lock() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&MARKER_TEST_LOCK)
 }
 
 // ── Grid scanner ─────────────────────────────────────────────────────────────
@@ -253,6 +290,9 @@ pub fn scan_grids_once() {
     let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
         return;
     };
+    // Taken BEFORE the snapshot: a marker created after this instant belongs
+    // to a terminal the snapshot may not hold yet, and survives this pass.
+    let snapshot_at = Instant::now();
     let sessions = tm.sessions_snapshot();
 
     // Decide under the fire-state lock, then dispatch with NO lock held (the
@@ -297,7 +337,7 @@ pub fn scan_grids_once() {
         // Drop state for terminals that have gone away.
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
-        retain_restored_limit_hits(&live);
+        retain_restored_limit_hits(&live, snapshot_at);
         gate.retain_live(&live);
     } // fire-state + scan-gate locks released
 
@@ -491,8 +531,15 @@ mod tests {
 
     /// Rule 1: inside the window no hint fires for the terminal, whatever the
     /// screen shows; once it passes the normal `should_fire` path runs.
+    fn marker_lock() -> crate::test_env::TestLockGuard {
+        marker_test_lock()
+    }
+
+    /// Rule 1: inside the window no hint fires for the terminal, whatever the
+    /// screen shows; once it passes the normal `should_fire` path runs.
     #[test]
     fn inside_the_window_no_hint_fires_and_after_it_the_normal_path_runs() {
+        let _l = marker_lock();
         let tid = "usage-limit-restored-window";
         let reset = T0 + 3_600_000;
         let marker = guard_restored_limit_hit(tid, Some(reset), T0);
@@ -507,17 +554,50 @@ mod tests {
         assert!(!is_restored_limit_hit("usage-limit-unmarked"));
     }
 
+    /// Re-review N3: a restore whose recorded reset (plus grace) has already
+    /// passed suppresses nothing, but the terminal is still marked.
+    #[test]
+    fn an_already_elapsed_window_suppresses_nothing_but_still_marks() {
+        let _l = marker_lock();
+        let tid = "usage-limit-restored-elapsed";
+        guard_restored_limit_hit(tid, Some(T0 - RESTORED_LIMIT_GRACE_MS - 1), T0);
+        assert!(!hint_suppressed(tid, T0));
+        assert!(is_restored_limit_hit(tid));
+    }
+
     #[test]
     fn a_marker_is_dropped_with_its_terminal() {
+        let _l = marker_lock();
         let (gone, kept) = ("usage-limit-restored-gone", "usage-limit-restored-kept");
         guard_restored_limit_hit(gone, None, T0);
         guard_restored_limit_hit(kept, None, T0);
+        let snapshot_at = Instant::now();
         let kept_s = kept.to_string();
         let live: HashSet<&String> = [&kept_s].into_iter().collect();
-        retain_restored_limit_hits(&live);
+        retain_restored_limit_hits(&live, snapshot_at);
         assert!(!is_restored_limit_hit(gone));
         assert!(!hint_suppressed(gone, T0));
         assert!(is_restored_limit_hit(kept));
+    }
+
+    /// Re-review M1: the resume core marks a new pane WHILE a scan pass runs;
+    /// the pane is not in that pass's terminal snapshot, and its marker must
+    /// survive the pass's retain (or the repainted old text fires inside the
+    /// window).
+    #[test]
+    fn a_marker_made_after_the_snapshot_survives_the_retain() {
+        let _l = marker_lock();
+        let tid = "usage-limit-restored-mid-pass";
+        let snapshot_at = Instant::now();
+        // The pass's snapshot holds no such terminal.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        guard_restored_limit_hit(tid, None, T0);
+        retain_restored_limit_hits(&HashSet::new(), snapshot_at);
+        assert!(is_restored_limit_hit(tid), "wiped by a pass it postdates");
+        assert!(hint_suppressed(tid, T0 + 1));
+        // The next pass (a later snapshot) still without it: dropped.
+        retain_restored_limit_hits(&HashSet::new(), Instant::now());
+        assert!(!is_restored_limit_hit(tid));
     }
 
     #[test]
