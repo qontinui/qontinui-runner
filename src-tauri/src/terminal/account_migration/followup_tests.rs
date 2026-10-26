@@ -123,6 +123,7 @@ fn the_stall_finding_has_the_door_shape_and_the_session_key() {
         "C:\\claude\\.claude-niklas",
         StallReason::UnrecognisedScreen,
         "❯",
+        false,
     );
     let mut keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -149,7 +150,7 @@ fn post_migration() -> PostMigration {
             main: session_carry::MainCarry::Copied,
             src_session_dir: std::path::PathBuf::new(),
             dst_session_dir: std::path::PathBuf::new(),
-            transcript_offset: 0,
+            transcript_offset: Some(0),
             session_dir: Default::default(),
             files: Vec::new(),
             subagents: Vec::new(),
@@ -162,7 +163,7 @@ fn post_migration() -> PostMigration {
 #[test]
 fn the_tail_event_reports_unknown_as_null_never_zero() {
     let p = post_migration();
-    let not_read = tail_event(&p, None, false);
+    let not_read = tail_event(&p, None, None);
     assert_eq!(not_read["transcriptTail"], "not-read");
     assert!(not_read["transcriptTailLines"].is_null());
     assert_eq!(not_read["transcriptTailDelivered"], false);
@@ -170,12 +171,16 @@ fn the_tail_event_reports_unknown_as_null_never_zero() {
     let shorter = tail_event(
         &p,
         Some(&TailRescue::SourceShorter { len: 8, offset: 16 }),
-        false,
+        None,
     );
     assert_eq!(shorter["transcriptTail"], "source-shorter-unknown");
     assert!(shorter["transcriptTailLines"].is_null());
 
-    let empty = tail_event(&p, Some(&TailRescue::Empty), false);
+    let empty = tail_event(
+        &p,
+        Some(&TailRescue::Empty),
+        Some(TailDelivery::NoneToDeliver),
+    );
     assert_eq!(empty["transcriptTailLines"], 0);
 
     let scan = session_carry::tail::scan_tail(
@@ -189,11 +194,212 @@ fn the_tail_event_reports_unknown_as_null_never_zero() {
             truncated: false,
             scan,
         }),
-        true,
+        Some(TailDelivery::Delivered),
     );
     assert_eq!(rescued["transcriptTail"], "rescued");
     assert_eq!(rescued["transcriptTailLines"], 2);
     assert_eq!(rescued["transcriptTailUnparseable"], 1);
     assert_eq!(rescued["transcriptTailDelivered"], true);
     assert_eq!(rescued["newTerminalId"], "bfca9a32");
+}
+
+// ---- 2026-10-23 review fixes ------------------------------------------------
+
+/// Fix 1: a limit banner HIGH up with a dialog (or a draft) in the bottom rows
+/// is not the limit-wait — an `Esc` there would cancel the dialog.
+///
+/// Mutation check: reading the whole screen in `screen_shows_limit_wait`
+/// fails both assertions.
+#[test]
+fn a_banner_above_a_bottom_dialog_is_not_the_limit_wait() {
+    let mut screen = String::from(
+        "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n",
+    );
+    for i in 0..10 {
+        screen.push_str(&format!("● later output {i}\n"));
+    }
+    let with_dialog = format!("{screen}{PLAIN_DIALOG}");
+    assert!(!screen_shows_limit_wait(&with_dialog));
+    let with_draft = format!("{screen}────────\n❯ half-typed operator draft\n────────\n");
+    assert!(!screen_shows_limit_wait(&with_draft));
+    assert_eq!(
+        decide_stall(Some(&with_dialog), Exhaustion::NotExhausted, false),
+        StallAction::Stalled(StallReason::UnrecognisedScreen)
+    );
+}
+
+/// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
+/// and no turn under way; an unreadable re-read never authorizes it.
+///
+/// Mutation checks: dropping the `screen_shows_turn` term fails the
+/// turn-started case; returning `true` for `None` fails the last.
+#[test]
+fn the_esc_is_sent_only_while_the_re_read_still_shows_the_banner() {
+    assert!(esc_still_warranted(Some(LIMIT_WAIT)));
+    let turn_started = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Working… (esc to interrupt)\n────────\n❯ \n────────\n";
+    assert!(!esc_still_warranted(Some(turn_started)));
+    assert!(!esc_still_warranted(Some(PLAIN_DIALOG)));
+    assert!(!esc_still_warranted(Some(BLANK_RESUME)));
+    assert!(!esc_still_warranted(None));
+}
+
+/// Fix 5: a failed PTY write of the nudge is a stall with its own reason,
+/// never a silent end; a give-up carries its refusal on.
+///
+/// Mutation check: mapping `SubmitFailed` to `Done` fails the first assertion.
+#[test]
+fn a_failed_nudge_write_is_a_stall() {
+    assert_eq!(
+        nudge_step(IdlePromptOutcome::SubmitFailed("broken pipe".into())),
+        NudgeStep::Stalled(StallReason::SubmitFailed)
+    );
+    assert_eq!(StallReason::SubmitFailed.as_str(), "submit-failed");
+    for done in [
+        IdlePromptOutcome::Submitted,
+        IdlePromptOutcome::AlreadyBusy,
+        IdlePromptOutcome::TerminalGone,
+    ] {
+        assert_eq!(nudge_step(done), NudgeStep::Done);
+    }
+    assert_eq!(
+        nudge_step(IdlePromptOutcome::GaveUp {
+            last_refusal: "x".into()
+        }),
+        NudgeStep::GaveUp {
+            last_refusal: "x".into()
+        }
+    );
+}
+
+/// Fix 10: each reason's finding says what the runner actually did — the
+/// `Esc` it sent (or attempted, or withheld), or that it typed nothing.
+///
+/// Mutation check: one shared wording for every reason fails the
+/// distinctness assertion; wording `RetryGaveUp` without `esc_sent` fails
+/// the withheld-Esc assertion.
+#[test]
+fn the_stall_finding_wording_follows_the_reason() {
+    let body = |reason: StallReason, esc_sent: bool| {
+        stall_finding_body("s", "t", "C:/a", reason, "row", esc_sent)["body"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let all = [
+        StallReason::ScreenUnreadable,
+        StallReason::UnrecognisedScreen,
+        StallReason::LimitWaitOnExhaustedAccount,
+        StallReason::LimitWaitExhaustionUnknown,
+        StallReason::EscNotDelivered,
+        StallReason::RetryGaveUp,
+        StallReason::SubmitFailed,
+    ];
+    let bodies: std::collections::HashSet<String> = all.iter().map(|r| body(*r, true)).collect();
+    assert_eq!(bodies.len(), all.len(), "one wording per reason");
+    assert!(body(StallReason::EscNotDelivered, false).contains("attempted ONE Esc"));
+    assert!(body(StallReason::RetryGaveUp, true).contains("sent ONE Esc"));
+    let withheld = body(StallReason::RetryGaveUp, false);
+    assert!(withheld.contains("none was sent"), "{withheld}");
+    assert!(!withheld.contains("sent ONE Esc"));
+    for r in [
+        StallReason::ScreenUnreadable,
+        StallReason::UnrecognisedScreen,
+        StallReason::LimitWaitOnExhaustedAccount,
+        StallReason::LimitWaitExhaustionUnknown,
+        StallReason::SubmitFailed,
+    ] {
+        let b = body(r, false);
+        assert!(b.contains("typed nothing further"), "{r:?}: {b}");
+        assert!(!b.contains("sent ONE Esc"), "{r:?}: {b}");
+    }
+}
+
+fn rescued_with_prompt(truncated: bool) -> TailRescue {
+    TailRescue::Rescued {
+        path: std::path::PathBuf::from("C:/t/migration-tail/claude-lukas-1.jsonl"),
+        bytes: 10,
+        truncated,
+        scan: session_carry::tail::scan_tail(
+            b"{\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"content\":\"hi\"}}\n",
+        ),
+    }
+}
+
+/// Fix 13: with `auto_continue_after_migration` OFF nothing is typed — the
+/// tail is still saved and reported, as `skipped_auto_continue_off`.
+///
+/// Mutation check: ignoring `auto_continue` in `catch_up_plan` returns
+/// `Deliver` for the off case.
+#[test]
+fn auto_continue_off_reports_the_tail_but_types_nothing() {
+    let rescued = rescued_with_prompt(false);
+    assert_eq!(
+        catch_up_plan(Some(&rescued), false),
+        CatchUpPlan::SkipAutoContinueOff
+    );
+    assert!(matches!(
+        catch_up_plan(Some(&rescued), true),
+        CatchUpPlan::Deliver(ref m) if m.contains("operator prompt \"hi\"")
+    ));
+    assert_eq!(
+        catch_up_plan(Some(&TailRescue::Empty), false),
+        CatchUpPlan::NoneToDeliver
+    );
+    for unknown in [
+        None,
+        Some(TailRescue::OffsetUnknown),
+        Some(TailRescue::SourceShorter { len: 1, offset: 2 }),
+    ] {
+        assert_eq!(catch_up_plan(unknown.as_ref(), true), CatchUpPlan::Unknown);
+    }
+    let ev = tail_event(
+        &post_migration(),
+        Some(&rescued),
+        Some(TailDelivery::SkippedAutoContinueOff),
+    );
+    assert_eq!(ev["transcriptTail"], "rescued");
+    assert_eq!(ev["transcriptTailLines"], 1);
+    assert_eq!(ev["transcriptTailDelivery"], "skipped_auto_continue_off");
+    assert_eq!(ev["transcriptTailDelivered"], false);
+}
+
+/// Fix 9: `transcriptTailTruncated` and the `transcriptTailDelivery` enum —
+/// `null` when the tail is UNKNOWN, never `false` / a delivery.
+///
+/// Mutation check: reporting `false` for an unread tail fails the null
+/// assertions.
+#[test]
+fn the_tail_event_carries_truncation_and_the_delivery_enum() {
+    let p = post_migration();
+    let truncated = tail_event(
+        &p,
+        Some(&rescued_with_prompt(true)),
+        Some(TailDelivery::GaveUp),
+    );
+    assert_eq!(truncated["transcriptTailTruncated"], true);
+    assert_eq!(truncated["transcriptTailDelivery"], "gave_up");
+    let empty = tail_event(
+        &p,
+        Some(&TailRescue::Empty),
+        Some(TailDelivery::NoneToDeliver),
+    );
+    assert_eq!(empty["transcriptTailTruncated"], false);
+    assert_eq!(empty["transcriptTailDelivery"], "none_to_deliver");
+    let unknown = tail_event(&p, Some(&TailRescue::OffsetUnknown), None);
+    assert_eq!(unknown["transcriptTail"], "offset-unknown");
+    assert!(unknown["transcriptTailLines"].is_null());
+    assert!(unknown["transcriptTailTruncated"].is_null());
+    assert!(unknown["transcriptTailDelivery"].is_null());
+    assert_eq!(
+        tail_delivery(&IdlePromptOutcome::SubmitFailed("x".into())),
+        TailDelivery::SubmitFailed
+    );
+    assert_eq!(
+        tail_delivery(&IdlePromptOutcome::Submitted),
+        TailDelivery::Delivered
+    );
+    assert_eq!(
+        tail_delivery(&IdlePromptOutcome::TerminalGone),
+        TailDelivery::GaveUp
+    );
 }

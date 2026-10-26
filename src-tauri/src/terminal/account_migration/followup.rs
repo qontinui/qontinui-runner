@@ -25,10 +25,31 @@
 //! 4. **The catch-up**: when the rescued tail holds task notifications or
 //!    operator prompts, ONE bounded single-line message through the same idle
 //!    watcher, waiting through the nudge's turn rather than standing down on
-//!    it. Then `session-account-migration-tail` reports the tail.
+//!    it — unless `auto_continue_after_migration` is off, when nothing is
+//!    typed (the tail is still saved and reported). Then
+//!    `session-account-migration-tail` reports the tail.
+//!
+//! Every screen rule reads the pane's BOTTOM rows only
+//! ([`crate::terminal::usage_limit::bottom_rows_text`]): a banner or a spinner
+//! quoted higher up the conversation is history, not state. The one `Esc` is
+//! sent only after re-reading the screen, and only while the banner still
+//! shows and no turn has started (2026-10-23 review fixes 1 and 2). A nudge
+//! whose PTY write fails is a stall like a give-up (fix 5).
+//!
+//! ## The `session-account-migration-tail` event
+//!
+//! | field | meaning |
+//! |---|---|
+//! | `transcriptTail` | `rescued` / `empty` / `not-read` / `source-shorter-unknown` / `offset-unknown` |
+//! | `transcriptTailLines`, `transcriptTailUnparseable` | counts; `null` when the tail is UNKNOWN (never 0) |
+//! | `transcriptTailTruncated` | the read hit its byte bound; `null` when UNKNOWN |
+//! | `transcriptTailPath` | where the tail was saved, when it was |
+//! | `transcriptTailDelivery` | `none_to_deliver` / `delivered` / `submit_failed` / `gave_up` (the idle watcher stood down without submitting) / `skipped_auto_continue_off`; `null` when the tail is UNKNOWN |
+//! | `transcriptTailDelivered` | `transcriptTailDelivery == "delivered"` |
 //!
 //! The decisions are pure ([`decide_stall`], [`screen_shows_limit_wait`],
-//! [`evidence_line`], [`screen_excerpt`], [`stall_finding_body`],
+//! [`esc_still_warranted`], [`nudge_step`], [`evidence_line`],
+//! [`screen_excerpt`], [`stall_finding_body`], [`catch_up_plan`],
 //! [`tail_event`]); the rest is wiring.
 
 use serde_json::json;
@@ -109,9 +130,18 @@ async fn run(p: PostMigration, gate: SyncGate) {
         nudge_with_stall_recovery(&p, &text).await;
     }
 
-    let message = tail.as_ref().and_then(TailRescue::message);
-    let delivered = match message {
-        Some(message) => {
+    let delivery = match catch_up_plan(tail.as_ref(), p.auto_continue) {
+        CatchUpPlan::Unknown => None,
+        CatchUpPlan::NoneToDeliver => Some(TailDelivery::NoneToDeliver),
+        CatchUpPlan::SkipAutoContinueOff => {
+            info!(
+                terminal_id = %p.new_terminal_id,
+                session = %p.claude_session_id,
+                "migration tail catch-up NOT typed — auto_continue_after_migration is off; the rescued lines are on disk under <sid>/migration-tail/"
+            );
+            Some(TailDelivery::SkippedAutoContinueOff)
+        }
+        CatchUpPlan::Deliver(message) => {
             let outcome = prompt_when_idle(
                 &p.new_terminal_id,
                 &message,
@@ -127,13 +157,12 @@ async fn run(p: PostMigration, gate: SyncGate) {
                     "migration tail catch-up NOT delivered — the rescued lines are still on disk under <sid>/migration-tail/"
                 );
             }
-            outcome == IdlePromptOutcome::Submitted
+            Some(tail_delivery(&outcome))
         }
-        None => false,
     };
     emit(
         "session-account-migration-tail",
-        tail_event(&p, tail.as_ref(), delivered),
+        tail_event(&p, tail.as_ref(), delivery),
     );
 }
 
@@ -169,19 +198,99 @@ async fn rescue_tail(p: &PostMigration) -> Option<TailRescue> {
     }
 }
 
-/// Pure: the `session-account-migration-tail` payload. `transcriptTailLines`
-/// is `null` when the tail was not read (writer not proven gone, or a failed
-/// read) and when the source was shorter than the carry's offset — both are
-/// UNKNOWN, never zero.
-fn tail_event(p: &PostMigration, tail: Option<&TailRescue>, delivered: bool) -> serde_json::Value {
-    let (status, lines, unparseable, path) = match tail {
-        None => ("not-read", None, None, None),
-        Some(TailRescue::Empty) => ("empty", Some(0), Some(0), None),
-        Some(TailRescue::SourceShorter { .. }) => ("source-shorter-unknown", None, None, None),
-        Some(TailRescue::Rescued { path, scan, .. }) => (
+/// What the follow-up does with a rescued tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatchUpPlan {
+    /// The tail is UNKNOWN (not read, source shorter, no offset): nothing to
+    /// decide from.
+    Unknown,
+    /// Read, and nothing in it the session needs to hear.
+    NoneToDeliver,
+    /// Something to deliver, but `auto_continue_after_migration` is off: the
+    /// runner types nothing into the resumed session (2026-10-23 review fix
+    /// 13). The tail is still saved and the event still sent.
+    SkipAutoContinueOff,
+    /// Type this ONE message once the pane is idle.
+    Deliver(String),
+}
+
+/// Pure: the catch-up plan for a tail. `auto_continue` is
+/// `auto_continue_after_migration` ([`PostMigration::auto_continue`]).
+pub(crate) fn catch_up_plan(tail: Option<&TailRescue>, auto_continue: bool) -> CatchUpPlan {
+    match tail {
+        None | Some(TailRescue::SourceShorter { .. }) | Some(TailRescue::OffsetUnknown) => {
+            CatchUpPlan::Unknown
+        }
+        Some(t) => match t.message() {
+            None => CatchUpPlan::NoneToDeliver,
+            Some(_) if !auto_continue => CatchUpPlan::SkipAutoContinueOff,
+            Some(message) => CatchUpPlan::Deliver(message),
+        },
+    }
+}
+
+/// How the tail's catch-up ended — `transcriptTailDelivery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailDelivery {
+    NoneToDeliver,
+    Delivered,
+    SubmitFailed,
+    /// The idle watcher stood down without submitting: its deadline passed,
+    /// or the pane went away.
+    GaveUp,
+    SkippedAutoContinueOff,
+}
+
+impl TailDelivery {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoneToDeliver => "none_to_deliver",
+            Self::Delivered => "delivered",
+            Self::SubmitFailed => "submit_failed",
+            Self::GaveUp => "gave_up",
+            Self::SkippedAutoContinueOff => "skipped_auto_continue_off",
+        }
+    }
+}
+
+/// Pure: the delivery an idle-watcher outcome amounts to.
+pub(crate) fn tail_delivery(outcome: &IdlePromptOutcome) -> TailDelivery {
+    match outcome {
+        IdlePromptOutcome::Submitted => TailDelivery::Delivered,
+        IdlePromptOutcome::SubmitFailed(_) => TailDelivery::SubmitFailed,
+        IdlePromptOutcome::GaveUp { .. }
+        | IdlePromptOutcome::TerminalGone
+        | IdlePromptOutcome::AlreadyBusy => TailDelivery::GaveUp,
+    }
+}
+
+/// Pure: the `session-account-migration-tail` payload (fields in the module
+/// doc). Counts and `transcriptTailTruncated` are `null` when the tail was not
+/// read (writer not proven gone, or a failed read), when the source was
+/// shorter than the carry's offset, and when the carry recorded no offset —
+/// all UNKNOWN, never zero. `delivery` is `None` exactly then too.
+fn tail_event(
+    p: &PostMigration,
+    tail: Option<&TailRescue>,
+    delivery: Option<TailDelivery>,
+) -> serde_json::Value {
+    let (status, lines, unparseable, truncated, path) = match tail {
+        None => ("not-read", None, None, None, None),
+        Some(TailRescue::Empty) => ("empty", Some(0), Some(0), Some(false), None),
+        Some(TailRescue::SourceShorter { .. }) => {
+            ("source-shorter-unknown", None, None, None, None)
+        }
+        Some(TailRescue::OffsetUnknown) => ("offset-unknown", None, None, None, None),
+        Some(TailRescue::Rescued {
+            path,
+            scan,
+            truncated,
+            ..
+        }) => (
             "rescued",
             Some(scan.lines),
             Some(scan.unparseable),
+            Some(*truncated),
             Some(path.display().to_string()),
         ),
     };
@@ -192,8 +301,10 @@ fn tail_event(p: &PostMigration, tail: Option<&TailRescue>, delivered: bool) -> 
         "transcriptTail": status,
         "transcriptTailLines": lines,
         "transcriptTailUnparseable": unparseable,
+        "transcriptTailTruncated": truncated,
         "transcriptTailPath": path,
-        "transcriptTailDelivered": delivered,
+        "transcriptTailDelivery": delivery.map(TailDelivery::as_str),
+        "transcriptTailDelivered": delivery == Some(TailDelivery::Delivered),
     })
 }
 
@@ -225,6 +336,9 @@ pub(crate) enum StallReason {
     EscNotDelivered,
     /// The one retry gave up too.
     RetryGaveUp,
+    /// The idle prompt was there, but writing the nudge to the PTY failed
+    /// (2026-10-23 review fix 5).
+    SubmitFailed,
 }
 
 impl StallReason {
@@ -236,6 +350,7 @@ impl StallReason {
             Self::LimitWaitExhaustionUnknown => "limit-wait-exhaustion-unknown",
             Self::EscNotDelivered => "esc-not-delivered",
             Self::RetryGaveUp => "retry-gave-up",
+            Self::SubmitFailed => "submit-failed",
         }
     }
 }
@@ -249,15 +364,54 @@ pub(crate) enum StallAction {
     Stalled(StallReason),
 }
 
-/// Pure: whether the screen shows the CLI's limit-wait banner
-/// (`… · continuing automatically at 6pm · esc to cancel`). A bare
-/// `esc to cancel` also labels many ordinary CLI dialogs, so it counts only
-/// beside a usage-limit phrase.
+/// Pure: whether the screen's BOTTOM rows
+/// ([`crate::terminal::usage_limit::bottom_rows_text`]) show the CLI's
+/// limit-wait banner (`… · continuing automatically at 6pm · esc to cancel`).
+/// A banner higher up is history — a dialog or a draft below it is what the
+/// CLI is showing now, and an `Esc` would cancel THAT (2026-10-23 review fix
+/// 1). A bare `esc to cancel` also labels many ordinary CLI dialogs, so it
+/// counts only beside a usage-limit phrase.
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
-    let normalized = normalize(screen);
+    let bottom = crate::terminal::usage_limit::bottom_rows_text(screen);
+    let normalized = normalize(&bottom);
     normalized.contains("continuing automatically at")
         || (normalized.contains("esc to cancel")
-            && crate::terminal::usage_limit::window_indicates_usage_limit(screen).is_some())
+            && crate::terminal::usage_limit::window_indicates_usage_limit(&bottom).is_some())
+}
+
+/// Pure: whether the one `Esc` may be sent on `screen`, re-read IMMEDIATELY
+/// before it: the banner must still be in the bottom rows and no turn may
+/// have started (2026-10-23 review fix 2). Between the give-up's read and the
+/// `Esc` the probe ran for seconds; the CLI's own wait may have ended and a
+/// turn begun, which the `Esc` would interrupt. `None` (unreadable) never
+/// authorizes it.
+pub(crate) fn esc_still_warranted(screen: Option<&str>) -> bool {
+    screen.is_some_and(|s| {
+        screen_shows_limit_wait(s) && !crate::terminal::usage_limit::screen_shows_turn(s)
+    })
+}
+
+/// What one nudge attempt's outcome leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NudgeStep {
+    /// Delivered, or moot (the session picked itself up, or the pane is gone).
+    Done,
+    /// The idle watcher gave up: decide between `Esc` + retry and a stall.
+    GaveUp { last_refusal: String },
+    /// Report this stall now.
+    Stalled(StallReason),
+}
+
+/// Pure: the step an idle-watcher outcome leads to. A failed PTY write is a
+/// stall like a give-up, never a silent end (2026-10-23 review fix 5).
+pub(crate) fn nudge_step(outcome: IdlePromptOutcome) -> NudgeStep {
+    match outcome {
+        IdlePromptOutcome::Submitted
+        | IdlePromptOutcome::AlreadyBusy
+        | IdlePromptOutcome::TerminalGone => NudgeStep::Done,
+        IdlePromptOutcome::SubmitFailed(_) => NudgeStep::Stalled(StallReason::SubmitFailed),
+        IdlePromptOutcome::GaveUp { last_refusal } => NudgeStep::GaveUp { last_refusal },
+    }
 }
 
 /// Pure: the give-up decision. `screen` is `None` when it could not be read;
@@ -329,6 +483,56 @@ pub(crate) fn screen_excerpt(screen: &str) -> String {
     format!("…{}", joined.chars().skip(skip).collect::<String>())
 }
 
+/// Pure: what happened, in words, for one stall reason — the finding says
+/// exactly what the runner did and did not type (2026-10-23 review fix 10).
+/// `esc_sent` is whether the one `Esc` was written (it matters for
+/// [`StallReason::RetryGaveUp`] only: the `Esc` is withheld when the banner
+/// had cleared by the re-read).
+fn stall_what_happened(reason: StallReason, esc_sent: bool) -> &'static str {
+    match reason {
+        StallReason::ScreenUnreadable => {
+            "the continue nudge gave up (the resumed CLI never painted an idle prompt) and the \
+             pane's screen could not be read, so nothing was decided from it. The runner typed \
+             nothing further"
+        }
+        StallReason::UnrecognisedScreen => {
+            "the continue nudge gave up: the resumed CLI never painted an idle prompt, and the \
+             screen shows neither that prompt nor the CLI's limit-wait banner. The runner typed \
+             nothing further"
+        }
+        StallReason::LimitWaitOnExhaustedAccount => {
+            "the continue nudge gave up: the pane sits in the CLI's limit-wait, and a fresh probe \
+             says this account IS exhausted, so the wait is correct and no Esc was sent. The \
+             runner typed nothing further"
+        }
+        StallReason::LimitWaitExhaustionUnknown => {
+            "the continue nudge gave up: the pane sits in the CLI's limit-wait, and the probe \
+             could not say whether this account is exhausted; an unknown never authorizes \
+             cancelling the wait, so no Esc was sent. The runner typed nothing further"
+        }
+        StallReason::EscNotDelivered => {
+            "the continue nudge gave up with the pane in the CLI's limit-wait on an account a \
+             fresh probe says is NOT exhausted; the runner attempted ONE Esc to cancel the wait, \
+             and writing it failed. Nothing else was typed"
+        }
+        StallReason::RetryGaveUp if esc_sent => {
+            "the continue nudge gave up with the pane in the CLI's limit-wait on an account a \
+             fresh probe says is NOT exhausted; the runner sent ONE Esc to cancel the wait and \
+             retried the nudge once, and the retry gave up too. Nothing else was typed"
+        }
+        StallReason::RetryGaveUp => {
+            "the continue nudge gave up with the pane in the CLI's limit-wait on an account a \
+             fresh probe says is NOT exhausted; by the re-read just before the Esc the banner had \
+             cleared (or a turn had started), so none was sent; the runner retried the nudge \
+             once, and the retry gave up too. Nothing else was typed"
+        }
+        StallReason::SubmitFailed => {
+            "the resumed CLI painted its idle prompt, but writing the continue nudge to the pane \
+             failed. The runner typed nothing further"
+        }
+    }
+}
+
 /// Pure: the stall's coord finding — the shape
 /// [`crate::session::duplicate_hosts::post_session_finding`] posts.
 pub(crate) fn stall_finding_body(
@@ -337,6 +541,7 @@ pub(crate) fn stall_finding_body(
     to_config_dir: &str,
     reason: StallReason,
     screen_line: &str,
+    esc_sent: bool,
 ) -> serde_json::Value {
     json!({
         "title": format!(
@@ -345,10 +550,10 @@ pub(crate) fn stall_finding_body(
         ),
         "body": format!(
             "The runner migrated session {claude_session_id} to {to_config_dir} (pane \
-             {terminal_id}), and the continue nudge could not be delivered: the resumed CLI never \
-             painted an idle prompt ({}). The pane's screen read: \"{screen_line}\". The runner \
-             typed nothing further; the session sits on that screen until someone acts on the \
-             pane. Reported once per migration by the account migration's follow-up.",
+             {terminal_id}), and {} ({}). The pane's screen read: \"{screen_line}\". The session \
+             sits on that screen until someone acts on the pane. Reported once per migration by \
+             the account migration's follow-up.",
+            stall_what_happened(reason, esc_sent),
             reason.as_str()
         ),
         "kind": "investigation",
@@ -402,6 +607,7 @@ async fn probe_exhaustion(config_dir: &str) -> Exhaustion {
 /// `Esc` + retry once or report the stall.
 async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
     let mut retried = false;
+    let mut esc_sent = false;
     loop {
         let label = if retried {
             "continue-nudge-retry"
@@ -409,8 +615,14 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
             "continue-nudge"
         };
         let outcome = prompt_when_idle(&p.new_terminal_id, nudge, label, IdleWait::NUDGE).await;
-        let IdlePromptOutcome::GaveUp { last_refusal } = outcome else {
-            return;
+        let last_refusal = match nudge_step(outcome) {
+            NudgeStep::Done => return,
+            NudgeStep::Stalled(reason) => {
+                let screen = pane_screen_text(&p.new_terminal_id);
+                report_stalled(p, reason, screen.as_deref(), esc_sent).await;
+                return;
+            }
+            NudgeStep::GaveUp { last_refusal } => last_refusal,
         };
         let screen = pane_screen_text(&p.new_terminal_id);
         warn!(
@@ -429,21 +641,33 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
         };
         match decide_stall(screen.as_deref(), exhaustion, retried) {
             StallAction::EscThenRetry => {
-                if let Err(e) = send_esc(&p.new_terminal_id) {
-                    warn!(terminal_id = %p.new_terminal_id, error = %e, "continue nudge: the one Esc could not be written");
-                    report_stalled(p, StallReason::EscNotDelivered, screen.as_deref()).await;
-                    return;
+                // The probe took seconds: re-read right before the Esc.
+                let fresh = pane_screen_text(&p.new_terminal_id);
+                if esc_still_warranted(fresh.as_deref()) {
+                    if let Err(e) = send_esc(&p.new_terminal_id) {
+                        warn!(terminal_id = %p.new_terminal_id, error = %e, "continue nudge: the one Esc could not be written");
+                        report_stalled(p, StallReason::EscNotDelivered, fresh.as_deref(), false)
+                            .await;
+                        return;
+                    }
+                    esc_sent = true;
+                    info!(
+                        terminal_id = %p.new_terminal_id,
+                        session = %p.claude_session_id,
+                        account = %p.dst_config_dir,
+                        "continue nudge: the pane sits in the CLI's limit-wait on an account the probe says is NOT exhausted — sent one Esc, retrying the nudge once"
+                    );
+                } else {
+                    info!(
+                        terminal_id = %p.new_terminal_id,
+                        session = %p.claude_session_id,
+                        "continue nudge: by the re-read the limit-wait banner had cleared (or a turn started) — no Esc sent, retrying the nudge once"
+                    );
                 }
-                info!(
-                    terminal_id = %p.new_terminal_id,
-                    session = %p.claude_session_id,
-                    account = %p.dst_config_dir,
-                    "continue nudge: the pane sits in the CLI's limit-wait on an account the probe says is NOT exhausted — sent one Esc, retrying the nudge once"
-                );
                 retried = true;
             }
             StallAction::Stalled(reason) => {
-                report_stalled(p, reason, screen.as_deref()).await;
+                report_stalled(p, reason, screen.as_deref(), esc_sent).await;
                 return;
             }
         }
@@ -452,7 +676,12 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
 
 /// The stalled event plus one best-effort coord finding through the
 /// duplicate-host reporter's door.
-async fn report_stalled(p: &PostMigration, reason: StallReason, screen: Option<&str>) {
+async fn report_stalled(
+    p: &PostMigration,
+    reason: StallReason,
+    screen: Option<&str>,
+    esc_sent: bool,
+) {
     let line = screen.map_or_else(|| "<screen unreadable>".to_string(), evidence_line);
     warn!(
         terminal_id = %p.new_terminal_id,
@@ -468,6 +697,7 @@ async fn report_stalled(p: &PostMigration, reason: StallReason, screen: Option<&
             "terminalId": p.new_terminal_id,
             "toConfigDir": p.dst_config_dir,
             "reason": reason.as_str(),
+            "escSent": esc_sent,
             "screenLine": line,
         }),
     );
@@ -478,6 +708,7 @@ async fn report_stalled(p: &PostMigration, reason: StallReason, screen: Option<&
             &p.dst_config_dir,
             reason,
             &line,
+            esc_sent,
         ),
         &p.claude_session_id,
         "account migration stall",
