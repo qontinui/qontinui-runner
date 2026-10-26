@@ -504,9 +504,10 @@ struct ReplayPass {
 /// `.`/`..` and — on macOS — `/private/var` aliases resolved), falling back to
 /// the path as given when it cannot be canonicalized, and lowercased on
 /// Windows like [`normalize_dir`]. The watcher reaches one file by two
-/// spellings (startup discovery builds it from `encode_for_lookup`, a notify
-/// event carries the OS's own path, the route takes the `read_dir` name), and
-/// a second spelling must not read as a fresh file with mark 0.
+/// spellings (startup discovery builds it from
+/// `transcript::session_transcript_path`, a notify event carries the OS's own
+/// path, the route takes the `read_dir` name), and a second spelling must not
+/// read as a fresh file with mark 0.
 fn file_identity(path: &Path) -> String {
     let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = p.display().to_string();

@@ -774,37 +774,26 @@ async fn embedding_service_health() -> serde_json::Value {
     })
 }
 
-/// Bounded PG liveness probe for `/health` (iter4 B-5). Runs a `SELECT 1`
-/// through the global deadpool pool with a hard 2s ceiling *on top of* the
-/// pool's own bounded `get()` timeout (B-1), so the health handler can never
-/// hang on a wedged data layer even in a pathological pool state.
+/// A FRESH PG liveness read for GATING consumers (`/restart-readiness`), now
+/// the guarded pool's `probe_now`: a real `SELECT 1` while the breaker is
+/// Closed (a connect failure trips it), an immediate single-flight trial
+/// while it is Open. Bounded at 5 s; feeds the breaker either way.
 ///
-/// Returns:
-/// * `None` — no PG configured (the global `PgDb` was never set). Do not
-///   downgrade a runner that legitimately runs without PG.
-/// * `Some(true)` — a connection was checked out and `SELECT 1` succeeded
-///   within the window.
-/// * `Some(false)` — the pool errored (unreachable / exhausted, incl. the
-///   degraded-boot pool with no live backend), or the probe exceeded 2s.
+/// `/health` no longer calls this: it reads cached state
+/// (`database::pg::health`, plan
+/// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`
+/// Phase 5, which reverses iter4 B-5's "intentionally NOT cached" choice —
+/// that bought freshness by charging every poll ~2 s while the database was
+/// down).
 ///
-/// Unlike the embedding probe this is intentionally NOT cached: it is a single
-/// sub-millisecond round-trip on a healthy DB, and when the DB is down the 2s
-/// ceiling bounds the cost — surfacing the outage on the very next `/health`
-/// poll is the whole point (the B-5 observability gap the plan calls out).
+/// Returns `None` when no PG is configured (the global `PgDb` was never set)
+/// OR the probe could not tell (a saturated pool, a probe that ran out its
+/// bound), else whether the database answered. Gating consumers pass only on
+/// `Some(true)`, so `None` withholds exactly as `Some(false)` does, while
+/// `derive_schema_health` labels it "unknown" rather than "false".
 pub(crate) async fn pg_liveness_probe() -> Option<bool> {
     let pg = crate::database::pg::PgDb::try_global()?;
-    let probe = async move {
-        let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
-        conn.simple_query("SELECT 1")
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
-        Ok(Ok(())) => Some(true),
-        Ok(Err(_)) => Some(false),
-        Err(_) => Some(false),
-    }
+    pg.pool().probe_now().await.reachable
 }
 
 /// Fixed, minimal set of relations the runner cannot work without. `schema_ok`
@@ -2092,37 +2081,16 @@ async fn health(
     // who care about the distinction should branch on `ui_error` /
     // `recent_crash` / `embeddingService.reachable` presence instead of
     // re-parsing the compound status string.
-    // iter4 B-5: bounded PG liveness. `/health` previously reported "healthy"
-    // in 3ms while every PG-backed panel hung forever (B-1). Fold a hard-capped
-    // `SELECT 1` into the aggregation so a wedged/unreachable data layer
-    // downgrades the runner to `degraded`. `None` (no PG configured) does NOT
-    // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
-    // the probe itself can never hang the handler.
-    // Time the PG probe SEPARATELY, and publish it as its own field.
-    //
-    // This is not curiosity, it is a latency confound that already caused a
-    // near-misreading. On 2026-08-19 `/health` answered `200` in 2.039 s while
-    // the process reported `Responding: False`, and that number was very
-    // nearly read as UI-thread latency. It was not: `pg_liveness_probe` is
-    // awaited here, BEFORE anything touches the event loop, and it is capped
-    // at exactly 2 s (and deliberately uncached). So 2.039 s was ~2.000 s of
-    // PG-timeout tax plus ~39 ms for everything else, and said almost nothing
-    // about the UI thread. With `pgProbeMs` on the wire the split is
-    // arithmetic, not inference.
-    let pg_probe_started = std::time::Instant::now();
-    let pg_reachable = pg_liveness_probe().await;
-    let pg_probe_ms = pg_probe_started.elapsed().as_millis() as u64;
-    // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`:
-    // `reachable` only proves a connect+auth handshake, not that the schema
-    // the runner needs exists. Only attempt the schema probe once the connect
-    // already succeeded — a connect failure is reported as `schema_ok: None`
-    // below, never silently re-tried or turned into `false`.
-    let schema_probe_result = if pg_reachable == Some(true) {
-        Some(pg_schema_probe().await)
-    } else {
-        None
-    };
-    let (schema_ok, schema_detail) = derive_schema_health(pg_reachable, schema_probe_result);
+    // PG state is read from CACHED state, with no PG I/O here (plan
+    // `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`
+    // Phase 5). The old inline `SELECT 1` cost every poll ~2 s while the
+    // database was down (the 2026-08-19 2.039 s confound). `pg_reachable` is
+    // the runner's own state for `derived_status`: Some(false) while the
+    // breaker is open, the age-bounded probe verdict otherwise.
+    let pg_health = crate::database::pg::health::pg_health_snapshot();
+    let pg_now = std::time::Instant::now();
+    let pg_reachable = pg_health.status_reachable(pg_now);
+    let (schema_ok, _) = pg_health.schema(pg_now);
 
     let main_window = {
         use tauri::Manager;
@@ -2211,6 +2179,10 @@ async fn health(
         pong_age_ms,
         last_event_pong: crate::ui_error::last_event_pong(),
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+        // From the SAME snapshot (`last_ping_emit_ok`) and clock reading the
+        // `pingDelivery` verdict beside it was classified with, so the verdict
+        // and the published `lastPingEmitOk` come from one read.
+        ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
     });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
@@ -2378,49 +2350,9 @@ async fn health(
             "hasDeviceJwt": relay_status.has_device_jwt,
             "lastError": relay_status.last_error,
         },
-        // iter4 B-5: PG data-layer liveness (bounded `SELECT 1`). `reachable`
-        // is null when unprobed/unconfigured, true/false otherwise. Drives the
-        // `degraded` downgrade above so `/health` mirrors the data layer.
-        "database": {
-            "reachable": pg_reachable,
-            // WHICH database this process is on -- `reachable` only says
-            // whether it answers, and is identically `true` for a developer's
-            // docker-compose cluster, for a bundled cluster this process
-            // started, and for one it attached to. Three states with
-            // completely different blast radii, previously distinguishable
-            // only by scraping the boot log. One of `external` /
-            // `embedded-owned` / `embedded-attached` / `degraded`; `unknown`
-            // only before boot reaches the PG block. Fixed at boot: it names
-            // the arm taken, not current liveness, so a cluster that dies
-            // later flips `reachable`, not `arm`.
-            "arm": crate::embedded_pg::db_arm().as_str(),
-            // The embedded cluster's loopback port, null off the embedded arms.
-            // Two runners reporting the same port is the observable form of the
-            // attach path's claim: one cluster, joined, not two fighting over a
-            // locked data dir.
-            "embeddedPort": crate::embedded_pg::embedded_port(),
-            // WHICH data dir is behind that port. `embeddedPort` alone cannot
-            // distinguish "this temp runner provisioned a private cluster"
-            // from "it attached to the machine-shared one" — the port is
-            // ephemeral either way. Null off the embedded arms.
-            "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
-            // How much of THIS response's latency was the PG probe. A timed-out
-            // probe costs exactly its 2s ceiling, which is most of a "slow"
-            // /health and has nothing to do with the UI thread — the 2026-08-19
-            // confound, now reported instead of inferred.
-            "probeMs": pg_probe_ms,
-            // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-
-            // probe-not-a-schema-probe`: does the SCHEMA the runner needs
-            // actually exist, not just "can we connect". `Some(true)` only
-            // when every relation in `SCHEMA_PROBE_REQUIRED_RELATIONS`
-            // resolves via `to_regclass()` — never a migration check, never a
-            // table scan. `None` means "could not determine" (the connect
-            // probe itself failed/is unknown, or the schema probe errored) —
-            // it must NEVER be read as `false`; `schema_detail` always
-            // explains whichever non-`Some(true)` state this is.
-            "schema_ok": schema_ok,
-            "schema_detail": schema_detail,
-        },
+        // PG liveness, the arm, the breaker and the schema check, from cached
+        // state (`database::pg::health`, plan Phase 5 / D7).
+        "database": crate::database::pg::health::database_health_json(&pg_health, pg_now),
         // Native message-loop liveness (plan
         // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5).
         // `wedged: true` means the window is frozen and the X button does
@@ -2455,6 +2387,11 @@ async fn health(
             "pingEmitFailures": ping_emit_failures,
             "lastPingEmitOk": last_ping_emit_ok,
             "lastPingEmitFail": last_ping_emit_fail,
+            // The `ui-bridge-ping` OS thread's own liveness (`ui_ping.rs`):
+            // wall-clock ms of its last tick, 0 = it never ran. A ping thread
+            // that died reads as an aging stamp here, and the native verdict
+            // above then reads `ping_not_emitted` rather than wedged.
+            "pingThreadTickMs": crate::ui_ping::ping_thread_tick_ms(),
             "pingDelivery": ping_delivery.as_str(),
             "falseDeathSuppressed": false_death_suppressed,
             // Descriptor pressure — the RECEIVE side (plan 2026-09-09 pong
@@ -2654,6 +2591,13 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Which cargo profile DIRECTORY this binary was built into (`debug`,
+        // `release-checked`, …), read from the build's own `OUT_DIR`; `null`
+        // when unmeasured, never a defaulted `"debug"`. The opt-level and the
+        // derived `optimized` verdict are in `provenance.build` (plan
+        // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it,
+        // Phase 2). Compile-time, like `buildId`.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // WHAT TREE STATE the two build halves came from, as content hashes
         // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
         // compile-time constants, like `gitSha`/`buildId` above. Compare them
@@ -2836,6 +2780,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.buildProfile`, for the same consumers.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // Top-level mirror of `data.provenance`, for the same consumers.
         "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
@@ -5565,6 +5511,16 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   same shape as `coord_post_finding`: it records what an overlord did, and
 ///   performs nothing.
 ///
+/// * the triage-pass ledger (plan
+///   `2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote`
+///   Phase 2b) — `coord_overlord_pass_record` (twin `POST /coord/overlord/passes`),
+///   the store-of-record for one `/triage-sessions` pass and its per-terminal
+///   rows, so session FLOW (time-to-close, nudge→progress) is measured rather
+///   than recalled. Like `coord_overlord_record` it is an append-only,
+///   self-attributed write that performs nothing. Its reads
+///   (`coord_query_overlord_passes`, `coord_query_overlord_flow`) need no entry:
+///   they ride the `coord_query_` read-family prefix.
+///
 /// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
 /// reported eleven names that coord ADVERTISED to this door's principal, which
 /// this list neither allowed nor named as deliberate. Each was classified; the
@@ -5723,6 +5679,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_operator_touch_classify",
     "coord_orient",
     "coord_overlord_interventions",
+    // Plan 2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote
+    // Phase 2b: the triage-PASS ledger write (twin `POST /coord/overlord/passes`).
+    // An append-only, self-attributed record of one /triage-sessions pass and its
+    // per-terminal rows; it records what the overlord observed and did, and
+    // performs nothing. Its two reads (`coord_query_overlord_passes`,
+    // `coord_query_overlord_flow`) ride the `coord_query_` prefix below.
+    "coord_overlord_pass_record",
     "coord_overlord_record",
     "coord_pending_agent_questions",
     "coord_pin_worktree",
@@ -6033,6 +5996,7 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // producer, so the two can never disagree about this binary.
         "gitSha": env!("QONTINUI_GIT_SHA"),
         "buildId": env!("RUNNER_BUILD_ID"),
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         "mainSha": main_sha,
         "buildDrift": build_drift,
         // The drift WARN's reader (plan
@@ -12268,8 +12232,11 @@ pub fn create_router(
         handle.listen("ui-bridge-pong", move |event| {
             // EVENT PROVENANCE, from whichever window answered: this pong
             // answered a `ui-bridge-ping` the event loop delivered, and
-            // travelled back as a Tauri event, so it proves the native loop
-            // is pumping. `ui_bridge_last_pong` cannot carry that fact — the
+            // travelled back as a Tauri event (the FALLBACK leg since the
+            // 2026-10-19 ui-wedge plan: the frontend answers over
+            // `POST /ui-bridge/pong?source=event` first, because a JS `emit`
+            // runs on `app-rt` and never settles while it is starved), so it
+            // proves the native loop is pumping. `ui_bridge_last_pong` cannot carry that fact — the
             // frontend also pongs unconditionally over HTTP, which WebView2
             // serves from its browser process while the UI thread is frozen.
             //
@@ -12294,45 +12261,10 @@ pub fn create_router(
         });
     }
 
-    // Start UI Bridge ping task (every 3s)
-    {
-        let handle = app_handle.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                // The `Result` is CHECKED, not discarded. This emit is the
-                // unfiltered broadcast (`handle.emit`, not `emit_to`), so it
-                // posts to every live window handle — and on Windows a single
-                // destroyed pop-out makes it fail with
-                // `ERROR_INVALID_WINDOW_HANDLE (0x80070578)`. It failed 119,012
-                // times on the operator box on 2026-09-01 while `let _ =`
-                // swallowed every one of them, and `ui_dead_now` — whose only
-                // evidence is a pong that this ping is supposed to elicit —
-                // called the UI dead 49 times as a result.
-                //
-                // Recording both arms is what lets `ui_error::ping_delivery_now`
-                // tell "the UI did not answer" from "we never asked".
-                match handle.emit(
-                    "ui-bridge-ping",
-                    serde_json::json!({ "timestamp": chrono::Utc::now().timestamp_millis() }),
-                ) {
-                    Ok(()) => crate::ui_error::record_ping_emit_ok(),
-                    Err(e) => {
-                        crate::ui_error::record_ping_emit_failure();
-                        // Deliberately `debug!`: a storm is 20/minute and the
-                        // COUNTER on `/health` is the surface meant to carry
-                        // it. One line per failure at `warn!` would be the
-                        // 119,012-line log this plan is cleaning up.
-                        tracing::debug!(
-                            error = %e,
-                            "ui-bridge-ping emit failed — the frontend was not asked for a pong"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // The `ui-bridge-ping` emitter is NOT started here any more: it runs on its
+    // own OS thread, started from `main.rs` setup beside the API server spawn
+    // (`ui_ping.rs`). A `tokio::spawn` here landed on `app-rt`, which is what
+    // let a starved runtime stop the ping.
 
     // Resume interrupted unified workflows on startup
     let state_for_resume = api_state.clone();
@@ -14216,17 +14148,16 @@ pub async fn start_server(
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
 
-    // D3 (self-healing degraded mode): if the runner booted degraded (PG
-    // unreachable + QONTINUI_ALLOW_NO_DB), start a background probe that
-    // reconnects + provisions and lifts the pg_guard 503 gate when PG returns —
-    // no restart needed for a transient outage. No-op on a normal boot.
-    if !crate::database::pg::pg_available() {
-        if let Some(pg) = crate::database::pg::PgDb::try_global() {
-            tracing::warn!(
-                "Runner booted DEGRADED (no PG); starting background PG reconnect probe"
-            );
-            pg.spawn_reconnect_probe();
+    // The PG circuit breaker's prober needs a process-lived runtime: this one.
+    // On a degraded boot (breaker Open, `cause=boot`) the prober starts now and
+    // reconnects + provisions, lifting the pg_guard 503 when PG returns; on a
+    // normal boot it starts on the first runtime trip.
+    if let Some(pg) = crate::database::pg::PgDb::try_global() {
+        if !crate::database::pg::pg_available() {
+            tracing::warn!("Runner booted DEGRADED (no PG); starting the PG breaker's prober");
         }
+        pg.start_background(tokio::runtime::Handle::current());
+        crate::database::pg::health::spawn_health_refresher();
     }
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
@@ -17601,6 +17532,7 @@ mod coord_mcp_body_gate_tests {
             "coord_session_obligations",
             "coord_overlord_record",
             "coord_overlord_interventions",
+            "coord_overlord_pass_record",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(!coord_mcp_withholding_is_deliberate(tool));
@@ -17620,6 +17552,26 @@ mod coord_mcp_body_gate_tests {
             );
         }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+        // The pass ledger's two reads are NOT named in the list: they forward
+        // through the `coord_query_` read-family prefix, so the parser must not
+        // find them as named entries while the gate still lets them through.
+        for read in ["coord_query_overlord_passes", "coord_query_overlord_flow"] {
+            assert!(coord_mcp_tool_is_allowed(read), "{read} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(read));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":read,"arguments":{}}
+                }))
+                .is_ok(),
+                "{read} must be callable through the proxy"
+            );
+            assert!(
+                !parsed.allowed.iter().any(|t| t == read),
+                "{read} rides the prefix and must not be named: {:?}",
+                parsed.allowed
+            );
+        }
     }
 
     /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`
@@ -19092,7 +19044,9 @@ mod coord_mcp_tool_policy_tests {
             "deliberateExclusionPrefixes",
             "gitSha",
             "buildId",
+            "buildProfile",
         ] {
+            assert!(served.get(key).is_some(), "{key} missing over the wire");
             assert_eq!(served[key], direct[key], "{key} differs over the wire");
         }
     }
@@ -20600,6 +20554,34 @@ mod coord_provision_session_gate_tests {
         for flow in crate::egress::Flow::ALL {
             assert_eq!(block[flow.key()]["domain"], flow.domain());
         }
+    }
+
+    /// Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`
+    /// Phase 2: `/health` carries `buildProfile` TWICE — under `data` beside
+    /// `buildId`, and at the root beside the root-level `buildId` mirror —
+    /// both rendered by the one `build_provenance::build_profile_json`, and
+    /// `provenance` (both copies) carries the `build` object it mirrors.
+    #[test]
+    fn the_health_handler_emits_build_profile_in_data_and_at_the_root() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let emit = "\"buildProfile\": qontinui_runner_lib::build_provenance::build_profile_json()";
+        assert_eq!(region.matches(emit).count(), 2, "{region}");
+        assert_eq!(
+            region
+                .matches("\"provenance\": qontinui_runner_lib::build_provenance::health_json()")
+                .count(),
+            2,
+            "{region}"
+        );
+        let provenance = qontinui_runner_lib::build_provenance::health_json();
+        assert_eq!(
+            provenance["build"]["profile"],
+            qontinui_runner_lib::build_provenance::build_profile_json()
+        );
     }
 
     /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-

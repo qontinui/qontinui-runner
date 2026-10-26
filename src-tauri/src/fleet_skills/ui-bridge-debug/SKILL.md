@@ -65,7 +65,21 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 
 # Type
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "type", "params": {"text": "value"}}'
+
+# Press a key (there is no "press" verb — keys go through sendKeys)
+curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "sendKeys", "params": {"keys": ["Enter"]}}'
 ```
+
+**Read the element's verbs before acting.** Each element advertises the verbs it
+accepts in its `actions` list (`GET $BASE/control/element/<id>`, or the
+element's entry in the snapshot) — use one of those rather than guessing.
+Today an unknown verb is rejected with a 400 whose message is
+`Unknown action '<x>'. Supported actions: <list>` and whose context carries
+`supportedActions` — but that list is the runner's GLOBAL verb list, not this
+element's, and there is no suggestion. Runner builds carrying the verb-hint
+change will instead list the element's own accepted verbs and add
+`didYouMean` and `paramsHint` (e.g. `press` → `sendKeys` with
+`{"keys": ["Enter"]}`). Either way, the element's `actions` list is the answer.
 
 ### 4. Verify layout without screenshots
 
@@ -192,7 +206,7 @@ export UIB_LOGIN_PASSWORD=$(aws ssm get-parameter --region eu-central-1 --name /
 $LOGIN_WEB --url "https://qontinui.io/login?next=%2Fdigital-twin" --success /digital-twin --email "$EMAIL" --expect-text "Delivery"
 ```
 
-**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + `qontinui-dev-notes/plans/2026-06-05-ui-bridge-authed-web-drive-harness.md`.
+**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + Qontinui's plan `2026-06-05-ui-bridge-authed-web-drive-harness`.
 
 ### Multi-step driving: act by id, wait for registration, script in JS (don't reinvent these)
 

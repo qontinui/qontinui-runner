@@ -417,7 +417,7 @@ pub enum ReviewStatus {
 
 impl GitHubClient {
     /// `consumer` is the budget-histogram label for whichever subsystem owns
-    /// this client — `pr_watcher`, `session_pr_reconciler`, `review_subtask`.
+    /// this client — `pr_watcher`, `session_pr_reconciler`.
     /// It never carries the token.
     pub fn new(token: &str, consumer: &'static str) -> Result<Self, String> {
         let client = reqwest::Client::builder()
@@ -939,48 +939,6 @@ impl GitHubClient {
         if !resp.is_success() {
             return Err(format!(
                 "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text()
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Submit a PR review (APPROVE, REQUEST_CHANGES, or COMMENT).
-    ///
-    /// Invalidates both the review list AND the PR detail: an approval changes
-    /// the PR's own `mergeable`/review-decision fields, so replaying a
-    /// pre-review body would report the state this call just superseded.
-    pub async fn submit_pr_review(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-        event: &str,
-        body: &str,
-    ) -> Result<(), String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
-            owner, repo, number
-        );
-        let resp = self
-            .send_write(
-                &url,
-                &[
-                    pr_reviews_url(owner, repo, number),
-                    pr_url(owner, repo, number),
-                ],
-                self.client
-                    .post(&url)
-                    .headers(self.headers())
-                    .json(&serde_json::json!({ "event": event, "body": body })),
-            )
-            .await?;
-
-        if !resp.is_success() {
-            return Err(format!(
-                "GitHub submit_pr_review returned {}: {}",
                 resp.status(),
                 resp.text()
             ));

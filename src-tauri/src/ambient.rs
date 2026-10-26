@@ -108,8 +108,10 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// - `QONTINUI_ROOT` / `QONTINUI_WORKSPACE_ROOT` — workspace discovery.
 /// - `QONTINUI_PLANS_DIR` — the plan corpus authoring directory.
 /// - `QONTINUI_DISABLE_KEYCHAIN` — flips the credential store to a file
-///   backend; a headless Linux box exports it and a test that inherits it
-///   exercises a different code path than CI does.
+///   backend. Captured and restored, but NOT set or removed by the fixture:
+///   CI sets it to `1` on purpose (the test step in `.github/workflows/ci.yml`),
+///   and removing it would re-arm the macOS keychain hang for every fixture
+///   test that does not set it again.
 /// - `DATABASE_URL` — set on a developer box and in DB-gated CI, unset
 ///   elsewhere.
 /// - `CLAUDE_CONFIG_DIR` — the Claude account in force on this box. A runner
@@ -124,7 +126,8 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// `std::env::var("QONTINUI_…")` / `("COORD_…")` literal appears in the
 /// PRODUCTION code under `src-tauri/src` — `#[cfg(test)]` modules and
 /// `#[test]` fns are outside the scan — that is not in this list, and the
-/// fixture captures and restores exactly this list around every test. A key
+/// fixture captures and restores this list around every test (with the
+/// root-confined keys, `test_support::captured_keys`). A key
 /// that exists only inside a test (an e2e opt-in, a marker a test plants) is
 /// not the ambient surface and is NOT listed: the test that reads it owns it.
 /// Keys read through a `const` (`env::var(SOME_ENV)`) are listed too, by
@@ -776,6 +779,15 @@ pub mod test_support {
         // A subject runner's root: a test that inherited one would run as a
         // secondary with the keychain gated off.
         "QONTINUI_INSTANCE_ROOT",
+        // A subject runner's identity, which a session it hosts passes to every
+        // test binary it runs: an inherited name reads the fixture as a named
+        // secondary, an inherited primary port as a nameless one (coord finding
+        // e0834743).
+        "QONTINUI_INSTANCE_NAME",
+        "QONTINUI_PRIMARY_PORT",
+        // QONTINUI_DISABLE_KEYCHAIN is deliberately NOT here, although a subject
+        // exports it too: CI sets it on purpose (plan
+        // 2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard, D3).
         "COORD_HTTP_URL",
         "QONTINUI_WORKSPACE_ROOT",
         "QONTINUI_SERVER_MODE",
@@ -783,6 +795,40 @@ pub mod test_support {
         "QONTINUI_RUNNER_TIER",
         "DATABASE_URL",
     ];
+
+    /// The root-confined keys the fixture removes: every
+    /// [`crate::instance_env::ROOT_CONFINED_ENV_KEYS`] entry [`KEYS_SET_TO_DIR`]
+    /// does not already point at its dir. A subject runner (a supervisor temp or
+    /// named instance) exports the whole family under its instance root, and a
+    /// session it hosts passes them to every test binary it runs, so a test
+    /// would read the HOSTING runner's dirs, and `apply_instance_root_env`
+    /// refuses any of them outside the instance root a subject test sets
+    /// (`<fixture>/subject`) (coord finding
+    /// e0834743; plan
+    /// `2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard`).
+    /// Derived rather than listed, so a key the runner confines later is
+    /// removed here too, with no second list to drift.
+    pub fn root_confined_keys_removed() -> impl Iterator<Item = &'static str> {
+        crate::instance_env::ROOT_CONFINED_ENV_KEYS
+            .iter()
+            .copied()
+            .filter(|k| !KEYS_SET_TO_DIR.contains(k))
+    }
+
+    /// Every key the fixture captures, and restores on drop:
+    /// [`super::AMBIENT_ENV_KEYS`] plus the root-confined keys that list does
+    /// not declare, so every key [`root_confined_keys_removed`] removes is put
+    /// back.
+    pub fn captured_keys() -> Vec<&'static str> {
+        let mut keys = super::AMBIENT_ENV_KEYS.to_vec();
+        keys.extend(
+            crate::instance_env::ROOT_CONFINED_ENV_KEYS
+                .iter()
+                .copied()
+                .filter(|k| !super::AMBIENT_ENV_KEYS.contains(k)),
+        );
+        keys
+    }
 
     /// A single process-wide lock that serializes every test which reads or
     /// mutates a `std::env` variable.
@@ -1088,8 +1134,8 @@ pub mod test_support {
     ///
     /// - takes the process-wide [`env_lock`], so no sibling test can observe or
     ///   race the environment it is about to rewrite;
-    /// - captures every [`super::AMBIENT_ENV_KEYS`] value for restoration on
-    ///   drop, **including the panic path**;
+    /// - captures every [`captured_keys`] value for restoration on drop,
+    ///   **including the panic path**;
     /// - creates a `tempfile::tempdir()` and points every [`KEYS_SET_TO_DIR`]
     ///   key at it — so [`super::qontinui_dir`], `dirs::home_dir()`, the
     ///   runner's config dir and its secure-storage dir all resolve inside the
@@ -1097,7 +1143,9 @@ pub mod test_support {
     /// - creates `<dir>/root` and points `QONTINUI_ROOT` at it, so the
     ///   workspace-root resolver answers a directory this test owns;
     /// - removes every [`KEYS_REMOVED`] key, which a configured developer box
-    ///   exports and a clean CI runner does not;
+    ///   exports and a clean CI runner does not, and every
+    ///   [`root_confined_keys_removed`] key, which a session a subject runner
+    ///   hosts inherits;
     /// - sets `QONTINUI_ENV` to [`NO_SUCH_PROFILE`], so the profile arm of the
     ///   coord-base resolver misses deterministically;
     /// - clears the process-global runtime tier override
@@ -1133,7 +1181,7 @@ pub mod test_support {
         #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             let lock = env_lock();
-            let restore = EnvVarRestore::capture(super::AMBIENT_ENV_KEYS);
+            let restore = EnvVarRestore::capture(&captured_keys());
             let dir = tempfile::tempdir().expect("isolated ambient fixture needs a temp dir");
             let root = dir.path().join("root");
             std::fs::create_dir_all(&root).expect("isolated ambient fixture needs <dir>/root");
@@ -1156,7 +1204,11 @@ pub mod test_support {
                 std::env::set_var(key, dir.path());
             }
             std::env::set_var("QONTINUI_ROOT", &root);
-            for key in KEYS_REMOVED {
+            for key in KEYS_REMOVED
+                .iter()
+                .copied()
+                .chain(root_confined_keys_removed())
+            {
                 std::env::remove_var(key);
             }
             std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
@@ -1374,7 +1426,9 @@ mod tests {
 
     /// Sorted so an addition has one obvious place, and covering every key the
     /// fixture itself steers — a key the fixture sets or removes but does not
-    /// declare would not be restored on drop.
+    /// capture would not be restored on drop. The derived root-confined keys
+    /// are captured through [`captured_keys`]; every other steered key must be
+    /// declared in [`AMBIENT_ENV_KEYS`].
     #[test]
     fn ambient_env_keys_are_sorted_and_cover_the_fixture() {
         let mut sorted = AMBIENT_ENV_KEYS.to_vec();
@@ -1382,7 +1436,17 @@ mod tests {
         assert_eq!(sorted, AMBIENT_ENV_KEYS, "AMBIENT_ENV_KEYS must be sorted");
         let set: BTreeSet<&str> = AMBIENT_ENV_KEYS.iter().copied().collect();
         for k in fixture_steered_keys() {
-            assert!(set.contains(k), "{k} must be in AMBIENT_ENV_KEYS");
+            assert!(
+                set.contains(k) || root_confined_keys_removed().any(|r| r == k),
+                "{k} is steered by the fixture but not captured: add it to AMBIENT_ENV_KEYS"
+            );
+        }
+        let captured: BTreeSet<&str> = captured_keys().into_iter().collect();
+        for k in root_confined_keys_removed() {
+            assert!(
+                captured.contains(k),
+                "{k} is removed by the fixture but not captured"
+            );
         }
     }
 
@@ -1588,6 +1652,7 @@ mod tests {
             .chain(KEYS_REMOVED)
             .chain(&["QONTINUI_ROOT", "QONTINUI_ENV", QONTINUI_HOME_ENV])
             .copied()
+            .chain(root_confined_keys_removed())
             .collect()
     }
 
@@ -1603,7 +1668,7 @@ mod tests {
         const SENTINEL: &str = "__qontinui_ambient_sentinel__";
         let steered = fixture_steered_keys();
         let _lock = env_lock();
-        let _outer = EnvVarRestore::capture(AMBIENT_ENV_KEYS);
+        let _outer = EnvVarRestore::capture(&captured_keys());
         for k in &steered {
             std::env::set_var(k, SENTINEL);
         }
@@ -1620,7 +1685,8 @@ mod tests {
                         Some(dir.as_os_str()),
                         "{k} must point at the fixture dir"
                     );
-                } else if KEYS_REMOVED.contains(k) {
+                } else if KEYS_REMOVED.contains(k) || root_confined_keys_removed().any(|r| r == *k)
+                {
                     assert_eq!(got, None, "{k} must be removed");
                 } else if *k == "QONTINUI_ROOT" {
                     assert_eq!(got.as_deref(), Some(amb.root().as_os_str()));
@@ -2295,6 +2361,12 @@ mod tests {
             "`paired_user_path_with`: the BARE-DEFAULT binding-store candidate, consulted only \
              without an instance root (`pair/subject_isolation.rs` replaces the candidate set \
              under one, D2)",
+        ),
+        (
+            "fleet.rs",
+            1,
+            "`CredProbeEnv::from_process`: gh's own `~/.config/gh/hosts.yml` fallback, the \
+             user's gh login read for presence only (never its value), not runner state",
         ),
         (
             "coord_doctor.rs",

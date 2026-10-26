@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn a_rooted_subject_persists_its_workspace_root_into_its_own_config() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = crate::instance::enter_rooted_subject_for_test(&amb);
+        let root = crate::instance::enter_rooted_subject_for_test(&amb);
         let expected = workspace_root().expect("the fixture's QONTINUI_ROOT must resolve");
 
         persist_resolved_workspace_root().expect("a subject may write its own settings");
