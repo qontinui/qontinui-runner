@@ -1316,9 +1316,14 @@ pub async fn tick_live() {
         return;
     };
     // Only the process that owns this instance's record ticks it (a second
-    // runner process on the same instance root must not write it).
+    // runner process on the same instance root must not write it). A process
+    // whose boot step found it owned elsewhere keeps trying to claim it, and
+    // runs the skipped boot step when it wins (`claim_late`).
     if !ctl.owns_record() {
-        return;
+        super::prepare::claim_late_live(ctl).await;
+        if !ctl.owns_record() {
+            return;
+        }
     }
     // Before the boot step has run, a rebuilt runner's record still reads
     // `preparing` over a cohort whose sessions are gone: scoring it now would
@@ -1383,8 +1388,9 @@ async fn run_loop() {
     if !crate::coord_drain_state::boot_read_complete() {
         warn!(
             "restart_prep: the boot drain read has not completed after 120 s — the notice loop \
-             runs anyway, so a prepare record is still served (a rebuilt runner's record may not \
-             have been moved to `restoring` yet)"
+             starts ticking anyway; it acts on the record only once this process owns it (and \
+             then runs the boot step if it was skipped), so a rebuilt runner's record may not be \
+             `restoring` yet"
         );
     }
     BOOT_WAIT_OVER.store(true, std::sync::atomic::Ordering::SeqCst);
