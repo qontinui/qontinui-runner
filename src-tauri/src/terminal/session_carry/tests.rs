@@ -1849,3 +1849,180 @@ async fn the_last_look_lands_on_the_deadline_and_still_counts() {
         "looks at 0, 0.6 and 1.0 s — the last one cut short onto the deadline"
     );
 }
+
+// ---- review round 5 (S1, S4, S5) ---------------------------------------------
+
+/// S1 — the production rename-aside is retried once on `PermissionDenied` (a
+/// transient Windows filter hold): a rename that fails once and then succeeds
+/// still preserves the fork and copies the live transcript in its place, and
+/// the retry renames over the claimed placeholder.
+#[test]
+fn a_rename_aside_that_fails_once_with_permission_denied_is_retried() {
+    let tmp = scratch("rename-aside-retry");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+    let calls = std::cell::Cell::new(0usize);
+
+    let carried = carry_session_with_rename(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                assert!(
+                    std::fs::metadata(to).is_ok_and(|m| m.len() == 0),
+                    "the claimed backup is an empty placeholder when the first attempt fails"
+                );
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::rename(from, to)
+            }
+        },
+    )
+    .expect("the retry moves the fork aside");
+    let MainCarry::DivergedPreserved { backup } = &carried.main else {
+        panic!("expected the fork preserved, got {:?}", carried.main);
+    };
+    assert_eq!(std::fs::read(backup).unwrap(), FORK_MAIN);
+    assert_eq!(read_main(&dst), SRC_MAIN, "the live conversation resumes");
+    assert_eq!(
+        diverged_backups(&dst),
+        vec![backup.clone()],
+        "one backup, no stray placeholder"
+    );
+    // Main: one failure + one retry; the subagent fork: one rename.
+    assert_eq!(calls.get(), 3);
+    assert_eq!(carried.session_dir.diverged_preserved, 1);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S5 — a subagent transcript moved aside keeps its fork's `.meta.json` beside
+/// it under the SAME suffix, taken before the source's meta replaces the
+/// destination's; the destination meta then is the live one.
+#[test]
+fn a_moved_aside_subagent_keeps_its_meta_json_under_the_same_suffix() {
+    let tmp = scratch("sub-meta");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let live_meta: &[u8] = br#"{"description":"live run"}"#;
+    let fork_meta: &[u8] = br#"{"description":"forked run"}"#;
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-a1.meta.json", live_meta),
+        ],
+    );
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nfork\n"),
+            ("subagents/agent-a1.meta.json", fork_meta),
+        ],
+    );
+
+    let carried = carry(&src, &dst);
+    assert_eq!(carried.session_dir.diverged_preserved, 1);
+    let backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let suffix = backups[0]
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("agent-a1.jsonl")
+        .unwrap()
+        .to_string();
+    assert!(suffix.starts_with(".diverged-"), "{suffix}");
+    let sub = literal_sidecar(&dst).join("subagents");
+    assert_eq!(
+        std::fs::read(sub.join(format!("agent-a1.meta.json{suffix}"))).unwrap(),
+        fork_meta,
+        "the fork's meta survives beside its transcript, same suffix"
+    );
+    assert_eq!(subagent_backups(&dst, "agent-a1.meta.json").len(), 1);
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        live_meta
+    );
+    assert_eq!(
+        carried.subagents,
+        vec![CarriedSubagent {
+            agent_id: "a1".to_string(),
+            description: Some("live run".to_string()),
+        }]
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S4 — after the delta sync, the resumable list is recomputed from disk: a
+/// subagent the sync first copied is named; one new at the source but not
+/// (yet) at the destination is not; one the carry left diverged is not.
+#[test]
+fn resumable_subagents_now_names_what_the_sync_copied_and_nothing_still_missing() {
+    let tmp = scratch("resumable-now");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let src_side = seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
+    let carried = carry(&src, &dst);
+    assert_eq!(agent_ids(&carried), ["a1"]);
+
+    // The old pane spawns n9 after the carry; the sync copies it.
+    std::fs::write(src_side.join("subagents").join("agent-n9.jsonl"), b"n\n").unwrap();
+    assert_eq!(sync(&carried).copied, 1);
+    // And m5 after the sync: never reached the destination.
+    std::fs::write(src_side.join("subagents").join("agent-m5.jsonl"), b"m\n").unwrap();
+
+    let now: Vec<String> = resumable_subagents_now(&carried)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.agent_id)
+        .collect();
+    assert_eq!(now, ["a1", "n9"]);
+
+    // A file the carry recorded as left diverged stays out.
+    let mut diverged = carried.clone();
+    diverged.files[0].wrote = CarryWrite::Diverged;
+    let now: Vec<String> = resumable_subagents_now(&diverged)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.agent_id)
+        .collect();
+    assert_eq!(now, ["n9"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S4 — a subagent whose carry write failed is named once the sync has
+/// replaced it, and not while the destination is still as the failure left it.
+#[test]
+fn resumable_subagents_now_names_a_failed_carry_only_once_the_sync_wrote_it() {
+    let tmp = scratch("resumable-failed");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
+    let dst_file = literal_sidecar(&dst)
+        .join("subagents")
+        .join("agent-a1.jsonl");
+    std::fs::create_dir_all(dst_file.parent().unwrap()).unwrap();
+    // An older prefix the carry "failed" to extend: still at the destination.
+    let mut carried = carry(&src, &dst);
+    std::fs::write(&dst_file, b"").unwrap();
+    carried.files[0].wrote = CarryWrite::Failed;
+    carried.files[0].dst = FileStamp::of(&dst_file);
+    assert!(
+        resumable_subagents_now(&carried).unwrap().is_empty(),
+        "still exactly what the failed write left"
+    );
+    assert_eq!(sync(&carried).copied, 1);
+    let now: Vec<String> = resumable_subagents_now(&carried)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.agent_id)
+        .collect();
+    assert_eq!(now, ["a1"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
