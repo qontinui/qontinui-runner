@@ -143,8 +143,8 @@ fn should_fire(
 ///    scan does not even read the pane. Any limit text then (old or new) is
 ///    the exhaustion the operator accepted.
 /// 2. **For the terminal's whole life, a hint may migrate it only on a
-///    SUCCESSFUL probe that reads exhausted** ([`is_restored_limit_hit`], read
-///    by `account_migration::exhaustion_confirmed`). Past the window the pane
+///    SUCCESSFUL probe that reads exhausted** ([`restored_marker`], read by
+///    `account_migration::hint_gate`). Past the window the pane
 ///    takes the normal path, and stale limit text on screen then costs at most
 ///    a probe: after the reset a successful probe reads not exhausted. But the
 ///    fleet-wide confirm also counts a FAILED probe (no token, any non-2xx, a
@@ -529,8 +529,7 @@ mod tests {
         );
     }
 
-    /// Rule 1: inside the window no hint fires for the terminal, whatever the
-    /// screen shows; once it passes the normal `should_fire` path runs.
+    /// Serializes the tests that write or retain the process-global marker map.
     fn marker_lock() -> crate::test_env::TestLockGuard {
         marker_test_lock()
     }
