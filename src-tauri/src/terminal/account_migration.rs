@@ -621,6 +621,18 @@ pub(crate) fn copy_transcript(
         working_dir,
         claude_session_id,
     );
+    // Before the first copy the target has no project dir to resolve, and for
+    // a cwd over 200 encoded chars `session_transcript_path` then answers the
+    // UNTRUNCATED name, which is not where `claude --resume` looks. Reuse the
+    // source's on-disk dir name instead: Claude Code wrote it, `-<hash>`
+    // suffix included, and derives the same name from the same cwd.
+    let dst = match (dst.exists(), src.parent().and_then(Path::file_name)) {
+        (false, Some(src_dir_name)) => Path::new(dst_config_dir)
+            .join("projects")
+            .join(src_dir_name)
+            .join(format!("{claude_session_id}.jsonl")),
+        _ => dst,
+    };
     let src_meta = std::fs::metadata(&src)
         .map_err(|e| format!("source transcript missing at {}: {e}", src.display()))?;
     if let Ok(dst_meta) = std::fs::metadata(&dst) {
@@ -1522,6 +1534,54 @@ mod tests {
         assert_eq!(dst, dst2);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A cwd whose encoded name exceeds 200 chars lives in a `<prefix>-<hash>`
+    /// dir. The copy lands in a dir of the SAME name in the target account,
+    /// not the untruncated name `claude --resume` would never look in.
+    #[test]
+    fn copy_transcript_keeps_a_long_project_dir_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_cfg = tmp.path().join("src");
+        let dst_cfg = tmp.path().join("dst");
+        let working_dir = format!("/home/u/{}", "d".repeat(250));
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let prefix = crate::terminal::transcript::encode_project_path(&working_dir)
+            .get(..200)
+            .unwrap()
+            .to_string();
+        let src_dir = src_cfg.join("projects").join(format!("{prefix}-k3j2h1"));
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join(format!("{sid}.jsonl")),
+            b"{\"type\":\"user\"}\n",
+        )
+        .unwrap();
+
+        let dst = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            &working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(
+            dst,
+            dst_cfg
+                .join("projects")
+                .join(format!("{prefix}-k3j2h1"))
+                .join(format!("{sid}.jsonl"))
+        );
+        assert!(dst.exists());
+        // The retry resolves the same file through the target's own dir.
+        let dst2 = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            &working_dir,
+            sid,
+        )
+        .unwrap();
+        assert_eq!(dst, dst2);
     }
 
     #[test]
