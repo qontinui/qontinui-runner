@@ -903,7 +903,10 @@ fn write_main(cfg: &Path, bytes: &[u8]) {
 }
 
 fn read_main(cfg: &Path) -> Vec<u8> {
-    std::fs::read(crate::terminal::transcript::session_transcript_path(cfg, WD, SID)).unwrap()
+    std::fs::read(crate::terminal::transcript::session_transcript_path(
+        cfg, WD, SID,
+    ))
+    .unwrap()
 }
 
 /// A destination that FORKED — its `.jsonl` files are smaller than the
@@ -984,10 +987,7 @@ fn an_append_only_prefix_destination_jsonl_is_extended() {
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
     seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nb\n")]);
     seed_session(&dst, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
-    write_main(
-        &src,
-        b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
-    );
+    write_main(&src, b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
 
     let carried = carry(&src, &dst);
     assert_eq!(
@@ -1002,7 +1002,12 @@ fn an_append_only_prefix_destination_jsonl_is_extended() {
         b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n"
     );
     assert_eq!(
-        std::fs::read(literal_sidecar(&dst).join("subagents").join("agent-a1.jsonl")).unwrap(),
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
         b"a\nb\n"
     );
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1031,7 +1036,10 @@ fn delta_sync_retries_a_failed_overwrite_of_an_existing_destination() {
         .unwrap();
     entry.dst = FileStamp::of(&dst_file);
     entry.wrote = CarryWrite::Failed;
-    assert!(entry.dst.is_some(), "the failed overwrite left a destination");
+    assert!(
+        entry.dst.is_some(),
+        "the failed overwrite left a destination"
+    );
 
     let done = sync(&src, &dst, &carried);
     assert_eq!(done.copied, 1, "{done:?}");
@@ -1063,7 +1071,10 @@ fn the_rename_retry_backs_out_when_the_destination_changed_during_the_pause() {
     });
 
     assert!(matches!(outcome, Ok(false)), "{outcome:?}");
-    assert_eq!(calls, 1, "the retry must not rename over a changed destination");
+    assert_eq!(
+        calls, 1,
+        "the retry must not rename over a changed destination"
+    );
     assert_eq!(std::fs::read(&to).unwrap(), b"a\nresumed wrote this\n");
     let partials: Vec<_> = std::fs::read_dir(&tmp)
         .unwrap()

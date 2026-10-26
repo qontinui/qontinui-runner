@@ -296,17 +296,16 @@ pub(crate) fn carry_session(
     // on its own and keeps its in-place sidecars). Sidecars that are rewritten
     // in place (not appended) follow it -- on a migration the source is newer,
     // but on a respawn that tops up from several holders the TARGET may be.
-    let source_is_newer = main_verdict != Verdict::Diverged
-        && dst_len.is_none_or(|len| src_meta.len() >= len);
+    let source_is_newer =
+        main_verdict != Verdict::Diverged && dst_len.is_none_or(|len| src_meta.len() >= len);
     match main_verdict {
         Verdict::Write => {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
             }
-            copy_via_partial(&src, &dst).map_err(|e| {
-                format!("copy {} -> {} failed: {e}", src.display(), dst.display())
-            })?;
+            copy_via_partial(&src, &dst)
+                .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
         }
         Verdict::Diverged => warn!(
             from = %src.display(),
