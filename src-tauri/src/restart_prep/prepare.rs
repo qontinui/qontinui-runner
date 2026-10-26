@@ -2939,6 +2939,7 @@ mod tests {
             unattributed_live: 0,
             device_drain: None,
             close_reasons: std::collections::HashMap::new(),
+            activity_detail: std::collections::HashMap::new(),
         };
         let mut v = crate::restart_prep::notice::verdict_of(&rec, &ev, None, T0);
         rec.verdict = Some(v.clone());

@@ -64,37 +64,50 @@ pub const PROMPT_MARKER: char = '❯';
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    idle_veto(lines, cursor_row).is_none()
+}
+
+/// Which of [`snapshot_looks_idle`]'s checks vetoes idle on this snapshot, as
+/// a short human-readable reason; `None` exactly when the snapshot looks idle.
+/// The same checks in the same order — the diagnostic for a pane that keeps
+/// reading busy (see `restart_prep::notice`'s told-but-busy log line).
+pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
     // (1) any processing-indicator text ⇒ busy.
-    for line in lines {
+    for (row, line) in lines.iter().enumerate() {
         let lower = line.to_ascii_lowercase();
         for ind in PROCESSING_INDICATORS {
             if lower.contains(ind) {
-                return false;
+                return Some(format!("processing indicator `{ind}` on row {row}"));
             }
         }
     }
 
     // (2) spinner glyphs (excluding bare `·`) ⇒ busy — except on the static
     // completed-turn line Claude Code leaves under a finished turn.
-    for line in lines {
+    for (row, line) in lines.iter().enumerate() {
         if is_completed_turn_line(line) {
             continue;
         }
-        for ch in line.chars() {
-            if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
-                return false;
-            }
+        if let Some(ch) = line
+            .chars()
+            .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch))
+        {
+            return Some(format!(
+                "spinner glyph `{ch}` on row {row}: {}",
+                line.trim()
+            ));
         }
     }
 
     // (3) prompt marker visible — remember its row for (4).
     let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
-        return false;
+        return Some("no `❯` prompt row on screen".to_string());
     };
 
     // (4) cursor in the input area (at/below the prompt row).
-    (cursor_row as usize) >= prompt_row
+    ((cursor_row as usize) < prompt_row)
+        .then(|| format!("cursor on row {cursor_row}, above the `❯` prompt row {prompt_row}"))
 }
 
 /// Is `line` the static line Claude Code leaves on screen once a turn has
@@ -342,6 +355,25 @@ mod tests {
             "❯ ",
         ]);
         assert!(!snapshot_looks_idle(&grid, 2));
+    }
+
+    #[test]
+    fn idle_veto_names_the_check_that_fired() {
+        let v = |rows: &[&str], c: u16| idle_veto(&lines(rows), c);
+        assert_eq!(v(&["done", "❯ "], 1), None);
+        assert!(v(&["  12.3k tokens · esc to interrupt", "❯ "], 1)
+            .unwrap()
+            .starts_with("processing indicator `esc to interrupt`"));
+        assert!(v(&["✶ Pondering", "❯ "], 1)
+            .unwrap()
+            .starts_with("spinner glyph `✶` on row 0"));
+        assert_eq!(v(&["out"], 0).unwrap(), "no `❯` prompt row on screen");
+        assert_eq!(
+            v(&["a", "❯ "], 0).unwrap(),
+            "cursor on row 0, above the `❯` prompt row 1"
+        );
+        // The completed-turn line names no veto.
+        assert_eq!(v(&["✻ Cooked for 16s · done 10:30 AM", "❯ "], 1), None);
     }
 
     #[test]

@@ -250,6 +250,7 @@ fn census(procs: Vec<(&str, ProcEvidence)>) -> CensusEvidence {
         unattributed_live: 0,
         device_drain: Some("drained".to_string()),
         close_reasons: HashMap::new(),
+        activity_detail: HashMap::new(),
     }
 }
 
@@ -1175,6 +1176,45 @@ fn restart_prep_the_readiness_block_is_flat_and_names_its_source() {
     assert_eq!(json["source"], READINESS_SOURCE);
     // Read-only: the record it was computed from is untouched.
     assert_eq!(rec.cohort.rows[0].pause_state, None);
+}
+
+/// E2E re-run: a told session stayed "told; still working" ~11 minutes after
+/// its turn ended and nothing said why. The diagnostic names the activity,
+/// what it was read from, and the grid veto — once per change.
+#[test]
+fn restart_prep_a_told_but_busy_row_logs_what_kept_it_busy_once_per_change() {
+    let mut told = row("tb-s1");
+    told.notified_at = Some(T0);
+    let mut untold = row("tb-s2");
+    untold.notified_at = None;
+    let mut ev = census(vec![
+        ("tb-s1", proc(Activity::Stale, Some(false))),
+        ("tb-s2", proc(Activity::Working, Some(false))),
+    ]);
+    ev.activity_detail.insert(
+        "tb-s1".to_string(),
+        "pane=None children=Some(false) record=Missing".to_string(),
+    );
+    let mut c = cohort(vec![told, untold], T0);
+    refresh_rows(&mut c, &ev);
+    assert_eq!(c.rows[0].pause_state, Some(PauseState::Notified));
+    let veto = |_: &str| Some("spinner glyph `✻` on row 3: ✻ Cooking…".to_string());
+    let lines = log_told_busy(&c, &ev, &veto);
+    assert_eq!(lines.len(), 1, "only the told row: {lines:?}");
+    assert!(lines[0].contains("activity=Stale"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("grid_veto=spinner glyph `✻`"),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("record=Missing"), "{}", lines[0]);
+    // Unchanged next tick: not logged again.
+    assert!(log_told_busy(&c, &ev, &veto).is_empty());
+    // A different veto: logged again.
+    let clean = |_: &str| None;
+    let again = log_told_busy(&c, &ev, &clean);
+    assert_eq!(again.len(), 1);
+    assert!(again[0].contains("grid_veto=none (the grid reads idle)"));
 }
 
 #[test]
