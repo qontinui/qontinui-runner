@@ -1600,6 +1600,13 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 /// malformed session id, 409 when no open record for it lives on that
 /// terminal, 503 with no lifecycle store. The hook ignores the answer either
 /// way and never holds up an exit.
+///
+/// The terminal binding is a CONSISTENCY check, not authentication: a local
+/// process running as the same user can still read a session's terminal id
+/// and forge its marker. The effect is bounded — the marker expires after
+/// `claude_ended_watch::MARKER_TTL`, and it only changes the close reason of a
+/// session whose `claude` then actually disappears (to non-restorable
+/// `claude-ended`); it never closes anything by itself.
 async fn session_end(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,

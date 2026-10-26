@@ -1635,7 +1635,13 @@ pub fn terminal_session_record_close(
     // record of them (taken before it emitted the exit): a session already
     // removed by `close_after_graceful_exit` must not read as unknown, which
     // would drop its `close_requested` (review round 12 N3).
-    let deliberate = crate::session::claude_ended_watch::deliberate_end(&claude_session_id);
+    //
+    // The marker read is the one of the record this close will actually
+    // close: a close redirected to the terminal's open record is that record's
+    // end, not the requested id's (review round 14 nit 2).
+    let deliberate = store
+        .close_target(&claude_session_id, terminal_id.as_deref())
+        .is_some_and(|target| crate::session::claude_ended_watch::deliberate_end(&target));
     let facts = terminal_id.as_deref().and_then(|tid| {
         use tauri::Manager;
         let live = crate::tauri_app_handle::current().and_then(|app| {
@@ -1660,7 +1666,7 @@ pub fn terminal_session_record_close(
         cause,
     );
     let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), reason);
-    crate::session::claude_ended_watch::consume_marker_after(&outcome, &claude_session_id);
+    crate::session::claude_ended_watch::consume_marker_after(&outcome);
     Ok(close_outcome_response(&outcome))
 }
 

@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::info;
 
@@ -62,19 +62,18 @@ const MAX_MARKERS: usize = 1024;
 /// well inside it — the pane's own exit at once, the watch within seconds, the
 /// 45 s poll after `LIVE_SHELL_DEAD_TICKS` ticks (minutes) — so an older marker
 /// belongs to no close in flight and counts as absent (and is pruned).
-pub const MARKER_TTL_MS: i64 = 10 * 60 * 1000;
+/// Measured on the MONOTONIC clock (review round 14 nit 1): a wall-clock step
+/// can neither extend nor shorten it.
+pub const MARKER_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Claude sessions whose `SessionEnd` hook reported a deliberate end
 /// ([`DELIBERATE_END_REASONS`]), keyed by the CLAUDE session id the hook
 /// payload carries (so a second session in the same terminal never inherits
-/// it), valued by when it was recorded (for the TTL and the bound).
-static DELIBERATE_ENDS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+/// it), valued by when it was recorded (monotonic; for the TTL and the bound).
+static DELIBERATE_ENDS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+fn expired(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) >= MARKER_TTL
 }
 
 /// PURE: whether `id` is shaped like a Claude session id — a UUID
@@ -96,17 +95,17 @@ pub fn is_session_id_shaped(id: &str) -> bool {
 /// [`report_session_end`], which also requires the session to be OPEN on the
 /// reporting terminal.
 pub fn record_session_end(claude_session_id: &str, reason: &str) -> bool {
-    record_session_end_at(claude_session_id, reason, now_ms())
+    record_session_end_at(claude_session_id, reason, Instant::now())
 }
 
-fn record_session_end_at(claude_session_id: &str, reason: &str, now: i64) -> bool {
+fn record_session_end_at(claude_session_id: &str, reason: &str, now: Instant) -> bool {
     let id = claude_session_id;
     if !is_session_id_shaped(id) || !DELIBERATE_END_REASONS.contains(&reason) {
         return false;
     }
     let mut guard = DELIBERATE_ENDS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    map.retain(|_, at| now - *at < MARKER_TTL_MS);
+    map.retain(|_, at| !expired(*at, now));
     if map.len() >= MAX_MARKERS && !map.contains_key(id) {
         if let Some(oldest) = map
             .iter()
@@ -167,18 +166,18 @@ pub fn report_session_end(
 }
 
 /// Whether `claude_session_id` reported a deliberate end within
-/// [`MARKER_TTL_MS`].
+/// [`MARKER_TTL`].
 pub fn deliberate_end(claude_session_id: &str) -> bool {
-    deliberate_end_at(claude_session_id, now_ms())
+    deliberate_end_at(claude_session_id, Instant::now())
 }
 
-fn deliberate_end_at(claude_session_id: &str, now: i64) -> bool {
+fn deliberate_end_at(claude_session_id: &str, now: Instant) -> bool {
     let mut guard = DELIBERATE_ENDS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = guard.as_mut() else {
         return false;
     };
     match map.get(claude_session_id) {
-        Some(at) if now - *at < MARKER_TTL_MS => true,
+        Some(at) if !expired(*at, now) => true,
         Some(_) => {
             map.remove(claude_session_id);
             false
@@ -200,19 +199,20 @@ pub fn forget_session_end(claude_session_id: &str) {
     }
 }
 
-/// Consume `claude_session_id`'s marker after a close — only when that close
-/// actually CLOSED its record (review round 13 S3). A refused or redirected
-/// close (`AlreadyClosed`, `NotFound`, `TerminalSuperseded`, …) leaves the
-/// record open, and the marker must survive for the close that does land.
-pub fn consume_marker_after(
-    outcome: &crate::session::session_lifecycle_store::CloseOutcome,
-    claude_session_id: &str,
-) {
-    if matches!(
-        outcome,
-        crate::session::session_lifecycle_store::CloseOutcome::Closed { .. }
-    ) {
-        forget_session_end(claude_session_id);
+/// Consume the marker of the record a close actually CLOSED (review round 13
+/// S3): the requested id on `Closed`, the id its terminal redirected to on
+/// `Redirected` / `RedirectedAmbiguous` (review round 14 nit 2). A refused
+/// close (`AlreadyClosed`, `NotFound`, `TerminalSuperseded`) closed nothing,
+/// and the marker must survive for the close that does land.
+pub fn consume_marker_after(outcome: &crate::session::session_lifecycle_store::CloseOutcome) {
+    use crate::session::session_lifecycle_store::CloseOutcome;
+    match outcome {
+        CloseOutcome::Closed { claude_session_id } => forget_session_end(claude_session_id),
+        CloseOutcome::Redirected { closed, .. }
+        | CloseOutcome::RedirectedAmbiguous { closed, .. } => forget_session_end(closed),
+        CloseOutcome::AlreadyClosed { .. }
+        | CloseOutcome::TerminalSuperseded { .. }
+        | CloseOutcome::NotFound { .. } => {}
     }
 }
 
@@ -387,7 +387,7 @@ async fn tick_live(watch: &mut EndedWatch) {
             );
             let outcome =
                 store.record_close_checked(&id, Some(&terminal_id), CLAUDE_ENDED_CLOSE_REASON);
-            consume_marker_after(&outcome, &id);
+            consume_marker_after(&outcome);
         }
     }
 }
@@ -557,40 +557,56 @@ mod tests {
         );
     }
 
-    /// Review round 13 N3: a marker older than the TTL counts as absent and
-    /// is pruned.
+    /// Review round 13 N3 / round 14: a marker older than the TTL counts as
+    /// absent and is pruned. Anchored on the REAL monotonic clock, so a
+    /// concurrent test's real-clock prune never evicts it early.
     #[test]
     fn a_marker_past_its_ttl_counts_as_absent() {
         let id = "4f6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
-        assert!(record_session_end_at(id, "prompt_input_exit", 1_000));
-        assert!(deliberate_end_at(id, 1_000 + MARKER_TTL_MS - 1));
-        assert!(!deliberate_end_at(id, 1_000 + MARKER_TTL_MS));
-        // Pruned: even a read "back in time" finds nothing now.
-        assert!(!deliberate_end_at(id, 1_000));
+        let at = Instant::now();
+        assert!(record_session_end_at(id, "prompt_input_exit", at));
+        assert!(deliberate_end_at(
+            id,
+            at + MARKER_TTL - Duration::from_millis(1)
+        ));
+        assert!(!deliberate_end_at(id, at + MARKER_TTL));
+        // Pruned: even a read at the recording instant finds nothing now.
+        assert!(!deliberate_end_at(id, at));
     }
 
-    /// Review round 13 S3: the marker is consumed only by a close that
-    /// actually closed the record; a refused close leaves it for the close
-    /// that will land.
+    /// Review round 13 S3 / round 14 nit 2: the marker consumed is the one of
+    /// the record a close actually closed — the requested id, or the id it was
+    /// redirected to; a refused close leaves it for the close that will land.
     #[test]
     fn only_a_landed_close_consumes_the_marker() {
         use crate::session::session_lifecycle_store::CloseOutcome;
         let id = "5f6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+        let other = "9f6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
         assert!(record_session_end(id, "prompt_input_exit"));
-        consume_marker_after(
-            &CloseOutcome::AlreadyClosed {
-                claude_session_id: id.to_string(),
-            },
-            id,
-        );
+        consume_marker_after(&CloseOutcome::AlreadyClosed {
+            claude_session_id: id.to_string(),
+        });
+        consume_marker_after(&CloseOutcome::NotFound {
+            requested: id.to_string(),
+            terminal_id: None,
+        });
         assert!(deliberate_end(id), "a refused close keeps the marker");
-        consume_marker_after(
-            &CloseOutcome::Closed {
-                claude_session_id: id.to_string(),
-            },
-            id,
-        );
+        consume_marker_after(&CloseOutcome::Closed {
+            claude_session_id: id.to_string(),
+        });
         assert!(!deliberate_end(id), "a landed close consumes it");
+
+        // Redirected: the requested id's marker is kept, the closed one's goes.
+        assert!(record_session_end(id, "prompt_input_exit"));
+        assert!(record_session_end(other, "prompt_input_exit"));
+        consume_marker_after(&CloseOutcome::Redirected {
+            requested: id.to_string(),
+            closed: other.to_string(),
+            terminal_id: "t".to_string(),
+        });
+        assert!(!deliberate_end(other), "the redirected-to record's marker");
+        assert!(deliberate_end(id), "not the requested id's");
+        forget_session_end(id);
     }
 
     /// The watch closes a gone row only with the marker: without it the

@@ -5132,10 +5132,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                         reason,
                                     );
                                     // Consumed only by a close that landed.
-                                    session::claude_ended_watch::consume_marker_after(
-                                        &outcome,
-                                        &rec.claude_session_id,
-                                    );
+                                    session::claude_ended_watch::consume_marker_after(&outcome);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(

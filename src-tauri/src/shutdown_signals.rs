@@ -160,6 +160,15 @@ mod tests {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
+                // A child that deadlocks (a lock another thread held at the
+                // fork, a malloc arena among them) must die signalled rather
+                // than hang the parent's waitpid: SIGALRM after 10 s, armed
+                // FIRST, before anything that might take such a lock. A child
+                // test that arms its own shorter alarm replaces this one.
+                libc::alarm(10);
+                // The panic hook prints through the harness's captured stdio
+                // (locks); the child reports a panic by its exit status alone.
+                std::panic::set_hook(Box::new(|_| {}));
                 // A panic in the child must never unwind into the forked copy
                 // of the test harness: it ends the child with a status the
                 // parent's assertions cannot mistake for a pass.

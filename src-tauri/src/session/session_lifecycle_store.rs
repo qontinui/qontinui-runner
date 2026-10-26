@@ -1812,6 +1812,21 @@ impl SessionLifecycleStore {
             .unwrap_or(0)
     }
 
+    /// Read-only: the `claude_session_id` a [`Self::record_close_checked`]
+    /// with these arguments would close right now — the requested id, or the
+    /// open record its terminal redirects to — or `None` when it would close
+    /// nothing. Lets a caller read per-session state (the deliberate-end
+    /// marker) for the record that will actually close (review round 14).
+    pub fn close_target(
+        &self,
+        claude_session_id: &str,
+        expect_terminal_id: Option<&str>,
+    ) -> Option<String> {
+        let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
+        let m = self.map.lock().ok()?;
+        resolve_close_target(&m, claude_session_id, expect).0
+    }
+
     /// Close the record the caller's TERMINAL actually owns, not merely the one
     /// its (possibly stale) `claude_session_id` names.
     ///
@@ -7653,6 +7668,27 @@ mod tests {
         assert_eq!(reason(Some(false), true), "poll-dead");
         assert_eq!(reason(None, true), "poll-dead");
         assert!(RESTORABLE_CLOSE_REASONS.contains(&reason(Some(true), false)));
+    }
+
+    /// Review round 14 nit 2: `close_target` names the record a close would
+    /// actually close — the requested id, or the open record its terminal
+    /// redirects to — without closing anything.
+    #[test]
+    fn close_target_names_the_record_a_close_would_close() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("live"));
+        assert_eq!(
+            store.close_target("live", Some("term-abc")).as_deref(),
+            Some("live")
+        );
+        assert_eq!(
+            store.close_target("stale-id", Some("term-abc")).as_deref(),
+            Some("live"),
+            "redirected to the terminal's open record"
+        );
+        assert_eq!(store.close_target("stale-id", None), None);
+        assert_eq!(store.get("live").unwrap().state, "open", "nothing closed");
     }
 
     /// Nit 4: exactly the listed reasons have a restore grace window.
