@@ -22,8 +22,10 @@
 //!   diverged is a fork with its own tail, and is left alone. The one
 //!   exception is the main `<sid>.jsonl` on an account migration
 //!   ([`MainTranscript::LiveSourceWins`]): the live conversation must be what
-//!   resumes, so the fork is renamed aside to `<sid>.jsonl.diverged-<unix_ms>`
-//!   (never deleted) and the source is copied in its place.
+//!   resumes, so any destination that is neither byte-identical to the source
+//!   nor a prefix of it — whatever its size — is renamed aside to
+//!   `<sid>.jsonl.diverged-<unix_ms>` (never deleted) and the source is copied
+//!   in its place.
 //! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
 //!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
@@ -138,11 +140,14 @@ pub(crate) enum MainCarry {
     Copied,
     /// The destination held an older byte-prefix of the source; replaced.
     ExtendedPrefix,
-    /// The destination was already at least as large; left untouched.
+    /// The destination was already current; left untouched. Under
+    /// [`MainTranscript::LiveSourceWins`] that means byte-identical to the
+    /// source; otherwise at least as large.
     Present,
-    /// [`MainTranscript::LiveSourceWins`] only: the destination had diverged
-    /// from the source (a fork with a tail of its own). It was renamed aside to
-    /// `backup`, in the same dir, and the source copied in its place.
+    /// [`MainTranscript::LiveSourceWins`] only: the destination was neither
+    /// byte-identical to the source nor a strict byte-prefix of it (a fork —
+    /// smaller, the same size with other bytes, or larger). It was renamed
+    /// aside to `backup`, in the same dir, and the source copied in its place.
     DivergedPreserved { backup: PathBuf },
     /// The destination's smaller copy was kept although the source's differs:
     /// a [`MainTranscript::KeepExisting`] target, or a diverged fork under
@@ -254,11 +259,14 @@ pub(crate) enum MainTranscript {
     /// append-only extension); keep it otherwise.
     ExtendPrefix,
     /// The account migration: the SOURCE is the live conversation and is what
-    /// the respawn resumes. As [`Self::ExtendPrefix`], except that a smaller
-    /// destination that DIVERGED is renamed aside to
-    /// `<sid>.jsonl.diverged-<unix_ms>` (never deleted) and the source copied
-    /// in its place ([`MainCarry::DivergedPreserved`]). If the rename-aside
-    /// fails the carry fails, so the migration leaves the old pane untouched.
+    /// the respawn resumes, whatever the sizes. A byte-identical destination is
+    /// left alone ([`MainCarry::Present`]) and a strict byte-prefix is extended
+    /// ([`MainCarry::ExtendedPrefix`]); any other destination — smaller and
+    /// diverged, the same size with other bytes, or larger — is renamed aside
+    /// to `<sid>.jsonl.diverged-<unix_ms>` (never deleted) and the source
+    /// copied in its place ([`MainCarry::DivergedPreserved`]). If the
+    /// rename-aside fails the carry fails, so the migration leaves the old pane
+    /// untouched.
     LiveSourceWins,
     /// Never replace an existing one (only an absent one is written). The
     /// respawn receiver uses this for a target that already held the
@@ -286,12 +294,14 @@ pub(crate) fn copy_transcript(
 
 /// Copy the session transcript from the source account's project dir into
 /// the target account's matching project dir. The source file is never
-/// modified or removed. Skips the copy when the destination already exists
-/// and is at least as large (idempotent retry). When it is smaller but its
-/// bytes are not a prefix of the source's (a fork), `main` decides: keep it
-/// ([`MainCarry::KeptExisting`], warned), or — on a migration — rename it
-/// aside and copy the source ([`MainCarry::DivergedPreserved`]). `main` can
-/// also forbid replacing an existing destination at all.
+/// modified or removed. Outside a migration, skips the copy when the
+/// destination already exists and is at least as large (idempotent retry), and
+/// keeps a smaller one whose bytes are not a prefix of the source's (a fork;
+/// [`MainCarry::KeptExisting`], warned). On a migration
+/// ([`MainTranscript::LiveSourceWins`]) only a byte-identical destination is
+/// skipped; every other non-prefix destination is renamed aside and the source
+/// copied ([`MainCarry::DivergedPreserved`]). `main` can also forbid replacing
+/// an existing destination at all.
 ///
 /// Then carries the session's sibling directory `<sid>/` file by file. Claude
 /// Code keeps each subagent's transcript there
@@ -368,6 +378,24 @@ where
     let dst_len = std::fs::metadata(&dst).map(|dst_meta| dst_meta.len()).ok();
     let main_verdict = match dst_len {
         None => Verdict::Write,
+        // A migration resumes the LIVE source, whatever the sizes: only a
+        // byte-identical destination is current, and one that is the same size
+        // with other bytes, or larger, is a fork to move aside. Before this, a
+        // larger stale fork read as current, was resumed, and the live pane was
+        // closed — dropping the live conversation.
+        Some(len) if len >= src_len && main == MainTranscript::LiveSourceWins => {
+            match is_byte_identical(&dst, &src) {
+                Ok(true) => Verdict::Current,
+                Ok(false) => Verdict::Diverged,
+                Err(e) => {
+                    return Err(format!(
+                        "compare {} with {} failed: {e}",
+                        dst.display(),
+                        src.display()
+                    ))
+                }
+            }
+        }
         // Already migrated (retry / repeated hint), or the newer copy.
         Some(len) if len >= src_len => Verdict::Current,
         // Smaller: an older prefix of the source, or a fork that wrote its
@@ -421,10 +449,14 @@ where
         // A target that already held the transcript resumes ITS copy, so its
         // in-place sidecars stay with it, whatever a holder has.
         false
+    } else if main == MainTranscript::LiveSourceWins {
+        // A migration that got here left the destination holding the live
+        // source's bytes (copied, extended, preserved-aside-and-copied, or
+        // already identical), so the live side's sidecars follow it.
+        true
     } else if main_verdict == Verdict::Diverged {
-        // A fork kept in place ran on its own and keeps its sidecars; a fork
-        // moved aside was replaced by the live source, whose sidecars follow.
-        matches!(main_carry, MainCarry::DivergedPreserved { .. })
+        // A fork kept in place ran on its own and keeps its sidecars.
+        false
     } else {
         dst_len.is_none_or(|len| src_len >= len)
     };
@@ -474,7 +506,8 @@ where
     })
 }
 
-/// [`MainTranscript::LiveSourceWins`] on a diverged destination: move the
+/// [`MainTranscript::LiveSourceWins`] on a destination that is neither
+/// byte-identical to the source nor a prefix of it: move the
 /// fork aside to [`diverged_backup_path`] with `rename_aside`, then copy the
 /// source in its place. Errors — so the carry, and the migration's step 1,
 /// fail — when the fork cannot be moved aside (nothing is overwritten then),
@@ -773,6 +806,16 @@ fn is_byte_prefix(prefix: &Path, of: &Path) -> std::io::Result<bool> {
         remaining -= n as u64;
     }
     Ok(true)
+}
+
+/// Whether `a` and `b` hold exactly the same bytes: equal lengths, then the
+/// chunked [`is_byte_prefix`] comparison over every byte — never a size or
+/// mtime shortcut.
+fn is_byte_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    is_byte_prefix(a, b)
 }
 
 fn is_jsonl(path: &Path) -> bool {
