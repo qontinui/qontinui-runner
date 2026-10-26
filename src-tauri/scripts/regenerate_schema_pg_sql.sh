@@ -96,14 +96,27 @@ cd "$(dirname "$0")/.."  # src-tauri/
 . ../atlas/scripts/lib.sh
 
 # One source for credentials. PGPASSWORD is exported for pg_dump/psql and the
-# helper containers; URLs carry the password percent-encoded, so a character
-# like @ : / # ? in it cannot break them.
+# helper containers. The user (and, where a URL must carry it, the password) is
+# percent-encoded, so a character like @ : / # ? cannot break a URL; an IPv6
+# host is bracketed.
 PG_PASSWORD="${PGPASSWORD:-qontinui_dev_password}"
 export PGPASSWORD="$PG_PASSWORD"
+urlenc() {
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+# pg_url <db> [nopass]. `nopass` leaves the password out of the URL, for a URL
+# that travels in argv: every consumer of such a URL (psql, Atlas) reads the
+# exported PGPASSWORD instead.
 pg_url() {
-    local enc
-    enc="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PG_PASSWORD")"
-    printf 'postgresql://%s:%s@%s:%s/%s\n' "$PG_USER" "$enc" "$HOST" "$PORT" "$1"
+    local host="$HOST" secret=""
+    case "$host" in
+        \[*) ;;
+        *:*) host="[$host]" ;;
+    esac
+    if [[ "${2:-}" != "nopass" ]]; then
+        secret=":$(urlenc "$PG_PASSWORD")"
+    fi
+    printf 'postgresql://%s%s@%s:%s/%s\n' "$(urlenc "$PG_USER")" "$secret" "$host" "$PORT" "$1"
 }
 
 OUTPUT="schema.pg.sql.generated"
@@ -196,7 +209,7 @@ else
     # With a named container, the helper containers join its network and reach
     # Postgres on its own port (works on Docker Desktop, which has no host
     # networking); without one they use the host network.
-    ATLAS_PG_CONTAINER="$CONTAINER" bash ../atlas/scripts/apply_to.sh "$(pg_url "$DUMP_DB")"
+    ATLAS_PG_CONTAINER="$CONTAINER" bash ../atlas/scripts/apply_to.sh "$(pg_url "$DUMP_DB" nopass)"
 fi
 
 # ---------------------------------------------------------------------
