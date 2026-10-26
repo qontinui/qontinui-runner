@@ -2017,9 +2017,11 @@ pub async fn terminal_migrate_session_account(
     // Which session does the pane PROVABLY run, under which account? Resolved
     // from the provider's live registry before anything is lifted or spawned
     // (plan 2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions,
-    // Phase 3). A session live in another process is refused even here; an
-    // unresolved identity falls back to the record, since the click is the
-    // operator's own confirmation.
+    // Phase 3). The click NAMES a session id, so a pane provably running a
+    // different id is refused (naming both), and so is a session live — or
+    // possibly live — in another process; an identity that merely could not
+    // be established falls back to the record, since the click is the
+    // operator's own confirmation, and the response says so.
     let subject = crate::terminal::account_migration::resolve_migration_subject(
         &app,
         &store,
@@ -2028,7 +2030,11 @@ pub async fn terminal_migrate_session_account(
     )
     .await
     .map_err(|reason| format!("migration refused: {reason}"))?;
-    let (record, src) = (subject.record, subject.src_config_dir);
+    let (record, src, identity_note) = (
+        subject.record,
+        subject.src_config_dir,
+        subject.identity_note,
+    );
 
     let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
@@ -2068,13 +2074,14 @@ pub async fn terminal_migrate_session_account(
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
-            "migrated session {} to {}",
+            "migrated session {} to {} (identity {identity_note})",
             record.claude_session_id, outcome.to_config_dir
         )),
         data: Some(serde_json::json!({
             "newTerminalId": outcome.new_terminal_id,
             "fromConfigDir": outcome.from_config_dir,
             "toConfigDir": outcome.to_config_dir,
+            "identity": identity_note,
         })),
     })
 }

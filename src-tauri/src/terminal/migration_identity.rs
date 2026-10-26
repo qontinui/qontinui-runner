@@ -42,11 +42,26 @@
 //!
 //! [`registry_row_validity`]: crate::session::claude_session_registry::registry_row_validity
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::process_capture::process_tree::ProcessSnapshot;
-use crate::session::claude_session_registry::{RegistryRow, RowValidity};
+use crate::session::claude_session_registry::{RegistryRow, RowValidity, UnknownRow};
 use crate::terminal::graceful_exit::ProcIdentity;
+
+/// Whether this build's `procStart` clock has been checked against REAL
+/// Claude Code registry files (2026-10-23 review fix 3).
+///
+/// Windows: yes — the FILETIME clock was validated against every live
+/// `sessions/<pid>.json` in the 2026-10-21 census. Elsewhere: the Linux clock
+/// (`ps -o lstart` in UTC, read from the CLI bundle — see the
+/// `claude_session_registry` module doc) is implemented but has never met a
+/// real Linux registry file. So off Windows a pane whose identity cannot be
+/// validated is [`MigrationIdentity::Unverifiable`]: the migration keeps its
+/// PRE-identity-check behaviour (migrate the runner's record, with a `warn!`
+/// naming why identity was not checked) instead of silently refusing every
+/// usage-limit hint — which would turn automatic migration OFF on Linux.
+pub const PROC_START_CLOCK_VERIFIED: bool = cfg!(windows);
 
 /// The migration's verdict on what the pane is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,62 +71,109 @@ pub enum MigrationIdentity {
     /// the registry row (the account the process actually runs under).
     Confirmed { sid: String, config_dir: PathBuf },
     /// The pane's one valid registry row names a DIFFERENT id than the record
-    /// (an in-pane `/clear` / `/resume`, or a binder mis-bind). Migrate THAT
-    /// id; the caller corrects the record.
+    /// (an in-pane `/clear` / `/resume`, or a binder mis-bind).
     Rebound { sid: String, config_dir: PathBuf },
     /// Another valid live interactive process holds the id. Refuse — migrating
     /// would fork it.
     HeldElsewhere { pid: u32 },
-    /// Identity could not be established. Refuse.
+    /// A live process OUTSIDE the pane has a registry row of UNKNOWN validity
+    /// that may name the id (including a row too torn to read its id). A fork
+    /// cannot be ruled out. Refuse.
+    MaybeHeldElsewhere { pid: u32, why: String },
+    /// Identity could not be established. Refuse (the operator's command
+    /// falls back to the record).
     Unknown(String),
+    /// Identity could not be established on a platform whose `procStart`
+    /// clock is not verified ([`PROC_START_CLOCK_VERIFIED`]): proceed on the
+    /// record, as before the check existed.
+    Unverifiable(String),
 }
 
 /// Pure decision. `pane_claude_pids` are the countable claude pids in the
 /// pane's inclusive subtree; `rows` are EVERY registry row with its validity
 /// against the same snapshot (stale rows included — they are ignored here,
-/// which is the point of carrying the verdict).
+/// which is the point of carrying the verdict). `clock_verified` is
+/// [`PROC_START_CLOCK_VERIFIED`] in production; a parameter so the off-Windows
+/// arm is testable on every platform.
 ///
-/// - no claude pid in the pane ⇒ `Unknown` (covers an unreadable/empty table);
-/// - any pane row whose validity is UNKNOWN ⇒ `Unknown` (it might be the
-///   pane's real identity);
-/// - not exactly one VALID pane row ⇒ `Unknown`;
+/// - a `sessions/` dir that could not be listed ⇒ unknown;
+/// - an UNKNOWN-validity row for a pid that also has a VALID row is a dead
+///   predecessor's file (one process writes one file) and is disregarded;
+/// - no claude pid in the pane ⇒ unknown (covers an unreadable/empty table);
+/// - any pane row whose validity is UNKNOWN ⇒ unknown (it might be the pane's
+///   real identity);
+/// - not exactly one VALID pane row ⇒ unknown;
 /// - a VALID interactive row outside the pane holding the id ⇒
 ///   `HeldElsewhere`; an UNKNOWN-validity interactive row outside the pane
-///   holding it ⇒ `Unknown` (never `HeldElsewhere`, never ignored);
+///   that names the id, or whose id could not be read ⇒ `MaybeHeldElsewhere`;
 /// - else `Confirmed` when the id is the record's, `Rebound` when not.
+///
+/// "unknown" is [`MigrationIdentity::Unknown`] when `clock_verified`, else
+/// [`MigrationIdentity::Unverifiable`].
 pub fn decide_migration_identity(
     record_sid: &str,
     pane_claude_pids: &[u32],
     rows: &[RegistryRow],
+    clock_verified: bool,
 ) -> MigrationIdentity {
+    let unknown = |why: String| {
+        if clock_verified {
+            MigrationIdentity::Unknown(why)
+        } else {
+            MigrationIdentity::Unverifiable(why)
+        }
+    };
+    if let Some(dir) = rows
+        .iter()
+        .find(|r| r.validity == RowValidity::Unknown(UnknownRow::RegistryDirUnreadable))
+    {
+        return unknown(format!(
+            "the registry could not be listed under {:?}",
+            dir.config_dir
+        ));
+    }
     if pane_claude_pids.is_empty() {
-        return MigrationIdentity::Unknown(
+        return unknown(
             "no live claude process in the pane (or the process table was unreadable)".into(),
         );
     }
+    // One process writes one file: an UNKNOWN row for a pid that also has a
+    // VALID row is a dead predecessor's, not a second identity.
+    let valid_pids: HashSet<u32> = rows
+        .iter()
+        .filter(|r| r.validity.is_valid())
+        .map(|r| r.pid)
+        .collect();
+    let rows: Vec<&RegistryRow> = rows
+        .iter()
+        .filter(|r| !(matches!(r.validity, RowValidity::Unknown(_)) && valid_pids.contains(&r.pid)))
+        .collect();
     let in_pane = |pid: u32| pane_claude_pids.contains(&pid);
-    let pane_rows: Vec<&RegistryRow> = rows.iter().filter(|r| in_pane(r.pid)).collect();
+    let pane_rows: Vec<&RegistryRow> = rows.iter().copied().filter(|r| in_pane(r.pid)).collect();
     if let Some((r, why)) = pane_rows.iter().find_map(|r| match r.validity {
         RowValidity::Unknown(why) => Some((r, why)),
         _ => None,
     }) {
-        return MigrationIdentity::Unknown(format!(
+        return unknown(format!(
             "pane claude pid {} has a registry row whose validity is unknown: {}",
             r.pid,
             why.as_str()
         ));
     }
-    let valid_pane: Vec<&&RegistryRow> =
-        pane_rows.iter().filter(|r| r.validity.is_valid()).collect();
+    let valid_pane: Vec<&RegistryRow> = pane_rows
+        .iter()
+        .copied()
+        .filter(|r| r.validity.is_valid())
+        .collect();
     let row = match valid_pane.as_slice() {
-        [one] => **one,
+        [one] => *one,
         [] => {
-            return MigrationIdentity::Unknown(format!(
+            return unknown(format!(
                 "no valid registry row for the pane's claude pid(s) {pane_claude_pids:?}"
             ))
         }
         many => {
-            return MigrationIdentity::Unknown(format!(
+            return unknown(format!(
                 "{} valid registry rows for the pane's claude pids {:?}",
                 many.len(),
                 many.iter().map(|r| r.pid).collect::<Vec<_>>()
@@ -120,26 +182,30 @@ pub fn decide_migration_identity(
     };
     let sid = row.session_id.clone();
 
-    // Another holder: same id, outside the pane, interactive (the class the
-    // 2026-10-21 census showed real forks in). Valid ⇒ refuse; unknown ⇒ we
-    // cannot rule a fork out ⇒ refuse as Unknown; stale ⇒ not evidence.
-    let others = rows
+    // Another holder: outside the pane, interactive (the class the 2026-10-21
+    // census showed real forks in). Valid + same id ⇒ refuse; unknown + same
+    // (or unreadable) id ⇒ a fork cannot be ruled out ⇒ refuse; stale ⇒ not
+    // evidence.
+    let mut maybe: Option<(u32, &'static str)> = None;
+    for other in rows
         .iter()
-        .filter(|r| !in_pane(r.pid) && r.session_id == sid && r.is_interactive());
-    let mut unknown_holder: Option<(u32, &'static str)> = None;
-    for other in others {
+        .filter(|r| !in_pane(r.pid) && r.is_interactive())
+    {
         match other.validity {
-            RowValidity::Valid => return MigrationIdentity::HeldElsewhere { pid: other.pid },
-            RowValidity::Unknown(why) => {
-                unknown_holder.get_or_insert((other.pid, why.as_str()));
+            RowValidity::Valid if other.session_id == sid => {
+                return MigrationIdentity::HeldElsewhere { pid: other.pid }
             }
-            RowValidity::Stale(_) => {}
+            RowValidity::Unknown(why) if other.session_id == sid || other.session_id.is_empty() => {
+                maybe.get_or_insert((other.pid, why.as_str()));
+            }
+            _ => {}
         }
     }
-    if let Some((pid, why)) = unknown_holder {
-        return MigrationIdentity::Unknown(format!(
-            "pid {pid} may also hold {sid} (row validity unknown: {why})"
-        ));
+    if let Some((pid, why)) = maybe {
+        return MigrationIdentity::MaybeHeldElsewhere {
+            pid,
+            why: why.to_string(),
+        };
     }
 
     let config_dir = row.config_dir.clone();
@@ -158,19 +224,21 @@ pub fn resolve_from_snapshot(
     record_sid: &str,
     snapshot: &ProcessSnapshot,
     rows: &[RegistryRow],
+    clock_verified: bool,
 ) -> MigrationIdentity {
     let pane_pids = crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(
         pane_child_pid,
         snapshot,
     );
-    decide_migration_identity(record_sid, &pane_pids, rows)
+    decide_migration_identity(record_sid, &pane_pids, rows, clock_verified)
 }
 
 /// I/O resolver: take ONE process-table snapshot, find the pane's claude pids
 /// (as `resume_door::read_claude_procs` does, from the pane's `child_pid`),
 /// read and validate every registry row against that same snapshot, and
 /// decide. `pane_child_pid = None` (the manager could not resolve the pane's
-/// child) is `Unknown`.
+/// child) is unknown. The registry read and the decision run on the blocking
+/// pool — they are disk reads (2026-10-23 review fix 8).
 ///
 /// Also returns the pane's `claude` ANCHOR (oldest claude image, pid + start
 /// time) from the same snapshot: the migration's detached delta sync waits for
@@ -193,29 +261,39 @@ pub async fn resolve_migration_identity(
             None,
         );
     }
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let rows = crate::session::claude_session_registry::read_registry_rows(&config_dirs, &snapshot);
     let writer = crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)
         .map(|(pid, started_at)| ProcIdentity { pid, started_at });
-    (
-        resolve_from_snapshot(root, record_sid, &snapshot, &rows),
-        writer,
-    )
+    let record_sid_owned = record_sid.to_string();
+    let identity = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+        let rows =
+            crate::session::claude_session_registry::read_registry_rows(&config_dirs, &snapshot);
+        resolve_from_snapshot(
+            root,
+            &record_sid_owned,
+            &snapshot,
+            &rows,
+            PROC_START_CLOCK_VERIFIED,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| MigrationIdentity::Unknown(format!("registry read did not complete: {e}")));
+    (identity, writer)
 }
 
-/// Who asked for the migration. It decides ONE arm only — `Unknown`.
+/// Who asked for the migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationTrigger {
     /// The PTY usage-limit hint: nobody chose this pane, so an unproven
     /// identity never authorizes closing it (plan Phase 3, "the migration does
-    /// NOT act").
+    /// NOT act"). It migrates whatever the pane provably runs (`Rebound`).
     UsageLimitHint,
-    /// The operator's `terminal_migrate_session_account` click. The plan keeps
-    /// it as the path that "still handles" a pane the automatic path refused,
-    /// and the click is its own confirmation — so an UNRESOLVED identity falls
-    /// back to the record (said so in a `warn!`). A PROVEN fork
-    /// (`HeldElsewhere`) is refused here too: the click names a pane, not a
-    /// licence to open a second live process on one conversation.
+    /// The operator's `terminal_migrate_session_account` click. It NAMES a
+    /// session id, so a pane provably running a DIFFERENT id is refused
+    /// rather than silently migrating something else; so is a possible second
+    /// holder. An identity that merely could not be established falls back to
+    /// the record (the click is the confirmation), said so in a `warn!` and in
+    /// the response.
     OperatorCommand,
 }
 
@@ -230,12 +308,11 @@ pub enum MigrationVerdict {
         config_dir: PathBuf,
         rebound_from: Option<String>,
     },
-    /// Operator command with an unresolved identity: migrate the RECORD's
-    /// session out of the record's account. `why` is the unresolved reason.
+    /// Migrate the RECORD's session out of the record's account: the identity
+    /// was not established (`why`).
     ProceedOnRecord { why: String },
     /// Do not migrate. `reason` is the typed `session-account-migration-skipped`
-    /// reason: `session-live-in-another-process(pid N)` or
-    /// `identity-unresolved(<why>)`.
+    /// reason (and the operator command's error).
     Refuse { reason: String },
 }
 
@@ -251,13 +328,23 @@ pub fn migration_verdict(
             config_dir,
             rebound_from: None,
         },
-        MigrationIdentity::Rebound { sid, config_dir } => MigrationVerdict::Proceed {
-            sid,
-            config_dir,
-            rebound_from: Some(record_sid.to_string()),
+        MigrationIdentity::Rebound { sid, config_dir } => match trigger {
+            MigrationTrigger::UsageLimitHint => MigrationVerdict::Proceed {
+                sid,
+                config_dir,
+                rebound_from: Some(record_sid.to_string()),
+            },
+            MigrationTrigger::OperatorCommand => MigrationVerdict::Refuse {
+                reason: format!(
+                    "identity-mismatch(the pane runs session {sid}, not the requested {record_sid})"
+                ),
+            },
         },
         MigrationIdentity::HeldElsewhere { pid } => MigrationVerdict::Refuse {
             reason: format!("session-live-in-another-process(pid {pid})"),
+        },
+        MigrationIdentity::MaybeHeldElsewhere { pid, why } => MigrationVerdict::Refuse {
+            reason: format!("identity-unresolved(pid {pid} may also hold the id: {why})"),
         },
         MigrationIdentity::Unknown(why) => match trigger {
             MigrationTrigger::UsageLimitHint => MigrationVerdict::Refuse {
@@ -265,6 +352,24 @@ pub fn migration_verdict(
             },
             MigrationTrigger::OperatorCommand => MigrationVerdict::ProceedOnRecord { why },
         },
+        MigrationIdentity::Unverifiable(why) => MigrationVerdict::ProceedOnRecord {
+            why: format!("identity not checked on this platform: {why}"),
+        },
+    }
+}
+
+/// Pure: a `Rebound` migrates the provider's id only when that id has a
+/// transcript under the source account. Without one, rewriting the record
+/// would leave two open records on the terminal and the copy would fail
+/// anyway (2026-10-23 review fix 9) — refuse instead, before anything is
+/// written.
+pub fn rebound_transcript_gate(sid: &str, src: &str, has_transcript: bool) -> Result<(), String> {
+    if has_transcript {
+        Ok(())
+    } else {
+        Err(format!(
+            "identity-unresolved(rebound id {sid} has no transcript under {src})"
+        ))
     }
 }
 
@@ -293,7 +398,16 @@ pub fn same_config_dir(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::claude_session_registry::{StaleRow, UnknownRow};
+    use crate::session::claude_session_registry::StaleRow;
+
+    /// The verified-clock (Windows) decision — every pre-existing case.
+    fn decide_migration_identity(
+        record_sid: &str,
+        pane_claude_pids: &[u32],
+        rows: &[RegistryRow],
+    ) -> MigrationIdentity {
+        super::decide_migration_identity(record_sid, pane_claude_pids, rows, true)
+    }
 
     fn row(pid: u32, sid: &str, cfg: &str, validity: RowValidity) -> RegistryRow {
         RegistryRow {
@@ -400,7 +514,7 @@ mod tests {
             "c",
             RowValidity::Unknown(UnknownRow::ProcessTableUnreadable),
         )];
-        match resolve_from_snapshot(P2_PID, REC, &empty, &rows) {
+        match resolve_from_snapshot(P2_PID, REC, &empty, &rows, true) {
             MigrationIdentity::Unknown(why) => assert!(
                 why.contains("no live claude process"),
                 "unexpected reason: {why}"
@@ -458,10 +572,13 @@ mod tests {
             row(P2_PID, REC, "c", RowValidity::Valid),
             row(9, REC, "d", unknown),
         ];
-        match decide_migration_identity(REC, &[P2_PID], &elsewhere) {
-            MigrationIdentity::Unknown(why) => assert!(why.contains("pid 9"), "{why}"),
-            other => panic!("expected Unknown, got {other:?}"),
-        }
+        assert_eq!(
+            decide_migration_identity(REC, &[P2_PID], &elsewhere),
+            MigrationIdentity::MaybeHeldElsewhere {
+                pid: 9,
+                why: UnknownRow::NoProcStart.as_str().to_string()
+            }
+        );
     }
 
     /// Two valid rows in the pane (two claude pids, both registered) — which
@@ -595,6 +712,181 @@ mod tests {
         assert_eq!(
             roster_spelling(&other, &roster),
             other.to_string_lossy().into_owned()
+        );
+    }
+
+    // ── 2026-10-23 review fixes ─────────────────────────────────────────────
+
+    fn unreadable(pid: u32, cfg: &str) -> RegistryRow {
+        RegistryRow {
+            pid,
+            session_id: String::new(),
+            config_dir: PathBuf::from(cfg),
+            kind: None,
+            validity: RowValidity::Unknown(UnknownRow::UnreadableFile),
+        }
+    }
+
+    /// Fix 2: a live second holder whose file was caught mid-write (its id
+    /// unreadable) is a POSSIBLE holder — never silently `Confirmed`. A
+    /// `sessions/` dir that could not be listed is unknown outright.
+    ///
+    /// Mutation check: dropping `|| other.session_id.is_empty()` from the
+    /// holder arm turns the first case into `Confirmed`.
+    #[test]
+    fn a_torn_registry_file_of_a_live_claude_may_hold_the_id() {
+        let rows = vec![
+            row(P2_PID, REC, ".claude-tiohorst", RowValidity::Valid),
+            unreadable(51860, ".claude-lukas"),
+        ];
+        assert_eq!(
+            decide_migration_identity(REC, &[P2_PID], &rows),
+            MigrationIdentity::MaybeHeldElsewhere {
+                pid: 51860,
+                why: UnknownRow::UnreadableFile.as_str().to_string()
+            }
+        );
+        let dir_down = vec![
+            row(P2_PID, REC, ".claude-tiohorst", RowValidity::Valid),
+            RegistryRow {
+                pid: 0,
+                session_id: String::new(),
+                config_dir: PathBuf::from(".claude-lukas"),
+                kind: None,
+                validity: RowValidity::Unknown(UnknownRow::RegistryDirUnreadable),
+            },
+        ];
+        match decide_migration_identity(REC, &[P2_PID], &dir_down) {
+            MigrationIdentity::Unknown(why) => {
+                assert!(why.contains("could not be listed"), "{why}")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// Fix 7: one process writes one file. A pid with a VALID row plus a dead
+    /// predecessor's no-procStart file (another account) is not unknown —
+    /// neither for the pane nor for a holder elsewhere.
+    ///
+    /// Mutation check: deleting the `valid_pids` filter makes both cases
+    /// unknown.
+    #[test]
+    fn a_dead_predecessors_file_for_a_validated_pid_is_disregarded() {
+        let no_ps = RowValidity::Unknown(UnknownRow::NoProcStart);
+        let rows = vec![
+            row(P2_PID, REC, ".claude-tiohorst", RowValidity::Valid),
+            row(P2_PID, "older-session", ".claude-lukas", no_ps),
+            row(9, "other", ".claude-ben", RowValidity::Valid),
+            row(9, REC, ".claude-erik", no_ps),
+        ];
+        assert_eq!(
+            decide_migration_identity(REC, &[P2_PID], &rows),
+            MigrationIdentity::Confirmed {
+                sid: REC.into(),
+                config_dir: PathBuf::from(".claude-tiohorst"),
+            }
+        );
+    }
+
+    /// Fix 3: off a verified clock, an identity that cannot be validated is
+    /// `Unverifiable`, and the automatic hint migrates the record as it did
+    /// before the identity check — never a silent refusal. A PROVEN holder
+    /// still refuses there.
+    ///
+    /// Mutation check: mapping `Unverifiable` to `Refuse` for the hint fails
+    /// the verdict assertion; ignoring `clock_verified` fails the first.
+    #[test]
+    fn off_a_verified_clock_an_unvalidatable_identity_keeps_the_old_behaviour() {
+        let clock_unknown = RowValidity::Unknown(UnknownRow::MalformedProcStart);
+        let rows = vec![row(P2_PID, REC, ".claude-a", clock_unknown)];
+        let id = super::decide_migration_identity(REC, &[P2_PID], &rows, false);
+        assert!(matches!(id, MigrationIdentity::Unverifiable(_)), "{id:?}");
+        assert!(matches!(
+            super::decide_migration_identity(REC, &[P2_PID], &rows, true),
+            MigrationIdentity::Unknown(_)
+        ));
+        match migration_verdict(id, REC, MigrationTrigger::UsageLimitHint) {
+            MigrationVerdict::ProceedOnRecord { why } => {
+                assert!(
+                    why.starts_with("identity not checked on this platform"),
+                    "{why}"
+                )
+            }
+            other => panic!("expected ProceedOnRecord, got {other:?}"),
+        }
+        let fork = vec![
+            row(P2_PID, REC, ".claude-a", RowValidity::Valid),
+            row(7, REC, ".claude-b", RowValidity::Valid),
+        ];
+        assert_eq!(
+            super::decide_migration_identity(REC, &[P2_PID], &fork, false),
+            MigrationIdentity::HeldElsewhere { pid: 7 }
+        );
+    }
+
+    /// Fix 4: the operator's command names a session id. A pane provably
+    /// running another id is refused, naming both ids; the hint still
+    /// migrates what the pane runs.
+    ///
+    /// Mutation check: routing the operator's `Rebound` to `Proceed` fails.
+    #[test]
+    fn verdict_operator_command_refuses_a_rebound_naming_both_ids() {
+        let id = MigrationIdentity::Rebound {
+            sid: "506a0190".into(),
+            config_dir: PathBuf::from(".claude-tiohorst"),
+        };
+        assert_eq!(
+            migration_verdict(id.clone(), REC, MigrationTrigger::OperatorCommand),
+            MigrationVerdict::Refuse {
+                reason:
+                    "identity-mismatch(the pane runs session 506a0190, not the requested 0c4e3025)"
+                        .into()
+            }
+        );
+        assert!(matches!(
+            migration_verdict(id, REC, MigrationTrigger::UsageLimitHint),
+            MigrationVerdict::Proceed {
+                rebound_from: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// Fix 4: a possible second holder refuses on BOTH triggers.
+    ///
+    /// Mutation check: routing `MaybeHeldElsewhere` to `ProceedOnRecord` for
+    /// the operator fails the loop's second iteration.
+    #[test]
+    fn verdict_a_possible_second_holder_refuses_on_every_trigger() {
+        for trigger in [
+            MigrationTrigger::UsageLimitHint,
+            MigrationTrigger::OperatorCommand,
+        ] {
+            assert_eq!(
+                migration_verdict(
+                    MigrationIdentity::MaybeHeldElsewhere {
+                        pid: 9,
+                        why: "x".into()
+                    },
+                    REC,
+                    trigger
+                ),
+                MigrationVerdict::Refuse {
+                    reason: "identity-unresolved(pid 9 may also hold the id: x)".into()
+                }
+            );
+        }
+    }
+
+    /// Fix 9: a rebound id with no transcript refuses before any write.
+    ///
+    /// Mutation check: returning `Ok(())` unconditionally fails.
+    #[test]
+    fn a_rebound_id_without_a_transcript_is_refused() {
+        assert_eq!(rebound_transcript_gate("b", "C:/a", true), Ok(()));
+        assert_eq!(
+            rebound_transcript_gate("b", "C:/a", false),
+            Err("identity-unresolved(rebound id b has no transcript under C:/a)".into())
         );
     }
 }
