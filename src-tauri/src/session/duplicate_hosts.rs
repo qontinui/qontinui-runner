@@ -12,8 +12,14 @@
 //! ([`registry_row_validity`](crate::session::claude_session_registry::registry_row_validity))
 //! and are `kind == interactive` count — the 2026-10-21 census found 3
 //! duplicate groups over raw rows but only 1 over valid rows, and that one was
-//! the real fork. A row of UNKNOWN validity never counts. An unreadable
-//! process table is UNKNOWN, never "no duplicates".
+//! the real fork. A row of UNKNOWN validity is never a holder, but it can stop
+//! the detector from saying "no duplicates" (2026-10-23 review fixes 2 and 3):
+//! an unreadable process table, a `sessions/` dir that could not be listed, a
+//! live claude's registry file too torn to read its id, a row of unknown
+//! validity naming an id another row also names, or a registry in which NO
+//! interactive row validated at all (the off-Windows `procStart` clock, see
+//! `claude_session_registry`) each make the verdict UNKNOWN when nothing was
+//! found. A pair of VALID holders is reported whatever else is unknown.
 //!
 //! The migration's own hand-off (old pane still alive for ~12 s after the
 //! resumed pane starts) is excluded: a group with a holder on a terminal the
@@ -31,7 +37,7 @@ use std::sync::Mutex;
 use serde_json::json;
 
 use crate::process_capture::process_tree::ProcessSnapshot;
-use crate::session::claude_session_registry::{RegistryRow, RowValidity, UnknownRow};
+use crate::session::claude_session_registry::{RawRegistry, RegistryRow, RowValidity, UnknownRow};
 use crate::session::reconcile::LivePty;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
@@ -72,7 +78,10 @@ pub enum DuplicateVerdict {
     Observed(Vec<DuplicateHost>),
 }
 
-/// What to exclude as the migration's own hand-off.
+/// What to exclude as the migration's own hand-off. Shared by this detector
+/// and the session binder's provider rung / confirmed re-bind
+/// (`session::reconcile::provider_rung`), which must not bind either side of a
+/// hand-off (2026-10-23 review fix 1).
 #[derive(Debug, Clone, Default)]
 pub struct HandoffExclusions {
     /// Terminals marked by `store.mark_terminal_superseded` or respawned by
@@ -82,10 +91,39 @@ pub struct HandoffExclusions {
     pub sessions: HashSet<String>,
 }
 
+impl HandoffExclusions {
+    /// The exclusions as of `now_ms`: the store's superseded terminals plus the
+    /// migration ledger's recent respawns
+    /// ([`crate::terminal::migration_handoff::recent_migration_handoffs`]).
+    /// Read it AFTER any await in the caller, so a migration that completed
+    /// during that await is seen.
+    pub fn current(store: &SessionLifecycleStore, now_ms: i64) -> Self {
+        let (mut terminals, sessions) =
+            crate::terminal::migration_handoff::recent_migration_handoffs(now_ms);
+        terminals.extend(store.superseded_terminal_ids());
+        Self {
+            terminals,
+            sessions,
+        }
+    }
+
+    /// Whether a pane / session pair is part of a hand-off.
+    pub fn excludes(&self, terminal_id: Option<&str>, session_id: &str) -> bool {
+        terminal_id.is_some_and(|t| self.terminals.contains(t))
+            || self.sessions.contains(session_id)
+    }
+}
+
 /// Pure detector.
 ///
 /// `table_readable` is the snapshot read's verdict (`false` ⇒ `Unknown`).
 /// `pid_terminals` maps each claude pid hosted in a live pane to its terminal.
+///
+/// Rows of UNKNOWN validity are first thinned exactly as
+/// `terminal::migration_identity::decide_migration_identity` thins them: one
+/// process writes one file, so an unknown row for a pid that also has a VALID
+/// row is a dead predecessor's and is disregarded. What remains decides
+/// whether an empty result may be said (see the module doc).
 pub fn detect_duplicate_hosts(
     table_readable: bool,
     rows: &[RegistryRow],
@@ -99,9 +137,32 @@ pub fn detect_duplicate_hosts(
     {
         return DuplicateVerdict::Unknown("process table unreadable".into());
     }
+    if let Some(r) = rows
+        .iter()
+        .find(|r| r.validity == RowValidity::Unknown(UnknownRow::RegistryDirUnreadable))
+    {
+        return DuplicateVerdict::Unknown(format!(
+            "the registry could not be listed under {:?}",
+            r.config_dir
+        ));
+    }
+    let valid_pids: HashSet<u32> = rows
+        .iter()
+        .filter(|r| r.validity.is_valid())
+        .map(|r| r.pid)
+        .collect();
+    let rows: Vec<&RegistryRow> = rows
+        .iter()
+        .filter(|r| !(r.validity.is_unknown() && valid_pids.contains(&r.pid)))
+        .collect();
+    let excluded = |r: &RegistryRow| {
+        exclusions.excludes(pid_terminals.get(&r.pid).map(String::as_str), &r.session_id)
+    };
+
     let mut by_sid: BTreeMap<&str, Vec<&RegistryRow>> = BTreeMap::new();
     for r in rows
         .iter()
+        .copied()
         .filter(|r| r.validity.is_valid() && r.is_interactive())
     {
         by_sid.entry(r.session_id.as_str()).or_default().push(r);
@@ -110,7 +171,7 @@ pub fn detect_duplicate_hosts(
     for (sid, mut group) in by_sid {
         group.sort_by_key(|r| r.pid);
         group.dedup_by_key(|r| r.pid);
-        if group.len() < 2 || exclusions.sessions.contains(sid) {
+        if group.len() < 2 || group.iter().any(|r| excluded(r)) {
             continue;
         }
         let holders: Vec<Holder> = group
@@ -121,40 +182,108 @@ pub fn detect_duplicate_hosts(
                 config_dir: r.config_dir.clone(),
             })
             .collect();
-        let in_handoff = holders.iter().any(|h| {
-            h.terminal_id
-                .as_ref()
-                .is_some_and(|t| exclusions.terminals.contains(t))
-        });
-        if in_handoff {
-            continue;
-        }
         out.push(DuplicateHost {
             session_id: sid.to_string(),
             holders,
         });
     }
+    if !out.is_empty() {
+        return DuplicateVerdict::Observed(out);
+    }
+
+    // Nothing found. May "no duplicates" be said?
+    let unknown: Vec<&RegistryRow> = rows
+        .iter()
+        .copied()
+        .filter(|r| r.validity.is_unknown() && r.is_interactive() && !excluded(r))
+        .collect();
+    let Some(first) = unknown.first() else {
+        return DuplicateVerdict::Observed(out);
+    };
+    // Fix 3: no interactive row validated at all (the unverified clock) —
+    // nothing could have been found, so finding nothing proves nothing.
+    if !rows
+        .iter()
+        .any(|r| r.validity.is_valid() && r.is_interactive())
+    {
+        return DuplicateVerdict::Unknown(format!(
+            "no interactive registry row validated ({} of unknown validity, e.g. pid {}: {})",
+            unknown.len(),
+            first.pid,
+            unknown_reason(first)
+        ));
+    }
+    // Fix 2: a torn file may hold any id; an unknown row naming an id another
+    // non-stale row names may be its second holder.
+    for u in &unknown {
+        if u.session_id.is_empty() {
+            return DuplicateVerdict::Unknown(format!(
+                "pid {}'s registry file could not be read — it may hold any session",
+                u.pid
+            ));
+        }
+        let paired = rows.iter().any(|r| {
+            r.pid != u.pid
+                && r.session_id == u.session_id
+                && r.is_interactive()
+                && !matches!(r.validity, RowValidity::Stale(_))
+        });
+        if paired {
+            return DuplicateVerdict::Unknown(format!(
+                "pid {} may also hold session {} (row validity unknown: {})",
+                u.pid,
+                u.session_id,
+                unknown_reason(u)
+            ));
+        }
+    }
     DuplicateVerdict::Observed(out)
 }
 
+fn unknown_reason(r: &RegistryRow) -> &'static str {
+    match r.validity {
+        RowValidity::Unknown(why) => why.as_str(),
+        _ => "not unknown",
+    }
+}
+
+/// How many consecutive OBSERVED ticks a reported occurrence must be absent
+/// before it is forgotten (and so reported again if it recurs). A holder
+/// whose row flickers out for a tick or two — a torn file, a CIM row missing
+/// once — no longer re-posts the same finding (2026-10-23 review fix 5).
+pub const FORGET_AFTER_ABSENT_TICKS: u32 = 3;
+
 /// Dedupe across ticks: one report per `(sid, pid set)` while it persists. A
-/// group that disappears and later recurs is reported again. An `Unknown`
-/// tick leaves the memory untouched.
+/// group absent for [`FORGET_AFTER_ABSENT_TICKS`] observed ticks in a row is
+/// forgotten; one that then recurs is reported again. An `Unknown` tick never
+/// reaches the reporter, so it leaves the memory untouched.
 #[derive(Debug, Default)]
 pub struct DuplicateReporter {
-    reported: HashSet<(String, Vec<u32>)>,
+    /// Reported occurrence → consecutive observed ticks it has been absent.
+    reported: HashMap<(String, Vec<u32>), u32>,
 }
 
 impl DuplicateReporter {
-    /// The occurrences in `found` not reported before.
+    /// The occurrences in `found` not reported before (or forgotten since).
     pub fn new_occurrences(&mut self, found: &[DuplicateHost]) -> Vec<DuplicateHost> {
         let current: HashSet<(String, Vec<u32>)> = found.iter().map(|d| d.dedupe_key()).collect();
         let fresh = found
             .iter()
-            .filter(|d| !self.reported.contains(&d.dedupe_key()))
+            .filter(|d| !self.reported.contains_key(&d.dedupe_key()))
             .cloned()
             .collect();
-        self.reported = current;
+        for (key, absent) in self.reported.iter_mut() {
+            *absent = if current.contains(key) {
+                0
+            } else {
+                *absent + 1
+            };
+        }
+        self.reported
+            .retain(|_, absent| *absent < FORGET_AFTER_ABSENT_TICKS);
+        for key in current {
+            self.reported.insert(key, 0);
+        }
         fresh
     }
 }
@@ -195,32 +324,25 @@ fn describe(d: &DuplicateHost) -> String {
         .join("; ")
 }
 
-/// I/O wrapper, called once per (unguarded) session-lifecycle poll tick with
-/// that tick's snapshot. Reads the registry, detects, warns once per new
-/// occurrence, and posts each new occurrence to coord in a detached task.
-/// Returns the verdict (for tests/logging).
+/// Called once per (unguarded) session-lifecycle poll tick with that tick's
+/// snapshot and its ONE registry read — read on the blocking pool by the tick
+/// and shared with the binder's passes (2026-10-23 review fix 8), so this does
+/// no disk I/O. Validates, detects, warns once per new occurrence, and posts
+/// each new occurrence to coord in a detached task. Returns the verdict (for
+/// tests/logging).
 pub fn run_duplicate_hosts_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
+    registry: &RawRegistry,
 ) -> DuplicateVerdict {
     let table_readable = !snapshot.names.is_empty();
     let rows = if table_readable {
-        crate::session::claude_session_registry::read_registry_rows(
-            &crate::terminal::transcript::find_claude_config_dirs(),
-            snapshot,
-        )
+        crate::session::claude_session_registry::rows_from_raw(registry, snapshot)
     } else {
         Vec::new()
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let (mut terminals, sessions) =
-        crate::terminal::migration_handoff::recent_migration_handoffs(now_ms);
-    terminals.extend(store.superseded_terminal_ids());
-    let exclusions = HandoffExclusions {
-        terminals,
-        sessions,
-    };
+    let exclusions = HandoffExclusions::current(store, chrono::Utc::now().timestamp_millis());
     let verdict = detect_duplicate_hosts(
         table_readable,
         &rows,
@@ -407,13 +529,13 @@ mod tests {
     }
 
     /// A stale file whose pid is dead, and a reused pid (procStart mismatch —
-    /// the pid-38920 case), are not holders. Neither is an UNKNOWN-validity
-    /// row (no procStart), nor a non-interactive row (benign SDK class).
+    /// the pid-38920 case), are not holders. Neither is a non-interactive row
+    /// (benign SDK class).
     ///
     /// Mutation check: dropping `r.validity.is_valid()` from the filter
     /// reports every one of these groups.
     #[test]
-    fn stale_reused_unknown_and_non_interactive_rows_are_ignored() {
+    fn stale_reused_and_non_interactive_rows_are_ignored() {
         let none = HandoffExclusions::default();
         let mut sdk = row(5, "a", "c", V);
         sdk.kind = Some("sdk".into());
@@ -426,10 +548,132 @@ mod tests {
                 "c",
                 RowValidity::Stale(StaleRow::ProcStartMismatch),
             ),
-            row(4, "a", "c", RowValidity::Unknown(UnknownRow::NoProcStart)),
             sdk,
         ];
         assert!(observed(detect_duplicate_hosts(true, &rows, &HashMap::new(), &none)).is_empty());
+    }
+
+    fn unknown(pid: u32, sid: &str, why: UnknownRow) -> RegistryRow {
+        RegistryRow {
+            kind: None,
+            ..row(pid, sid, "c", RowValidity::Unknown(why))
+        }
+    }
+
+    /// Fix 2: an UNKNOWN-validity row is never a holder, but "no duplicates"
+    /// cannot be said past one that could be a second holder — a live
+    /// claude's torn file (id unreadable), an unlistable `sessions/` dir, or
+    /// an unknown row naming an id another row names. An unknown row naming
+    /// an id nobody else holds, and a dead predecessor's file for a pid with
+    /// a VALID row (fix 7's rule), leave the verdict observed.
+    ///
+    /// Mutation checks: deleting the `session_id.is_empty()` arm fails the
+    /// torn case; deleting the `paired` arm fails the paired case; deleting
+    /// the `RegistryDirUnreadable` guard fails the dir case; deleting the
+    /// `valid_pids` thinning fails the predecessor case.
+    #[test]
+    fn unknown_rows_that_could_be_a_second_holder_make_an_empty_verdict_unknown() {
+        let none = HandoffExclusions::default();
+        let verdict =
+            |rows: &[RegistryRow]| detect_duplicate_hosts(true, rows, &HashMap::new(), &none);
+        let base = row(1, "a", "c", V);
+
+        let torn = [base.clone(), unknown(2, "", UnknownRow::UnreadableFile)];
+        assert!(
+            matches!(verdict(&torn), DuplicateVerdict::Unknown(ref w) if w.contains("pid 2")),
+            "{:?}",
+            verdict(&torn)
+        );
+        let paired = [base.clone(), unknown(4, "a", UnknownRow::NoProcStart)];
+        assert!(
+            matches!(verdict(&paired), DuplicateVerdict::Unknown(ref w) if w.contains("pid 4")),
+            "{:?}",
+            verdict(&paired)
+        );
+        let dir = [
+            base.clone(),
+            RegistryRow {
+                pid: 0,
+                config_dir: PathBuf::from(".claude-lukas"),
+                ..unknown(0, "", UnknownRow::RegistryDirUnreadable)
+            },
+        ];
+        assert!(matches!(verdict(&dir), DuplicateVerdict::Unknown(_)));
+
+        let unpaired = [base.clone(), unknown(4, "b", UnknownRow::NoProcStart)];
+        assert!(observed(verdict(&unpaired)).is_empty());
+        let predecessor = [
+            base.clone(),
+            row(9, "z", "c", V),
+            unknown(1, "", UnknownRow::UnreadableFile),
+            unknown(9, "a", UnknownRow::NoProcStart),
+        ];
+        assert!(observed(verdict(&predecessor)).is_empty());
+    }
+
+    /// Fix 2: a pair of VALID holders is reported whatever else is unknown.
+    ///
+    /// Mutation check: moving the unknown checks above the early
+    /// `return Observed(out)` turns this into `Unknown`.
+    #[test]
+    fn a_valid_pair_is_reported_past_unknown_rows() {
+        let rows = [
+            row(46416, "0c4e3025", ".claude-tiohorst", V),
+            row(51860, "0c4e3025", ".claude-lukas", V),
+            unknown(3, "", UnknownRow::UnreadableFile),
+        ];
+        let found = observed(detect_duplicate_hosts(
+            true,
+            &rows,
+            &terminals(),
+            &HandoffExclusions::default(),
+        ));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "0c4e3025");
+    }
+
+    /// Fix 3: when NO interactive row validated (the off-Windows clock, where
+    /// every row reads `CreationTimeUnavailable`), finding nothing proves
+    /// nothing — UNKNOWN, even though no unknown row is paired.
+    ///
+    /// Mutation check: deleting the no-valid-row guard returns
+    /// `Observed([])`.
+    #[test]
+    fn no_validated_interactive_row_is_unknown() {
+        let rows = [
+            unknown(1, "a", UnknownRow::CreationTimeUnavailable),
+            unknown(2, "b", UnknownRow::CreationTimeUnavailable),
+        ];
+        match detect_duplicate_hosts(true, &rows, &HashMap::new(), &HandoffExclusions::default()) {
+            DuplicateVerdict::Unknown(why) => {
+                assert!(
+                    why.starts_with("no interactive registry row validated"),
+                    "{why}"
+                )
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // No rows at all is still a sayable "none".
+        assert!(observed(detect_duplicate_hosts(
+            true,
+            &[],
+            &HashMap::new(),
+            &HandoffExclusions::default()
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn handoff_exclusions_match_a_terminal_or_a_session() {
+        let ex = HandoffExclusions {
+            terminals: ["old".to_string()].into_iter().collect(),
+            sessions: ["sid".to_string()].into_iter().collect(),
+        };
+        assert!(ex.excludes(Some("old"), "x"));
+        assert!(ex.excludes(None, "sid"));
+        assert!(ex.excludes(Some("other"), "sid"));
+        assert!(!ex.excludes(Some("other"), "x"));
+        assert!(!ex.excludes(None, "x"));
     }
 
     /// The migration's own hand-off: the old pane is superseded (or the new
@@ -490,11 +734,14 @@ mod tests {
         ));
     }
 
-    /// One report per (sid, pid set) while it persists; a recurrence after it
-    /// cleared is reported again; a new pid set is new.
+    /// One report per (sid, pid set) while it persists; a new pid set is new;
+    /// a group that flickers out for fewer than `FORGET_AFTER_ABSENT_TICKS`
+    /// observed ticks is NOT re-reported (fix 5); one absent that long and
+    /// then recurring is.
     ///
-    /// Mutation check: never inserting into `reported` reports the same
-    /// occurrence on the second tick.
+    /// Mutation checks: never inserting into `reported` reports the same
+    /// occurrence on the second tick; dropping the absent-tick memory
+    /// (forgetting on the first absent tick) fails the flicker assertion.
     #[test]
     fn reporter_dedupes_per_session_and_pid_set() {
         let d = |pids: &[u32]| DuplicateHost {
@@ -515,7 +762,18 @@ mod tests {
             "same occurrence"
         );
         assert_eq!(r.new_occurrences(&[d(&[1, 3])]).len(), 1, "new pid set");
-        assert!(r.new_occurrences(&[]).is_empty());
+        // Flicker: absent for FORGET_AFTER_ABSENT_TICKS - 1 ticks, then back.
+        for _ in 1..FORGET_AFTER_ABSENT_TICKS {
+            assert!(r.new_occurrences(&[]).is_empty());
+        }
+        assert!(
+            r.new_occurrences(&[d(&[1, 3])]).is_empty(),
+            "a flicker is not a new occurrence"
+        );
+        // Absent for the full count: forgotten, so a recurrence is new.
+        for _ in 0..FORGET_AFTER_ABSENT_TICKS {
+            assert!(r.new_occurrences(&[]).is_empty());
+        }
         assert_eq!(r.new_occurrences(&[d(&[1, 3])]).len(), 1, "recurrence");
     }
 

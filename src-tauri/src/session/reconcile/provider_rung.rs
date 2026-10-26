@@ -22,6 +22,13 @@
 //!   pane's valid row names a different id. It runs in the UNGUARDED
 //!   `refresh_titles_pass`, because the bind pass is skipped entirely once
 //!   every live pane is confirmed.
+//!
+//! Both withhold a pane [`binder_exclusion`] names (2026-10-23 review fix 1):
+//! one whose valid row names an id another live pane's valid row also names
+//! (a fork — binding either pane would be a coin toss), and either side of an
+//! account-migration hand-off ([`HandoffExclusions`], shared with the
+//! duplicate-host detector). A valid row that DISAGREES with the launch argv
+//! wins over it (fix 6, in `decide_bind_for_live_pty`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,6 +38,7 @@ use super::{
 };
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_session_registry::{registry_row_validity, RowValidity};
+use crate::session::duplicate_hosts::HandoffExclusions;
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
 };
@@ -87,6 +95,58 @@ pub fn valid_rows_for_ptys<'a, N: ProviderSessionIndex>(
             valid_provider_row(pid, &index.metas_for_pid(pid), snapshot).map(|r| (pid, r))
         })
         .collect()
+}
+
+/// Session ids that the VALID provider rows of TWO OR MORE live panes name — a
+/// forked conversation (the 2026-10-21 `0c4e3025` shape). The binder binds
+/// neither pane to such an id and re-binds neither (2026-10-23 review fix 1):
+/// whichever it picked, the other pane would be the one running it too.
+pub fn forked_session_ids<'a>(
+    live: impl IntoIterator<Item = &'a LivePty>,
+    rows: &HashMap<u32, ValidProviderRow>,
+) -> HashSet<String> {
+    let mut panes: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for pty in live {
+        if let Some(row) = pty.ai_pid.and_then(|pid| rows.get(&pid)) {
+            panes
+                .entry(row.session_id.as_str())
+                .or_default()
+                .insert(pty.terminal_id.as_str());
+        }
+    }
+    panes
+        .into_iter()
+        .filter(|(_, terminals)| terminals.len() >= 2)
+        .map(|(sid, _)| sid.to_string())
+        .collect()
+}
+
+/// Pure: why the binder must leave `terminal_id` alone this pass, if it must.
+///
+/// - its valid row names a FORKED id ([`forked_session_ids`]);
+/// - the terminal is one side of a migration hand-off — superseded by the
+///   store or respawned by the migration within the hand-off window
+///   ([`HandoffExclusions`]);
+/// - its valid row names a session the migration just respawned elsewhere.
+///
+/// The migration retires the old pane itself; binding or re-binding either
+/// side meanwhile would write a second open record for one conversation.
+pub fn binder_exclusion(
+    terminal_id: &str,
+    row: Option<&ValidProviderRow>,
+    forked: &HashSet<String>,
+    exclusions: &HandoffExclusions,
+) -> Option<&'static str> {
+    if row.is_some_and(|r| forked.contains(&r.session_id)) {
+        return Some("its provider row names a session another live pane also runs");
+    }
+    if exclusions.terminals.contains(terminal_id) {
+        return Some("the pane is one side of an account-migration hand-off");
+    }
+    if row.is_some_and(|r| exclusions.sessions.contains(&r.session_id)) {
+        return Some("its provider row names a session an account migration just respawned");
+    }
+    None
 }
 
 /// RUNG 2½ — the provider's live registry names the id the pane's claude is
@@ -155,17 +215,23 @@ fn deferred_logged() -> &'static std::sync::Mutex<HashSet<(String, String)>> {
 /// same terminal in the same write. Without a transcript yet (a `/clear`
 /// before the first prompt) it is deferred to a later tick and logged once.
 /// Returns the `Bind` actions written, for the `session-bound` event.
+///
+/// A pane [`binder_exclusion`] names (forked id, migration hand-off) is never
+/// re-bound.
 pub fn rebind_confirmed_from_registry<N, F>(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     index: &N,
     snapshot: &ProcessSnapshot,
+    exclusions: &HandoffExclusions,
     transcript_exists: F,
 ) -> Vec<ReconcileAction>
 where
     N: ProviderSessionIndex,
     F: Fn(&str, &str, &str) -> bool,
 {
+    let rows = valid_rows_for_ptys(live.iter(), index, snapshot);
+    let forked = forked_session_ids(live.iter(), &rows);
     let mut out = Vec::new();
     for pty in live {
         let Some(ai_pid) = pty.ai_pid else { continue };
@@ -175,10 +241,20 @@ where
         if rec.confirmed_at.is_none() {
             continue; // the bind pass owns unconfirmed records
         }
-        let row = valid_provider_row(ai_pid, &index.metas_for_pid(ai_pid), snapshot);
-        let Some(rb) = decide_registry_rebind(&rec, row.as_ref()) else {
+        let row = rows.get(&ai_pid);
+        let Some(rb) = decide_registry_rebind(&rec, row) else {
             continue;
         };
+        if let Some(why) = binder_exclusion(&pty.terminal_id, row, &forked, exclusions) {
+            tracing::debug!(
+                terminal_id = %rb.terminal_id,
+                record_session = %rb.from_session_id,
+                provider_session = %rb.to_session_id,
+                why,
+                "session binder: confirmed-record re-bind withheld"
+            );
+            continue;
+        }
         if !transcript_exists(&rb.config_dir, &pty.working_dir, &rb.to_session_id) {
             let first = deferred_logged()
                 .lock()
@@ -320,6 +396,7 @@ mod tests {
                 &index,
                 &no_cmdlines(),
                 &rows,
+                &none(),
             );
 
             assert!(
@@ -466,7 +543,9 @@ mod tests {
         );
 
         let actions =
-            rebind_confirmed_from_registry(&store, &live, &index, &snapshot, |_, _, _| true);
+            rebind_confirmed_from_registry(&store, &live, &index, &snapshot, &none(), |_, _, _| {
+                true
+            });
         assert_eq!(
             actions,
             vec![ReconcileAction::Bind {
@@ -488,19 +567,29 @@ mod tests {
         assert_eq!(store.get("steady").unwrap().state, "open");
 
         // Converged: a second tick writes nothing.
-        assert!(
-            rebind_confirmed_from_registry(&store, &live, &index, &snapshot, |_, _, _| true)
-                .is_empty()
-        );
+        assert!(rebind_confirmed_from_registry(
+            &store,
+            &live,
+            &index,
+            &snapshot,
+            &none(),
+            |_, _, _| true
+        )
+        .is_empty());
 
         // Deferred: no transcript for the new id yet.
         let dir2 = tempdir().unwrap();
         let store2 = SessionLifecycleStore::open(dir2.path().join("s.json")).unwrap();
         store2.record_open(confirmed("before-clear", "term-1"));
-        assert!(
-            rebind_confirmed_from_registry(&store2, &live, &index, &snapshot, |_, _, _| false)
-                .is_empty()
-        );
+        assert!(rebind_confirmed_from_registry(
+            &store2,
+            &live,
+            &index,
+            &snapshot,
+            &none(),
+            |_, _, _| false
+        )
+        .is_empty());
         assert_eq!(
             store2
                 .find_open_by_terminal("term-1")
@@ -540,6 +629,296 @@ mod tests {
             decide_registry_rebind(&unconfirmed, Some(&row)),
             None,
             "bind pass owns it"
+        );
+    }
+
+    // ── 2026-10-23 review fixes ─────────────────────────────────────────────
+
+    fn none() -> HandoffExclusions {
+        HandoffExclusions::default()
+    }
+
+    fn binds(actions: &[ReconcileAction]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ReconcileAction::Bind { terminal_id, .. } => Some(terminal_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fix 1: two live panes whose VALID rows name ONE id (a forked
+    /// conversation) — the bind pass binds neither, at any rung.
+    ///
+    /// Mutation check: deleting the `forked` arm of `binder_exclusion` binds
+    /// whichever pane is visited first.
+    #[test]
+    fn a_forked_id_binds_neither_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let live = vec![
+            pty_anchored("p1", 51000, 900, "C:/repo"),
+            pty_anchored("p2", 46416, 800, "C:/repo"),
+        ];
+        let snapshot = snap(&[51000, 46416]);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("0c4e3025", "C:/cfg", Some(1_000))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: HashSet::new(),
+        };
+        let rows = valid_rows_for_ptys(
+            live.iter(),
+            &Rows(
+                [
+                    (51000, vec![meta_row("0c4e3025", "C:/a", Some(FT))]),
+                    (46416, vec![meta_row("0c4e3025", "C:/b", Some(FT))]),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            &snapshot,
+        );
+        assert_eq!(
+            forked_session_ids(live.iter(), &rows),
+            ["0c4e3025".to_string()].into_iter().collect()
+        );
+        let actions = run_reconcile_with_provider(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &rows,
+            &none(),
+        );
+        assert!(binds(&actions).is_empty(), "{actions:?}");
+        assert!(store.get("0c4e3025").is_none());
+    }
+
+    /// Fix 1: a pane on either side of a migration hand-off — superseded /
+    /// respawned terminal, or a row naming the respawned session — is left
+    /// alone at every rung, even with a unique rung-3 candidate.
+    ///
+    /// Mutation checks: deleting the `exclusions.terminals` arm binds the
+    /// superseded pane via rung 3; deleting the `exclusions.sessions` arm
+    /// binds the respawned session via rung 2½.
+    #[test]
+    fn a_migration_handoff_pane_is_left_alone_at_every_rung() {
+        let snapshot = snap(&[100, 200]);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("only", "C:/cfg", Some(1_500))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: HashSet::new(),
+        };
+        // Superseded terminal, no provider row: rung 3 would bind "only".
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let old = vec![pty_anchored("old-pane", 100, 1_000, "C:/repo")];
+        let by_terminal = HandoffExclusions {
+            terminals: ["old-pane".to_string()].into_iter().collect(),
+            sessions: HashSet::new(),
+        };
+        let actions = run_reconcile_with_provider(
+            &store,
+            &old,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &HashMap::new(),
+            &by_terminal,
+        );
+        assert!(binds(&actions).is_empty(), "{actions:?}");
+        // Sanity: without the exclusion the same pane binds.
+        assert_eq!(
+            binds(&run_reconcile_with_provider(
+                &store,
+                &old,
+                &snapshot,
+                &index,
+                &no_cmdlines(),
+                &HashMap::new(),
+                &none(),
+            )),
+            vec!["old-pane"]
+        );
+
+        // A row naming the session a migration just respawned elsewhere.
+        let dir2 = tempdir().unwrap();
+        let store2 = SessionLifecycleStore::open(dir2.path().join("s.json")).unwrap();
+        let other = vec![pty_anchored("other-pane", 200, 1_000, "C:/repo")];
+        let rows: HashMap<u32, ValidProviderRow> = [(
+            200,
+            ValidProviderRow {
+                session_id: "respawned".into(),
+                config_dir: "C:/cfg".into(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let by_session = HandoffExclusions {
+            terminals: HashSet::new(),
+            sessions: ["respawned".to_string()].into_iter().collect(),
+        };
+        let actions = run_reconcile_with_provider(
+            &store2,
+            &other,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &rows,
+            &by_session,
+        );
+        assert!(binds(&actions).is_empty(), "{actions:?}");
+    }
+
+    /// Fix 1: the confirmed-record re-bind withholds the same panes — a
+    /// re-bind to a forked id, and a re-bind of a superseded terminal.
+    ///
+    /// Mutation check: deleting the `binder_exclusion` call in
+    /// `rebind_confirmed_from_registry` re-binds both.
+    #[test]
+    fn the_confirmed_rebind_withholds_forked_and_handoff_panes() {
+        let snapshot = snap(&[100, 200, 300]);
+        let live = vec![
+            pty_anchored("term-1", 100, 1_000, "C:/repo"),
+            pty_anchored("term-2", 200, 1_000, "C:/repo"),
+            pty_anchored("term-3", 300, 1_000, "C:/repo"),
+        ];
+        let index = Rows(
+            [
+                // term-1 and term-2 both run "forked" now.
+                (100, vec![meta_row("forked", "C:/cfg", Some(FT))]),
+                (200, vec![meta_row("forked", "C:/cfg", Some(FT))]),
+                // term-3 was /clear-ed — but it is being migrated away.
+                (300, vec![meta_row("after-clear", "C:/cfg", Some(FT))]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(confirmed("a", "term-1"));
+        store.record_open(confirmed("b", "term-2"));
+        store.record_open(confirmed("c", "term-3"));
+        let ex = HandoffExclusions {
+            terminals: ["term-3".to_string()].into_iter().collect(),
+            sessions: HashSet::new(),
+        };
+        let actions =
+            rebind_confirmed_from_registry(&store, &live, &index, &snapshot, &ex, |_, _, _| true);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-3")
+                .unwrap()
+                .claude_session_id,
+            "c"
+        );
+        // Sanity: without the hand-off, term-3 re-binds (the forked pair still
+        // does not).
+        let actions =
+            rebind_confirmed_from_registry(&store, &live, &index, &snapshot, &none(), |_, _, _| {
+                true
+            });
+        assert_eq!(binds(&actions), vec!["term-3"]);
+    }
+
+    /// Fix 6: a VALID registry row that disagrees with the launch argv wins —
+    /// the argv is the id the process STARTED with, the registry the one it
+    /// runs after an in-pane `/clear`. When they agree, rung 2 binds as before.
+    ///
+    /// Mutation check: deleting the disagreement arm binds the stale
+    /// `launched` id.
+    #[test]
+    fn a_valid_row_beats_a_disagreeing_stale_launch_id() {
+        let pty = pty_anchored("t", 5, 1_000, "C:/repo");
+        let cands = [cand("reg", "C:/cfg", Some(1_500))];
+        let row = ValidProviderRow {
+            session_id: "reg".into(),
+            config_dir: "C:/acct".into(),
+        };
+        assert_eq!(
+            super::super::decide_bind_for_live_pty(
+                &pty,
+                None,
+                1_000,
+                Some("launched"),
+                &cands,
+                &no_claims(),
+                Some(&row)
+            ),
+            ReconcileAction::Bind {
+                terminal_id: "t".into(),
+                session_id: "reg".into(),
+                config_dir: "C:/cfg".into(),
+                origin: BindOrigin::Authoritative,
+                confirmed: true,
+            }
+        );
+        // Agreement: rung 2 (no row account fallback — the candidate's or
+        // empty), exactly as before.
+        let only_launch = [cand("other", "C:/cfg", Some(1_500))];
+        assert_eq!(
+            super::super::decide_bind_for_live_pty(
+                &pty,
+                None,
+                1_000,
+                Some("reg"),
+                &only_launch,
+                &no_claims(),
+                Some(&row)
+            ),
+            ReconcileAction::Bind {
+                terminal_id: "t".into(),
+                session_id: "reg".into(),
+                config_dir: String::new(),
+                origin: BindOrigin::Authoritative,
+                confirmed: false,
+            }
+        );
+    }
+
+    /// Fix 8: the title / re-bind pass reads the tick's shared raw registry,
+    /// never the disk — a registry built in memory renames the tab.
+    ///
+    /// Mutation check: making `refresh_titles_pass` build its index from a
+    /// fresh disk read instead of `registry` leaves the title unchanged.
+    #[test]
+    fn the_title_pass_reads_the_ticks_shared_registry() {
+        use crate::session::claude_session_registry::{RawRegistry, RawRegistryFile};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(confirmed("sid-1", "term-1"));
+        let live = vec![pty_anchored("term-1", 100, 1_000, "C:/repo")];
+        let raw = RawRegistry {
+            files: vec![RawRegistryFile {
+                config_dir: std::path::PathBuf::from("C:/no-such-account"),
+                file_pid: Some(100),
+                content: Ok(format!(
+                    r#"{{"pid":100,"sessionId":"sid-1","name":"renamed","procStart":"{FT}","pidDomain":"win32:spaceship","kind":"interactive"}}"#
+                )),
+            }],
+            dir_errors: vec![],
+            complete: true,
+        };
+        let out = super::super::refresh_titles_pass(&store, &live, &snap(&[100]), &raw);
+        assert_eq!(out.titles.len(), 1, "{:?}", out.titles);
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-1")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("renamed")
         );
     }
 }
