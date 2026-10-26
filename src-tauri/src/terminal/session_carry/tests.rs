@@ -2258,6 +2258,7 @@ fn the_carry_puts_transcripts_first_whatever_order_the_walk_returns() {
         true,
         true,
         &mut |a, b| std::fs::rename(a, b),
+        &mut |a, b| prefix_relation(a, b),
         &mut tally,
     );
     assert_eq!(tally.diverged_preserved, 1, "{tally:?}");
@@ -2491,4 +2492,383 @@ fn delta_sync_never_writes_a_meta_beside_a_fork_left_in_place() {
         "no meta is written beside the fork"
     );
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---- review round 8 -------------------------------------------------------
+
+/// The walk of `cfg`'s literal `<SID>/`, as the carry collects it.
+fn walked_of(cfg: &Path) -> Vec<WalkedFile> {
+    let mut walked = Vec::new();
+    walk_session_dir(&literal_sidecar(cfg), &mut |event| {
+        if let WalkEvent::File { from, rel, src } = event {
+            walked.push((from.to_path_buf(), rel.to_path_buf(), src));
+        }
+    });
+    walked
+}
+
+/// The record of `subagents/<name>` in `files`.
+fn subagent_record<'a>(files: &'a [CarriedFile], name: &str) -> &'a CarriedFile {
+    files
+        .iter()
+        .find(|f| f.rel == Path::new("subagents").join(name))
+        .unwrap_or_else(|| panic!("{name} is recorded: {files:?}"))
+}
+
+const LIVE_META_LATER: &[u8] = br#"{"description":"live run, renamed later"}"#;
+
+/// R8 W1 — the compare of a subagent transcript with its destination FAILS, so
+/// the carry records it `Failed` with the fork still in place. In either mode
+/// that fork keeps its meta: the carry does not copy the source's over it, and
+/// the delta sync never writes one there either — neither over a meta the
+/// carry recorded, nor where a source meta first appears after the carry.
+#[test]
+fn a_compare_failure_keeps_the_forks_meta_through_the_carry_and_the_sync() {
+    for live_source_wins in [true, false] {
+        for late_meta in [false, true] {
+            let tmp = scratch(&format!("cmp-fail-{live_source_wins}-{late_meta}"));
+            let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+            let mut src_files: Vec<(&str, &[u8])> =
+                vec![("subagents/agent-a1.jsonl", b"a\nlive\n")];
+            // Smaller than the source, so even the non-migration size rule
+            // compares the bytes.
+            let mut dst_files: Vec<(&str, &[u8])> = vec![("subagents/agent-a1.jsonl", b"a\nf\n")];
+            if !late_meta {
+                src_files.push(("subagents/agent-a1.meta.json", LIVE_META));
+                dst_files.push(("subagents/agent-a1.meta.json", FORK_META));
+            }
+            let src_side = seed_session(&src, WD, SID, &src_files);
+            let dst_side = seed_session(&dst, WD, SID, &dst_files);
+            let mut tally = SessionDirCarry::default();
+            let files = carry_walked_files(
+                walked_of(&src),
+                &dst_side,
+                true,
+                live_source_wins,
+                &mut |a, b| std::fs::rename(a, b),
+                &mut |a, b| {
+                    if a.ends_with("agent-a1.jsonl") {
+                        Err(std::io::Error::other("injected compare failure"))
+                    } else {
+                        prefix_relation(a, b)
+                    }
+                },
+                &mut tally,
+            );
+            let case = format!("live_source_wins={live_source_wins} late_meta={late_meta}");
+            let sub = dst_side.join("subagents");
+            let rec = subagent_record(&files, "agent-a1.jsonl");
+            assert_eq!(rec.wrote, CarryWrite::Failed, "{case}");
+            assert!(rec.dst.is_some(), "the fork is still in place ({case})");
+            assert_eq!(tally.failed, 1, "{case}: {tally:?}");
+            assert_eq!(
+                std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+                b"a\nf\n"
+            );
+            let meta = sub.join("agent-a1.meta.json");
+            if late_meta {
+                assert!(!meta.exists(), "{case}");
+            } else {
+                assert_eq!(
+                    std::fs::read(&meta).unwrap(),
+                    FORK_META,
+                    "the carry keeps the fork's meta ({case})"
+                );
+                assert!(
+                    subagent_record(&files, "agent-a1.meta.json").kept_destination_newer,
+                    "{case}"
+                );
+            }
+
+            // The old pane (re)writes its meta after the carry.
+            std::fs::write(
+                src_side.join("subagents").join("agent-a1.meta.json"),
+                LIVE_META_LATER,
+            )
+            .unwrap();
+            let since = TranscriptCopy {
+                path: crate::terminal::transcript::session_transcript_path(&dst, WD, SID),
+                main: MainCarry::Present,
+                src_session_dir: src_side.clone(),
+                dst_session_dir: dst_side.clone(),
+                session_dir: tally,
+                files,
+                subagents: Vec::new(),
+            };
+            let synced = sync(&since);
+            assert_eq!(synced.copied, 0, "{case}: {synced:?}");
+            assert_eq!(synced.kept_destination_newer, 1, "{case}: {synced:?}");
+            if late_meta {
+                assert!(
+                    !meta.exists(),
+                    "the sync writes no meta beside the fork ({case})"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(&meta).unwrap(),
+                    FORK_META,
+                    "the sync keeps the fork's meta ({case})"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+}
+
+/// R8 W1 — outside a migration a destination subagent `.jsonl` LARGER than the
+/// source's is current by its size alone, even when it diverged and the source
+/// side ran the session last (`source_is_newer`: the source's in-place
+/// `custom-title.json` replaces the destination's). Its bytes were never
+/// compared, so its meta is kept — by the carry and by the delta sync.
+#[test]
+fn extend_prefix_keeps_the_meta_of_a_larger_diverged_subagent_when_the_source_is_newer() {
+    let tmp = scratch("sub-meta-larger-extend");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let src_side = seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-a1.meta.json", LIVE_META),
+            ("custom-title.json", br#"{"customTitle":"src"}"#),
+        ],
+    );
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[
+            (
+                "subagents/agent-a1.jsonl",
+                b"a\nfork, with a longer tail of its own\n",
+            ),
+            ("subagents/agent-a1.meta.json", FORK_META),
+            ("custom-title.json", br#"{"customTitle":"dst"}"#),
+        ],
+    );
+    // The destination's main transcript is a strict prefix of the source's.
+    write_main(&src, SRC_MAIN);
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
+    assert_eq!(carried.main, MainCarry::ExtendedPrefix);
+    let side = literal_sidecar(&dst);
+    assert_eq!(
+        std::fs::read(side.join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"src"}"#,
+        "the premise: the source ran last, so its in-place files win"
+    );
+    let rec = subagent_record(&carried.files, "agent-a1.jsonl");
+    assert_eq!(rec.wrote, CarryWrite::PresentBySize, "{rec:?}");
+    let sub = side.join("subagents");
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+        b"a\nfork, with a longer tail of its own\n"
+    );
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        FORK_META
+    );
+    assert!(subagent_record(&carried.files, "agent-a1.meta.json").kept_destination_newer);
+
+    std::fs::write(
+        src_side.join("subagents").join("agent-a1.meta.json"),
+        LIVE_META_LATER,
+    )
+    .unwrap();
+    let synced = sync(&carried);
+    assert_eq!(synced.copied, 0, "{synced:?}");
+    assert_eq!(synced.kept_destination_newer, 1, "{synced:?}");
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        FORK_META
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// R8 W1 regression guard — a subagent transcript the destination is known to
+/// hold the source's bytes for (copied fresh, prefix-extended, or
+/// byte-identical on a migration) has its stale meta REPLACED by the live one,
+/// and the delta sync keeps topping that meta up.
+#[test]
+fn a_subagent_known_to_hold_the_source_takes_the_live_meta() {
+    let cases: [(MainTranscript, Option<&[u8]>, CarryWrite); 4] = [
+        (MainTranscript::LiveSourceWins, None, CarryWrite::Copied),
+        (
+            MainTranscript::LiveSourceWins,
+            Some(b"a\n"),
+            CarryWrite::Copied,
+        ),
+        (
+            MainTranscript::ExtendPrefix,
+            Some(b"a\n"),
+            CarryWrite::Copied,
+        ),
+        (
+            MainTranscript::LiveSourceWins,
+            Some(b"a\nlive\n"),
+            CarryWrite::Present,
+        ),
+    ];
+    for (i, (mode, dst_jsonl, expected)) in cases.into_iter().enumerate() {
+        let tmp = scratch(&format!("sub-meta-follows-{i}"));
+        let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let src_side = seed_session(
+            &src,
+            WD,
+            SID,
+            &[
+                ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+                ("subagents/agent-a1.meta.json", LIVE_META),
+            ],
+        );
+        let mut dst_files: Vec<(&str, &[u8])> = vec![("subagents/agent-a1.meta.json", FORK_META)];
+        if let Some(bytes) = dst_jsonl {
+            dst_files.push(("subagents/agent-a1.jsonl", bytes));
+        }
+        seed_session(&dst, WD, SID, &dst_files);
+        let carried =
+            carry_session(src.to_str().unwrap(), dst.to_str().unwrap(), WD, SID, mode).unwrap();
+        let case = format!("case {i}: {mode:?} dst={dst_jsonl:?}");
+        assert_eq!(
+            subagent_record(&carried.files, "agent-a1.jsonl").wrote,
+            expected,
+            "{case}"
+        );
+        let sub = literal_sidecar(&dst).join("subagents");
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+            b"a\nlive\n",
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+            LIVE_META,
+            "{case}"
+        );
+        assert!(
+            !subagent_record(&carried.files, "agent-a1.meta.json").kept_destination_newer,
+            "{case}"
+        );
+
+        std::fs::write(
+            src_side.join("subagents").join("agent-a1.meta.json"),
+            LIVE_META_LATER,
+        )
+        .unwrap();
+        let synced = sync(&carried);
+        assert_eq!(synced.copied, 1, "{case}: {synced:?}");
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+            LIVE_META_LATER,
+            "{case}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// R8 S1 — "the rename-aside moved the fork" needs a positive not-found at the
+/// destination. A link whose target is gone is something there, though
+/// `Path::exists` reads it as absent.
+#[test]
+fn only_a_positive_not_found_reads_as_a_free_path() {
+    let tmp = scratch("path-free");
+    assert!(path_is_free(&tmp.join("absent")));
+    let file = tmp.join("file");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(!path_is_free(&file));
+    let (target, link) = (tmp.join("target"), tmp.join("link"));
+    std::fs::create_dir(&target).unwrap();
+    assert!(
+        link_dir(&target, &link),
+        "could not create a link to test with"
+    );
+    std::fs::remove_dir(&target).unwrap();
+    assert!(
+        !link.exists(),
+        "the premise: exists() reads a dangling link as absent"
+    );
+    assert!(!path_is_free(&link), "a dangling link is not a free path");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Every `custom-title.json.diverged-*` file in `cfg`'s `<SID>/`.
+fn title_backups(cfg: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(literal_sidecar(cfg))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("custom-title.json.diverged-")
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// R8 S4 — a migration that moves the destination's main transcript aside also
+/// keeps the fork's differing `custom-title.json`, as
+/// `custom-title.json.diverged-<same suffix>`, before the live title replaces
+/// it; the backup is never carried on to a later account. An identical title
+/// gets no backup.
+#[test]
+fn a_moved_aside_main_transcript_keeps_the_forks_custom_title_beside_it() {
+    let tmp = scratch("title-backup");
+    let (src, dst, onward) = (
+        tmp.join(".claude-a"),
+        tmp.join(".claude-b"),
+        tmp.join(".claude-c"),
+    );
+    seed_forked(&src, &dst);
+    let carried = carry(&src, &dst);
+    let MainCarry::DivergedPreserved { backup } = &carried.main else {
+        panic!("expected the fork preserved, got {:?}", carried.main);
+    };
+    let suffix = backup
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix(&format!("{SID}.jsonl"))
+        .unwrap()
+        .to_string();
+    assert!(suffix.starts_with(".diverged-"), "{suffix}");
+    let side = literal_sidecar(&dst);
+    assert_eq!(
+        std::fs::read(side.join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"src"}"#
+    );
+    assert_eq!(
+        std::fs::read(side.join(format!("custom-title.json{suffix}"))).unwrap(),
+        br#"{"customTitle":"fork"}"#,
+        "the fork's title is kept beside it, same suffix as its transcript"
+    );
+    assert_eq!(title_backups(&dst).len(), 1);
+
+    carry(&dst, &onward);
+    assert!(
+        title_backups(&onward).is_empty(),
+        "a title backup is never carried on"
+    );
+
+    // The same fork with a title identical to the live one: nothing to keep.
+    let tmp2 = scratch("title-identical");
+    let (src2, dst2) = (tmp2.join(".claude-a"), tmp2.join(".claude-b"));
+    seed_forked(&src2, &dst2);
+    std::fs::write(
+        literal_sidecar(&dst2).join("custom-title.json"),
+        br#"{"customTitle":"src"}"#,
+    )
+    .unwrap();
+    let carried2 = carry(&src2, &dst2);
+    assert!(matches!(carried2.main, MainCarry::DivergedPreserved { .. }));
+    assert!(title_backups(&dst2).is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp2);
 }

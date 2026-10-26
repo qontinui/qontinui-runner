@@ -1206,11 +1206,15 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
 /// already confirmed exhaustion) and the manual Tauri command
 /// (`terminal_migrate_session_account`, where the operator's click is the
 /// confirmation).
+///
+/// Private on purpose: the only caller is [`migrate_session_off_runtime`],
+/// which holds the per-session in-flight guard across it, so the compiler —
+/// not a comment — keeps it from running unguarded.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-pub fn migrate_session(
+fn migrate_session(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
     src_config_dir: &str,
