@@ -444,6 +444,12 @@ fn classify(
     if cohort.is_some_and(|m| m.held) && !operator {
         return Err("held_for_hand_restore".to_string());
     }
+    // A row whose account hit its usage limit during the prepare comes back on
+    // that same, possibly still exhausted, account (D3) — only when the
+    // operator chooses it, never by a route or an autonomous resume.
+    if cohort.is_some_and(|m| m.limit_hit.is_some()) && !operator {
+        return Err("limit_hit_hand_restore_only".to_string());
+    }
     let lift_finish = rec.finished_at.is_some();
     if lift_finish && !(operator && cohort.is_some()) {
         return Err("finished".to_string());
@@ -1808,6 +1814,29 @@ mod tests {
             "held_for_hand_restore"
         );
         assert!(classify(ID, Some(&cohort_rec), Some(&member), true).is_ok());
+    }
+
+    #[test]
+    fn a_limit_hit_cohort_row_is_the_operators_to_restore() {
+        let mut cohort_rec = rec("open");
+        cohort_rec.claude_session_id = ID.to_string();
+        let cohort = restoring(&[ID]);
+        let mut member =
+            cohort_member(Some(&cohort), ID, Some(&cohort_rec), no_blocker, true).unwrap();
+        member.limit_hit = Some(Some(1_800_000_000_000));
+        assert_eq!(
+            reason(classify(ID, Some(&cohort_rec), Some(&member), false)),
+            "limit_hit_hand_restore_only"
+        );
+        member.limit_hit = Some(None);
+        assert_eq!(
+            reason(classify(ID, Some(&cohort_rec), Some(&member), false)),
+            "limit_hit_hand_restore_only",
+            "an unknown reset is still hand-restore only"
+        );
+        assert!(classify(ID, Some(&cohort_rec), Some(&member), true).is_ok());
+        member.limit_hit = None;
+        assert!(classify(ID, Some(&cohort_rec), Some(&member), false).is_ok());
     }
 
     #[test]
