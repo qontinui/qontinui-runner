@@ -124,186 +124,118 @@ fn should_fire(
     Some(pattern)
 }
 
-// ── Stale limit text on a hand-restored limit_hit session ────────────────────
+// ── Hand-restored limit_hit sessions ─────────────────────────────────────────
 
-/// A restart-cohort row that hit its account's usage limit during the prepare
-/// (`limit_hit`) and that the operator restored BY HAND under the same,
-/// still-exhausted account (plan
-/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3: a
-/// restore never re-targets an account; the operator clicks "Account … resets
-/// at …" anyway). `claude --resume` repaints the conversation, including the
-/// old "usage limit reached" line, so without this guard the scanner fired a
-/// hint ~2 s after the resume, the probe (rightly) confirmed the account was
-/// still exhausted, and the session was migrated to another account — undoing
-/// exactly the choice the operator had just made.
+/// A terminal spawned by the operator's hand restore of a restart-cohort row
+/// that hit its account's usage limit during the prepare (`limit_hit`) — kept
+/// on that same, possibly still exhausted, account by choice (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3).
+/// `claude --resume` repaints the old "usage limit reached" line, and before
+/// this marker the scanner fired on it ~2 s after the resume and migrated the
+/// session the operator had just chosen to keep.
 ///
-/// **The rule (one, whatever the screen shows): a hand-restored `limit_hit`
-/// session is not auto-migrated before its account's recorded reset plus
-/// [`STALE_LIMIT_RESET_GRACE_MS`].** The operator chose to resume it on that
-/// account knowing it was exhausted; any limit text before then — the
-/// repainted old line, or a new hit on the same still-exhausted window — is
-/// that same exhaustion, so no hint fires (nothing probed, nothing migrated,
-/// the debounce state untouched). With no recorded reset the window is
-/// [`STALE_LIMIT_MAX_MS`], the exhausted-account cooldown's own clamp. The
-/// grace covers a usage endpoint that still reports 100% for a while after
-/// the reset.
+/// **Two rules, nothing heuristic about the screen:**
 ///
-/// **After that window, only NEW limit output lifts the guard.** Lifting with
-/// the old line still painted would hand hours-old text to `should_fire`,
-/// whose empty last-fired entry fires at once — migrating the very session the
-/// operator kept. So at the first scan past the window the guard records, per
-/// limit PATTERN, how many times it occurs on the whole normalized screen
-/// ([`pattern_counts`]), and suppresses that. It lifts — and the ordinary
-/// probe-guarded hint runs on that same scan — when the screen shows no limit
-/// text at all, or a pattern's count RISES above the record, or a pattern the
-/// record does not hold appears: a genuine new hit printed while the old line
-/// is still in the grid fires.
+/// 1. **Inside the window — until the recorded reset plus
+///    [`RESTORED_LIMIT_GRACE_MS`], or [`RESTORED_LIMIT_MAX_MS`] from the
+///    restore when no reset was recorded — no usage-limit hint fires for the
+///    terminal at all**, whatever the screen shows ([`hint_suppressed`]). The
+///    scan does not even read the pane. Any limit text then (old or new) is
+///    the exhaustion the operator accepted.
+/// 2. **For the terminal's whole life, a hint may migrate it only on a
+///    SUCCESSFUL probe that reads exhausted** ([`is_restored_limit_hit`], read
+///    by `account_migration::exhaustion_confirmed`). Past the window the pane
+///    takes the normal path, and stale limit text on screen then costs at most
+///    a probe: after the reset a successful probe reads not exhausted. But the
+///    fleet-wide confirm also counts a FAILED probe (no token, any non-2xx, a
+///    network error) as exhausted (`commands::ai_settings::probe_result_exhausted`),
+///    which would let stale text plus a transient probe failure migrate the
+///    session; for this terminal a probe error is NotConfirmed instead.
 ///
-/// **Why per pattern over the whole screen, not per row:** the record must be
-/// rewrap-proof. `normalize` collapses newlines, so a message wrapped across
-/// rows still matches; a resize that truncates or re-wraps the old line, a
-/// typed character, a spinner or a clock changes the screen text but not how
-/// many times each pattern occurs, so the old text never reads as new. A count
-/// that stays the same or drops (scroll-off, truncation) keeps the guard. The
-/// accepted weakness errs toward NOT migrating: a wrap that splits a word
-/// inside a pattern can hide one occurrence.
-///
-/// Cost: an unchanged screen is never re-read inside the window (nothing it
-/// shows can change a step), only once at the window's end to take the record,
-/// and after that only when its output changed — the scan gate's skip is
-/// reused for everything else, so a week-long window costs nothing per tick.
-///
-/// No screen-settle or prompt heuristic is involved, so a `❯` menu cursor (a
-/// trust dialog, a picker) cannot end the guard early. Keyed by terminal id,
-/// dropped with the terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StaleLimitGuard {
-    pub until_ms: i64,
-    /// The limit-pattern counts on screen at the first scan past the window:
-    /// the stale text that may never fire. `None` until that scan.
-    pub stale: Option<PatternCounts>,
+/// The marker is kept for the terminal's life, not cleared on a later clean
+/// probe: whether a later probe error is a real exhaustion or a transient
+/// failure is exactly what cannot be told apart, and this session sits on the
+/// account the operator chose, so it only ever moves on a positive reading.
+/// A migration spawns a NEW terminal, which carries no marker. Dropped with
+/// the terminal (the scan's live-set retain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoredLimitHit {
+    /// No hint fires for the terminal before this instant (unix millis).
+    pub suppress_until_ms: i64,
 }
 
-/// How many times each limit pattern occurs on one normalized screen. Only
-/// patterns that occur are present.
-pub(crate) type PatternCounts = std::collections::BTreeMap<&'static str, usize>;
-
-/// PURE: [`PatternCounts`] of an ALREADY-normalized screen.
-pub(crate) fn pattern_counts(normalized: &str) -> PatternCounts {
-    USAGE_LIMIT_PATTERNS
-        .iter()
-        .filter_map(|p| {
-            let n = normalized.matches(p).count();
-            (n > 0).then_some((*p, n))
-        })
-        .collect()
-}
-
-/// How long past the recorded reset the guard still holds: a usage endpoint
+/// How long past the recorded reset hints stay suppressed: a usage endpoint
 /// can keep reporting the old window as full for a while after it rolled.
-pub(crate) const STALE_LIMIT_RESET_GRACE_MS: i64 = 10 * 60 * 1000;
+pub(crate) const RESTORED_LIMIT_GRACE_MS: i64 = 10 * 60 * 1000;
 /// The window when the account's reset time is unknown: six hours, the
 /// exhausted-account cooldown's own clamp.
-pub(crate) const STALE_LIMIT_MAX_MS: i64 = 6 * 3600 * 1000;
+pub(crate) const RESTORED_LIMIT_MAX_MS: i64 = 6 * 3600 * 1000;
 
-/// What one scan does with an armed guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GuardStep {
-    /// Do not fire a hint (limit text on screen inside, or still on screen
-    /// after, the window).
-    Suppress,
-    /// The guard ends; the scan proceeds as for any terminal.
-    Lift,
-    /// No limit text inside the window: nothing to fire, guard stays.
-    Keep,
-}
-
-impl StaleLimitGuard {
-    /// The guard for a restore at `now_ms` of a row whose account resets at
-    /// `limit_reset_at_ms`: until that reset plus the grace, or
-    /// [`STALE_LIMIT_MAX_MS`] from now when the reset is unknown. `None` when
-    /// the reset and its grace have already passed.
-    pub(crate) fn arm(limit_reset_at_ms: Option<i64>, now_ms: i64) -> Option<Self> {
-        let until_ms = match limit_reset_at_ms {
-            Some(reset) => reset.saturating_add(STALE_LIMIT_RESET_GRACE_MS),
-            None => now_ms.saturating_add(STALE_LIMIT_MAX_MS),
-        };
-        (until_ms > now_ms).then_some(Self {
-            until_ms,
-            stale: None,
-        })
-    }
-
-    /// Whether the scan must read this pane even though its output did not
-    /// change: only once, at the end of the window, to record the stale lines.
-    pub(crate) fn needs_unchanged_read(&self, now_ms: i64) -> bool {
-        now_ms >= self.until_ms && self.stale.is_none()
-    }
-
-    /// The step for one scan of the guarded pane, whose limit-pattern counts
-    /// are `counts` (see [`pattern_counts`]). Records them at the first scan
-    /// past the window.
-    pub(crate) fn step(&mut self, counts: &PatternCounts, now_ms: i64) -> GuardStep {
-        if now_ms < self.until_ms {
-            return if counts.is_empty() {
-                GuardStep::Keep
-            } else {
-                GuardStep::Suppress
-            };
-        }
-        if counts.is_empty() {
-            return GuardStep::Lift;
-        }
-        let Some(stale) = &self.stale else {
-            self.stale = Some(counts.clone());
-            return GuardStep::Suppress;
-        };
-        let new_output = counts
-            .iter()
-            .any(|(p, n)| stale.get(p).is_none_or(|old| n > old));
-        if new_output {
-            GuardStep::Lift
-        } else {
-            GuardStep::Suppress
+impl RestoredLimitHit {
+    /// The marker for a restore at `now_ms` of a row whose account resets at
+    /// `limit_reset_at_ms`. A reset (plus grace) already past gives a window
+    /// that is already over; the marker still applies rule 2.
+    pub(crate) fn new(limit_reset_at_ms: Option<i64>, now_ms: i64) -> Self {
+        Self {
+            suppress_until_ms: match limit_reset_at_ms {
+                Some(reset) => reset.saturating_add(RESTORED_LIMIT_GRACE_MS),
+                None => now_ms.saturating_add(RESTORED_LIMIT_MAX_MS),
+            },
         }
     }
 }
 
-/// Per-terminal stale-limit guards (see [`StaleLimitGuard`]).
-static STALE_LIMIT_GUARDS: Mutex<Option<HashMap<String, StaleLimitGuard>>> = Mutex::new(None);
+/// Per-terminal markers (see [`RestoredLimitHit`]).
+static RESTORED_LIMIT_HITS: Mutex<Option<HashMap<String, RestoredLimitHit>>> = Mutex::new(None);
 
-/// Arm the stale-limit guard on `terminal_id`, the pane a hand restore of a
-/// `limit_hit` cohort row just spawned. Returns whether a guard was armed.
+fn restored_limit_hits() -> std::sync::MutexGuard<'static, Option<HashMap<String, RestoredLimitHit>>>
+{
+    RESTORED_LIMIT_HITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Mark `terminal_id`, the pane a hand restore of a `limit_hit` cohort row
+/// just spawned. Returns the marker.
 pub(crate) fn guard_restored_limit_hit(
     terminal_id: &str,
     limit_reset_at_ms: Option<i64>,
     now_ms: i64,
-) -> bool {
-    let Some(guard) = StaleLimitGuard::arm(limit_reset_at_ms, now_ms) else {
-        return false;
-    };
-    let until_ms = guard.until_ms;
-    STALE_LIMIT_GUARDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+) -> RestoredLimitHit {
+    let marker = RestoredLimitHit::new(limit_reset_at_ms, now_ms);
+    restored_limit_hits()
         .get_or_insert_with(HashMap::new)
-        .insert(terminal_id.to_string(), guard);
+        .insert(terminal_id.to_string(), marker);
     info!(
         terminal_id,
-        until_ms,
-        "usage_limit: hand-restored limit_hit session — its repainted limit text will not \
-         trigger an account migration"
+        suppress_until_ms = marker.suppress_until_ms,
+        "usage_limit: hand-restored limit_hit session — no usage-limit hint until its \
+         reset window passes, and a migration only on a successful exhausted probe"
     );
-    true
+    marker
 }
 
-#[cfg(test)]
-pub(crate) fn stale_limit_guard_of(terminal_id: &str) -> Option<StaleLimitGuard> {
-    STALE_LIMIT_GUARDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// Rule 1: whether no usage-limit hint may fire for `terminal_id` at `now_ms`.
+pub(crate) fn hint_suppressed(terminal_id: &str, now_ms: i64) -> bool {
+    restored_limit_hits()
         .as_ref()
-        .and_then(|m| m.get(terminal_id).cloned())
+        .and_then(|m| m.get(terminal_id))
+        .is_some_and(|r| now_ms < r.suppress_until_ms)
+}
+
+/// Rule 2: whether `terminal_id` was hand-restored from a `limit_hit` row, so
+/// only a successful exhausted probe may migrate it.
+pub(crate) fn is_restored_limit_hit(terminal_id: &str) -> bool {
+    restored_limit_hits()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(terminal_id))
+}
+
+/// Drop the markers of terminals that are gone.
+fn retain_restored_limit_hits(live: &HashSet<&String>) {
+    if let Some(m) = restored_limit_hits().as_mut() {
+        m.retain(|tid, _| live.contains(tid));
+    }
 }
 
 // ── Grid scanner ─────────────────────────────────────────────────────────────
@@ -333,23 +265,17 @@ pub fn scan_grids_once() {
         let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
         let now = Instant::now();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut guards_guard = STALE_LIMIT_GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-        let guards = guards_guard.get_or_insert_with(HashMap::new);
         for (tid, session) in &sessions {
+            // A hand-restored limit_hit pane inside its reset window: no hint
+            // at all, so the screen is not even read (`RestoredLimitHit`).
+            if hint_suppressed(tid, now_ms) {
+                continue;
+            }
             // Skip sessions whose grid has not been mutated since the last
             // pass — the rendered screen is byte-identical, so a limit message
             // frozen on an idle terminal is not re-detected. One atomic load
             // instead of a grid lock + full screen render.
-            // A guarded pane with unchanged output is read only once, at the
-            // end of its window, to record the stale lines (see
-            // `StaleLimitGuard`); nothing else on an unchanged screen can
-            // change its step.
-            let changed = gate.should_scan(tid, session.grid_generation());
-            if !changed
-                && !guards
-                    .get(tid)
-                    .is_some_and(|g| g.needs_unchanged_read(now_ms))
-            {
+            if !gate.should_scan(tid, session.grid_generation()) {
                 continue;
             }
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
@@ -360,26 +286,7 @@ pub fn scan_grids_once() {
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            // Normalized ONCE: the matcher and the guard's counts share it.
-            let normalized = normalize(&text);
-            let matched = normalized_indicates_usage_limit(&normalized);
-            if let Some(guard) = guards.get_mut(tid) {
-                match guard.step(&pattern_counts(&normalized), now_ms) {
-                    GuardStep::Suppress => {
-                        debug!(
-                            terminal_id = %tid,
-                            "usage_limit: limit text on a hand-restored limit_hit pane — \
-                             suppressed (inside its reset window, or not yet cleared)"
-                        );
-                        continue;
-                    }
-                    GuardStep::Keep => continue,
-                    GuardStep::Lift => {
-                        guards.remove(tid);
-                        info!(terminal_id = %tid, "usage_limit: stale-limit guard lifted");
-                    }
-                }
-            }
+            let matched = normalized_indicates_usage_limit(&normalize(&text));
             // `entry` defaults to "never fired" → the first appearance fires
             // immediately; thereafter the debounce gates re-fires.
             let last_fired = map.entry(tid.clone()).or_insert(None);
@@ -390,7 +297,7 @@ pub fn scan_grids_once() {
         // Drop state for terminals that have gone away.
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
-        guards.retain(|tid, _| live.contains(tid));
+        retain_restored_limit_hits(&live);
         gate.retain_live(&live);
     } // fire-state + scan-gate locks released
 
@@ -559,239 +466,58 @@ mod tests {
         assert_eq!(last, Some(t0));
     }
 
-    // ── the stale-limit guard (hand-restored limit_hit rows) ──────────────
+    // ── hand-restored limit_hit sessions ──────────────────────────────────
 
     const T0: i64 = 1_800_000_000_000;
 
-    const OLD: &str = "Claude usage limit reached. Your limit will reset at 3am.";
-    const NEW: &str = "5-hour limit reached ∙ resets 9am";
-
-    /// What the guard reads off a screen of `rows`.
-    fn screen_of(rows: &[&str]) -> PatternCounts {
-        pattern_counts(&normalize(&rows.join("\n")))
-    }
-
     #[test]
-    fn pattern_counts_count_each_pattern_over_the_whole_screen() {
-        let c = screen_of(&["work", OLD, "  more", OLD, NEW]);
-        assert_eq!(c.get("usage limit reached"), Some(&2));
-        assert_eq!(c.get("5-hour limit reached"), Some(&1));
-        assert!(screen_of(&["cargo build ok", "❯ "]).is_empty());
-        // Wrapped across rows: normalize joins them, so it still counts.
-        assert_eq!(
-            screen_of(&["Claude usage limit", "reached. Resets 3am."]).get("usage limit reached"),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn a_guard_suppresses_limit_text_until_the_reset_plus_grace() {
+    fn the_window_is_the_reset_plus_grace_or_six_hours() {
         let reset = T0 + 3_600_000;
-        let until = reset + STALE_LIMIT_RESET_GRACE_MS;
-        let mut g = StaleLimitGuard::arm(Some(reset), T0).expect("armed");
-        assert_eq!(g.until_ms, until);
-        let old = screen_of(&[OLD, "❯ "]);
-        // The resume repaint ~2 s later: suppressed, not migrated (the E2E
-        // failure).
-        assert_eq!(g.step(&old, T0 + 2_000), GuardStep::Suppress);
-        // At the exact reset (the endpoint may still read 100%): suppressed.
-        assert_eq!(g.step(&old, reset), GuardStep::Suppress);
-        // A new hit inside the window is the same exhaustion: suppressed.
         assert_eq!(
-            g.step(&screen_of(&[OLD, NEW]), until - 1),
-            GuardStep::Suppress
+            RestoredLimitHit::new(Some(reset), T0).suppress_until_ms,
+            reset + RESTORED_LIMIT_GRACE_MS
         );
-        assert_eq!(g.stale, None, "nothing recorded inside the window");
-    }
-
-    /// Past the window, the old text still on screen never fires, but a NEW
-    /// limit message printed while it is still painted does.
-    #[test]
-    fn past_the_window_old_text_is_suppressed_and_new_limit_output_fires() {
-        let mut g = StaleLimitGuard::arm(None, T0).expect("armed");
-        let after = g.until_ms + 1;
-        assert!(g.needs_unchanged_read(after));
-        let old = screen_of(&["earlier work", OLD, "❯ "]);
-        assert_eq!(g.step(&old, after), GuardStep::Suppress);
-        assert!(!g.needs_unchanged_read(after), "recorded once");
-        // Scrolled / repainted, same stale line: still suppressed.
         assert_eq!(
-            g.step(&screen_of(&[OLD, "❯ "]), after + 5),
-            GuardStep::Suppress
+            RestoredLimitHit::new(None, T0).suppress_until_ms,
+            T0 + RESTORED_LIMIT_MAX_MS
         );
-        // A new limit line printed while the old one is still in the grid.
+        // A known weekly reset is not clamped to six hours.
+        let week = T0 + 7 * 86_400_000;
         assert_eq!(
-            g.step(&screen_of(&[OLD, "retrying…", NEW, "❯ "]), after + 10),
-            GuardStep::Lift
+            RestoredLimitHit::new(Some(week), T0).suppress_until_ms,
+            week + RESTORED_LIMIT_GRACE_MS
         );
     }
 
-    /// Re-review M1 (a): the pane is narrowed after the record. The grid
-    /// truncates the old row (no reflow) and Claude Code redraws at the new
-    /// width, so the old message's row text changes — but it is still only
-    /// the old message.
+    /// Rule 1: inside the window no hint fires for the terminal, whatever the
+    /// screen shows; once it passes the normal `should_fire` path runs.
     #[test]
-    fn a_resized_or_truncated_old_message_stays_suppressed() {
-        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
-        let after = g.until_ms + 1;
-        assert_eq!(
-            g.step(&screen_of(&["work", OLD, "❯ "]), after),
-            GuardStep::Suppress
-        );
-        // Truncated by the grid.
-        assert_eq!(
-            g.step(
-                &screen_of(&["work", "Claude usage limit reached. Your limit will", "❯ "]),
-                after + 1
-            ),
-            GuardStep::Suppress
-        );
-        // Re-wrapped by the redraw at the narrower width.
-        assert_eq!(
-            g.step(
-                &screen_of(&[
-                    "work",
-                    "Claude usage limit reached. Your",
-                    "limit will reset at 3am.",
-                    "❯ "
-                ]),
-                after + 2
-            ),
-            GuardStep::Suppress
-        );
-    }
-
-    /// Re-review M2 (b): the old message matches only across wrapped rows; a
-    /// typed character, a spinner or a clock change elsewhere on screen is
-    /// not new limit output.
-    #[test]
-    fn a_wrapped_old_message_with_other_screen_changes_stays_suppressed() {
-        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
-        let after = g.until_ms + 1;
-        let (a, b) = ("Claude usage limit", "reached. Resets 3am.");
-        assert_eq!(
-            g.step(&screen_of(&[a, b, "❯ "]), after),
-            GuardStep::Suppress
-        );
-        assert_eq!(
-            g.step(&screen_of(&[a, b, "❯ h"]), after + 1),
-            GuardStep::Suppress
-        );
-        assert_eq!(
-            g.step(&screen_of(&["✶ 12:01", a, b, "❯ "]), after + 2),
-            GuardStep::Suppress
-        );
-    }
-
-    /// Re-review S1 (c): the old message on its own row and a NEW message that
-    /// wraps across rows: the new one fires.
-    #[test]
-    fn a_new_wrapped_message_beside_the_old_line_fires() {
-        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
-        let after = g.until_ms + 1;
-        assert_eq!(g.step(&screen_of(&[OLD, "❯ "]), after), GuardStep::Suppress);
-        assert_eq!(
-            g.step(
-                &screen_of(&[OLD, "5-hour limit", "reached ∙ resets 9am", "❯ "]),
-                after + 1
-            ),
-            GuardStep::Lift
-        );
-    }
-
-    /// (d): one more occurrence of the same pattern is new output; a drop
-    /// (one scrolled off) is not.
-    #[test]
-    fn a_rising_count_of_the_same_pattern_fires() {
-        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
-        let after = g.until_ms + 1;
-        assert_eq!(g.step(&screen_of(&[OLD]), after), GuardStep::Suppress);
-        assert_eq!(g.step(&screen_of(&[OLD, OLD]), after + 1), GuardStep::Lift);
-        let mut g2 = StaleLimitGuard::arm(None, T0).unwrap();
-        assert_eq!(g2.step(&screen_of(&[OLD, OLD]), after), GuardStep::Suppress);
-        assert_eq!(g2.step(&screen_of(&[OLD]), after + 1), GuardStep::Suppress);
-    }
-
-    /// (e): no limit text at all lifts the guard, and the scan's matcher then
-    /// has nothing to fire on.
-    #[test]
-    fn a_screen_with_no_limit_text_lifts_without_firing() {
-        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
-        let after = g.until_ms + 1;
-        assert_eq!(g.step(&screen_of(&[OLD]), after), GuardStep::Suppress);
-        let clean = ["work done", "❯ "];
-        assert_eq!(g.step(&screen_of(&clean), after + 1), GuardStep::Lift);
-        let mut last = None;
-        assert_eq!(
-            should_fire(
-                normalized_indicates_usage_limit(&normalize(&clean.join("\n"))),
-                &mut last,
-                Instant::now(),
-                HINT_DEBOUNCE
-            ),
-            None
-        );
-    }
-
-    /// One rule inside the window: a clean screen (the old line scrolled off,
-    /// or a `❯` menu cursor painted) does NOT end it early.
-    #[test]
-    fn a_clean_screen_inside_the_window_does_not_lift_the_guard() {
-        let mut g = StaleLimitGuard::arm(Some(T0 + 3_600_000), T0).expect("armed");
-        assert_eq!(
-            g.step(&screen_of(&["work", "❯ "]), T0 + 60_000),
-            GuardStep::Keep
-        );
-        assert_eq!(
-            g.step(&screen_of(&[NEW]), T0 + 120_000),
-            GuardStep::Suppress
-        );
-        assert!(!g.needs_unchanged_read(T0 + 120_000));
-    }
-
-    /// The scan reads an unchanged guarded pane only once, at the window's end.
-    #[test]
-    fn an_unchanged_guarded_pane_is_read_only_at_the_windows_end() {
-        let mut g = StaleLimitGuard::arm(Some(T0 + 1_000), T0).unwrap();
-        assert!(!g.needs_unchanged_read(T0 + 500));
-        let end = g.until_ms;
-        assert!(g.needs_unchanged_read(end));
-        g.step(&screen_of(&[OLD]), end);
-        assert!(!g.needs_unchanged_read(end + 60_000));
+    fn inside_the_window_no_hint_fires_and_after_it_the_normal_path_runs() {
+        let tid = "usage-limit-restored-window";
+        let reset = T0 + 3_600_000;
+        let marker = guard_restored_limit_hit(tid, Some(reset), T0);
+        assert!(hint_suppressed(tid, T0 + 2_000), "the resume repaint");
+        assert!(hint_suppressed(tid, reset), "at the exact reset");
+        assert!(hint_suppressed(tid, marker.suppress_until_ms - 1));
+        assert!(!hint_suppressed(tid, marker.suppress_until_ms));
+        // Past the window the marker remains for rule 2 only.
+        assert!(is_restored_limit_hit(tid));
+        // An unmarked terminal is never suppressed.
+        assert!(!hint_suppressed("usage-limit-unmarked", T0));
+        assert!(!is_restored_limit_hit("usage-limit-unmarked"));
     }
 
     #[test]
-    fn no_guard_once_the_recorded_reset_and_its_grace_have_passed() {
-        assert_eq!(
-            StaleLimitGuard::arm(Some(T0 - STALE_LIMIT_RESET_GRACE_MS), T0),
-            None
-        );
-        let g = StaleLimitGuard::arm(Some(T0 - 1_000), T0).expect("armed");
-        assert_eq!(g.until_ms, T0 - 1_000 + STALE_LIMIT_RESET_GRACE_MS);
-        let far = StaleLimitGuard::arm(Some(T0 + 10 * STALE_LIMIT_MAX_MS), T0).unwrap();
-        assert_eq!(
-            far.until_ms,
-            T0 + 10 * STALE_LIMIT_MAX_MS + STALE_LIMIT_RESET_GRACE_MS
-        );
-    }
-
-    #[test]
-    fn guard_restored_limit_hit_arms_per_terminal() {
-        let tid = "usage-limit-guard-test-terminal";
-        assert!(guard_restored_limit_hit(tid, Some(T0 + 60_000), T0));
-        assert_eq!(
-            stale_limit_guard_of(tid),
-            Some(StaleLimitGuard {
-                until_ms: T0 + 60_000 + STALE_LIMIT_RESET_GRACE_MS,
-                stale: None,
-            })
-        );
-        assert!(!guard_restored_limit_hit(
-            "usage-limit-guard-test-2",
-            Some(T0 - STALE_LIMIT_RESET_GRACE_MS - 5),
-            T0
-        ));
-        assert_eq!(stale_limit_guard_of("usage-limit-guard-test-2"), None);
+    fn a_marker_is_dropped_with_its_terminal() {
+        let (gone, kept) = ("usage-limit-restored-gone", "usage-limit-restored-kept");
+        guard_restored_limit_hit(gone, None, T0);
+        guard_restored_limit_hit(kept, None, T0);
+        let kept_s = kept.to_string();
+        let live: HashSet<&String> = [&kept_s].into_iter().collect();
+        retain_restored_limit_hits(&live);
+        assert!(!is_restored_limit_hit(gone));
+        assert!(!hint_suppressed(gone, T0));
+        assert!(is_restored_limit_hit(kept));
     }
 
     #[test]

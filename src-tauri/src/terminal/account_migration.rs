@@ -177,9 +177,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // and require the account to actually be exhausted before acting.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    let confirmed = crate::ai_provider::account_known_exhausted(&src);
     let now_ms = chrono::Utc::now().timestamp_millis();
     let src_usage = usage.iter().find(|i| i.config_dir == src);
+    let confirmed = exhaustion_confirmed(
+        crate::ai_provider::account_known_exhausted(&src),
+        src_usage,
+        super::usage_limit::is_restored_limit_hit(&terminal_id),
+    );
     let verdict = decide_hint(
         &mut LiveHintEffects,
         HintFacts {
@@ -269,6 +273,32 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             emit_skipped(&app, &record, &src, &format!("migration-failed: {e}"));
         }
     }
+}
+
+/// Whether the re-probe CONFIRMS the session's account is exhausted.
+///
+/// For an ordinary terminal this is the fleet-wide reading,
+/// `account_known_exhausted`, unchanged — which counts a FAILED probe (no
+/// token, a non-2xx, a network error) as exhausted on purpose
+/// (`commands::ai_settings::probe_result_exhausted`: a rejected probe means the
+/// account will not serve a request).
+///
+/// For a terminal hand-restored from a `limit_hit` cohort row
+/// (`usage_limit::is_restored_limit_hit`) only a SUCCESSFUL probe that reads
+/// exhausted confirms: the operator chose to keep that session on its
+/// account, and stale limit text on its screen plus a transient probe failure
+/// must not move it (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3). A
+/// probe error, or no probe result for the account, is NotConfirmed there.
+pub(crate) fn exhaustion_confirmed(
+    snapshot_exhausted: bool,
+    src_probe: Option<&crate::commands::ai_settings::AccountUsageInfo>,
+    restored_limit_hit: bool,
+) -> bool {
+    if !restored_limit_hit {
+        return snapshot_exhausted;
+    }
+    snapshot_exhausted && src_probe.is_some_and(|p| p.error.is_none())
 }
 
 /// What [`decide_hint`] reads: the probe's verdict and the account's usage.
@@ -1286,6 +1316,68 @@ mod tests {
         assert_eq!(
             row_state(&prep),
             (StateAtPrepare::LimitHit, Some(PREP_T0 + 3_600_000))
+        );
+    }
+
+    fn probe(error: Option<&str>) -> crate::commands::ai_settings::AccountUsageInfo {
+        crate::commands::ai_settings::AccountUsageInfo {
+            config_dir: "/home/u/.claude-iris".to_string(),
+            error: error.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A hand-restored limit_hit terminal after its window: a FAILED probe
+    /// (which the fleet-wide reading counts as exhausted) does not migrate it.
+    #[test]
+    fn a_restored_limit_hit_terminal_does_not_migrate_on_a_probe_error() {
+        let failed = probe(Some("Network error: timed out"));
+        let confirmed = exhaustion_confirmed(true, Some(&failed), true);
+        assert!(!confirmed);
+        let mut fx = Recorded::new(None);
+        assert_eq!(
+            decide_hint(&mut fx, facts(confirmed)),
+            HintVerdict::NotConfirmed
+        );
+        assert_eq!(fx.target_calls, 0, "nothing migrated");
+        // No probe result for the account at all: not confirmed either.
+        assert!(!exhaustion_confirmed(true, None, true));
+    }
+
+    /// ...but a SUCCESSFUL probe that reads exhausted migrates it as usual.
+    #[test]
+    fn a_restored_limit_hit_terminal_migrates_on_a_successful_exhausted_probe() {
+        let ok = probe(None);
+        let confirmed = exhaustion_confirmed(true, Some(&ok), true);
+        assert!(confirmed);
+        let mut fx = Recorded::new(None);
+        assert_eq!(
+            decide_hint(&mut fx, facts(confirmed)),
+            HintVerdict::Migrate {
+                dst: "/home/u/.claude-other".to_string()
+            }
+        );
+        // A successful probe that reads NOT exhausted: nothing.
+        assert!(!exhaustion_confirmed(false, Some(&ok), true));
+    }
+
+    /// Any other terminal keeps the fleet-wide reading: a probe error still
+    /// counts as exhausted (`probe_result_exhausted` is unchanged).
+    #[test]
+    fn an_ordinary_terminal_still_treats_a_probe_error_as_exhausted() {
+        let failed = probe(Some("API error (429): rate limited"));
+        assert!(exhaustion_confirmed(true, Some(&failed), false));
+        assert!(exhaustion_confirmed(true, None, false));
+        assert!(!exhaustion_confirmed(false, Some(&failed), false));
+        let mut fx = Recorded::new(None);
+        assert_eq!(
+            decide_hint(
+                &mut fx,
+                facts(exhaustion_confirmed(true, Some(&failed), false))
+            ),
+            HintVerdict::Migrate {
+                dst: "/home/u/.claude-other".to_string()
+            }
         );
     }
 

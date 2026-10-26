@@ -298,7 +298,9 @@ struct CohortMember {
     held: bool,
     /// `Some(reset)` for a row that hit its account's usage limit during the
     /// prepare (`reset` = when that account resets, if known): the resumed
-    /// pane gets the stale-limit guard so its repainted limit text cannot
+    /// pane gets the restored-limit-hit marker (no usage-limit hint before the
+    /// reset window passes; afterwards a migration only on a successful
+    /// exhausted probe) so its repainted limit text cannot
     /// migrate it off the account the restore deliberately kept (D3).
     limit_hit: Option<Option<i64>>,
     /// Whether the restore set withheld THIS row from the webview's boot
@@ -945,7 +947,7 @@ async fn resume_one(
     };
     let terminal_id = match spawn {
         Ok(Ok((terminal_id, _coord_id))) => {
-            // Armed BEFORE the verify below: the resume repaints the old limit
+            // Marked BEFORE the verify below: the resume repaints the old limit
             // line within ~2 s, well inside the verification window.
             if let Some(reset) = cand.cohort.as_ref().and_then(|m| m.limit_hit) {
                 crate::terminal::usage_limit::guard_restored_limit_hit(
