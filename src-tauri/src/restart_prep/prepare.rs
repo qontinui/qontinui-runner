@@ -673,6 +673,13 @@ pub struct RestartPrep {
     boot_gate: tokio::sync::Mutex<()>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether the last [`RestartPrep::reload_on_win`] on this thread ran with
+    /// `owner_lock` held (review round 12 S2's invariant, observed).
+    static RELOADED_UNDER_OWNER_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Why [`RestartPrep::claim`] did not yield ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Claim {
@@ -1323,8 +1330,18 @@ impl RestartPrep {
             Ok(()) => {
                 self.owner_lock_errors.store(0, Ordering::SeqCst);
                 *held = Some(file);
+                // Re-read and swap the record WHILE still holding `owner_lock`
+                // (review round 12 S2): a concurrent `claim` blocks on it until
+                // the record in memory is the one on disk, so it can never see
+                // `Owned` and act (pay the owed boot step) on the stale copy —
+                // nor can this reload then write an older copy back over what
+                // that call produced. Only the announcement waits for the
+                // guard's release.
+                let announce = self.reload_on_win();
                 drop(held);
-                self.reload_on_win();
+                if let Some(rec) = announce {
+                    self.emit(&rec);
+                }
                 Claim::Owned
             }
             Err(std::fs::TryLockError::WouldBlock) => Claim::OtherProcess,
@@ -1337,26 +1354,28 @@ impl RestartPrep {
     /// finished restore). Act on what is on disk now — and announce it, so the
     /// UI shows the record this process now acts on (review round 11 N1). A
     /// read that FAILS (anything but "no such file") keeps the in-memory copy:
-    /// a transient error is not evidence the record is gone.
-    fn reload_on_win(&self) {
+    /// a transient error is not evidence the record is gone. Called with
+    /// `owner_lock` held; returns the record to announce once it is released.
+    fn reload_on_win(&self) -> Option<PrepareRecord> {
+        #[cfg(test)]
+        RELOADED_UNDER_OWNER_LOCK.with(|c| c.set(self.owner_lock.try_lock().is_err()));
         match super::load_result(&self.path) {
             Ok(disk) => {
-                let changed = {
-                    let mut mem = self.lock();
-                    let changed = *mem != disk;
-                    *mem = disk.clone();
-                    changed
-                };
-                if let (true, Some(rec)) = (changed, disk.as_ref()) {
-                    self.emit(rec);
-                }
+                let mut mem = self.lock();
+                let changed = *mem != disk;
+                *mem = disk.clone();
+                drop(mem);
+                disk.filter(|_| changed)
             }
-            Err(e) => warn!(
+            Err(e) => {
+                warn!(
                 path = %self.path.display(),
                 error = %e,
                 "restart_prep: won the record's lock but could not re-read it — acting on the \
                  copy in memory"
-            ),
+                );
+                None
+            }
         }
     }
 
@@ -2590,6 +2609,26 @@ mod tests {
         assert_eq!(door.release_count(), releases_before + 1, "released once");
         assert_eq!(serving.claim_late(&*door, T0 + 4).await, None);
         assert_eq!(door.release_count(), releases_before + 1, "and only once");
+    }
+
+    /// Review round 12 S2: the reload on winning the lock runs while
+    /// `owner_lock` is still held, so a concurrent claim (a control call racing
+    /// the late claim) waits for it rather than reading `Owned` and acting on
+    /// the stale record — whose reload would then also write the older copy
+    /// back over that call's result. Observed directly: the guard is held at
+    /// the reload (a non-blocking `try_lock` from inside it fails).
+    #[test]
+    fn restart_prep_the_reload_on_winning_the_lock_runs_under_the_owner_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        RELOADED_UNDER_OWNER_LOCK.with(|c| c.set(false));
+        assert!(ctl.claim_ownership());
+        assert!(
+            RELOADED_UNDER_OWNER_LOCK.with(|c| c.get()),
+            "the record was reloaded after owner_lock was released"
+        );
+        // And the guard is released afterwards: a second claim is Owned.
+        assert!(ctl.claim_ownership());
     }
 
     /// Review round 11 N2: a lock error is reported as such, never as another
