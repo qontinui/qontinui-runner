@@ -538,6 +538,8 @@ impl Grid {
         let region_rows = bottom - top + 1;
         let n = (n as usize).min(region_rows);
         let cols = self.cols as usize;
+        // Rows scrolled in take the pen's background (BCE), as erases do.
+        let blank = self.blank_cell();
         for r in top..=bottom {
             let src = r + n;
             if src <= bottom {
@@ -548,7 +550,7 @@ impl Grid {
             } else {
                 let dst_start = r * cols;
                 for cell in &mut self.cells[dst_start..dst_start + cols] {
-                    *cell = Cell::default();
+                    *cell = blank;
                 }
             }
         }
@@ -1563,6 +1565,23 @@ mod tests {
         feed(&mut grid, b"\x1b[10;20H");
         assert_eq!(grid.cursor().row, 9);
         assert_eq!(grid.cursor().col, 19);
+    }
+
+    /// Review round 11 N4: a row scrolled in takes the pen's background
+    /// (BCE), like an erase — not the default background.
+    #[test]
+    fn a_scrolled_in_row_takes_the_pen_background() {
+        let mut grid = Grid::new(10, 3);
+        // Blue background, then scroll by line feeds from the bottom row.
+        feed(&mut grid, b"\x1b[44m\x1b[3;1H\n");
+        let snap = grid.snapshot();
+        let bottom = &snap.cells[20..30];
+        assert!(
+            bottom
+                .iter()
+                .all(|c| c.bg == ansi_color_16(4, false) && c.ch == ' '),
+            "scrolled-in row: {bottom:?}"
+        );
     }
 
     #[test]
