@@ -59,6 +59,9 @@ pub(super) fn spawn_and_wait_with_doctor(
             // returns empty buffers.
             let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
             let pid = child.id();
+            // The Doctor's force-stop kills only a pid with a recorded spawn
+            // identity; `child` is unwaited here, so the token is its own.
+            let token = crate::tree_kill::record_spawn_identity(pid);
 
             // Register with Doctor
             let reg = ProcessRegistration {
@@ -71,14 +74,15 @@ pub(super) fn spawn_and_wait_with_doctor(
                 warn!("Failed to register process with Doctor: {}", e);
             }
 
-            let output = child.wait_with_output()?;
+            let output = child.wait_with_output();
 
             // Unregister (Doctor will auto-unregister dead processes, but explicit is cleaner)
             if let Err(e) = handle.unregister_blocking(pid) {
                 debug!("Failed to unregister process with Doctor: {}", e);
             }
+            crate::tree_kill::forget_spawn_identity(pid, token.as_deref());
 
-            Ok(output)
+            output
         }
         None => cmd.output(),
     }

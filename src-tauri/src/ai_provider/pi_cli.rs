@@ -319,6 +319,9 @@ fn execute_argv(
     };
 
     let pid = child.id();
+    // The Doctor's force-stop kills only a pid with a recorded spawn identity;
+    // `child` is unwaited here, so the token is its own.
+    let doctor_token = doctor_handle.and_then(|_| crate::tree_kill::record_spawn_identity(pid));
     if let Some(handle) = doctor_handle {
         let reg = ProcessRegistration {
             pid,
@@ -337,7 +340,7 @@ fn execute_argv(
             if let Err(e) = stdin.write_all(payload.as_bytes()) {
                 warn!("pi CLI: writing prompt to stdin failed: {}", e);
                 kill_child_tree(&mut child);
-                unregister(doctor_handle, pid);
+                unregister(doctor_handle, pid, doctor_token.as_deref());
                 return ExecOutcome::SpawnError(format!("writing prompt to stdin failed: {}", e));
             }
             // Drop closes stdin (EOF) so pi starts producing output.
@@ -368,13 +371,13 @@ fn execute_argv(
             Err(e) => {
                 warn!("pi CLI: try_wait failed: {}", e);
                 kill_child_tree(&mut child);
-                unregister(doctor_handle, pid);
+                unregister(doctor_handle, pid, doctor_token.as_deref());
                 return ExecOutcome::SpawnError(format!("wait failed: {}", e));
             }
         }
     };
 
-    unregister(doctor_handle, pid);
+    unregister(doctor_handle, pid, doctor_token.as_deref());
 
     let Some(status) = status else {
         // TIMED OUT — return NOW, without joining the reader threads.
@@ -430,11 +433,12 @@ fn kill_child_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn unregister(doctor_handle: Option<&DoctorHandle>, pid: u32) {
+fn unregister(doctor_handle: Option<&DoctorHandle>, pid: u32, doctor_token: Option<&str>) {
     if let Some(handle) = doctor_handle {
         if let Err(e) = handle.unregister_blocking(pid) {
             debug!("Failed to unregister pi CLI process with Doctor: {}", e);
         }
+        crate::tree_kill::forget_spawn_identity(pid, doctor_token);
     }
 }
 

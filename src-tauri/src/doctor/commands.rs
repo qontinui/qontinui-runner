@@ -5,8 +5,10 @@
 //! Tauri's managed state and that type is owned there.
 
 /// Force stop a process by PID: its whole tree, on every OS, and only while
-/// the pid is provably the tracked AI process it was registered as. A pid with
-/// no recorded spawn identity is reported, never signalled.
+/// the pid is provably the process recorded at its spawn — by
+/// `tree_kill::track_ai_pid`, or by `tree_kill::record_spawn_identity` at its
+/// Doctor registration. A pid with no recorded spawn identity is reported,
+/// never signalled.
 #[tauri::command]
 pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
     tracing::warn!("Doctor: Force stopping process PID {} by user request", pid);

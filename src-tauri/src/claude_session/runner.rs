@@ -668,17 +668,23 @@ fn run_claude_session_inline(
 
     // Store child PID for stop functionality
     let child_pid = child.id();
-    if let Some(ref tracker) = pid_tracker {
-        crate::tree_kill::track_ai_pid(tracker, child_pid);
-        info!(
-            "Registered AI process PID {} for session {}",
-            child_pid, session_id
-        );
-    }
+    // Its start token, read while `child` is unwaited: the identity a
+    // per-task stop matches this pid against.
+    let child_token = match pid_tracker {
+        Some(ref tracker) => {
+            let token = crate::tree_kill::track_ai_pid(tracker, child_pid);
+            info!(
+                "Registered AI process PID {} for session {}",
+                child_pid, session_id
+            );
+            token
+        }
+        None => crate::tree_kill::spawn_token(child_pid),
+    };
 
     // Register inline PID with SessionManager for stale task sweep visibility
     if let (Some(sm), Some(trid)) = (session_manager, task_run_id) {
-        sm.register_inline_pid(trid, child_pid);
+        sm.register_inline_pid(trid, child_pid, child_token);
     }
 
     // Track activity for timeout (created early so Doctor registration can use it)
@@ -689,8 +695,10 @@ fn run_claude_session_inline(
     let last_activity = Arc::new(AtomicU64::new(now_secs));
     let last_activity_stdout = last_activity.clone();
 
-    // Register with Doctor health monitoring
-    if let Some(handle) = doctor_handle {
+    // Register with Doctor health monitoring. Its force-stop kills only a pid
+    // with a recorded spawn identity, so record one (`child` is unwaited).
+    let doctor_token = doctor_handle.map(|handle| {
+        let token = crate::tree_kill::record_spawn_identity(child_pid);
         let reg = crate::doctor::ProcessRegistration {
             pid: child_pid,
             process_type: crate::doctor::ProcessType::SessionStreaming,
@@ -700,7 +708,8 @@ fn run_claude_session_inline(
         if let Err(e) = handle.register_blocking(reg) {
             warn!("Failed to register session with Doctor: {}", e);
         }
-    }
+        token
+    });
 
     // Helper to remove PID from tracker when we're done
     let remove_pid = |tracker: &Option<Arc<std::sync::Mutex<Vec<u32>>>>| {
@@ -713,6 +722,9 @@ fn run_claude_session_inline(
         // Also unregister from Doctor
         if let Some(handle) = doctor_handle {
             let _ = handle.unregister_blocking(child_pid);
+        }
+        if let Some(token) = &doctor_token {
+            crate::tree_kill::forget_spawn_identity(child_pid, token.as_deref());
         }
         // Remove inline PID from SessionManager
         if let (Some(sm), Some(trid)) = (session_manager, task_run_id) {
@@ -2527,8 +2539,14 @@ pub fn run_claude_session_interactive(
         None, // agent_log_emitter — non-interactive path, no coord agent_logs
     )?;
 
-    // Register with Doctor health monitoring
+    // Register with Doctor health monitoring. Its force-stop kills only a pid
+    // with a recorded spawn identity: record the token the session read at
+    // spawn (its waiter thread may already have reaped the child).
     if let Some(handle) = doctor_handle {
+        crate::tree_kill::record_spawn_token(
+            session.pid(),
+            session.spawn_token().map(str::to_string),
+        );
         let reg = crate::doctor::ProcessRegistration {
             pid: session.pid(),
             process_type: crate::doctor::ProcessType::SessionStreaming,
@@ -2581,6 +2599,7 @@ pub fn run_claude_session_interactive(
     // Unregister from Doctor health monitoring
     if let Some(handle) = doctor_handle {
         let _ = handle.unregister_blocking(session.pid());
+        crate::tree_kill::forget_spawn_identity(session.pid(), session.spawn_token());
     }
 
     info!(

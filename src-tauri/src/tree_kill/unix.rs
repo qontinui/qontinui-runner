@@ -290,11 +290,11 @@ mod tests {
         let (b, gb) = spawn_tree();
         let a_ids = [identity(a.id()), identity(ga)];
         let b_ids = [identity(b.id()), identity(gb)];
-        track_ai_pid(&tracker, a.id());
+        let ta = track_ai_pid(&tracker, a.id());
         track_ai_pid(&tracker, b.id());
         let tally = rt().block_on(kill_tracked_subset(
             &tracker,
-            &[a.id()],
+            &[(a.id(), ta)],
             Duration::from_secs(5),
             "T15",
         ));
@@ -313,6 +313,149 @@ mod tests {
             Duration::from_secs(5),
             "T15 cleanup",
         ));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        cleanup(b);
+    }
+
+    /// Review r1, finding 5: a task's pid whose recorded identity is now
+    /// ANOTHER spawn's (the pid was reaped and reused) is refused, and that
+    /// spawn stays alive and tracked.
+    #[test]
+    fn per_task_refuses_a_pid_another_spawn_now_holds() {
+        let tracker = Mutex::new(Vec::new());
+        let (b, gb) = spawn_tree();
+        let ids = [identity(b.id()), identity(gb)];
+        track_ai_pid(&tracker, b.id());
+        let stale = Some("linux:1".to_string());
+        let tally = rt().block_on(kill_tracked_subset(
+            &tracker,
+            &[(b.id(), stale)],
+            Duration::from_secs(5),
+            "finding 5",
+        ));
+        assert_eq!(tally.killed, 0, "{tally:?}");
+        assert!(
+            tally
+                .refused
+                .iter()
+                .any(|(p, why)| *p == b.id() && why.contains("reused")),
+            "{tally:?}"
+        );
+        assert_eq!(*lock_tracker(&tracker), vec![b.id()]);
+        std::thread::sleep(Duration::from_millis(200));
+        for id in ids {
+            assert!(is_running(id), "{id:?} was killed or left stopped");
+        }
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        cleanup(b);
+    }
+
+    /// Review r1, finding 7: a pid refused for a reason that may pass (here
+    /// a spent deadline) stays tracked with its identity, so a later stop
+    /// still kills it.
+    #[test]
+    fn a_transiently_refused_pid_stays_tracked() {
+        let tracker = Mutex::new(Vec::new());
+        let (mut a, ga) = spawn_tree();
+        let ids = [identity(a.id()), identity(ga)];
+        track_ai_pid(&tracker, a.id());
+        let tally = kill_tracked_with_deadline(&tracker, "finding 7", || None);
+        assert_eq!(tally.refused.len(), 1, "{tally:?}");
+        assert_eq!(*lock_tracker(&tracker), vec![a.id()]);
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "retry"));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        a.wait().unwrap();
+        for id in ids {
+            assert!(gone_within(id, Duration::from_secs(5)), "{id:?} survived");
+        }
+    }
+
+    /// Review r1, finding 1: a process recorded through
+    /// `record_spawn_identity` (Doctor-listed, in no tracker) is killed by
+    /// the force-stop; once forgotten it is refused again.
+    #[test]
+    fn a_doctor_recorded_pid_is_killable_until_forgotten() {
+        let (mut a, ga) = spawn_tree();
+        let ids = [identity(a.id()), identity(ga)];
+        let token = record_spawn_identity(a.id());
+        assert!(token.is_some());
+        forget_spawn_identity(a.id(), token.as_deref());
+        let outcome = kill_tracked_pid(a.id(), Duration::from_secs(5));
+        assert!(
+            matches!(&outcome, KillOutcome::Refused(why) if why.contains("no recorded spawn identity")),
+            "{outcome:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        for id in ids {
+            assert!(is_running(id), "{id:?} was killed or left stopped");
+        }
+        record_spawn_identity(a.id());
+        let outcome = kill_tracked_pid(a.id(), Duration::from_secs(5));
+        assert!(matches!(outcome, KillOutcome::Killed(_)), "{outcome:?}");
+        a.wait().unwrap();
+        for id in ids {
+            assert!(gone_within(id, Duration::from_secs(5)), "{id:?} survived");
+        }
+    }
+
+    /// A [`TaskPids`] over fixed rows, standing in for the SessionManager.
+    struct Rows(Vec<(&'static str, u32, Option<String>)>);
+
+    impl TaskPids for Rows {
+        fn pids_for_task_run(&self, id: &str) -> Vec<(u32, Option<String>)> {
+            self.0
+                .iter()
+                .filter(|(t, _, _)| *t == id)
+                .map(|(_, p, k)| (*p, k.clone()))
+                .collect()
+        }
+    }
+
+    /// Review r1, finding 8: THE per-task stop both endpoints call kills the
+    /// named task's tree only, and without a session registry signals
+    /// nothing and says so.
+    #[test]
+    fn stop_task_run_trees_kills_only_that_task() {
+        let tracker = Mutex::new(Vec::new());
+        let (mut a, ga) = spawn_tree();
+        let (b, gb) = spawn_tree();
+        let a_ids = [identity(a.id()), identity(ga)];
+        let b_ids = [identity(b.id()), identity(gb)];
+        let ta = track_ai_pid(&tracker, a.id());
+        let tb = track_ai_pid(&tracker, b.id());
+        let rows = Rows(vec![("A", a.id(), ta), ("B", b.id(), tb)]);
+        let none = rt().block_on(stop_task_run_trees(
+            None,
+            &tracker,
+            "A",
+            Duration::from_secs(5),
+            "finding 8",
+        ));
+        assert_eq!(none, TaskStop::NoSessionRegistry);
+        assert!(none.summary().contains("nothing was signalled"));
+        assert_eq!(lock_tracker(&tracker).len(), 2);
+        let stop = rt().block_on(stop_task_run_trees(
+            Some(&rows as &dyn TaskPids),
+            &tracker,
+            "A",
+            Duration::from_secs(5),
+            "finding 8",
+        ));
+        assert!(
+            matches!(&stop, TaskStop::Ran(t) if t.killed == 1),
+            "{stop:?}"
+        );
+        a.wait().unwrap();
+        for id in a_ids {
+            assert!(gone_within(id, Duration::from_secs(5)), "{id:?} survived");
+        }
+        assert_eq!(*lock_tracker(&tracker), vec![b.id()]);
+        std::thread::sleep(Duration::from_millis(200));
+        for id in b_ids {
+            assert!(is_running(id), "task B's {id:?} was killed or left stopped");
+        }
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         cleanup(b);
     }

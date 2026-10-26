@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
-use crate::safe_lock::safe_lock_or_recover;
 use crate::unified_workflows::UnifiedWorkflowExt;
 
 /// PG-primary get_task_run helper.
@@ -220,19 +219,21 @@ pub async fn stop_task_run(
 
     // Kill THIS task run's process trees only (its interactive and inline
     // sessions); every other task's tracked trees stay alive and tracked.
-    let task_pids = state
+    let sessions = state
         .app_handle
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .map(|sm| sm.pids_for_task_run(&id))
-        .unwrap_or_default();
-    let tally = crate::tree_kill::kill_tracked_subset(
+        .map(|sm| sm.inner().clone());
+    let kill_summary = crate::tree_kill::stop_task_run_trees(
+        sessions
+            .as_deref()
+            .map(|sm| sm as &dyn crate::tree_kill::TaskPids),
         &state.current_ai_pids,
-        &task_pids,
+        &id,
         std::time::Duration::from_secs(5),
         &format!("stop task run {id}"),
     )
-    .await;
-    let kill_summary = crate::tree_kill::task_stop_summary(&tally);
+    .await
+    .summary();
 
     // Mark as stopped in database
     state

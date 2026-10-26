@@ -220,9 +220,15 @@ pub async fn close_session(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<CloseRequest>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let mut sessions = SESSION_MANAGER.sessions.lock().await;
+    // Released before the kill below, which may take its whole 5 s budget:
+    // every other session call waits on this lock.
+    let removed = SESSION_MANAGER
+        .sessions
+        .lock()
+        .await
+        .remove(&request.session_id);
 
-    if let Some(mut entry) = sessions.remove(&request.session_id) {
+    if let Some(mut entry) = removed {
         info!(
             "Closing headless browser: session={}, pid={}",
             request.session_id, entry.session.pid

@@ -321,22 +321,21 @@ impl MutationRoot {
         }
 
         // Kill THIS task run's process trees only; other tasks' stay alive.
-        let task_pids = tauri::Manager::try_state::<Arc<crate::claude_session::SessionManager>>(
+        let sessions = tauri::Manager::try_state::<Arc<crate::claude_session::SessionManager>>(
             &state.app_handle,
         )
-        .map(|sm| sm.pids_for_task_run(&id))
-        .unwrap_or_default();
-        let tally = crate::tree_kill::kill_tracked_subset(
+        .map(|sm| sm.inner().clone());
+        let stop = crate::tree_kill::stop_task_run_trees(
+            sessions
+                .as_deref()
+                .map(|sm| sm as &dyn crate::tree_kill::TaskPids),
             &state.current_ai_pids,
-            &task_pids,
+            &id,
             std::time::Duration::from_secs(5),
             &format!("GraphQL: stop task run {id}"),
         )
         .await;
-        info!(
-            "GraphQL: task {id}: {}",
-            crate::tree_kill::task_stop_summary(&tally)
-        );
+        info!("GraphQL: task {id}: {}", stop.summary());
 
         {
             let mut stopped = false;

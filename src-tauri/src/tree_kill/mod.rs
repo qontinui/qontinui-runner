@@ -27,7 +27,9 @@
 //! killed only when its current identity still matches that token — on Linux
 //! inside the freeze walk's pidfd window, on Windows through a handle opened
 //! BEFORE the creation time is compared — and a pid with no recorded identity
-//! is refused, never signalled.
+//! is refused, never signalled. A process the Doctor lists but no tracker
+//! holds gets the same record through [`record_spawn_identity`], so the
+//! Doctor's force-stop reaches it under the same proof.
 //!
 //! **Counts count kills (D-4).** [`KillTally`] counts a pid as killed only
 //! when its tree kill returned `Ok` with a non-empty `killed`. A root that had
@@ -115,18 +117,20 @@ pub(crate) fn kill_child_tree(
 // Tracked AI pids (D-2)
 // ---------------------------------------------------------------------------
 
-/// What [`track_ai_pid`] recorded for one pid.
+/// What was recorded for one pid: by [`track_ai_pid`] (a tracker entry), or
+/// by [`record_spawn_identity`] (a Doctor-listed process in no tracker).
 #[derive(Debug, Clone)]
 struct Recorded {
-    /// The pid's start token at track time; `None` when unreadable, or on an
+    /// The pid's start token at record time; `None` when unreadable, or on an
     /// OS with no token.
     token: Option<String>,
     /// The tracker the pid was pushed into (its address), so pruning one
     /// tracker's departed pids never touches another tracker's entries.
-    tracker: usize,
+    /// `None` for a [`record_spawn_identity`] record.
+    tracker: Option<usize>,
 }
 
-/// Spawn identities of tracked pids, keyed by pid.
+/// Spawn identities of tracked and Doctor-listed pids, keyed by pid.
 static SPAWN_IDENTITY: LazyLock<Mutex<HashMap<u32, Recorded>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -144,14 +148,23 @@ fn tracker_key(tracker: &Mutex<Vec<u32>>) -> usize {
     tracker as *const Mutex<Vec<u32>> as usize
 }
 
+/// The start token of `pid` now. The caller must hold the pid's `Child`
+/// UNWAITED, so that the pid certainly names it: that is what makes the token
+/// the child's spawn identity.
+pub(crate) fn spawn_token(pid: u32) -> Option<String> {
+    qontinui_pty_holder::proc_identity::start_token(pid)
+}
+
 /// THE writer of an AI pid tracker. Push `pid` — a child this runner has just
 /// spawned and not yet waited, so the pid certainly names it — and record its
-/// start token, against which every later kill of the pid is checked.
+/// start token, against which every later kill of the pid is checked. Returns
+/// that token, for a per-task registration of the same pid (see
+/// [`TaskPids`]).
 ///
 /// Entries of this tracker whose pid has since left it (its waiter removed
 /// it) are pruned here, so the record stays as small as the tracker.
-pub(crate) fn track_ai_pid(tracker: &Mutex<Vec<u32>>, pid: u32) {
-    let token = qontinui_pty_holder::proc_identity::start_token(pid);
+pub(crate) fn track_ai_pid(tracker: &Mutex<Vec<u32>>, pid: u32) -> Option<String> {
+    let token = spawn_token(pid);
     if token.is_none() && START_TOKENS_EXIST {
         warn!(
             target: "tree_kill",
@@ -163,14 +176,78 @@ pub(crate) fn track_ai_pid(tracker: &Mutex<Vec<u32>>, pid: u32) {
     let mut pids = lock_tracker(tracker);
     pids.push(pid);
     let mut ids = identities();
-    ids.retain(|p, r| r.tracker != key || pids.contains(p));
+    ids.retain(|p, r| r.tracker != Some(key) || pids.contains(p));
     ids.insert(
         pid,
         Recorded {
-            token,
-            tracker: key,
+            token: token.clone(),
+            tracker: Some(key),
         },
     );
+    token
+}
+
+/// Record the spawn identity of a process the Doctor lists but no AI pid
+/// tracker holds (a one-shot whose `Child` is being waited elsewhere, an
+/// interactive session spawned without a tracker), so the Doctor's force-stop
+/// can kill it while it is provably that process. The caller must hold the
+/// `Child` UNWAITED. Returns the token, which [`forget_spawn_identity`] takes.
+pub(crate) fn record_spawn_identity(pid: u32) -> Option<String> {
+    let token = spawn_token(pid);
+    record_spawn_token(pid, token.clone());
+    token
+}
+
+/// [`record_spawn_identity`] with a token the caller read earlier, while the
+/// `Child` was still unwaited (a session whose waiter thread may since have
+/// reaped it).
+///
+/// Such a record needs a token on every OS (its `Child` is waited on another
+/// thread, so "an unreaped child of this runner" proves nothing), so an
+/// unreadable one records nothing and the force-stop refuses. A pid that is
+/// already tracked under the same identity keeps its tracker record, and a
+/// tracked record under ANOTHER identity (a stale entry its waiter has not
+/// removed yet) is never overwritten: that pid's force-stop then refuses.
+/// Untracked records whose process is gone or reused are pruned here.
+pub(crate) fn record_spawn_token(pid: u32, token: Option<String>) {
+    let mut ids = identities();
+    ids.retain(|p, r| r.tracker.is_some() || (r.token.is_some() && spawn_token(*p) == r.token));
+    match (&token, ids.get(&pid)) {
+        (None, _) => warn!(
+            target: "tree_kill",
+            "pid {pid}: its start token is unreadable, so a Doctor force-stop will refuse to              signal it"
+        ),
+        (Some(_), Some(r)) if r.tracker.is_some() => {
+            if r.token != token {
+                warn!(
+                    target: "tree_kill",
+                    "pid {pid}: a stale tracked record holds this pid, so a Doctor force-stop                      will refuse to signal it"
+                );
+            }
+        }
+        (Some(_), _) => {
+            ids.insert(
+                pid,
+                Recorded {
+                    token,
+                    tracker: None,
+                },
+            );
+        }
+    }
+}
+
+/// Drop the [`record_spawn_identity`] record of `pid`, if it is still the one
+/// recorded with `token` (a reused pid's newer record is kept). A tracker's
+/// record is never dropped here.
+pub(crate) fn forget_spawn_identity(pid: u32, token: Option<&str>) {
+    let mut ids = identities();
+    if ids
+        .get(&pid)
+        .is_some_and(|r| r.tracker.is_none() && r.token.as_deref() == token)
+    {
+        ids.remove(&pid);
+    }
 }
 
 /// What one tracked-pid kill did, classified per D-4.
@@ -196,7 +273,32 @@ impl KillOutcome {
             Err(e) => KillOutcome::Refused(e),
         }
     }
+
+    /// Whether the pid is finished with: killed, exited, or refused for a
+    /// reason no retry can change. A pid refused for any other reason
+    /// (an unreadable `/proc` entry, a pidfd error, a spent deadline, a root
+    /// that survived) may still be alive, so it goes back into its tracker
+    /// rather than becoming unreachable (review r1, finding 7).
+    fn is_final(&self) -> bool {
+        match self {
+            KillOutcome::Killed(_) | KillOutcome::AlreadyExited => true,
+            KillOutcome::Refused(why) => FINAL_REFUSALS.iter().any(|p| why.contains(p)),
+        }
+    }
 }
+
+/// Phrases of the refusals no retry can change: the pid's process is gone or
+/// is another process, or the pid can never be proven or signalled. Each is
+/// pinned against the messages that carry it by `source_tests`.
+const FINAL_REFUSALS: [&str; 7] = [
+    " was reused",
+    "no such process",
+    "is not an unreaped child",
+    " was reaped while",
+    "has no recorded spawn identity",
+    "cannot ever be proven",
+    "refusing ",
+];
 
 /// The per-pid outcomes of a stop, counted per D-4.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -273,22 +375,38 @@ impl KillTally {
     }
 }
 
-/// Kill the tree of the tracked pid `pid`, but only while it is provably the
-/// process [`track_ai_pid`] recorded. A pid with no recorded identity is
-/// refused. A token mismatch ("reused") drops the stale record.
-pub(crate) fn kill_tracked_pid(pid: u32, budget: Duration) -> KillOutcome {
-    let recorded = identities().get(&pid).cloned();
-    let Some(recorded) = recorded else {
-        return KillOutcome::Refused(format!(
+/// The recorded identity of `pid`, or the refusal for a pid with none.
+fn recorded(pid: u32) -> Result<Recorded, KillOutcome> {
+    identities().get(&pid).cloned().ok_or_else(|| {
+        KillOutcome::Refused(format!(
             "pid {pid} has no recorded spawn identity (it was not tracked through \
-             tree_kill::track_ai_pid); nothing signalled"
-        ));
-    };
-    let result = kill_verified(pid, recorded.token.as_deref(), budget);
+             tree_kill::track_ai_pid nor recorded through tree_kill::record_spawn_identity); \
+             nothing signalled"
+        ))
+    })
+}
+
+/// Kill `pid`'s tree under its `recorded` identity. A token mismatch
+/// ("reused") drops the stale record.
+fn kill_recorded(pid: u32, recorded: &Recorded, budget: Duration) -> KillOutcome {
+    // A Doctor-only record's `Child` is waited on another thread, so on every
+    // OS only a token can prove the pid is still that process.
+    let require_token = START_TOKENS_EXIST || recorded.tracker.is_none();
+    let result = kill_verified(pid, recorded.token.as_deref(), require_token, budget);
     if matches!(&result, Err(e) if e.contains(" was reused")) {
         identities().remove(&pid);
     }
     KillOutcome::from_result(result)
+}
+
+/// Kill the tree of the tracked (or Doctor-recorded) pid `pid`, but only while
+/// it is provably the process that was recorded. A pid with no recorded
+/// identity is refused. A token mismatch ("reused") drops the stale record.
+pub(crate) fn kill_tracked_pid(pid: u32, budget: Duration) -> KillOutcome {
+    match recorded(pid) {
+        Ok(r) => kill_recorded(pid, &r, budget),
+        Err(refused) => refused,
+    }
 }
 
 /// [`kill_tracked_pid`] off the async runtime.
@@ -298,17 +416,26 @@ pub(crate) async fn kill_tracked_pid_async(pid: u32, budget: Duration) -> KillOu
         .unwrap_or_else(|e| KillOutcome::Refused(format!("pid {pid}: tree-kill task failed: {e}")))
 }
 
+/// [`kill_recorded`] off the async runtime.
+async fn kill_recorded_async(pid: u32, recorded: Recorded, budget: Duration) -> KillOutcome {
+    tokio::task::spawn_blocking(move || kill_recorded(pid, &recorded, budget))
+        .await
+        .unwrap_or_else(|e| KillOutcome::Refused(format!("pid {pid}: tree-kill task failed: {e}")))
+}
+
 /// Kill `pid`'s tree after proving it is the process whose start token is
-/// `token`.
+/// `token`. With no token, only an OS without tokens and a pid whose `Child`
+/// this runner holds unwaited (`require_token` false) proceeds.
 fn kill_verified(
     pid: u32,
     token: Option<&str>,
+    require_token: bool,
     budget: Duration,
 ) -> Result<TreeKillReport, String> {
-    if token.is_none() && START_TOKENS_EXIST {
+    if token.is_none() && require_token {
         return Err(format!(
-            "pid {pid}: its start token was unreadable when it was tracked, so its identity \
-             cannot be proven; nothing signalled"
+            "pid {pid}: its start token was unreadable when it was recorded, so its identity \
+             cannot ever be proven; nothing signalled"
         ));
     }
     #[cfg(windows)]
@@ -335,8 +462,15 @@ fn windows_kill_verified(
             "pid {pid}: refusing to terminate the calling process's own tree"
         ));
     }
-    let root = OwnedProcess::open(pid)
-        .map_err(|e| format!("pid {pid}: cannot open the process ({e}); nothing signalled"))?;
+    /// `OpenProcess`'s answer for a pid that names no process.
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    let root = OwnedProcess::open(pid).map_err(|e| {
+        if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            format!("pid {pid}: no such process ({e}); nothing signalled")
+        } else {
+            format!("pid {pid}: cannot open the process ({e}); nothing signalled")
+        }
+    })?;
     match root.creation_time().map(|c| format!("windows:{c}")) {
         Some(have) if have == token => {}
         Some(have) => {
@@ -355,7 +489,23 @@ fn windows_kill_verified(
     terminate_tree_of(&root, pid, budget).map_err(|e| e.to_string())
 }
 
+/// After a kill of a pid taken out of `tracker`: a pid whose outcome is not
+/// final goes back into the tracker, keeping its record; any other pid's
+/// record is dropped.
+fn settle(tracker: &Mutex<Vec<u32>>, pid: u32, taken: bool, outcome: &KillOutcome) {
+    if taken && !outcome.is_final() {
+        lock_tracker(tracker).push(pid);
+        warn!(
+            target: "tree_kill",
+            "pid {pid}: not signalled for a reason that may pass; it stays tracked"
+        );
+    } else {
+        identities().remove(&pid);
+    }
+}
+
 /// Drain `tracker` and kill every tracked tree in it — "stop ALL AI work".
+/// A pid refused for a reason that may pass stays tracked.
 pub(crate) async fn kill_tracked(
     tracker: &Mutex<Vec<u32>>,
     budget: Duration,
@@ -364,8 +514,11 @@ pub(crate) async fn kill_tracked(
     let pids = drain(tracker);
     let mut tally = KillTally::default();
     for pid in pids {
-        let outcome = kill_tracked_pid_async(pid, budget).await;
-        identities().remove(&pid);
+        let outcome = match recorded(pid) {
+            Ok(r) => kill_recorded_async(pid, r, budget).await,
+            Err(refused) => refused,
+        };
+        settle(tracker, pid, true, &outcome);
         tally.record(label, pid, outcome);
     }
     tally
@@ -373,7 +526,8 @@ pub(crate) async fn kill_tracked(
 
 /// Synchronous [`kill_tracked`] under a caller's deadline arithmetic (the
 /// runner's quit). `next_budget` is asked before each pid; `None` means the
-/// deadline is spent, and every pid left is reported refused, unsignalled.
+/// deadline is spent, and every pid left is reported refused, unsignalled
+/// (and stays tracked).
 pub(crate) fn kill_tracked_with_deadline(
     tracker: &Mutex<Vec<u32>>,
     label: &str,
@@ -393,38 +547,118 @@ pub(crate) fn kill_tracked_with_deadline(
                 ))
             }
         };
-        identities().remove(&pid);
+        settle(tracker, pid, true, &outcome);
         tally.record(label, pid, outcome);
     }
     tally
 }
 
-/// Kill only `pids` — one task run's processes (D-3) — and remove exactly
-/// those from `tracker`; every other tracked pid stays tracked and alive.
+/// Where a per-task stop finds a task run's processes: the pid of each, with
+/// the start token captured when the task registered it (its `Child` then
+/// held unwaited). Implemented by `claude_session::SessionManager`.
+pub(crate) trait TaskPids: Sync {
+    fn pids_for_task_run(&self, task_run_id: &str) -> Vec<(u32, Option<String>)>;
+}
+
+/// Kill only `pids` — one task run's processes (D-3) — and take exactly those
+/// out of `tracker`; every other tracked pid stays tracked and alive.
+///
+/// Each pid carries the token its task registered it with, which must equal
+/// the pid's recorded identity: the pid may since have been reaped and reused
+/// by ANOTHER task's tracked spawn, whose record then holds the pid (review
+/// r1, finding 5). A mismatched pid is refused and left in the tracker.
 pub(crate) async fn kill_tracked_subset(
     tracker: &Mutex<Vec<u32>>,
-    pids: &[u32],
+    pids: &[(u32, Option<String>)],
     budget: Duration,
     label: &str,
 ) -> KillTally {
-    lock_tracker(tracker).retain(|p| !pids.contains(p));
     let mut tally = KillTally::default();
-    for &pid in pids {
-        let outcome = kill_tracked_pid_async(pid, budget).await;
-        identities().remove(&pid);
+    for (pid, registered) in pids {
+        let pid = *pid;
+        let checked = recorded(pid).and_then(|r| {
+            if registered.is_none() && START_TOKENS_EXIST {
+                Err(KillOutcome::Refused(format!(
+                    "pid {pid}: its start token was unreadable when its task registered it, so \
+                     it cannot ever be proven that task's process; nothing signalled"
+                )))
+            } else if *registered != r.token {
+                Err(KillOutcome::Refused(format!(
+                    "pid {pid}: its recorded identity is not the process this task run \
+                     registered (the pid was reused by another spawn); nothing signalled"
+                )))
+            } else {
+                Ok(r)
+            }
+        });
+        let outcome = match checked {
+            Ok(r) => {
+                let taken = {
+                    let mut t = lock_tracker(tracker);
+                    let before = t.len();
+                    t.retain(|p| *p != pid);
+                    t.len() != before
+                };
+                let outcome = kill_recorded_async(pid, r, budget).await;
+                settle(tracker, pid, taken, &outcome);
+                outcome
+            }
+            Err(refused) => refused,
+        };
         tally.record(label, pid, outcome);
     }
     tally
 }
 
-/// A per-task stop's reply text: what was killed, or that no process was
-/// found for the task (never a silent "killed 0").
-pub(crate) fn task_stop_summary(tally: &KillTally) -> String {
-    if tally.attempted() == 0 {
-        "no process was found for this task, so nothing was signalled".to_string()
-    } else {
-        format!("killed {} process(es){}", tally.killed, tally.qualifiers())
+/// What a per-task stop did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskStop {
+    /// No session registry was available, so the task's processes could not
+    /// be looked up; nothing was signalled.
+    NoSessionRegistry,
+    /// The task's processes were looked up and each was handled.
+    Ran(KillTally),
+}
+
+impl TaskStop {
+    /// A per-task stop's reply text: what was killed, or why nothing was
+    /// (never a silent "killed 0").
+    pub fn summary(&self) -> String {
+        match self {
+            TaskStop::NoSessionRegistry => "the session registry is unavailable, so this task's \
+                                            processes could not be looked up; nothing was \
+                                            signalled"
+                .to_string(),
+            TaskStop::Ran(tally) if tally.attempted() == 0 => {
+                "no process was found for this task, so nothing was signalled".to_string()
+            }
+            TaskStop::Ran(tally) => {
+                format!("killed {} process(es){}", tally.killed, tally.qualifiers())
+            }
+        }
     }
+}
+
+/// THE per-task stop (D-3), shared by `POST /task-runs/{id}/stop` and the
+/// GraphQL `stopTaskRun`: look up task run `task_run_id`'s processes in
+/// `sessions` and kill exactly those trees.
+pub(crate) async fn stop_task_run_trees(
+    sessions: Option<&dyn TaskPids>,
+    tracker: &Mutex<Vec<u32>>,
+    task_run_id: &str,
+    budget: Duration,
+    label: &str,
+) -> TaskStop {
+    let Some(sessions) = sessions else {
+        warn!(
+            target: "tree_kill",
+            "{label}: no session registry, so task {task_run_id}'s processes cannot be found; \
+             nothing signalled"
+        );
+        return TaskStop::NoSessionRegistry;
+    };
+    let pids = sessions.pids_for_task_run(task_run_id);
+    TaskStop::Ran(kill_tracked_subset(tracker, &pids, budget, label).await)
 }
 
 fn drain(tracker: &Mutex<Vec<u32>>) -> Vec<u32> {
@@ -608,11 +842,11 @@ mod tests {
         let tracker = Mutex::new(Vec::new());
         let mut a = spawn_long();
         let mut b = spawn_long();
-        track_ai_pid(&tracker, a.id());
+        let ta = track_ai_pid(&tracker, a.id());
         track_ai_pid(&tracker, b.id());
         let tally = rt().block_on(kill_tracked_subset(
             &tracker,
-            &[a.id()],
+            &[(a.id(), ta)],
             Duration::from_secs(5),
             "T15",
         ));
@@ -628,6 +862,132 @@ mod tests {
             Duration::from_secs(5),
             "T15 cleanup",
         ));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        assert!(exits_within(&mut b, Duration::from_secs(5)));
+    }
+
+    /// Review r1, finding 5: a task's pid whose recorded identity is now
+    /// ANOTHER spawn's (the pid was reaped and reused) is refused, and that
+    /// spawn stays alive and tracked.
+    #[test]
+    fn tree_kill_per_task_refuses_a_pid_another_spawn_now_holds() {
+        let tracker = Mutex::new(Vec::new());
+        let mut b = spawn_long();
+        track_ai_pid(&tracker, b.id());
+        let stale = Some("windows:1".to_string());
+        let tally = rt().block_on(kill_tracked_subset(
+            &tracker,
+            &[(b.id(), stale)],
+            Duration::from_secs(5),
+            "finding 5",
+        ));
+        assert_eq!(tally.killed, 0, "{tally:?}");
+        assert!(
+            tally
+                .refused
+                .iter()
+                .any(|(p, why)| *p == b.id() && why.contains("reused")),
+            "{tally:?}"
+        );
+        assert_eq!(*lock_tracker(&tracker), vec![b.id()]);
+        assert!(
+            !exits_within(&mut b, Duration::from_millis(300)),
+            "the other spawn was killed"
+        );
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        assert!(exits_within(&mut b, Duration::from_secs(5)));
+    }
+
+    /// Review r1, finding 7: a pid refused for a reason that may pass (here
+    /// a spent deadline) stays tracked with its identity, so a later stop
+    /// still kills it.
+    #[test]
+    fn tree_kill_a_transiently_refused_pid_stays_tracked() {
+        let tracker = Mutex::new(Vec::new());
+        let mut a = spawn_long();
+        track_ai_pid(&tracker, a.id());
+        let tally = kill_tracked_with_deadline(&tracker, "finding 7", || None);
+        assert_eq!(tally.refused.len(), 1, "{tally:?}");
+        assert_eq!(*lock_tracker(&tracker), vec![a.id()]);
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "retry"));
+        assert_eq!(tally.killed, 1, "{tally:?}");
+        assert!(exits_within(&mut a, Duration::from_secs(5)));
+    }
+
+    /// Review r1, finding 1: a process recorded through
+    /// `record_spawn_identity` (Doctor-listed, in no tracker) is killed by
+    /// the force-stop; once forgotten it is refused again.
+    #[test]
+    fn tree_kill_a_doctor_recorded_pid_is_killable_until_forgotten() {
+        let mut a = spawn_long();
+        let token = record_spawn_identity(a.id());
+        assert!(token.is_some());
+        forget_spawn_identity(a.id(), token.as_deref());
+        let outcome = kill_tracked_pid(a.id(), Duration::from_secs(5));
+        assert!(
+            matches!(&outcome, KillOutcome::Refused(why) if why.contains("no recorded spawn identity")),
+            "{outcome:?}"
+        );
+        assert!(!exits_within(&mut a, Duration::from_millis(300)), "killed");
+        record_spawn_identity(a.id());
+        let outcome = kill_tracked_pid(a.id(), Duration::from_secs(5));
+        assert!(matches!(outcome, KillOutcome::Killed(_)), "{outcome:?}");
+        assert!(exits_within(&mut a, Duration::from_secs(5)));
+    }
+
+    /// A [`TaskPids`] over fixed rows, standing in for the SessionManager.
+    struct Rows(Vec<(&'static str, u32, Option<String>)>);
+
+    impl TaskPids for Rows {
+        fn pids_for_task_run(&self, id: &str) -> Vec<(u32, Option<String>)> {
+            self.0
+                .iter()
+                .filter(|(t, _, _)| *t == id)
+                .map(|(_, p, k)| (*p, k.clone()))
+                .collect()
+        }
+    }
+
+    /// Review r1, finding 8: THE per-task stop both endpoints call kills the
+    /// named task's tree only, and without a session registry signals
+    /// nothing and says so.
+    #[test]
+    fn tree_kill_stop_task_run_trees_kills_only_that_task() {
+        let tracker = Mutex::new(Vec::new());
+        let mut a = spawn_long();
+        let mut b = spawn_long();
+        let ta = track_ai_pid(&tracker, a.id());
+        let tb = track_ai_pid(&tracker, b.id());
+        let rows = Rows(vec![("A", a.id(), ta), ("B", b.id(), tb)]);
+        let none = rt().block_on(stop_task_run_trees(
+            None,
+            &tracker,
+            "A",
+            Duration::from_secs(5),
+            "finding 8",
+        ));
+        assert_eq!(none, TaskStop::NoSessionRegistry);
+        assert!(none.summary().contains("nothing was signalled"));
+        assert_eq!(lock_tracker(&tracker).len(), 2);
+        let stop = rt().block_on(stop_task_run_trees(
+            Some(&rows as &dyn TaskPids),
+            &tracker,
+            "A",
+            Duration::from_secs(5),
+            "finding 8",
+        ));
+        assert!(
+            matches!(&stop, TaskStop::Ran(t) if t.killed == 1),
+            "{stop:?}"
+        );
+        assert!(exits_within(&mut a, Duration::from_secs(5)));
+        assert_eq!(*lock_tracker(&tracker), vec![b.id()]);
+        assert!(
+            !exits_within(&mut b, Duration::from_millis(300)),
+            "task B was killed"
+        );
+        let tally = rt().block_on(kill_tracked(&tracker, Duration::from_secs(5), "cleanup"));
         assert_eq!(tally.killed, 1, "{tally:?}");
         assert!(exits_within(&mut b, Duration::from_secs(5)));
     }
