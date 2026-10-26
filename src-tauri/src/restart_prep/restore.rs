@@ -564,9 +564,17 @@ pub async fn set_held_on(
 }
 
 /// Reason recorded on a row un-finished by hand after the notice loop last
-/// read it as finished.
+/// read it as finished, while the prepare is in its window: the next notice
+/// tick re-reads it within seconds, so "not re-read yet" is true until then.
 pub const UNFINISHED_SINCE_LAST_READ: &str =
     "un-finished by hand since the last read — not re-read yet";
+
+/// The same, once the prepare has left its window (the cohort is restoring):
+/// nothing re-reads a row then, so a "not re-read yet" would stay forever and
+/// stop being true. This one stays true.
+pub const UNFINISHED_AFTER_RESTART: &str =
+    "un-finished by hand after the restart — rows are not re-read while the cohort is \
+     restoring; restore it by hand";
 
 /// The work axis of cohort row `claude_session_id` changed by hand
 /// (`terminal_session_set_finished`): carry it onto the row at once. The
@@ -609,6 +617,7 @@ pub async fn note_finished_on(
     {
         return Ok(false);
     }
+    let in_window = rec.in_window();
     ctl.update(&rec.prepare_id, |r| {
         if let Some(row) = r
             .cohort
@@ -619,7 +628,14 @@ pub async fn note_finished_on(
             row.finished = Some(finished);
             if !finished && row.pause_state == Some(super::cohort::PauseState::Finished) {
                 row.pause_state = None;
-                row.pause_reason = Some(UNFINISHED_SINCE_LAST_READ.to_string());
+                row.pause_reason = Some(
+                    if in_window {
+                        UNFINISHED_SINCE_LAST_READ
+                    } else {
+                        UNFINISHED_AFTER_RESTART
+                    }
+                    .to_string(),
+                );
             }
         }
     })
@@ -630,6 +646,10 @@ pub async fn note_finished_on(
 /// lifecycle record, which the next re-capture reads, already holds the mark.
 pub async fn note_finished(claude_session_id: &str, finished: bool) {
     let Some(ctl) = super::prepare::install_live() else {
+        tracing::info!(
+            session = claude_session_id,
+            "restart_prep: finish mark not carried — no restart-prep controller in this process"
+        );
         return;
     };
     let store_finished = |id: &str| -> Option<bool> {
@@ -641,15 +661,21 @@ pub async fn note_finished(claude_session_id: &str, finished: bool) {
         store.get(id).map(|r| r.finished_at.is_some())
     };
     match note_finished_on(ctl, claude_session_id, finished, &store_finished).await {
-        // One line either way, so a row that keeps a stale state after an
-        // un-finish says which: never reached, no row / nothing to change, or
-        // carried.
-        Ok(changed) => tracing::info!(
+        // One line on every path, so a row that keeps a stale state after an
+        // un-finish says which: no controller (above), no record / no row /
+        // nothing to change, or written.
+        Ok(true) => tracing::info!(
             session = claude_session_id,
             requested = finished,
             store_finished = ?store_finished(claude_session_id),
-            changed,
-            "restart_prep: finish mark carried onto the cohort row"
+            "restart_prep: finish mark written onto the cohort row"
+        ),
+        Ok(false) => tracing::info!(
+            session = claude_session_id,
+            requested = finished,
+            store_finished = ?store_finished(claude_session_id),
+            "restart_prep: finish mark not written — no prepare record, no cohort row for this \
+             session, or the row already matched"
         ),
         Err(e) => warn!(
             session = claude_session_id,
@@ -974,6 +1000,30 @@ mod tests {
         }
     }
 
+    /// Inside the prepare's window the next notice tick re-reads the row, so
+    /// "not re-read yet" is the true reason there.
+    #[tokio::test]
+    async fn an_unfinish_inside_the_window_says_not_re_read_yet() {
+        use crate::restart_prep::cohort::PauseState;
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["w1"], 0);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        ctl.update(&prepare_id, |r| {
+            r.cohort.rows[0].finished = Some(true);
+            r.cohort.rows[0].pause_state = Some(PauseState::Finished);
+        })
+        .unwrap();
+        assert!(ctl.record().unwrap().in_window());
+        assert_eq!(
+            note_finished_on(&ctl, "w1", false, &no_store).await,
+            Ok(true)
+        );
+        assert_eq!(
+            ctl.record().unwrap().cohort.rows[0].pause_reason.as_deref(),
+            Some(UNFINISHED_SINCE_LAST_READ)
+        );
+    }
+
     /// The lifecycle store could not be read: the caller's value stands.
     fn no_store(_: &str) -> Option<bool> {
         None
@@ -1020,7 +1070,8 @@ mod tests {
         let s1 = &rec.cohort.rows[0];
         assert_eq!(s1.finished, Some(false));
         assert_eq!(s1.pause_state, None, "not `finished` any more");
-        assert_eq!(s1.pause_reason.as_deref(), Some(UNFINISHED_SINCE_LAST_READ));
+        // Restoring: nothing re-reads the row, so the reason must stay true.
+        assert_eq!(s1.pause_reason.as_deref(), Some(UNFINISHED_AFTER_RESTART));
         // The other row is untouched; a repeat or an unknown row writes nothing.
         assert_eq!(rec.cohort.rows[1].pause_state, Some(PauseState::Finished));
         assert_eq!(
