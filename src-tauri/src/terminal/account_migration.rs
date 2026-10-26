@@ -456,7 +456,7 @@ async fn run_continue_nudge<D, DF>(
 }
 
 /// How many carried subagents [`continue_nudge`] names before summarising the
-/// rest as a count — a fan-out measured at 45 on one session.
+/// rest as a count, so a large fan-out cannot make the typed prompt unbounded.
 const NUDGE_MAX_LISTED_SUBAGENTS: usize = 12;
 
 /// Character bound on one subagent description in [`continue_nudge`].
@@ -809,12 +809,11 @@ fn resume_respawn_extra_required(
 /// [`migrate_session`] on the blocking pool rather than an async worker.
 ///
 /// The migration is synchronous file and process work, and since the `<sid>/`
-/// carry it can copy a whole session directory, which for a long fan-out runs
-/// to hundreds of files and tens of megabytes or more. A usage limit is per
-/// account, so every session on that account migrates at about the same moment;
-/// run inline, each of those would hold a tokio worker for the length of its
-/// copy. Both async callers (the usage-limit hint and the manual Tauri command)
-/// go through here.
+/// carry it can copy a whole session directory, which for a long fan-out can
+/// be many files. A usage limit is per account, so every session on that
+/// account migrates at about the same moment; run inline, each of those would
+/// hold a tokio worker for the length of its copy. Both async callers (the
+/// usage-limit hint and the manual Tauri command) go through here.
 pub async fn migrate_session_off_runtime(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
