@@ -75,6 +75,7 @@
 //! is tested against an injected door and never against real coord: this box's
 //! device holding its own agent lane would drain the primary runner.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -629,6 +630,10 @@ pub struct RestartPrep {
     /// (or a click and a tick) cannot race.
     pub(super) ops: tokio::sync::Mutex<()>,
     on_change: Option<ChangeHook>,
+    /// The notice loop's told-but-busy diagnostic memory: per session, the key
+    /// of the line last logged (`notice::log_told_busy`). In memory only, and
+    /// cleared when a new prepare starts.
+    pub(super) told_busy_logged: Mutex<HashMap<String, String>>,
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -662,6 +667,7 @@ impl RestartPrep {
             persist_pending: AtomicBool::new(false),
             ops: tokio::sync::Mutex::new(()),
             on_change,
+            told_busy_logged: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1068,6 +1074,11 @@ impl RestartPrep {
         // (the banner, and Release hold's restart test) belongs to that record.
         self.same_build_restart.store(false, Ordering::SeqCst);
         let cohort = capture().await?;
+        // A new prepare's diagnostics start empty.
+        self.told_busy_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut rec = PrepareRecord::new(uuid::Uuid::new_v4().to_string(), now_ms, cohort);
         rec.reason = sanitize_reason(reason);
         let until = now_ms + DEFAULT_HOLD_MS;
@@ -2940,6 +2951,7 @@ mod tests {
             device_drain: None,
             close_reasons: std::collections::HashMap::new(),
             activity_detail: std::collections::HashMap::new(),
+            activity_key: std::collections::HashMap::new(),
         };
         let mut v = crate::restart_prep::notice::verdict_of(&rec, &ev, None, T0);
         rec.verdict = Some(v.clone());

@@ -316,6 +316,9 @@ pub struct CensusEvidence {
     /// observation, the children hint, Claude Code's record), for the
     /// told-but-busy diagnostic ([`told_busy_diagnostic`]). Information only.
     pub activity_detail: HashMap<String, String>,
+    /// claude session id → the STABLE part of that detail (variants only — no
+    /// timestamps), which the diagnostic's once-per-change dedupe keys on.
+    pub activity_key: HashMap<String, String>,
 }
 
 impl CensusEvidence {
@@ -329,6 +332,7 @@ impl CensusEvidence {
             device_drain: None,
             close_reasons: HashMap::new(),
             activity_detail: HashMap::new(),
+            activity_key: HashMap::new(),
         }
     }
 }
@@ -354,6 +358,7 @@ pub fn evidence_from(
     let mut by_session: HashMap<String, ProcEvidence> = HashMap::new();
     let mut ambiguous: HashSet<String> = HashSet::new();
     let mut activity_detail: HashMap<String, String> = HashMap::new();
+    let mut activity_key: HashMap<String, String> = HashMap::new();
     let mut unattributed_live = report.holder_hosted.len()
         + report.live_untracked.len()
         + report.holder_unresolved_count()
@@ -388,13 +393,17 @@ pub fn evidence_from(
             .records
             .get(&p.pid)
             .unwrap_or(&RecordReading::Missing);
+        let pane = activity.pane_by_pid.get(&p.pid);
         activity_detail.insert(
             sid.clone(),
             format!(
-                "pane={:?} children={:?} record={record:?}",
-                activity.pane_by_pid.get(&p.pid),
+                "pane={pane:?} children={:?} record={record:?}",
                 p.has_live_children
             ),
+        );
+        activity_key.insert(
+            sid.clone(),
+            stable_activity_key(pane, p.has_live_children, record),
         );
         if by_session.insert(sid.clone(), ev).is_some() {
             ambiguous.insert(sid);
@@ -415,7 +424,50 @@ pub fn evidence_from(
         device_drain,
         close_reasons: HashMap::new(),
         activity_detail,
+        activity_key,
     }
+}
+
+/// PURE: the variants of what an activity was classified from, with every
+/// timestamp dropped (`set_at_ms`, `since_ms`, `status_updated_at_ms`,
+/// `last_message_ms`), so it changes only when the classification's inputs
+/// change in kind.
+pub fn stable_activity_key(
+    pane: Option<&crate::session::wind_down_observer::TerminalObservation>,
+    children: Option<bool>,
+    record: &RecordReading,
+) -> String {
+    use qontinui_runner_lib::wind_down::{GridIdle, Sideband};
+    let (sideband, grid) = match pane {
+        None => ("no pane".to_string(), "no pane"),
+        Some(o) => (
+            match o.sideband {
+                Sideband::NeverReported => "never reported".to_string(),
+                Sideband::Reported { state, .. } => format!("{state:?}"),
+                Sideband::Unreadable => "unreadable".to_string(),
+            },
+            match o.grid {
+                GridIdle::Idle { .. } => "idle",
+                GridIdle::Busy => "busy",
+                GridIdle::Unknown => "unknown",
+            },
+        ),
+    };
+    let record = match record {
+        RecordReading::Parsed(ev) => format!("status {}", ev.status),
+        other => format!("{other:?}"),
+    };
+    format!("sideband={sideband} grid={grid} children={children:?} record={record}")
+}
+
+/// The KIND of an `idle::idle_veto` reason, without its row number or the
+/// row's text: `spinner glyph `✻``, `processing indicator `…``, `no prompt`,
+/// `cursor above the prompt`.
+pub fn veto_kind(veto: &str) -> &str {
+    if veto.starts_with("cursor on row") {
+        return "cursor above the prompt";
+    }
+    veto.split_once(" on row").map_or(veto, |(kind, _)| kind)
 }
 
 /// A row's state from the census: `(state, idle_now, reason)`.
@@ -522,7 +574,7 @@ pub fn told_busy_diagnostic(
     row: &CohortRow,
     ev: &CensusEvidence,
     grid_veto: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     if row.pause_state != Some(PauseState::Notified) {
         return None;
     }
@@ -537,27 +589,30 @@ pub fn told_busy_diagnostic(
         .get(id)
         .map(String::as_str)
         .unwrap_or("-");
-    Some(format!(
+    let key = format!(
+        "activity={activity}; veto={}; {}",
+        grid_veto.map_or("none", veto_kind),
+        ev.activity_key.get(id).map(String::as_str).unwrap_or("-")
+    );
+    let line = format!(
         "activity={activity}; grid_veto={}; {detail}",
         grid_veto.unwrap_or("none (the grid reads idle)")
-    ))
+    );
+    Some((key, line))
 }
 
-/// The last told-but-busy line logged per session, so a row that stays busy
-/// for the same reason logs once, and again only when the reason changes.
-static TOLD_BUSY_LOGGED: std::sync::Mutex<Option<HashMap<String, String>>> =
-    std::sync::Mutex::new(None);
-
-/// Log [`told_busy_diagnostic`] for every told-but-busy row whose line changed
-/// since it was last logged. Returns the lines it logged (for tests).
+/// Log [`told_busy_diagnostic`] for every told-but-busy row whose STABLE key
+/// (activity, input kinds, veto kind — no timestamps, no row text) changed
+/// since it was last logged; the logged line carries the full detail. `last`
+/// is the controller's own per-prepare memory (`RestartPrep::told_busy_logged`,
+/// cleared when a prepare starts). Returns the lines it logged (for tests).
 pub fn log_told_busy(
     cohort: &Cohort,
     ev: &CensusEvidence,
     grid_veto_of: &dyn Fn(&str) -> Option<String>,
+    last: &mut HashMap<String, String>,
 ) -> Vec<String> {
     let mut logged = Vec::new();
-    let mut guard = TOLD_BUSY_LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-    let last = guard.get_or_insert_with(HashMap::new);
     // Only a told-but-busy row's pane is read: every other row costs nothing.
     for row in cohort
         .rows
@@ -565,15 +620,15 @@ pub fn log_told_busy(
         .filter(|r| r.pause_state == Some(PauseState::Notified))
     {
         let veto = grid_veto_of(&row.session.terminal_id);
-        let Some(line) = told_busy_diagnostic(row, ev, veto.as_deref()) else {
+        let Some((key, line)) = told_busy_diagnostic(row, ev, veto.as_deref()) else {
             continue;
         };
         let id = &row.session.claude_session_id;
-        if last.get(id) == Some(&line) {
+        if last.get(id) == Some(&key) {
             continue;
         }
         info!(session = %id, "restart_prep: told but not idle — {line}");
-        last.insert(id.clone(), line.clone());
+        last.insert(id.clone(), key);
         logged.push(line);
     }
     logged
@@ -822,10 +877,21 @@ impl RestartPrep {
             Err(e) => (rec.cohort.clone(), Some(e)),
         };
         refresh_rows(&mut cohort, census);
-        log_told_busy(&cohort, census, &|terminal_id| {
-            let screen = terminals.pane(terminal_id)?.input().screen();
-            qontinui_runner_lib::looping_agent::idle::idle_veto(&screen.lines, screen.cursor_row)
-        });
+        log_told_busy(
+            &cohort,
+            census,
+            &|terminal_id| {
+                let screen = terminals.pane(terminal_id)?.input().screen();
+                qontinui_runner_lib::looping_agent::idle::idle_veto(
+                    &screen.lines,
+                    screen.cursor_row,
+                )
+            },
+            &mut self
+                .told_busy_logged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
 
         let mut delivered = 0usize;
         if rec.is_active(now_ms) {

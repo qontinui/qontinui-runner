@@ -251,6 +251,7 @@ fn census(procs: Vec<(&str, ProcEvidence)>) -> CensusEvidence {
         device_drain: Some("drained".to_string()),
         close_reasons: HashMap::new(),
         activity_detail: HashMap::new(),
+        activity_key: HashMap::new(),
     }
 }
 
@@ -1198,8 +1199,9 @@ fn restart_prep_a_told_but_busy_row_logs_what_kept_it_busy_once_per_change() {
     let mut c = cohort(vec![told, untold], T0);
     refresh_rows(&mut c, &ev);
     assert_eq!(c.rows[0].pause_state, Some(PauseState::Notified));
+    let mut last = HashMap::new();
     let veto = |_: &str| Some("spinner glyph `✻` on row 3: ✻ Cooking…".to_string());
-    let lines = log_told_busy(&c, &ev, &veto);
+    let lines = log_told_busy(&c, &ev, &veto, &mut last);
     assert_eq!(lines.len(), 1, "only the told row: {lines:?}");
     assert!(lines[0].contains("activity=Stale"), "{}", lines[0]);
     assert!(
@@ -1209,12 +1211,70 @@ fn restart_prep_a_told_but_busy_row_logs_what_kept_it_busy_once_per_change() {
     );
     assert!(lines[0].contains("record=Missing"), "{}", lines[0]);
     // Unchanged next tick: not logged again.
-    assert!(log_told_busy(&c, &ev, &veto).is_empty());
-    // A different veto: logged again.
+    assert!(log_told_busy(&c, &ev, &veto, &mut last).is_empty());
+    // The same veto KIND on another row with other text: still not again.
+    let moved = |_: &str| Some("spinner glyph `✻` on row 9: ✻ Cooking… (3s)".to_string());
+    assert!(log_told_busy(&c, &ev, &moved, &mut last).is_empty());
+    // A different veto kind: logged again.
     let clean = |_: &str| None;
-    let again = log_told_busy(&c, &ev, &clean);
+    let again = log_told_busy(&c, &ev, &clean, &mut last);
     assert_eq!(again.len(), 1);
     assert!(again[0].contains("grid_veto=none (the grid reads idle)"));
+}
+
+/// Review B: a working row's record timestamps move every tick; only the
+/// kinds of its inputs key the dedupe, so changing just `last_message_ms`
+/// logs one line, not one per 15 s tick.
+#[test]
+fn restart_prep_the_told_but_busy_dedupe_ignores_timestamps() {
+    use crate::session::claude_activity::{RecordEvidence, RecordReading};
+    let busy_at = |last_message_ms: i64| {
+        RecordReading::Parsed(RecordEvidence {
+            status: "busy".to_string(),
+            status_updated_at_ms: Some(last_message_ms - 5),
+            last_message_ms: Some(last_message_ms),
+        })
+    };
+    let k1 = stable_activity_key(None, Some(false), &busy_at(T0));
+    let k2 = stable_activity_key(None, Some(false), &busy_at(T0 + 15_000));
+    assert_eq!(k1, k2);
+    assert!(k1.contains("record=status busy"), "{k1}");
+    assert_ne!(
+        k1,
+        stable_activity_key(None, Some(false), &RecordReading::Missing),
+        "a change of KIND does change the key"
+    );
+
+    let mut told = row("tb-k1");
+    told.notified_at = Some(T0);
+    let mut ev = census(vec![("tb-k1", proc(Activity::Working, Some(false)))]);
+    let mut c = cohort(vec![told], T0);
+    refresh_rows(&mut c, &ev);
+    let mut last = HashMap::new();
+    let none = |_: &str| None;
+    let mut logged = 0;
+    for tick in 0..3 {
+        let rec = busy_at(T0 + tick * 15_000);
+        ev.activity_detail
+            .insert("tb-k1".to_string(), format!("record={rec:?}"));
+        ev.activity_key.insert(
+            "tb-k1".to_string(),
+            stable_activity_key(None, Some(false), &rec),
+        );
+        logged += log_told_busy(&c, &ev, &none, &mut last).len();
+    }
+    assert_eq!(
+        logged, 1,
+        "one line for three ticks whose only change is a timestamp"
+    );
+    assert_eq!(
+        veto_kind("cursor on row 0, above the `❯` prompt row 1"),
+        "cursor above the prompt"
+    );
+    assert_eq!(
+        veto_kind("spinner glyph `✻` on row 3: x"),
+        "spinner glyph `✻`"
+    );
 }
 
 #[test]
