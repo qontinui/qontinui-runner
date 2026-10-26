@@ -281,17 +281,25 @@ export function cohortCounts(rows: readonly RestorePlaceholder[]): CohortCounts 
 const MAX_TIMER_MS = 2_147_483_647;
 
 /**
- * PURE: how long until {@link restoreButtonLabel} changes on its own — the
- * moment a usage-limited row's recorded reset passes — or `null` when it never
- * does. The pane re-renders then, so "Account … resets at …" does not linger
- * past the reset. Capped at the timer ceiling (the pane re-arms).
+ * PURE: the epoch millis at which {@link restoreButtonLabel} changes on its
+ * own — a usage-limited row's recorded reset — or `null` when it never does.
+ * A fixed instant, so the pane's timer depends on it rather than on a value
+ * re-derived from `Date.now()` every render.
+ */
+export function restoreLabelChangesAt(p: RestorePlaceholder): number | null {
+  return isLimitHit(p) && p.limitResetAt !== null ? p.limitResetAt : null;
+}
+
+/**
+ * PURE: the timer delay until `changesAtMs` passes (`null` once it has),
+ * capped at the timer ceiling — a capped timer just re-arms.
  */
 export function restoreLabelRefreshMs(
-  p: RestorePlaceholder,
+  changesAtMs: number | null,
   nowMs: number = Date.now(),
 ): number | null {
-  if (!isLimitHit(p) || p.limitResetAt === null || p.limitResetAt <= nowMs) return null;
-  return Math.min(p.limitResetAt - nowMs + 1, MAX_TIMER_MS);
+  if (changesAtMs === null || changesAtMs < nowMs) return null;
+  return Math.min(changesAtMs - nowMs + 1, MAX_TIMER_MS);
 }
 
 /**

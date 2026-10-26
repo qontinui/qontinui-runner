@@ -28,6 +28,7 @@ import {
   effortBadgeText,
   placeholderSessionIdOf,
   restoreButtonLabel,
+  restoreLabelChangesAt,
   restoreLabelRefreshMs,
   setPlaceholderFinished,
   setPlaceholderHeld,
@@ -52,13 +53,16 @@ export function RestorePlaceholderPane({ tabId }: { tabId: string }) {
   const ids = restorePlaceholderIds(sid);
   // Re-render when a usage-limited row's reset passes, so its Restore label
   // ("Account … resets at …") does not go stale while the pane sits open.
+  // The timer depends on the fixed reset instant, so an unrelated re-render
+  // does not re-arm it; `labelTick` re-arms only a capped (very long) wait.
   const [labelTick, setLabelTick] = useState(0);
-  const refreshMs = row ? restoreLabelRefreshMs(row) : null;
+  const labelChangesAt = row ? restoreLabelChangesAt(row) : null;
   useEffect(() => {
-    if (refreshMs === null) return;
-    const handle = setTimeout(() => setLabelTick((t) => t + 1), refreshMs);
+    const ms = restoreLabelRefreshMs(labelChangesAt);
+    if (ms === null) return;
+    const handle = setTimeout(() => setLabelTick((t) => t + 1), ms);
     return () => clearTimeout(handle);
-  }, [refreshMs, labelTick]);
+  }, [labelChangesAt, labelTick]);
   const phase = queue.phaseOf(sid);
   const phaseText = restorePhaseText(phase);
   const inQueue =

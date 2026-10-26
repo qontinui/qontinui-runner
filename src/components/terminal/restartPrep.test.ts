@@ -158,6 +158,19 @@ describe("row chips read the backend's observation", () => {
       "max · screen",
     );
   });
+
+  it("names the transcript sources the backend now sends", () => {
+    // Before: a transcript-read level rendered as "account default".
+    expect(effortBadge(row("a", { effort: { level: "max", source: "transcript" } }))).toBe(
+      "max · set with /effort",
+    );
+    expect(
+      effortBadge(row("a", { effort: { level: null, source: "transcript_unrecognised" } })),
+    ).toBe("effort unknown (unrecognised /effort)");
+    expect(effortBadge(row("a", { effort: { level: "low", source: "account_default" } }))).toBe(
+      "low · account default",
+    );
+  });
 });
 
 /** A fake backend: records invokes, answers from `answer`, delivers events on demand. */

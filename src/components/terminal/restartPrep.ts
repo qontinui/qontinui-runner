@@ -42,10 +42,18 @@ export type HoldStatus =
   | { status: "local_secondary" }
   | { status: "release_sent"; outcome: string };
 
+/** `restart_prep::effort::EffortSource`, as serde spells it (snake_case). */
+export type EffortSource =
+  | "transcript"
+  | "transcript_unrecognised"
+  | "screen"
+  | "account_default"
+  | "unknown";
+
 /** `restart_prep::effort::Effort`. */
 export interface Effort {
   level: string | null;
-  source: "screen" | "account_default" | "unknown";
+  source: EffortSource;
 }
 
 /** `restart_prep::effort::Baseline`. */
@@ -386,8 +394,14 @@ export function rowStateChip(
 /** The effort badge: the level and where it was read, or "effort unknown". */
 export function effortBadge(row: CohortRow): string {
   const { level, source } = row.effort ?? { level: null, source: "unknown" };
+  if (source === "transcript_unrecognised") return "effort unknown (unrecognised /effort)";
   if (!level || source === "unknown") return "effort unknown";
-  return `${level} · ${source === "screen" ? "screen" : "account default"}`;
+  const from: Record<Exclude<EffortSource, "unknown" | "transcript_unrecognised">, string> = {
+    transcript: "set with /effort",
+    screen: "screen",
+    account_default: "account default",
+  };
+  return `${level} · ${from[source] ?? source}`;
 }
 
 // ── The store ─────────────────────────────────────────────────────────

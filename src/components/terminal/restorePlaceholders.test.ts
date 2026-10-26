@@ -23,6 +23,7 @@ import {
   parsePlaceholderSet,
   placeholderSessionIdOf,
   restoreButtonLabel,
+  restoreLabelChangesAt,
   restoreLabelRefreshMs,
   restorePlaceholderTabId,
   setPlaceholderFinished,
@@ -216,20 +217,23 @@ describe("a usage-limited (limit_hit) row", () => {
   });
 
   it("schedules a re-render for the moment its reset passes", () => {
-    expect(restoreLabelRefreshMs(limited(), NOW)).toBe(3_600_001);
+    const at = restoreLabelChangesAt(limited());
+    expect(at).toBe(NOW + 3_600_000);
+    expect(restoreLabelRefreshMs(at, NOW)).toBe(3_600_001);
     // After that delay the label has changed on its own.
     const later = NOW + 3_600_001;
     expect(restoreButtonLabel(limited(), later)).toMatch(/^Restore \(account ben reset at /);
-    expect(restoreLabelRefreshMs(limited(), later)).toBeNull();
-    expect(restoreLabelRefreshMs(limited({ limitResetAt: null }), NOW)).toBeNull();
-    expect(restoreLabelRefreshMs(placeholder(), NOW)).toBeNull();
-    expect(restoreLabelRefreshMs(limited({ limitResetAt: NOW + 30 * 86_400_000 }), NOW)).toBe(
-      2_147_483_647,
-    );
-    // The pane arms its timer from it.
+    expect(restoreLabelRefreshMs(at, later)).toBeNull();
+    expect(restoreLabelChangesAt(limited({ limitResetAt: null }))).toBeNull();
+    expect(restoreLabelChangesAt(placeholder())).toBeNull();
+    expect(restoreLabelRefreshMs(null, NOW)).toBeNull();
+    expect(restoreLabelRefreshMs(NOW + 30 * 86_400_000, NOW)).toBe(2_147_483_647);
+    // The pane arms its timer from the fixed instant, not a Date.now()-derived
+    // delay that changes every render (re-review nit c).
     const pane = readFileSync(join(__dirname, "RestorePlaceholderPane.tsx"), "utf8");
-    expect(pane).toMatch(/restoreLabelRefreshMs\(row\)/);
-    expect(pane).toMatch(/setTimeout\(\(\) => setLabelTick/);
+    expect(pane).toMatch(/restoreLabelChangesAt\(row\)/);
+    expect(pane).toMatch(/\}, \[labelChangesAt, labelTick\]\);/);
+    expect(pane).not.toMatch(/\[refreshMs/);
   });
 });
 
