@@ -395,7 +395,16 @@ pub fn begin_next_interval(rec: &mut TerminalSessionRecord, now_ms: i64, boot_ms
         return false;
     }
     rec.run.note_opened(now_ms);
-    if rec.restored_from_boot_at.is_some_and(|t| t >= boot_ms) {
+    // Only a resume the RUNNER started (its boot restore typed the resume:
+    // tier `resumed`, or `failed` while still pending) continues the same work.
+    // A resume typed into a terminal-only tile is a new launch — fresh facts.
+    let runner_resumed = rec.restored_from_boot_at.is_some_and(|t| t >= boot_ms)
+        && matches!(
+            rec.restore_tier.as_deref(),
+            Some(super::session_lifecycle_store::RESTORE_TIER_RESUMED)
+                | Some(super::session_lifecycle_store::RESTORE_TIER_FAILED)
+        );
+    if runner_resumed {
         match rec.spawn.as_mut() {
             Some(sp) => sp.spawn_origin = SpawnOrigin::BootResume,
             None => rec.spawn = Some(SpawnFacts::new(SpawnOrigin::BootResume)),
@@ -1901,7 +1910,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_resume_typed_into_a_terminal_only_tile_is_the_next_run() {
-        let (store, outbox, _d) = previous_process_store(None);
+        let (store, outbox, _d) = previous_process_store(Some(
+            SpawnFacts::new(SpawnOrigin::GateContinuation).gate_id(Some("old-gate".into())),
+        ));
         store.mark_restored_from_boot(SID, "terminal-only");
         // The frontend re-asserts the tile (unconfirmed): not a run.
         let mut reassert = rec(SID);
@@ -1910,6 +1921,9 @@ pub(crate) mod tests {
         assert_eq!(events(&outbox), vec![("end".to_string(), 1)]);
         // The operator types `claude --resume` — its hook confirms the id.
         store.record_open(rec(SID));
+        // No launcher stamps a typed resume: the first liveness touch releases
+        // its held start (with fresh, empty facts).
+        store.touch(SID);
         store.record_close(SID, "pty-exit");
         store.record_close(SID, "pty-exit");
         assert_eq!(
@@ -1920,6 +1934,11 @@ pub(crate) mod tests {
                 ("end".to_string(), 2),
             ]
         );
+        // The typed resume is a NEW launch: run 1's facts do not ride run 2.
+        let b = bodies(&outbox);
+        assert_eq!(b[0]["facts"]["gate_id"], "old-gate");
+        assert!(b[1]["facts"].get("gate_id").is_none(), "{}", b[1]);
+        assert!(b[1]["facts"].get("spawn_origin").is_none(), "{}", b[1]);
     }
 
     #[test]
