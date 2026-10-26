@@ -19,7 +19,11 @@
 //!   since the carry; best-effort — see [`delta_sync`].
 //! - No carry replaces an existing `.jsonl` (main or subagent) unless the
 //!   destination's bytes are a prefix of the source's: a destination that
-//!   diverged is a fork with its own tail, and is left alone.
+//!   diverged is a fork with its own tail, and is left alone. The one
+//!   exception is the main `<sid>.jsonl` on an account migration
+//!   ([`MainTranscript::LiveSourceWins`]): the live conversation must be what
+//!   resumes, so the fork is renamed aside to `<sid>.jsonl.diverged-<unix_ms>`
+//!   (never deleted) and the source is copied in its place.
 //! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
 //!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
@@ -47,6 +51,15 @@ mod tests;
 pub(crate) struct TranscriptCopy {
     /// The session transcript (`<sid>.jsonl`) under the destination account.
     pub path: PathBuf,
+    /// What the carry did with the main `<sid>.jsonl`.
+    pub main: MainCarry,
+    /// The source's `<sid>/` side-car dir as the carry resolved it (beside the
+    /// source transcript), whether or not it exists. [`delta_sync`] reads it
+    /// from here rather than re-deriving it.
+    pub src_session_dir: PathBuf,
+    /// The destination's `<sid>/` side-car dir the carry wrote into (beside
+    /// [`Self::path`] — for a long cwd, the source's `<prefix>-<hash>` name).
+    pub dst_session_dir: PathBuf,
     /// The session's sibling directory (`<sid>/`), carried best-effort.
     pub session_dir: SessionDirCarry,
     /// Every regular file under `<sid>/` the carry looked at, with the source's
@@ -69,9 +82,10 @@ pub(crate) struct SessionDirCarry {
     pub skipped_present: usize,
     /// Never followed: a symlink or junction (including `<sid>/` itself), a
     /// leftover `*.partial`, a directory past the depth bound, or a session id
-    /// that is not one plain path component. Also an existing `.jsonl` — the
-    /// main `<sid>.jsonl` included — whose bytes are not a prefix of the
-    /// source's: a diverged fork, never overwritten.
+    /// that is not one plain path component. Also an existing `.jsonl` under
+    /// `<sid>/` whose bytes are not a prefix of the source's: a diverged fork,
+    /// never overwritten. The main `<sid>.jsonl` is NOT counted here — its
+    /// outcome is [`TranscriptCopy::main`].
     pub skipped_other: usize,
     /// Read or write errors (including an unreadable `<sid>/`); each is logged.
     pub failed: usize,
@@ -111,6 +125,50 @@ pub(crate) struct CarriedFile {
     pub dst: Option<FileStamp>,
     /// What the carry did to the destination.
     pub wrote: CarryWrite,
+    /// A file rewritten in place (not a `.jsonl`) whose destination copy the
+    /// carry KEPT because the destination side ran the session last.
+    /// [`delta_sync`] never overwrites it either.
+    pub kept_destination_newer: bool,
+}
+
+/// What [`carry_session`] did with the main `<sid>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MainCarry {
+    /// The destination had none; the source was copied.
+    Copied,
+    /// The destination held an older byte-prefix of the source; replaced.
+    ExtendedPrefix,
+    /// The destination was already at least as large; left untouched.
+    Present,
+    /// [`MainTranscript::LiveSourceWins`] only: the destination had diverged
+    /// from the source (a fork with a tail of its own). It was renamed aside to
+    /// `backup`, in the same dir, and the source copied in its place.
+    DivergedPreserved { backup: PathBuf },
+    /// The destination's smaller copy was kept although the source's differs:
+    /// a [`MainTranscript::KeepExisting`] target, or a diverged fork under
+    /// [`MainTranscript::ExtendPrefix`].
+    KeptExisting,
+}
+
+impl MainCarry {
+    /// The `mainTranscript` value of the `session-account-migrated` event.
+    pub(crate) fn event_name(&self) -> &'static str {
+        match self {
+            Self::Copied => "copied",
+            Self::ExtendedPrefix => "extended",
+            Self::Present => "present",
+            Self::DivergedPreserved { .. } => "diverged_preserved",
+            Self::KeptExisting => "kept_existing",
+        }
+    }
+
+    /// Where the diverged fork was preserved, when it was.
+    pub(crate) fn backup(&self) -> Option<&Path> {
+        match self {
+            Self::DivergedPreserved { backup } => Some(backup),
+            _ => None,
+        }
+    }
 }
 
 /// What the carry did to one destination file.
@@ -150,6 +208,9 @@ pub(crate) struct DeltaSync {
     pub refused_destination_changed: usize,
     /// Not followed (same rules as the carry, including a diverged `.jsonl`).
     pub skipped_other: usize,
+    /// An in-place file the carry kept as the destination's (the destination
+    /// side ran the session last) — never overwritten by the sync either.
+    pub kept_destination_newer: usize,
     /// Read or write errors; each is logged.
     pub failed: usize,
 }
@@ -192,6 +253,13 @@ pub(crate) enum MainTranscript {
     /// Replace it when it is a strict byte-prefix of the source's (an
     /// append-only extension); keep it otherwise.
     ExtendPrefix,
+    /// The account migration: the SOURCE is the live conversation and is what
+    /// the respawn resumes. As [`Self::ExtendPrefix`], except that a smaller
+    /// destination that DIVERGED is renamed aside to
+    /// `<sid>.jsonl.diverged-<unix_ms>` (never deleted) and the source copied
+    /// in its place ([`MainCarry::DivergedPreserved`]). If the rename-aside
+    /// fails the carry fails, so the migration leaves the old pane untouched.
+    LiveSourceWins,
     /// Never replace an existing one (only an absent one is written). The
     /// respawn receiver uses this for a target that already held the
     /// transcript: that copy is what the target resumes, even when a holder's
@@ -199,7 +267,8 @@ pub(crate) enum MainTranscript {
     KeepExisting,
 }
 
-/// [`carry_session`] with [`MainTranscript::ExtendPrefix`].
+/// [`carry_session`] with [`MainTranscript::LiveSourceWins`] — the account
+/// migration's carry.
 pub(crate) fn copy_transcript(
     src_config_dir: &str,
     dst_config_dir: &str,
@@ -211,17 +280,18 @@ pub(crate) fn copy_transcript(
         dst_config_dir,
         working_dir,
         claude_session_id,
-        MainTranscript::ExtendPrefix,
+        MainTranscript::LiveSourceWins,
     )
 }
 
 /// Copy the session transcript from the source account's project dir into
 /// the target account's matching project dir. The source file is never
 /// modified or removed. Skips the copy when the destination already exists
-/// and is at least as large (idempotent retry), and when it is smaller but
-/// its bytes are not a prefix of the source's (a fork: counted in
-/// `skipped_other` and warned, never overwritten). `main` can forbid
-/// replacing an existing destination at all.
+/// and is at least as large (idempotent retry). When it is smaller but its
+/// bytes are not a prefix of the source's (a fork), `main` decides: keep it
+/// ([`MainCarry::KeptExisting`], warned), or — on a migration — rename it
+/// aside and copy the source ([`MainCarry::DivergedPreserved`]). `main` can
+/// also forbid replacing an existing destination at all.
 ///
 /// Then carries the session's sibling directory `<sid>/` file by file. Claude
 /// Code keeps each subagent's transcript there
@@ -245,6 +315,29 @@ pub(crate) fn carry_session(
     claude_session_id: &str,
     main: MainTranscript,
 ) -> Result<TranscriptCopy, String> {
+    carry_session_with(
+        src_config_dir,
+        dst_config_dir,
+        working_dir,
+        claude_session_id,
+        main,
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+/// [`carry_session`] with the diverged main transcript's rename-aside
+/// injected, so its failure path is testable.
+fn carry_session_with<R>(
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    working_dir: &str,
+    claude_session_id: &str,
+    main: MainTranscript,
+    rename_aside: R,
+) -> Result<TranscriptCopy, String>
+where
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     require_session_uuid(claude_session_id)?;
     let src = super::transcript::session_transcript_path(
         Path::new(src_config_dir),
@@ -271,16 +364,17 @@ pub(crate) fn carry_session(
     };
     let src_meta = std::fs::metadata(&src)
         .map_err(|e| format!("source transcript missing at {}: {e}", src.display()))?;
+    let src_len = src_meta.len();
     let dst_len = std::fs::metadata(&dst).map(|dst_meta| dst_meta.len()).ok();
     let main_verdict = match dst_len {
         None => Verdict::Write,
         // Already migrated (retry / repeated hint), or the newer copy.
-        Some(len) if len >= src_meta.len() => Verdict::Current,
+        Some(len) if len >= src_len => Verdict::Current,
         // Smaller: an older prefix of the source, or a fork that wrote its
-        // own tail. Only the first may be replaced.
+        // own tail. Only the first may be extended in place.
         Some(_) => match is_byte_prefix(&dst, &src) {
-            Ok(true) if main == MainTranscript::ExtendPrefix => Verdict::Write,
-            Ok(true) => Verdict::Current,
+            Ok(true) if main == MainTranscript::KeepExisting => Verdict::Current,
+            Ok(true) => Verdict::Write,
             Ok(false) => Verdict::Diverged,
             Err(e) => {
                 return Err(format!(
@@ -291,45 +385,64 @@ pub(crate) fn carry_session(
             }
         },
     };
-    // Which side ran the session last, decided once from the append-only main
-    // transcript: the larger one, unless the destination diverged (then it ran
-    // on its own and keeps its in-place sidecars). Sidecars that are rewritten
-    // in place (not appended) follow it -- on a migration the source is newer,
-    // but on a respawn that tops up from several holders the TARGET may be.
-    let source_is_newer =
-        main_verdict != Verdict::Diverged && dst_len.is_none_or(|len| src_meta.len() >= len);
-    match main_verdict {
-        Verdict::Write => {
+    let main_carry = match (main_verdict, main) {
+        (Verdict::Write, _) => {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
             }
             copy_via_partial(&src, &dst)
                 .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+            if dst_len.is_some() {
+                MainCarry::ExtendedPrefix
+            } else {
+                MainCarry::Copied
+            }
         }
-        Verdict::Diverged => warn!(
-            from = %src.display(),
-            to = %dst.display(),
-            "session transcript carry: the destination <sid>.jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
-        ),
-        Verdict::Current => {}
-    }
-    let (mut session_dir, files) =
-        carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
-    if main_verdict == Verdict::Diverged {
-        session_dir.skipped_other += 1;
-    }
+        (Verdict::Current, _) if dst_len.is_some_and(|len| len >= src_len) => MainCarry::Present,
+        (Verdict::Current, _) => MainCarry::KeptExisting,
+        (Verdict::Diverged, MainTranscript::LiveSourceWins) => {
+            preserve_diverged_and_copy(&src, &dst, rename_aside)?
+        }
+        (Verdict::Diverged, _) => {
+            warn!(
+                from = %src.display(),
+                to = %dst.display(),
+                "session transcript carry: the destination <sid>.jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
+            );
+            MainCarry::KeptExisting
+        }
+    };
+    // Which side ran the session last, decided once from the append-only main
+    // transcript. Sidecars that are rewritten in place (not appended) follow
+    // it -- on a migration the source is newer, but on a respawn that tops up
+    // from several holders the TARGET may be.
+    let source_is_newer = if main == MainTranscript::KeepExisting && dst_len.is_some() {
+        // A target that already held the transcript resumes ITS copy, so its
+        // in-place sidecars stay with it, whatever a holder has.
+        false
+    } else if main_verdict == Verdict::Diverged {
+        // A fork kept in place ran on its own and keeps its sidecars; a fork
+        // moved aside was replaced by the live source, whose sidecars follow.
+        matches!(main_carry, MainCarry::DivergedPreserved { .. })
+    } else {
+        dst_len.is_none_or(|len| src_len >= len)
+    };
+    let (session_dir, files) = carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
     // Beside the two transcripts actually used above, so a long-cwd target
     // resolves to the same `<prefix>-<hash>` dir the main copy landed in.
-    let subagents = carried_subagents(
-        &src.with_file_name(claude_session_id),
-        &dst.with_file_name(claude_session_id),
+    // `carry_session_dir` derives the same two paths (`parent()/<sid>`).
+    let (src_session_dir, dst_session_dir) = (
+        src.with_file_name(claude_session_id),
+        dst.with_file_name(claude_session_id),
     );
+    let subagents = carried_subagents(&src_session_dir, &dst_session_dir);
     // Times the main copy and the `<sid>/` carry together.
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if session_dir.failed > 0 {
         warn!(
             session = %claude_session_id,
+            main = main_carry.event_name(),
             copied = session_dir.copied,
             skipped_present = session_dir.skipped_present,
             skipped_other = session_dir.skipped_other,
@@ -341,6 +454,7 @@ pub(crate) fn carry_session(
     } else if session_dir != SessionDirCarry::default() {
         info!(
             session = %claude_session_id,
+            main = main_carry.event_name(),
             copied = session_dir.copied,
             skipped_present = session_dir.skipped_present,
             skipped_other = session_dir.skipped_other,
@@ -351,10 +465,77 @@ pub(crate) fn carry_session(
     }
     Ok(TranscriptCopy {
         path: dst,
+        main: main_carry,
+        src_session_dir,
+        dst_session_dir,
         session_dir,
         files,
         subagents,
     })
+}
+
+/// [`MainTranscript::LiveSourceWins`] on a diverged destination: move the
+/// fork aside to [`diverged_backup_path`] with `rename_aside`, then copy the
+/// source in its place. Errors — so the carry, and the migration's step 1,
+/// fail — when the fork cannot be moved aside (nothing is overwritten then),
+/// or when the copy fails afterwards, in which case the fork is moved back if
+/// the destination path is still free.
+fn preserve_diverged_and_copy<R>(
+    src: &Path,
+    dst: &Path,
+    rename_aside: R,
+) -> Result<MainCarry, String>
+where
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let backup = diverged_backup_path(dst);
+    rename_aside(dst, &backup).map_err(|e| {
+        format!(
+            "the destination {} diverged from the live transcript and could not be moved aside to {}: {e} — nothing overwritten",
+            dst.display(),
+            backup.display()
+        )
+    })?;
+    warn!(
+        from = %src.display(),
+        to = %dst.display(),
+        backup = %backup.display(),
+        "session transcript carry: the destination <sid>.jsonl diverged from the live transcript — the fork was moved aside and the live transcript copied in its place"
+    );
+    if let Err(e) = copy_via_partial(src, dst) {
+        let restored = !dst.exists() && std::fs::rename(&backup, dst).is_ok();
+        let fork = if restored {
+            "the fork was moved back".to_string()
+        } else {
+            format!("the fork is preserved at {}", backup.display())
+        };
+        return Err(format!(
+            "copy {} -> {} failed after the diverged destination was moved aside: {e} — {fork}",
+            src.display(),
+            dst.display(),
+        ));
+    }
+    Ok(MainCarry::DivergedPreserved { backup })
+}
+
+/// `<sid>.jsonl.diverged-<unix_ms>` beside `dst`. The millisecond is bumped
+/// until the name is free, so an earlier backup is never replaced.
+fn diverged_backup_path(dst: &Path) -> PathBuf {
+    let mut stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    loop {
+        let mut name = dst
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(format!(".diverged-{stamp}"));
+        let candidate = dst.with_file_name(name);
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+        stamp += 1;
+    }
 }
 
 /// Copy `from` to a temporary `<to>.<pid>.<seq>.partial` and return its path.
@@ -508,6 +689,9 @@ fn carry_session_dir(
                 src,
                 dst: FileStamp::of(&to),
                 wrote,
+                kept_destination_newer: wrote == CarryWrite::Present
+                    && !source_is_newer
+                    && !is_jsonl(rel),
             });
         }
     });
@@ -719,9 +903,14 @@ fn meta_description(path: &Path) -> Option<String> {
 }
 
 /// Top the destination's `<sid>/` up from the source after the OLD writer has
-/// exited, against the baseline the carry recorded in `since`.
+/// exited, against the baseline the carry recorded in `since` — including the
+/// two `<sid>/` dirs the carry actually used, which are never re-derived here
+/// (for a long cwd a re-derivation can name a different project dir).
 ///
 /// Per regular file under the source's `<sid>/` (same walk as the carry):
+/// - an in-place file the carry kept as the destination's
+///   ([`CarriedFile::kept_destination_newer`]) is never overwritten
+///   (`kept_destination_newer`);
 /// - the destination must be EXACTLY as the carry left it (same size and
 ///   mtime; absent stays absent). Otherwise the resumed process — or someone —
 ///   has written it, and it is never touched (`refused_destination_changed`);
@@ -743,26 +932,11 @@ fn meta_description(path: &Path) -> Option<String> {
 ///
 /// `<sid>.jsonl` is never touched: from the moment of respawn the resumed
 /// process owns the destination's main transcript.
-pub(crate) fn delta_sync(
-    src_config_dir: &str,
-    dst_config_dir: &str,
-    working_dir: &str,
-    claude_session_id: &str,
-    since: &TranscriptCopy,
-) -> Result<DeltaSync, String> {
-    require_session_uuid(claude_session_id)?;
-    let src_dir = super::transcript::session_sidecar_dir(
-        Path::new(src_config_dir),
-        working_dir,
-        claude_session_id,
-    );
-    let dst_dir = super::transcript::session_sidecar_dir(
-        Path::new(dst_config_dir),
-        working_dir,
-        claude_session_id,
-    );
+pub(crate) fn delta_sync(since: &TranscriptCopy) -> Result<DeltaSync, String> {
+    // Built by a carry that has already validated the session id.
+    let (src_dir, dst_dir) = (&since.src_session_dir, &since.dst_session_dir);
     let mut sync = DeltaSync::default();
-    match std::fs::symlink_metadata(&src_dir) {
+    match std::fs::symlink_metadata(src_dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
             sync.skipped_other += 1;
@@ -773,7 +947,7 @@ pub(crate) fn delta_sync(
     }
     let baseline: HashMap<&Path, &CarriedFile> =
         since.files.iter().map(|f| (f.rel.as_path(), f)).collect();
-    walk_session_dir(&src_dir, &mut |event| match event {
+    walk_session_dir(src_dir, &mut |event| match event {
         WalkEvent::Skipped => sync.skipped_other += 1,
         WalkEvent::Failed => sync.failed += 1,
         WalkEvent::File { from, rel, src } => {
@@ -782,6 +956,12 @@ pub(crate) fn delta_sync(
             let recorded = baseline.get(rel).copied();
             if dst_now != recorded.and_then(|r| r.dst) {
                 sync.refused_destination_changed += 1;
+                return;
+            }
+            // The carry kept the destination's copy as the newer one; the
+            // older side rewriting its own copy since does not change that.
+            if recorded.is_some_and(|r| r.kept_destination_newer) {
+                sync.kept_destination_newer += 1;
                 return;
             }
             // A file the carry failed to write is retried even when its source
@@ -1006,23 +1186,25 @@ where
 /// between the carry and its exit. Bounded by [`DELTA_SYNC_EXIT_WAIT`]; on
 /// timeout, or with no writer identity to watch, it logs and skips. A failure
 /// is logged and never reaches the migration.
+///
+/// Returns a receiver that gets the outcome once the sync has finished or
+/// given up, so the continue nudge can wait for it; `None` when no sync runs
+/// at all (no writer identity).
 pub(crate) fn spawn_delta_sync_after_exit(
     writer: Option<ProcIdentity>,
-    src_config_dir: String,
-    dst_config_dir: String,
-    working_dir: String,
     claude_session_id: String,
     since: TranscriptCopy,
-) {
+) -> Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>> {
     let Some(writer) = writer else {
         info!(
             session = %claude_session_id,
             "session delta sync: skipped — the old pane's claude was not resolved before the close, so its exit cannot be proven"
         );
-        return;
+        return None;
     };
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tauri::async_runtime::spawn(async move {
-        let sid = claude_session_id.clone();
+        let sid = claude_session_id;
         let outcome = run_delta_sync_after_exit(
             || probe_writer(writer),
             DELTA_SYNC_EXIT_WAIT,
@@ -1031,27 +1213,22 @@ pub(crate) fn spawn_delta_sync_after_exit(
             // disk I/O: keep it off the async workers.
             move || async move {
                 qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                    delta_sync(
-                        &src_config_dir,
-                        &dst_config_dir,
-                        &working_dir,
-                        &claude_session_id,
-                        &since,
-                    )
+                    delta_sync(&since)
                 })
                 .await
                 .map_err(|e| format!("delta sync task did not complete: {e}"))?
             },
         )
         .await;
-        match outcome {
-            DeltaSyncOutcome::Synced(done) if done == DeltaSync::default() => {}
+        match &outcome {
+            DeltaSyncOutcome::Synced(done) if *done == DeltaSync::default() => {}
             DeltaSyncOutcome::Synced(done) => info!(
                 session = %sid,
                 copied = done.copied,
                 unchanged = done.unchanged,
                 refused_destination_changed = done.refused_destination_changed,
                 skipped_other = done.skipped_other,
+                kept_destination_newer = done.kept_destination_newer,
                 failed = done.failed,
                 "session delta sync: topped up the destination's <sid>/ after the old writer exited"
             ),
@@ -1067,5 +1244,8 @@ pub(crate) fn spawn_delta_sync_after_exit(
                 "session delta sync: failed (the migration itself is unaffected)"
             ),
         }
+        // No receiver (auto-continue off) is fine.
+        let _ = done_tx.send(outcome);
     });
+    Some(done_rx)
 }

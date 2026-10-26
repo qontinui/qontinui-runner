@@ -446,7 +446,7 @@ fn newest_copy_among(config_dirs: &[PathBuf], session_id: &str) -> Option<PathBu
 ///
 /// Newest rather than "the exact path in `config_dir`": a migrated session's
 /// frozen copy sits at the SAME encoded path in its old config dir
-/// (`account_migration::copy_transcript` keeps the project dir), so callers
+/// (`session_carry::copy_transcript` keeps the project dir), so callers
 /// that loop over config dirs would otherwise read the frozen copy whenever its
 /// dir came first. The exact path in each config dir is checked first (a few
 /// `stat`s); the full `projects/*` sweep runs only when none exists.
@@ -486,16 +486,6 @@ fn session_transcript_in(config_dir: &Path, project_path: &str, session_id: &str
 /// summary.
 pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
     project_dir(config_dir, project_path, Some(session_id)).join(format!("{}.jsonl", session_id))
-}
-
-/// The session's side-car directory `<config_dir>/projects/<enc>/<session_id>/`
-/// (subagent transcripts, `tool-results/`, `custom-title.json`), whether or not
-/// it exists. Derived from [`session_transcript_path`] with `.jsonl` dropped,
-/// so the two path rules cannot drift.
-pub fn session_sidecar_dir(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
-    let mut path = session_transcript_path(config_dir, project_path, session_id);
-    path.set_file_name(session_id);
-    path
 }
 
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────

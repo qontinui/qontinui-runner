@@ -15,21 +15,63 @@
 
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { ShowToastFn } from "./useToast";
+import type { ShowToastFn, ToastType } from "./useToast";
 
-interface SessionDirCarry {
+/** Tally of the `<sid>/` directory carry — the main `<sid>.jsonl` is NOT in it. */
+export interface SessionDirCarry {
   copied?: number;
   skippedPresent?: number;
   skippedOther?: number;
   failed?: number;
 }
 
-interface MigratedPayload {
+/**
+ * What the migration did with the main `<sid>.jsonl` — `MainCarry::event_name`
+ * in `src-tauri/src/terminal/session_carry/mod.rs`.
+ */
+export type MainTranscriptCarry =
+  | "copied"
+  | "extended"
+  | "present"
+  | "diverged_preserved"
+  | "kept_existing";
+
+export interface MigratedPayload {
   claudeSessionId?: string;
   fromConfigDir?: string;
   toConfigDir?: string;
+  /** Absent on older builds. */
+  mainTranscript?: MainTranscriptCarry;
+  /** Where the diverged fork was moved; set only for `diverged_preserved`. */
+  mainTranscriptBackup?: string | null;
   /** Tally of the `<sid>/` (subagent transcripts) carry; absent on older builds. */
   sessionDirCarry?: SessionDirCarry;
+}
+
+/**
+ * Suffix describing the main-transcript carry, when it is worth saying, and
+ * the toast level it calls for (`undefined` = a plain success).
+ */
+function mainTranscriptSummary(
+  main: MainTranscriptCarry | undefined,
+  backup: string | null | undefined,
+): { text: string; level?: ToastType } {
+  switch (main) {
+    case "diverged_preserved":
+      return {
+        text: ` — the target account held a DIVERGED copy of this conversation; it was kept at ${
+          backup ?? "a <session>.jsonl.diverged-* file beside the transcript"
+        } and the live conversation was resumed`,
+        level: "info",
+      };
+    case "kept_existing":
+      return {
+        text: " — the target account's own copy of the transcript was resumed, NOT the live one; see the runner log",
+        level: "error",
+      };
+    default:
+      return { text: "" };
+  }
 }
 
 /**
@@ -74,17 +116,24 @@ function accountLabel(dir: string | undefined): string {
   return parts[parts.length - 1] ?? dir;
 }
 
+/** The toast for one `session-account-migrated` event. */
+export function migratedToast(p: MigratedPayload): { message: string; type: ToastType } {
+  const main = mainTranscriptSummary(p.mainTranscript, p.mainTranscriptBackup);
+  const carry = carrySummary(p.sessionDirCarry);
+  const type: ToastType = carry.partial ? "error" : (main.level ?? "success");
+  return {
+    message: `Session ${(p.claudeSessionId ?? "").slice(0, 8)} migrated: ${accountLabel(
+      p.fromConfigDir,
+    )} ran out of tokens → resumed on ${accountLabel(p.toConfigDir)}${main.text}${carry.text}`,
+    type,
+  };
+}
+
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
-      const p = event.payload ?? {};
-      const carry = carrySummary(p.sessionDirCarry);
-      showToast(
-        `Session ${(p.claudeSessionId ?? "").slice(0, 8)} migrated: ${accountLabel(
-          p.fromConfigDir,
-        )} ran out of tokens → resumed on ${accountLabel(p.toConfigDir)}${carry.text}`,
-        carry.partial ? "error" : "success",
-      );
+      const toast = migratedToast(event.payload ?? {});
+      showToast(toast.message, toast.type);
     });
     const unlistenSkipped = listen<SkippedPayload>("session-account-migration-skipped", (event) => {
       const p = event.payload ?? {};

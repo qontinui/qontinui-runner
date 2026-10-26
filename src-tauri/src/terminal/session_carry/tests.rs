@@ -17,14 +17,15 @@ fn copy_transcript_copies_and_is_idempotent() {
     std::fs::create_dir_all(src_path.parent().unwrap()).unwrap();
     std::fs::write(&src_path, b"{\"type\":\"user\"}\n").unwrap();
 
-    let dst = copy_transcript(
+    let first = copy_transcript(
         src_cfg.to_str().unwrap(),
         dst_cfg.to_str().unwrap(),
         working_dir,
         sid,
     )
-    .expect("copy should succeed")
-    .path;
+    .expect("copy should succeed");
+    assert_eq!(first.main, MainCarry::Copied);
+    let dst = first.path;
     assert!(dst.exists());
     assert_eq!(
         std::fs::read(&dst).unwrap(),
@@ -34,15 +35,15 @@ fn copy_transcript_copies_and_is_idempotent() {
     assert!(src_path.exists());
 
     // Second call (repeated hint / retry) is a no-op success.
-    let dst2 = copy_transcript(
+    let second = copy_transcript(
         src_cfg.to_str().unwrap(),
         dst_cfg.to_str().unwrap(),
         working_dir,
         sid,
     )
-    .expect("idempotent retry should succeed")
-    .path;
-    assert_eq!(dst, dst2);
+    .expect("idempotent retry should succeed");
+    assert_eq!(second.main, MainCarry::Present);
+    assert_eq!(dst, second.path);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -606,8 +607,8 @@ fn carry(src: &Path, dst: &Path) -> TranscriptCopy {
     copy_transcript(src.to_str().unwrap(), dst.to_str().unwrap(), WD, SID).unwrap()
 }
 
-fn sync(src: &Path, dst: &Path, since: &TranscriptCopy) -> DeltaSync {
-    delta_sync(src.to_str().unwrap(), dst.to_str().unwrap(), WD, SID, since).unwrap()
+fn sync(since: &TranscriptCopy) -> DeltaSync {
+    delta_sync(since).unwrap()
 }
 
 fn append(path: &Path, bytes: &[u8]) {
@@ -617,12 +618,14 @@ fn append(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
-fn sidecar_dir_is_the_transcript_path_without_jsonl() {
-    let cfg = Path::new("C:/claude/.claude-a");
-    assert_eq!(
-        crate::terminal::transcript::session_sidecar_dir(cfg, WD, SID),
-        literal_sidecar(cfg)
-    );
+fn the_carry_records_the_two_sidecar_dirs_it_used() {
+    let tmp = scratch("dirs");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[]);
+    let carried = carry(&src, &dst);
+    assert_eq!(carried.src_session_dir, literal_sidecar(&src));
+    assert_eq!(carried.dst_session_dir, literal_sidecar(&dst));
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -727,7 +730,7 @@ fn a_missing_session_dir_records_nothing() {
     let carried = carry(&src, &dst);
     assert!(carried.files.is_empty() && carried.subagents.is_empty());
     assert_eq!(
-        sync(&src, &dst, &carried),
+        sync(&carried),
         DeltaSync::default(),
         "no <sid>/ on the source: nothing to top up"
     );
@@ -790,7 +793,7 @@ fn delta_sync_copies_a_grown_source_and_a_new_file() {
     append(&src_side.join("subagents").join("agent-a1.jsonl"), b"a2\n");
     std::fs::write(src_side.join("subagents").join("agent-n9.jsonl"), b"new\n").unwrap();
 
-    let done = sync(&src, &dst, &carried);
+    let done = sync(&carried);
     assert_eq!(done.copied, 2, "{done:?}");
     let dst_sub = literal_sidecar(&dst).join("subagents");
     assert_eq!(
@@ -819,7 +822,7 @@ fn delta_sync_leaves_an_unchanged_source_alone() {
     );
     let carried = carry(&src, &dst);
     assert_eq!(
-        sync(&src, &dst, &carried),
+        sync(&carried),
         DeltaSync {
             unchanged: 2,
             ..DeltaSync::default()
@@ -851,7 +854,7 @@ fn delta_sync_refuses_a_destination_written_after_the_carry() {
     )
     .unwrap();
 
-    let done = sync(&src, &dst, &carried);
+    let done = sync(&carried);
     assert_eq!(done.refused_destination_changed, 2, "{done:?}");
     assert_eq!(done.copied, 0);
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\nresumed\n");
@@ -868,14 +871,16 @@ fn delta_sync_retries_a_file_the_carry_failed_to_write() {
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
     seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
     let mut carried = carry(&src, &dst);
-    // As if the carry's write had failed: no destination, recorded absent.
+    // As if the carry's write had failed: no destination, recorded absent
+    // and `Failed` — exactly what a real failed carry records.
     let dst_file = literal_sidecar(&dst)
         .join("subagents")
         .join("agent-a1.jsonl");
     std::fs::remove_file(&dst_file).unwrap();
     carried.files[0].dst = None;
+    carried.files[0].wrote = CarryWrite::Failed;
 
-    let done = sync(&src, &dst, &carried);
+    let done = sync(&carried);
     assert_eq!(done.copied, 1, "{done:?}");
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\n");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -891,7 +896,7 @@ fn delta_sync_never_touches_the_main_transcript() {
     append(&src_main, b"{\"type\":\"assistant\"}\n");
     let before = std::fs::read(&carried.path).unwrap();
 
-    sync(&src, &dst, &carried);
+    sync(&carried);
     assert_eq!(std::fs::read(&carried.path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -909,17 +914,17 @@ fn read_main(cfg: &Path) -> Vec<u8> {
     .unwrap()
 }
 
-/// A destination that FORKED — its `.jsonl` files are smaller than the
-/// source's but are not a prefix of them, so each carries a tail of its own —
-/// is never overwritten: not the main `<sid>.jsonl`, not a subagent
-/// transcript, and not by the delta sync after the source grows further. Its
-/// in-place sidecar is kept too (the fork ran the session last).
-#[test]
-fn a_diverged_destination_jsonl_is_never_overwritten() {
-    let tmp = scratch("diverged");
-    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+const SRC_MAIN: &[u8] =
+    b"{\"type\":\"user\"}\n{\"type\":\"assistant\",\"tail\":\"source, longer\"}\n";
+const FORK_MAIN: &[u8] = b"{\"type\":\"user\"}\n{\"fork\":1}\n";
+
+/// A destination that FORKED: its `.jsonl` files (main and subagent) are
+/// smaller than the source's but not a prefix of them, so each carries a tail
+/// of its own; its `custom-title.json` differs too. Returns the source's
+/// `<sid>/`.
+fn seed_forked(src: &Path, dst: &Path) -> PathBuf {
     let src_side = seed_session(
-        &src,
+        src,
         WD,
         SID,
         &[
@@ -928,7 +933,7 @@ fn a_diverged_destination_jsonl_is_never_overwritten() {
         ],
     );
     seed_session(
-        &dst,
+        dst,
         WD,
         SID,
         &[
@@ -936,30 +941,75 @@ fn a_diverged_destination_jsonl_is_never_overwritten() {
             ("custom-title.json", br#"{"customTitle":"fork"}"#),
         ],
     );
-    write_main(
-        &src,
-        b"{\"type\":\"user\"}\n{\"type\":\"assistant\",\"tail\":\"source, longer\"}\n",
-    );
-    write_main(&dst, b"{\"type\":\"user\"}\n{\"fork\":1}\n");
+    write_main(src, SRC_MAIN);
+    write_main(dst, FORK_MAIN);
+    src_side
+}
+
+/// Every `<SID>.jsonl.diverged-*` file in the destination's project dir.
+fn diverged_backups(cfg: &Path) -> Vec<PathBuf> {
+    let main = crate::terminal::transcript::session_transcript_path(cfg, WD, SID);
+    let prefix = format!("{SID}.jsonl.diverged-");
+    std::fs::read_dir(main.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// W1 — on a MIGRATION the source is the live conversation and is what
+/// resumes. A destination `<sid>.jsonl` that diverged from it is moved aside
+/// (its bytes survive at `<sid>.jsonl.diverged-<ms>`), and the destination
+/// then holds the source's bytes. A diverged SUBAGENT transcript is still
+/// never overwritten — by the carry or by the delta sync — and the main
+/// transcript is not counted in the `<sid>/` tally.
+#[test]
+fn a_migration_moves_a_diverged_main_transcript_aside_and_copies_the_live_one() {
+    let tmp = scratch("diverged");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let src_side = seed_forked(&src, &dst);
 
     let carried = carry(&src, &dst);
+    let MainCarry::DivergedPreserved { backup } = &carried.main else {
+        panic!("expected the fork preserved, got {:?}", carried.main);
+    };
+    assert_eq!(
+        std::fs::read(backup).unwrap(),
+        FORK_MAIN,
+        "the fork's bytes survive at the backup path"
+    );
+    assert_eq!(
+        backup.parent(),
+        carried.path.parent(),
+        "beside the transcript"
+    );
+    assert!(backup
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(&format!("{SID}.jsonl.diverged-")));
+    assert_eq!(
+        read_main(&dst),
+        SRC_MAIN,
+        "the live conversation now resumes"
+    );
+    assert_eq!(diverged_backups(&dst), vec![backup.clone()]);
+    assert_eq!(carried.main.event_name(), "diverged_preserved");
+    assert_eq!(carried.main.backup(), Some(backup.as_path()));
     assert_eq!(
         carried.session_dir,
         SessionDirCarry {
-            skipped_present: 1,
-            skipped_other: 2,
+            copied: 1,
+            skipped_other: 1,
             ..SessionDirCarry::default()
         },
-        "the main transcript and the subagent are both skipped as diverged"
+        "the subagent fork is skipped; the main transcript is not counted here; \
+         the live side's in-place custom-title follows the live transcript"
     );
-    assert_eq!(read_main(&dst), b"{\"type\":\"user\"}\n{\"fork\":1}\n");
     let dst_side = literal_sidecar(&dst);
     let dst_sub = dst_side.join("subagents").join("agent-a1.jsonl");
     assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
-    assert_eq!(
-        std::fs::read(dst_side.join("custom-title.json")).unwrap(),
-        br#"{"customTitle":"fork"}"#
-    );
     let recorded = carried
         .files
         .iter()
@@ -972,10 +1022,212 @@ fn a_diverged_destination_jsonl_is_never_overwritten() {
         &src_side.join("subagents").join("agent-a1.jsonl"),
         b"and the old pane wrote even more\n",
     );
-    let done = sync(&src, &dst, &carried);
+    let done = sync(&carried);
     assert_eq!(done.skipped_other, 1, "{done:?}");
     assert_eq!(done.copied, 0, "{done:?}");
     assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W1 — when the fork cannot be moved aside the carry FAILS (so the migration
+/// leaves the old pane untouched) and nothing is overwritten.
+#[test]
+fn a_failed_rename_aside_fails_the_carry_and_overwrites_nothing() {
+    let tmp = scratch("diverged-rename-fails");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+
+    let err = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+    )
+    .unwrap_err();
+    assert!(err.contains("could not be moved aside"), "got: {err}");
+    assert_eq!(read_main(&dst), FORK_MAIN, "the fork is untouched");
+    assert!(diverged_backups(&dst).is_empty());
+    assert_eq!(
+        std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"fork"}"#,
+        "a failed step 1 carries no side-car either"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Outside a migration ([`MainTranscript::ExtendPrefix`], the respawn's mode
+/// for an absent target) a diverged main transcript is KEPT, as before: no
+/// backup, and the fork keeps its in-place sidecar.
+#[test]
+fn extend_prefix_keeps_a_diverged_main_transcript() {
+    let tmp = scratch("diverged-keep");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_forked(&src, &dst);
+
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
+    assert_eq!(carried.main, MainCarry::KeptExisting);
+    assert_eq!(read_main(&dst), FORK_MAIN);
+    assert!(diverged_backups(&dst).is_empty());
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            skipped_present: 1,
+            skipped_other: 1,
+            ..SessionDirCarry::default()
+        }
+    );
+    assert_eq!(
+        std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"fork"}"#
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W2 — the destination ran the session last (its main transcript is the
+/// larger), so the carry keeps its in-place `custom-title.json`. When the
+/// older source side rewrites its own copy before the delta sync, the sync
+/// must not overwrite the destination's either.
+#[test]
+fn delta_sync_never_overwrites_a_sidecar_the_carry_kept_as_newer() {
+    let tmp = scratch("delta-kept-newer");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let src_side = seed_session(
+        &src,
+        WD,
+        SID,
+        &[("custom-title.json", br#"{"customTitle":"old"}"#)],
+    );
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[("custom-title.json", br#"{"customTitle":"new"}"#)],
+    );
+    write_main(&dst, b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
+
+    let carried = carry(&src, &dst);
+    assert_eq!(carried.main, MainCarry::Present);
+    let title = carried
+        .files
+        .iter()
+        .find(|f| f.rel == Path::new("custom-title.json"))
+        .unwrap();
+    assert!(title.kept_destination_newer, "{title:?}");
+
+    std::fs::write(
+        src_side.join("custom-title.json"),
+        br#"{"customTitle":"old side, renamed again"}"#,
+    )
+    .unwrap();
+    let done = sync(&carried);
+    assert_eq!(
+        done,
+        DeltaSync {
+            kept_destination_newer: 1,
+            ..DeltaSync::default()
+        }
+    );
+    assert_eq!(
+        std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"new"}"#,
+        "the destination's copy survives the sync"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S3 — under [`MainTranscript::KeepExisting`] a target that already holds
+/// the transcript resumes ITS copy, so its in-place sidecars stay with it even
+/// when a holder's main transcript is a larger extension of the target's.
+#[test]
+fn keep_existing_keeps_the_targets_in_place_sidecars() {
+    let tmp = scratch("keep-existing-sidecar");
+    let (holder, target) = (tmp.join(".claude-h"), tmp.join(".claude-t"));
+    seed_session(
+        &holder,
+        WD,
+        SID,
+        &[("custom-title.json", br#"{"customTitle":"holder"}"#)],
+    );
+    seed_session(
+        &target,
+        WD,
+        SID,
+        &[("custom-title.json", br#"{"customTitle":"target"}"#)],
+    );
+    // The holder's main transcript extends the target's (a strict prefix).
+    write_main(&holder, b"{\"type\":\"user\"}\n{\"more\":1}\n");
+
+    let carried = carry_session(
+        holder.to_str().unwrap(),
+        target.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::KeepExisting,
+    )
+    .unwrap();
+    assert_eq!(carried.main, MainCarry::KeptExisting);
+    assert_eq!(read_main(&target), b"{\"type\":\"user\"}\n");
+    assert_eq!(
+        std::fs::read(literal_sidecar(&target).join("custom-title.json")).unwrap(),
+        br#"{"customTitle":"target"}"#,
+        "a holder's in-place sidecar must not overwrite the target's"
+    );
+    assert!(carried.files.iter().all(|f| f.kept_destination_newer));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S1 — with a cwd over 200 encoded chars the session lives in a
+/// `<prefix>-<hash>` project dir, and the target's copy lands in a dir of the
+/// same name. The delta sync tops up exactly those two dirs — the ones the
+/// carry used — rather than a re-derived name.
+#[test]
+fn delta_sync_tops_up_the_long_cwd_dirs_the_carry_used() {
+    let tmp = scratch("delta-long-cwd");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    let working_dir = format!("/home/u/{}", "d".repeat(250));
+    let prefix = crate::terminal::transcript::encode_project_path(&working_dir)
+        .get(..200)
+        .unwrap()
+        .to_string();
+    let src_project = src.join("projects").join(format!("{prefix}-k3j2h1"));
+    let src_sub = src_project.join(SID).join("subagents");
+    std::fs::create_dir_all(&src_sub).unwrap();
+    std::fs::write(src_project.join(format!("{SID}.jsonl")), b"{}\n").unwrap();
+    std::fs::write(src_sub.join("agent-a1.jsonl"), b"a\n").unwrap();
+
+    let carried = copy_transcript(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        &working_dir,
+        SID,
+    )
+    .unwrap();
+    let dst_project = dst.join("projects").join(format!("{prefix}-k3j2h1"));
+    assert_eq!(carried.src_session_dir, src_project.join(SID));
+    assert_eq!(carried.dst_session_dir, dst_project.join(SID));
+
+    append(&src_sub.join("agent-a1.jsonl"), b"a2\n");
+    std::fs::write(src_sub.join("agent-n9.jsonl"), b"new\n").unwrap();
+    let done = sync(&carried);
+    assert_eq!(done.copied, 2, "{done:?}");
+    let dst_sub = dst_project.join(SID).join("subagents");
+    assert_eq!(
+        std::fs::read(dst_sub.join("agent-a1.jsonl")).unwrap(),
+        b"a\na2\n"
+    );
+    assert_eq!(
+        std::fs::read(dst_sub.join("agent-n9.jsonl")).unwrap(),
+        b"new\n"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -990,6 +1242,7 @@ fn an_append_only_prefix_destination_jsonl_is_extended() {
     write_main(&src, b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
 
     let carried = carry(&src, &dst);
+    assert_eq!(carried.main, MainCarry::ExtendedPrefix);
     assert_eq!(
         carried.session_dir,
         SessionDirCarry {
@@ -1041,7 +1294,7 @@ fn delta_sync_retries_a_failed_overwrite_of_an_existing_destination() {
         "the failed overwrite left a destination"
     );
 
-    let done = sync(&src, &dst, &carried);
+    let done = sync(&carried);
     assert_eq!(done.copied, 1, "{done:?}");
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\nb\n");
     let _ = std::fs::remove_dir_all(&tmp);
