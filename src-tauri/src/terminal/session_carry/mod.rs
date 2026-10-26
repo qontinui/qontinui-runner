@@ -707,6 +707,19 @@ where
             );
             Ok(MainCarry::DivergedPreserved { backup })
         }
+        // A rename that moved the fork and then reported an error: the fork is
+        // at its backup, not at the destination. Same test as the subagent
+        // arm in `preserve_diverged_file`.
+        Err(PreserveError::NotMovedAside {
+            backup: Some(backup),
+            error,
+        }) if std::fs::metadata(&backup).is_ok_and(|m| m.len() > 0) || !dst.exists() => {
+            Err(format!(
+                "the rename-aside of the diverged destination {} reported an error but moved it: {error} — the fork is preserved at {}, and the live transcript was not copied",
+                dst.display(),
+                backup.display(),
+            ))
+        }
         Err(PreserveError::NotMovedAside { backup, error }) => Err(format!(
             "the destination {} diverged from the live transcript and could not be moved aside{}: {error} — nothing overwritten",
             dst.display(),
