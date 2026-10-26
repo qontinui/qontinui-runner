@@ -563,6 +563,72 @@ pub async fn set_held_on(
     }
 }
 
+/// Reason recorded on a row un-finished by hand after the notice loop last
+/// read it as finished.
+pub const UNFINISHED_SINCE_LAST_READ: &str =
+    "un-finished by hand since the last read — not re-read yet";
+
+/// The work axis of cohort row `claude_session_id` changed by hand
+/// (`terminal_session_set_finished`): carry it onto the row at once. The
+/// notice loop re-derives `pause_state` each tick, but only while the prepare
+/// is in its window — on a restoring cohort (a placeholder's Finish /
+/// Unfinish) nothing re-reads it, so an un-finished row kept reading
+/// `pause_state: finished`. An un-finish clears a `finished` pause state to
+/// UNKNOWN-until-read (`None`, with [`UNFINISHED_SINCE_LAST_READ`]) rather
+/// than guessing what the session is doing now. `Ok(false)` when there is no
+/// record, no such row, or nothing changed.
+pub fn note_finished_on(
+    ctl: &RestartPrep,
+    claude_session_id: &str,
+    finished: bool,
+) -> Result<bool, String> {
+    let Some(rec) = ctl.record() else {
+        return Ok(false);
+    };
+    let changes = |row: &CohortRow| {
+        row.finished != Some(finished)
+            || (!finished && row.pause_state == Some(super::cohort::PauseState::Finished))
+    };
+    if !rec
+        .cohort
+        .rows
+        .iter()
+        .any(|row| row.session.claude_session_id == claude_session_id && changes(row))
+    {
+        return Ok(false);
+    }
+    ctl.update(&rec.prepare_id, |r| {
+        if let Some(row) = r
+            .cohort
+            .rows
+            .iter_mut()
+            .find(|row| row.session.claude_session_id == claude_session_id)
+        {
+            row.finished = Some(finished);
+            if !finished && row.pause_state == Some(super::cohort::PauseState::Finished) {
+                row.pause_state = None;
+                row.pause_reason = Some(UNFINISHED_SINCE_LAST_READ.to_string());
+            }
+        }
+    })
+    .map(|_| true)
+}
+
+/// [`note_finished_on`] on the live controller. A failed write is logged: the
+/// lifecycle record, which the next re-capture reads, already holds the mark.
+pub fn note_finished(claude_session_id: &str, finished: bool) {
+    let Some(ctl) = super::prepare::install_live() else {
+        return;
+    };
+    if let Err(e) = note_finished_on(ctl, claude_session_id, finished) {
+        warn!(
+            session = claude_session_id,
+            error = %e,
+            "restart_prep: finish mark not carried onto the cohort row"
+        );
+    }
+}
+
 /// [`set_held_on`] on the live controller (the Tauri `restart_prep_set_held`).
 pub async fn set_held(
     prepare_id: &str,
@@ -834,6 +900,35 @@ mod tests {
                 "{level:?} from {source:?} over baseline {baseline:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unfinish_clears_a_stale_finished_pause_state() {
+        use crate::restart_prep::cohort::PauseState;
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 0);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        ctl.update(&prepare_id, |r| {
+            r.state = PrepState::Restoring;
+            for row in &mut r.cohort.rows {
+                row.finished = Some(true);
+                row.pause_state = Some(PauseState::Finished);
+            }
+        })
+        .unwrap();
+        assert_eq!(note_finished_on(&ctl, "s1", false), Ok(true));
+        let rec = ctl.record().unwrap();
+        let s1 = &rec.cohort.rows[0];
+        assert_eq!(s1.finished, Some(false));
+        assert_eq!(s1.pause_state, None, "not `finished` any more");
+        assert_eq!(s1.pause_reason.as_deref(), Some(UNFINISHED_SINCE_LAST_READ));
+        // The other row is untouched; a repeat or an unknown row writes nothing.
+        assert_eq!(rec.cohort.rows[1].pause_state, Some(PauseState::Finished));
+        assert_eq!(note_finished_on(&ctl, "s1", false), Ok(false));
+        assert_eq!(note_finished_on(&ctl, "nope", false), Ok(false));
+        // Finishing again records the mark; the tick derives the state.
+        assert_eq!(note_finished_on(&ctl, "s1", true), Ok(true));
+        assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
     }
 
     #[test]

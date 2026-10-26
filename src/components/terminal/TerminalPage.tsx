@@ -1614,8 +1614,12 @@ function TerminalPageInner({
           {/* A prepared restart's placeholders on this page: "Restore all on
             this page (n)" (plan
             `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
-            Phase 7). Renders nothing on a page with none. */}
-          <RestorePageBar pageId={pageId} notify={notifyRestorePage} />
+            Phase 7). Renders nothing on a page with none. Keyed by page: this
+            TerminalPage is ONE instance across page switches, and UI Bridge
+            auto-registers a DOM element once under the id it first carried, so
+            a reused button kept `terminal.restore-page-<first page>` after a
+            switch. A remount per page gives each page its own element. */}
+          <RestorePageBar key={pageId} pageId={pageId} notify={notifyRestorePage} />
 
           <div className="flex-1 flex flex-row overflow-hidden">
             {workflowGen.showSidebar && (

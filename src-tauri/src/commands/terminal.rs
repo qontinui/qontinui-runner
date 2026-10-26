@@ -1658,11 +1658,16 @@ pub fn terminal_session_set_finished(
 ) -> Result<CommandResponse, String> {
     use crate::session::session_lifecycle_store::SetFinishedError;
     match store.set_finished(&claude_session_id, finished, reason) {
-        Ok(outcome) => Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(outcome.response_json()),
-        }),
+        Ok(outcome) => {
+            // A restart cohort row's work axis follows at once: a restoring
+            // cohort is not re-read by the notice loop.
+            crate::restart_prep::restore::note_finished(&claude_session_id, finished);
+            Ok(CommandResponse {
+                success: true,
+                message: None,
+                data: Some(outcome.response_json()),
+            })
+        }
         Err(SetFinishedError::UnknownSession) => Ok(CommandResponse {
             success: false,
             message: Some("no such session in the lifecycle registry".to_string()),

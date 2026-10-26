@@ -4,6 +4,8 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -210,6 +212,16 @@ describe("a usage-limited (limit_hit) row", () => {
       /^Restore \(account ben reset at /,
     );
     expect(restoreButtonLabel(placeholder(), NOW)).toBe("Restore");
+  });
+});
+
+describe("the per-page Restore-all bar", () => {
+  it("is remounted per page, so its UI Bridge id follows the page", () => {
+    // TerminalPage is ONE instance across page switches and UI Bridge
+    // registers a DOM element once under its first id: without a per-page key
+    // the button kept `terminal.restore-page-default` on every page.
+    const src = readFileSync(join(__dirname, "TerminalPage.tsx"), "utf8");
+    expect(src).toMatch(/<RestorePageBar\s+key=\{pageId\}\s+pageId=\{pageId\}/);
   });
 });
 
