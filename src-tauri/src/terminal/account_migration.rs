@@ -727,8 +727,8 @@ fn resume_respawn_extra_required(
 /// [`migrate_session`] on the blocking pool rather than an async worker.
 ///
 /// The migration is synchronous file and process work, and since the `<sid>/`
-/// carry it can copy a whole session directory — measured 2026-10-12 at up to
-/// ~125 MB / 250 files per session on this fleet. A usage limit is per
+/// carry it can copy a whole session directory, which for a long fan-out runs
+/// to hundreds of files and tens of megabytes or more. A usage limit is per
 /// account, so every session on that account migrates at about the same moment;
 /// run inline, each of those would hold a tokio worker for the length of its
 /// copy. Both async callers (the usage-limit hint and the manual Tauri command)
