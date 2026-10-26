@@ -254,6 +254,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
+mod shutdown_signals; // SIGTERM/SIGHUP mark the app quitting inside the signal handler, then die by default (round 11 M2)
 pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
@@ -1649,39 +1650,6 @@ fn install_app_runtime() {
 static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
-/// Mark the app as quitting when a terminating signal arrives, then let the
-/// signal take its default action (the process ends exactly as before). The
-/// mark is what keeps the panes' exits during that shutdown restart-shaped
-/// (`session_lifecycle_store::witnessed_close_reason`).
-#[cfg(unix)]
-fn spawn_shutdown_signal_marker() {
-    use tokio::signal::unix::{signal, SignalKind};
-    for (kind, raw) in [
-        (SignalKind::terminate(), libc::SIGTERM),
-        (SignalKind::hangup(), libc::SIGHUP),
-        (SignalKind::interrupt(), libc::SIGINT),
-    ] {
-        tauri::async_runtime::spawn(async move {
-            let Ok(mut stream) = signal(kind) else {
-                return;
-            };
-            if stream.recv().await.is_some() {
-                commands::terminal_windows::mark_app_quitting();
-                // SAFETY: restoring the default disposition and re-raising the
-                // same signal — the default action this process had before the
-                // listener was installed.
-                unsafe {
-                    libc::signal(raw, libc::SIG_DFL);
-                    libc::raise(raw);
-                }
-            }
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn spawn_shutdown_signal_marker() {}
-
 fn main() {
     // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
     // and roots its locations BEFORE anything below reads a path; a no-op for
@@ -2169,10 +2137,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // meanwhile does not bring it back at boot.
                 session::claude_ended_watch::spawn();
 
-                // A SIGTERM / SIGHUP / SIGINT is a shutdown: mark it BEFORE the
-                // panes die, so their exits stay restart-shaped (`pty-exit`)
-                // rather than reading as `claude` ending under a live runner.
-                spawn_shutdown_signal_marker();
+                // A SIGTERM / SIGHUP is a shutdown: mark it BEFORE the panes
+                // die, so their exits stay restart-shaped. Installed as a raw
+                // signal handler, NOT a runtime listener: see the module.
+                shutdown_signals::install();
 
                 // Visibility sweeper (Phase 5 of
                 // `plans/2026-07-28-runner-many-sessions-performance.md`).
