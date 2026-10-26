@@ -727,6 +727,18 @@ impl AgenticRunLedger {
         }
     }
 
+    /// The open runs THIS process opened (`opened_at >= boot_ms`).
+    pub fn current_open_runs(&self, boot_ms: i64) -> Vec<(String, AgenticRun)> {
+        let m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.iter()
+            .filter(|(_, r)| r.closed_at.is_none() && r.opened_at >= boot_ms)
+            .map(|(k, r)| (k.clone(), r.clone()))
+            .collect()
+    }
+
     /// End every run a PREVIOUS process left open (`runner-stopped`, at its
     /// last known activity) — the boot sweep, so a session that is never
     /// re-registered does not stay open on coord forever. Returns the
@@ -769,7 +781,25 @@ pub type CoordSessionResolver = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
 
 /// The debounce key value: the last body emitted for a run, less
 /// `last_seen_at` (which moves on every touch and is not a material change).
-type DebounceState = HashMap<(String, u32), (RunEvent, JsonValue)>;
+type DebounceState = HashMap<(String, u32), Emitted>;
+
+/// What was last emitted for one run: the debounce key value (event + body
+/// less `last_seen_at`), when, and the `last_seen_at` it carried — the inputs
+/// of the liveness cadence ([`LIVENESS_MERGE_EVERY_MS`]).
+#[derive(Debug, Clone, PartialEq)]
+struct Emitted {
+    event: RunEvent,
+    material: JsonValue,
+    at_ms: i64,
+    last_seen_ms: Option<i64>,
+}
+
+/// How often an open, counted run re-reports `last_seen_at` while it stays
+/// alive. Coord's backstop closes a run `inferred_lost` after 6 h without a
+/// refresh, and the debounce suppresses an otherwise-unchanged body, so a long
+/// healthy run needs this explicit liveness `merge` — at most one per run per
+/// cadence, driven by the existing liveness poll (never a loop of its own).
+pub const LIVENESS_MERGE_EVERY_MS: i64 = 30 * 60 * 1000;
 
 /// Bound on the debounce map; past it the map is cleared (a re-emit is an
 /// idempotent upsert, so forgetting is safe).
@@ -881,6 +911,65 @@ impl RunRecordEmitter {
         );
     }
 
+    /// Whether `snap`'s run is due a liveness merge at `now_ms`: its
+    /// `last_seen_at` advanced past what was last emitted for it, and the last
+    /// emission is at least [`LIVENESS_MERGE_EVERY_MS`] old. A run with no
+    /// emission recorded in this process (a restart) is due once.
+    fn liveness_due(&self, snap: &RunSnapshot, now_ms: i64) -> bool {
+        let last = self
+            .last_emitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.get(&(snap.claude_session_id.clone(), snap.run_seq)) {
+            None => true,
+            Some(e) => {
+                now_ms - e.at_ms >= LIVENESS_MERGE_EVERY_MS && snap.last_seen_at_ms > e.last_seen_ms
+            }
+        }
+    }
+
+    /// Terminal plane: the liveness poll saw `rec` alive (`touch`). Emits one
+    /// `merge` carrying the new `last_seen_at` when the cadence is due — only
+    /// for a counted, started, not-ended run.
+    pub fn liveness(&self, rec: &TerminalSessionRecord) {
+        self.liveness_at(rec, Utc::now().timestamp_millis());
+    }
+
+    fn liveness_at(&self, rec: &TerminalSessionRecord, now_ms: i64) {
+        if !(self.gate)() || !rec.run.start_emitted || rec.run.ended || rec.state != "open" {
+            return;
+        }
+        let coord_session = (self.resolver)(&rec.terminal_id);
+        let Some(snap) = RunSnapshot::from_record(rec, coord_session) else {
+            return;
+        };
+        if self.liveness_due(&snap, now_ms) {
+            self.emit_snapshot_at(&snap, RunEvent::Merge, true, now_ms);
+        }
+    }
+
+    /// Agentic plane, from the liveness poll's tick: every run THIS process
+    /// opened and has not closed is alive by construction (its end is the
+    /// process exit, which closes it), so its last activity is now — and a
+    /// liveness `merge` goes out when the cadence is due.
+    pub fn agentic_liveness_tick(&self) {
+        self.agentic_liveness_tick_at(Utc::now().timestamp_millis());
+    }
+
+    fn agentic_liveness_tick_at(&self, now_ms: i64) {
+        if !(self.gate)() {
+            return;
+        }
+        for (ccsid, mut run) in self.ledger.current_open_runs(process_boot_ms()) {
+            run.last_seen_at = now_ms;
+            let snap = agentic_snapshot(&ccsid, &run, None);
+            if self.liveness_due(&snap, now_ms) {
+                self.ledger.touch(&ccsid, now_ms);
+                self.emit_snapshot_at(&snap, RunEvent::Merge, true, now_ms);
+            }
+        }
+    }
+
     /// Agentic plane: an operator interaction with `claude_session_id` — its
     /// open run's last known activity.
     pub fn agentic_touch(&self, claude_session_id: &str) {
@@ -916,6 +1005,13 @@ impl RunRecordEmitter {
     }
 
     fn emit_snapshot(&self, snap: &RunSnapshot, event: RunEvent) {
+        self.emit_snapshot_at(snap, event, false, Utc::now().timestamp_millis());
+    }
+
+    /// [`Self::emit_snapshot`] with the clock injected; `liveness` bypasses the
+    /// body debounce (the liveness merge's body differs only in `last_seen_at`,
+    /// which the debounce deliberately ignores).
+    fn emit_snapshot_at(&self, snap: &RunSnapshot, event: RunEvent, liveness: bool, now_ms: i64) {
         let Some(body) = run_record_body(snap, event) else {
             let mut skipped = self
                 .skipped
@@ -939,7 +1035,11 @@ impl RunRecordEmitter {
             .last_emitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.get(&key) == Some(&(event, material.clone())) {
+        if !liveness
+            && last
+                .get(&key)
+                .is_some_and(|e| e.event == event && e.material == material)
+        {
             return;
         }
         let mut payload = json!({ "body": body });
@@ -956,7 +1056,15 @@ impl RunRecordEmitter {
                 if last.len() >= DEBOUNCE_CAP {
                     last.clear();
                 }
-                last.insert(key, (event, material));
+                last.insert(
+                    key,
+                    Emitted {
+                        event,
+                        material,
+                        at_ms: now_ms,
+                        last_seen_ms: snap.last_seen_at_ms,
+                    },
+                );
             }
             Err(e) => tracing::warn!(
                 session = %snap.claude_session_id,
@@ -978,6 +1086,14 @@ static GLOBAL: std::sync::OnceLock<Arc<RunRecordEmitter>> = std::sync::OnceLock:
 pub fn install_global(emitter: Arc<RunRecordEmitter>) {
     if GLOBAL.set(emitter).is_err() {
         tracing::warn!("run_record_emitter: global emitter already installed — ignoring");
+    }
+}
+
+/// The liveness poll's tick for the agentic plane — see
+/// [`RunRecordEmitter::agentic_liveness_tick`].
+pub fn agentic_liveness_tick() {
+    if let Some(emitter) = GLOBAL.get() {
+        emitter.agentic_liveness_tick();
     }
 }
 
@@ -1365,6 +1481,80 @@ pub(crate) mod tests {
         assert_eq!(swept[0]["ended_at"], "2023-11-14T22:13:20.000Z");
         // The current run (this process's) is untouched by the sweep.
         assert!(em.ledger.get(SID).unwrap().closed_at.is_none());
+    }
+
+    #[test]
+    fn a_long_run_refreshes_last_seen_once_per_cadence() {
+        let (em, outbox, _d) = emitter(true);
+        let mut r = rec(SID);
+        begin_run_if_due(&mut r);
+        r.spawn = Some(SpawnFacts::new(SpawnOrigin::Steward));
+        assert!(claim_start(&mut r, false));
+        let t0 = Utc::now().timestamp_millis();
+        em.emit_snapshot_at(
+            &RunSnapshot::from_record(&r, None).unwrap(),
+            RunEvent::Start,
+            false,
+            t0,
+        );
+        // Touched UNDER the cadence: no merge, however often.
+        r.last_seen_at += 60_000;
+        em.liveness_at(&r, t0 + 10 * 60 * 1000);
+        em.liveness_at(&r, t0 + LIVENESS_MERGE_EVERY_MS - 1);
+        assert_eq!(bodies(&outbox).len(), 1, "under the cadence emits none");
+        // Touched PAST it: exactly one merge carrying the new last_seen_at.
+        r.last_seen_at = 1_700_009_000_000;
+        em.liveness_at(&r, t0 + LIVENESS_MERGE_EVERY_MS);
+        em.liveness_at(&r, t0 + LIVENESS_MERGE_EVERY_MS + 1_000);
+        let b = bodies(&outbox);
+        assert_eq!(b.len(), 2, "one merge per cadence");
+        assert_eq!(b[1]["event"], "merge");
+        assert_eq!(b[1]["last_seen_at"], "2023-11-15T00:43:20.000Z");
+        // A past cadence with NO new sighting refreshes nothing.
+        em.liveness_at(&r, t0 + 3 * LIVENESS_MERGE_EVERY_MS);
+        assert_eq!(bodies(&outbox).len(), 2, "no advance, no merge");
+        // An ended run is never refreshed.
+        r.run.ended = true;
+        r.last_seen_at += 1;
+        em.liveness_at(&r, t0 + 5 * LIVENESS_MERGE_EVERY_MS);
+        assert_eq!(bodies(&outbox).len(), 2);
+    }
+
+    #[test]
+    fn a_store_touch_under_the_cadence_emits_no_liveness_merge() {
+        let (store, outbox, _d) = store_with_emitter();
+        store.record_open(rec(SID));
+        store.touch(SID); // releases the held start
+        store.touch(SID);
+        store.touch(SID);
+        assert_eq!(events(&outbox), vec![("start".to_string(), 1)]);
+    }
+
+    #[test]
+    fn an_open_agentic_run_refreshes_last_seen_once_per_cadence() {
+        let (em, outbox, _d) = emitter(true);
+        em.agentic_start(
+            SID,
+            Some(SpawnFacts::new(SpawnOrigin::Scheduler)),
+            None,
+            None,
+        );
+        let t0 = Utc::now().timestamp_millis();
+        em.agentic_liveness_tick_at(t0 + 60_000);
+        assert_eq!(bodies(&outbox).len(), 1, "under the cadence emits none");
+        let later = t0 + LIVENESS_MERGE_EVERY_MS + 60_000;
+        em.agentic_liveness_tick_at(later);
+        em.agentic_liveness_tick_at(later + 1_000);
+        let b = bodies(&outbox);
+        assert_eq!(b.len(), 2, "one merge per cadence");
+        assert_eq!(b[1]["event"], "merge");
+        assert_eq!(b[1]["run_seq"], 1);
+        assert_eq!(b[1]["last_seen_at"], rfc3339(later).unwrap());
+        assert_eq!(em.ledger.get(SID).unwrap().last_seen_at, later, "persisted");
+        // A closed run is never refreshed.
+        em.agentic_end(SID, None);
+        em.agentic_liveness_tick_at(later + 2 * LIVENESS_MERGE_EVERY_MS);
+        assert_eq!(bodies(&outbox).len(), 3, "start, merge, end — no more");
     }
 
     #[test]

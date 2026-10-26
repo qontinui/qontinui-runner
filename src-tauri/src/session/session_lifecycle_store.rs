@@ -2378,6 +2378,10 @@ impl SessionLifecycleStore {
         );
         if start {
             self.emit_run(&touched, RunEvent::Start);
+        } else if let Some(emitter) = self.run_emitter.get() {
+            // A long healthy run re-reports `last_seen_at` at a bounded
+            // cadence, or coord's 6 h backstop would infer it lost.
+            emitter.liveness(&touched);
         }
     }
 
