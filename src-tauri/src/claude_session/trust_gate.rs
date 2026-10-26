@@ -931,13 +931,8 @@ pub fn local_worktree_shape(dir: &Path, roots: &[(String, PathBuf)]) -> LocalWor
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 pub fn primary_checkout_from_gitdir(raw: &str) -> Option<PathBuf> {
-    let line = raw
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-        .trim();
-    if line.is_empty() {
-        return None;
-    }
+    // The shared `.git`-pointer parser: the FIRST line, trimmed, blank refused.
+    let line = qontinui_runner_lib::git_layout::gitdir_value(raw)?;
     let norm = line.replace('\\', "/");
     // Case-insensitive on the marker: the path segments are git's own, so
     // `.git/worktrees` is stable, but the drive-letter case is not and a
@@ -1360,14 +1355,19 @@ pub fn verified_primary_checkout(cwd: &Path) -> Result<(PathBuf, String), String
     let canon = |p: &Path| {
         std::fs::canonicalize(p).map_err(|e| format!("could not resolve {}: {e}", p.display()))
     };
-    let read_line = |file: &Path, prefix: Option<&str>| -> Result<String, String> {
+    // The FIRST line of each file, as git reads it. The `.git` file's
+    // `gitdir:` value goes through the runner's one `.git`-pointer parser
+    // (`git_layout::gitdir_value`), so this verifier and
+    // `primary_checkout_from_gitdir` cannot disagree about which line counts.
+    let read_line = |file: &Path, gitdir: bool| -> Result<String, String> {
         let raw = std::fs::read_to_string(file)
             .map_err(|e| format!("could not read {}: {e}", file.display()))?;
-        raw.lines()
-            .find_map(|l| match prefix {
-                Some(p) => l.trim().strip_prefix(p).map(str::trim),
-                None => Some(l.trim()),
-            })
+        let value = if gitdir {
+            qontinui_runner_lib::git_layout::gitdir_value(&raw)
+        } else {
+            raw.lines().next().map(str::trim)
+        };
+        value
             .filter(|v| !v.is_empty())
             .map(str::to_string)
             .ok_or_else(|| format!("{} carries no usable line", file.display()))
@@ -1382,8 +1382,8 @@ pub fn verified_primary_checkout(cwd: &Path) -> Result<(PathBuf, String), String
             dot_git.display()
         ));
     }
-    let admin = canon(&worktree.join(read_line(&dot_git, Some("gitdir:"))?))?;
-    let common = canon(&admin.join(read_line(&admin.join("commondir"), None)?))?;
+    let admin = canon(&worktree.join(read_line(&dot_git, true)?))?;
+    let common = canon(&admin.join(read_line(&admin.join("commondir"), false)?))?;
     if common.file_name().and_then(|n| n.to_str()) != Some(".git")
         || admin.parent() != Some(common.join("worktrees").as_path())
     {
@@ -1393,7 +1393,7 @@ pub fn verified_primary_checkout(cwd: &Path) -> Result<(PathBuf, String), String
             common.display()
         ));
     }
-    let back = canon(&admin.join(read_line(&admin.join("gitdir"), None)?))?;
+    let back = canon(&admin.join(read_line(&admin.join("gitdir"), false)?))?;
     if back != canon(&dot_git)? {
         return Err(format!(
             "{}/gitdir points at {}, not at this worktree",

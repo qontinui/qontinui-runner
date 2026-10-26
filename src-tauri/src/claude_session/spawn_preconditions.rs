@@ -255,11 +255,7 @@ pub(crate) fn explicit_trust_for(
 ) -> Option<ExplicitTrustPrecondition> {
     let root = workspace_trust::git_root(&std::fs::canonicalize(cwd).ok()?)?;
     let dot_git = std::fs::read_to_string(root.join(".git")).ok()?;
-    let admin = dot_git
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-        .trim()
-        .replace('\\', "/");
+    let admin = qontinui_runner_lib::git_layout::gitdir_value(&dot_git)?.replace('\\', "/");
     if Path::new(&admin).parent()?.file_name()? != std::ffi::OsStr::new("worktrees") {
         return None;
     }
