@@ -69,6 +69,13 @@ mod tests {
         /// appear in that file's non-comment lines for the gate to count as
         /// wired.
         gate_wiring: &'static [(&'static str, &'static str)],
+        /// `(file relative to the repo root, count)`: the `#[expect]`s that are
+        /// a lint's sanctioned DOOR rather than grandfathered debt — the one
+        /// place a disallowed call is the point (`outbound_net/os_dns.rs`
+        /// `client_builder`, which wraps `reqwest::Client::builder()`). They
+        /// are left out of the ceiling, and each file must carry EXACTLY its
+        /// count, so a door can neither grow a second site nor hide one.
+        doors: &'static [(&'static str, usize)],
     }
 
     const RATCHETS: [Ratchet; 3] = [
@@ -92,6 +99,14 @@ mod tests {
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
+                // The async reqwest constructors, which resolve DNS on tokio's
+                // shared blocking pool (coord finding 1d5d6c2e). Not
+                // grandfathered: every site was migrated to
+                // `outbound_net::{client_builder, client}` when the entries
+                // landed, so they add nothing to the baseline above.
+                ("clippy.toml", "\"reqwest::Client::new\""),
+                ("clippy.toml", "\"reqwest::Client::builder\""),
+                ("clippy.toml", "\"reqwest::ClientBuilder::new\""),
                 (
                     "src-tauri/Cargo.toml",
                     "disallowed_methods = { level = \"deny\"",
@@ -101,6 +116,7 @@ mod tests {
                     "unfulfilled_lint_expectations = \"deny\"",
                 ),
             ],
+            doors: &[("src-tauri/src/outbound_net/os_dns.rs", 1)],
         },
         // Plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate: the
         // count the sweep left once BOTH required clippy legs were clean —
@@ -131,6 +147,7 @@ mod tests {
                     "unfulfilled_lint_expectations = \"deny\"",
                 ),
             ],
+            doors: &[],
         },
         // Plan 2026-09-12-residual-work-from-the-april-2026-plan-audit, Phase 1:
         // the regression guard plan runner-arc-runtime-root-cause (deliverable
@@ -165,6 +182,7 @@ mod tests {
                     "unfulfilled_lint_expectations = \"deny\"",
                 ),
             ],
+            doors: &[],
         },
     ];
 
@@ -174,6 +192,20 @@ mod tests {
         fn bare_lint(&self) -> &'static str {
             self.lint.strip_prefix("clippy::").unwrap_or(self.lint)
         }
+        /// The sanctioned count for `path` when it is one of [`Ratchet::doors`].
+        fn door_count(&self, path: &Path) -> Option<usize> {
+            self.doors
+                .iter()
+                .find(|(rel, _)| is_file(path, rel))
+                .map(|(_, n)| *n)
+        }
+    }
+
+    /// Is `path` the file `rel` (repo-root relative, `/`-separated)?
+    fn is_file(path: &Path, rel: &str) -> bool {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(&format!("/{rel}"))
     }
 
     /// The directories the sweep script counts over — kept in lockstep with
@@ -352,6 +384,11 @@ mod tests {
                     .iter()
                     .filter(|a| a.is_expect_of_lint(ratchet.bare_lint()))
                     .count();
+                // A door's attributes are the gate working, not debt; their
+                // exact count is pinned by `each_door_carries_exactly_its_count`.
+                if ratchet.door_count(path).is_some() {
+                    continue;
+                }
                 if n > 0 {
                     per_file.push((path.display().to_string(), n));
                     total += n;
@@ -379,6 +416,36 @@ mod tests {
                 eprintln!(
                     "expect_ratchet: {lint}: {total} attribute(s) < baseline {baseline} — lower \
                      that entry's baseline in src-tauri/src/expect_ratchet.rs to {total}"
+                );
+            }
+        }
+    }
+
+    /// A door is exempt from the ceiling only for the count it declares: a
+    /// second disallowed call grandfathered beside it, or the door deleted
+    /// while its exemption stays, both red here.
+    #[test]
+    fn each_door_carries_exactly_its_count() {
+        let sources = walk_sources();
+        for ratchet in &RATCHETS {
+            for (rel, want) in ratchet.doors {
+                let found: Vec<usize> = sources
+                    .iter()
+                    .filter(|(path, _)| is_file(path, rel))
+                    .map(|(_, text)| {
+                        flatten_attributes(text)
+                            .iter()
+                            .filter(|a| a.is_expect_of_lint(ratchet.bare_lint()))
+                            .count()
+                    })
+                    .collect();
+                assert_eq!(
+                    found,
+                    vec![*want],
+                    "{}: door `{rel}` must be walked once and carry exactly {want} `{}` \
+                     attribute(s); found {found:?} (one entry per walked match)",
+                    ratchet.lint,
+                    ratchet.expect_needle
                 );
             }
         }

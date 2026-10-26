@@ -420,7 +420,7 @@ impl GitHubClient {
     /// this client — `pr_watcher`, `session_pr_reconciler`.
     /// It never carries the token.
     pub fn new(token: &str, consumer: &'static str) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

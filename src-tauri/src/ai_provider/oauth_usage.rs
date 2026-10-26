@@ -147,7 +147,7 @@ pub async fn fetch(token: &str) -> Result<OauthUsageSnapshot, String> {
     if crate::model_gateway::gateway_declared() {
         return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
     }
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;

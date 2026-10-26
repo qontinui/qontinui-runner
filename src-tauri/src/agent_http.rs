@@ -55,7 +55,7 @@ const POOL_MAX_IDLE_PER_HOST: usize = 64;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
@@ -70,7 +70,7 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
                 "agent_http: pooled client build failed ({e}); \
                  falling back to an unpooled default client"
             );
-            reqwest::Client::new()
+            qontinui_runner_lib::outbound_net::client()
         })
 });
 

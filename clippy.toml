@@ -5,6 +5,17 @@
 # `src-tauri/src/expect_ratchet.rs` asserts this entry is still present.
 disallowed-methods = [
   { path = "tokio_postgres::Row::get", reason = "Row::get PANICS on NULL/type/index mismatch and kills the enclosing task silently — use try_get and handle the Err arm. Dossier row-get-panic-kills-spawned-loop." },
+  # reqwest's default GaiResolver runs getaddrinfo on the calling runtime's
+  # shared blocking pool, so DNS queues behind unrelated blocking work when the
+  # pool is exhausted. Every async client starts from
+  # `outbound_net::client_builder()` / `outbound_net::client()`, which install
+  # the bounded OS resolver (`src-tauri/src/outbound_net/os_dns.rs`, the one
+  # sanctioned `#[expect]`). Coord finding 1d5d6c2e; `expect_ratchet.rs` pins
+  # these entries. `reqwest::blocking` is not listed: its own runtime owns its
+  # lookups.
+  { path = "reqwest::Client::new", reason = "resolves DNS on tokio's shared blocking pool — use qontinui_runner_lib::outbound_net::client() (OS resolver on bounded dedicated threads)." },
+  { path = "reqwest::Client::builder", reason = "resolves DNS on tokio's shared blocking pool — use qontinui_runner_lib::outbound_net::client_builder() (OS resolver on bounded dedicated threads)." },
+  { path = "reqwest::ClientBuilder::new", reason = "resolves DNS on tokio's shared blocking pool — use qontinui_runner_lib::outbound_net::client_builder() (OS resolver on bounded dedicated threads)." },
 ]
 
 # An owned `tokio::runtime::Runtime` dropped from inside an async context panics

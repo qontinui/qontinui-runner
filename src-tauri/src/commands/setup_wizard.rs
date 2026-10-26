@@ -238,7 +238,7 @@ pub async fn github_list_repos() -> Result<Value, String> {
         "{}/api/v1/operations/github/repos",
         crate::api_config::get_api_base_url()
     );
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let resp = client
         .get(&url)
         .bearer_auth(&bearer)
@@ -550,7 +550,7 @@ async fn mint_backend_connect_state(bearer: &str) -> Result<ConnectStateToken, S
         "{}/api/v1/operations/pr-merge/onboarding/connect-state",
         crate::api_config::get_api_base_url()
     );
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let resp = client
         .post(&url)
         .bearer_auth(bearer)
@@ -684,7 +684,7 @@ pub async fn claim_github_connection(
         GithubClaimTarget::InstallationId(id) => format!("installation_id={}", id),
         GithubClaimTarget::AccountLogin(login) => format!("account_login={}", login),
     };
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let resp = client
         .post(&url)
         .bearer_auth(&bearer)
@@ -782,7 +782,7 @@ pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Valu
         "{}/api/v1/operations/github/clone-credential",
         crate::api_config::get_api_base_url()
     );
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let resp = client
         .post(&cred_url)
         .bearer_auth(&bearer)

@@ -2294,12 +2294,12 @@ impl CoordOutsideObserver {
             );
         }
         Self {
-            http: reqwest::Client::builder()
+            http: qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
                 .build()
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "coord outside observer: reqwest build failed; using default");
-                    reqwest::Client::new()
+                    qontinui_runner_lib::outbound_net::client()
                 }),
             state: Mutex::new(ObserverState::default()),
             in_flight: AtomicBool::new(false),
@@ -4363,7 +4363,7 @@ mod tests {
         });
 
         let url = format!("http://{addr}/mcp");
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -4399,7 +4399,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -4446,7 +4446,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -4496,7 +4496,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -4846,7 +4846,7 @@ mod tests {
     }
 
     fn stub_client() -> reqwest::Client {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap()

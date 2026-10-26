@@ -16,7 +16,7 @@ use std::time::Duration;
 const BASE: &str = "http://localhost:9876";
 
 fn client() -> Client {
-    Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap()

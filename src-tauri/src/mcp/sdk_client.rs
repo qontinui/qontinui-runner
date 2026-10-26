@@ -681,8 +681,10 @@ pub async fn connect_sdk_app(
 /// a Qontinui origin is the backend the operator configured.
 fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
     match target {
-        BearerTarget::Loopback => reqwest::Client::builder().no_proxy(),
-        BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder(),
+        BearerTarget::Loopback => qontinui_runner_lib::outbound_net::client_builder().no_proxy(),
+        BearerTarget::QontinuiOrigin | BearerTarget::Foreign => {
+            qontinui_runner_lib::outbound_net::client_builder()
+        }
     }
 }
 
@@ -3501,11 +3503,11 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
     let mut stale_urls = Vec::new();
 
     // Create a short-timeout client for health checks
-    let health_client = reqwest::Client::builder()
+    let health_client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(2))
         .connect_timeout(std::time::Duration::from_secs(2))
         .build()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
 
     for (url, conn) in &manager.connections {
         let health_url = format!("{}{}/health", conn.app_url, conn.base_path);
@@ -3731,7 +3733,7 @@ async fn handle_discover_and_cache(
     info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
 
     // Step 1: Ensure connected to the app
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
@@ -9074,10 +9076,12 @@ mod connect_bearer_scope_tests {
             // local recorder, so no real host is ever contacted.
             let builder = match target {
                 BearerTarget::Loopback => connect_client_builder(target),
-                BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder()
-                    .no_proxy()
-                    .resolve("qontinui-web.test", local)
-                    .resolve("foreign.example", local),
+                BearerTarget::QontinuiOrigin | BearerTarget::Foreign => {
+                    qontinui_runner_lib::outbound_net::client_builder()
+                        .no_proxy()
+                        .resolve("qontinui-web.test", local)
+                        .resolve("foreign.example", local)
+                }
             };
             let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
             let response =
@@ -9135,7 +9139,7 @@ mod connect_bearer_scope_tests {
             }
         })
         .await;
-        let builder = reqwest::Client::builder()
+        let builder = qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .resolve("foreign.example", local);
         connect_sdk_app_with(
@@ -9304,7 +9308,7 @@ mod connect_bearer_scope_tests {
         // Test-only: trust the throwaway certificate and resolve the test
         // host to the fixture. The redirect policy is the production one,
         // installed by `connect_sdk_app_with` with the bearer.
-        let builder = reqwest::Client::builder()
+        let builder = qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .danger_accept_invalid_certs(true)
             .resolve(HOST, SocketAddr::from(([127, 0, 0, 1], port)));

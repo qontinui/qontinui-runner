@@ -1405,7 +1405,7 @@ async fn deliver_once(
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/').to_string();
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     let ctx = SurfaceCtx {
@@ -2488,7 +2488,7 @@ mod tests {
         // push-miss counter, regardless of priority. Below the threshold no
         // POST is attempted, so this needs no coord.
         let _serial = counter_test_guard();
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let ctx = SurfaceCtx {
             client: &client,
             base: "http://127.0.0.1:9",

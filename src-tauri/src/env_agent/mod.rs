@@ -387,7 +387,7 @@ async fn put_envelope_with_retry(
         backend_url.trim_end_matches('/'),
         environment_id
     );
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;

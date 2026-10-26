@@ -273,7 +273,7 @@ async fn probe_deepseek_balance(base_url: &str, api_key: &str) -> PrepaidBalance
     let url = format!("{}/user/balance", base_url.trim_end_matches('/'));
     // Bounded: this probe now also runs on the periodic fleet-usage report, and
     // an unbounded request to a hung provider would pin that loop forever.
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
     {

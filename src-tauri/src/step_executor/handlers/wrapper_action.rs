@@ -115,7 +115,7 @@ impl StepHandler for WrapperActionHandler {
             .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_SECS);
         // Loopback only (this runner's own API): never through a configured
         // HTTP proxy.
-        let client = match reqwest::Client::builder()
+        let client = match qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
             .build()

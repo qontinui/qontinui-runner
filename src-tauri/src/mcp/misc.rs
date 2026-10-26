@@ -725,7 +725,7 @@ pub async fn get_instances(
     let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     seen_ports.insert(self_port);
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
         .ok();
@@ -1654,7 +1654,7 @@ async fn spawn_instance(
         Some(port) => format!("http://127.0.0.1:{}/runners", port),
         None => format!("{}/runners", crate::api_config::get_supervisor_url()),
     };
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok();

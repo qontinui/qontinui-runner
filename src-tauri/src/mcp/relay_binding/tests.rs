@@ -92,7 +92,7 @@ async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Serve
     Server {
         port,
         relay,
-        http: reqwest::Client::builder()
+        http: qontinui_runner_lib::outbound_net::client_builder()
             .pool_max_idle_per_host(0)
             .build()
             .unwrap(),

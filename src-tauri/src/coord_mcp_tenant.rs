@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     async fn fetch(url: &str, request: &[u8]) -> bytes::Bytes {
-        reqwest::Client::new()
+        qontinui_runner_lib::outbound_net::client()
             .post(url)
             .body(request.to_vec())
             .send()

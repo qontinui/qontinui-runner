@@ -130,7 +130,7 @@ pub async fn canonical_checkout_claim_holder(
         coord_base.trim_end_matches('/'),
         urlencoding::encode(resource_key),
     );
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("build client: {e}"))?;
@@ -336,7 +336,7 @@ async fn post_canonical_drift(
     scope: crate::auth::TenantScope,
 ) {
     let url = format!("{}/coord/fs/observations", coord_base.trim_end_matches('/'));
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
