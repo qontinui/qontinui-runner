@@ -396,14 +396,18 @@ pub fn begin_next_interval(rec: &mut TerminalSessionRecord, now_ms: i64, boot_ms
     }
     rec.run.note_opened(now_ms);
     // Only a resume the RUNNER started (its boot restore typed the resume:
-    // tier `resumed`, or `failed` while still pending) continues the same work.
-    // A resume typed into a terminal-only tile is a new launch — fresh facts.
+    // tier `resumed`, or `failed` while its restore is still pending) continues
+    // the same work. A resume typed into a terminal-only tile — or into a tile
+    // whose runner resume already failed for good — is a new launch: fresh
+    // facts.
     let runner_resumed = rec.restored_from_boot_at.is_some_and(|t| t >= boot_ms)
-        && matches!(
-            rec.restore_tier.as_deref(),
-            Some(super::session_lifecycle_store::RESTORE_TIER_RESUMED)
-                | Some(super::session_lifecycle_store::RESTORE_TIER_FAILED)
-        );
+        && match rec.restore_tier.as_deref() {
+            Some(super::session_lifecycle_store::RESTORE_TIER_RESUMED) => true,
+            Some(super::session_lifecycle_store::RESTORE_TIER_FAILED) => {
+                rec.restore_pending_at.is_some()
+            }
+            _ => false,
+        };
     if runner_resumed {
         match rec.spawn.as_mut() {
             Some(sp) => sp.spawn_origin = SpawnOrigin::BootResume,
@@ -724,6 +728,24 @@ impl AgenticRunLedger {
         Some(closed)
     }
 
+    /// [`Self::touch`] for several runs, persisted ONCE.
+    pub fn touch_many<'a>(&self, ccsids: impl IntoIterator<Item = &'a str>, now_ms: i64) {
+        let mut m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for ccsid in ccsids {
+            if let Some(run) = m.get_mut(ccsid).filter(|r| r.closed_at.is_none()) {
+                run.last_seen_at = now_ms;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(&m);
+        }
+    }
+
     /// Bump `ccsid`'s open run's last known activity. No write when it has none.
     pub fn touch(&self, ccsid: &str, now_ms: i64) {
         let mut m = self
@@ -824,6 +846,8 @@ pub struct RunRecordEmitter {
     resolver: CoordSessionResolver,
     ledger: AgenticRunLedger,
     last_emitted: Mutex<DebounceState>,
+    /// Per run: when a liveness merge was last ATTEMPTED (emitted or not).
+    liveness_attempts: Mutex<HashMap<(String, u32), i64>>,
     skipped: Mutex<HashSet<String>>,
 }
 
@@ -875,6 +899,7 @@ impl RunRecordEmitter {
             resolver,
             ledger,
             last_emitted: Mutex::new(HashMap::new()),
+            liveness_attempts: Mutex::new(HashMap::new()),
             skipped: Mutex::new(HashSet::new()),
         }
     }
@@ -929,12 +954,39 @@ impl RunRecordEmitter {
             .last_emitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match last.get(&(snap.claude_session_id.clone(), snap.run_seq)) {
+        let key = (snap.claude_session_id.clone(), snap.run_seq);
+        // A liveness ATTEMPT is recorded whether or not it emitted (a body that
+        // cannot be built, an outbox append that failed), so a run that cannot
+        // emit is retried at the cadence, never on every poll tick.
+        let attempts = self
+            .liveness_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts
+            .get(&key)
+            .is_some_and(|at| now_ms - at < LIVENESS_MERGE_EVERY_MS)
+        {
+            return false;
+        }
+        match last.get(&key) {
             None => true,
             Some(e) => {
                 now_ms - e.at_ms >= LIVENESS_MERGE_EVERY_MS && snap.last_seen_at_ms > e.last_seen_ms
             }
         }
+    }
+
+    /// Record a liveness attempt for `snap`'s run at `now_ms` (see
+    /// [`Self::liveness_due`]).
+    fn note_liveness_attempt(&self, snap: &RunSnapshot, now_ms: i64) {
+        let mut attempts = self
+            .liveness_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts.len() >= DEBOUNCE_CAP {
+            attempts.clear();
+        }
+        attempts.insert((snap.claude_session_id.clone(), snap.run_seq), now_ms);
     }
 
     /// Terminal plane: the liveness poll saw `rec` alive (`touch`). Emits one
@@ -953,6 +1005,7 @@ impl RunRecordEmitter {
             return;
         };
         if self.liveness_due(&snap, now_ms) {
+            self.note_liveness_attempt(&snap, now_ms);
             self.emit_snapshot_at(&snap, RunEvent::Merge, true, now_ms);
         }
     }
@@ -969,13 +1022,23 @@ impl RunRecordEmitter {
         if !(self.gate)() {
             return;
         }
+        let mut due = Vec::new();
         for (ccsid, mut run) in self.ledger.current_open_runs(process_boot_ms()) {
             run.last_seen_at = now_ms;
             let snap = agentic_snapshot(&ccsid, &run, None);
             if self.liveness_due(&snap, now_ms) {
-                self.ledger.touch(&ccsid, now_ms);
-                self.emit_snapshot_at(&snap, RunEvent::Merge, true, now_ms);
+                due.push((ccsid, snap));
             }
+        }
+        if due.is_empty() {
+            return;
+        }
+        // ONE ledger write for the whole tick, before the rows go out.
+        self.ledger
+            .touch_many(due.iter().map(|(c, _)| c.as_str()), now_ms);
+        for (_, snap) in due {
+            self.note_liveness_attempt(&snap, now_ms);
+            self.emit_snapshot_at(&snap, RunEvent::Merge, true, now_ms);
         }
     }
 
@@ -1564,6 +1627,66 @@ pub(crate) mod tests {
         em.agentic_end(SID, None);
         em.agentic_liveness_tick_at(later + 2 * LIVENESS_MERGE_EVERY_MS);
         assert_eq!(bodies(&outbox).len(), 3, "start, merge, end — no more");
+    }
+
+    #[test]
+    fn a_run_that_cannot_emit_retries_liveness_at_the_cadence_not_every_tick() {
+        let (em, outbox, _d) = emitter(true);
+        // A non-uuid id: its body can never be built, so nothing is recorded
+        // as emitted for it.
+        let mut r = rec("not-a-uuid");
+        begin_run_if_due(&mut r);
+        r.run.start_emitted = true;
+        let t0 = Utc::now().timestamp_millis();
+        let snap = RunSnapshot::from_record(&r, None).unwrap();
+        assert!(em.liveness_due(&snap, t0), "due once (nothing recorded)");
+        em.liveness_at(&r, t0);
+        assert!(outbox.pending().unwrap().is_empty());
+        assert!(
+            !em.liveness_due(&snap, t0 + 45_000),
+            "not again on the next tick"
+        );
+        assert!(!em.liveness_due(&snap, t0 + LIVENESS_MERGE_EVERY_MS - 1));
+        assert!(
+            em.liveness_due(&snap, t0 + LIVENESS_MERGE_EVERY_MS),
+            "retried at the cadence"
+        );
+    }
+
+    #[test]
+    fn a_failed_tier_keeps_the_runners_facts_only_while_its_restore_is_pending() {
+        let boot = process_boot_ms();
+        let mk = |pending: bool| {
+            let mut r = rec(SID);
+            r.run = RunAccounting {
+                seq: 1,
+                opened_at: Some(boot - 1),
+                started: true,
+                ended: true,
+                start_emitted: true,
+                first_command: None,
+            };
+            r.restored_from_boot_at = Some(boot + 1);
+            r.restore_tier =
+                Some(crate::session::session_lifecycle_store::RESTORE_TIER_FAILED.to_string());
+            r.restore_pending_at = pending.then_some(boot + 1);
+            r.spawn =
+                Some(SpawnFacts::new(SpawnOrigin::GateContinuation).gate_id(Some("g".into())));
+            r
+        };
+        let mut pending = mk(true);
+        assert!(begin_next_interval(&mut pending, boot + 2, boot));
+        assert_eq!(
+            pending.spawn.as_ref().map(|f| f.spawn_origin),
+            Some(SpawnOrigin::BootResume)
+        );
+        assert_eq!(pending.spawn.unwrap().gate_id.as_deref(), Some("g"));
+        let mut settled = mk(false);
+        assert!(begin_next_interval(&mut settled, boot + 2, boot));
+        assert!(
+            settled.spawn.is_none(),
+            "a failed restore no longer pending: fresh facts"
+        );
     }
 
     #[test]
