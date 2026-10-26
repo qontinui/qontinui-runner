@@ -1831,6 +1831,18 @@ mod tests {
         }
     }
 
+    /// Review round 2, C2: the snapshot the getter and every event serve
+    /// (`snapshot()`) reads the live local hold, not only `snapshot_of`.
+    #[test]
+    fn the_served_snapshot_carries_the_live_local_hold() {
+        crate::restart_prep::prepare::set_test_local_hold(Some("prepare p — hold local"));
+        let held = snapshot();
+        crate::restart_prep::prepare::set_test_local_hold(None);
+        assert!(!held.autonomous_spawns_allowed);
+        assert_eq!(held.local_hold.as_deref(), Some("prepare p — hold local"));
+        assert_eq!(snapshot().local_hold, None, "the hold lifted");
+    }
+
     /// Finding 2: the hold's lift — including its `until` passing, which no
     /// fold sees — is an edge the next getter-driven check emits.
     #[test]

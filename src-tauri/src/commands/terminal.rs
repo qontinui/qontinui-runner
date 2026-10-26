@@ -3392,6 +3392,37 @@ mod tests {
         );
     }
 
+    /// Review round 2, C1: the restore set the boot restore reads
+    /// (`live_restore_set_body`, for a `placeholders: true` caller) actually
+    /// applies the withholding — before any restoring cohort is judged, from
+    /// the live withheld set. Read off the source because the call needs a
+    /// running app with a live prepare controller, which no unit test has.
+    #[test]
+    fn the_live_restore_set_withholds_a_prepared_cohort_before_it_restores() {
+        let src = include_str!("terminal.rs");
+        let (_, rest) = src
+            .split_once("fn live_restore_set_body(")
+            .expect("live_restore_set_body exists");
+        let (body, _) = rest.split_once("\n}\n").expect("its body ends");
+        let withheld_at = body
+            .find("withhold_prepared_rows(rows, &crate::restart_prep::restore::withheld_cohort_ids())")
+            .expect("the live restore set withholds the prepared cohort's rows");
+        let none_arm = body
+            .find("None => withhold_prepared_rows(")
+            .expect("only with no cohort");
+        assert!(none_arm <= withheld_at);
+        let body_call = body
+            .rfind("restore_set_body(\n")
+            .expect("the live restore set builds its body");
+        assert!(withheld_at < body_call, "withheld before the body is built");
+        // `terminal_session_list_open` answers through it on the undeferred arm.
+        let (_, list_open) = src
+            .split_once("pub fn terminal_session_list_open(")
+            .expect("list_open exists");
+        let (list_open, _) = list_open.split_once("\n}\n").expect("its body ends");
+        assert!(list_open.contains("live_restore_set_body(&store, rows, placeholders)"));
+    }
+
     /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):
     /// while a restart cohort is `restoring`, its rows leave the auto-restore
     /// `sessions` and come back as `placeholders`; with none (a crash boot, no

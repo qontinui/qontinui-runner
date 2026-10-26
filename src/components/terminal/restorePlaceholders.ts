@@ -364,6 +364,13 @@ export class RestoreCohortStore {
   private holderSweepPending = false;
   private unread = false;
   private setRead: Promise<void> | null = null;
+  /**
+   * A forced re-read asked for while a read was in flight: the ONE read
+   * chained after it. The in-flight read may have been issued before the
+   * change that forced it (the record moving to `restoring`), so it cannot
+   * answer it.
+   */
+  private rereadAfter: Promise<void> | null = null;
   /** Bumped by every `markBack`: a read that started before one is stale. */
   private backEpoch = 0;
   private snapshot: RestoreCohortSnapshot = {
@@ -420,11 +427,24 @@ export class RestoreCohortStore {
    *
    * With no cohort known (and the last read readable) the periodic re-read
    * does nothing; `force` reads anyway — for a change that announces a cohort
-   * this store has not seen yet ({@link onPrepChanged}).
+   * this store has not seen yet ({@link onPrepChanged}). A forced read never
+   * joins a read already in flight (issued before the change, it may not see
+   * it): exactly one more read is chained after it, however many forced
+   * re-reads ask meanwhile.
    */
   refreshSet(force = false): Promise<void> {
     if (!force && this.prepareId === null && !this.unread) return Promise.resolve();
-    if (this.setRead) return this.setRead;
+    if (this.setRead) {
+      if (!force) return this.setRead;
+      // Chained on settle, not success: a failed in-flight read must still
+      // be followed by the forced one, and must not leave this slot stuck.
+      const reread = () => {
+        this.rereadAfter = null;
+        return this.refreshSet(true);
+      };
+      this.rereadAfter ??= this.setRead.then(reread, reread);
+      return this.rereadAfter;
+    }
     const epoch = this.backEpoch;
     this.setRead = (async () => {
       try {

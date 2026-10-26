@@ -876,7 +876,8 @@ mod tests {
                 .find(|row| row.session.claude_session_id == "closed")
                 .unwrap();
             closed.left_capture_at = Some(1_500);
-            closed.left_capture_reason = Some("user-close".to_string());
+            // What the tab close button writes.
+            closed.left_capture_reason = Some("explicit".to_string());
         })
         .unwrap();
         let rec = ctl.record().unwrap();

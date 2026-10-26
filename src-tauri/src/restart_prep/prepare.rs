@@ -488,6 +488,16 @@ fn coord_hold_was_confirmed(rec: &PrepareRecord) -> bool {
     rec.coord_hold_confirmed || rec.hold == HoldStatus::Confirmed
 }
 
+/// A record just moved to `restoring` with NO row waiting — every session
+/// was closed on purpose during the prepare, so none is a restore candidate
+/// — has nothing to restore: it is `done` at once, rather than a cohort that
+/// shows an empty strip and blocks the next prepare until it is dismissed.
+fn settle_empty_restore(rec: &mut PrepareRecord) {
+    if super::restore::RestoringCohort::of(rec).is_some_and(|c| c.ids().is_empty()) {
+        rec.state = PrepState::Done;
+    }
+}
+
 /// Why `action` is refused on a runner rebuilt since `rec` was prepared, or
 /// `None`. The hold waits for a rebuild (D1); a rebuilt runner whose boot
 /// release did not settle owes a release — never a longer drain, and never a
@@ -978,12 +988,25 @@ impl RestartPrep {
         Fut: Future<Output = Result<Cohort, String>>,
     {
         let _op = self.ops.lock().await;
+        // A prepare still in its window on a runner that restarted since —
+        // rebuilt, or the same build — is owed a release, which moves its
+        // cohort to `restoring`. Never a re-sent hold for it, and never a new
+        // record over it, whether or not its hold has expired: the old
+        // cohort's rows are withheld from the auto-restore and shielded from
+        // the orphan close only while this record names them, so replacing it
+        // after the boot restore has run strands them — never restored, never
+        // shown as placeholders.
+        if let Some(rec) = self
+            .record()
+            .filter(|r| r.in_window() && (r.restarted_since() || self.same_build_restart()))
+        {
+            return Err(format!(
+                "this runner was rebuilt or restarted since prepare {} — release its hold (its \
+                 sessions are then restored by hand) rather than preparing again over it",
+                rec.prepare_id
+            ));
+        }
         if let Some(rec) = self.record().filter(|r| r.is_active(now_ms)) {
-            // The same rule as Extend: a rebuilt runner owes the old prepare a
-            // release, never a re-sent hold.
-            if let Some(refusal) = rebuilt_refusal(&rec, "preparing again over") {
-                return Err(refusal);
-            }
             if matches!(
                 rec.hold,
                 HoldStatus::Confirmed | HoldStatus::Local | HoldStatus::LocalSecondary
@@ -1122,6 +1145,7 @@ impl RestartPrep {
                 } else {
                     PrepState::Cancelled
                 };
+                settle_empty_restore(r);
             }
             r.release = Some(report);
         });
@@ -1167,6 +1191,7 @@ impl RestartPrep {
                         outcome: outcome.clone(),
                     };
                     r.state = PrepState::Restoring;
+                    settle_empty_restore(r);
                 }
                 r.release = Some(report);
             });
@@ -1261,7 +1286,25 @@ pub fn same_build_restart() -> bool {
 /// `None` before the controller is installed (the boot drain read installs
 /// it, and until then the drain state is `Unknown`, which defers anyway).
 pub fn local_hold_reason() -> Option<String> {
+    #[cfg(test)]
+    if let Some(hold) = TEST_LOCAL_HOLD.with(|h| h.borrow().clone()) {
+        return Some(hold);
+    }
     LIVE.get()?.local_hold_reason(now_ms())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A unit test's stand-in for an active runner-local hold, on its own
+    /// thread only — a test never installs the live controller.
+    static TEST_LOCAL_HOLD: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make [`local_hold_reason`] answer `hold` on this test thread.
+#[cfg(test)]
+pub(crate) fn set_test_local_hold(hold: Option<&str>) {
+    TEST_LOCAL_HOLD.with(|h| *h.borrow_mut() = hold.map(str::to_string));
 }
 
 /// Whether an active prepare freezes account moves.
@@ -2518,6 +2561,98 @@ mod tests {
             door.published.lock().unwrap().last(),
             Some(&("clear".to_string(), Some(PrepState::Restoring)))
         );
+    }
+
+    /// Review round 2, A: a restarted runner's prepare whose hold has EXPIRED
+    /// is still in its window, and still owed a release that restores its
+    /// cohort by hand. A prepare (a stale webview's) must not store a new
+    /// record over it — on a rebuilt runner and after a same-build restart.
+    #[tokio::test]
+    async fn restart_prep_a_restarted_runners_expired_prepare_is_never_replaced() {
+        let until = T0 + 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Unconfirmed {
+                cause: "coord_unreachable: x".to_string(),
+            },
+            until,
+        );
+        let door = MockDoor::primary();
+        let err = ctl
+            .prepare(&*door, "again", until + 1, || async { Ok(cohort(&["n"])) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("rebuilt or restarted"), "{err}");
+        assert_eq!(door.hold_count(), 0);
+        assert_eq!(load_from(&ctl.path).unwrap().prepare_id, "prep-boot");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(&dir, running_build(), HoldStatus::Confirmed, until);
+        let door = MockDoor::primary();
+        ctl.on_boot(&*door, running_build(), until + 1).await;
+        assert!(
+            !ctl.record().unwrap().is_active(until + 2),
+            "the hold expired"
+        );
+        let err = ctl
+            .prepare(&*door, "again", until + 2, || async { Ok(cohort(&["n"])) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("rebuilt or restarted"), "{err}");
+        assert_eq!(load_from(&ctl.path).unwrap().prepare_id, "prep-boot");
+    }
+
+    /// Review round 2, D: a cohort with no restore candidate left (every
+    /// session closed on purpose during the prepare) is `done` at once on the
+    /// rebuilt runner's boot and on Release hold — never an empty `restoring`
+    /// that blocks the next prepare — and the drain still lifts only after the
+    /// record moved.
+    #[tokio::test]
+    async fn restart_prep_a_cohort_with_nothing_to_restore_is_done_at_once() {
+        let closed_on_purpose = |ctl: &RestartPrep| {
+            ctl.update("prep-boot", |r| {
+                for row in &mut r.cohort.rows {
+                    row.left_capture_at = Some(T0 + 10);
+                    row.left_capture_reason = Some("explicit".to_string());
+                }
+            })
+            .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            "an-older-build",
+            HoldStatus::Confirmed,
+            T0 + DEFAULT_HOLD_MS,
+        );
+        closed_on_purpose(&ctl);
+        let door = MockDoor::primary();
+        *door.record_at.lock().unwrap() = Some(ctl.path.clone());
+        ctl.on_boot(&*door, running_build(), T0 + 1).await;
+        assert_eq!(load_from(&ctl.path).unwrap().state, PrepState::Done);
+        assert_eq!(
+            door.published.lock().unwrap().as_slice(),
+            [("clear".to_string(), Some(PrepState::Done))]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = seeded(
+            &dir,
+            running_build(),
+            HoldStatus::Confirmed,
+            T0 + DEFAULT_HOLD_MS,
+        );
+        closed_on_purpose(&ctl);
+        let door = MockDoor::primary();
+        ctl.on_boot(&*door, running_build(), T0 + 1).await;
+        let rec = ctl.cancel(&*door, T0 + 2).await.unwrap();
+        assert_eq!(rec.state, PrepState::Done);
+        // Nothing waits, so a new prepare may start.
+        ctl.prepare(&*door, "next", T0 + 3, || async { Ok(cohort(&["n"])) })
+            .await
+            .expect("a new prepare");
     }
 
     #[tokio::test]

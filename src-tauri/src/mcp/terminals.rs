@@ -770,7 +770,47 @@ pub async fn list_terminal_pages_handler(
     ))))
 }
 
-/// Close a terminal session.
+/// The close reason `DELETE /terminals/{id}` records on the session the
+/// terminal hosts: `explicit`, the same deliberate-close reason a tab's close
+/// button records. The restore set never resurrects it, and a restart
+/// prepare's cohort does not restore a session closed this way during the
+/// prepare (`restart_prep::cohort::CohortRow::restore_candidate`).
+pub const HTTP_CLOSE_REASON: &str = "explicit";
+
+/// Close terminal `terminal_id` DELIBERATELY: when `deliberate` (a local
+/// terminal that exists), record [`HTTP_CLOSE_REASON`] on the session it
+/// hosts, THEN end it with `close`.
+///
+/// The order is the point. Ending the pane fires the tab's own exit close
+/// (`pty-exit`) — or, with no webview attached, the lifecycle poll's
+/// `poll-dead` / `no-terminal` — and those are restart-shaped closes, which
+/// would leave a session an agent or the operator closed on purpose looking
+/// like one that died with the runner. The store closes a record once
+/// (`record_close_checked` resolves only OPEN rows; a repeat close is
+/// `AlreadyClosed`), so the reason recorded first is the one that stays.
+fn close_deliberately<T, E>(
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    terminal_id: &str,
+    deliberate: bool,
+    close: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    if deliberate {
+        if let Some(rec) = store.and_then(|s| s.find_open_by_terminal(terminal_id)) {
+            if let Some(store) = store {
+                store.record_close_checked(
+                    &rec.claude_session_id,
+                    Some(terminal_id),
+                    HTTP_CLOSE_REASON,
+                );
+            }
+        }
+    }
+    close()
+}
+
+/// Close a terminal session. A deliberate close: the session it hosts is
+/// recorded closed [`HTTP_CLOSE_REASON`] before its process ends
+/// ([`close_deliberately`]).
 pub async fn close_terminal_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -792,23 +832,34 @@ pub async fn close_terminal_handler(
     // Probed BEFORE the close, which removes the identity and the pane.
     // `None` for a local tab, whose response is unchanged.
     let remote_probe = crate::commands::remote_attach::probe_remote_close(&terminal_manager, &id);
+    // A remote tab's close detaches it; the session runs on.
+    let local = remote_probe.is_none();
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
 
-    spawn_blocking_tracked(move || manager.close(&terminal_id))
-        .await
-        .map_err(|e| {
-            error!("HTTP: spawn_blocking error for close terminal: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Internal error: {}", e))),
-            )
-        })?
-        .map_err(|e| {
-            error!("HTTP: Failed to close terminal {}: {}", id, e);
-            (
-                StatusCode::NOT_FOUND,
-                Json(api_error(format!("Terminal not found: {}", id))),
-            )
-        })?;
+    spawn_blocking_tracked(move || {
+        let deliberate = local && manager.get(&terminal_id).is_some();
+        close_deliberately(store.as_deref(), &terminal_id, deliberate, || {
+            manager.close(&terminal_id)
+        })
+    })
+    .await
+    .map_err(|e| {
+        error!("HTTP: spawn_blocking error for close terminal: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?
+    .map_err(|e| {
+        error!("HTTP: Failed to close terminal {}: {}", id, e);
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Terminal not found: {}", id))),
+        )
+    })?;
 
     let mut body = serde_json::json!({
         "closed": true,
@@ -1179,6 +1230,107 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round 2, F (finding 6): a session closed through
+    /// `DELETE /terminals/{id}` during a prepare is a deliberate close. It is
+    /// recorded `explicit` BEFORE the pane ends, so the pane's own exit close
+    /// (`pty-exit`, stood for by `close` here) cannot replace it — and the
+    /// prepare's cohort does not restore it.
+    #[test]
+    fn an_http_close_is_deliberate_and_survives_the_panes_own_exit_close() {
+        use crate::restart_prep::cohort::{Cohort, RowFacts};
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let id = "0f4b3c2a-1d5e-4f60-8a7b-9c0d1e2f3a4b";
+        store.record_open(test_open_record(id));
+        let terminal = format!("term-{id}");
+
+        let closed: Result<(), String> = close_deliberately(Some(&store), &terminal, true, || {
+            // The pane's process ends: its tab's onExit records `pty-exit`.
+            store.record_close(id, "pty-exit");
+            Ok(())
+        });
+        closed.unwrap();
+        let rec = store.get(id).expect("the record is kept");
+        assert_eq!(rec.state, "closed");
+        assert_eq!(
+            rec.close_reason.as_deref(),
+            Some(HTTP_CLOSE_REASON),
+            "the deliberate reason is recorded first and stays"
+        );
+        // A later restart-shaped close cannot replace it either.
+        store.record_close(id, "poll-dead");
+        assert_eq!(
+            store.get(id).unwrap().close_reason.as_deref(),
+            Some("explicit")
+        );
+
+        // The prepare's re-capture no longer sees it, and records why.
+        let pinned = Cohort {
+            captured_at_ms: 0,
+            captured_at: String::new(),
+            reason: "restart-prep".to_string(),
+            rows: vec![crate::restart_prep::cohort::build_row(
+                crate::session::session_ledger::LedgerEntry {
+                    claude_session_id: id.to_string(),
+                    terminal_id: terminal.clone(),
+                    page_id: "default".to_string(),
+                    zone_index: 0,
+                    title: None,
+                    session_name: None,
+                    account_label: None,
+                    config_dir: None,
+                    working_dir: None,
+                    restorable: None,
+                    worktree_path: None,
+                    plan_slug: None,
+                    work_unit_id: None,
+                    wip_state: None,
+                    wip_ref: None,
+                    custody_session_mismatch: false,
+                    name_source: None,
+                    resume_config_dir: None,
+                    resume_command: None,
+                    provider: None,
+                    last_seen_at: None,
+                    finished: false,
+                },
+                RowFacts::default(),
+            )],
+        };
+        let empty = Cohort {
+            captured_at_ms: 1,
+            captured_at: String::new(),
+            reason: "restart-prep".to_string(),
+            rows: vec![],
+        };
+        let merged = crate::restart_prep::cohort::merge_recapture(&pinned, empty, 1, &|sid| {
+            store.get(sid).and_then(|r| r.close_reason)
+        });
+        assert!(
+            !merged.rows[0].restore_candidate(),
+            "not restored after the rebuild"
+        );
+
+        // A remote tab's close (or no terminal) records nothing.
+        let other = "1f4b3c2a-1d5e-4f60-8a7b-9c0d1e2f3a4b";
+        store.record_open(test_open_record(other));
+        let _: Result<(), String> =
+            close_deliberately(Some(&store), &format!("term-{other}"), false, || Ok(()));
+        assert_eq!(store.get(other).unwrap().state, "open");
+    }
+
+    /// F: the HTTP close door goes through [`close_deliberately`].
+    #[test]
+    fn the_http_close_door_records_a_deliberate_close() {
+        let src = include_str!("terminals.rs");
+        let (_, rest) = src
+            .split_once("pub async fn close_terminal_handler(")
+            .expect("the door exists");
+        let (body, _) = rest.split_once("\n}\n").expect("its body ends");
+        assert!(body.contains("close_deliberately(store.as_deref(), &terminal_id, deliberate"));
+    }
 
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —

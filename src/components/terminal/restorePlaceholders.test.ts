@@ -330,6 +330,70 @@ describe("RestoreCohortStore", () => {
     expect(store.getSnapshot().rows.map((r) => r.claudeSessionId)).toEqual(["a"]);
   });
 
+  // Review round 2, B: the restoring event lands while an earlier re-read
+  // (the unread store's 15 s one) is in flight. That read was issued before
+  // the record moved and answers "no cohort"; the forced re-read must not be
+  // answered by it, or the strip and placeholders never appear.
+  it("a forced re-read during an in-flight read chains one more read after it", async () => {
+    const answers: Array<(s: PlaceholderSet | null) => void> = [];
+    const io = {
+      readStatus: vi.fn(async () => null),
+      readSet: vi.fn(
+        () =>
+          new Promise<PlaceholderSet | null>((resolve) => {
+            answers.push(resolve);
+          }),
+      ),
+    };
+    const store = new RestoreCohortStore(io);
+    store.markUnread();
+    const stale = store.refreshSet();
+    expect(io.readSet).toHaveBeenCalledTimes(1);
+    const forced = store.onPrepChanged({ record: { prepare_id: "prep-1", state: "restoring" } });
+    const forcedAgain = store.refreshSet(true);
+    expect(io.readSet).toHaveBeenCalledTimes(1);
+    answers[0]({ placeholders: [], restartPrep: null });
+    await stale;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(io.readSet).toHaveBeenCalledTimes(2);
+    answers[1]({
+      placeholders: [rec("a")],
+      restartPrep: { prepareId: "prep-1", holderSweepPending: false },
+    });
+    await Promise.all([forced, forcedAgain]);
+    expect(io.readSet).toHaveBeenCalledTimes(2);
+    expect(store.getSnapshot().prepareId).toBe("prep-1");
+    expect(store.getSnapshot().rows.map((r) => r.claudeSessionId)).toEqual(["a"]);
+  });
+
+  it("a forced re-read still follows an in-flight read that failed", async () => {
+    let fail: (e: Error) => void = () => {};
+    const io = {
+      readStatus: vi.fn(async () => null),
+      readSet: vi
+        .fn<() => Promise<PlaceholderSet | null>>()
+        .mockImplementationOnce(
+          () =>
+            new Promise<PlaceholderSet | null>((_, reject) => {
+              fail = reject;
+            }),
+        )
+        .mockImplementation(async () => ({
+          placeholders: [rec("a")],
+          restartPrep: { prepareId: "prep-1", holderSweepPending: false },
+        })),
+    };
+    const store = new RestoreCohortStore(io);
+    store.markUnread();
+    const stale = store.refreshSet();
+    const forced = store.refreshSet(true);
+    fail(new Error("read failed"));
+    await expect(stale).rejects.toThrow("read failed");
+    await forced;
+    expect(io.readSet).toHaveBeenCalledTimes(2);
+    expect(store.getSnapshot().prepareId).toBe("prep-1");
+  });
+
   // Finding 4 (review): the cohort leaving `restoring` (dismissed from any
   // surface) ends it here at once, placeholder tabs included.
   it("a restart-prep-changed that ends the held cohort empties the store", async () => {
