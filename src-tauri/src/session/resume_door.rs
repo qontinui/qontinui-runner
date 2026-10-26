@@ -86,12 +86,16 @@
 //! holder that kept its pane alive across the restart may still be adopted —
 //! and the in-flight and live-process guards are unchanged. A row held for a
 //! hand restore is the operator's only (`skipped(held_for_hand_restore)` for
-//! an autonomous caller), and only the operator's Restore of a finished
-//! cohort row is admitted; its finish mark is lifted once the resume is
-//! verified, so a refused or failed Restore leaves it untouched. A cohort row is resumed at
-//! the effort it ran at (`--effort <level>`, when that differs from its
-//! account's baseline) and the verdict, with the effort read-back, is
-//! recorded on the cohort row.
+//! an autonomous caller), as is a row whose account hit its usage limit during
+//! the prepare (`skipped(limit_hit_hand_restore_only)`), and only the
+//! operator's Restore of a finished cohort row is admitted; its finish mark is
+//! lifted once the resume is verified, so a refused or failed Restore leaves it
+//! untouched. A cohort row is resumed at the effort it ran at as
+//! `--effort <level>` (`restart_prep::restore::effort_to_apply`): always for a
+//! level set explicitly with `/effort` (read from its transcript), even one
+//! equal to the account's baseline; for a level that may only be a default,
+//! when it differs from that baseline. The verdict, with the effort read-back,
+//! is recorded on the cohort row.
 //!
 //! ## Origin
 //!
