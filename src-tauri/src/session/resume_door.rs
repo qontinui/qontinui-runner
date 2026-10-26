@@ -1053,7 +1053,12 @@ async fn lift_finish_mark(
         return;
     }
     if let Some(ctl) = ctl {
-        if let Err(e) = crate::restart_prep::restore::note_finished_on(ctl, id, false).await {
+        if let Err(e) =
+            crate::restart_prep::restore::note_finished_on(ctl, id, false, &|id: &str| {
+                store.get(id).map(|r| r.finished_at.is_some())
+            })
+            .await
+        {
             warn!(id = %id, error = %e, "resume_door: finish mark lifted, but not carried onto the cohort row");
         }
     }

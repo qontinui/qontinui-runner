@@ -581,12 +581,19 @@ pub const UNFINISHED_SINCE_LAST_READ: &str =
 /// Serialized with the notice tick (`ops`), as [`set_held_on`] is: the tick
 /// replaces the whole cohort with the one it re-captured at its start, so a
 /// mark written while it ran would be overwritten by its stale copy.
+///
+/// `finished` is what the caller set, but two quick toggles spawn two calls
+/// that can reach `ops` out of order. So under the lock the lifecycle store's
+/// CURRENT mark (`store_finished`) wins whenever it can be read; `finished` is
+/// only the fallback for an unreadable store.
 pub async fn note_finished_on(
     ctl: &RestartPrep,
     claude_session_id: &str,
     finished: bool,
+    store_finished: &(dyn Fn(&str) -> Option<bool> + Send + Sync),
 ) -> Result<bool, String> {
     let _op = ctl.ops.lock().await;
+    let finished = store_finished(claude_session_id).unwrap_or(finished);
     let Some(rec) = ctl.record() else {
         return Ok(false);
     };
@@ -625,7 +632,15 @@ pub async fn note_finished(claude_session_id: &str, finished: bool) {
     let Some(ctl) = super::prepare::install_live() else {
         return;
     };
-    if let Err(e) = note_finished_on(ctl, claude_session_id, finished).await {
+    let store_finished = |id: &str| -> Option<bool> {
+        use tauri::Manager;
+        let app = crate::tauri_app_handle::current()?;
+        let store = app.try_state::<std::sync::Arc<
+            crate::session::session_lifecycle_store::SessionLifecycleStore,
+        >>()?;
+        store.get(id).map(|r| r.finished_at.is_some())
+    };
+    if let Err(e) = note_finished_on(ctl, claude_session_id, finished, &store_finished).await {
         warn!(
             session = claude_session_id,
             error = %e,
@@ -907,6 +922,30 @@ mod tests {
         }
     }
 
+    /// The lifecycle store could not be read: the caller's value stands.
+    fn no_store(_: &str) -> Option<bool> {
+        None
+    }
+
+    /// Re-review finding 2: two quick toggles (finish, then un-finish) spawn
+    /// two calls that can take `ops` out of order. The late, stale "finish"
+    /// must not leave the row finished while the store says it is not.
+    #[tokio::test]
+    async fn out_of_order_toggles_end_on_the_stores_current_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1"], 0);
+        // The store's mark after both toggles: NOT finished.
+        let store_now = |_: &str| Some(false);
+        // The un-finish lands first, then the stale finish.
+        note_finished_on(&ctl, "s1", false, &store_now)
+            .await
+            .unwrap();
+        note_finished_on(&ctl, "s1", true, &store_now)
+            .await
+            .unwrap();
+        assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(false));
+    }
+
     #[tokio::test]
     async fn an_unfinish_clears_a_stale_finished_pause_state() {
         use crate::restart_prep::cohort::PauseState;
@@ -921,7 +960,10 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(note_finished_on(&ctl, "s1", false).await, Ok(true));
+        assert_eq!(
+            note_finished_on(&ctl, "s1", false, &no_store).await,
+            Ok(true)
+        );
         let rec = ctl.record().unwrap();
         let s1 = &rec.cohort.rows[0];
         assert_eq!(s1.finished, Some(false));
@@ -929,10 +971,19 @@ mod tests {
         assert_eq!(s1.pause_reason.as_deref(), Some(UNFINISHED_SINCE_LAST_READ));
         // The other row is untouched; a repeat or an unknown row writes nothing.
         assert_eq!(rec.cohort.rows[1].pause_state, Some(PauseState::Finished));
-        assert_eq!(note_finished_on(&ctl, "s1", false).await, Ok(false));
-        assert_eq!(note_finished_on(&ctl, "nope", false).await, Ok(false));
+        assert_eq!(
+            note_finished_on(&ctl, "s1", false, &no_store).await,
+            Ok(false)
+        );
+        assert_eq!(
+            note_finished_on(&ctl, "nope", false, &no_store).await,
+            Ok(false)
+        );
         // Finishing again records the mark; the tick derives the state.
-        assert_eq!(note_finished_on(&ctl, "s1", true).await, Ok(true));
+        assert_eq!(
+            note_finished_on(&ctl, "s1", true, &no_store).await,
+            Ok(true)
+        );
         assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
     }
 
@@ -945,13 +996,16 @@ mod tests {
         let tick = ctl.ops.lock().await;
         let blocked = tokio::time::timeout(
             Duration::from_millis(50),
-            note_finished_on(&ctl, "s1", true),
+            note_finished_on(&ctl, "s1", true, &no_store),
         )
         .await;
         assert!(blocked.is_err(), "wrote while the tick held ops");
         assert_ne!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
         drop(tick);
-        assert_eq!(note_finished_on(&ctl, "s1", true).await, Ok(true));
+        assert_eq!(
+            note_finished_on(&ctl, "s1", true, &no_store).await,
+            Ok(true)
+        );
         assert_eq!(ctl.record().unwrap().cohort.rows[0].finished, Some(true));
     }
 
