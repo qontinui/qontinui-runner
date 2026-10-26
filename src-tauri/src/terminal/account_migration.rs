@@ -1340,6 +1340,9 @@ pub(crate) struct MigrationSubject {
     pub src_config_dir: String,
     /// The old pane's `claude` anchor, for the post-close delta sync.
     pub old_writer: Option<ProcIdentity>,
+    /// How the identity was settled, in words — returned by the operator's
+    /// command so a migration of an unverified identity says so.
+    pub identity_note: String,
 }
 
 /// Resolve which session `record`'s pane provably runs (plan
@@ -1372,14 +1375,28 @@ pub(crate) async fn resolve_migration_subject(
             rebound_from,
         } => {
             let src = roster_spelling(&config_dir, &crate::settings::get_claude_config_dirs());
+            let identity_note = match &rebound_from {
+                None => format!("confirmed: the pane runs {sid} under {src} (provider registry)"),
+                Some(from) => format!(
+                    "rebound: the pane runs {sid} under {src}, not the record's {from} (provider registry)"
+                ),
+            };
             let record = match rebound_from {
                 None => record.clone(),
                 Some(from) => {
-                    let confirmed_at = record.working_dir.as_deref().and_then(|wd| {
+                    // No transcript for the provider's id under its account:
+                    // refuse BEFORE rewriting the record (two open records on
+                    // one terminal, and a copy that would fail anyway).
+                    let has_transcript = record.working_dir.as_deref().is_some_and(|wd| {
                         super::transcript::session_transcript_path(Path::new(&src), wd, &sid)
                             .exists()
-                            .then(|| chrono::Utc::now().timestamp_millis())
                     });
+                    crate::terminal::migration_identity::rebound_transcript_gate(
+                        &sid,
+                        &src,
+                        has_transcript,
+                    )?;
+                    let confirmed_at = Some(chrono::Utc::now().timestamp_millis());
                     let corrected = rebound_record(record, &sid, &src, confirmed_at);
                     store.record_open(corrected.clone());
                     warn!(
@@ -1396,6 +1413,7 @@ pub(crate) async fn resolve_migration_subject(
                 record,
                 src_config_dir: src,
                 old_writer,
+                identity_note,
             })
         }
         MigrationVerdict::ProceedOnRecord { why } => {
@@ -1407,13 +1425,17 @@ pub(crate) async fn resolve_migration_subject(
             warn!(
                 terminal_id = %record.terminal_id,
                 session = %record.claude_session_id,
+                trigger = ?trigger,
                 why = %why,
-                "account migration (operator command): the pane's identity is unresolved — migrating the record's session as the operator asked"
+                "account migration: the pane's identity was NOT established — migrating the runner's record of the session (identity not checked)"
             );
             Ok(MigrationSubject {
                 record: record.clone(),
                 src_config_dir: src,
                 old_writer,
+                identity_note: format!(
+                    "unresolved — migrated the runner's record of the session: {why}"
+                ),
             })
         }
         MigrationVerdict::Refuse { reason } => {
