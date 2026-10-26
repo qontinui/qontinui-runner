@@ -151,12 +151,22 @@ fn should_fire(
 /// **After that window, only NEW limit output lifts the guard.** Lifting with
 /// the old line still painted would hand hours-old text to `should_fire`,
 /// whose empty last-fired entry fires at once — migrating the very session the
-/// operator kept. So at the first scan past the window the guard records the
-/// limit lines then on screen (a multiset of normalized lines, [`limit_lines`])
-/// and suppresses them; it lifts — and the ordinary probe-guarded hint runs on
-/// that same scan — as soon as the screen shows no limit text at all, or a
-/// limit line the record does not hold (or one more copy of one it does):
-/// a genuine new hit printed while the old line is still in the grid fires.
+/// operator kept. So at the first scan past the window the guard records, per
+/// limit PATTERN, how many times it occurs on the whole normalized screen
+/// ([`pattern_counts`]), and suppresses that. It lifts — and the ordinary
+/// probe-guarded hint runs on that same scan — when the screen shows no limit
+/// text at all, or a pattern's count RISES above the record, or a pattern the
+/// record does not hold appears: a genuine new hit printed while the old line
+/// is still in the grid fires.
+///
+/// **Why per pattern over the whole screen, not per row:** the record must be
+/// rewrap-proof. `normalize` collapses newlines, so a message wrapped across
+/// rows still matches; a resize that truncates or re-wraps the old line, a
+/// typed character, a spinner or a clock changes the screen text but not how
+/// many times each pattern occurs, so the old text never reads as new. A count
+/// that stays the same or drops (scroll-off, truncation) keeps the guard. The
+/// accepted weakness errs toward NOT migrating: a wrap that splits a word
+/// inside a pattern can hide one occurrence.
 ///
 /// Cost: an unchanged screen is never re-read inside the window (nothing it
 /// shows can change a step), only once at the window's end to take the record,
@@ -169,32 +179,24 @@ fn should_fire(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleLimitGuard {
     pub until_ms: i64,
-    /// The limit lines on screen at the first scan past the window: the stale
-    /// text that may never fire. `None` until that scan.
-    pub stale: Option<LimitLines>,
+    /// The limit-pattern counts on screen at the first scan past the window:
+    /// the stale text that may never fire. `None` until that scan.
+    pub stale: Option<PatternCounts>,
 }
 
-/// The limit-matching lines of one screen, normalized, with their counts.
-pub(crate) type LimitLines = std::collections::BTreeMap<String, usize>;
+/// How many times each limit pattern occurs on one normalized screen. Only
+/// patterns that occur are present.
+pub(crate) type PatternCounts = std::collections::BTreeMap<&'static str, usize>;
 
-/// PURE: the limit lines of a rendered screen (rows joined by `\n`). A message
-/// only matched across wrapped rows is recorded as the whole normalized screen,
-/// so it still counts as limit text.
-pub(crate) fn limit_lines(text: &str) -> LimitLines {
-    let mut out = LimitLines::new();
-    for line in text.lines() {
-        let n = normalize(line);
-        if normalized_indicates_usage_limit(&n).is_some() {
-            *out.entry(n).or_insert(0) += 1;
-        }
-    }
-    if out.is_empty() {
-        let whole = normalize(text);
-        if normalized_indicates_usage_limit(&whole).is_some() {
-            out.insert(whole, 1);
-        }
-    }
-    out
+/// PURE: [`PatternCounts`] of an ALREADY-normalized screen.
+pub(crate) fn pattern_counts(normalized: &str) -> PatternCounts {
+    USAGE_LIMIT_PATTERNS
+        .iter()
+        .filter_map(|p| {
+            let n = normalized.matches(p).count();
+            (n > 0).then_some((*p, n))
+        })
+        .collect()
 }
 
 /// How long past the recorded reset the guard still holds: a usage endpoint
@@ -238,27 +240,27 @@ impl StaleLimitGuard {
         now_ms >= self.until_ms && self.stale.is_none()
     }
 
-    /// The step for one scan of the guarded pane, whose limit lines are
-    /// `lines` (see [`limit_lines`]). Records the stale lines at the first
-    /// scan past the window.
-    pub(crate) fn step(&mut self, lines: &LimitLines, now_ms: i64) -> GuardStep {
+    /// The step for one scan of the guarded pane, whose limit-pattern counts
+    /// are `counts` (see [`pattern_counts`]). Records them at the first scan
+    /// past the window.
+    pub(crate) fn step(&mut self, counts: &PatternCounts, now_ms: i64) -> GuardStep {
         if now_ms < self.until_ms {
-            return if lines.is_empty() {
+            return if counts.is_empty() {
                 GuardStep::Keep
             } else {
                 GuardStep::Suppress
             };
         }
-        if lines.is_empty() {
+        if counts.is_empty() {
             return GuardStep::Lift;
         }
         let Some(stale) = &self.stale else {
-            self.stale = Some(lines.clone());
+            self.stale = Some(counts.clone());
             return GuardStep::Suppress;
         };
-        let new_output = lines
+        let new_output = counts
             .iter()
-            .any(|(line, n)| stale.get(line).is_none_or(|old| n > old));
+            .any(|(p, n)| stale.get(p).is_none_or(|old| n > old));
         if new_output {
             GuardStep::Lift
         } else {
@@ -358,9 +360,11 @@ pub fn scan_grids_once() {
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            let matched = normalized_indicates_usage_limit(&normalize(&text));
+            // Normalized ONCE: the matcher and the guard's counts share it.
+            let normalized = normalize(&text);
+            let matched = normalized_indicates_usage_limit(&normalized);
             if let Some(guard) = guards.get_mut(tid) {
-                match guard.step(&limit_lines(&text), now_ms) {
+                match guard.step(&pattern_counts(&normalized), now_ms) {
                     GuardStep::Suppress => {
                         debug!(
                             terminal_id = %tid,
@@ -562,25 +566,22 @@ mod tests {
     const OLD: &str = "Claude usage limit reached. Your limit will reset at 3am.";
     const NEW: &str = "5-hour limit reached ∙ resets 9am";
 
-    fn screen_of(rows: &[&str]) -> LimitLines {
-        limit_lines(&rows.join("\n"))
+    /// What the guard reads off a screen of `rows`.
+    fn screen_of(rows: &[&str]) -> PatternCounts {
+        pattern_counts(&normalize(&rows.join("\n")))
     }
 
     #[test]
-    fn limit_lines_is_a_multiset_of_normalized_matching_lines() {
-        let l = screen_of(&["work", OLD, "  more", OLD, NEW]);
-        assert_eq!(l.len(), 2);
-        assert_eq!(
-            l.values()
-                .copied()
-                .collect::<Vec<_>>()
-                .iter()
-                .sum::<usize>(),
-            3
-        );
+    fn pattern_counts_count_each_pattern_over_the_whole_screen() {
+        let c = screen_of(&["work", OLD, "  more", OLD, NEW]);
+        assert_eq!(c.get("usage limit reached"), Some(&2));
+        assert_eq!(c.get("5-hour limit reached"), Some(&1));
         assert!(screen_of(&["cargo build ok", "❯ "]).is_empty());
-        // Wrapped across rows: still limit text.
-        assert_eq!(screen_of(&["Claude usage", "limit reached"]).len(), 1);
+        // Wrapped across rows: normalize joins them, so it still counts.
+        assert_eq!(
+            screen_of(&["Claude usage limit", "reached. Resets 3am."]).get("usage limit reached"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -603,9 +604,8 @@ mod tests {
         assert_eq!(g.stale, None, "nothing recorded inside the window");
     }
 
-    /// Re-review finding 1: past the window, the old text still on screen
-    /// never fires, but a NEW limit line appended while it is still painted
-    /// does.
+    /// Past the window, the old text still on screen never fires, but a NEW
+    /// limit message printed while it is still painted does.
     #[test]
     fn past_the_window_old_text_is_suppressed_and_new_limit_output_fires() {
         let mut g = StaleLimitGuard::arm(None, T0).expect("armed");
@@ -624,13 +624,113 @@ mod tests {
             g.step(&screen_of(&[OLD, "retrying…", NEW, "❯ "]), after + 10),
             GuardStep::Lift
         );
-        // One more copy of the same message is new output too.
+    }
+
+    /// Re-review M1 (a): the pane is narrowed after the record. The grid
+    /// truncates the old row (no reflow) and Claude Code redraws at the new
+    /// width, so the old message's row text changes — but it is still only
+    /// the old message.
+    #[test]
+    fn a_resized_or_truncated_old_message_stays_suppressed() {
+        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
+        let after = g.until_ms + 1;
+        assert_eq!(
+            g.step(&screen_of(&["work", OLD, "❯ "]), after),
+            GuardStep::Suppress
+        );
+        // Truncated by the grid.
+        assert_eq!(
+            g.step(
+                &screen_of(&["work", "Claude usage limit reached. Your limit will", "❯ "]),
+                after + 1
+            ),
+            GuardStep::Suppress
+        );
+        // Re-wrapped by the redraw at the narrower width.
+        assert_eq!(
+            g.step(
+                &screen_of(&[
+                    "work",
+                    "Claude usage limit reached. Your",
+                    "limit will reset at 3am.",
+                    "❯ "
+                ]),
+                after + 2
+            ),
+            GuardStep::Suppress
+        );
+    }
+
+    /// Re-review M2 (b): the old message matches only across wrapped rows; a
+    /// typed character, a spinner or a clock change elsewhere on screen is
+    /// not new limit output.
+    #[test]
+    fn a_wrapped_old_message_with_other_screen_changes_stays_suppressed() {
+        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
+        let after = g.until_ms + 1;
+        let (a, b) = ("Claude usage limit", "reached. Resets 3am.");
+        assert_eq!(
+            g.step(&screen_of(&[a, b, "❯ "]), after),
+            GuardStep::Suppress
+        );
+        assert_eq!(
+            g.step(&screen_of(&[a, b, "❯ h"]), after + 1),
+            GuardStep::Suppress
+        );
+        assert_eq!(
+            g.step(&screen_of(&["✶ 12:01", a, b, "❯ "]), after + 2),
+            GuardStep::Suppress
+        );
+    }
+
+    /// Re-review S1 (c): the old message on its own row and a NEW message that
+    /// wraps across rows: the new one fires.
+    #[test]
+    fn a_new_wrapped_message_beside_the_old_line_fires() {
+        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
+        let after = g.until_ms + 1;
+        assert_eq!(g.step(&screen_of(&[OLD, "❯ "]), after), GuardStep::Suppress);
+        assert_eq!(
+            g.step(
+                &screen_of(&[OLD, "5-hour limit", "reached ∙ resets 9am", "❯ "]),
+                after + 1
+            ),
+            GuardStep::Lift
+        );
+    }
+
+    /// (d): one more occurrence of the same pattern is new output; a drop
+    /// (one scrolled off) is not.
+    #[test]
+    fn a_rising_count_of_the_same_pattern_fires() {
+        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
+        let after = g.until_ms + 1;
+        assert_eq!(g.step(&screen_of(&[OLD]), after), GuardStep::Suppress);
+        assert_eq!(g.step(&screen_of(&[OLD, OLD]), after + 1), GuardStep::Lift);
         let mut g2 = StaleLimitGuard::arm(None, T0).unwrap();
-        assert_eq!(g2.step(&screen_of(&[OLD]), after), GuardStep::Suppress);
-        assert_eq!(g2.step(&screen_of(&[OLD, OLD]), after + 1), GuardStep::Lift);
-        // A clean screen past the window lifts.
-        let mut g3 = StaleLimitGuard::arm(None, T0).unwrap();
-        assert_eq!(g3.step(&LimitLines::new(), after), GuardStep::Lift);
+        assert_eq!(g2.step(&screen_of(&[OLD, OLD]), after), GuardStep::Suppress);
+        assert_eq!(g2.step(&screen_of(&[OLD]), after + 1), GuardStep::Suppress);
+    }
+
+    /// (e): no limit text at all lifts the guard, and the scan's matcher then
+    /// has nothing to fire on.
+    #[test]
+    fn a_screen_with_no_limit_text_lifts_without_firing() {
+        let mut g = StaleLimitGuard::arm(None, T0).unwrap();
+        let after = g.until_ms + 1;
+        assert_eq!(g.step(&screen_of(&[OLD]), after), GuardStep::Suppress);
+        let clean = ["work done", "❯ "];
+        assert_eq!(g.step(&screen_of(&clean), after + 1), GuardStep::Lift);
+        let mut last = None;
+        assert_eq!(
+            should_fire(
+                normalized_indicates_usage_limit(&normalize(&clean.join("\n"))),
+                &mut last,
+                Instant::now(),
+                HINT_DEBOUNCE
+            ),
+            None
+        );
     }
 
     /// One rule inside the window: a clean screen (the old line scrolled off,
@@ -638,7 +738,10 @@ mod tests {
     #[test]
     fn a_clean_screen_inside_the_window_does_not_lift_the_guard() {
         let mut g = StaleLimitGuard::arm(Some(T0 + 3_600_000), T0).expect("armed");
-        assert_eq!(g.step(&LimitLines::new(), T0 + 60_000), GuardStep::Keep);
+        assert_eq!(
+            g.step(&screen_of(&["work", "❯ "]), T0 + 60_000),
+            GuardStep::Keep
+        );
         assert_eq!(
             g.step(&screen_of(&[NEW]), T0 + 120_000),
             GuardStep::Suppress
