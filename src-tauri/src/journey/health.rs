@@ -49,6 +49,7 @@ static FRONTIER_UPSERTS: AtomicU64 = AtomicU64::new(0);
 static WRITES_NOT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PENDING_OPEN: AtomicU64 = AtomicU64::new(0);
+static TEMPLATE_UNTRUSTED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 struct Recent {
@@ -59,6 +60,7 @@ struct Recent {
     last_prune_at: Option<String>,
     last_prune_deleted: Option<u64>,
     last_prune_skipped: Option<String>,
+    last_template_scrub: Option<String>,
 }
 
 fn recent() -> &'static Mutex<Recent> {
@@ -114,6 +116,20 @@ pub(crate) fn record_not_written() {
 /// The worker's count of open pending edges.
 pub(crate) fn set_pending_open(n: u64) {
     PENDING_OPEN.store(n, Ordering::Relaxed);
+}
+
+/// A snapshot carried a route pattern without `patternSource: "router"`, so
+/// its template was dropped (plan
+/// `2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern`
+/// D1). Counted so an app that never asserts is visible, not silent.
+pub(crate) fn record_template_untrusted() {
+    TEMPLATE_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What the once-per-database template scrub did (or why it did not run).
+pub(crate) fn record_template_scrub(summary: String) {
+    let mut r = recent().lock().unwrap_or_else(|p| p.into_inner());
+    r.last_template_scrub = Some(format!("{} {summary}", now_iso()));
 }
 
 /// One retention pass finished.
@@ -223,6 +239,14 @@ pub struct JourneyCounters {
     pub last_prune_deleted: Option<u64>,
     /// Why the last retention pass did not run (or stopped), when it did not.
     pub last_prune_skipped: Option<String>,
+    /// Route patterns dropped because the app did not assert
+    /// `patternSource: "router"` (D1) — each one is a `pathnameTemplate`
+    /// stored as `null` instead of an unproven string.
+    pub template_untrusted: u64,
+    /// The template scrub's last outcome in this process, prefixed with its
+    /// time: what it invalidated/deleted, that the database was already
+    /// scrubbed, or why it could not run. `None` = it has not run yet.
+    pub last_template_scrub: Option<String>,
 }
 
 /// Body of `GET /apps/{app_id}/journey/health`.
@@ -268,6 +292,8 @@ pub(crate) fn snapshot_health(app_id: String) -> JourneyHealthResponse {
                 last_prune_at: r.last_prune_at.clone(),
                 last_prune_deleted: r.last_prune_deleted,
                 last_prune_skipped: r.last_prune_skipped.clone(),
+                template_untrusted: TEMPLATE_UNTRUSTED.load(Ordering::Relaxed),
+                last_template_scrub: r.last_template_scrub.clone(),
             },
         )
     };
@@ -409,6 +435,8 @@ mod tests {
             "lastPruneAt",
             "lastPruneDeleted",
             "recentWriteFailures",
+            "templateUntrusted",
+            "lastTemplateScrub",
         ] {
             assert!(
                 body["counters"].get(field).is_some(),
