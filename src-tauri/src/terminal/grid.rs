@@ -349,8 +349,17 @@ impl Grid {
         let start = (row as usize) * (self.cols as usize);
         let end = start + self.cols as usize;
         let mut s = String::with_capacity(self.cols as usize);
-        for cell in &self.cells[start..end] {
+        let row_cells = &self.cells[start..end];
+        for (col, cell) in row_cells.iter().enumerate() {
             if cell.attrs & ATTR_WIDE_RIGHT != 0 {
+                // The right half of a glyph whose left half is still there is
+                // covered by that glyph. An ORPHANED right half (its left half
+                // overwritten) covers nothing: it is a blank column, and
+                // dropping it would glue the words either side together.
+                let covered = col > 0 && row_cells[col - 1].attrs & ATTR_WIDE_LEFT != 0;
+                if !covered {
+                    s.push(' ');
+                }
                 continue;
             }
             s.push(cell.ch);
@@ -445,10 +454,31 @@ impl Grid {
 
     fn put_cell(&mut self, row: u16, col: u16, cell: Cell) {
         let i = self.idx(row, col);
-        if let Some(slot) = self.cells.get_mut(i) {
-            *slot = cell;
-            self.dirty = true;
+        let Some(existing) = self.cells.get(i).copied() else {
+            return;
+        };
+        // Overwriting HALF of a width-2 glyph destroys the whole glyph, as a
+        // real terminal does: the other half becomes a blank cell. Left in
+        // place, an orphaned right-half sentinel is skipped by `row_text`, so
+        // the column it occupies vanishes from the text — Claude Code redraws
+        // a row with cursor-forward moves over such cells, and the screen text
+        // read `✻Brewed for2m 39s` instead of `✻ Brewed for 2m 39s`.
+        if existing.attrs & ATTR_WIDE_LEFT != 0 && col + 1 < self.cols {
+            let right = self.idx(row, col + 1);
+            if self.cells[right].attrs & ATTR_WIDE_RIGHT != 0 {
+                self.cells[right] = Cell::default();
+            }
         }
+        // ...but not when this IS the right half of the glyph just written
+        // into `col - 1` (`print_char` writes left, then right).
+        if existing.attrs & ATTR_WIDE_RIGHT != 0 && cell.attrs & ATTR_WIDE_RIGHT == 0 && col > 0 {
+            let left = self.idx(row, col - 1);
+            if self.cells[left].attrs & ATTR_WIDE_LEFT != 0 {
+                self.cells[left] = Cell::default();
+            }
+        }
+        self.cells[i] = cell;
+        self.dirty = true;
     }
 
     fn clear_row_range(&mut self, row: u16, start_col: u16, end_col_exclusive: u16) {
@@ -1373,6 +1403,49 @@ mod tests {
         assert_eq!(snap.cursor.row, 0);
         assert_eq!(snap.cursor.col, 0);
         assert!(snap.cursor.visible);
+    }
+
+    /// E2E: a hidden pane's grid read `✻Brewed for2m 39s · done 11:46 AM`.
+    /// `row_text` drops exactly one kind of cell — a width-2 glyph's
+    /// right-half sentinel — so each lost blank was a column whose last
+    /// writer was half of a wide glyph (an emoji in an earlier frame on that
+    /// row) that the new frame skipped with a cursor-forward move: its left
+    /// half overwritten, its orphaned right half silently removed from the
+    /// text. The completed-turn line must read with its spaces.
+    #[test]
+    fn a_cursor_forward_gap_over_an_old_wide_glyph_reads_as_a_space() {
+        let mut grid = Grid::new(40, 3);
+        // The old frame: width-2 glyphs under each column the new frame's
+        // cursor-forward moves skip (1, 8, 12).
+        feed(&mut grid, "\x1b[1;1H🤖\x1b[1;8H🤖\x1b[1;12H🤖".as_bytes());
+        // The new frame, as Claude Code paints it: glyph, CUF, word, CUF, ...
+        feed(
+            &mut grid,
+            "\x1b[1;1H✻\x1b[1CBrewed\x1b[1Cfor\x1b[1C2m 39s · done 11:46 AM\x1b[K".as_bytes(),
+        );
+        assert_eq!(grid.row_text(0), "✻ Brewed for 2m 39s · done 11:46 AM");
+        assert!(
+            qontinui_runner_lib::looping_agent::idle::is_completed_turn_line(&grid.row_text(0))
+        );
+    }
+
+    /// Writing over either half of a wide glyph blanks the other half; writing
+    /// a wide glyph itself is unaffected.
+    #[test]
+    fn overwriting_half_a_wide_glyph_blanks_the_other_half() {
+        let mut grid = Grid::new(10, 1);
+        feed(&mut grid, "日本".as_bytes());
+        assert_eq!(grid.row_text(0), "日本");
+        // Over the LEFT half of 日: its right half becomes a blank.
+        feed(&mut grid, "\x1b[1;1Ha".as_bytes());
+        assert_eq!(grid.row_text(0), "a 本");
+        // Over the RIGHT half of 本 (column 3): its left half becomes a blank.
+        feed(&mut grid, "\x1b[1;4Hb".as_bytes());
+        assert_eq!(grid.row_text(0), "a  b");
+        // A wide glyph written over a wide glyph keeps both of its halves.
+        let mut g2 = Grid::new(10, 1);
+        feed(&mut g2, "日本\x1b[1;1H中".as_bytes());
+        assert_eq!(g2.row_text(0), "中本");
     }
 
     #[test]

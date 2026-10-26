@@ -169,28 +169,61 @@ pub fn is_completed_turn_line(line: &str) -> bool {
             return false;
         }
     }
-    let mut words = head.split_whitespace();
-    let verb_ok = words
-        .next()
-        .is_some_and(|v| !v.is_empty() && v.chars().all(char::is_alphabetic));
-    if !verb_ok || words.next() != Some("for") {
+    // `<Verb>ed for <duration>`, tolerating a missing space after the glyph,
+    // between the verb and `for`, and between `for` and the duration — a
+    // grid row can lose a blank column (an orphaned wide-glyph half under a
+    // cursor-forward move read `✻Brewed for2m 39s`). Every other check stays.
+    let head = head.trim_start();
+    let verb_end = head
+        .char_indices()
+        .find(|(_, c)| !c.is_alphabetic())
+        .map_or(head.len(), |(i, _)| i);
+    let (verb, after) = head.split_at(verb_end);
+    let after = after.trim_start();
+    let duration = if let Some(d) = after.strip_prefix("for") {
+        if verb.is_empty() {
+            return false;
+        }
+        d
+    } else if after.starts_with(|c: char| c.is_ascii_digit()) {
+        // `Brewedfor2m`: the verb run swallowed `for`.
+        match verb.strip_suffix("for") {
+            Some(v) if !v.is_empty() => after,
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+    // The duration must follow `for` directly or after blanks, never another
+    // letter (`format`, `fortune`).
+    if !duration.starts_with(|c: char| c.is_ascii_digit() || c.is_whitespace()) {
         return false;
     }
     let mut saw_duration = false;
-    for w in words {
-        let Some(unit) = w.chars().last() else {
-            return false;
-        };
-        let digits = w.strip_suffix(unit).unwrap_or_default();
-        if !matches!(unit, 'h' | 'm' | 's')
-            || digits.is_empty()
-            || !digits.chars().all(|c| c.is_ascii_digit())
-        {
+    for w in duration.split_whitespace() {
+        if !is_duration_token(w) {
             return false;
         }
         saw_duration = true;
     }
     saw_duration
+}
+
+/// `9m`, `42s`, `1h`, or several glued together (`2m39s`).
+fn is_duration_token(w: &str) -> bool {
+    let mut saw_unit = false;
+    let mut digits = 0usize;
+    for c in w.chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else if matches!(c, 'h' | 'm' | 's') && digits > 0 {
+            digits = 0;
+            saw_unit = true;
+        } else {
+            return false;
+        }
+    }
+    saw_unit && digits == 0
 }
 
 /// Context-low grid markers. The percentage form
@@ -323,6 +356,34 @@ mod tests {
             ]);
             assert!(is_completed_turn_line(done), "completed shape: {done:?}");
             assert!(snapshot_looks_idle(&grid, 5), "must be idle with: {done:?}");
+        }
+    }
+
+    /// E2E: a hidden pane's grid lost blank columns (an orphaned wide-glyph
+    /// half under a cursor-forward move). The completed-turn line still reads
+    /// idle with those spaces missing; a live spinner missing them still reads
+    /// busy.
+    #[test]
+    fn completed_turn_line_tolerates_missing_spaces() {
+        for done in [
+            "✻Brewed for2m 39s · done 11:46 AM",
+            "✻ Brewedfor 2m 39s · done 11:46 AM",
+            "✻Brewedfor2m39s · done 11:46 AM",
+            "✻ Brewed for 2m 39s · done 11:46 AM",
+        ] {
+            assert!(is_completed_turn_line(done), "completed: {done:?}");
+            assert!(snapshot_looks_idle(&lines(&[done, "❯ "]), 1), "{done:?}");
+        }
+        for busy in [
+            "✻Brewing…(2m 39s · esc to interrupt)",
+            "✻Brewing… (2m 39s)",
+            "✻Brewed format",
+            "✻ for2m 39s",
+            "✻Brewed for2mx",
+            "✻Brewed fortune 2m",
+        ] {
+            assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
+            assert!(!snapshot_looks_idle(&lines(&[busy, "❯ "]), 1), "{busy:?}");
         }
     }
 
