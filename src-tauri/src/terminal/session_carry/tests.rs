@@ -2026,3 +2026,263 @@ fn resumable_subagents_now_names_a_failed_carry_only_once_the_sync_wrote_it() {
     assert_eq!(now, ["a1"]);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---- review round 6 -------------------------------------------------------
+
+const LIVE_META: &[u8] = br#"{"description":"live run"}"#;
+const FORK_META: &[u8] = br#"{"description":"forked run"}"#;
+
+/// A source subagent `agent-a1` (live transcript + meta) and a destination
+/// that forked it (its own transcript + meta). Returns (scratch, src, dst).
+fn seed_forked_subagent_with_meta(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let tmp = scratch(label);
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-a1.meta.json", LIVE_META),
+        ],
+    );
+    seed_session(
+        &dst,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nfork\n"),
+            ("subagents/agent-a1.meta.json", FORK_META),
+        ],
+    );
+    (tmp, src, dst)
+}
+
+/// The one backup of the destination's `agent-a1.jsonl`, and its
+/// `.diverged-<ms>` suffix.
+fn only_transcript_backup_suffix(dst: &Path) -> (PathBuf, String) {
+    let backups = subagent_backups(dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let suffix = backups[0]
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("agent-a1.jsonl")
+        .unwrap()
+        .to_string();
+    (backups[0].clone(), suffix)
+}
+
+/// W1(b) — a diverged subagent the migration could NOT move aside stays in
+/// place as the fork, and so does its fork's `.meta.json`: the source's meta
+/// is not copied over it, the carry records it kept, and the delta sync never
+/// overwrites it either, even after the source's meta moved on. Both in-place
+/// outcomes: the rename-aside failed (`NotMovedAside`), and the copy failed
+/// after the move and the fork was moved back (`CopyFailed { restored: true }`).
+#[test]
+fn a_subagent_left_diverged_in_place_keeps_its_forks_meta() {
+    for copy_fails in [false, true] {
+        let (tmp, src, dst) = seed_forked_subagent_with_meta(if copy_fails {
+            "sub-meta-moved-back"
+        } else {
+            "sub-meta-not-moved"
+        });
+        let src_sub = literal_sidecar(&src).join("subagents");
+        let carried = carry_session_with(
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            WD,
+            SID,
+            MainTranscript::LiveSourceWins,
+            |from, to| {
+                if !from.ends_with("agent-a1.jsonl") {
+                    return std::fs::rename(from, to);
+                }
+                if !copy_fails {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                // Moved aside; then the live source vanishes, so the copy
+                // fails with the destination path still free: moved back.
+                std::fs::rename(from, to)?;
+                std::fs::remove_file(src_sub.join("agent-a1.jsonl"))
+            },
+            || {},
+        )
+        .expect("a subagent never fails the carry");
+        let sub = literal_sidecar(&dst).join("subagents");
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.jsonl")).unwrap(),
+            b"a\nfork\n",
+            "the fork stays in place (copy_fails={copy_fails})"
+        );
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+            FORK_META,
+            "the fork keeps its own meta (copy_fails={copy_fails})"
+        );
+        assert!(subagent_backups(&dst, "agent-a1.meta.json").is_empty());
+        let meta_rec = carried
+            .files
+            .iter()
+            .find(|f| f.rel == Path::new("subagents").join("agent-a1.meta.json"))
+            .expect("the meta is recorded");
+        assert_eq!(meta_rec.wrote, CarryWrite::Present);
+        assert!(meta_rec.kept_destination_newer);
+        assert_eq!(carried.session_dir.skipped_present, 1);
+        assert_eq!(carried.session_dir.failed, 1);
+
+        // The old pane rewrites its meta after the carry: still not copied.
+        std::fs::write(
+            src_sub.join("agent-a1.meta.json"),
+            br#"{"description":"live run, renamed later"}"#,
+        )
+        .unwrap();
+        let synced = sync(&carried);
+        assert_eq!(synced.kept_destination_newer, 1, "{synced:?}");
+        assert_eq!(synced.copied, 0, "{synced:?}");
+        assert_eq!(
+            std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+            FORK_META,
+            "the delta sync never overwrites the fork's meta (copy_fails={copy_fails})"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// W1(a) — the copy fails after the fork was moved aside and the fork can
+/// NOT be moved back (something now occupies the destination path): the fork
+/// stays at its backup name, and its meta is kept beside it under the same
+/// suffix, exactly as when the copy succeeds.
+#[test]
+fn a_fork_stranded_at_its_backup_keeps_its_meta_beside_it() {
+    let (tmp, src, dst) = seed_forked_subagent_with_meta("sub-meta-stranded");
+    let carried = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| {
+            std::fs::rename(from, to)?;
+            if from.ends_with("agent-a1.jsonl") {
+                // A non-empty directory where the live copy must land: its
+                // rename into place fails, and the fork cannot move back.
+                std::fs::create_dir_all(from.join("occupied"))?;
+            }
+            Ok(())
+        },
+        || {},
+    )
+    .expect("a subagent never fails the carry");
+    let rec = carried
+        .files
+        .iter()
+        .find(|f| f.rel == Path::new("subagents").join("agent-a1.jsonl"))
+        .expect("the transcript is recorded");
+    assert_eq!(rec.wrote, CarryWrite::Failed, "restored: false");
+    let (backup, suffix) = only_transcript_backup_suffix(&dst);
+    assert_eq!(std::fs::read(&backup).unwrap(), b"a\nfork\n");
+    let sub = literal_sidecar(&dst).join("subagents");
+    assert_eq!(
+        std::fs::read(sub.join(format!("agent-a1.meta.json{suffix}"))).unwrap(),
+        FORK_META,
+        "the fork's meta sits beside its transcript backup, same suffix"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S1 — the carry orders `.jsonl` first ITSELF, whatever order the walk hands
+/// it: given the meta before its transcript, the fork's meta is still taken
+/// beside the moved-aside transcript before the live meta replaces it. (On
+/// NTFS the walk already returns `agent-a1.jsonl` first, so only an injected
+/// order can tell whether the sort is there.)
+#[test]
+fn the_carry_puts_transcripts_first_whatever_order_the_walk_returns() {
+    let (tmp, src, dst) = seed_forked_subagent_with_meta("sub-meta-order");
+    let mut walked: Vec<WalkedFile> = Vec::new();
+    walk_session_dir(&literal_sidecar(&src), &mut |event| {
+        if let WalkEvent::File { from, rel, src } = event {
+            walked.push((from.to_path_buf(), rel.to_path_buf(), src));
+        }
+    });
+    // The wrong order: every non-`.jsonl` first.
+    walked.sort_by_key(|(_, rel, _)| is_jsonl(rel));
+    assert_eq!(
+        walked
+            .iter()
+            .map(|(_, rel, _)| rel.clone())
+            .collect::<Vec<_>>(),
+        [
+            Path::new("subagents").join("agent-a1.meta.json"),
+            Path::new("subagents").join("agent-a1.jsonl"),
+        ],
+        "the premise: the meta arrives first"
+    );
+    let mut tally = SessionDirCarry::default();
+    carry_walked_files(
+        walked,
+        &literal_sidecar(&dst),
+        true,
+        true,
+        &mut |a, b| std::fs::rename(a, b),
+        &mut tally,
+    );
+    assert_eq!(tally.diverged_preserved, 1, "{tally:?}");
+    let (_, suffix) = only_transcript_backup_suffix(&dst);
+    let sub = literal_sidecar(&dst).join("subagents");
+    assert_eq!(
+        std::fs::read(sub.join(format!("agent-a1.meta.json{suffix}"))).unwrap(),
+        FORK_META,
+        "the fork's meta, not the live one, sits beside the fork"
+    );
+    assert_eq!(
+        std::fs::read(sub.join("agent-a1.meta.json")).unwrap(),
+        LIVE_META
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S4 — a `*.diverged-*` backup an earlier migration left in the SOURCE
+/// account belongs to that account: the next carry does not take it along
+/// (counted `skipped_other`), and neither does the delta sync.
+#[test]
+fn an_earlier_diverged_backup_is_never_carried_on() {
+    let tmp = scratch("backup-not-carried");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-a1.jsonl.diverged-1000", b"a\nold fork\n"),
+            ("subagents/agent-a1.meta.json.diverged-1000", FORK_META),
+        ],
+    );
+    let carried = carry(&src, &dst);
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            copied: 1,
+            skipped_other: 2,
+            ..SessionDirCarry::default()
+        }
+    );
+    let names = |cfg: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(literal_sidecar(cfg).join("subagents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&dst), ["agent-a1.jsonl"]);
+    assert_eq!(carried.files.len(), 1, "{:?}", carried.files);
+    let synced = sync(&carried);
+    assert_eq!(synced.copied, 0, "{synced:?}");
+    assert_eq!(synced.skipped_other, 2, "{synced:?}");
+    assert_eq!(names(&dst), ["agent-a1.jsonl"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -28,7 +28,9 @@
 //!   deleted, never over an earlier backup) and the source is copied in its
 //!   place. A subagent transcript moved aside keeps a copy of its fork's
 //!   `agent-<id>.meta.json` beside it, under the same suffix
-//!   (`agent-<id>.meta.json.diverged-<unix_ms>`), best-effort.
+//!   (`agent-<id>.meta.json.diverged-<unix_ms>`), best-effort; one that could
+//!   not be moved aside stays in place with its fork's meta untouched. A
+//!   `*.diverged-*` backup is never carried on to another account.
 //! - [`spawn_delta_sync_after_exit`] is the detached driver: it waits (bounded)
 //!   for the old pane's `claude` to be gone from the whole process table, then
 //!   runs [`delta_sync`]. On timeout it skips; it never copies while the old
@@ -91,12 +93,18 @@ pub(crate) struct SessionDirCarry {
     /// - any other file: when its bytes are identical, OR — whatever its bytes
     ///   — when the destination side ran the session last and its copy was
     ///   kept as the newer one ([`CarriedFile::kept_destination_newer`];
-    ///   never on a migration, where the live source always ran last).
+    ///   never on a migration, where the live source always ran last);
+    /// - on a migration, the `<stem>.meta.json` of a subagent transcript left
+    ///   diverged in place (it could not be moved aside, or was moved back
+    ///   after the copy failed): the fork's meta,
+    ///   kept with it, whatever its bytes (or its absence)
+    ///   ([`CarriedFile::kept_destination_newer`]).
     pub skipped_present: usize,
     /// Never followed: a symlink or junction (including `<sid>/` itself), a
-    /// leftover `*.partial`, a directory past the depth bound, or a session id
-    /// that is not one plain path component. The main `<sid>.jsonl` is NOT
-    /// counted in this tally at all — its outcome is [`TranscriptCopy::main`].
+    /// leftover `*.partial`, an earlier `*.diverged-*` backup, a directory
+    /// past the depth bound, or a session id that is not one plain path
+    /// component. The main `<sid>.jsonl` is NOT counted in this tally at all —
+    /// its outcome is [`TranscriptCopy::main`].
     pub skipped_other: usize,
     /// [`MainTranscript::LiveSourceWins`] only: an existing `.jsonl` under
     /// `<sid>/` that diverged from the source's was renamed aside to
@@ -146,7 +154,9 @@ pub(crate) struct CarriedFile {
     /// What the carry did to the destination.
     pub wrote: CarryWrite,
     /// A file rewritten in place (not a `.jsonl`) whose destination copy the
-    /// carry KEPT because the destination side ran the session last.
+    /// carry KEPT: because the destination side ran the session last, or —
+    /// on a migration — because it is the `.meta.json` of a subagent
+    /// transcript left diverged in place, which keeps its fork's meta.
     /// [`delta_sync`] never overwrites it either.
     pub kept_destination_newer: bool,
 }
@@ -233,7 +243,8 @@ pub(crate) struct DeltaSync {
     /// Not followed (same rules as the carry, including a diverged `.jsonl`).
     pub skipped_other: usize,
     /// An in-place file the carry kept as the destination's (the destination
-    /// side ran the session last) — never overwritten by the sync either.
+    /// side ran the session last, or the meta of a subagent fork left in
+    /// place) — never overwritten by the sync either.
     pub kept_destination_newer: usize,
     /// Read or write errors; each is logged.
     pub failed: usize,
@@ -247,6 +258,10 @@ const SESSION_DIR_MAX_DEPTH: usize = 8;
 
 /// Suffix of the temporary file a copy writes before renaming it into place.
 const PARTIAL_SUFFIX: &str = ".partial";
+
+/// What a backup name carries between the file's own name and its stamp
+/// (`<file>.diverged-<unix_ms>`, [`claim_diverged_backup_at`]).
+const DIVERGED_MARKER: &str = ".diverged-";
 
 /// How long the detached [`spawn_delta_sync_after_exit`] waits for the old
 /// pane's `claude` to leave the process table before it gives up.
@@ -648,10 +663,19 @@ where
         });
     }
     if let Err(error) = copy_via_partial(src, dst) {
-        // Check-then-rename, not atomic. Nothing else writes this path in
-        // between: the migration holds its per-session in-flight guard
-        // (`account_migration::begin_migration`) across the whole carry, and
-        // the resumed pane that will own the destination is not spawned yet.
+        // Check-then-rename, not atomic. The migration's per-session
+        // in-flight guard (`account_migration::begin_migration`), held across
+        // the whole carry, excludes only a CONCURRENT MIGRATION of this
+        // session; the resumed pane that will own the destination is not
+        // spawned yet. It does NOT exclude an earlier hop's detached step-4b
+        // delta sync, which runs outside the guard by design (the
+        // `account_migration` module doc's exception): after a fast hop back
+        // to an account the session left moments ago, that sync may still be
+        // writing into this same `<sid>/`. It writes only a destination still
+        // exactly as its own carry left it, so it backs off a file this carry
+        // moved aside — best-effort, not a lock. A write that lands before the
+        // check below leaves the fork at `backup` (`restored: false`); one
+        // that lands between the check and the rename is replaced by the fork.
         let restored = !dst.exists() && std::fs::rename(&backup, dst).is_ok();
         return Err(PreserveError::CopyFailed {
             backup,
@@ -729,7 +753,7 @@ fn claim_diverged_backup_at(dst: &Path, mut stamp: u128) -> std::io::Result<Path
         .ok_or_else(|| std::io::Error::other("destination has no file name"))?;
     loop {
         let mut name = file_name.clone();
-        name.push(format!(".diverged-{stamp}"));
+        name.push(format!("{DIVERGED_MARKER}{stamp}"));
         let candidate = dst.with_file_name(name);
         match std::fs::OpenOptions::new()
             .write(true)
@@ -853,12 +877,7 @@ fn carry_session_dir(
         }
     }
     let dst_dir = dst_parent.join(claude_session_id);
-    // Walk first, carry after, every `.jsonl` before any other file: a
-    // diverged subagent transcript moved aside takes its fork's
-    // `agent-<id>.meta.json` with it ([`preserve_sibling_meta`]), which must
-    // happen before the source's meta is copied over that one. `read_dir`
-    // promises no order, so the walk's order cannot be relied on for that.
-    let mut walked: Vec<(PathBuf, PathBuf, FileStamp)> = Vec::new();
+    let mut walked: Vec<WalkedFile> = Vec::new();
     walk_session_dir(&src_dir, &mut |event| match event {
         WalkEvent::Skipped => carry.skipped_other += 1,
         WalkEvent::Failed => carry.failed += 1,
@@ -866,10 +885,60 @@ fn carry_session_dir(
             walked.push((from.to_path_buf(), rel.to_path_buf(), src));
         }
     });
+    let files = carry_walked_files(
+        walked,
+        &dst_dir,
+        source_is_newer,
+        live_source_wins,
+        rename_aside,
+        &mut carry,
+    );
+    (carry, files)
+}
+
+/// One regular file the walk of the source's `<sid>/` met: its path, its path
+/// relative to `<sid>/`, and its stamp as read then.
+type WalkedFile = (PathBuf, PathBuf, FileStamp);
+
+/// Carry the files [`walk_session_dir`] collected into `dst_dir`, in whatever
+/// order they arrive — the walk's order is not trusted, so this sorts them
+/// itself (a test hands them in the wrong order to prove it).
+///
+/// Every `.jsonl` goes before any other file: a diverged subagent transcript
+/// moved aside takes its fork's `agent-<id>.meta.json` with it
+/// ([`preserve_sibling_meta`]), which must happen before the source's meta is
+/// copied over that one, and a diverged transcript LEFT in place keeps its
+/// fork's meta ([`CarriedFile::kept_destination_newer`]), which the meta's own
+/// turn must already know. `read_dir` promises no order.
+fn carry_walked_files(
+    mut walked: Vec<WalkedFile>,
+    dst_dir: &Path,
+    source_is_newer: bool,
+    live_source_wins: bool,
+    rename_aside: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    carry: &mut SessionDirCarry,
+) -> Vec<CarriedFile> {
     walked.sort_by_key(|(_, rel, _)| !is_jsonl(rel));
+    let mut files = Vec::new();
+    // `<stem>.meta.json` (relative to `<sid>/`) of every subagent transcript a
+    // migration left diverged IN PLACE — it could not be moved aside, or was
+    // moved back after the copy failed. That fork keeps its own meta: the
+    // source's is not copied over it, and [`delta_sync`] never overwrites it.
+    let mut fork_metas: HashSet<PathBuf> = HashSet::new();
     for (from, rel, src) in walked {
         let (from, rel) = (from.as_path(), rel.as_path());
         let to = dst_dir.join(rel);
+        if fork_metas.contains(rel) {
+            carry.skipped_present += 1;
+            files.push(CarriedFile {
+                rel: rel.to_path_buf(),
+                src,
+                dst: FileStamp::of(&to),
+                wrote: CarryWrite::Present,
+                kept_destination_newer: true,
+            });
+            continue;
+        }
         let wrote = match destination_verdict(from, &to, src.len, source_is_newer, live_source_wins)
         {
             Ok(Verdict::Current) => {
@@ -877,7 +946,13 @@ fn carry_session_dir(
                 CarryWrite::Present
             }
             Ok(Verdict::Diverged) if live_source_wins => {
-                preserve_diverged_file(from, &to, &mut *rename_aside, &mut carry)
+                let wrote = preserve_diverged_file(from, &to, &mut *rename_aside, carry);
+                if wrote == CarryWrite::Diverged {
+                    if let Some(meta) = sibling_meta_rel(rel) {
+                        fork_metas.insert(meta);
+                    }
+                }
+                wrote
             }
             Ok(Verdict::Diverged) => {
                 warn!(
@@ -931,7 +1006,13 @@ fn carry_session_dir(
                 && !is_jsonl(rel),
         });
     }
-    (carry, files)
+    files
+}
+
+/// `<stem>.meta.json` beside the transcript `<stem>.jsonl` at `jsonl_rel`.
+fn sibling_meta_rel(jsonl_rel: &Path) -> Option<PathBuf> {
+    let stem = jsonl_rel.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    Some(jsonl_rel.with_file_name(format!("{stem}.meta.json")))
 }
 
 /// A diverged `.jsonl` under `<sid>/` on a migration: move the fork aside
@@ -939,6 +1020,11 @@ fn carry_session_dir(
 /// the carry — a subagent file that cannot be moved aside is skipped, counted
 /// `failed` and recorded [`CarryWrite::Diverged`], so it is left out of
 /// [`TranscriptCopy::subagents`] and [`delta_sync`] never overwrites it.
+///
+/// Wherever the fork ends up, its `agent-<id>.meta.json` goes with it: beside
+/// the backup when the fork was moved aside (copied, success or a copy that
+/// failed and could not move it back), and untouched in place when the fork
+/// stayed there (the caller keeps the source's meta off it).
 fn preserve_diverged_file(
     from: &Path,
     to: &Path,
@@ -985,6 +1071,9 @@ fn preserve_diverged_file(
             if restored {
                 CarryWrite::Diverged
             } else {
+                // The fork now lives at `backup`, away from its meta: keep
+                // the meta with it, as on the success path.
+                preserve_sibling_meta(to, &backup);
                 CarryWrite::Failed
             }
         }
@@ -992,7 +1081,8 @@ fn preserve_diverged_file(
 }
 
 /// A subagent transcript `<stem>.jsonl` at `jsonl_dst` was just moved aside to
-/// `jsonl_backup` (`<stem>.jsonl.diverged-<stamp>`): keep its fork's sibling
+/// `jsonl_backup` (`<stem>.jsonl.diverged-<stamp>`) — and stayed there, whether
+/// the live copy then landed or not: keep its fork's sibling
 /// `<stem>.meta.json` (the subagent's description and type) with it, as a copy
 /// at `<stem>.meta.json.diverged-<stamp>` — the SAME suffix, so the pair reads
 /// as one. Copied, not moved: the destination meta stays for the carry to
@@ -1181,8 +1271,9 @@ enum WalkEvent<'a> {
         rel: &'a Path,
         src: FileStamp,
     },
-    /// Not followed: a symlink or junction, a leftover `*.partial`, or a
-    /// directory past [`SESSION_DIR_MAX_DEPTH`]. Logged where it is decided.
+    /// Not followed: a symlink or junction, a leftover `*.partial`, an earlier
+    /// `*.diverged-*` backup, or a directory past [`SESSION_DIR_MAX_DEPTH`].
+    /// Logged where it is decided.
     Skipped,
     /// An unreadable directory, entry or stat. Logged where it happened.
     Failed,
@@ -1231,11 +1322,14 @@ fn walk_dir(dir: &Path, rel: &Path, depth: usize, visit: &mut dyn FnMut(WalkEven
             walk_dir(&from, &child_rel, depth + 1, visit);
             continue;
         }
-        let is_partial = entry
+        // A leftover `*.partial`, or a `*.diverged-*` backup an earlier
+        // migration made in this account: the backup belongs to the account
+        // that forked, and carrying it on would copy it into every later one.
+        let is_leftover = entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.ends_with(PARTIAL_SUFFIX));
-        if !meta.is_file() || is_partial {
+            .is_some_and(|name| name.ends_with(PARTIAL_SUFFIX) || name.contains(DIVERGED_MARKER));
+        if !meta.is_file() || is_leftover {
             visit(WalkEvent::Skipped);
             continue;
         }

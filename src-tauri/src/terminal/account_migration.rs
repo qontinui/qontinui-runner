@@ -50,7 +50,7 @@
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
 //! dry), one migration in flight per session ([`begin_migration`], which also
-//! refuses a session that already moved), settings kill-switch
+//! refuses a session that already moved or is closed), settings kill-switch
 //! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
 //! than two configured accounts. A refusal by [`begin_migration`] is not a
 //! failure: the automatic path logs it, reports nothing to the UI and gives
@@ -134,7 +134,7 @@ fn refund_migration_cap(claude_session_id: &str, stamp: i64) {
 #[derive(Debug)]
 pub(crate) enum MigrateError {
     /// [`begin_migration`] refused before anything was read or written: the
-    /// session is already migrating, has already moved, or is gone. Nothing
+    /// session is already migrating, has already moved, is closed, or is gone. Nothing
     /// failed and nothing changed.
     Refused(MigrationRefusal),
     /// The migration ran and failed; the old pane is left in place.
@@ -165,6 +165,8 @@ pub(crate) enum MigrationRefusal {
     AlreadyMoved { to: String },
     /// The session's lifecycle record is gone.
     Unknown { session: String },
+    /// The session's lifecycle record is closed: there is no pane to migrate.
+    Closed { session: String },
 }
 
 impl std::fmt::Display for MigrationRefusal {
@@ -174,6 +176,12 @@ impl std::fmt::Display for MigrationRefusal {
             Self::AlreadyMoved { to } => write!(f, "session already moved to {to}"),
             Self::Unknown { session } => {
                 write!(f, "session {session} is no longer in the lifecycle store")
+            }
+            Self::Closed { session } => {
+                write!(
+                    f,
+                    "session {session} is closed — there is no pane to migrate"
+                )
             }
         }
     }
@@ -227,7 +235,9 @@ fn claim_migration_slot(claude_session_id: &str) -> Result<MigrationInFlight, Mi
 /// aside and copy a stale source over it. So: take the session's in-flight
 /// slot (a second concurrent request is refused with
 /// [`MigrationRefusal::InFlight`]), and, under it, re-read the session's
-/// record (`current_record`) and refuse unless it still runs under `src` in
+/// record (`current_record`) and refuse unless it is still open
+/// ([`MigrationRefusal::Closed`] — `current_record` answers closed rows too,
+/// and a closed session has no pane to migrate) and still runs under `src` in
 /// the caller's terminal ([`MigrationRefusal::AlreadyMoved`]) — a migration
 /// that finished while this one waited to be scheduled has already moved it.
 ///
@@ -248,6 +258,11 @@ pub(crate) fn begin_migration(
             session: sid.clone(),
         });
     };
+    if current.state != "open" {
+        return Err(MigrationRefusal::Closed {
+            session: sid.clone(),
+        });
+    }
     match current.config_dir.as_deref() {
         Some(dir) if dir != src_config_dir => {
             return Err(MigrationRefusal::AlreadyMoved {
@@ -413,7 +428,8 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
 ///
 /// - Migrated: logged.
 /// - [`MigrateError::Refused`]: another migration of this session holds its
-///   slot, or already moved it (or its record is gone). Nothing failed, so it
+///   slot, or already moved it (or its record is gone, or closed — no pane
+///   is left to migrate). Nothing failed, so it
 ///   is logged at info and NOT reported as `session-account-migration-skipped`
 ///   — the UI would otherwise toast a "migration failed" for a session that
 ///   is migrating or has migrated. The cap slot this hint took at
@@ -443,7 +459,7 @@ fn settle_hint_migration(
             info!(
                 session = %claude_session_id,
                 %refusal,
-                "usage-limit migration not started — the session is already migrating or has moved; nothing to report"
+                "usage-limit migration not started — the session is already migrating, has moved, or is closed; nothing to report"
             );
             unrecord_handoff();
             refund_migration_cap(claude_session_id, cap_stamp);
@@ -1968,6 +1984,48 @@ mod tests {
                 "the refused hint's slot was given back"
             );
         }
+    }
+
+    /// S3 — `SessionLifecycleStore::get` answers closed rows too: a session
+    /// whose record is closed by the time the guard re-reads it has no pane to
+    /// migrate, and is refused `Closed` on either path (both go through
+    /// `begin_migration`). The auto path treats that like any refusal: nothing
+    /// reported, the cap slot given back. The slot is released, and a closed
+    /// record that also moved is still refused as closed.
+    #[test]
+    fn a_closed_session_is_refused_and_the_auto_path_refunds_its_cap_slot() {
+        let sid = "test/account_migration/closed";
+        let seen = session_record(sid, "t-1", Some("C:/a"));
+        let mut closed = seen.clone();
+        closed.state = "closed".to_string();
+        let refusal = begin_migration(&seen, "C:/a", || Some(closed.clone())).unwrap_err();
+        assert_eq!(
+            refusal,
+            MigrationRefusal::Closed {
+                session: sid.to_string()
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            format!("session {sid} is closed — there is no pane to migrate")
+        );
+        let mut closed_elsewhere = session_record(sid, "t-9", Some("C:/b"));
+        closed_elsewhere.state = "closed".to_string();
+        assert!(matches!(
+            begin_migration(&seen, "C:/a", || Some(closed_elsewhere.clone())),
+            Err(MigrationRefusal::Closed { .. })
+        ));
+        assert!(
+            begin_migration(&seen, "C:/a", || Some(seen.clone())).is_ok(),
+            "the refusal released the slot, and an open record proceeds"
+        );
+
+        let base = 1_760_000_000_000i64;
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        let (unrecorded, skipped) = settle(sid, base, Err(MigrateError::Refused(refusal)));
+        assert!(unrecorded);
+        assert_eq!(skipped, None, "no session-account-migration-skipped");
+        assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP);
     }
 
     #[test]
