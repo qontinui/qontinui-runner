@@ -57,8 +57,52 @@ use crate::terminal::graceful_exit::ScreenText;
 /// The read-back verdict when the pane's status row shows the re-applied level.
 pub const EFFORT_RESTORED: &str = "effort_restored";
 
+/// The read-back verdict when the screen never showed the status row but the
+/// verified `claude` process's own argv carries `--effort <wanted>`. Claude
+/// Code 2.1.310 paints the effort row only transiently, so the screen alone
+/// can no longer confirm a re-applied level; the argv of the process the
+/// resume verified proves the flag reached the CLI that is running.
+pub const EFFORT_RESTORED_BY_ARGV: &str = "effort_restored_by_argv";
+
 /// How long the read-back waits for the resumed CLI to paint its status row.
 pub const EFFORT_READ_BACK_DEADLINE: Duration = Duration::from_secs(30);
+/// ...when the verified argv already carries the flag: a short look for a
+/// contradicting status row, not a 30 s wait per row of a one-at-a-time queue.
+pub const EFFORT_READ_BACK_ARGV_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Whether `cmdline` (a process command line, space-joined) passes
+/// `--effort <wanted>` (or `--effort=<wanted>`), compared as levels.
+pub fn argv_carries_effort(cmdline: &str, wanted: &str) -> bool {
+    let Some(want) = effort::rank(wanted) else {
+        return false;
+    };
+    let mut words = cmdline.split_whitespace();
+    while let Some(w) = words.next() {
+        let value = if w == "--effort" {
+            words.next()
+        } else {
+            w.strip_prefix("--effort=")
+        };
+        if let Some(v) = value {
+            if effort::rank(v) == Some(want) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The read-back verdict, given whether the verified argv carried the flag:
+/// the screen's answer, except that a row never seen (`indicator_not_seen`)
+/// on a process whose argv carries the level is [`EFFORT_RESTORED_BY_ARGV`].
+/// A row showing ANOTHER level still reads `effort_not_restored(shows_…)`.
+pub fn effort_verdict_with_argv(screen_verdict: String, argv_carries: bool) -> String {
+    if argv_carries && screen_verdict == effort_not_restored("indicator_not_seen") {
+        EFFORT_RESTORED_BY_ARGV.to_string()
+    } else {
+        screen_verdict
+    }
+}
 /// How often the read-back looks.
 pub const EFFORT_READ_BACK_POLL: Duration = Duration::from_millis(1000);
 
@@ -133,11 +177,16 @@ pub struct RestoreTarget {
 }
 
 /// The level a row is resumed at: the effort it RAN at, when that was read
-/// (off its pane or its account's `settings.json`) and differs from the
-/// baseline a fresh session on that account gets anyway. `None` — no flag —
-/// when the effort was not read (never a guessed level) or equals the
-/// baseline. A baseline that is itself unknown cannot be equal, so a read
-/// effort is re-applied rather than dropped.
+/// and differs from the baseline a fresh session on that account gets anyway.
+/// An EXPLICITLY set level (a transcript `/effort` record) is always
+/// re-applied, even when it equals the baseline: the baseline may be the CLI
+/// default [`effort::CLI_DEFAULT_EFFORT`] while the model's own default differs
+/// (a Sonnet session starts at `xhigh` on 2.1.310), so "equal to the baseline"
+/// does not prove the resumed session would come back at it. `None` — no flag
+/// — when the effort was not read (never a guessed level), or when a level
+/// that may only be a default equals the baseline. A baseline that is itself
+/// unknown cannot be equal, so a read effort is re-applied rather than
+/// dropped.
 ///
 /// Only a canonical level ever comes out ([`effort::rank`]): the value lands
 /// in an argv, and a record edited on disk must not be able to put anything
@@ -148,6 +197,9 @@ pub fn effort_to_apply(row: &CohortRow) -> Option<String> {
     }
     let level = row.effort.level.as_deref()?;
     let canonical = effort::EFFORT_LEVELS.get(effort::rank(level)?)?;
+    if row.effort.source.is_explicit() {
+        return Some((*canonical).to_string());
+    }
     let same_as_baseline = row
         .baseline
         .baseline
@@ -751,6 +803,18 @@ mod tests {
                 Some("high"),
                 None,
             ),
+            (
+                Some("--dangerously-skip-permissions"),
+                Transcript,
+                Some("high"),
+                None,
+            ),
+            // An explicit `/effort` from the transcript: re-applied even when
+            // it equals the baseline — the CLI-default baseline is not the
+            // model's own default (Sonnet starts at xhigh on 2.1.310).
+            (Some("high"), Transcript, Some("high"), Some("high")),
+            (Some("max"), Transcript, Some("high"), Some("max")),
+            (Some("low"), Transcript, None, Some("low")),
         ];
         for (level, source, baseline, want) in cases {
             let row = row_with(*level, *source, *baseline);
@@ -760,6 +824,31 @@ mod tests {
                 "{level:?} from {source:?} over baseline {baseline:?}"
             );
         }
+    }
+
+    #[test]
+    fn argv_effort_confirms_a_level_the_screen_no_longer_shows() {
+        let cmd = "claude --resume 1512e91d --effort max --model claude-opus-5-5";
+        assert!(argv_carries_effort(cmd, "max"));
+        assert!(argv_carries_effort(cmd, "MAX"));
+        assert!(!argv_carries_effort(cmd, "high"));
+        assert!(argv_carries_effort("claude --effort=xhigh -r x", "xhigh"));
+        assert!(!argv_carries_effort("claude --resume x", "max"));
+        assert!(!argv_carries_effort("claude --resume x --effort", "max"));
+        assert!(!argv_carries_effort(cmd, "turbo"));
+        let unseen = effort_not_restored("indicator_not_seen");
+        assert_eq!(
+            effort_verdict_with_argv(unseen.clone(), true),
+            EFFORT_RESTORED_BY_ARGV
+        );
+        assert_eq!(effort_verdict_with_argv(unseen.clone(), false), unseen);
+        // The screen showing ANOTHER level is never overruled by the argv.
+        let other = effort_not_restored("shows_high");
+        assert_eq!(effort_verdict_with_argv(other.clone(), true), other);
+        assert_eq!(
+            effort_verdict_with_argv(EFFORT_RESTORED.to_string(), true),
+            EFFORT_RESTORED
+        );
     }
 
     fn record(state: PrepState, ids: &[&str]) -> PrepareRecord {

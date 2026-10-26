@@ -13,15 +13,34 @@
 //! `terminal/usage_limit.rs` scans for limit messages, so a full-screen repaint
 //! cannot hide it the way it hides text from a byte stream.
 //!
-//! When the screen shows no indicator, the account's own `settings.json`
-//! `effortLevel` is the fallback ([`EffortSource::AccountDefault`]). When
-//! neither answers, the effort is [`EffortSource::Unknown`] with no level: an
-//! unread effort is never rendered as a guessed default.
+//! **The screen row is transient on Claude Code 2.1.310**: the CLI paints it
+//! when `/effort` runs and removes it on the next repaint, so an end-to-end
+//! prepare read `effort: unknown` on every row. The DURABLE source is the
+//! session's own transcript ([`transcript_effort_level`]): an `/effort` command
+//! leaves a local-command record whose stdout reads
+//! `Set effort level to <level> (…)`, in the session's JSONL under the account
+//! it ran on — and `claude --resume` appends to that same file, so the record
+//! survives a restore too. That is read FIRST ([`EffortSource::Transcript`]),
+//! then the screen row, then the account's own `settings.json` `effortLevel`
+//! ([`EffortSource::AccountDefault`]). When none answers, the effort is
+//! [`EffortSource::Unknown`] with no level: an unread effort is never rendered
+//! as a guessed default.
+//!
+//! Not read: the `--effort` flag on the live `claude` argv. Finding the pane's
+//! `claude` and its argv is an async process-table walk the cohort's sync probe
+//! does not have; the transcript covers every session whose effort was set
+//! with `/effort`, including one this runner resumed with `--effort` (its
+//! original record is still in the file).
 //!
 //! ## The baseline
 //!
-//! A row is `held` for a hand restore when its effort is ABOVE the effort a
-//! session on that account gets anyway. That is the account's `effortLevel`
+//! A row is `held` for a hand restore when an EXPLICITLY SET effort
+//! ([`EffortSource::is_explicit`] — a transcript `/effort` record) is ABOVE the
+//! effort a session on that account gets anyway. A level that may only be the
+//! CLI's or the model's default — the screen row, which a fresh session paints
+//! too, or the account default — never holds: Claude Code 2.1.310 starts a
+//! Sonnet session at `xhigh` while [`CLI_DEFAULT_EFFORT`] is `high`, so a
+//! default read off the screen would have held every Sonnet session. That is the account's `effortLevel`
 //! when its `settings.json` carries one, else the CLI's own default as
 //! observed ([`CLI_DEFAULT_EFFORT`]) — none of the twelve account
 //! `settings.json` files on the vet box carried `effortLevel`, so a baseline
@@ -62,7 +81,11 @@ const SEPARATORS: &[char] = &['·', '∙'];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffortSource {
-    /// The pane's own status row.
+    /// An `/effort` command's record in the session's transcript: a level the
+    /// operator (or the session) SET, durable across repaints and resumes.
+    Transcript,
+    /// The pane's own status row (transient on 2.1.310, and painted for a
+    /// default level too — so not proof of an explicit choice).
     Screen,
     /// The account's `settings.json` `effortLevel`.
     AccountDefault,
@@ -76,6 +99,15 @@ pub struct Effort {
     /// One of [`EFFORT_LEVELS`]; `None` exactly when `source` is `unknown`.
     pub level: Option<String>,
     pub source: EffortSource,
+}
+
+impl EffortSource {
+    /// Whether a level from this source was explicitly SET for the session
+    /// (only the transcript's `/effort` record), rather than possibly being a
+    /// CLI, model or account default. Only an explicit level can hold a row.
+    pub fn is_explicit(self) -> bool {
+        matches!(self, EffortSource::Transcript)
+    }
 }
 
 impl Effort {
@@ -143,6 +175,63 @@ pub fn parse_screen(lines: &[String]) -> Option<&'static str> {
     lines.iter().rev().find_map(|l| parse_row(l))
 }
 
+/// The stdout Claude Code records for an `/effort` command (2.1.306–2.1.310,
+/// observed in the fleet's transcripts): `Set effort level to max (this
+/// session only): …` or `Set effort level to xhigh (saved as your default for
+/// new sessions): …`.
+const TRANSCRIPT_EFFORT_PREFIX: &str = "<local-command-stdout>Set effort level to ";
+
+/// The level the LAST `/effort` record in a transcript set, from the JSONL's
+/// text. Only a real record counts: a `type: "user"` line whose
+/// `message.content` (a string, or a text part) STARTS with the local-command
+/// stdout — so the phrase quoted inside a tool result, an assistant message or
+/// a pasted log is never mistaken for one. A later record whose level is not
+/// one of [`EFFORT_LEVELS`] (a reset, a value a newer CLI adds) clears the
+/// earlier one: the session's effort is then UNKNOWN, never the stale level.
+pub fn transcript_effort_level_in(jsonl: &str) -> Option<&'static str> {
+    let mut level: Option<&'static str> = None;
+    for line in jsonl.lines() {
+        // Cheap pre-filter: a transcript can be tens of MB.
+        if !line.contains("Set effort level to ") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+            continue;
+        };
+        let text = match content {
+            serde_json::Value::String(s) => Some(s.as_str()),
+            serde_json::Value::Array(parts) => parts.iter().find_map(|p| {
+                (p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .then(|| p.get("text").and_then(|t| t.as_str()))
+                    .flatten()
+            }),
+            _ => None,
+        };
+        let Some(rest) = text.and_then(|t| t.strip_prefix(TRANSCRIPT_EFFORT_PREFIX)) else {
+            continue;
+        };
+        let word: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        level = canonical(&word);
+    }
+    level
+}
+
+/// [`transcript_effort_level_in`] over the transcript file at `path`. An
+/// unreadable file reads `None` (UNKNOWN).
+pub fn transcript_effort_level(path: &Path) -> Option<&'static str> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    transcript_effort_level_in(&raw)
+}
+
 /// `<config_dir>/settings.json` `effortLevel`, when it holds a level. An
 /// unreadable file, an absent key or a value that is not a level all read
 /// `None`.
@@ -158,8 +247,24 @@ fn settings_effort_level_in(raw: &str) -> Option<String> {
     canonical(level).map(str::to_string)
 }
 
-/// The session's effort: the screen first, then the account default, else
-/// unknown.
+/// The session's effort: its transcript's last `/effort` record first, then
+/// the screen, then the account default, else unknown.
+pub fn effort_from_sources(
+    transcript_level: Option<&str>,
+    screen_level: Option<&str>,
+    settings_level: Option<&str>,
+) -> Effort {
+    if let Some(level) = transcript_level.and_then(canonical) {
+        return Effort {
+            level: Some(level.to_string()),
+            source: EffortSource::Transcript,
+        };
+    }
+    effort_from(screen_level, settings_level)
+}
+
+/// The session's effort with no transcript reading: the screen first, then
+/// the account default, else unknown.
 pub fn effort_from(screen_level: Option<&str>, settings_level: Option<&str>) -> Effort {
     if let Some(level) = screen_level.and_then(canonical) {
         return Effort {
@@ -198,9 +303,15 @@ pub fn baseline_from(settings_level: Option<&str>, cli_default: Option<&str>) ->
     }
 }
 
-/// Is `effort` strictly above `baseline`? `false` when either side is unknown
-/// — an unread effort holds nothing.
+/// Is an EXPLICITLY set `effort` strictly above `baseline`? `false` when either
+/// side is unknown — an unread effort holds nothing — and `false` for a level
+/// that may only be a default ([`EffortSource::is_explicit`]): a Sonnet
+/// session painting its `xhigh` default must not be held against the `high`
+/// CLI default.
 pub fn is_above(effort: &Effort, baseline: &Baseline) -> bool {
+    if !effort.source.is_explicit() {
+        return false;
+    }
     match (
         effort.level.as_deref().and_then(rank),
         baseline.baseline.as_deref().and_then(rank),
@@ -343,19 +454,122 @@ mod tests {
         assert_eq!(b.default_source, DefaultSource::Unknown);
     }
 
+    /// An explicit (transcript) level.
+    fn set(level: &str) -> Effort {
+        effort_from_sources(Some(level), None, None)
+    }
+
     #[test]
     fn is_above_is_strict_and_unknown_holds_nothing() {
         let cli = baseline_from(None, Some("high"));
-        assert!(is_above(&effort_from(Some("xhigh"), None), &cli));
-        assert!(is_above(&effort_from(Some("max"), None), &cli));
-        assert!(!is_above(&effort_from(Some("high"), None), &cli));
-        assert!(!is_above(&effort_from(Some("low"), None), &cli));
+        assert!(is_above(&set("xhigh"), &cli));
+        assert!(is_above(&set("max"), &cli));
+        assert!(!is_above(&set("high"), &cli));
+        assert!(!is_above(&set("low"), &cli));
         // Either side unknown: never held.
         assert!(!is_above(&Effort::unknown(), &cli));
+        assert!(!is_above(&set("max"), &baseline_from(None, None)));
+    }
+
+    #[test]
+    fn only_an_explicitly_set_level_holds() {
+        let cli = baseline_from(None, CLI_DEFAULT_EFFORT);
+        // A Sonnet session on 2.1.310 paints its `xhigh` DEFAULT on the status
+        // row: a screen reading may be a default, so it never holds.
+        assert!(!is_above(&effort_from(Some("xhigh"), None), &cli));
+        assert!(!is_above(&effort_from(Some("max"), None), &cli));
+        // An account default is the baseline itself, never above it.
         assert!(!is_above(
-            &effort_from(Some("max"), None),
-            &baseline_from(None, None)
+            &effort_from(None, Some("max")),
+            &baseline_from(Some("max"), CLI_DEFAULT_EFFORT)
         ));
+        // `/effort max` recorded in the transcript: held.
+        assert!(is_above(&set("max"), &cli));
+        assert!(EffortSource::Transcript.is_explicit());
+        assert!(!EffortSource::Screen.is_explicit());
+        assert!(!EffortSource::AccountDefault.is_explicit());
+        assert!(!EffortSource::Unknown.is_explicit());
+    }
+
+    /// Real-shaped records, copied from Claude Code 2.1.306 transcripts on the
+    /// fleet (`~/.claude-*/projects/<slug>/<session>.jsonl`, read-only): the
+    /// caveat, the command and its stdout are three `type: "user"` lines.
+    const EFFORT_RECORD: &str = r#"{"parentUuid":"6ef1","isSidechain":false,"type":"user","message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>"},"isMeta":true,"uuid":"fb79","timestamp":"2026-10-21T22:14:59.055Z","sessionId":"1445af04","version":"2.1.306"}
+{"parentUuid":"fb79","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args></command-args>"},"uuid":"b795","timestamp":"2026-10-21T22:14:59.055Z","sessionId":"1445af04","version":"2.1.306"}
+{"parentUuid":"b795","isSidechain":false,"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum (on supported models)</local-command-stdout>"},"uuid":"34b0","timestamp":"2026-10-21T22:14:59.055Z","sessionId":"1445af04","version":"2.1.306"}
+{"type":"last-prompt","leafUuid":"34b0","sessionId":"1445af04"}"#;
+
+    const MAX_RECORD: &str = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens resulting in slower responses.</local-command-stdout>"},"uuid":"9a1c","timestamp":"2026-10-22T08:00:00.000Z","sessionId":"1445af04","version":"2.1.310"}"#;
+
+    #[test]
+    fn the_transcript_effort_record_parses() {
+        assert_eq!(transcript_effort_level_in(EFFORT_RECORD), Some("xhigh"));
+        assert_eq!(transcript_effort_level_in(MAX_RECORD), Some("max"));
+        assert_eq!(transcript_effort_level_in(""), None);
+    }
+
+    #[test]
+    fn the_last_effort_record_wins_and_an_unknown_one_clears_it() {
+        let both = format!("{EFFORT_RECORD}\n{MAX_RECORD}");
+        assert_eq!(transcript_effort_level_in(&both), Some("max"));
+        let back = format!("{MAX_RECORD}\n{EFFORT_RECORD}");
+        assert_eq!(transcript_effort_level_in(&back), Some("xhigh"));
+        let reset = MAX_RECORD.replace("to max (", "to auto (");
+        assert_eq!(
+            transcript_effort_level_in(&format!("{MAX_RECORD}\n{reset}")),
+            None,
+            "a later level that is not one of ours is UNKNOWN, not the stale max"
+        );
+    }
+
+    #[test]
+    fn a_quoted_effort_line_is_not_a_record() {
+        // The phrase inside an assistant message, a tool result, or mid-text.
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"<local-command-stdout>Set effort level to max (this session only)</local-command-stdout>"}]}}"#;
+        let tool_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"<local-command-stdout>Set effort level to max (this session only)"}]}}"#;
+        let quoted = r#"{"type":"user","message":{"role":"user","content":"the log said <local-command-stdout>Set effort level to max"}}"#;
+        for not_a_record in [
+            assistant,
+            tool_result,
+            quoted,
+            "not json Set effort level to max",
+        ] {
+            assert_eq!(
+                transcript_effort_level_in(not_a_record),
+                None,
+                "{not_a_record}"
+            );
+        }
+        // A text-part array that IS the stdout counts.
+        let parts = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<local-command-stdout>Set effort level to low (this session only): Quick</local-command-stdout>"}]}}"#;
+        assert_eq!(transcript_effort_level_in(parts), Some("low"));
+    }
+
+    #[test]
+    fn the_transcript_file_is_read_and_a_missing_one_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, MAX_RECORD).unwrap();
+        assert_eq!(transcript_effort_level(&path), Some("max"));
+        assert_eq!(
+            transcript_effort_level(&dir.path().join("none.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_transcript_comes_before_the_screen_and_the_account() {
+        let e = effort_from_sources(Some("max"), Some("high"), Some("low"));
+        assert_eq!(e.level.as_deref(), Some("max"));
+        assert_eq!(e.source, EffortSource::Transcript);
+        let e = effort_from_sources(None, Some("high"), Some("low"));
+        assert_eq!(e.source, EffortSource::Screen);
+        let e = effort_from_sources(Some("turbo"), None, Some("low"));
+        assert_eq!(e.source, EffortSource::AccountDefault);
+        assert_eq!(
+            serde_json::to_value(EffortSource::Transcript).unwrap(),
+            serde_json::json!("transcript")
+        );
     }
 
     #[test]

@@ -80,7 +80,7 @@ export interface RestorePlaceholder {
   planSlug: string | null;
   /** `null` = not read. */
   effortLevel: string | null;
-  /** `screen` | `account_default` | `unknown`; `null` before the status read. */
+  /** `transcript` | `screen` | `account_default` | `unknown`; `null` before the status read. */
   effortSource: string | null;
   /** `null` = not read yet. */
   held: boolean | null;

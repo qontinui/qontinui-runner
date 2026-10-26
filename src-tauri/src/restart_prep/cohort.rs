@@ -223,6 +223,9 @@ pub struct RowFacts {
     pub model: Option<String>,
     /// The account's `settings.json` `effortLevel`.
     pub settings_effort: Option<String>,
+    /// The level the transcript's last `/effort` record set
+    /// ([`effort::transcript_effort_level`]) — the durable source.
+    pub transcript_effort: Option<String>,
     /// The lifecycle record's provider.
     pub provider: Option<String>,
 }
@@ -259,7 +262,8 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         .as_ref()
         .and_then(|s| effort::parse_screen(&s.lines));
     let settings = facts.settings_effort.as_deref();
-    let effort = effort::effort_from(screen_level, settings);
+    let effort =
+        effort::effort_from_sources(facts.transcript_effort.as_deref(), screen_level, settings);
     let baseline = effort::baseline_from(settings, effort::CLI_DEFAULT_EFFORT);
     let held = effort::is_above(&effort, &baseline);
     CohortRow {
@@ -335,8 +339,17 @@ pub fn merge_recapture(
                 if row.model.is_none() {
                     row.model = fresh_row.model;
                 }
-                if row.effort.source == effort::EffortSource::Unknown
-                    && fresh_row.effort.source != effort::EffortSource::Unknown
+                // Taken when the prepare read nothing and this capture reads
+                // something, or when this capture reads an EXPLICIT level (a
+                // transcript `/effort` record) that differs from what the
+                // prepare recorded — an earlier screen/default reading, or a
+                // `/effort` the session ran since. A reading is never replaced
+                // by a weaker one.
+                let fresh_explicit =
+                    fresh_row.effort.source.is_explicit() && fresh_row.effort != row.effort;
+                if (row.effort.source == effort::EffortSource::Unknown
+                    && fresh_row.effort.source != effort::EffortSource::Unknown)
+                    || fresh_explicit
                 {
                     row.effort = fresh_row.effort;
                     row.baseline = fresh_row.baseline;
@@ -429,25 +442,32 @@ impl CohortProbe for LiveCohortProbe {
             .map(str::trim)
             .filter(|c| !c.is_empty());
         // Read exactly as the migration's respawn reads it: the transcript
-        // under the account the session RAN on.
-        let model = match (config_dir, entry.working_dir.as_deref()) {
+        // under the account the session RAN on. The same file carries the
+        // session's `/effort` records.
+        let transcript = match (config_dir, entry.working_dir.as_deref()) {
             (Some(cfg), Some(wd)) if !wd.trim().is_empty() => {
-                crate::terminal::account_migration::transcript_last_model(
-                    &crate::terminal::transcript::session_transcript_path(
-                        Path::new(cfg),
-                        wd,
-                        &entry.claude_session_id,
-                    ),
-                )
+                Some(crate::terminal::transcript::session_transcript_path(
+                    Path::new(cfg),
+                    wd,
+                    &entry.claude_session_id,
+                ))
             }
             _ => None,
         };
+        let model = transcript
+            .as_deref()
+            .and_then(crate::terminal::account_migration::transcript_last_model);
+        let transcript_effort = transcript
+            .as_deref()
+            .and_then(effort::transcript_effort_level)
+            .map(str::to_string);
         let settings_effort = config_dir.and_then(|c| effort::settings_effort_level(Path::new(c)));
         RowFacts {
             screen,
             finished,
             model,
             settings_effort,
+            transcript_effort,
             provider,
         }
     }
@@ -562,6 +582,7 @@ mod tests {
                     finished: Some(false),
                     model: Some("claude-opus-5-5".to_string()),
                     settings_effort: None,
+                    transcript_effort: None,
                     provider: None,
                 },
             )]),
@@ -595,6 +616,7 @@ mod tests {
                     "a",
                     RowFacts {
                         screen: Some(busy_at("◉ max · /effort")),
+                        transcript_effort: Some("max".to_string()),
                         finished: Some(false),
                         ..Default::default()
                     },
@@ -646,9 +668,11 @@ mod tests {
             ]
         );
         let held: Vec<bool> = c.rows.iter().map(|r| r.held).collect();
-        // a: max > high (CLI default). b: low. c: high = high.
-        // d: xhigh from settings, against settings xhigh. e: unknown.
+        // a: `/effort max` in its transcript > high (CLI default). b: low.
+        // c: high = high. d: xhigh from settings, against settings xhigh.
+        // e: unknown.
         assert_eq!(held, [true, false, false, false, false]);
+        assert_eq!(c.rows[0].effort.source, EffortSource::Transcript);
         assert_eq!(c.rows[3].effort.source, EffortSource::AccountDefault);
         assert_eq!(c.rows[3].baseline.default_source, DefaultSource::Settings);
     }
@@ -669,6 +693,109 @@ mod tests {
         assert_eq!(c.rows.len(), 1, "a finished session is still recorded");
         assert_eq!(c.rows[0].finished, Some(true));
         assert_eq!(c.rows[0].state_at_prepare, StateAtPrepare::Finished);
+    }
+
+    /// The 2.1.310 end-to-end failure: the status row is gone after a
+    /// repaint, so every row read `effort: unknown` and nothing was ever held.
+    /// The transcript's `/effort` record is read instead.
+    #[test]
+    fn the_effort_is_read_from_the_transcript_when_the_screen_shows_none() {
+        let c = build_cohort(
+            ledger(&["m", "d"]),
+            &fixed(vec![
+                (
+                    "m",
+                    RowFacts {
+                        // A finished-turn screen with no effort row on it.
+                        screen: Some(idle_at("✻ Cogitated for 9m 42s · done 6:36 AM")),
+                        transcript_effort: Some("max".to_string()),
+                        finished: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "d",
+                    RowFacts {
+                        screen: Some(idle_at("✻ Cogitated for 9m 42s · done 6:36 AM")),
+                        finished: Some(false),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        );
+        let by = |id: &str| {
+            c.rows
+                .iter()
+                .find(|r| r.session.claude_session_id == id)
+                .expect("row")
+        };
+        let m = by("m");
+        assert_eq!(m.effort.level.as_deref(), Some("max"));
+        assert_eq!(m.effort.source, EffortSource::Transcript);
+        assert!(m.held, "an explicit max is above the high CLI default");
+        // The finished-turn line reads idle (the idle.rs fix), not unknown.
+        assert_eq!(m.state_at_prepare, StateAtPrepare::Idle);
+        let d = by("d");
+        assert_eq!(d.effort.source, EffortSource::Unknown);
+        assert!(!d.held);
+    }
+
+    /// A Sonnet session on 2.1.310 starts at `xhigh`; a screen reading of that
+    /// default must not hold it against the `high` CLI default.
+    #[test]
+    fn a_default_level_on_the_screen_is_recorded_but_not_held() {
+        let r = build_row(
+            entry("sonnet"),
+            RowFacts {
+                screen: Some(idle_at("◉ xhigh · /effort")),
+                finished: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.effort.level.as_deref(), Some("xhigh"));
+        assert_eq!(r.effort.source, EffortSource::Screen);
+        assert!(!r.held);
+    }
+
+    #[test]
+    fn a_recapture_takes_an_explicit_level_over_a_screen_reading() {
+        let screen_only = RowFacts {
+            screen: Some(idle_at("◉ xhigh · /effort")),
+            finished: Some(false),
+            ..Default::default()
+        };
+        let pinned = build_cohort(ledger(&["a"]), &fixed(vec![("a", screen_only)]));
+        assert!(!pinned.rows[0].held);
+        let fresh = build_cohort(
+            ledger(&["a"]),
+            &fixed(vec![(
+                "a",
+                RowFacts {
+                    transcript_effort: Some("max".to_string()),
+                    finished: Some(false),
+                    ..Default::default()
+                },
+            )]),
+        );
+        let merged = merge_recapture(&pinned, fresh.clone(), 1_000, &|_| None);
+        assert_eq!(merged.rows[0].effort.source, EffortSource::Transcript);
+        assert_eq!(merged.rows[0].effort.level.as_deref(), Some("max"));
+        assert!(merged.rows[0].held);
+        // ...and an explicit reading is never replaced by a weaker one.
+        let weaker = build_cohort(
+            ledger(&["a"]),
+            &fixed(vec![(
+                "a",
+                RowFacts {
+                    screen: Some(idle_at("● high · /effort")),
+                    finished: Some(false),
+                    ..Default::default()
+                },
+            )]),
+        );
+        let again = merge_recapture(&merged, weaker, 2_000, &|_| None);
+        assert_eq!(again.rows[0].effort.source, EffortSource::Transcript);
+        assert_eq!(again.rows[0].effort.level.as_deref(), Some("max"));
     }
 
     #[test]
@@ -706,6 +833,7 @@ mod tests {
         };
         let read_max = || RowFacts {
             screen: Some(idle_at("◉ max · /effort")),
+            transcript_effort: Some("max".to_string()),
             finished: Some(false),
             ..Default::default()
         };
@@ -752,6 +880,7 @@ mod tests {
                     "a",
                     RowFacts {
                         screen: Some(idle_at("◉ max · /effort")),
+                        transcript_effort: Some("max".to_string()),
                         finished: Some(false),
                         ..Default::default()
                     },

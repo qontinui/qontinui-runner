@@ -964,19 +964,32 @@ async fn resume_one(
                     warn!(id = %cand.id, error = ?e, "resume_door: resumed, but the finish mark could not be lifted");
                 }
             }
+            use crate::restart_prep::restore as rp_restore;
+            let argv = ev.cmdline.clone();
             let mut row = ResumeRow::resumed(&cand.id, ev);
             if let Some(wanted) = effort {
+                // The verified process's own argv: 2.1.310 paints the status
+                // row only transiently, so the screen alone cannot confirm.
+                let argv_carries = argv
+                    .as_deref()
+                    .is_some_and(|c| rp_restore::argv_carries_effort(c, &wanted));
                 let tm = tm.clone();
                 let read = move || tm.get(&terminal_id).map(|s| s.grid_screen());
-                row.effort = Some(
-                    crate::restart_prep::restore::read_back_effort(
-                        &wanted,
-                        read,
-                        crate::restart_prep::restore::EFFORT_READ_BACK_DEADLINE,
-                        crate::restart_prep::restore::EFFORT_READ_BACK_POLL,
-                    )
-                    .await,
-                );
+                let screen_verdict = rp_restore::read_back_effort(
+                    &wanted,
+                    read,
+                    if argv_carries {
+                        rp_restore::EFFORT_READ_BACK_ARGV_DEADLINE
+                    } else {
+                        rp_restore::EFFORT_READ_BACK_DEADLINE
+                    },
+                    rp_restore::EFFORT_READ_BACK_POLL,
+                )
+                .await;
+                row.effort = Some(rp_restore::effort_verdict_with_argv(
+                    screen_verdict,
+                    argv_carries,
+                ));
                 row.effort_applied = Some(wanted);
             }
             row
