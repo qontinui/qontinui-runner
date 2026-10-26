@@ -39,7 +39,8 @@
 //!    renamed aside to `<sid>.jsonl.diverged-<unix_ms>`, never deleted, so the
 //!    live conversation is what resumes) and, best-effort, its sibling
 //!    directory `<sid>/` (subagent transcripts — without it no subagent spawned
-//!    before the migration can be resumed), respawn
+//!    before the migration can be resumed; a diverged one is renamed aside the
+//!    same way), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
 //!    PTY pinned to the target account, on the same grid page/zone, and only
 //!    THEN close the old pane. The respawn re-keys the session's lifecycle
@@ -48,13 +49,14 @@
 //!    old pane in place.
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
-//! dry), settings kill-switch
+//! dry), one migration in flight per session ([`begin_migration`], which also
+//! refuses a session that already moved), settings kill-switch
 //! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
 //! than two configured accounts. The manual Tauri command
 //! (`terminal_migrate_session_account`) reuses step 4 directly — an operator
 //! click is its own confirmation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -95,6 +97,120 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     }
     entry.push(now_ms);
     true
+}
+
+/// Claude session ids with a migration in flight, for [`begin_migration`].
+static MIGRATIONS_IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Why [`begin_migration`] refused to start a migration. `Display` is the
+/// error string the caller returns and the `session-account-migration-skipped`
+/// event carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MigrationRefusal {
+    /// Another migration of the same session is still running.
+    InFlight { session: String },
+    /// The session no longer runs where the caller saw it: its record now
+    /// names another account (`to` = that config dir) or another terminal.
+    AlreadyMoved { to: String },
+    /// The session's lifecycle record is gone.
+    Unknown { session: String },
+}
+
+impl std::fmt::Display for MigrationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InFlight { session } => write!(f, "migration already in flight for {session}"),
+            Self::AlreadyMoved { to } => write!(f, "session already moved to {to}"),
+            Self::Unknown { session } => {
+                write!(f, "session {session} is no longer in the lifecycle store")
+            }
+        }
+    }
+}
+
+/// Holds one session's slot in [`MIGRATIONS_IN_FLIGHT`]; dropping it — on
+/// return, on `?`, or while unwinding from a panic — releases the slot.
+#[derive(Debug)]
+pub(crate) struct MigrationInFlight {
+    session: String,
+}
+
+impl Drop for MigrationInFlight {
+    fn drop(&mut self) {
+        // A poisoned lock still guards a valid set; never leave a slot held.
+        let mut set = MIGRATIONS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(set) = set.as_mut() {
+            set.remove(&self.session);
+        }
+    }
+}
+
+/// Take `claude_session_id`'s in-flight slot, or refuse when another migration
+/// of the same session holds it.
+fn claim_migration_slot(claude_session_id: &str) -> Result<MigrationInFlight, MigrationRefusal> {
+    let mut set = MIGRATIONS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !set
+        .get_or_insert_with(HashSet::new)
+        .insert(claude_session_id.to_string())
+    {
+        return Err(MigrationRefusal::InFlight {
+            session: claude_session_id.to_string(),
+        });
+    }
+    Ok(MigrationInFlight {
+        session: claude_session_id.to_string(),
+    })
+}
+
+/// Serialise migrations per session, then re-check the caller's view.
+///
+/// Nothing else orders two migrations of one session: the usage-limit hint is
+/// debounced per terminal only, the manual Tauri command has no debounce at
+/// all, and [`migration_cap_permits`] allows [`MIGRATION_CAP`]. Run
+/// concurrently, the second one's carry could find the live transcript the
+/// first one's resumed pane is writing, read it as a diverged fork, move it
+/// aside and copy a stale source over it. So: take the session's in-flight
+/// slot (a second concurrent request is refused with
+/// [`MigrationRefusal::InFlight`]), and, under it, re-read the session's
+/// record (`current_record`) and refuse unless it still runs under `src` in
+/// the caller's terminal ([`MigrationRefusal::AlreadyMoved`]) — a migration
+/// that finished while this one waited to be scheduled has already moved it.
+///
+/// An unpinned record (no `config_dir`) has never been migrated — a
+/// migration always pins its destination — so the caller's fallback
+/// resolution of `src` stands for it.
+///
+/// The returned guard must be held until the migration has finished.
+pub(crate) fn begin_migration(
+    caller_record: &TerminalSessionRecord,
+    src_config_dir: &str,
+    current_record: impl FnOnce() -> Option<TerminalSessionRecord>,
+) -> Result<MigrationInFlight, MigrationRefusal> {
+    let sid = &caller_record.claude_session_id;
+    let guard = claim_migration_slot(sid)?;
+    let Some(current) = current_record() else {
+        return Err(MigrationRefusal::Unknown {
+            session: sid.clone(),
+        });
+    };
+    match current.config_dir.as_deref() {
+        Some(dir) if dir != src_config_dir => {
+            return Err(MigrationRefusal::AlreadyMoved {
+                to: dir.to_string(),
+            })
+        }
+        _ => {}
+    }
+    if current.terminal_id != caller_record.terminal_id {
+        return Err(MigrationRefusal::AlreadyMoved {
+            to: format!("terminal {}", current.terminal_id),
+        });
+    }
+    Ok(guard)
 }
 
 /// Outcome payload emitted on `session-account-migrated`.
@@ -376,10 +492,15 @@ impl ReadyDebounce {
 /// migration hint on this terminal anyway.
 ///
 /// It first waits for the step-4b delta sync (`sync_done`) to report, bounded
-/// by [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`] — the sync's own
-/// writer-exit wait — so the resumed session is not told to `SendMessage` a
-/// subagent whose last lines are still being topped up. See
-/// [`run_continue_nudge`].
+/// by [`NUDGE_SYNC_WAIT`], so the resumed session is not told to `SendMessage`
+/// a subagent whose last lines are still being topped up. The sync starts no
+/// later than [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`] after
+/// it was spawned (its writer-exit wait counts no look that completes after
+/// that) and this wait starts after the sync was spawned, so the nudge
+/// normally goes after the sync. The bounded exception: a sync whose copy
+/// itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
+/// blocking pool) — the nudge then goes first, and the log says the sync had
+/// not reported. See [`run_continue_nudge`].
 fn spawn_continue_nudge(
     terminal_id: String,
     subagents: &[CarriedSubagent],
@@ -389,10 +510,20 @@ fn spawn_continue_nudge(
     tauri::async_runtime::spawn(run_continue_nudge(
         terminal_id.clone(),
         sync_done,
-        crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT,
+        NUDGE_SYNC_WAIT,
         move || prompt_when_idle(terminal_id, prompt, "continue-nudge"),
     ));
 }
+
+/// Time the delta sync gets to finish its copy and report after its
+/// writer-exit wait ([`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`])
+/// has ended, before the continue nudge stops waiting for it.
+const DELTA_SYNC_REPORT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the continue nudge waits for the delta sync to report: the sync's
+/// writer-exit wait plus [`DELTA_SYNC_REPORT_MARGIN`].
+const NUDGE_SYNC_WAIT: std::time::Duration =
+    crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT.saturating_add(DELTA_SYNC_REPORT_MARGIN);
 
 /// What the continue nudge heard from the delta sync before it started.
 #[derive(Debug, PartialEq, Eq)]
@@ -814,12 +945,32 @@ fn resume_respawn_extra_required(
 /// account migrates at about the same moment; run inline, each of those would
 /// hold a tokio worker for the length of its copy. Both async callers (the
 /// usage-limit hint and the manual Tauri command) go through here.
+///
+/// The whole migration runs under the session's in-flight guard
+/// ([`begin_migration`]): a second concurrent migration of the same session,
+/// or one whose view of the session is stale, is refused before anything is
+/// read or written. The guard moves into the blocking task, so it is released
+/// when the migration itself ends — on success, on error, or on a panic —
+/// even if this future is dropped first.
 pub async fn migrate_session_off_runtime(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
 ) -> Result<MigrationOutcome, String> {
+    use tauri::Manager;
+    let store = app
+        .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .ok_or("SessionLifecycleStore not managed")?
+        .inner()
+        .clone();
+    let in_flight = begin_migration(record, src_config_dir, || {
+        store.get(&record.claude_session_id)
+    })
+    .map_err(|refusal| {
+        warn!(session = %record.claude_session_id, %refusal, "session migration refused");
+        refusal.to_string()
+    })?;
     // The old pane's `claude`, identified BEFORE anything is closed: the
     // detached delta sync waits for exactly this process to leave the table.
     // Taken here because the snapshot is async and `migrate_session` is not.
@@ -827,6 +978,7 @@ pub async fn migrate_session_off_runtime(
     let (app, record) = (app.clone(), record.clone());
     let (src, dst) = (src_config_dir.to_string(), dst_config_dir.to_string());
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let _in_flight = in_flight;
         migrate_session(&app, &record, &src, &dst, old_writer)
     })
     .await
@@ -1119,7 +1271,8 @@ pub fn migrate_session(
     // 5. Optionally nudge the resumed session to pick the task back up once
     // the CLI paints its idle prompt — a bare `--resume` restores context but
     // then sits at the input box with nobody typing. The nudge waits for 4b's
-    // outcome first (bounded by the same deadline as 4b's writer-exit wait).
+    // outcome first, bounded by 4b's writer-exit wait plus a report margin
+    // (`NUDGE_SYNC_WAIT`), so it normally goes after the sync.
     if crate::settings::get_ai_settings()
         .claude_cli
         .auto_continue_after_migration
@@ -1146,10 +1299,18 @@ pub fn migrate_session(
             // set only for `diverged_preserved`.
             "mainTranscript": carried.main.event_name(),
             "mainTranscriptBackup": carried.main.backup().map(|p| p.display().to_string()),
+            // `subagentsDivergedPreserved`: `.jsonl` files under `<sid>/` whose
+            // diverged destination was moved aside (`<file>.diverged-<ms>`)
+            // and replaced by the live one. `subagentsDivergedKept`: diverged
+            // ones kept in place instead — a non-migration carry mode only,
+            // so 0 here today; reported apart rather than folded into
+            // `skippedOther`, which means "not followed".
             "sessionDirCarry": {
                 "copied": carried.session_dir.copied,
                 "skippedPresent": carried.session_dir.skipped_present,
                 "skippedOther": carried.session_dir.skipped_other,
+                "subagentsDivergedPreserved": carried.session_dir.diverged_preserved,
+                "subagentsDivergedKept": carried.session_dir.diverged_kept,
                 "failed": carried.session_dir.failed,
             },
             "subagentsCarried": carried.subagents.len(),
@@ -1396,6 +1557,113 @@ mod tests {
         ));
     }
 
+    // ---- one migration in flight per session (W1) ----------------------------
+
+    /// A minimal open record for `sid` in `terminal`, under `config_dir`.
+    fn session_record(
+        sid: &str,
+        terminal: &str,
+        config_dir: Option<&str>,
+    ) -> TerminalSessionRecord {
+        serde_json::from_value(json!({
+            "claudeSessionId": sid,
+            "configDir": config_dir,
+            "workingDir": "D:\\qontinui-root",
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": terminal,
+            "openedAt": 1,
+            "lastSeenAt": 1,
+            "state": "open",
+            "finishSynced": false,
+        }))
+        .expect("a minimal TerminalSessionRecord")
+    }
+
+    #[test]
+    fn a_second_migration_of_the_same_session_is_refused_while_one_is_in_flight() {
+        let sid = "test/account_migration/in-flight";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let held = begin_migration(&rec, "C:/a", || Some(rec.clone())).expect("first one starts");
+        let refusal = begin_migration(&rec, "C:/a", || Some(rec.clone())).unwrap_err();
+        assert_eq!(
+            refusal,
+            MigrationRefusal::InFlight {
+                session: sid.to_string()
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            format!("migration already in flight for {sid}")
+        );
+        let other = session_record("test/account_migration/in-flight-other", "t-2", None);
+        assert!(
+            begin_migration(&other, "C:/a", || Some(other.clone())).is_ok(),
+            "another session is not blocked"
+        );
+        drop(held);
+        assert!(
+            begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok(),
+            "the slot is free once the first migration ends"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_slot_is_released_on_every_exit_path() {
+        let sid = "test/account_migration/release";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        // An early error return (`?`) while the guard is held.
+        let failing = || -> Result<(), String> {
+            let _guard =
+                begin_migration(&rec, "C:/a", || Some(rec.clone())).map_err(|r| r.to_string())?;
+            Err("the carry failed".to_string())
+        };
+        assert!(failing().is_err());
+        assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
+        // A panic while the guard is held.
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = begin_migration(&rec, "C:/a", || Some(rec.clone())).unwrap();
+            panic!("the migration panicked");
+        });
+        assert!(panicked.is_err());
+        assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
+        // A refusal by the moved-check releases the slot it took.
+        assert!(begin_migration(&rec, "C:/stale", || Some(rec.clone())).is_err());
+        assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
+    }
+
+    #[test]
+    fn a_session_that_already_moved_is_refused() {
+        let sid = "test/account_migration/moved";
+        let seen = session_record(sid, "t-1", Some("C:/a"));
+        // The record now says the session runs under C:/b (a migration that
+        // finished while this one waited).
+        let now = session_record(sid, "t-9", Some("C:/b"));
+        let refusal = begin_migration(&seen, "C:/a", || Some(now.clone())).unwrap_err();
+        assert_eq!(
+            refusal,
+            MigrationRefusal::AlreadyMoved {
+                to: "C:/b".to_string()
+            }
+        );
+        assert_eq!(refusal.to_string(), "session already moved to C:/b");
+        // Same account, another terminal: moved too.
+        let rehosted = session_record(sid, "t-9", Some("C:/a"));
+        assert!(matches!(
+            begin_migration(&seen, "C:/a", || Some(rehosted.clone())),
+            Err(MigrationRefusal::AlreadyMoved { .. })
+        ));
+        // Gone from the store.
+        assert!(matches!(
+            begin_migration(&seen, "C:/a", || None),
+            Err(MigrationRefusal::Unknown { .. })
+        ));
+        // Unchanged, or never pinned to an account: proceeds.
+        assert!(begin_migration(&seen, "C:/a", || Some(seen.clone())).is_ok());
+        let unpinned = session_record(sid, "t-1", None);
+        assert!(begin_migration(&unpinned, "C:/a", || Some(unpinned.clone())).is_ok());
+    }
+
     #[test]
     fn migration_cap_is_per_session() {
         let base = 1_750_000_000_000i64;
@@ -1514,10 +1782,10 @@ mod tests {
         let nudge = tokio::spawn(run_continue_nudge(
             "t-1".to_string(),
             Some(rx),
-            DELTA_SYNC_EXIT_WAIT,
+            NUDGE_SYNC_WAIT,
             deliver,
         ));
-        tokio::time::sleep(DELTA_SYNC_EXIT_WAIT - Duration::from_secs(1)).await;
+        tokio::time::sleep(NUDGE_SYNC_WAIT - Duration::from_secs(1)).await;
         assert!(
             !delivered.load(Ordering::SeqCst),
             "the nudge fired before the delta sync completed"
@@ -1541,10 +1809,63 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         let (delivered, deliver) = delivery_flag();
         let started = tokio::time::Instant::now();
-        run_continue_nudge("t-2".to_string(), Some(rx), DELTA_SYNC_EXIT_WAIT, deliver).await;
+        run_continue_nudge("t-2".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
-        assert!(started.elapsed() >= DELTA_SYNC_EXIT_WAIT);
-        assert!(started.elapsed() < DELTA_SYNC_EXIT_WAIT + Duration::from_secs(1));
+        assert!(started.elapsed() >= NUDGE_SYNC_WAIT);
+        assert!(started.elapsed() < NUDGE_SYNC_WAIT + Duration::from_secs(1));
+    }
+
+    /// W3 — the delta sync starts as late as `DELTA_SYNC_EXIT_WAIT` (the
+    /// writer proven gone on its very last look) and then needs time to copy.
+    /// A sync that reports just AFTER `DELTA_SYNC_EXIT_WAIT` still holds the
+    /// nudge back: the nudge's own wait carries `DELTA_SYNC_REPORT_MARGIN` on
+    /// top. Driven end to end — the real writer-exit wait and the real nudge
+    /// wait on one paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_finishing_just_after_the_exit_wait_still_gates_the_nudge() {
+        use crate::terminal::session_carry::{run_delta_sync_after_exit, WriterProbe};
+        let poll = crate::terminal::graceful_exit::POLL_INTERVAL;
+        let started = tokio::time::Instant::now();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sync = tokio::spawn(async move {
+            let outcome = run_delta_sync_after_exit(
+                // Alive until the deadline; gone on the looks that land on it.
+                move || {
+                    std::future::ready(if started.elapsed() + poll >= DELTA_SYNC_EXIT_WAIT {
+                        WriterProbe::Gone
+                    } else {
+                        WriterProbe::Alive
+                    })
+                },
+                DELTA_SYNC_EXIT_WAIT,
+                poll,
+                || async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(DeltaSync::default())
+                },
+            )
+            .await;
+            let _ = tx.send(outcome);
+        });
+        let (delivered, deliver) = delivery_flag();
+        let delivered_at = Arc::new(std::sync::Mutex::new(None));
+        let at = delivered_at.clone();
+        run_continue_nudge("t-4".to_string(), Some(rx), NUDGE_SYNC_WAIT, move || {
+            *at.lock().unwrap() = Some(tokio::time::Instant::now());
+            deliver()
+        })
+        .await;
+        sync.await.unwrap();
+        assert!(delivered.load(Ordering::SeqCst));
+        let elapsed = delivered_at.lock().unwrap().unwrap() - started;
+        assert!(
+            elapsed > DELTA_SYNC_EXIT_WAIT,
+            "the sync finished after the exit wait, and the nudge waited for it: {elapsed:?}"
+        );
+        assert!(
+            elapsed < NUDGE_SYNC_WAIT,
+            "delivered on the sync's report, not at the nudge's deadline: {elapsed:?}"
+        );
     }
 
     /// No sync started (no writer identity), or a sync task that died without
@@ -1553,14 +1874,20 @@ mod tests {
     async fn with_no_delta_sync_to_wait_for_the_nudge_goes_at_once() {
         let started = tokio::time::Instant::now();
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge("t-3".to_string(), None, DELTA_SYNC_EXIT_WAIT, deliver).await;
+        run_continue_nudge("t-3".to_string(), None, NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
         assert_eq!(
-            await_delta_sync(Some(rx), DELTA_SYNC_EXIT_WAIT).await,
+            await_delta_sync(Some(rx), NUDGE_SYNC_WAIT).await,
             SyncGate::Dropped
         );
+        // The nudge itself, behind a sync that died without reporting.
+        let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
+        drop(tx);
+        let (delivered, deliver) = delivery_flag();
+        run_continue_nudge("t-3b".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
+        assert!(delivered.load(Ordering::SeqCst));
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }

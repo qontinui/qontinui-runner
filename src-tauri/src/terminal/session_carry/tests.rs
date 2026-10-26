@@ -253,11 +253,15 @@ fn copy_transcript_never_truncates_a_newer_destination_subagent_file() {
         ],
     );
 
-    let carried = copy_transcript(
+    // Outside a migration (the respawn's `ExtendPrefix`); a migration moves
+    // the larger one aside instead — see
+    // `a_migration_moves_a_larger_diverged_subagent_aside`.
+    let carried = carry_session(
         src_cfg.to_str().unwrap(),
         dst_cfg.to_str().unwrap(),
         working_dir,
         sid,
+        MainTranscript::ExtendPrefix,
     )
     .expect("copy should succeed");
     assert_eq!(
@@ -303,6 +307,8 @@ fn carry_session_dir_refuses_a_session_id_that_is_not_one_path_component() {
             &dst_project.join("t.jsonl"),
             bad,
             true,
+            true,
+            &mut |from: &Path, to: &Path| std::fs::rename(from, to),
         );
         assert!(files.is_empty());
         assert_eq!(
@@ -768,6 +774,8 @@ fn a_repeat_carry_copies_nothing_and_records_the_same_destination() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Outside a migration ([`MainTranscript::ExtendPrefix`]) a larger destination
+/// subagent is the newer copy and is left alone.
 #[test]
 fn a_destination_subagent_larger_than_the_source_is_skipped() {
     let tmp = scratch("dst-larger");
@@ -779,7 +787,14 @@ fn a_destination_subagent_larger_than_the_source_is_skipped() {
     std::fs::create_dir_all(dst_file.parent().unwrap()).unwrap();
     std::fs::write(&dst_file, b"a\nand more\n").unwrap();
 
-    let carried = carry(&src, &dst);
+    let carried = carry_session(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::ExtendPrefix,
+    )
+    .unwrap();
     assert_eq!(carried.session_dir.skipped_present, 1);
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\nand more\n");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -964,9 +979,11 @@ fn diverged_backups(cfg: &Path) -> Vec<PathBuf> {
 /// W1 — on a MIGRATION the source is the live conversation and is what
 /// resumes. A destination `<sid>.jsonl` that diverged from it is moved aside
 /// (its bytes survive at `<sid>.jsonl.diverged-<ms>`), and the destination
-/// then holds the source's bytes. A diverged SUBAGENT transcript is still
-/// never overwritten — by the carry or by the delta sync — and the main
-/// transcript is not counted in the `<sid>/` tally.
+/// then holds the source's bytes. A diverged SUBAGENT transcript is treated
+/// the same way (W2): its fork survives as `<file>.diverged-<ms>` beside it,
+/// the destination ends up equal to the source, and the delta sync then tops
+/// it up like any carried file. The main transcript is not counted in the
+/// `<sid>/` tally.
 #[test]
 fn a_migration_moves_a_diverged_main_transcript_aside_and_copies_the_live_one() {
     let tmp = scratch("diverged");
@@ -1004,31 +1021,269 @@ fn a_migration_moves_a_diverged_main_transcript_aside_and_copies_the_live_one() 
         carried.session_dir,
         SessionDirCarry {
             copied: 1,
-            skipped_other: 1,
+            diverged_preserved: 1,
             ..SessionDirCarry::default()
         },
-        "the subagent fork is skipped; the main transcript is not counted here; \
+        "the subagent fork is preserved aside; the main transcript is not counted here; \
          the live side's in-place custom-title follows the live transcript"
     );
     let dst_side = literal_sidecar(&dst);
     let dst_sub = dst_side.join("subagents").join("agent-a1.jsonl");
-    assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
+    assert_eq!(
+        std::fs::read(&dst_sub).unwrap(),
+        b"a\nsource tail, longer\n",
+        "the destination subagent now equals the live source"
+    );
+    let sub_backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(sub_backups.len(), 1, "{sub_backups:?}");
+    assert_eq!(
+        std::fs::read(&sub_backups[0]).unwrap(),
+        b"a\nfork\n",
+        "the subagent fork survives as a backup beside it"
+    );
     let recorded = carried
         .files
         .iter()
         .find(|f| f.rel == Path::new("subagents").join("agent-a1.jsonl"))
         .unwrap();
-    assert_eq!(recorded.wrote, CarryWrite::Diverged);
+    assert_eq!(recorded.wrote, CarryWrite::Copied);
+    assert_eq!(agent_ids(&carried), ["a1"]);
 
-    // The old pane writes more; the delta sync still leaves the fork alone.
+    // The old pane writes more; the delta sync tops up the live copy and
+    // never touches the backup.
     append(
         &src_side.join("subagents").join("agent-a1.jsonl"),
         b"and the old pane wrote even more\n",
     );
     let done = sync(&carried);
-    assert_eq!(done.skipped_other, 1, "{done:?}");
-    assert_eq!(done.copied, 0, "{done:?}");
-    assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nfork\n");
+    assert_eq!(done.copied, 1, "{done:?}");
+    assert_eq!(
+        std::fs::read(&dst_sub).unwrap(),
+        b"a\nsource tail, longer\nand the old pane wrote even more\n"
+    );
+    assert_eq!(std::fs::read(&sub_backups[0]).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Every `<name>.diverged-*` file in the destination's `<SID>/subagents/`.
+fn subagent_backups(cfg: &Path, name: &str) -> Vec<PathBuf> {
+    let prefix = format!("{name}.diverged-");
+    std::fs::read_dir(literal_sidecar(cfg).join("subagents"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect()
+}
+
+fn agent_ids(carried: &TranscriptCopy) -> Vec<&str> {
+    carried
+        .subagents
+        .iter()
+        .map(|a| a.agent_id.as_str())
+        .collect()
+}
+
+/// Seed a source subagent `agent-a1.jsonl` = `src_bytes` and a destination
+/// copy = `dst_bytes` (main transcripts identical), then migrate.
+fn migrate_subagent(label: &str, src_bytes: &[u8], dst_bytes: &[u8]) -> (PathBuf, TranscriptCopy) {
+    let tmp = scratch(label);
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", src_bytes)]);
+    seed_session(&dst, WD, SID, &[("subagents/agent-a1.jsonl", dst_bytes)]);
+    let carried = carry(&src, &dst);
+    (tmp, carried)
+}
+
+/// W2 — a destination subagent LARGER than the live source's (a stale fork
+/// that grew past it) is moved aside on a migration, and the destination then
+/// holds the source's bytes; the subagent is listed as carried.
+#[test]
+fn a_migration_moves_a_larger_diverged_subagent_aside() {
+    let fork: &[u8] = b"a\nfork that kept running and grew past the live one\n";
+    let (tmp, carried) = migrate_subagent("sub-larger", b"a\nlive\n", fork);
+    let dst = tmp.join(".claude-b");
+    assert_eq!(carried.main, MainCarry::Present);
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            diverged_preserved: 1,
+            ..SessionDirCarry::default()
+        }
+    );
+    let dst_sub = literal_sidecar(&dst)
+        .join("subagents")
+        .join("agent-a1.jsonl");
+    assert_eq!(std::fs::read(&dst_sub).unwrap(), b"a\nlive\n");
+    let backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), fork);
+    assert_eq!(agent_ids(&carried), ["a1"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W2 — the same size with other bytes is a fork too: a size check alone
+/// would call it current.
+#[test]
+fn a_migration_moves_a_same_size_different_bytes_subagent_aside() {
+    let (tmp, carried) = migrate_subagent("sub-same-size", b"a\nlive\n", b"a\nfork\n");
+    let dst = tmp.join(".claude-b");
+    assert_eq!(carried.session_dir.diverged_preserved, 1);
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"a\nlive\n"
+    );
+    let backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W2 — byte-identical stays `Present` (untouched, no backup); a strict
+/// prefix is extended in place (no backup).
+#[test]
+fn a_migration_keeps_an_identical_subagent_and_extends_a_prefix_one() {
+    let (tmp, identical) = migrate_subagent("sub-identical", b"a\nlive\n", b"a\nlive\n");
+    assert_eq!(identical.session_dir.skipped_present, 1);
+    assert!(subagent_backups(&tmp.join(".claude-b"), "agent-a1.jsonl").is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let (tmp, prefix) = migrate_subagent("sub-prefix", b"a\nlive\n", b"a\n");
+    assert_eq!(prefix.session_dir.copied, 1);
+    assert_eq!(prefix.session_dir.diverged_preserved, 0);
+    let dst = tmp.join(".claude-b");
+    assert!(subagent_backups(&dst, "agent-a1.jsonl").is_empty());
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"a\nlive\n"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W2 — a diverged subagent that cannot be moved aside is skipped, not
+/// fatal: the carry succeeds, the file is counted `failed`, the fork is left
+/// exactly as it was (no backup, no placeholder), and the subagent is NOT
+/// listed as resumable.
+#[test]
+fn a_subagent_that_cannot_be_moved_aside_is_skipped_and_not_listed() {
+    let tmp = scratch("sub-rename-fails");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-a1.jsonl", b"a\nlive\n"),
+            ("subagents/agent-b2.jsonl", b"b\n"),
+        ],
+    );
+    seed_session(&dst, WD, SID, &[("subagents/agent-a1.jsonl", b"a\nfork\n")]);
+
+    let carried = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| {
+            if from.ends_with("agent-a1.jsonl") {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::rename(from, to)
+            }
+        },
+        || {},
+    )
+    .expect("a subagent never fails the carry");
+    assert_eq!(
+        carried.session_dir,
+        SessionDirCarry {
+            copied: 1,
+            failed: 1,
+            ..SessionDirCarry::default()
+        }
+    );
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"a\nfork\n",
+        "the fork is not overwritten"
+    );
+    assert!(subagent_backups(&dst, "agent-a1.jsonl").is_empty());
+    assert_eq!(agent_ids(&carried), ["b2"], "a1 is not called resumable");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W1(c) — two backups claimed for the same file in the same millisecond get
+/// distinct names, and neither replaces an earlier backup.
+#[test]
+fn two_backups_in_the_same_millisecond_get_distinct_names() {
+    let tmp = scratch("backup-names");
+    let dst = tmp.join(format!("{SID}.jsonl"));
+    std::fs::write(&dst, b"x").unwrap();
+    let earlier = tmp.join(format!("{SID}.jsonl.diverged-1000"));
+    std::fs::write(&earlier, b"an earlier backup").unwrap();
+
+    let first = claim_diverged_backup_at(&dst, 1000).unwrap();
+    let second = claim_diverged_backup_at(&dst, 1000).unwrap();
+    assert_ne!(first, second);
+    assert_ne!(first, earlier);
+    assert_ne!(second, earlier);
+    assert!(
+        first.is_file() && second.is_file(),
+        "both names are claimed"
+    );
+    assert_eq!(
+        std::fs::read(&earlier).unwrap(),
+        b"an earlier backup",
+        "an earlier backup is never replaced"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// S1 — the main transcript is classified prefix-first from one read. The
+/// live source grows between the carry's stat and its comparison (`after_stat`
+/// appends to it): a destination identical to the source as stat'ed is a
+/// strict prefix of the grown one and is EXTENDED, never moved aside as a
+/// same-size fork.
+#[test]
+fn a_source_that_grows_after_the_stat_is_extended_not_forked() {
+    let tmp = scratch("growing-source");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[]);
+    seed_session(&dst, WD, SID, &[]);
+    let src_main = crate::terminal::transcript::session_transcript_path(&src, WD, SID);
+
+    let carried = carry_session_with(
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+        WD,
+        SID,
+        MainTranscript::LiveSourceWins,
+        |from, to| std::fs::rename(from, to),
+        || append(&src_main, b"{\"type\":\"assistant\"}\n"),
+    )
+    .unwrap();
+    assert_eq!(carried.main, MainCarry::ExtendedPrefix);
+    assert!(diverged_backups(&dst).is_empty(), "no fork was invented");
+    assert_eq!(
+        read_main(&dst),
+        b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -1047,11 +1302,15 @@ fn a_failed_rename_aside_fails_the_carry_and_overwrites_nothing() {
         SID,
         MainTranscript::LiveSourceWins,
         |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        || {},
     )
     .unwrap_err();
     assert!(err.contains("could not be moved aside"), "got: {err}");
     assert_eq!(read_main(&dst), FORK_MAIN, "the fork is untouched");
-    assert!(diverged_backups(&dst).is_empty());
+    assert!(
+        diverged_backups(&dst).is_empty(),
+        "the claimed placeholder is removed again"
+    );
     assert_eq!(
         std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
         br#"{"customTitle":"fork"}"#,
@@ -1084,9 +1343,19 @@ fn extend_prefix_keeps_a_diverged_main_transcript() {
         carried.session_dir,
         SessionDirCarry {
             skipped_present: 1,
-            skipped_other: 1,
+            diverged_kept: 1,
             ..SessionDirCarry::default()
-        }
+        },
+        "a kept subagent fork is `diverged_kept`, not `skipped_other` (not followed)"
+    );
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"a\nfork\n"
     );
     assert_eq!(
         std::fs::read(literal_sidecar(&dst).join("custom-title.json")).unwrap(),
@@ -1524,5 +1793,59 @@ async fn a_writer_still_live_at_the_deadline_skips_the_sync() {
     assert!(
         seen.load(Ordering::SeqCst) > 1,
         "it kept looking until the deadline"
+    );
+}
+
+/// W3(b) — a look that completes AFTER the deadline is discarded, whatever it
+/// saw. Each look here takes 300 ms and the pause is 600 ms against a 1 s
+/// deadline: the first look (done at 0.3 s) sees the writer gone, the second
+/// starts at 0.9 s and only returns at 1.2 s — past the deadline. Accepting it
+/// would start the sync after the deadline, outside the window the continue
+/// nudge's wait is sized for.
+#[tokio::test(start_paused = true)]
+async fn a_gone_look_that_completes_after_the_deadline_does_not_count() {
+    let started = tokio::time::Instant::now();
+    let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = looks.clone();
+    let gone = wait_for_writer_exit(
+        move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                WriterProbe::Gone
+            }
+        },
+        Duration::from_secs(1),
+        Duration::from_millis(600),
+    )
+    .await;
+    assert!(!gone, "the second gone look landed after the deadline");
+    assert_eq!(looks.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(started.elapsed(), Duration::from_millis(1200));
+}
+
+/// W3(b) — no look STARTS after the deadline: the pause is cut short so the
+/// last look lands on it, and a gone streak completed exactly at the deadline
+/// still counts.
+#[tokio::test(start_paused = true)]
+async fn the_last_look_lands_on_the_deadline_and_still_counts() {
+    let started = tokio::time::Instant::now();
+    let gone = wait_for_writer_exit(
+        move || {
+            std::future::ready(if started.elapsed() >= Duration::from_millis(600) {
+                WriterProbe::Gone
+            } else {
+                WriterProbe::Alive
+            })
+        },
+        Duration::from_secs(1),
+        Duration::from_millis(600),
+    )
+    .await;
+    assert!(gone);
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(1),
+        "looks at 0, 0.6 and 1.0 s — the last one cut short onto the deadline"
     );
 }
