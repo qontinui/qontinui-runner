@@ -161,6 +161,7 @@ mod git_supervision;
 // the worktree census, the reclaim-safety probe, the fleet tree publisher and
 // the build-drift baseline, none of which may assume `origin/main`.
 mod git_trunk;
+mod paced_loop;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
 mod blind_spots;

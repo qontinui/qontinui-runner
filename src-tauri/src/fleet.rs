@@ -64,6 +64,11 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// Which directories the tree publisher fetches, keyed by git COMMON dir
+/// (plan `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// Phase 2).
+mod tree_fetch;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -4815,7 +4820,7 @@ fn last_skill_parity_at() -> &'static std::sync::Mutex<Option<std::time::Instant
 
 /// True when the parity check is due (never run, or last run at least
 /// [`skill_parity_interval`] ago). Records `now` when it returns true, so
-/// back-to-back ticks do not double-walk. Mirrors [`fetch_due`].
+/// back-to-back ticks do not double-walk. Mirrors [`tree_fetch::fetch_due`].
 fn skill_parity_due(now: std::time::Instant) -> bool {
     skill_parity_due_at(now, skill_parity_interval())
 }
@@ -4957,7 +4962,10 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 )]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let dot_git = repo_path.join(".git");
-    if !dot_git.exists() {
+    // A pruned worktree's dangling `.git` file still `exists()`; git can open
+    // no repository there, so the `rev-parse HEAD` below would only fail into
+    // the same `None` — one wasted git (3 processes on Windows) per cycle.
+    if !dot_git.exists() || qontinui_runner_lib::git_layout::git_provably_absent(repo_path) {
         return None;
     }
 
@@ -5086,8 +5094,11 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // On the five governed `master`-trunk repos the old literal named a ref
     // that does not exist, so `rev-list` failed and `behind_count` collapsed
     // to `None` for every detached capture.
+    // Resolved ONCE per capture (it was resolved twice: here and for
+    // `local_ahead` below — two `git` calls each).
+    let default_branch = resolve_default_branch(repo_path);
     let remote_ref = if head_detached || branch == "(detached)" {
-        format!("origin/{}", resolve_default_branch(repo_path))
+        format!("origin/{default_branch}")
     } else {
         format!("origin/{branch}")
     };
@@ -5140,8 +5151,8 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // default branch from `origin/HEAD` (e.g. `origin/main` -> `main`),
     // falling back to `main`. No network fetch — uses last-fetched refs,
     // same posture as `behind_count` above. This used to be an inlined
-    // duplicate of `resolve_default_branch`; both now share one resolver.
-    let default_branch = resolve_default_branch(repo_path);
+    // duplicate of `resolve_default_branch`; both now share one resolver,
+    // resolved once above.
     let local_ahead: Option<i32> = git_out(&[
         "-C",
         repo_path.to_str()?,
@@ -5276,49 +5287,8 @@ fn pull_executor_enabled() -> bool {
 // real throttle, not a kill switch — the default fetches every publish cycle.
 // =============================================================================
 
-/// Resolve the per-repo fetch interval. Reads `COORD_TREE_FETCH_INTERVAL_SECS`,
-/// falling back to `COORD_TREE_PUBLISH_INTERVAL_SECS`, then 60; floored at 5s.
-fn tree_fetch_interval() -> Duration {
-    let secs: u64 = std::env::var("COORD_TREE_FETCH_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(60)
-        .max(5);
-    Duration::from_secs(secs)
-}
-
-/// Process-global per-repo last-fetch timestamps for the interval gate.
-fn last_fetch_at(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
-    static LAST_FETCH: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
-    > = std::sync::OnceLock::new();
-    LAST_FETCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// True when `repo_path` is due a fetch (never fetched, or last fetch is at
-/// least `tree_fetch_interval()` ago). Records `now` as the attempt time when
-/// it returns true, so concurrent/back-to-back ticks don't double-fetch.
-fn fetch_due(repo_path: &std::path::Path, now: std::time::Instant) -> bool {
-    let interval = tree_fetch_interval();
-    let mut map = match last_fetch_at().lock() {
-        Ok(m) => m,
-        Err(p) => p.into_inner(),
-    };
-    let due = match map.get(repo_path) {
-        Some(prev) => now.duration_since(*prev) >= interval,
-        None => true,
-    };
-    if due {
-        map.insert(repo_path.to_path_buf(), now);
-    }
-    due
-}
+// The fetch interval and its per-key gate live in `fleet/tree_fetch.rs`, keyed
+// by git COMMON dir rather than by directory.
 
 /// Best-effort `git -C <path> fetch origin --prune` (no refspec). Blocking git;
 /// call from a blocking context. Non-zero/spawn errors `warn!` and return — a
@@ -5417,6 +5387,28 @@ fn apply_pull_verdict_blocking(
             git_op: None,
         },
         "default_ref_sync" => {
+            // `refs/heads/<default>` is ONE ref for a primary and every linked
+            // worktree of it, so a sync another checkout of the same repo
+            // already attempted this interval is not repeated (measured
+            // 2026-10-23: 17 of these ran on linked worktrees in 90 s).
+            if let Err(prior) =
+                tree_fetch::claim_ref_sync(repo_path, &default_branch, std::time::Instant::now())
+            {
+                return PullOutcome {
+                    chosen_option: "ref_sync_shared".to_string(),
+                    reasoning: format!(
+                        "local {default_branch} is shared with {} (same git common dir), \
+                         whose ref sync ran within the fetch interval with outcome {} — \
+                         not repeated",
+                        prior.dir.display(),
+                        prior
+                            .outcome
+                            .as_deref()
+                            .unwrap_or("UNKNOWN (still running)")
+                    ),
+                    git_op: None,
+                };
+            }
             // Pure local-default ref fast-forward; never touches the checked-out
             // tree. git refuses a non-ff ref update, so an unpushed local
             // default is safe.
@@ -5427,7 +5419,7 @@ fn apply_pull_verdict_blocking(
                 "origin",
                 &format!("{default_branch}:{default_branch}"),
             ]);
-            match out {
+            let outcome = match out {
                 Ok(o) if o.status.success() => PullOutcome {
                     chosen_option: "default_ref_sync".to_string(),
                     reasoning: format!("fast-forwarded local {default_branch} ref to origin"),
@@ -5453,7 +5445,9 @@ fn apply_pull_verdict_blocking(
                     reasoning: format!("git fetch invocation failed: {e}"),
                     git_op: None,
                 },
-            }
+            };
+            tree_fetch::record_ref_sync_outcome(repo_path, &default_branch, &outcome.chosen_option);
+            outcome
         }
         "pull" => {
             if !timing_now {
@@ -6100,6 +6094,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         return Ok(());
     }
+    // One generation for every fetch and ref sync this cycle attempts, so a
+    // repository is fetched once per cycle even when the cycle outlasts the
+    // fetch interval (`tree_fetch`).
+    let fetch_cycle = Some(tree_fetch::begin_cycle());
     // Phase 3 unified-devices rename: the on-disk file is still
     // `~/.qontinui/machine.json` (legacy filename, kept for tooling
     // back-compat) but the in-memory `DeviceFile` struct now exposes
@@ -6226,7 +6224,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // on machines with no manual `git fetch` cadence. Interval-gated by
         // COORD_TREE_FETCH_INTERVAL_SECS; best-effort (failures warn, never
         // fail the cycle). Runs on the blocking pool like capture_tree below.
-        if fetch_due(&path, std::time::Instant::now()) {
+        // Keyed by git COMMON dir, and only for a directory git can open:
+        // a husk is never fetched, and linked worktrees share their
+        // primary's fetch (`tree_fetch`).
+        if tree_fetch::fetch_target(&path, std::time::Instant::now(), fetch_cycle).is_some() {
             let fetch_path = path.clone();
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
@@ -6343,9 +6344,9 @@ pub async fn publish_tree_state() -> Result<(), String> {
 /// Spawn the periodic tree-state publisher on the ambient tokio runtime.
 ///
 /// Interval read from `COORD_TREE_PUBLISH_INTERVAL_SECS` (default 60s,
-/// floored at 5s). `MissedTickBehavior::Skip` mirrors `spawn_heartbeat`
-/// above. Failures `warn!` and retry on the next tick; the loop never
-/// panics.
+/// floored at 5s), measured from the END of each cycle, so a cycle longer
+/// than the interval can never run back to back. Failures `warn!` and retry
+/// on the next cycle; the loop never panics.
 pub fn spawn_tree_publisher() {
     // `coord.primary_trees` rows are keyed by this device and describe the repos
     // on the BOX, so they are machine-scoped by the same definition the budget is.
@@ -6368,31 +6369,48 @@ pub fn spawn_tree_publisher() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.tree_publisher",
         move |hb| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Rebuilt with the loop on a supervised restart, so a restart
             // starts with no streak — a fresh loop has no episode to back off
             // from.
-            let mut shed = crate::resource_guard::BackgroundShed::new(
-                "tree_publisher",
-                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
-            );
-            loop {
-                tick.tick().await;
-                // The heartbeat ticks whether or not the cycle is shed: a
-                // deliberately idle loop is a live loop, and the supervisor must
-                // not rebuild it for yielding.
-                hb.tick();
-                shed_gated_cycle(
-                    &mut shed,
-                    &crate::resource_guard::background_work_verdict(),
-                    "fleet::tree_publisher",
-                    publish_tree_state,
-                )
-                .await;
-            }
+            let mut cycle = PublisherCycle {
+                hb,
+                shed: crate::resource_guard::BackgroundShed::new(
+                    "tree_publisher",
+                    crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+                ),
+            };
+            // Paced from the END of each cycle (`paced_loop`), not on a fixed
+            // tick: a cycle longer than the interval restarted at once under
+            // the old `Skip` tick, so its git spawn rate was bounded only by
+            // process creation.
+            crate::paced_loop::run_paced(Duration::from_secs(secs), None, &mut cycle).await;
         },
     );
+}
+
+/// One tree-publisher cycle: tick the supervisor heartbeat, then run the
+/// shed-gated publish.
+struct PublisherCycle {
+    hb: crate::worker_supervisor::Heartbeat,
+    // Rebuilt with the loop on a supervised restart, so a restart starts with
+    // no streak — a fresh loop has no episode to back off from.
+    shed: crate::resource_guard::BackgroundShed,
+}
+
+impl crate::paced_loop::PacedCycle for PublisherCycle {
+    async fn run(&mut self) {
+        // The heartbeat ticks whether or not the cycle is shed: a deliberately
+        // idle loop is a live loop, and the supervisor must not rebuild it for
+        // yielding.
+        self.hb.tick();
+        shed_gated_cycle(
+            &mut self.shed,
+            &crate::resource_guard::background_work_verdict(),
+            "fleet::tree_publisher",
+            publish_tree_state,
+        )
+        .await;
+    }
 }
 
 /// One periodic tick of a fleet background loop, gated at its HEAD on the
@@ -6693,7 +6711,8 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
     let is_behind = {
         let repo = repo_path.clone();
         spawn_blocking_tracked(move || {
-            if fetch_due(&repo, std::time::Instant::now()) {
+            // Outside the publisher's cycle: the interval alone gates it.
+            if tree_fetch::fetch_target(&repo, std::time::Instant::now(), None).is_some() {
                 fetch_remote_refs_blocking(&repo);
             }
             check_if_behind(&repo)
@@ -7587,34 +7606,8 @@ mod tests {",
 
     // ---- repo-freshness Layer 1 — fetch interval gate ----
 
-    #[test]
-    fn fetch_due_first_call_true_then_immediate_false() {
-        // Unique path so the process-global last-fetch map can't collide with
-        // another test. The interval is >= 5s for any env config, so an
-        // immediately-following call is never due regardless of the knob.
-        let p = std::path::PathBuf::from(format!(
-            "/tmp/freshness-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let t0 = std::time::Instant::now();
-        // Never-fetched repo is due, and records the attempt.
-        assert!(fetch_due(&p, t0), "first call should be due");
-        // A call right after (well inside the >=5s interval) is not due.
-        assert!(
-            !fetch_due(&p, std::time::Instant::now()),
-            "immediate re-call should not be due"
-        );
-    }
-
-    #[test]
-    fn tree_fetch_interval_floored_at_5s() {
-        // Even with no env set the default is 60s; the floor guarantees >= 5s.
-        assert!(tree_fetch_interval() >= Duration::from_secs(5));
-    }
+    // `fetch_due` / `tree_fetch_interval` tests moved with the code to
+    // `fleet/tree_fetch.rs`.
 
     // ---- chkguard Phase 3 — restore_default executor (real temp git) ----
 
