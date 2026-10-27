@@ -116,13 +116,7 @@ pub fn decide_migration_identity(
     rows: &[RegistryRow],
     clock_verified: bool,
 ) -> MigrationIdentity {
-    let unknown = |why: String| {
-        if clock_verified {
-            MigrationIdentity::Unknown(why)
-        } else {
-            MigrationIdentity::Unverifiable(why)
-        }
-    };
+    let unknown = |why: String| unestablished_identity(why, clock_verified);
     if let Some(dir) = rows
         .iter()
         .find(|r| r.validity == RowValidity::Unknown(UnknownRow::RegistryDirUnreadable))
@@ -160,11 +154,21 @@ pub fn decide_migration_identity(
             why.as_str()
         ));
     }
-    let valid_pane: Vec<&RegistryRow> = pane_rows
-        .iter()
-        .copied()
-        .filter(|r| r.validity.is_valid())
-        .collect();
+    // One process, one identity: the SAME file read twice (one config dir
+    // reached under two spellings — the discovery sweep dedups by exact path,
+    // which is case-sensitive while a Windows path is not) is one row, not
+    // two. Only an exact repeat collapses — same pid, same id, same account;
+    // one pid with two DIFFERENT ids (or accounts) stays ambiguous.
+    let mut valid_pane: Vec<&RegistryRow> = Vec::new();
+    for r in pane_rows.iter().copied().filter(|r| r.validity.is_valid()) {
+        if !valid_pane.iter().any(|v| {
+            v.pid == r.pid
+                && v.session_id == r.session_id
+                && same_config_path(&v.config_dir, &r.config_dir)
+        }) {
+            valid_pane.push(r);
+        }
+    }
     let row = match valid_pane.as_slice() {
         [one] => *one,
         [] => {
@@ -216,6 +220,21 @@ pub fn decide_migration_identity(
     }
 }
 
+/// Pure: the identity for "could not be established" (`why`) — refuse
+/// ([`MigrationIdentity::Unknown`]) where the `procStart` clock is verified,
+/// proceed on the record ([`MigrationIdentity::Unverifiable`]) where it is not
+/// ([`PROC_START_CLOCK_VERIFIED`]). EVERY such outcome goes through here —
+/// the decision's own and the I/O resolver's (no pane child, an unreadable
+/// process table, a registry read that did not complete) — so off Windows no
+/// path refuses where the pre-check build migrated.
+pub fn unestablished_identity(why: String, clock_verified: bool) -> MigrationIdentity {
+    if clock_verified {
+        MigrationIdentity::Unknown(why)
+    } else {
+        MigrationIdentity::Unverifiable(why)
+    }
+}
+
 /// Snapshot-level half of the resolver, separated so it is testable without a
 /// live process table: the pane's claude pids from `snapshot`, then the pure
 /// decision.
@@ -248,16 +267,29 @@ pub async fn resolve_migration_identity(
     pane_child_pid: Option<u32>,
     record_sid: &str,
 ) -> (MigrationIdentity, Option<ProcIdentity>) {
+    resolve_migration_identity_with(pane_child_pid, record_sid, PROC_START_CLOCK_VERIFIED).await
+}
+
+/// [`resolve_migration_identity`] with the clock verdict as a parameter, so
+/// the resolver's own early outs are testable in both arms on every OS.
+async fn resolve_migration_identity_with(
+    pane_child_pid: Option<u32>,
+    record_sid: &str,
+    clock_verified: bool,
+) -> (MigrationIdentity, Option<ProcIdentity>) {
     let Some(root) = pane_child_pid else {
         return (
-            MigrationIdentity::Unknown("the pane has no resolvable child pid".into()),
+            unestablished_identity(
+                "the pane has no resolvable child pid".into(),
+                clock_verified,
+            ),
             None,
         );
     };
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snapshot.names.is_empty() {
         return (
-            MigrationIdentity::Unknown("process table unreadable".into()),
+            unestablished_identity("process table unreadable".into(), clock_verified),
             None,
         );
     }
@@ -268,16 +300,15 @@ pub async fn resolve_migration_identity(
         let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
         let rows =
             crate::session::claude_session_registry::read_registry_rows(&config_dirs, &snapshot);
-        resolve_from_snapshot(
-            root,
-            &record_sid_owned,
-            &snapshot,
-            &rows,
-            PROC_START_CLOCK_VERIFIED,
-        )
+        resolve_from_snapshot(root, &record_sid_owned, &snapshot, &rows, clock_verified)
     })
     .await
-    .unwrap_or_else(|e| MigrationIdentity::Unknown(format!("registry read did not complete: {e}")));
+    .unwrap_or_else(|e| {
+        unestablished_identity(
+            format!("registry read did not complete: {e}"),
+            clock_verified,
+        )
+    });
     (identity, writer)
 }
 
@@ -411,22 +442,27 @@ pub fn same_config_dir(a: &str, b: &str) -> bool {
     )
 }
 
-/// The one path comparison [`same_config_dir`] and [`roster_spelling`] share.
-/// On Windows: component by component, each lowercased with `/` normalised to
-/// `\` (only a prefix such as a UNC `//host/share` can still carry one —
-/// `Path` already splits components on both separators and spells the root
-/// as `\`). Elsewhere: `Path` equality, case-sensitive like the filesystem.
-fn same_config_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+/// The one path comparison [`same_config_dir`], [`roster_spelling`] and the
+/// registry reader's config-dir dedup share. On Windows: the whole path
+/// lowercased with `/` normalised to `\`, a verbatim prefix stripped
+/// (`\\?\C:\x` is `C:\x`, `\\?\UNC\host\share` is `\\host\share` — what
+/// `canonicalize` hands back), then compared component by component.
+/// Elsewhere: `Path` equality, case-sensitive like the filesystem.
+pub fn same_config_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     #[cfg(windows)]
     {
         fn key(p: &std::path::Path) -> Vec<String> {
-            p.components()
-                .map(|c| {
-                    c.as_os_str()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .replace('/', "\\")
-                })
+            let s = p.to_string_lossy().to_lowercase().replace('/', "\\");
+            let s = if let Some(rest) = s.strip_prefix(r"\\?\unc\") {
+                format!(r"\\{rest}")
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                rest.to_string()
+            } else {
+                s
+            };
+            std::path::Path::new(&s)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect()
         }
         key(a) == key(b)
@@ -983,5 +1019,136 @@ mod tests {
             "/home/me/./.claude-a"
         ));
         assert!(!same_config_dir("/home/me/.claude-a", "/home/me/.Claude-A"));
+    }
+
+    /// Round-11 S1: a verbatim prefix (`\\?\`, `\\?\UNC\`) — what
+    /// `canonicalize` returns — is the same account as the plain spelling.
+    ///
+    /// Mutation check: dropping either `strip_prefix` arm fails its assertion.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_windows_prefix_is_the_same_config_dir() {
+        assert!(same_config_dir(
+            r"\\?\C:\Users\Me\.claude-a",
+            "c:/users/me/.claude-a"
+        ));
+        assert!(same_config_dir(
+            r"\\?\UNC\Host\Share\.claude-a",
+            "//host/share/.claude-a"
+        ));
+        assert!(!same_config_dir(
+            r"\\?\C:\Users\Me\.claude-a",
+            r"C:\Users\Me\.claude-b"
+        ));
+    }
+
+    /// Round-11 W1: one config dir read twice under two spellings gives one
+    /// pid two VALID rows with the SAME id. That is one identity, not an
+    /// ambiguity — before the fix every hint on such an account resolved to
+    /// `Unknown("2 valid registry rows")` and migration was silently off.
+    /// One pid with two DIFFERENT ids, or the same id under two different
+    /// accounts, stays ambiguous.
+    ///
+    /// Mutation check: reverting the (pid, id, account) collapse to a plain
+    /// valid-row filter fails the first assertion.
+    #[test]
+    fn one_pid_read_twice_under_two_spellings_is_one_identity() {
+        let twice = vec![
+            row(P2_PID, REC, "C:/claude/.claude-erik", RowValidity::Valid),
+            row(P2_PID, REC, "C:/claude/./.claude-erik/", RowValidity::Valid),
+        ];
+        assert_eq!(
+            decide_migration_identity(REC, &[P2_PID], &twice),
+            MigrationIdentity::Confirmed {
+                sid: REC.into(),
+                config_dir: PathBuf::from("C:/claude/.claude-erik"),
+            }
+        );
+        #[cfg(windows)]
+        {
+            let cased = vec![
+                row(P2_PID, REC, r"C:\claude\.claude-Erik", RowValidity::Valid),
+                row(P2_PID, REC, "C:/claude/.claude-erik", RowValidity::Valid),
+            ];
+            assert!(matches!(
+                decide_migration_identity(REC, &[P2_PID], &cased),
+                MigrationIdentity::Confirmed { .. }
+            ));
+        }
+        let two_ids = vec![
+            row(P2_PID, REC, "C:/claude/.claude-erik", RowValidity::Valid),
+            row(
+                P2_PID,
+                "506a0190",
+                "C:/claude/.claude-erik",
+                RowValidity::Valid,
+            ),
+        ];
+        assert!(matches!(
+            decide_migration_identity(REC, &[P2_PID], &two_ids),
+            MigrationIdentity::Unknown(ref why) if why.starts_with("2 valid registry rows")
+        ));
+        let two_accounts = vec![
+            row(P2_PID, REC, "C:/claude/.claude-erik", RowValidity::Valid),
+            row(P2_PID, REC, "C:/claude/.claude-lukas", RowValidity::Valid),
+        ];
+        assert!(matches!(
+            decide_migration_identity(REC, &[P2_PID], &two_accounts),
+            MigrationIdentity::Unknown(_)
+        ));
+    }
+
+    /// Round-11 W4: "could not be established" maps through ONE pure fn on
+    /// every path — refuse where the clock is verified, proceed on the record
+    /// where it is not — so the resolver's own early outs (no pane child, an
+    /// unreadable table, a registry read that did not complete) no longer
+    /// refuse off Windows. Both arms run on every OS.
+    ///
+    /// Mutation check: returning `Unknown` regardless of `clock_verified`
+    /// fails the second assertion; the decision's own unknowns use it too
+    /// (the empty-pane case at `clock_verified = false`).
+    #[test]
+    fn an_unestablished_identity_refuses_only_where_the_clock_is_verified() {
+        assert_eq!(
+            unestablished_identity("process table unreadable".into(), true),
+            MigrationIdentity::Unknown("process table unreadable".into())
+        );
+        assert_eq!(
+            unestablished_identity("process table unreadable".into(), false),
+            MigrationIdentity::Unverifiable("process table unreadable".into())
+        );
+        assert!(matches!(
+            super::decide_migration_identity(REC, &[], &[], false),
+            MigrationIdentity::Unverifiable(_)
+        ));
+        assert!(matches!(
+            migration_verdict(
+                unestablished_identity("no pane child".into(), false),
+                REC,
+                MigrationTrigger::UsageLimitHint
+            ),
+            MigrationVerdict::ProceedOnRecord { .. }
+        ));
+    }
+
+    /// Round-11 W4, the resolver's own wiring: a pane with no resolvable
+    /// child pid (an early out that needs no I/O) maps through the clock
+    /// verdict — `Unverifiable` off a verified clock, `Unknown` on one.
+    ///
+    /// Mutation check: returning `MigrationIdentity::Unknown` directly from
+    /// the resolver's early out fails the first assertion.
+    #[tokio::test]
+    async fn the_resolvers_early_outs_follow_the_clock_verdict() {
+        let (identity, writer) = resolve_migration_identity_with(None, REC, false).await;
+        assert!(
+            matches!(identity, MigrationIdentity::Unverifiable(_)),
+            "{identity:?}"
+        );
+        assert_eq!(writer, None);
+        let (identity, _) = resolve_migration_identity_with(None, REC, true).await;
+        assert!(
+            matches!(identity, MigrationIdentity::Unknown(_)),
+            "{identity:?}"
+        );
     }
 }

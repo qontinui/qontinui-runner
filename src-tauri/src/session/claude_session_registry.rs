@@ -569,12 +569,26 @@ fn read_registry_file_once(path: &Path) -> Result<String, String> {
 /// read or parse is retried ONCE after [`REGISTRY_RETRY_DELAY`]; a missing
 /// `sessions/` is normal and silent; any OTHER listing error is recorded in
 /// [`RawRegistry::dir_errors`], never dropped.
+///
+/// A config dir listed twice under two spellings (the discovery sweep dedups
+/// by exact path, which is case-sensitive while a Windows path is not — e.g.
+/// `.claude-Erik` from settings and `.claude-erik` from the scan) is read
+/// ONCE, by [`crate::terminal::migration_identity::same_config_path`]:
+/// reading it twice would hand every consumer two copies of each row.
 pub fn read_raw_registry(config_dirs: &[std::path::PathBuf]) -> RawRegistry {
     let mut raw = RawRegistry {
         complete: true,
         ..RawRegistry::default()
     };
+    let mut seen: Vec<&std::path::PathBuf> = Vec::new();
     for dir in config_dirs {
+        if seen
+            .iter()
+            .any(|s| crate::terminal::migration_identity::same_config_path(s, dir))
+        {
+            continue;
+        }
+        seen.push(dir);
         let sessions = dir.join("sessions");
         let entries = match std::fs::read_dir(&sessions) {
             Ok(entries) => entries,
@@ -1363,6 +1377,29 @@ mod tests {
         assert!(ok.content.is_ok());
         assert_eq!(raw.dir_errors.len(), 1, "{:?}", raw.dir_errors);
         assert_eq!(raw.dir_errors[0].0, file_not_dir);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Round-11 W1: one config dir listed under two spellings is read once.
+    ///
+    /// Mutation check: dropping the `seen` dedup reads the file twice.
+    #[test]
+    fn read_raw_registry_reads_a_twice_spelled_dir_once() {
+        let root = tmpdir("twice");
+        let acct = root.join(".claude-paktis");
+        fs::write(
+            acct.join("sessions").join("8.json"),
+            r#"{"pid":8,"sessionId":"s"}"#,
+        )
+        .unwrap();
+        let respelled = root.join(".").join(".claude-paktis");
+        let mut dirs = vec![acct.clone(), respelled];
+        if cfg!(windows) {
+            dirs.push(root.join(".CLAUDE-PAKTIS"));
+        }
+        let raw = read_raw_registry(&dirs);
+        assert_eq!(raw.files.len(), 1, "{:?}", raw.files);
+        assert_eq!(raw.files[0].config_dir, acct);
         let _ = fs::remove_dir_all(&root);
     }
 
