@@ -258,6 +258,24 @@ fn a_limit_line_above_a_short_dialog_is_not_the_limit_wait() {
     );
 }
 
+/// Round-12 S6: the real banner directly over an input box holding an
+/// unsent draft is not the limit wait, so no `Esc` (it could wipe the
+/// draft); the placeholder is not a draft.
+///
+/// Mutation check: dropping the draft term fails the first assertion.
+#[test]
+fn a_banner_over_an_unsent_draft_sends_no_esc() {
+    let with_draft = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n";
+    assert!(!screen_shows_limit_wait(with_draft));
+    assert!(!esc_still_warranted(Some(with_draft)));
+    assert_eq!(
+        decide_stall(Some(with_draft), Exhaustion::NotExhausted, false),
+        StallAction::Stalled(StallReason::UnrecognisedScreen)
+    );
+    let placeholder = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ Try \"fix the tests\"\n────────\n";
+    assert!(screen_shows_limit_wait(placeholder));
+}
+
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///

@@ -149,11 +149,30 @@ struct PromptLine {
 
 fn prompt_line(screen: &ScreenText) -> Option<PromptLine> {
     let row = screen.lines.get(usize::from(screen.cursor_row))?;
+    prompt_row(row)
+}
+
+/// The `❯` marker's column on `row` and the text after it, trimmed
+/// (including a non-breaking space and a box edge `│`); `None` without one.
+fn prompt_row(row: &str) -> Option<PromptLine> {
     let chars: Vec<char> = row.chars().collect();
     let marker_col = chars.iter().position(|&c| c == '❯')?;
     let rest: String = chars[marker_col + 1..].iter().collect();
     let input = rest.trim().trim_end_matches('│').trim().to_string();
     Some(PromptLine { marker_col, input })
+}
+
+/// The ONE draft rule: input-line text that is neither empty nor the CLI's
+/// empty-prompt placeholder is something the operator typed and has not sent.
+fn is_unsent_draft(input: &str) -> bool {
+    !input.is_empty() && !input.starts_with(PLACEHOLDER_PREFIX)
+}
+
+/// Whether `row` is a `❯` input row holding an unsent draft, by the same rule
+/// [`input_prompt_ready`] refuses on. For screen rules that read rendered
+/// text without a cursor (the migration follow-up's limit-wait gate).
+pub(crate) fn row_holds_unsent_draft(row: &str) -> bool {
+    prompt_row(row).is_some_and(|line| is_unsent_draft(&line.input))
 }
 
 /// The column typed input starts at: the marker, one separator, then input.
@@ -230,7 +249,7 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
             screen.cursor_col
         ));
     }
-    if !line.input.is_empty() && !line.input.starts_with(PLACEHOLDER_PREFIX) {
+    if is_unsent_draft(&line.input) {
         return Err(
             "the input line holds text that is not the empty-prompt placeholder".to_string(),
         );
