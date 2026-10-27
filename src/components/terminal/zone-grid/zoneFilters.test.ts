@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   clearTabFilter,
+  pruneTabFilters,
   setTabFilter,
   toggleFilterInputTab,
   zoneFiltersFor,
@@ -53,5 +54,16 @@ describe("zone filters keyed by tab", () => {
     expect(zoneOfTab({ 0: "a" }, open)).toBeNull();
     expect(toggleFilterInputTab(open, "b")).toBeNull();
     expect(toggleFilterInputTab(open, "a")).toBe("a");
+  });
+
+  it("pruning drops closed tabs' filters and their open input, same identity otherwise", () => {
+    const filters = setTabFilter(setTabFilter({}, "a", "1"), "gone", "2");
+    expect(pruneTabFilters(filters, "gone", new Set(["a"]))).toStrictEqual({
+      filters: { a: "1" },
+      openInput: null,
+    });
+    const kept = pruneTabFilters(filters, "a", new Set(["a", "gone"]));
+    expect(kept.filters).toBe(filters);
+    expect(kept.openInput).toBe("a");
   });
 });
