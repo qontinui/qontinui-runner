@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { useDisplayTitleResolver } from "./displayTitle";
-import type { LayoutPreset } from "./useZoneLayout";
+import type { LayoutPreset, ZoneAssignments } from "./useZoneLayout";
+import { migrateZoneMetadataByTab } from "./zoneAutoTrim";
 import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
 import { tmuxMountedTabIds } from "./terminalWorkMode";
 import {
@@ -88,6 +89,7 @@ type GridAction =
   | { type: "SET_ZONE_FILTER"; zoneIndex: number; value: string }
   | { type: "CLEAR_ZONE_FILTER"; zoneIndex: number }
   | { type: "TOGGLE_FILTER_INPUT"; zoneIndex: number }
+  | { type: "MIGRATE_ZONE_FILTERS"; prev: ZoneAssignments; next: ZoneAssignments }
   | { type: "SET_COL_RATIOS"; ratios: number[] }
   | { type: "SET_ROW_RATIOS"; ratios: number[] }
   | { type: "TICK_UPTIME" };
@@ -107,6 +109,19 @@ function gridReducer(state: GridState, action: GridAction): GridState {
       const next = { ...state.zoneFilters };
       delete next[action.zoneIndex];
       return { ...state, zoneFilters: next };
+    }
+    case "MIGRATE_ZONE_FILTERS": {
+      // An output filter belongs to a session, not to a zone index: it follows
+      // its tab on EVERY assignment change, whatever moved it.
+      const zoneFilters = migrateZoneMetadataByTab(state.zoneFilters, action.prev, action.next);
+      const openInput =
+        state.showFilterInput === null
+          ? state.showFilterInput
+          : (Object.keys(
+              migrateZoneMetadataByTab({ [state.showFilterInput]: true }, action.prev, action.next),
+            ).map(Number)[0] ?? null);
+      if (zoneFilters === state.zoneFilters && openInput === state.showFilterInput) return state;
+      return { ...state, zoneFilters, showFilterInput: openInput };
     }
     case "TOGGLE_FILTER_INPUT":
       return {
@@ -258,6 +273,18 @@ function ZoneGridInner({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
+
+  // Output filters are keyed by the zone a cell's cosmetics live in (its grid
+  // zone; in tmux mode the snapshot's), so they follow their tab through the
+  // GRID's assignments: a swap, a drag, a close, a grow, a trim, a compaction.
+  const gridAssignments = zoneLayout.gridView.assignments;
+  const prevGridAssignmentsRef = useRef(gridAssignments);
+  useEffect(() => {
+    const prev = prevGridAssignmentsRef.current;
+    if (prev === gridAssignments) return;
+    prevGridAssignmentsRef.current = gridAssignments;
+    dispatch({ type: "MIGRATE_ZONE_FILTERS", prev, next: gridAssignments });
+  }, [gridAssignments]);
 
   // ── Prompts panel: which sessions are showing the operator's own prompts ──
   //

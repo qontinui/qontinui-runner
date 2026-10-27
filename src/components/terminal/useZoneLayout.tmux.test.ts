@@ -354,7 +354,7 @@ describe("layout requests by source", () => {
   it("spawn in tmux stays in tmux, and the spawned tab is shown", () => {
     const render = inTmuxFromSplit();
     const r = render(["a", "b", "n"]);
-    r.setLayoutId("quad", { source: "spawn" });
+    r.setLayoutId("quad", { source: "auto" });
     r.showSpawnedTab("n");
     expect(view(render())).toStrictEqual({
       workMode: "tmux",
@@ -410,7 +410,7 @@ describe("layout requests by source", () => {
 
   it("grid mode is unchanged: every source applies, showSpawnedTab is a no-op", () => {
     const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"]);
-    render().setLayoutId("quad", { source: "spawn" });
+    render().setLayoutId("quad", { source: "auto" });
     expect(render().layoutId).toBe("quad");
     render().setLayoutId("triptych", { source: "restore" });
     expect(render().layoutId).toBe("triptych");

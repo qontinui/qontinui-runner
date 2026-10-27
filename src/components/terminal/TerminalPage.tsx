@@ -1207,7 +1207,7 @@ function TerminalPageInner({
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
-    zoneLayout.setLayoutId(layoutId, { source: "spawn" });
+    zoneLayout.setLayoutId(layoutId, { source: "auto" });
     const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
     // Plain shells have no `--tenant` grammar (F3 is `/spawn-ai` only), so
     // they always take the picker's current selection.
@@ -1233,7 +1233,7 @@ function TerminalPageInner({
   ): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
-    zoneLayout.setLayoutId(layoutId, { source: "spawn" });
+    zoneLayout.setLayoutId(layoutId, { source: "auto" });
     const spawnTenant = resolveTenantForSpawn(tenantId);
 
     const isWindows = navigator.platform.startsWith("Win");

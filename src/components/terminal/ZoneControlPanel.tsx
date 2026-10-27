@@ -18,6 +18,7 @@ import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 import { tabsForIds } from "./useZoneLayout";
+import { readAutoTrimEnabled, writeAutoTrimEnabled } from "./zoneAutoTrim";
 import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
 import {
   LayoutGrid,
@@ -315,6 +316,39 @@ function StateFilterBar({
         </button>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// AutoTrimToggle
+// ---------------------------------------------------------------------------
+
+/**
+ * "Shrink the grid when tabs close": the per-runner-instance auto-trim
+ * preference (`zoneAutoTrim.ts`), beside the layout choices it qualifies. On
+ * by default. Off restores grow-only exactly. The hook reads the stored value
+ * when a trim is about to apply, so this toggle only has to write it.
+ */
+function AutoTrimToggle() {
+  const [enabled, setEnabled] = useState(readAutoTrimEnabled);
+  const onChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    writeAutoTrimEnabled(e.target.checked);
+    setEnabled(e.target.checked);
+  }, []);
+  return (
+    <label
+      className="flex items-center gap-2 px-3 py-1.5 border-t border-[#2a2d3d] text-[10px] text-[#565f89] hover:text-[#c0caf5] cursor-pointer transition-colors"
+      title="When the runner grew the grid for new tabs, shrink it back as tabs close. A layout you picked yourself is never shrunk."
+    >
+      <input
+        type="checkbox"
+        checked={enabled}
+        onChange={onChange}
+        data-ui-bridge-id="terminal.zone-auto-trim"
+        className="accent-[#7aa2f7]"
+      />
+      Shrink the grid when tabs close
+    </label>
   );
 }
 
@@ -1203,7 +1237,8 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
         )}
       </div>
 
-      {/* Workspaces section (above footer) */}
+      {/* Layout: auto-trim preference, then workspaces (above footer) */}
+      <AutoTrimToggle />
       <WorkspacesSection
         workspaces={workspaces}
         onSave={handleSaveWorkspace}

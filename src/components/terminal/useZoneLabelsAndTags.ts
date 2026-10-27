@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
+import { migrateZoneMetadataByTab, migrateZoneSetByTab, type LayoutOrigin } from "./zoneAutoTrim";
 
 const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
 
@@ -25,6 +26,14 @@ export function useZoneLabelsAndTags(
   layoutId: string,
   assignments: Record<number, string>,
   pageId: string = "default",
+  /**
+   * The origin of the switch that produced `layoutId`
+   * (`useZoneLayout().layoutSwitchOrigin`). An `auto` switch (a grow, a trim,
+   * a quick launch, a compaction) moved tiles the operator did not move, so
+   * labels, notes and pins follow their TAB to its new zone. Any other switch
+   * keeps the per-layout sets: choosing a layout is choosing its saved set.
+   */
+  layoutSwitchOrigin: LayoutOrigin | null = null,
 ): UseZoneLabelsAndTagsReturn {
   const pk = (key: string) => pageKey(pageId, key);
   // ── State ─────────────────────────────────────────────────────────────────
@@ -95,12 +104,22 @@ export function useZoneLabelsAndTags(
   }, [pinnedZones, layoutId]);
 
   // ── Reload labels/pins when layout changes, with pin migration ────────────
+  // An `auto` switch carries labels, notes and pins by tab (old zone → tab →
+  // new zone, `migrateZoneMetadataByTab`). Any other switch reloads the
+  // target layout's sets and migrates pins by tab on top of them.
 
   const prevLayoutIdRef2 = useRef(layoutId);
   const prevAssignmentsRef = useRef<Record<number, string>>(assignments);
 
   useEffect(() => {
-    if (prevLayoutIdRef2.current !== layoutId) {
+    if (prevLayoutIdRef2.current !== layoutId && layoutSwitchOrigin === "auto") {
+      const prevAssignments = prevAssignmentsRef.current;
+      prevLayoutIdRef2.current = layoutId;
+      prevAssignmentsRef.current = assignments;
+      setZoneLabels((prev) => migrateZoneMetadataByTab(prev, prevAssignments, assignments));
+      setZoneNotes((prev) => migrateZoneMetadataByTab(prev, prevAssignments, assignments));
+      setPinnedZones((prev) => migrateZoneSetByTab(prev, prevAssignments, assignments));
+    } else if (prevLayoutIdRef2.current !== layoutId) {
       // Capture which TAB IDs were pinned using the previous layout's assignments
       const pinnedTabIds = new Set<string>();
       for (const zoneIdx of pinnedZones) {

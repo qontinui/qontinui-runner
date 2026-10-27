@@ -24,6 +24,13 @@ import {
   type SessionKeyOf,
   type TerminalWorkMode,
 } from "./terminalWorkMode";
+import {
+  autoTrimHold,
+  computeAutoTrimLayoutId,
+  parseLayoutOrigin,
+  readAutoTrimEnabled,
+  type LayoutOrigin,
+} from "./zoneAutoTrim";
 
 // ── Layout Definitions ─────────────────────────────────────────────────────
 
@@ -228,10 +235,14 @@ export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
  *
  * A closed tile therefore leaves an empty tile, exactly as a close leaves an
  * empty zone in the preset layouts, and the next new tab fills the lowest one
- * (`reconcileAssignments`). Nothing re-packs the survivors. Zone labels,
- * notes, pins and output filters are keyed by zone index, so a tile moved by
- * anything but the operator would silently wear another tile's metadata. The
- * grid still shrinks whenever the highest tiles close.
+ * (`reconcileAssignments`). A close alone re-packs nothing, and the grid
+ * still shrinks whenever the highest tiles close. Survivors move only on a
+ * layout switch: the operator's, or a runner-originated one (auto-trim
+ * leaving flow-grid for `full-grid` at 9 tabs or fewer, `zoneAutoTrim.ts`;
+ * a compaction). Zone labels, notes and pins are keyed by zone index, so a
+ * runner-originated switch carries them by TAB (`migrateZoneMetadataByTab`)
+ * rather than letting a moved tile wear another tile's metadata; output
+ * filters follow their tab on every assignment change (`ZoneGrid`).
  *
  * Dead assignments (a tab already gone from `tabIds`, not yet dropped by the
  * reconcile effect) are ignored, so a closing tab cannot hold the grid open.
@@ -271,8 +282,13 @@ export function resolveLayout(layoutId: string, tabCount: number): LayoutPreset 
  * synthesized `flow-grid`. Pure — exported so EVERY consumer shares ONE
  * mapping: the `+ new terminal` quick-launch path
  * ({@link computeQuickLaunchLayoutId}, called from `useZoneActions`), the
- * in-hook auto-grow effect ({@link computeAutoGrowLayoutId}), the
- * layout-mismatch suggestion chip (`suggestions/rules.ts`), and the unit test.
+ * tab-bar quick launch and AI launch (`TerminalPage.tsx`), the in-hook
+ * auto-grow effect ({@link computeAutoGrowLayoutId}), the in-hook auto-trim
+ * effect (`computeAutoTrimLayoutId` in `zoneAutoTrim.ts`: the trim target is
+ * what auto-grow would have grown to, so a spawn right after a trim needs no
+ * re-flow), the "keep AI sessions" compaction, tmux mode's snapshot-less
+ * exit, the layout-mismatch suggestion chip (`suggestions/rules.ts`), and the
+ * unit tests.
  * Inline copies once lived in `TerminalPage.tsx`, `useZoneActions.ts` and
  * `suggestions/rules.ts`; the latter two had drifted (no flow-grid rung).
  *
@@ -298,8 +314,13 @@ export function pickLayout(totalTabs: number): string {
  *
  * Rules (all enforced here so the effect stays a thin wrapper, and the test can
  * assert them without React):
- *   - **grow only, never shrink**: only returns a target whose zone count is
- *     STRICTLY GREATER than the current layout's; fewer tabs → null.
+ *   - **this reducer only grows**: it only returns a target whose zone count
+ *     is STRICTLY GREATER than the current layout's; fewer tabs → null. The
+ *     shrink is a separate decision with its own guards
+ *     (`computeAutoTrimLayoutId`, `zoneAutoTrim.ts`): it trims only a layout
+ *     the runner chose, only after a tab-count decrease, and only once no
+ *     restore, compaction, maximize or tmux hold is active, so an operator's
+ *     roomy layout is never shrunk under them.
  *   - **capacity-driven**: only grows when `tabCount` exceeds the current
  *     layout's zone capacity.
  *   - **grows INTO `flow-grid` at tab 10** (via `pickLayout`): the flow-grid
@@ -349,9 +370,10 @@ export function computeAutoGrowLayoutId(
  * whatever holes existed, and the auto-grow effect regrew the layout but not
  * the arrangement — one silent re-shuffle of the operator's grid per spawn.
  *
- * Grow-only, like every other path `pickLayout` feeds: a target with fewer
- * zones than the current layout is refused (`null`), so this path can never
- * be the one that compacts assignments.
+ * Grow-only: a target with fewer zones than the current layout is refused
+ * (`null`), so a spawn never compacts assignments. Shrinking is auto-trim's
+ * job alone (`zoneAutoTrim.ts`), which runs after a close, never on a spawn,
+ * and carries zone metadata by tab when it moves a tile.
  */
 export function computeQuickLaunchLayoutId(
   currentLayoutId: string,
@@ -397,6 +419,12 @@ interface PersistedState {
   mruSessionKeys?: Record<string, string>;
   /** The grid to restore when tmux mode exits (`null` in grid mode). */
   gridSnapshot?: GridSnapshot | null;
+  /**
+   * Who chose `layoutId` (`zoneAutoTrim.ts`): only an `auto` layout is
+   * trimmed when tabs close. Absent on pages saved before the field existed,
+   * which read as `operator`, so no page shrinks on upgrade.
+   */
+  layoutOrigin?: LayoutOrigin;
   // NOTE: older builds persisted a `pinned` latch here that suppressed
   // auto-grow. The concept is removed (it hid live sessions as zoneless
   // tabs); a stale `pinned` key in storage is simply ignored on load.
@@ -714,6 +742,12 @@ export function useZoneLayout(
    * grid zone across a runner restart, which re-creates its tab under a new id.
    */
   sessionKeyByTab?: ReadonlyMap<string, string>,
+  /**
+   * Has this page's restore settled (`useTerminalManager().initialized`)?
+   * Until it has, tab-count changes are the restore drain, not closes, so an
+   * owed auto-trim waits. Defaults to settled for callers with no restore.
+   */
+  initialized: boolean = true,
 ) {
   const [persistedState] = useState(() => loadPersistedState(pageId, windowLabel));
   const [initialMode] = useState(() => loadWorkModeState(persistedState));
@@ -749,6 +783,18 @@ export function useZoneLayout(
   const [assignments, setAssignments] = useState<ZoneAssignments>(
     persistedState?.assignments ?? {},
   );
+  /** Who chose `layoutId`; `undefined` = a page persisted before the field. */
+  const [layoutOrigin, setLayoutOrigin] = useState<LayoutOrigin | undefined>(() =>
+    parseLayoutOrigin(persistedState?.layoutOrigin),
+  );
+  /**
+   * The origin of the switch that produced the current `layoutId`, committed
+   * with it: `auto` or `operator` as for `layoutOrigin`, `null` for a switch
+   * that is neither (a boot restore, a tmux enter or toggle exit).
+   * `useZoneLabelsAndTags` reads it to carry labels and notes by tab on an
+   * `auto` switch.
+   */
+  const [layoutSwitchOrigin, setLayoutSwitchOrigin] = useState<LayoutOrigin | null>(null);
   const [focusedZone, setFocusedZone] = useState<number>(
     initialMode.workMode === "tmux" ? 0 : (persistedState?.focusedZone ?? 0),
   );
@@ -852,6 +898,8 @@ export function useZoneLayout(
       mru,
       mruSessionKeys,
       gridSnapshot,
+      // Written only once known: an absent origin must stay absent (legacy).
+      ...(layoutOrigin ? { layoutOrigin } : {}),
     });
   }, [
     pageId,
@@ -863,6 +911,7 @@ export function useZoneLayout(
     mru,
     mruSessionKeys,
     gridSnapshot,
+    layoutOrigin,
   ]);
 
   // Reconcile assignments with the live tabs. Grid: auto-assign tabs to empty
@@ -961,10 +1010,11 @@ export function useZoneLayout(
   }, [assignments, maximizedZone, tabIds]);
 
   // Shared layout-application logic: switch the preset and redistribute
-  // assignments. Used by BOTH the operator-facing `setLayoutId` and the
-  // programmatic auto-grow effect.
+  // assignments. Used by the request-facing `setLayoutId` and the
+  // programmatic auto-grow and auto-trim effects. `origin` is who chose the
+  // layout; `null` (a boot restore) keeps the stored origin.
   const applyLayout = useCallback(
-    (id: string) => {
+    (id: string, origin: LayoutOrigin | null) => {
       // `resolveLayout` accepts the synthetic `flow-grid` id (auto-grow calls
       // `applyLayout` directly, so a plain `LAYOUT_PRESETS.find` returning
       // undefined would EAT the grow into flow mode). Unknown ids resolve to
@@ -980,6 +1030,8 @@ export function useZoneLayout(
       const zoneCount = zoneCountFor(committedRef.current.assignments);
 
       setLayoutIdState(id);
+      if (origin !== null) setLayoutOrigin(origin);
+      setLayoutSwitchOrigin(origin);
       setMaximizedZone(null);
 
       // Reassign: preserve every in-range assignment exactly; compact only
@@ -1009,7 +1061,7 @@ export function useZoneLayout(
   useEffect(() => {
     const target = computeAutoGrowLayoutId(layoutId, tabIds.length, workMode);
     if (target) {
-      applyLayout(target);
+      applyLayout(target, "auto");
     }
   }, [layoutId, tabIds.length, workMode, applyLayout]);
 
@@ -1049,6 +1101,7 @@ export function useZoneLayout(
     setPendingShownKey(null);
     setWorkMode("tmux");
     setLayoutIdState("single");
+    setLayoutSwitchOrigin(null);
     setMaximizedZone(null);
     setFocusedZone(0);
     setAssignments(shown === null ? {} : { 0: shown });
@@ -1103,6 +1156,10 @@ export function useZoneLayout(
       setGridSnapshot(null);
       setPendingShownKey(null);
       setLayoutIdState(next.layoutId);
+      // A preset pick is an operator choice of layout. A toggle exit returns
+      // to the grid as it was, with the origin it had.
+      if (presetId !== null) setLayoutOrigin("operator");
+      setLayoutSwitchOrigin(presetId !== null ? "operator" : null);
       setAssignments(next.assignments);
       setFocusedZone(next.focusedZone);
       setMaximizedZone(null);
@@ -1126,9 +1183,15 @@ export function useZoneLayout(
    *   - `operator` (picker, layout chords, `/layout`, profile/workspace load):
    *     applied in grid mode; in tmux mode it is an explicit request for a
    *     grid, so it exits tmux and applies the preset over the restored grid.
-   *   - `spawn` (a new terminal growing the grid) and `restore` (mount
-   *     re-applying the saved preset): applied in grid mode; no-ops in tmux,
-   *     which would otherwise end on every spawn and every reload.
+   *   - `auto` (a layout the runner chose: a quick or AI launch growing the
+   *     grid) and `restore` (mount re-applying the saved preset): applied in
+   *     grid mode; no-ops in tmux, which would otherwise end on every spawn
+   *     and every reload.
+   *
+   * The source also records the layout's origin (`zoneAutoTrim.ts`), which
+   * decides whether closing tabs may trim it: `operator` and `auto` record
+   * themselves; `restore` keeps the stored origin, because stamping it would
+   * turn every auto page into a never-trimmed one (or the reverse) on restart.
    */
   const setLayoutId = useCallback(
     (id: string, request: { source: LayoutRequestSource }) => {
@@ -1140,7 +1203,7 @@ export function useZoneLayout(
         if (request.source === "operator") exitTmux(id);
         return;
       }
-      applyLayout(id);
+      applyLayout(id, request.source === "restore" ? null : request.source);
     },
     [applyLayout, exitTmux],
   );
@@ -1233,6 +1296,8 @@ export function useZoneLayout(
       const snapshot = committedRef.current.gridSnapshot;
       const snapshotFocused = snapshot ? snapshot.assignments[snapshot.focusedZone] : undefined;
       const compacted = compactAssignments(ordered);
+      // The grid tmux returns to is now the runner's choice.
+      setLayoutOrigin("auto");
       setGridSnapshot({
         layoutId: pickLayout(ordered.length),
         assignments: compacted,
@@ -1243,10 +1308,64 @@ export function useZoneLayout(
     }
     const focusedTab = committedRef.current.assignments[focusedZone];
     setLayoutIdState(pickLayout(ordered.length));
+    setLayoutOrigin("auto");
+    setLayoutSwitchOrigin("auto");
     setAssignments(compactAssignments(ordered));
     setMaximizedZone(null);
     setFocusedZone(Math.max(0, focusedTab ? ordered.indexOf(focusedTab) : 0));
   }, [pendingCompaction, tabIds, focusedZone, sessionKeyOf]);
+
+  // ── Auto-trim: shrink a runner-chosen layout when tabs close ──────────────
+  // A tab-count DECREASE latches a trim as owed; the owed trim applies once no
+  // hold is active (`autoTrimHold`), from the count as it is THEN. The holds
+  // are this effect's dependencies, so releasing one re-runs it: never a
+  // timer, never "the next close". Mount, load and upgrade never trim, since
+  // the count starts at the mount-time count and no decrease has been seen.
+  // Restore reservations clear inside an assignment update, which is why
+  // `assignments` is a dependency. No thrash with auto-grow: the target is
+  // `pickLayout(count)`, which fits the tabs, so neither reducer has anything
+  // to do after the other.
+  const prevTabCountRef = useRef(tabIds.length);
+  const trimOwedRef = useRef(false);
+  useEffect(() => {
+    const tabCount = tabIds.length;
+    if (tabCount < prevTabCountRef.current) trimOwedRef.current = true;
+    prevTabCountRef.current = tabCount;
+    if (!trimOwedRef.current) return;
+    const hold = autoTrimHold({
+      initialized,
+      reservedZoneCount: reservedZonesRef.current.size,
+      compactionPending: pendingCompaction !== null,
+      maximizedZone,
+      workMode,
+    });
+    if (hold !== null) return;
+    trimOwedRef.current = false;
+    if (!readAutoTrimEnabled()) return;
+    const target = computeAutoTrimLayoutId(
+      layoutId,
+      layoutOrigin,
+      tabCount,
+      layout.zones.length,
+      workMode,
+    );
+    // A layout switch in reaction to committed state (a close, a hold
+    // releasing), exactly like auto-grow above: it cannot be derived during
+    // render, because the owed latch spans commits.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (target) applyLayout(target, "auto");
+  }, [
+    tabIds.length,
+    initialized,
+    assignments,
+    pendingCompaction,
+    maximizedZone,
+    workMode,
+    layoutId,
+    layoutOrigin,
+    layout.zones.length,
+    applyLayout,
+  ]);
 
   const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
     // tmux mode renders zone 0 only: assigning there is a swap (the MRU effect
@@ -1464,6 +1583,8 @@ export function useZoneLayout(
   return {
     layout,
     layoutId,
+    layoutOrigin,
+    layoutSwitchOrigin,
     setLayoutId,
     assignments,
     assignTabToZone,
