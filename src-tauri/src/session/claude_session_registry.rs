@@ -498,28 +498,77 @@ impl RegistryRow {
 }
 
 /// Parse one registry file into a [`RegistryRow`], validated against
-/// `snapshot`. `None` for malformed JSON or an empty `sessionId`.
+/// `snapshot`. `None` for malformed JSON, or JSON with no usable `pid` or a
+/// missing / empty `sessionId`.
+///
+/// The typed [`RegistryFile`] parse is tried first. JSON it rejects — a
+/// field of an unexpected TYPE, e.g. a future CLI writing `procStart` as a
+/// number — is read leniently ([`lenient_registry_fields`]) rather than
+/// dropped. Dropped, it became an `UnreadableFile` row with an empty id and
+/// no `kind` (counted as interactive), which made every migration on the box
+/// `MaybeHeldElsewhere` for as long as that process lived.
 pub fn parse_registry_row(
     bytes: &str,
     config_dir: &Path,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
 ) -> Option<RegistryRow> {
-    let raw: RegistryFile = serde_json::from_str(bytes).ok()?;
-    if raw.session_id.trim().is_empty() {
+    let fields = match serde_json::from_str::<RegistryFile>(bytes) {
+        Ok(raw) => LenientRegistryFields {
+            pid: raw.pid,
+            session_id: raw.session_id,
+            kind: raw.kind,
+            proc_start: raw.proc_start,
+            pid_domain: raw.pid_domain,
+        },
+        Err(_) => lenient_registry_fields(&serde_json::from_str(bytes).ok()?)?,
+    };
+    if fields.session_id.trim().is_empty() {
         return None;
     }
     let validity = registry_row_validity(
-        raw.pid,
-        raw.proc_start.as_deref(),
-        raw.pid_domain.as_deref(),
+        fields.pid,
+        fields.proc_start.as_deref(),
+        fields.pid_domain.as_deref(),
         snapshot,
     );
     Some(RegistryRow {
-        pid: raw.pid,
-        session_id: raw.session_id,
+        pid: fields.pid,
+        session_id: fields.session_id,
         config_dir: config_dir.to_path_buf(),
-        kind: raw.kind,
+        kind: fields.kind,
         validity,
+    })
+}
+
+/// The fields [`parse_registry_row`] needs from one registry file.
+struct LenientRegistryFields {
+    pid: u32,
+    session_id: String,
+    kind: Option<String>,
+    proc_start: Option<String>,
+    pid_domain: Option<String>,
+}
+
+/// Pure: the identity fields of a registry file that is valid JSON but does
+/// not match [`RegistryFile`]'s types. A number or a string is accepted for
+/// `pid` and `procStart` (a number is read as its decimal text, which is what
+/// the Windows FILETIME comparison parses); `sessionId`, `kind` and
+/// `pidDomain` are read only when they are strings. `None` without a usable
+/// `pid` or `sessionId`.
+fn lenient_registry_fields(v: &serde_json::Value) -> Option<LenientRegistryFields> {
+    let text = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_string);
+    let number_or_text = |key: &str| match v.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let pid = number_or_text("pid")?.trim().parse::<u32>().ok()?;
+    Some(LenientRegistryFields {
+        pid,
+        session_id: text("sessionId")?,
+        kind: text("kind"),
+        proc_start: number_or_text("procStart"),
+        pid_domain: text("pidDomain"),
     })
 }
 
@@ -1215,6 +1264,55 @@ mod tests {
             RowValidity::Stale(StaleRow::PidNotLiveClaude)
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Round-12 S1: valid JSON that fails the typed parse (here `procStart`
+    /// as a NUMBER, `status` as an object) is read leniently — its real id,
+    /// kind and procStart — instead of becoming an id-less `UnreadableFile`
+    /// row that reads as a possible holder of every session. Torn content
+    /// still yields `None` (and stays `UnreadableFile` in `rows_from_raw`).
+    ///
+    /// Mutation check: returning `None` on a typed-parse error again fails
+    /// the first assertion.
+    #[test]
+    fn a_registry_file_with_unexpected_field_types_is_read_leniently() {
+        let snap = snap_with(&[(46416, 134_369_000_000_000_000)]);
+        let future = r#"{"pid":46416,"sessionId":"0c4e3025","procStart":134369000000000005,"pidDomain":"win32:spaceship","kind":"sdk-cli","status":{"busy":true}}"#;
+        let row = parse_registry_row(future, Path::new("c"), &snap).expect("read leniently");
+        assert_eq!(row.session_id, "0c4e3025");
+        assert_eq!(row.kind.as_deref(), Some("sdk-cli"));
+        assert!(!row.is_interactive());
+        assert_eq!(
+            row.validity,
+            registry_row_validity(
+                46416,
+                Some("134369000000000005"),
+                Some("win32:spaceship"),
+                &snap
+            )
+        );
+        assert_eq!(parse_registry_row("{torn", Path::new("c"), &snap), None);
+        assert_eq!(
+            parse_registry_row(r#"{"pid":46416,"procStart":1}"#, Path::new("c"), &snap),
+            None,
+            "no sessionId: not a row"
+        );
+
+        let raw = RawRegistry {
+            files: vec![RawRegistryFile {
+                config_dir: PathBuf::from("c"),
+                file_pid: Some(46416),
+                content: Ok(future.to_string()),
+            }],
+            dir_errors: Vec::new(),
+            complete: true,
+        };
+        let rows = rows_from_raw(&raw, &snap);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].session_id, "0c4e3025",
+            "not an id-less UnreadableFile row"
+        );
     }
 
     #[test]

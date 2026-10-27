@@ -100,6 +100,8 @@ pub enum MigrationIdentity {
 /// - an UNKNOWN-validity row for a pid that also has a VALID row is a dead
 ///   predecessor's file (one process writes one file) and is disregarded;
 /// - no claude pid in the pane ⇒ unknown (covers an unreadable/empty table);
+/// - only the pane's INTERACTIVE rows count below (a nested headless
+///   `claude -p` row is not the pane's identity);
 /// - any pane row whose validity is UNKNOWN ⇒ unknown (it might be the pane's
 ///   real identity);
 /// - not exactly one VALID pane row ⇒ unknown;
@@ -143,7 +145,16 @@ pub fn decide_migration_identity(
         .filter(|r| !(matches!(r.validity, RowValidity::Unknown(_)) && valid_pids.contains(&r.pid)))
         .collect();
     let in_pane = |pid: u32| pane_claude_pids.contains(&pid);
-    let pane_rows: Vec<&RegistryRow> = rows.iter().copied().filter(|r| in_pane(r.pid)).collect();
+    // Only INTERACTIVE rows can be the pane's identity: a nested headless
+    // `claude -p` run inside the pane writes its own (non-interactive) row,
+    // and counting it made two valid pane rows — `Unknown`, a refused hint
+    // (round-12 review S2). A row whose kind could not be read counts as
+    // interactive ([`RegistryRow::is_interactive`]), so it still blocks.
+    let pane_rows: Vec<&RegistryRow> = rows
+        .iter()
+        .copied()
+        .filter(|r| in_pane(r.pid) && r.is_interactive())
+        .collect();
     if let Some((r, why)) = pane_rows.iter().find_map(|r| match r.validity {
         RowValidity::Unknown(why) => Some((r, why)),
         _ => None,
@@ -1094,6 +1105,37 @@ mod tests {
         ];
         assert!(matches!(
             decide_migration_identity(REC, &[P2_PID], &two_accounts),
+            MigrationIdentity::Unknown(_)
+        ));
+    }
+
+    /// Round-12 S2: a nested headless `claude -p` in the pane writes a valid
+    /// NON-interactive row; it is not the pane's identity, so the pane's one
+    /// interactive row still confirms. Two interactive rows stay ambiguous.
+    ///
+    /// Mutation check: dropping the `is_interactive` filter on the pane rows
+    /// makes the first case `Unknown("2 valid registry rows …")`.
+    #[test]
+    fn a_nested_headless_run_in_the_pane_is_not_a_second_identity() {
+        let mut headless = row(P2_PID + 1, "f00dfeed", ".claude-erik", RowValidity::Valid);
+        headless.kind = Some("sdk-cli".to_string());
+        let rows = vec![
+            row(P2_PID, REC, ".claude-erik", RowValidity::Valid),
+            headless,
+        ];
+        assert_eq!(
+            decide_migration_identity(REC, &[P2_PID, P2_PID + 1], &rows),
+            MigrationIdentity::Confirmed {
+                sid: REC.into(),
+                config_dir: PathBuf::from(".claude-erik"),
+            }
+        );
+        let two_interactive = vec![
+            row(P2_PID, REC, ".claude-erik", RowValidity::Valid),
+            row(P2_PID + 1, "f00dfeed", ".claude-erik", RowValidity::Valid),
+        ];
+        assert!(matches!(
+            decide_migration_identity(REC, &[P2_PID, P2_PID + 1], &two_interactive),
             MigrationIdentity::Unknown(_)
         ));
     }
