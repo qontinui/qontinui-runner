@@ -236,6 +236,9 @@ pub fn scan_grids_once() {
     let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
         return;
     };
+    // Taken BEFORE the terminal list: a pane respawned after this instant may
+    // be missing from `sessions`, and the replay guard's retain keeps it.
+    let scan_started = Instant::now();
     let sessions = tm.sessions_snapshot();
 
     // Decide under the fire-state lock, then dispatch with NO lock held (the
@@ -285,7 +288,7 @@ pub fn scan_grids_once() {
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
         gate.retain_live(&live);
-        super::migration_handoff::retain_live_panes(&live);
+        super::migration_handoff::retain_live_panes(&live, scan_started);
     } // fire-state + scan-gate locks released
 
     for (tid, pattern) in to_fire {

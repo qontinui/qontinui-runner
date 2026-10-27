@@ -979,6 +979,11 @@ pub(crate) async fn prompt_when_idle(
                 ) {
                     Ok(_) => {
                         info!(terminal_id, label, "prompt-when-idle submitted");
+                        // Anything the pane renders after a RUNNER submission
+                        // is the session working, not the transcript
+                        // replaying: lift a migration's replay guard from the
+                        // next scan on (no-op for a pane without one).
+                        crate::terminal::migration_handoff::note_runner_submission(terminal_id);
                         IdlePromptOutcome::Submitted
                     }
                     Err(e) => {
@@ -1724,6 +1729,15 @@ fn migrate_session(
         }
     };
 
+    // The usage-limit watcher must not read the new pane's replayed banner as
+    // news until the pane has produced a turn (Phase 2b). Noted the moment
+    // the respawn is known good — before the old pane closes — so no scan
+    // runs between the new pane existing and its guard (round-11 review W2).
+    crate::terminal::migration_handoff::note_respawned_pane(
+        &new_terminal_id,
+        std::time::Instant::now(),
+    );
+
     // 4. The replacement is up: close the old pane. Its lifecycle row already
     // belongs to the new terminal (step 3), so the exit hook's later
     // `(session id, old terminal)` close must not be resolved against the map
@@ -1753,13 +1767,6 @@ fn migrate_session(
             "old terminal close failed after a successful respawn"
         );
     }
-
-    // The usage-limit watcher must not read the new pane's replayed banner as
-    // news until the pane has produced a turn (Phase 2b).
-    crate::terminal::migration_handoff::note_respawned_pane(
-        &new_terminal_id,
-        std::time::Instant::now(),
-    );
 
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
     // and its exit — detached, because `close` does not wait for the `claude`
