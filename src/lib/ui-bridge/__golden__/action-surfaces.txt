@@ -176,7 +176,7 @@ src/components/terminal/terminalLaunchMenuActions.ts:172	guarded	free	create-bes
 src/components/terminal/terminalLaunchMenuActions.ts:206	guarded	free	create-with-command	schema=yes	arity=-	effect=destructive
 src/hooks/changeTrackingHandler.test.ts:52	builtin	element	click	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts:1360	delegated	component	map	schema=no	arity=-	effect=-
-src/hooks/ui-bridge-events/utils.ts:192	delegated	component	map	schema=no	arity=-	effect=-
+src/hooks/ui-bridge-events/utils.ts:278	delegated	component	map	schema=no	arity=-	effect=-
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:17	literal	component	open-advanced-controls	schema=no	arity=0	effect=read
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:30	literal	component	scroll-to-top	schema=no	arity=0	effect=read
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:39	literal	component	get-pipeline-phase	schema=no	arity=0	effect=read

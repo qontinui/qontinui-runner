@@ -277,7 +277,8 @@ pub struct ApiState {
     /// Phase 3 vision pipeline: content-addressed disk cache for encoded
     /// capture bytes. Key = SHA-256 of (window_handle, scale, mutation_id,
     /// pipeline_hash); value = the verified bytes from `Pipeline::run`.
-    /// Persisted under `tmp_vision_cache/` (scratch-file whitelisted).
+    /// Persisted under the instance-scoped DataLocal dir
+    /// (`mcp::ui_bridge::vision_capture_access::vision_cache_root_from`).
     pub vision_cache: Arc<qontinui_vision_core::VisionCache>,
     /// Phase 3 vision pipeline: bounded permits around the xcap
     /// `spawn_blocking` capture. xcap is GDI-bound on Windows and exhibits
