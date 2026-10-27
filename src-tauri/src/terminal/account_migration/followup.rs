@@ -370,13 +370,35 @@ pub(crate) enum StallAction {
 /// A banner higher up is history — a dialog or a draft below it is what the
 /// CLI is showing now, and an `Esc` would cancel THAT (2026-10-23 review fix
 /// 1). A bare `esc to cancel` also labels many ordinary CLI dialogs, so it
-/// counts only beside a usage-limit phrase.
+/// counts only beside a usage-limit phrase — on the SAME row: a replayed
+/// `5-hour limit reached ∙ resets 3am` line sitting above a short dialog that
+/// ends `Enter to select · Esc to cancel` is two rows, and is the dialog
+/// (round-11 review W3). And when any OTHER bottom row is a numbered choice
+/// or dialog chrome ([`DIALOG_CHROME_MARKERS`](crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS)),
+/// a dialog is showing beside the banner and the `Esc` would cancel it: not a
+/// limit wait. (A banner the CLI wrapped onto two rows therefore reads as
+/// not-a-wait — a reported stall, never a stray `Esc`.)
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
     let bottom = crate::terminal::usage_limit::bottom_rows_text(screen);
-    let normalized = normalize(&bottom);
-    normalized.contains("continuing automatically at")
-        || (normalized.contains("esc to cancel")
-            && crate::terminal::usage_limit::window_indicates_usage_limit(&bottom).is_some())
+    let rows: Vec<&str> = bottom.lines().collect();
+    let is_banner = |row: &str| {
+        let n = normalize(row);
+        n.contains("continuing automatically at")
+            || (n.contains("esc to cancel")
+                && crate::terminal::usage_limit::window_indicates_usage_limit(row).is_some())
+    };
+    let Some(banner) = rows.iter().rposition(|row| is_banner(row)) else {
+        return false;
+    };
+    !rows.iter().enumerate().any(|(i, row)| {
+        i != banner && {
+            let n = normalize(row);
+            crate::terminal::graceful_exit::is_numbered_option(row)
+                || crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS
+                    .iter()
+                    .any(|m| n.contains(m))
+        }
+    })
 }
 
 /// Pure: whether the one `Esc` may be sent on `screen`, re-read IMMEDIATELY

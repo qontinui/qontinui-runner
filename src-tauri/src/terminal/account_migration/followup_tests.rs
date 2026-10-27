@@ -228,6 +228,36 @@ fn a_banner_above_a_bottom_dialog_is_not_the_limit_wait() {
     );
 }
 
+/// Round-11 W3: the banner phrase and `esc to cancel` must share ONE row. A
+/// replayed limit line directly above a short dialog (all of it inside the
+/// bottom rows) is the dialog, and an `Esc` would cancel the operator's
+/// choice; so is a real banner row with a numbered choice or dialog chrome
+/// on another bottom row.
+///
+/// Mutation checks: matching the phrase and `esc to cancel` across the whole
+/// bottom window again fails the first assertion; dropping the other-row
+/// dialog check fails the second and third.
+#[test]
+fn a_limit_line_above_a_short_dialog_is_not_the_limit_wait() {
+    let banner_over_dialog = format!("5-hour limit reached ∙ resets 3am\n{PLAIN_DIALOG}");
+    assert!(!screen_shows_limit_wait(&banner_over_dialog));
+    assert_eq!(
+        decide_stall(Some(&banner_over_dialog), Exhaustion::NotExhausted, false),
+        StallAction::Stalled(StallReason::UnrecognisedScreen)
+    );
+    let wait_beside_dialog = format!(
+        "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n{PLAIN_DIALOG}"
+    );
+    assert!(!screen_shows_limit_wait(&wait_beside_dialog));
+    let wait_beside_choice =
+        "  ⎿  5-hour limit reached ∙ resets 3am · esc to cancel\n❯ 1. Yes\n  2. No\n";
+    assert!(!screen_shows_limit_wait(wait_beside_choice));
+    assert!(
+        screen_shows_limit_wait(LIMIT_WAIT),
+        "the real banner over the idle input box still is"
+    );
+}
+
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///
