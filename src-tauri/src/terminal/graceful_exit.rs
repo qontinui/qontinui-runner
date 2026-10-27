@@ -166,7 +166,7 @@ fn input_start(line: &PromptLine) -> usize {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn is_numbered_option(text: &str) -> bool {
+pub(crate) fn is_numbered_option(text: &str) -> bool {
     let body = text.trim_start_matches(|c: char| c.is_whitespace() || c == '│' || c == '❯');
     let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
     digits > 0 && body[digits..].starts_with(". ")
@@ -183,7 +183,7 @@ fn is_box_edge(line: &str) -> bool {
 /// these do not turn up in an ordinary finished turn ("Do you want me to run
 /// the tests?", "the allowlist"), so a check that must ADMIT the common idle
 /// screen can scan for them without refusing it.
-const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+pub(crate) const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
 
 /// May `/exit` be typed now? `Ok` only for an idle screen whose cursor sits at
 /// the start of an empty `❯` input line with no dialog showing. The `Err`
