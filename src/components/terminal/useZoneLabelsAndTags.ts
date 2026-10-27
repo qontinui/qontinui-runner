@@ -1,7 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
-import { migrateZoneMetadataByTab, migrateZoneSetByTab, type LayoutOrigin } from "./zoneAutoTrim";
+import {
+  INITIAL_LAYOUT_SWITCH,
+  migrateZoneMetadataByTab,
+  migrateZoneSetByTab,
+  rememberVacatedZones,
+  type LayoutSwitch,
+} from "./zoneAutoTrim";
 
 const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
 
@@ -27,13 +33,13 @@ export function useZoneLabelsAndTags(
   assignments: Record<number, string>,
   pageId: string = "default",
   /**
-   * The origin of the switch that produced `layoutId`
-   * (`useZoneLayout().layoutSwitchOrigin`). An `auto` switch (a grow, a trim,
-   * a quick launch, a compaction) moved tiles the operator did not move, so
-   * labels, notes and pins follow their TAB to its new zone. Any other switch
-   * keeps the per-layout sets: choosing a layout is choosing its saved set.
+   * The last layout switch or re-deal (`useZoneLayout().layoutSwitch`). An
+   * `auto` one (a grow, a trim, a quick launch, a compaction — even one that
+   * keeps the layout id) moved tiles the operator did not move, so labels,
+   * notes and pins follow their TAB to its new zone. Any other layout change
+   * takes the per-layout path below, unchanged.
    */
-  layoutSwitchOrigin: LayoutOrigin | null = null,
+  layoutSwitch: LayoutSwitch = INITIAL_LAYOUT_SWITCH,
 ): UseZoneLabelsAndTagsReturn {
   const pk = (key: string) => pageKey(pageId, key);
   // ── State ─────────────────────────────────────────────────────────────────
@@ -103,32 +109,45 @@ export function useZoneLabelsAndTags(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pinnedZones, layoutId]);
 
-  // ── Reload labels/pins when layout changes, with pin migration ────────────
-  // An `auto` switch carries labels, notes and pins by tab (old zone → tab →
-  // new zone, `migrateZoneMetadataByTab`). Any other switch reloads the
-  // target layout's sets and migrates pins by tab on top of them.
+  // ── Follow the tabs on an auto re-deal; reload on any other layout change ─
+  // An `auto` re-deal (keyed on `layoutSwitch.seq`, so a compaction that keeps
+  // the layout id counts) carries labels, notes and pins by tab: old zone →
+  // tab → new zone (`migrateZoneMetadataByTab`). It migrates FROM the last
+  // assignments plus each vacated zone's departed tab (`rememberVacatedZones`),
+  // so a close and its held trim landing in different commits still drop the
+  // closed tab's label instead of leaving it on the index.
+  //
+  // Any other layout change (operator, boot restore, tmux enter/exit) reloads
+  // the target layout's stored sets and migrates pins by tab on top. In
+  // practice the persist effects above run first on that same commit and
+  // write the OUTGOING labels, notes and pins under the new layout's key, so
+  // the "reload" reads them straight back: labels and notes stay on their
+  // zone indices, and pins keep their indices plus the tab-migrated ones.
 
   const prevLayoutIdRef2 = useRef(layoutId);
-  const prevAssignmentsRef = useRef<Record<number, string>>(assignments);
+  const prevSwitchSeqRef = useRef(layoutSwitch.seq);
+  const migrateFromRef = useRef<Record<number, string>>(assignments);
 
   useEffect(() => {
-    if (prevLayoutIdRef2.current !== layoutId && layoutSwitchOrigin === "auto") {
-      const prevAssignments = prevAssignmentsRef.current;
+    const switched = prevSwitchSeqRef.current !== layoutSwitch.seq;
+    prevSwitchSeqRef.current = layoutSwitch.seq;
+    if (switched && layoutSwitch.origin === "auto") {
+      const from = migrateFromRef.current;
       prevLayoutIdRef2.current = layoutId;
-      prevAssignmentsRef.current = assignments;
-      setZoneLabels((prev) => migrateZoneMetadataByTab(prev, prevAssignments, assignments));
-      setZoneNotes((prev) => migrateZoneMetadataByTab(prev, prevAssignments, assignments));
-      setPinnedZones((prev) => migrateZoneSetByTab(prev, prevAssignments, assignments));
+      migrateFromRef.current = assignments;
+      setZoneLabels((prev) => migrateZoneMetadataByTab(prev, from, assignments));
+      setZoneNotes((prev) => migrateZoneMetadataByTab(prev, from, assignments));
+      setPinnedZones((prev) => migrateZoneSetByTab(prev, from, assignments));
     } else if (prevLayoutIdRef2.current !== layoutId) {
       // Capture which TAB IDs were pinned using the previous layout's assignments
       const pinnedTabIds = new Set<string>();
       for (const zoneIdx of pinnedZones) {
-        const tabId = prevAssignmentsRef.current[zoneIdx];
+        const tabId = migrateFromRef.current[zoneIdx];
         if (tabId) pinnedTabIds.add(tabId);
       }
 
       prevLayoutIdRef2.current = layoutId;
-      prevAssignmentsRef.current = assignments;
+      migrateFromRef.current = assignments;
 
       setZoneLabels(
         instanceStorage.getJSON<Record<number, string>>(pk(`zone-labels-${layoutId}`), {}),
@@ -150,10 +169,11 @@ export function useZoneLabelsAndTags(
         instanceStorage.getJSON<Record<number, string>>(pk(`zone-notes-${layoutId}`), {}),
       );
     } else {
-      // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)
-      prevAssignmentsRef.current = assignments;
+      // No layout change (a swap, a close, a fill): track the assignments,
+      // remembering each vacated zone's departed tab for the next re-deal.
+      migrateFromRef.current = rememberVacatedZones(migrateFromRef.current, assignments);
     }
-  }, [layoutId, assignments]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [layoutId, assignments, layoutSwitch.seq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Memos ─────────────────────────────────────────────────────────────────
 
