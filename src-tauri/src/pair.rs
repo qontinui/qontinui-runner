@@ -3192,7 +3192,11 @@ impl PairCodeRedeemResponse {
             jti: None,
             exp: None,
             tenant_id: Some(self.tenant_id),
-            // The pair-code redeem path does not carry a dmk_ in this phase.
+            // The pair-code redeem response carries no dmk_. Callers enrol one
+            // right after persisting the pairing
+            // (`enrol_machine_key_after_pairing`), so the device never starts
+            // keyless (plan 2026-09-24-runner-coord-credential-stranded-after-
+            // outage Phase 3).
             device_machine_key: None,
         }
     }
@@ -3539,10 +3543,304 @@ pub fn pair_via_browser(
         jti: None,
         exp: None,
         tenant_id: Some(tenant_id.to_string()),
-        // The browser callback delivers only the device JWT; a dmk_ (if any)
-        // is minted server-side and arrives via the pair-cli response path.
+        // The browser callback delivers only the device JWT. The caller
+        // enrols a dmk_ right after persisting the pairing
+        // (`enrol_machine_key_after_pairing`) — before plan
+        // 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3 a
+        // device paired this way never received one.
         device_machine_key: None,
     })
+}
+
+// ============================================================================
+// Machine-key enrolment (plan 2026-09-24-runner-coord-credential-stranded-
+// after-outage Phase 3)
+// ============================================================================
+
+/// Response body of web's two machine-key mint routes —
+/// `DeviceMachineCredentialMintResponse` in qontinui-web
+/// `backend/app/schemas/device.py`. The plaintext key is delivered ONCE; every
+/// successful call ROTATES the key (the previous plaintext dies immediately),
+/// so the caller must persist this before relying on anything else.
+#[derive(Clone, Deserialize)]
+pub struct DeviceMachineKeyMint {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub device_machine_key: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// ISO-8601, or `null` when web did not set one.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// Redacting `Debug`: the plaintext key must never reach a `{:?}` log line.
+impl std::fmt::Debug for DeviceMachineKeyMint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceMachineKeyMint")
+            .field("device_id", &self.device_id)
+            .field("device_machine_key", &"<redacted>")
+            .field("prefix", &self.prefix)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl DeviceMachineKeyMint {
+    /// `expires_at` as unix seconds; `None` when absent or unparseable.
+    pub fn expires_at_unix(&self) -> Option<i64> {
+        let raw = self.expires_at.as_deref()?.trim();
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|t| t.timestamp())
+            .ok()
+            .or_else(|| {
+                // Python's isoformat() on a naive UTC datetime omits the offset.
+                chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+                    .ok()
+                    .map(|n| n.and_utc().timestamp())
+            })
+    }
+}
+
+/// Which of web's two mint doors to knock on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineKeyMintRoute {
+    /// `POST /api/v1/devices/{id}/machine-credential/self-mint`, authenticated
+    /// by an UNEXPIRED coord device JWT for this very device. The door a
+    /// headless runner can use — no human session needed.
+    SelfMint,
+    /// `POST /api/v1/devices/{id}/machine-credential/mint`, authenticated by
+    /// the device OWNER's user bearer (Cognito access token).
+    UserMint,
+}
+
+impl MachineKeyMintRoute {
+    fn path_segment(self) -> &'static str {
+        match self {
+            MachineKeyMintRoute::SelfMint => "self-mint",
+            MachineKeyMintRoute::UserMint => "mint",
+        }
+    }
+}
+
+/// Why an enrolment did not produce a key. Each variant maps to a different
+/// retry posture in the caller, which is the point of typing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineKeyEnrolError {
+    /// 404 / 405: this web build predates the route. Quiet, long backoff —
+    /// never an error loop.
+    RouteUnavailable,
+    /// 403 `device_machine_key_revoked`: the operator revoked this device's
+    /// key. Terminal — do not retry.
+    Revoked,
+    /// 409 `machine_key_still_usable`: web holds an unrevoked key for this
+    /// device with more than 7 days left, and self-mint will not rotate it.
+    /// Either the local expiry is stale (web slides `expires_at` on every
+    /// exchange and does not report it) or the runner lost its copy. A long
+    /// self-mint backoff, not a verdict; the owner's `/mint` can still rotate.
+    ServerKeyStillUsable,
+    /// Any other 401 / 403 (expired or foreign bearer, provenance refused,
+    /// device not owned). Carries web's `detail.code` when it sent one.
+    Refused { status: u16, code: Option<String> },
+    /// 5xx / anything else non-2xx (e.g. web's coord JWKS down).
+    Upstream(u16),
+    /// Could not reach web at all.
+    Transport(String),
+    /// A 2xx whose body was not a usable mint response.
+    Decode(String),
+    /// The key was minted (and the previous one is therefore dead) but could
+    /// not be stored locally.
+    Persist(String),
+}
+
+impl std::fmt::Display for MachineKeyEnrolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MachineKeyEnrolError::RouteUnavailable => {
+                write!(f, "enrolment unavailable (web predates the route)")
+            }
+            MachineKeyEnrolError::Revoked => write!(f, "device machine key revoked"),
+            MachineKeyEnrolError::ServerKeyStillUsable => {
+                write!(f, "web still considers this device's key usable (409)")
+            }
+            MachineKeyEnrolError::Refused { status, code } => {
+                write!(
+                    f,
+                    "refused: HTTP {status} ({})",
+                    code.as_deref().unwrap_or("-")
+                )
+            }
+            MachineKeyEnrolError::Upstream(s) => write!(f, "web answered HTTP {s}"),
+            MachineKeyEnrolError::Transport(e) => write!(f, "transport: {e}"),
+            MachineKeyEnrolError::Decode(e) => write!(f, "decode: {e}"),
+            MachineKeyEnrolError::Persist(e) => write!(f, "persist: {e}"),
+        }
+    }
+}
+
+/// `detail.code` out of a FastAPI error body (`{"detail":{"code":…}}`), if any.
+fn web_detail_code(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("detail")
+        .and_then(|d| d.get("code"))
+        .or_else(|| v.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// Classify a non-2xx mint answer. Pure, so the retry posture is testable
+/// without a server.
+pub fn classify_machine_key_mint_refusal(status: u16, body: &str) -> MachineKeyEnrolError {
+    match status {
+        404 | 405 => MachineKeyEnrolError::RouteUnavailable,
+        401 | 403 => {
+            let code = web_detail_code(body);
+            if code.as_deref() == Some("device_machine_key_revoked") {
+                MachineKeyEnrolError::Revoked
+            } else {
+                MachineKeyEnrolError::Refused { status, code }
+            }
+        }
+        409 if web_detail_code(body).as_deref() == Some("machine_key_still_usable") => {
+            MachineKeyEnrolError::ServerKeyStillUsable
+        }
+        s => MachineKeyEnrolError::Upstream(s),
+    }
+}
+
+/// POST one of web's mint routes (blocking). Empty JSON body; any 2xx is
+/// success (web answers 201). Does NOT persist — see
+/// [`DeviceMachineKeyMint`] for why the caller must, immediately.
+pub fn mint_device_machine_key(
+    web_base: &str,
+    device_id: &str,
+    bearer: &str,
+    route: MachineKeyMintRoute,
+) -> Result<DeviceMachineKeyMint, MachineKeyEnrolError> {
+    let url = format!(
+        "{}/api/v1/devices/{}/machine-credential/{}",
+        web_base.trim_end_matches('/'),
+        device_id,
+        route.path_segment()
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| MachineKeyEnrolError::Transport(format!("client build: {e}")))?;
+    // coord-auth-exempt(not-coord): `qontinui-web`
+    // `/api/v1/devices/{id}/machine-credential/{self-mint|mint}`, authenticated
+    // by this device's coord JWT (self-mint) or its owner's user bearer (mint).
+    let resp = client
+        .post(&url)
+        .bearer_auth(bearer.trim())
+        .json(&serde_json::json!({}))
+        .send()
+        .map_err(|e| MachineKeyEnrolError::Transport(e.to_string()))?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(classify_machine_key_mint_refusal(status.as_u16(), &body));
+    }
+    let mint: DeviceMachineKeyMint =
+        serde_json::from_str(&body).map_err(|e| MachineKeyEnrolError::Decode(e.to_string()))?;
+    if mint.device_machine_key.trim().is_empty() {
+        return Err(MachineKeyEnrolError::Decode(
+            "empty device_machine_key".to_string(),
+        ));
+    }
+    // A 2xx means web has ALREADY rotated the key: the previous plaintext is
+    // dead. Refusing this one over a formatting difference would leave the
+    // device with no key at all, so compare by parsed UUID and only refuse a
+    // body that names a genuinely DIFFERENT device.
+    if let Some(returned) = mint.device_id.as_deref() {
+        if !same_device_id(returned, device_id) {
+            let parsed = (
+                uuid::Uuid::parse_str(returned.trim()),
+                uuid::Uuid::parse_str(device_id.trim()),
+            );
+            if let (Ok(a), Ok(b)) = parsed {
+                if a != b {
+                    return Err(MachineKeyEnrolError::Decode(format!(
+                        "minted for device {returned}, asked for {device_id}"
+                    )));
+                }
+            }
+            // Unparseable on one side: web answered 2xx for OUR route, so the
+            // key is ours. Keep it — dropping it would lose a rotated key.
+            tracing::warn!(
+                "machine-key mint named device {returned:?} for requested {device_id:?} \
+                 (unparseable); storing the key anyway — web already rotated it"
+            );
+        }
+    }
+    Ok(mint)
+}
+
+/// Do two device ids name the same device? By parsed UUID when both parse
+/// (case, braces and hyphenation differences are formatting), else by
+/// case-insensitive trimmed text.
+pub fn same_device_id(a: &str, b: &str) -> bool {
+    match (
+        uuid::Uuid::parse_str(a.trim()),
+        uuid::Uuid::parse_str(b.trim()),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// Enrol a machine key right after an EXPLICIT pairing (pair-code redeem, the
+/// browser callback, or any pairing whose response carried no `dmk_`), so a
+/// newly paired device never starts keyless.
+///
+/// Before this, only the pair-cli response delivered a key; the pair-code and
+/// browser paths hard-coded `device_machine_key: None` and nothing backfilled,
+/// so a device paired those ways had NO recovery once its JWT expired during
+/// an outage — the 2026-09-24 incident on device `eb2155ed`.
+///
+/// Uses the just-minted device JWT as the self-mint bearer. `Ok(false)` = the
+/// pairing response already carried a key (stored by [`persist_pairing`]),
+/// nothing to do. Blocking; best-effort for callers — a failure never undoes
+/// the pairing, and the refresher retries enrolment on its own cadence.
+pub fn enrol_machine_key_after_pairing(
+    web_base: &str,
+    resp: &PairCompleteResponse,
+) -> Result<bool, MachineKeyEnrolError> {
+    let storage = crate::secure_storage::SecureStorage::new()
+        .map_err(|e| MachineKeyEnrolError::Persist(e.to_string()))?;
+    enrol_machine_key_after_pairing_into(&storage, web_base, resp)
+}
+
+/// [`enrol_machine_key_after_pairing`] over an explicit store, so the
+/// "a pairing leaves a machine key behind" contract is testable against a
+/// temp `.enc` with no process-global path.
+pub(crate) fn enrol_machine_key_after_pairing_into(
+    storage: &crate::secure_storage::SecureStorage,
+    web_base: &str,
+    resp: &PairCompleteResponse,
+) -> Result<bool, MachineKeyEnrolError> {
+    if resp
+        .device_machine_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    let device_id = match resp.device_id.as_deref().filter(|d| !d.trim().is_empty()) {
+        Some(d) => d.trim().to_string(),
+        None => read_device_id_from_disk()
+            .map_err(|e| MachineKeyEnrolError::Decode(format!("device_id: {e}")))?,
+    };
+    let mint = mint_device_machine_key(
+        web_base,
+        &device_id,
+        &resp.token,
+        MachineKeyMintRoute::SelfMint,
+    )?;
+    storage
+        .store_device_machine_key_with_expiry(&mint.device_machine_key, mint.expires_at_unix())
+        .map_err(|e| MachineKeyEnrolError::Persist(e.to_string()))?;
+    Ok(true)
 }
 
 // ============================================================================
@@ -4078,6 +4376,19 @@ mod device_identity_invariant_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_machine_key_mint_debug_never_prints_the_key() {
+        let mint = DeviceMachineKeyMint {
+            device_id: Some("d".into()),
+            device_machine_key: "dmk_SECRET_PLAINTEXT".into(),
+            prefix: Some("dmk_SECRE".into()),
+            expires_at: None,
+        };
+        let shown = format!("{mint:?}");
+        assert!(!shown.contains("SECRET_PLAINTEXT"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
     use super::*;
 
     /// Phase 8a reconciliation gate: `response_tenant_ids` must be
@@ -8587,5 +8898,162 @@ mod vanished_paired_user_heal_tests {
             usable_slot_claim_tenants_with(&mgr),
             Some((tb(), vec![ta(), tb()]))
         );
+    }
+}
+
+/// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 6: every
+/// pairing leaves a device machine key behind. The shared post-pairing core
+/// (`commands::web_integration::complete_pairing_after_redeem`) calls
+/// [`enrol_machine_key_after_pairing`]; these drive its store-explicit body
+/// against a mock of web's self-mint route.
+#[cfg(test)]
+mod machine_key_after_pairing_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const PAIRED_JWT: &str = "hdr.payload-of-the-just-minted-device-jwt.sig";
+
+    #[derive(Clone)]
+    struct Mock {
+        status: StatusCode,
+        body: String,
+        /// One entry per hit: (device_id path segment, bearer presented).
+        hits: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    }
+
+    async fn self_mint(
+        State(m): State<Mock>,
+        Path(device_id): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        let bearer = h
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_start_matches("Bearer ").to_string());
+        m.hits.lock().unwrap().push((device_id, bearer));
+        (m.status, m.body.clone())
+    }
+
+    fn spawn(status: StatusCode, body: String) -> (String, Mock) {
+        let mock = Mock {
+            status,
+            body,
+            hits: Arc::new(Mutex::new(Vec::new())),
+        };
+        let served = mock.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/self-mint",
+                        post(self_mint),
+                    )
+                    .with_state(served);
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+                let _ = axum::serve(listener, app).await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), mock)
+    }
+
+    fn store(dir: &tempfile::TempDir) -> crate::secure_storage::SecureStorage {
+        crate::secure_storage::SecureStorage::with_path(dir.path().join("tokens.enc"))
+            .expect("storage")
+    }
+
+    fn paired(dmk: Option<&str>) -> PairCompleteResponse {
+        PairCompleteResponse {
+            token: PAIRED_JWT.to_string(),
+            user_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            device_id: Some(DID.to_string()),
+            jti: None,
+            exp: None,
+            tenant_id: Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string()),
+            device_machine_key: dmk.map(str::to_string),
+        }
+    }
+
+    /// The contract: a pairing whose response carried no key ends with a key
+    /// STORED, minted by presenting the just-paired device JWT.
+    #[test]
+    fn after_a_pairing_a_machine_key_is_stored() {
+        let body = serde_json::json!({
+            "device_id": DID,
+            "device_machine_key": "dmk_minted_after_pairing",
+            "prefix": "dmk_minted_af",
+            "expires_at": "2099-01-01T00:00:00Z",
+        })
+        .to_string();
+        let (base, mock) = spawn(StatusCode::CREATED, body);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
+
+        let enrolled = enrol_machine_key_after_pairing_into(&storage, &base, &paired(None))
+            .expect("enrolment succeeds");
+
+        assert!(enrolled, "a keyless pairing must enrol");
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_minted_after_pairing"),
+            "the minted key must be in the store once the pairing completes"
+        );
+        assert!(
+            storage.get_device_machine_key_expires_at().is_some(),
+            "the key's expiry is stored with it"
+        );
+        assert_eq!(
+            *mock.hits.lock().unwrap(),
+            vec![(DID.to_string(), Some(PAIRED_JWT.to_string()))],
+            "exactly one self-mint, for this device, with the just-paired JWT as bearer"
+        );
+    }
+
+    /// A pairing response that already carried a key (pair-cli) needs no
+    /// second mint: a mint ROTATES the key, so minting again would kill the
+    /// one `persist_pairing` just stored.
+    #[test]
+    fn a_pairing_that_delivered_a_key_mints_nothing() {
+        let (base, mock) = spawn(StatusCode::CREATED, "{}".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+
+        let enrolled =
+            enrol_machine_key_after_pairing_into(&storage, &base, &paired(Some("dmk_from_pair")))
+                .expect("no-op");
+
+        assert!(!enrolled);
+        assert!(mock.hits.lock().unwrap().is_empty(), "no self-mint call");
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
+    }
+
+    /// A refused mint stores nothing and says so — the refresher retries.
+    #[test]
+    fn a_refused_mint_stores_no_key() {
+        let (base, mock) = spawn(StatusCode::FORBIDDEN, r#"{"error":"nope"}"#.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+
+        let got = enrol_machine_key_after_pairing_into(&storage, &base, &paired(None));
+
+        assert!(got.is_err(), "a 403 is not an enrolment: {got:?}");
+        assert_eq!(mock.hits.lock().unwrap().len(), 1);
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
     }
 }
