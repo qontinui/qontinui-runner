@@ -94,15 +94,20 @@ pub(crate) struct TranscriptCopy {
     /// The destination's `<sid>/` side-car dir the carry wrote into (beside
     /// [`Self::path`] — for a long cwd, the source's `<prefix>-<hash>` name).
     pub dst_session_dir: PathBuf,
-    /// Where in the SOURCE `<sid>.jsonl` the tail starts: just past the last
-    /// `\n` in the bytes this carry copied (0 when they hold none), so a line
-    /// the old writer was half-way through appending during the copy is
-    /// rescued WHOLE rather than as an unparseable fragment (2026-10-23 review
-    /// fix 7). Everything past it is the tail [`tail::rescue_tail`] rescues
-    /// (Phase 2b). Recorded whenever this carry wrote the destination
+    /// Where in the SOURCE `<sid>.jsonl` the tail starts: the line boundary
+    /// [`settle_jsonl_end`] left the copy on. After a TORN final line, that is
+    /// just past the last `\n` copied (the fragment was cut, so the line the
+    /// old writer was half-way through appending is rescued WHOLE rather than
+    /// as an unparseable fragment — 2026-10-23 review fix 7); with no complete
+    /// line, 0. After a WHOLE final record the writer had not yet terminated,
+    /// it is the copied length: the copy was completed with its own `\n`, and
+    /// the writer's later `\n` reads as a blank first tail line, which the
+    /// rescue skips. Everything past it is the tail [`tail::rescue_tail`]
+    /// rescues (Phase 2b). Recorded whenever this carry wrote the destination
     /// ([`MainCarry::Copied`], [`MainCarry::ExtendedPrefix`], and
-    /// [`MainCarry::DivergedPreserved`], after which the destination equals the
-    /// source).
+    /// [`MainCarry::DivergedPreserved`]), after which the destination holds the
+    /// source's bytes up to that boundary (plus that `\n`, in the whole-record
+    /// case).
     ///
     /// `None` when this carry copied nothing because the destination already
     /// held the transcript ([`MainCarry::Present`], [`MainCarry::KeptExisting`]
