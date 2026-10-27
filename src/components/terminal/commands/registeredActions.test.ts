@@ -162,7 +162,7 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(42);
+    expect(getAll().length).toBe(44);
   });
 
   /**
@@ -195,7 +195,16 @@ describe("registered actions — the cost/destruction declarations are not empty
         .filter((a) => a.destructive)
         .map((a) => a.id)
         .sort(),
-    ).toEqual(["terminal.approve-all", "terminal.close", "terminal.restart"]);
+    ).toEqual([
+      "terminal.approve-all",
+      // The restart prepare and its cancel type a save-and-pause / resume
+      // notice into live sessions — a keystroke delivered to a subprocess,
+      // which cannot be taken back.
+      "terminal.cancel-restart-prep",
+      "terminal.close",
+      "terminal.prepare-restart",
+      "terminal.restart",
+    ]);
   });
 
   it("leaves the free, local, reversible actions unflagged", () => {

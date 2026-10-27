@@ -1812,6 +1812,35 @@ impl SessionLifecycleStore {
             .unwrap_or(0)
     }
 
+    /// Read-only: the `claude_session_id` a [`Self::record_close_checked`]
+    /// with these arguments would close right now — the requested id, or the
+    /// open record its terminal redirects to — or `None` when it would close
+    /// nothing. Lets a caller read per-session state (the deliberate-end
+    /// marker) for the record that will actually close (review round 14).
+    pub fn close_target(
+        &self,
+        claude_session_id: &str,
+        expect_terminal_id: Option<&str>,
+    ) -> Option<String> {
+        let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
+        // As `record_close_checked`: a superseded terminal's close closes
+        // nothing. Read-only here — the register entry is consumed only by the
+        // close itself.
+        if let Some(t) = expect {
+            // A poisoned register reads "not superseded", as the close does.
+            if self
+                .superseded_terminals
+                .lock()
+                .map(|s| s.contains(t))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+        }
+        let m = self.map.lock().ok()?;
+        resolve_close_target(&m, claude_session_id, expect).0
+    }
+
     /// Close the record the caller's TERMINAL actually owns, not merely the one
     /// its (possibly stale) `claude_session_id` names.
     ///
@@ -3974,6 +4003,124 @@ pub enum CloseOutcome {
     },
 }
 
+/// The close reasons a session dies with when its runner (or its process)
+/// stops without the user asking: restorable within their grace windows.
+pub const RESTORABLE_CLOSE_REASONS: [&str; 2] = ["pty-exit", "poll-dead"];
+
+/// How long after its close a record closed with `reason` stays restorable;
+/// `None` for every reason outside [`RESTORABLE_CLOSE_REASONS`]. The ONE map
+/// from the restorable list to its grace windows.
+///
+/// Since [`witnessed_close_reason`], a `pty-exit` / `poll-dead` close carries
+/// these grace windows only for deaths that were NOT a deliberate end the live
+/// runner witnessed: deaths during shutdown, deaths found at boot (the record
+/// still open from the previous process), deaths with an abnormal or unknown
+/// cause (a holder gone, a signal or OOM kill, a status 0 or a vanished
+/// `claude` with no deliberate-end report), and a `poll-dead` whose shell is
+/// itself dead. A deliberate end (`SessionEnd` `prompt_input_exit`) is
+/// `claude-ended` and has none.
+fn restorable_grace_ms(reason: &str) -> Option<i64> {
+    match reason {
+        "pty-exit" => Some(RESTORABLE_PTY_EXIT_MS),
+        "poll-dead" => Some(RESTORABLE_POLL_DEAD_MS),
+        _ => None,
+    }
+}
+
+/// The close reason of a session the user ended on purpose — `/exit`, as its
+/// own `SessionEnd` hook reported it (`prompt_input_exit`) — whose end the LIVE
+/// runner then saw while it was running and not shutting down. A `claude` that
+/// merely vanished (a crash, an OOM kill, a SIGKILL) is NOT this: it reported
+/// nothing, and stays restart-shaped. Not restart-shaped:
+/// boot restore exists to bring back sessions a RESTART killed, and this one
+/// ended with the runner alive, so it is never auto-resumed (a manual resume
+/// from Past Sessions stays available) and never a restart-prep restore
+/// candidate. Claude Code 2.1.310 writes no transcript record for `/exit`, so
+/// the `SessionEnd` hook is the only positive signal.
+pub const CLAUDE_ENDED_CLOSE_REASON: &str = "claude-ended";
+
+/// How the observed death came about, as far as the observer can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCause {
+    /// The session reported its own deliberate end: Claude Code's `SessionEnd`
+    /// hook with reason `prompt_input_exit` (`/exit`, a double Ctrl-D) —
+    /// `claude_ended_watch::deliberate_end`. The ONLY positive evidence: a
+    /// `claude` hosted under a shell is the shell's child, so its exit status
+    /// is invisible, and a SIGKILL / OOM kill / crash fires no `SessionEnd`.
+    DeliberateEnd,
+    /// A non-zero status, a signal death, or an exit the runner itself
+    /// requested (its kill, a migration hand-off).
+    Abnormal,
+    /// No usable fact: a failed wait, a holder that died without reporting the
+    /// exit, a status 0 with no deliberate-end report, or no pane at all.
+    Unknown,
+}
+
+impl ExitCause {
+    /// The cause a pane exit's recorded facts support. A runner-requested
+    /// close is abnormal whatever else is known. Otherwise a deliberate-end
+    /// report is a deliberate end. A status 0 ALONE is not: Claude Code also
+    /// exits 0 on SIGINT and on its orphan check (its terminal / parent gone —
+    /// a restart's death), so it reads [`ExitCause::Unknown`]. A non-zero
+    /// status (a signal death reads as non-zero) is abnormal; no status at all
+    /// (a failed wait, a PTY holder that died without reporting) is unknown.
+    ///
+    /// TRANSITIONAL COST, accepted (review round 13 S2): a pane whose `claude`
+    /// was started before this runner shipped the `SessionEnd` hook — a pane
+    /// adopted across a runner upgrade, or one whose `--settings` carrier failed
+    /// to materialize — never reports, so its `/exit` reads
+    /// [`ExitCause::Unknown`] and the session is restored at the next boot. That
+    /// fails in the safe direction (a session brought back, never one lost), and
+    /// there is deliberately no status-0 fallback to recover it: status 0 is
+    /// also what SIGINT and the orphan check produce.
+    pub fn of_pane_exit(code: Option<i32>, runner_requested: bool, deliberate_end: bool) -> Self {
+        match (code, runner_requested, deliberate_end) {
+            (_, true, _) => ExitCause::Abnormal,
+            (_, false, true) => ExitCause::DeliberateEnd,
+            (Some(0), false, false) => ExitCause::Unknown,
+            (Some(_), false, false) => ExitCause::Abnormal,
+            (None, false, false) => ExitCause::Unknown,
+        }
+    }
+}
+
+/// PURE: the cause the lifecycle poll's dead-shell close (`poll-dead`) can
+/// claim. Only a LIVING shell (`live_is_alive == Some(true)`) whose session
+/// reported a deliberate end (`deliberate_end`) is a `claude` that ended on
+/// purpose; `claude` merely gone from a living shell is equally an OOM kill, a
+/// SIGKILL or a crash, and a dead PTY is decided by its own exit — both
+/// [`ExitCause::Unknown`], which keeps `poll-dead` restorable. A pane with no
+/// `SessionEnd` hook (adopted across a runner upgrade) never has the marker:
+/// the accepted transitional cost described on [`ExitCause::of_pane_exit`].
+pub fn poll_exit_cause(live_is_alive: Option<bool>, deliberate_end: bool) -> ExitCause {
+    if live_is_alive == Some(true) && deliberate_end {
+        ExitCause::DeliberateEnd
+    } else {
+        ExitCause::Unknown
+    }
+}
+
+/// PURE: the reason a close OBSERVED by the live runner is recorded with.
+///
+/// [`CLAUDE_ENDED_CLOSE_REASON`] — not restorable — ONLY for a restart-shaped
+/// observation (`pty-exit`, `poll-dead`) made while the runner is not shutting
+/// down AND whose cause is [`ExitCause::DeliberateEnd`]. Everything else keeps
+/// its restart-shaped reason and stays restorable: a death during shutdown,
+/// and any death with an abnormal or unknown cause — a PTY holder that died,
+/// an OOM or out-of-band kill, a signal death, `claude` gone with no
+/// deliberate-end report — because those are not the user ending the session.
+/// Any other reason passes through unchanged.
+pub fn witnessed_close_reason(observed: &str, quitting: bool, cause: ExitCause) -> &str {
+    if !quitting
+        && cause == ExitCause::DeliberateEnd
+        && RESTORABLE_CLOSE_REASONS.contains(&observed)
+    {
+        CLAUDE_ENDED_CLOSE_REASON
+    } else {
+        observed
+    }
+}
+
 /// Resolve WHICH record a close is actually about, under the map lock.
 ///
 /// Returns `(target claude_session_id to close, typed outcome)`. A `None`
@@ -4371,10 +4518,8 @@ fn restore_admissible(r: &TerminalSessionRecord, anchors: &RestoreAnchors, now_m
         };
     }
     if r.state == "closed" {
-        let grace = match r.close_reason.as_deref() {
-            Some("pty-exit") => RESTORABLE_PTY_EXIT_MS,
-            Some("poll-dead") => RESTORABLE_POLL_DEAD_MS,
-            _ => return false,
+        let Some(grace) = r.close_reason.as_deref().and_then(restorable_grace_ms) else {
+            return false;
         };
         return match r.closed_at {
             Some(closed_at) => anchors
@@ -4776,11 +4921,22 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   (drained, or drain state unknown). This covers a poll tick that lands
 ///   before the frontend's first ask; when the gate allows, today's handling
 ///   applies (the restore is about to run, or there is no consumer for it).
+/// - `in_active_cohort` ⇒ hold, whatever the phase: the record is an
+///   unfinished row of a restart cohort the rebuilt runner is restoring by
+///   hand (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+///   Phase 6). The boot restore deliberately does NOT take it — it waits as a
+///   placeholder for the operator's Restore — so the latch reading `Ran` says
+///   nothing about it. The hold ends when the row is restored (a this-boot
+///   record), Finished (the caller passes `false` for a finished record) or
+///   the cohort is dismissed (no longer `restoring`). Deliberately not
+///   `mark_restore_pending`, which would stamp a FAILED boot restore on every
+///   placeholder nobody has restored yet.
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
     phase: BootRestorePhase,
     drain_defers_boot_resume: bool,
+    in_active_cohort: bool,
 ) -> bool {
     let Some(boot_at) = boot_at_ms else {
         return false;
@@ -4788,11 +4944,23 @@ pub fn withheld_boot_restore_candidate(
     if last_seen_at >= boot_at {
         return false;
     }
+    if in_active_cohort {
+        return true;
+    }
     match phase {
         BootRestorePhase::Ran => false,
         BootRestorePhase::Withheld => true,
         BootRestorePhase::NotYetRun => drain_defers_boot_resume,
     }
+}
+
+/// The `in_active_cohort` input of [`withheld_boot_restore_candidate`] for
+/// `rec`: an UNFINISHED row of the restart cohort being restored (`cohort` is
+/// [`crate::restart_prep::restore::withheld_cohort_ids`], read once per poll
+/// tick, empty when nothing is restoring). A Finished placeholder is let go:
+/// nothing will restore it, and the orphan close may take it.
+pub fn in_active_cohort(cohort: &HashSet<String>, rec: &TerminalSessionRecord) -> bool {
+    rec.finished_at.is_none() && cohort.contains(&rec.claude_session_id)
 }
 
 /// Match an open record to a live terminal the way the lifecycle poll does: by
@@ -7412,6 +7580,193 @@ mod tests {
         store.record_open(rec("sess-1"));
         store.record_close("sess-1", "poll-dead");
         assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    /// D / review S3 + round 12 S1: only a DELIBERATE end — the session's own
+    /// `SessionEnd` `prompt_input_exit` report — witnessed by the live runner is
+    /// `claude-ended` (not restorable). A holder-gone or signal death, a status
+    /// 0 with no report (SIGINT and the orphan check exit 0), a
+    /// runner-requested close, a death during shutdown, and a record found open
+    /// at boot all stay restorable.
+    #[test]
+    fn a_claude_end_witnessed_while_alive_is_not_restorable() {
+        use ExitCause::*;
+        assert_eq!(ExitCause::of_pane_exit(Some(0), false, true), DeliberateEnd);
+        assert_eq!(ExitCause::of_pane_exit(None, false, true), DeliberateEnd);
+        // Status 0 alone is not evidence.
+        assert_eq!(ExitCause::of_pane_exit(Some(0), false, false), Unknown);
+        // A signal death reads as a non-zero status (in-process and holder
+        // panes alike — `daemon_pane_io::SIGNAL_EXIT_CODE`).
+        assert_eq!(ExitCause::of_pane_exit(Some(137), false, false), Abnormal);
+        // A PTY holder that died without reporting: no status.
+        assert_eq!(ExitCause::of_pane_exit(None, false, false), Unknown);
+        // The runner's own kill / hand-off, even after a reported `/exit`.
+        assert_eq!(ExitCause::of_pane_exit(Some(0), true, true), Abnormal);
+
+        assert_eq!(
+            witnessed_close_reason("pty-exit", false, DeliberateEnd),
+            CLAUDE_ENDED_CLOSE_REASON
+        );
+        assert_eq!(
+            witnessed_close_reason("poll-dead", false, DeliberateEnd),
+            CLAUDE_ENDED_CLOSE_REASON
+        );
+        for cause in [Abnormal, Unknown] {
+            assert_eq!(witnessed_close_reason("pty-exit", false, cause), "pty-exit");
+            assert_eq!(
+                witnessed_close_reason("poll-dead", false, cause),
+                "poll-dead"
+            );
+        }
+        assert_eq!(
+            witnessed_close_reason("pty-exit", true, DeliberateEnd),
+            "pty-exit"
+        );
+        assert_eq!(
+            witnessed_close_reason("explicit", false, DeliberateEnd),
+            "explicit"
+        );
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let open = |id: &str| {
+            let mut r = rec(id);
+            r.terminal_id = format!("term-{id}");
+            store.record_open(r);
+        };
+        let close = |id: &str, observed: &str, quitting: bool, cause: ExitCause| {
+            open(id);
+            store.record_close(id, witnessed_close_reason(observed, quitting, cause));
+        };
+        close("reported-exit", "pty-exit", false, DeliberateEnd);
+        close("holder-gone", "pty-exit", false, Unknown);
+        close("signal-death", "pty-exit", false, Abnormal);
+        close("killed-in-shutdown", "pty-exit", true, DeliberateEnd);
+        open("open-at-boot"); // never closed: the runner died under it
+        let mut restorable: Vec<String> = store
+            .restorable_records(None, true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        restorable.sort();
+        assert_eq!(
+            restorable,
+            [
+                "holder-gone",
+                "killed-in-shutdown",
+                "open-at-boot",
+                "signal-death"
+            ]
+        );
+        assert_eq!(
+            store.get("reported-exit").unwrap().close_reason.as_deref(),
+            Some(CLAUDE_ENDED_CLOSE_REASON)
+        );
+        assert!(!crate::restart_prep::cohort::RESTART_SHAPED_CLOSE_REASONS
+            .contains(&CLAUDE_ENDED_CLOSE_REASON));
+    }
+
+    /// Review S4 / round 12 S1: the lifecycle poll's dead-shell close is
+    /// `claude-ended` only for a living shell whose session reported a
+    /// deliberate end. `claude` merely gone (an OOM kill, a SIGKILL, a crash —
+    /// indistinguishable from `/exit` without the report) or a dead PTY keeps
+    /// `poll-dead`, which is restorable.
+    #[test]
+    fn the_polls_close_is_claude_ended_only_with_a_deliberate_end_report() {
+        let reason = |alive, marker| {
+            witnessed_close_reason("poll-dead", false, poll_exit_cause(alive, marker))
+        };
+        assert_eq!(reason(Some(true), true), CLAUDE_ENDED_CLOSE_REASON);
+        assert_eq!(reason(Some(true), false), "poll-dead");
+        assert_eq!(reason(Some(false), true), "poll-dead");
+        assert_eq!(reason(None, true), "poll-dead");
+        assert!(RESTORABLE_CLOSE_REASONS.contains(&reason(Some(true), false)));
+    }
+
+    /// Review round 14 nit 2: `close_target` names the record a close would
+    /// actually close — the requested id, or the open record its terminal
+    /// redirects to — without closing anything.
+    #[test]
+    fn close_target_names_the_record_a_close_would_close() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("live"));
+        assert_eq!(
+            store.close_target("live", Some("term-abc")).as_deref(),
+            Some("live")
+        );
+        assert_eq!(
+            store.close_target("stale-id", Some("term-abc")).as_deref(),
+            Some("live"),
+            "redirected to the terminal's open record"
+        );
+        assert_eq!(store.close_target("stale-id", None), None);
+        assert_eq!(store.get("live").unwrap().state, "open", "nothing closed");
+    }
+
+    /// Review round 15: a superseded terminal's close closes nothing, so
+    /// `close_target` names nothing — matching `record_close_checked` — and
+    /// reading it does not consume the register entry the close relies on.
+    #[test]
+    fn close_target_names_nothing_for_a_superseded_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("live"));
+        store.mark_terminal_superseded("term-abc", "term-new");
+        assert_eq!(store.close_target("live", Some("term-abc")), None);
+        assert_eq!(
+            store.close_target("live", Some("term-abc")),
+            None,
+            "not consumed"
+        );
+        assert!(matches!(
+            store.record_close_checked("live", Some("term-abc"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+    }
+
+    /// Review round 15: the pane close's marker read follows a redirect — a
+    /// marker recorded on the LIVE id is found through a stale requested id.
+    #[test]
+    fn a_redirected_close_reads_the_live_records_marker() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let live = "af6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+        store.record_open(rec(live));
+        assert!(crate::session::claude_ended_watch::record_session_end(
+            live,
+            "prompt_input_exit"
+        ));
+        // A marker on the stale id too: the redirect still names the live
+        // record, so the live record's marker is the one that is read.
+        let stale = "0d1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6";
+        assert!(crate::session::claude_ended_watch::record_session_end(
+            stale,
+            "prompt_input_exit"
+        ));
+        let target = store.close_target(stale, Some("term-abc"));
+        assert_eq!(target.as_deref(), Some(live));
+        assert!(target.is_some_and(|t| crate::session::claude_ended_watch::deliberate_end(&t)));
+        crate::session::claude_ended_watch::forget_session_end(live);
+        crate::session::claude_ended_watch::forget_session_end(stale);
+    }
+
+    /// Nit 4: exactly the listed reasons have a restore grace window.
+    #[test]
+    fn the_restorable_list_and_its_grace_windows_agree() {
+        for r in RESTORABLE_CLOSE_REASONS {
+            assert!(restorable_grace_ms(r).is_some(), "{r}");
+        }
+        for r in [
+            CLAUDE_ENDED_CLOSE_REASON,
+            "explicit",
+            "user-close",
+            "no-terminal",
+            "superseded",
+        ] {
+            assert!(restorable_grace_ms(r).is_none(), "{r}");
+        }
     }
 
     #[test]
@@ -10951,6 +11306,27 @@ mod tests {
         phase: BootRestorePhase,
         drain_defers_boot_resume: bool,
     ) {
+        simulate_no_terminal_poll_ticks_with_cohort(
+            store,
+            ticks,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            &HashSet::new(),
+        );
+    }
+
+    /// [`simulate_no_terminal_poll_ticks`] with a restoring restart cohort,
+    /// whose unfinished rows the poll passes as `in_active_cohort` exactly as
+    /// `main.rs` does.
+    fn simulate_no_terminal_poll_ticks_with_cohort(
+        store: &SessionLifecycleStore,
+        ticks: u32,
+        boot_at_ms: Option<i64>,
+        phase: BootRestorePhase,
+        drain_defers_boot_resume: bool,
+        cohort: &HashSet<String>,
+    ) {
         let mut consecutive_no_match: HashMap<String, u32> = HashMap::new();
         for _ in 0..ticks {
             for rec in store.open_records() {
@@ -10963,6 +11339,7 @@ mod tests {
                     boot_at_ms,
                     phase,
                     drain_defers_boot_resume,
+                    in_active_cohort(cohort, &rec),
                 );
                 let action = hold_for_withheld_boot_restore(
                     classify(
@@ -11205,24 +11582,127 @@ mod tests {
         assert_eq!(store.get("victim-a").unwrap().state, "open");
     }
 
+    /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):
+    /// after a prepared restart the boot restore HAS run (`Ran`, nothing
+    /// drained) but deliberately left the cohort rows as placeholders. They
+    /// match no terminal on every tick, and must survive far more ticks than
+    /// the orphan debounce — while a non-cohort prior-boot record is closed as
+    /// before, and a Finished placeholder is let go. Nothing here stamps a
+    /// restore tier, so the restore census counts no placeholder as a FAILED
+    /// boot restore.
+    #[test]
+    fn restart_cohort_placeholders_survive_the_orphan_close_and_are_no_failed_restore() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        store.set_finished("victim-b", true, None).unwrap();
+        let cohort: HashSet<String> = ["victim-a", "victim-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            NO_TERMINAL_ORPHAN_TICKS < 5,
+            "5 ticks must exceed the debounce"
+        );
+
+        simulate_no_terminal_poll_ticks_with_cohort(
+            &store,
+            5,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            &cohort,
+        );
+
+        let a = store.get("victim-a").unwrap();
+        assert_eq!(a.state, "open", "an unfinished placeholder stays open");
+        assert_eq!(a.restore_pending_at, None);
+        assert_eq!(a.restore_tier, None);
+        assert_eq!(a.restored_from_boot_at, None);
+        // Not in the cohort: the ordinary orphan close, exactly as before.
+        let ghost = store.get("ghost").unwrap();
+        assert_eq!(ghost.state, "closed");
+        assert_eq!(ghost.close_reason.as_deref(), Some("no-terminal"));
+        // Finished: the shield lets it go.
+        assert_eq!(store.get("victim-b").unwrap().state, "closed");
+
+        let observed = crate::session::restore_census::observe_restored(&store, boot);
+        assert!(
+            observed.is_empty(),
+            "no placeholder may read as an attempted (failed) boot restore: {observed:?}"
+        );
+        // The control: the census DOES count a row once a restore of it is
+        // attempted — which is when, and only when, the resume core stamps it.
+        store.mark_restore_pending("victim-a", true);
+        let observed = crate::session::restore_census::observe_restored(&store, boot);
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(
+            observed[0].restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED)
+        );
+    }
+
+    /// The same 5 ticks with NO restoring cohort (a crash boot, no prepare
+    /// record): the prior-boot records are closed as orphans, exactly as before.
+    #[test]
+    fn without_a_restoring_cohort_the_orphan_close_is_unchanged() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        simulate_no_terminal_poll_ticks(&store, 5, Some(boot), BootRestorePhase::Ran, false);
+        for id in ["victim-a", "victim-b", "ghost"] {
+            assert_eq!(store.get(id).unwrap().state, "closed", "{id}");
+        }
+    }
+
     #[test]
     fn withheld_boot_restore_candidate_truth_table() {
         let boot = Some(1_000);
         use BootRestorePhase::*;
         // Prior-boot record.
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, false));
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, true));
-        assert!(withheld_boot_restore_candidate(999, boot, NotYetRun, true));
-        assert!(!withheld_boot_restore_candidate(
-            999, boot, NotYetRun, false
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, false, false
         ));
-        assert!(!withheld_boot_restore_candidate(999, boot, Ran, true));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, true, false
+        ));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, NotYetRun, false, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, Ran, true, false
+        ));
         // This-boot record: never held.
         assert!(!withheld_boot_restore_candidate(
-            1_000, boot, Withheld, true
+            1_000, boot, Withheld, true, false
         ));
         // No boot instant: nothing is provably prior-boot.
-        assert!(!withheld_boot_restore_candidate(999, None, Withheld, true));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Withheld, true, false
+        ));
+        // A prior-boot row of a restoring restart cohort is held in EVERY phase,
+        // the restore having run included (it is a placeholder, not restored).
+        for phase in [NotYetRun, Withheld, Ran] {
+            for drain in [false, true] {
+                assert!(
+                    withheld_boot_restore_candidate(999, boot, phase, drain, true),
+                    "{phase:?} drain={drain}"
+                );
+            }
+        }
+        // ...but not once it is a this-boot record (restored), nor with no boot
+        // instant.
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Ran, false, true
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Ran, false, true
+        ));
     }
 
     #[test]

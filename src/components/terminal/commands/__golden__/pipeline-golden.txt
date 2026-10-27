@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3148
+# tier: golden   inputs: 3484
 
 /admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 /admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
@@ -213,6 +213,76 @@
 /auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
 /auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound	-
 /auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
+/cancel restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart "3 best"	none	-	null	none	-
+/cancel restart "3 best" --tenant	none	-	null	none	-
+/cancel restart --tenant	none	-	null	none	-
+/cancel restart 1 gmail fix the bug	none	-	null	none	-
+/cancel restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart 3 best	none	-	null	none	-
+/cancel restart 3 best --tenant	none	-	null	none	-
+/cancel restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart prep "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart prep "3 best"	none	-	null	none	-
+/cancel restart prep "3 best" --tenant	none	-	null	none	-
+/cancel restart prep --tenant	none	-	null	none	-
+/cancel restart prep 1 gmail fix the bug	none	-	null	none	-
+/cancel restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart prep 3 best	none	-	null	none	-
+/cancel restart prep 3 best --tenant	none	-	null	none	-
+/cancel restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart prepare "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart prepare "3 best"	none	-	null	none	-
+/cancel restart prepare "3 best" --tenant	none	-	null	none	-
+/cancel restart prepare --tenant	none	-	null	none	-
+/cancel restart prepare 1 gmail fix the bug	none	-	null	none	-
+/cancel restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart prepare 3 best	none	-	null	none	-
+/cancel restart prepare 3 best --tenant	none	-	null	none	-
+/cancel the restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart "3 best"	none	-	null	none	-
+/cancel the restart "3 best" --tenant	none	-	null	none	-
+/cancel the restart --tenant	none	-	null	none	-
+/cancel the restart 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart 3 best	none	-	null	none	-
+/cancel the restart 3 best --tenant	none	-	null	none	-
+/cancel the restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart prep "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart prep "3 best"	none	-	null	none	-
+/cancel the restart prep "3 best" --tenant	none	-	null	none	-
+/cancel the restart prep --tenant	none	-	null	none	-
+/cancel the restart prep 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart prep 3 best	none	-	null	none	-
+/cancel the restart prep 3 best --tenant	none	-	null	none	-
+/cancel the restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart prepare "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart prepare "3 best"	none	-	null	none	-
+/cancel the restart prepare "3 best" --tenant	none	-	null	none	-
+/cancel the restart prepare --tenant	none	-	null	none	-
+/cancel the restart prepare 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart prepare 3 best	none	-	null	none	-
+/cancel the restart prepare 3 best --tenant	none	-	null	none	-
+/cancel-restart	literal	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel-restart "1 gmail fix the bug"	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "1 gmail fix the bug" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "3 best"	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "3 best" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 1 gmail fix the bug	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 1 gmail fix the bug --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 3 best	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 3 best --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
 /clear-tag	pattern	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
 /clear-tag "1 gmail fix the bug"	none	-	null	none	-
 /clear-tag "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -801,6 +871,86 @@
 /plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 /plan-verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 /plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+/prep-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for a restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare for a restart "3 best"	none	-	null	none	-
+/prepare for a restart "3 best" --tenant	none	-	null	none	-
+/prepare for a restart --tenant	none	-	null	none	-
+/prepare for a restart 1 gmail fix the bug	none	-	null	none	-
+/prepare for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare for a restart 3 best	none	-	null	none	-
+/prepare for a restart 3 best --tenant	none	-	null	none	-
+/prepare for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare for restart "3 best"	none	-	null	none	-
+/prepare for restart "3 best" --tenant	none	-	null	none	-
+/prepare for restart --tenant	none	-	null	none	-
+/prepare for restart 1 gmail fix the bug	none	-	null	none	-
+/prepare for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare for restart 3 best	none	-	null	none	-
+/prepare for restart 3 best --tenant	none	-	null	none	-
+/prepare restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare restart "3 best"	none	-	null	none	-
+/prepare restart "3 best" --tenant	none	-	null	none	-
+/prepare restart --tenant	none	-	null	none	-
+/prepare restart 1 gmail fix the bug	none	-	null	none	-
+/prepare restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare restart 3 best	none	-	null	none	-
+/prepare restart 3 best --tenant	none	-	null	none	-
+/prepare the runner for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner for a restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner for a restart "3 best"	none	-	null	none	-
+/prepare the runner for a restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner for a restart --tenant	none	-	null	none	-
+/prepare the runner for a restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner for a restart 3 best	none	-	null	none	-
+/prepare the runner for a restart 3 best --tenant	none	-	null	none	-
+/prepare the runner for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner for restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner for restart "3 best"	none	-	null	none	-
+/prepare the runner for restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner for restart --tenant	none	-	null	none	-
+/prepare the runner for restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner for restart 3 best	none	-	null	none	-
+/prepare the runner for restart 3 best --tenant	none	-	null	none	-
+/prepare the runner restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner restart "3 best"	none	-	null	none	-
+/prepare the runner restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner restart --tenant	none	-	null	none	-
+/prepare the runner restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner restart 3 best	none	-	null	none	-
+/prepare the runner restart 3 best --tenant	none	-	null	none	-
+/prepare-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 /prev session	pattern	terminal.focus	[["target","prev"]]	ok	ok /focus ✓ focused 1 zone
 /prev session --tenant	none	-	null	none	-
 /previous session	pattern	terminal.focus	[["target","previous"]]	ok	ok /focus ✓ focused 1 zone
@@ -879,6 +1029,16 @@
 /restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 /restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 /restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
+/restart-prep	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 /resume	pattern	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
 /resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound	-
 /resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound	-
@@ -1619,6 +1779,76 @@ auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
 auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
 auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound	-
 auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
+cancel restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart "1 gmail fix the bug"	none	-	null	none	-
+cancel restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart "3 best"	none	-	null	none	-
+cancel restart "3 best" --tenant	none	-	null	none	-
+cancel restart --tenant	none	-	null	none	-
+cancel restart 1 gmail fix the bug	none	-	null	none	-
+cancel restart 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart 3 best	none	-	null	none	-
+cancel restart 3 best --tenant	none	-	null	none	-
+cancel restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart prep "1 gmail fix the bug"	none	-	null	none	-
+cancel restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart prep "3 best"	none	-	null	none	-
+cancel restart prep "3 best" --tenant	none	-	null	none	-
+cancel restart prep --tenant	none	-	null	none	-
+cancel restart prep 1 gmail fix the bug	none	-	null	none	-
+cancel restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart prep 3 best	none	-	null	none	-
+cancel restart prep 3 best --tenant	none	-	null	none	-
+cancel restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart prepare "1 gmail fix the bug"	none	-	null	none	-
+cancel restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart prepare "3 best"	none	-	null	none	-
+cancel restart prepare "3 best" --tenant	none	-	null	none	-
+cancel restart prepare --tenant	none	-	null	none	-
+cancel restart prepare 1 gmail fix the bug	none	-	null	none	-
+cancel restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart prepare 3 best	none	-	null	none	-
+cancel restart prepare 3 best --tenant	none	-	null	none	-
+cancel the restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart "3 best"	none	-	null	none	-
+cancel the restart "3 best" --tenant	none	-	null	none	-
+cancel the restart --tenant	none	-	null	none	-
+cancel the restart 1 gmail fix the bug	none	-	null	none	-
+cancel the restart 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart 3 best	none	-	null	none	-
+cancel the restart 3 best --tenant	none	-	null	none	-
+cancel the restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart prep "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart prep "3 best"	none	-	null	none	-
+cancel the restart prep "3 best" --tenant	none	-	null	none	-
+cancel the restart prep --tenant	none	-	null	none	-
+cancel the restart prep 1 gmail fix the bug	none	-	null	none	-
+cancel the restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart prep 3 best	none	-	null	none	-
+cancel the restart prep 3 best --tenant	none	-	null	none	-
+cancel the restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart prepare "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart prepare "3 best"	none	-	null	none	-
+cancel the restart prepare "3 best" --tenant	none	-	null	none	-
+cancel the restart prepare --tenant	none	-	null	none	-
+cancel the restart prepare 1 gmail fix the bug	none	-	null	none	-
+cancel the restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart prepare 3 best	none	-	null	none	-
+cancel the restart prepare 3 best --tenant	none	-	null	none	-
+cancel-restart	literal	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel-restart "1 gmail fix the bug"	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "1 gmail fix the bug" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "3 best"	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "3 best" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 1 gmail fix the bug	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 1 gmail fix the bug --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 3 best	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 3 best --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
 clear-tag	pattern	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
 clear-tag "1 gmail fix the bug"	none	-	null	none	-
 clear-tag "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2207,6 +2437,86 @@ plan-verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+prep-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for a restart "1 gmail fix the bug"	none	-	null	none	-
+prepare for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare for a restart "3 best"	none	-	null	none	-
+prepare for a restart "3 best" --tenant	none	-	null	none	-
+prepare for a restart --tenant	none	-	null	none	-
+prepare for a restart 1 gmail fix the bug	none	-	null	none	-
+prepare for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare for a restart 3 best	none	-	null	none	-
+prepare for a restart 3 best --tenant	none	-	null	none	-
+prepare for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for restart "1 gmail fix the bug"	none	-	null	none	-
+prepare for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare for restart "3 best"	none	-	null	none	-
+prepare for restart "3 best" --tenant	none	-	null	none	-
+prepare for restart --tenant	none	-	null	none	-
+prepare for restart 1 gmail fix the bug	none	-	null	none	-
+prepare for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare for restart 3 best	none	-	null	none	-
+prepare for restart 3 best --tenant	none	-	null	none	-
+prepare restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare restart "1 gmail fix the bug"	none	-	null	none	-
+prepare restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare restart "3 best"	none	-	null	none	-
+prepare restart "3 best" --tenant	none	-	null	none	-
+prepare restart --tenant	none	-	null	none	-
+prepare restart 1 gmail fix the bug	none	-	null	none	-
+prepare restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare restart 3 best	none	-	null	none	-
+prepare restart 3 best --tenant	none	-	null	none	-
+prepare the runner for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner for a restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner for a restart "3 best"	none	-	null	none	-
+prepare the runner for a restart "3 best" --tenant	none	-	null	none	-
+prepare the runner for a restart --tenant	none	-	null	none	-
+prepare the runner for a restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner for a restart 3 best	none	-	null	none	-
+prepare the runner for a restart 3 best --tenant	none	-	null	none	-
+prepare the runner for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner for restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner for restart "3 best"	none	-	null	none	-
+prepare the runner for restart "3 best" --tenant	none	-	null	none	-
+prepare the runner for restart --tenant	none	-	null	none	-
+prepare the runner for restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner for restart 3 best	none	-	null	none	-
+prepare the runner for restart 3 best --tenant	none	-	null	none	-
+prepare the runner restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner restart "3 best"	none	-	null	none	-
+prepare the runner restart "3 best" --tenant	none	-	null	none	-
+prepare the runner restart --tenant	none	-	null	none	-
+prepare the runner restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner restart 3 best	none	-	null	none	-
+prepare the runner restart 3 best --tenant	none	-	null	none	-
+prepare-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 prev session	pattern	terminal.focus	[["target","prev"]]	ok	ok /focus ✓ focused 1 zone
 prev session --tenant	none	-	null	none	-
 previous session	pattern	terminal.focus	[["target","previous"]]	ok	ok /focus ✓ focused 1 zone
@@ -2285,6 +2595,16 @@ restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /res
 restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
+restart-prep	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 resume	pattern	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
 resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound	-
 resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound	-
@@ -2857,6 +3177,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.auto-approve [bool] do the thing	ai	terminal.auto-approve	[]	refused	error /auto-approve: "action" must be text or a number (got true/false)
 «ai» terminal.auto-approve [empty] do the thing	ai	terminal.auto-approve	[]	error:invalid-args	error /auto-approve: action is required (add, remove, list, clear)
 «ai» terminal.auto-approve [valid] do the thing	ai	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«ai» terminal.cancel-restart-prep [alien] do the thing	ai	terminal.cancel-restart-prep	[["nonsense","x"]]	refused	error /cancel-restart: takes no arguments (got "nonsense")
+«ai» terminal.cancel-restart-prep [bool] do the thing	ai	terminal.cancel-restart-prep	[]	refused	error /cancel-restart: "count" must be text or a number (got true/false)
+«ai» terminal.cancel-restart-prep [empty] do the thing	ai	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+«ai» terminal.cancel-restart-prep [valid] do the thing	ai	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
 «ai» terminal.close [alien] do the thing	ai	terminal.close	[["nonsense","x"]]	refused	error /close: takes no argument named "nonsense"
 «ai» terminal.close [bool] do the thing	ai	terminal.close	[]	refused	error /close: "zone" must be text or a number (got true/false)
 «ai» terminal.close [empty] do the thing	ai	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
@@ -2925,6 +3249,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.plan-verify [bool] do the thing	ai	terminal.plan-verify	[]	refused	error /plan-verify: "count" must be text or a number (got true/false)
 «ai» terminal.plan-verify [empty] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
 «ai» terminal.plan-verify [valid] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.prepare-restart [alien] do the thing	ai	terminal.prepare-restart	[["nonsense","x"]]	refused	error /prepare-restart: takes no argument named "nonsense"
+«ai» terminal.prepare-restart [bool] do the thing	ai	terminal.prepare-restart	[]	refused	error /prepare-restart: "reason" must be text or a number (got true/false)
+«ai» terminal.prepare-restart [empty] do the thing	ai	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+«ai» terminal.prepare-restart [valid] do the thing	ai	terminal.prepare-restart	[["reason","rebuild"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 «ai» terminal.prompt [alien] do the thing	ai	terminal.prompt	[["nonsense","x"]]	refused	error /prompt: takes no arguments (got "nonsense")
 «ai» terminal.prompt [bool] do the thing	ai	terminal.prompt	[]	refused	error /prompt: "count" must be text or a number (got true/false)
 «ai» terminal.prompt [empty] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
@@ -3025,6 +3353,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.auto-approve [bool]	direct	terminal.auto-approve	[["action",true]]	threw	error /auto-approve: "action" must be text or a number (got true/false)
 «direct» terminal.auto-approve [empty]	direct	terminal.auto-approve	[]	threw	error /auto-approve: action is required (add, remove, list, clear)
 «direct» terminal.auto-approve [valid]	direct	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«direct» terminal.cancel-restart-prep [alien]	direct	terminal.cancel-restart-prep	[["nonsense","x"]]	threw	error /cancel-restart: takes no arguments (got "nonsense")
+«direct» terminal.cancel-restart-prep [bool]	direct	terminal.cancel-restart-prep	[["count",true]]	threw	error /cancel-restart: "count" must be text or a number (got true/false)
+«direct» terminal.cancel-restart-prep [empty]	direct	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+«direct» terminal.cancel-restart-prep [valid]	direct	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
 «direct» terminal.close [alien]	direct	terminal.close	[["nonsense","x"]]	threw	error /close: takes no argument named "nonsense"
 «direct» terminal.close [bool]	direct	terminal.close	[["zone",true]]	threw	error /close: "zone" must be text or a number (got true/false)
 «direct» terminal.close [empty]	direct	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
@@ -3093,6 +3425,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.plan-verify [bool]	direct	terminal.plan-verify	[["count",true]]	threw	error /plan-verify: "count" must be text or a number (got true/false)
 «direct» terminal.plan-verify [empty]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
 «direct» terminal.plan-verify [valid]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.prepare-restart [alien]	direct	terminal.prepare-restart	[["nonsense","x"]]	threw	error /prepare-restart: takes no argument named "nonsense"
+«direct» terminal.prepare-restart [bool]	direct	terminal.prepare-restart	[["reason",true]]	threw	error /prepare-restart: "reason" must be text or a number (got true/false)
+«direct» terminal.prepare-restart [empty]	direct	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+«direct» terminal.prepare-restart [valid]	direct	terminal.prepare-restart	[["reason","rebuild"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 «direct» terminal.prompt [alien]	direct	terminal.prompt	[["nonsense","x"]]	threw	error /prompt: takes no arguments (got "nonsense")
 «direct» terminal.prompt [bool]	direct	terminal.prompt	[["count",true]]	threw	error /prompt: "count" must be text or a number (got true/false)
 «direct» terminal.prompt [empty]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library

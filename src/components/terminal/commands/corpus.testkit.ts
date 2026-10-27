@@ -452,6 +452,7 @@ export const ARG_FILL: Record<string, string | number> = {
   action: "list",
   pattern: "yes",
   tenant: "acme",
+  reason: "rebuild",
 };
 
 /** Bare argument names an action declares — a `--flag` under its bare name. */

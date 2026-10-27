@@ -700,7 +700,7 @@ describe("ZoneGrid wiring", () => {
     // The parked (hidden / off-screen) mount is decided in the cell list.
     const cells = readFileSync(resolve(__dirname, "./zone-grid/zoneCells.tsx"), "utf8");
     expect(cells).toContain(
-      'return classification === "hidden" && tab.type !== "plan" && !tab.sessionBacked;',
+      'return classification === "hidden" && !isPtylessTab(tab) && !tab.sessionBacked;',
     );
   });
 

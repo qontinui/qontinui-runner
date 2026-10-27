@@ -43,7 +43,7 @@ export interface DurabilityInput {
   /** Coordinator task-run id for worker-backed (AI) sessions. */
   taskRunId?: string;
   /** Tab kind — "plan" tabs are markdown viewers, not sessions. */
-  type?: "terminal" | "plan";
+  type?: "terminal" | "plan" | "restore-placeholder";
   /**
    * Remote tab identity (Phase 4). The session behind a remote tab lives on
    * another machine; its durability is that machine's to report, so no
@@ -71,11 +71,11 @@ export function classifyTabDurability(tab: DurabilityInput): SessionDurability {
 
 /**
  * Whether a tab represents a live session that a durability affordance is
- * meaningful for. Plan tabs (markdown viewers) carry no process, so they get
- * no marker either way.
+ * meaningful for. Plan tabs (markdown viewers) and restore placeholders carry
+ * no process, so they get no marker either way.
  */
 export function isMarkableSession(tab: DurabilityInput): boolean {
-  return tab.type !== "plan" && !tab.remote;
+  return tab.type !== "plan" && tab.type !== "restore-placeholder" && !tab.remote;
 }
 
 /** True only for the genuinely non-durable interactive PTY case. */

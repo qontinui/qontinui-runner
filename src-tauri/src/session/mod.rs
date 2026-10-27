@@ -90,6 +90,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod claude_ended_watch; // A claude that ended under a living shell is closed `claude-ended` in seconds (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore, round 10 D)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;

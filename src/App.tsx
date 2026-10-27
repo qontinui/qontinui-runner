@@ -83,6 +83,7 @@ import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
+import { RestoreCohortStrip } from "./components/terminal/RestoreCohortStrip";
 import { useProjectPageActivation } from "./components/terminal/useProjectPageActivation";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
@@ -428,6 +429,8 @@ function AppContent() {
   const { toasts, showToast, dismissToast } = useToast();
   useErrorNotifications(showToast);
   useAccountMigrationNotifications(showToast);
+  // The restart cohort strip's notices ("skipped N held", a failed dismiss).
+  const notifyRestore = useCallback((message: string) => showToast(message, "info"), [showToast]);
   // Spawn-time resource gate — WARN notices (and overridden CRITICAL spawns)
   // arrive as Tauri events and become toasts that link into
   // `Settings > Resource Guard`. The CRITICAL *refusal* is not an event; it
@@ -878,6 +881,13 @@ function AppContent() {
                   deferred-work count. Operator actions still run.
                 */}
                     <RunnerDrainBanner />
+                    {/*
+                  A prepared restart's cohort (plan
+                  `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+                  Phase 7): how many sessions wait for a hand restore, with
+                  Restore all and Dismiss. Renders nothing otherwise.
+                */}
+                    <RestoreCohortStrip notify={notifyRestore} />
                     {showReorganize && (
                       <ReorganizeDialog
                         pages={terminalPages.pages}

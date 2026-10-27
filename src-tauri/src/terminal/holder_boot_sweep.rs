@@ -101,7 +101,7 @@
 //! it invisible (the census-invisibility failure Risk 2 names). With the
 //! setting off and no pane directory — the default — it costs one `stat`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -213,6 +213,64 @@ pub fn adoption_pending(terminal_id: &str) -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .contains(terminal_id)
+}
+
+/// Terminal ids whose holder the sweep found ALIVE and is leaving running with
+/// no tab: a live holder below this runner's data path (`Incompatible`,
+/// `LeftAlone`), a pane whose holder holds its lock but does not answer
+/// (`Unknown`), or a deferred adoption whose background retry gave up. Its
+/// `claude` may still be running the session, so a cold `--resume` of that
+/// session would be a second process on one transcript — the restart
+/// restore's cohort mode refuses an open row on such a terminal (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, Phase 6).
+/// Keyed by terminal id, with the holder's pid when the census knew it: an
+/// entry whose holder pid is no longer alive is dropped on read, so a holder
+/// that died later stops blocking its row. One with no known pid (an
+/// `Incompatible` census entry, an `Unknown` with no lock record) stays —
+/// nothing proves that holder gone, and fail-closed is the safe reading.
+static LEFT_RUNNING: Mutex<BTreeMap<String, Option<u32>>> = Mutex::new(BTreeMap::new());
+
+/// Whether the sweep left `terminal_id`'s live holder running with no tab
+/// (see [`LEFT_RUNNING`]).
+pub fn holder_left_running(terminal_id: &str) -> bool {
+    left_running_with(terminal_id, crate::process_capture::health::pid_alive)
+}
+
+/// [`holder_left_running`] with the liveness probe passed in (tests).
+fn left_running_with(terminal_id: &str, pid_alive: impl Fn(u32) -> bool) -> bool {
+    let mut map = LEFT_RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+    match map.get(terminal_id) {
+        None => false,
+        Some(Some(pid)) if !pid_alive(*pid) => {
+            map.remove(terminal_id);
+            false
+        }
+        Some(_) => true,
+    }
+}
+
+fn note_left_running(terminal_id: &str, holder_pid: Option<u32>) {
+    LEFT_RUNNING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(terminal_id.to_string(), holder_pid);
+}
+
+/// PURE: the census entries whose holder is alive (or cannot be ruled out)
+/// and which no adoption will take — `Incompatible` and `Unknown` — with the
+/// holder pid when the lock record names one. A `Live` entry goes to an
+/// adoption, whose own outcome decides; a `Reaped` one is gone.
+pub fn left_running_in_census(entries: &[SweepEntry]) -> Vec<(String, Option<u32>)> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.outcome {
+            SweepOutcome::Incompatible { .. } => Some((e.pane_id.clone(), None)),
+            SweepOutcome::Unknown { record, .. } => {
+                Some((e.pane_id.clone(), record.as_ref().map(|r| r.holder_pid)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn set_adoption_pending(terminal_id: &str, pending: bool) {
@@ -880,6 +938,7 @@ fn spawn_background_retry(
             }
         }
         if matches!(late, AdoptOutcome::Deferred(_)) {
+            note_left_running(&adoption.pane_id, Some(adoption.holder_pid));
             error!(
                 pane = %adoption.pane_id,
                 outcome = ?late,
@@ -966,12 +1025,15 @@ fn adopt_all(
                     ),
                     // HolderGone comes only from the background retry.
                     AdoptOutcome::Ended(_) | AdoptOutcome::HolderGone => {}
-                    AdoptOutcome::LeftAlone(why) => warn!(
-                        pane = %adoption.pane_id,
-                        why = %why,
-                        "pty holder boot sweep: a live holder below this runner's data path — \
-                         left running, not adopted (plan D15)"
-                    ),
+                    AdoptOutcome::LeftAlone(why) => {
+                        note_left_running(&adoption.pane_id, Some(adoption.holder_pid));
+                        warn!(
+                            pane = %adoption.pane_id,
+                            why = %why,
+                            "pty holder boot sweep: a live holder below this runner's data path — \
+                             left running, not adopted (plan D15)"
+                        )
+                    }
                     AdoptOutcome::Deferred(why) => {
                         error!(
                             pane = %adoption.pane_id,
@@ -1073,6 +1135,9 @@ fn sweep_and_adopt(
         pane_dir,
         &skip,
         |entries| {
+            for (id, pid) in left_running_in_census(entries) {
+                note_left_running(&id, pid);
+            }
             let adoptions = plan_adoptions(entries, &already_open, |terminal_id| {
                 store
                     .as_deref()?
@@ -1126,6 +1191,21 @@ mod tests {
     }
 
     #[test]
+    fn a_left_running_holder_stops_blocking_once_its_pid_is_dead() {
+        note_left_running("t-left-dies", Some(4242));
+        note_left_running("t-left-unknown-pid", None);
+        assert!(left_running_with("t-left-dies", |_| true));
+        assert!(!left_running_with("t-left-dies", |_| false), "dead holder");
+        assert!(
+            !left_running_with("t-left-dies", |_| true),
+            "dropped once seen dead"
+        );
+        // No pid known: nothing proves it gone, so it keeps blocking.
+        assert!(left_running_with("t-left-unknown-pid", |_| false));
+        assert!(!left_running_with("t-never-noted", |_| true));
+    }
+
+    #[test]
     fn pty_holder_boot_sweep_adopts_live_panes_under_their_registry_identity() {
         let entries = vec![
             live("t-known"),
@@ -1145,6 +1225,12 @@ mod tests {
                 },
             },
         ];
+        // The wedged and the incompatible holders are left running with no
+        // tab; the live ones go to an adoption.
+        assert_eq!(
+            left_running_in_census(&entries),
+            [("t-wedged".to_string(), None), ("t-old".to_string(), None)]
+        );
         let plans = plan_adoptions(&entries, &["t-open-already".to_string()], |id| {
             (id == "t-known").then(|| ("sess-1".to_string(), "page-2".to_string()))
         });

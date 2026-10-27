@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
+import { ENSURE_PAGES_EVENT, type EnsurePagesDetail } from "./restorePlaceholders";
 
 export interface TerminalPageConfig {
   id: string;
@@ -374,6 +375,24 @@ export function keyboardReorderTarget(
   }
   if (i >= pages.length - 1) return undefined;
   return i + 2 < pages.length ? pages[i + 2].id : null;
+}
+
+/**
+ * Pure: add each of `wanted` that `pages` lacks, under its own id. Returns the
+ * SAME array when nothing was missing (same contract as `reconcilePages`).
+ */
+export function ensurePagesPresent(
+  pages: TerminalPageConfig[],
+  wanted: ReadonlyArray<{ id: string; name: string }>,
+): TerminalPageConfig[] {
+  const known = new Set(pages.map((p) => p.id));
+  const added: TerminalPageConfig[] = [];
+  for (const w of wanted) {
+    if (!w.id || known.has(w.id)) continue;
+    known.add(w.id);
+    added.push({ id: w.id, name: w.name, createdAt: Date.now() });
+  }
+  return added.length === 0 ? pages : [...pages, ...added];
 }
 
 export function reconcilePages(
@@ -763,6 +782,28 @@ export function useTerminalPages() {
     window.addEventListener("terminal-open-page", handler as EventListener);
     return () => window.removeEventListener("terminal-open-page", handler as EventListener);
   }, [openPage]);
+
+  // A prepared restart's placeholders can name a page this window no longer
+  // has (closed after the prepare). Recreate it under the SAME id, without
+  // activating it, so its placeholders land there when it is opened (plan
+  // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+  // Phase 7). A pinned pop-out never touches the shared page list.
+  useEffect(() => {
+    if (isPinned) return;
+    const handler = (e: Event) => {
+      const pages = (e as CustomEvent<EnsurePagesDetail>).detail?.pages ?? [];
+      if (pages.length === 0) return;
+      setPages((prev) => {
+        const next = ensurePagesPresent(prev, pages);
+        if (next === prev) return prev;
+        savePages(next);
+        allPagesRef.current = next;
+        return next;
+      });
+    };
+    window.addEventListener(ENSURE_PAGES_EVENT, handler as EventListener);
+    return () => window.removeEventListener(ENSURE_PAGES_EVENT, handler as EventListener);
+  }, [isPinned]);
 
   // Reconcile backend-known page_ids into the tab list. A backend-spawned gate
   // continuation can land on a freshly-minted page_id that isn't in the

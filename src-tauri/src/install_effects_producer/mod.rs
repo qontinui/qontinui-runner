@@ -1250,6 +1250,10 @@ fn record_session_open_into(
     req: &SessionOpenRequest,
     provider: &str,
 ) {
+    // A (re)started session carries no earlier run's `/exit` report: a resume
+    // of the same id (boot restore, account migration) must not be closed
+    // `claude-ended` on its own later crash.
+    crate::session::claude_ended_watch::forget_session_end(&req.session_id);
     let existing = store.get(&req.session_id);
     // The most recent OTHER session open on this terminal, read before
     // `record_open` below can supersede it. Deterministic, not a first match:
@@ -2876,6 +2880,23 @@ mod tests {
     // -------------------------------------------------------------------
     // /control/session-open store-write (session-restore-redesign Phase 1)
     // -------------------------------------------------------------------
+
+    /// Review round 13: a session (re)opening clears any deliberate-end
+    /// marker an earlier run of the same id left, so a resumed session is
+    /// never closed `claude-ended` on its own later crash.
+    #[test]
+    fn session_open_clears_the_deliberate_end_marker() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let id = "8f6c2a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+        assert!(crate::session::claude_ended_watch::record_session_end(
+            id,
+            "prompt_input_exit"
+        ));
+        record_session_open_into(&store, &session_open_req("term-77", id), "claude");
+        assert!(!crate::session::claude_ended_watch::deliberate_end(id));
+    }
 
     #[test]
     fn session_open_records_authoritatively_into_store() {

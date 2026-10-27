@@ -1771,6 +1771,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/auth/runner-token-callback"),
     ("POST", "/backup/info"),
     ("POST", "/checks/repair-associations"),
+    // The persisted restart-prepare record plus an in-memory cohort preview;
+    // reads disk and pane grids, writes nothing, spawns nothing, carries no
+    // credential (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore).
+    ("GET", "/control/restart-prep"),
     ("GET", "/control/sessions/restore-census"),
     ("GET", "/control/sessions/restore-health"),
     ("GET", "/current-execution/steps"),

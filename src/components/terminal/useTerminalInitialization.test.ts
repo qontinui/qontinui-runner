@@ -49,6 +49,7 @@ import {
   applyDrainSkip,
   holdNeedsAccountIfNotLive,
   applyNeedsAccountNote,
+  placeRestorePlaceholders,
   type NeedsAccountRecord,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
@@ -85,7 +86,12 @@ describe("fetchOpenRecords", () => {
       },
     });
     const out = await fetchOpenRecords("default");
-    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open", { purpose: "restore" });
+    // The boot restore is the reader that draws a restart cohort's
+    // placeholders, so it is the one that opts in (Phase 7).
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open", {
+      purpose: "restore",
+      placeholders: true,
+    });
     expect(out.map((r) => r.claudeSessionId).sort()).toEqual(["A", "B"]);
   });
 
@@ -1155,7 +1161,13 @@ describe("fetchRestoreSet — coord device drain", () => {
 
     mockInvoke.mockResolvedValueOnce({ success: true, data: { sessions: [] } });
     const empty = await fetchRestoreSet("default");
-    expect(empty).toEqual({ records: [], deferredByDrain: null });
+    expect(empty).toEqual({
+      records: [],
+      deferredByDrain: null,
+      placeholders: [],
+      restartPrep: null,
+      placeholdersRead: true,
+    });
   });
 
   it("keeps fetchOpenRecords' contract: a deferral yields no records", async () => {
@@ -1803,5 +1815,145 @@ describe("applyNeedsAccountNote (mark: false never touches the registry row)", (
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+/**
+ * Plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+ * Phase 7: a prepared restart's cohort comes back as placeholders in the
+ * recorded zones, never as auto-resumes.
+ */
+describe("restart cohort placeholders", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const placeholder = (o: Partial<TerminalSessionRecord>) => ({
+    ...rec(o),
+    restorePlaceholder: true as const,
+  });
+
+  it("returns every page's placeholders apart from the auto-resume records", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: {
+        sessions: [rec({ claudeSessionId: "A" })],
+        placeholders: [
+          rec({ claudeSessionId: "P1", pageId: "default", zoneIndex: 2 }),
+          rec({ claudeSessionId: "P2", pageId: "other", zoneIndex: 0 }),
+        ],
+        restartPrep: { prepareId: "prep-1", state: "restoring", holderSweepPending: false },
+      },
+    });
+    const out = await fetchRestoreSet("default");
+    expect(out.records.map((r) => r.claudeSessionId)).toEqual(["A"]);
+    expect(out.placeholders.map((r) => r.claudeSessionId)).toEqual(["P1", "P2"]);
+    expect(out.placeholders.every((r) => r.restorePlaceholder)).toBe(true);
+    expect(out.restartPrep).toEqual({ prepareId: "prep-1", holderSweepPending: false });
+  });
+
+  it("never reads a failed call as 'no cohort'", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    const failed = await fetchRestoreSet("default");
+    expect(failed.placeholdersRead).toBe(false);
+    mockInvoke.mockResolvedValueOnce({ success: true, data: { sessions: [] } });
+    expect((await fetchRestoreSet("default")).placeholdersRead).toBe(true);
+  });
+
+  it("still offers placeholders when the drain defers the auto-restore", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: {
+        sessions: [],
+        placeholders: [rec({ claudeSessionId: "P1" })],
+        restartPrep: { prepareId: "prep-1" },
+        deferredByDrain: { reason: "drained" },
+      },
+    });
+    const out = await fetchRestoreSet("default");
+    expect(out.deferredByDrain).toBe("drained");
+    expect(out.placeholders.map((r) => r.claudeSessionId)).toEqual(["P1"]);
+  });
+
+  it("classifies a placeholder record as restore-placeholder whatever else it is", () => {
+    const confirmed = rec({
+      claudeSessionId: "P1",
+      origin: "authoritative",
+      confirmedAt: 1,
+      configDir: "/cfg/a",
+    });
+    expect(classifyRestoreAction(confirmed, HOME)).toBe("auto-resume");
+    expect(classifyRestoreAction({ ...confirmed, restorePlaceholder: true }, HOME)).toBe(
+      "restore-placeholder",
+    );
+  });
+
+  it("lands each placeholder of this page in its recorded zone and recreates a missing page", () => {
+    const created: Array<[string, string]> = [];
+    const zones: Array<[number, string]> = [];
+    const ensured: Array<{ id: string; name: string }> = [];
+    const ids = placeRestorePlaceholders({
+      placeholders: [
+        placeholder({ claudeSessionId: "P1", pageId: "default", zoneIndex: 2, sessionName: "one" }),
+        placeholder({ claudeSessionId: "P2", pageId: "default", zoneIndex: 0 }),
+        placeholder({ claudeSessionId: "P3", pageId: "gone-page-1234", zoneIndex: 1 }),
+        placeholder({ claudeSessionId: "P4", pageId: "other", zoneIndex: 1 }),
+      ],
+      pageId: "default",
+      knownPageIds: ["default", "other"],
+      runningSessionIds: new Set(),
+      assignments: {},
+      createTab: (sid, name) => {
+        created.push([sid, name]);
+        return `restore-placeholder-${sid}`;
+      },
+      placeRestoredTab: (z, t) => zones.push([z, t]),
+      ensurePages: (pages) => ensured.push(...pages),
+    });
+    expect(ids).toEqual(["restore-placeholder-P1", "restore-placeholder-P2"]);
+    expect(created[0]).toEqual(["P1", "one"]);
+    expect(zones).toEqual([
+      [2, "restore-placeholder-P1"],
+      [0, "restore-placeholder-P2"],
+    ]);
+    // The page the cohort recorded but this window lost is recreated (not
+    // activated); an existing other page restores its own when opened.
+    expect(ensured).toEqual([{ id: "gone-page-1234", name: "Restored gone-pag" }]);
+  });
+
+  it("lands a missing page's placeholders once that page restores", () => {
+    const zones: Array<[number, string]> = [];
+    placeRestorePlaceholders({
+      placeholders: [
+        placeholder({ claudeSessionId: "P3", pageId: "gone-page-1234", zoneIndex: 1 }),
+      ],
+      pageId: "gone-page-1234",
+      knownPageIds: ["default", "gone-page-1234"],
+      runningSessionIds: new Set(),
+      assignments: {},
+      createTab: (sid) => `restore-placeholder-${sid}`,
+      placeRestoredTab: (z, t) => zones.push([z, t]),
+      ensurePages: () => {},
+    });
+    expect(zones).toEqual([[1, "restore-placeholder-P3"]]);
+  });
+
+  it("never takes a zone a tab holds, and never draws a session already running", () => {
+    const zones: Array<[number, string]> = [];
+    const created = placeRestorePlaceholders({
+      placeholders: [
+        placeholder({ claudeSessionId: "P1", pageId: "default", zoneIndex: 2 }),
+        placeholder({ claudeSessionId: "LIVE", pageId: "default", zoneIndex: 3 }),
+      ],
+      pageId: "default",
+      knownPageIds: ["default"],
+      assignments: { 2: "t-operator" },
+      runningSessionIds: new Set(["LIVE"]),
+      createTab: (sid) => `restore-placeholder-${sid}`,
+      placeRestoredTab: (z, t) => zones.push([z, t]),
+      ensurePages: () => {},
+    });
+    expect(created).toEqual(["restore-placeholder-P1"]);
+    expect(zones).toEqual([]);
   });
 });

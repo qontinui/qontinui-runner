@@ -1496,7 +1496,7 @@ const EXHAUSTION_UTILIZATION: f64 = 0.99;
 /// window; the header probe leaves it `None`). The session-window arm is what
 /// lets a "5-hour limit reached" migration hint confirm — the weekly number
 /// alone stays low when only the session window is exhausted.
-fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
+pub(crate) fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
     if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
         return true;
     }

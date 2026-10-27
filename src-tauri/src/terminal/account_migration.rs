@@ -91,6 +91,21 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
+/// Hand back the `MIGRATION_CAP` slot [`migration_cap_permits`] recorded for
+/// `claude_session_id` at `at_ms`, for an attempt that started nothing (the
+/// resume door's spawn the resource guard refused). Removes one slot stamped
+/// exactly `at_ms`; a no-op when there is none.
+pub(crate) fn migration_cap_refund(claude_session_id: &str, at_ms: i64) {
+    let Ok(mut hist) = MIGRATION_HISTORY.lock() else {
+        return;
+    };
+    if let Some(entry) = hist.as_mut().and_then(|m| m.get_mut(claude_session_id)) {
+        if let Some(i) = entry.iter().rposition(|t| *t == at_ms) {
+            entry.remove(i);
+        }
+    }
+}
+
 /// Outcome payload emitted on `session-account-migrated`.
 #[derive(Debug)]
 pub struct MigrationOutcome {
@@ -162,54 +177,80 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // and require the account to actually be exhausted before acting.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if !crate::ai_provider::account_known_exhausted(&src) {
-        info!(
-            terminal_id,
-            session = %record.claude_session_id,
-            account = %src,
-            matched_pattern,
-            "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
-        );
-        return;
-    }
-
-    // Keep spawn-time selection off the dead account, and repoint the global
-    // resolved dir so unrelated new sessions stop landing on it. When the
-    // usage stats carry the 5-hour window's actual reset time, cool down
-    // until then (clamped) instead of the blanket hour — the account comes
-    // back into rotation the moment its session window rolls over.
-    let cooldown = usage
-        .iter()
-        .find(|i| i.config_dir == src)
-        .and_then(|i| i.session_resets_at)
-        .and_then(|reset_ts| {
-            let now = chrono::Utc::now().timestamp();
-            let secs = (reset_ts as i64) - now;
-            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
-        })
-        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN);
-    crate::ai_provider::mark_account_rate_limited_with_duration(&src, cooldown);
-    crate::ai_provider::pick_best_account();
-
     let now_ms = chrono::Utc::now().timestamp_millis();
-    if !migration_cap_permits(&record.claude_session_id, now_ms) {
-        warn!(
-            session = %record.claude_session_id,
-            cap = MIGRATION_CAP,
-            "migration cap reached for this session — not migrating again"
-        );
-        emit_skipped(&app, &record, &src, "migration-cap-reached");
-        return;
-    }
-
-    let Some(dst) = crate::ai_provider::pick_migration_target(&src) else {
-        warn!(
-            session = %record.claude_session_id,
-            from = %src,
-            "no usable migration target (every other account exhausted/cooled/unauthenticated)"
-        );
-        emit_skipped(&app, &record, &src, "no-usable-target");
-        return;
+    let src_usage = usage.iter().find(|i| i.config_dir == src);
+    let confirmed = match hint_gate(
+        super::usage_limit::restored_marker(&terminal_id),
+        now_ms,
+        crate::ai_provider::account_known_exhausted(&src),
+        src_usage,
+    ) {
+        // A hint dispatched before the terminal was marked (or one racing the
+        // mark) is re-judged here, after the probe: inside the window it is
+        // dropped like any hint the scan would not have fired.
+        HintGate::InsideWindow => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                "usage-limit hint on a hand-restored limit_hit terminal inside its reset \
+                 window — ignored"
+            );
+            return;
+        }
+        HintGate::Confirmed(confirmed) => confirmed,
+    };
+    let verdict = decide_hint(
+        &mut LiveHintEffects,
+        HintFacts {
+            confirmed,
+            src: &src,
+            claude_session_id: &record.claude_session_id,
+            session_resets_at: src_usage.and_then(|i| i.session_resets_at),
+            limit_reset_at_ms: src_usage.and_then(|i| limit_reset_at_ms(i, now_ms)),
+            now_ms,
+        },
+    );
+    let dst = match verdict {
+        HintVerdict::NotConfirmed => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                account = %src,
+                matched_pattern,
+                "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
+            );
+            return;
+        }
+        HintVerdict::Frozen { row_marked } => {
+            info!(
+                session = %record.claude_session_id,
+                account = %src,
+                row_marked,
+                "token exhaustion confirmed during a restart prepare — the account is frozen, \
+                 so the session stays on it (cohort row limit_hit)"
+            );
+            emit_skipped(&app, &record, &src, "restart-prep-account-freeze");
+            return;
+        }
+        HintVerdict::CapReached => {
+            warn!(
+                session = %record.claude_session_id,
+                cap = MIGRATION_CAP,
+                "migration cap reached for this session — not migrating again"
+            );
+            emit_skipped(&app, &record, &src, "migration-cap-reached");
+            return;
+        }
+        HintVerdict::NoTarget => {
+            warn!(
+                session = %record.claude_session_id,
+                from = %src,
+                "no usable migration target (every other account exhausted/cooled/unauthenticated)"
+            );
+            emit_skipped(&app, &record, &src, "no-usable-target");
+            return;
+        }
+        HintVerdict::Migrate { dst } => dst,
     };
 
     info!(
@@ -249,12 +290,201 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     }
 }
 
+/// What a usage-limit hint may do once the account was re-probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintGate {
+    /// The terminal was hand-restored from a `limit_hit` row and its reset
+    /// window is still open: the hint is dropped.
+    InsideWindow,
+    /// Whether the re-probe CONFIRMS the account is exhausted.
+    Confirmed(bool),
+}
+
+/// PURE: the gate a hint passes after the re-probe, from the terminal's
+/// restored-limit-hit `marker` (`usage_limit::restored_marker`), the time, the
+/// fleet-wide `snapshot_exhausted` reading and this call's own probe result
+/// for the session's account.
+///
+/// * No marker — an ordinary terminal: the fleet-wide reading,
+///   `account_known_exhausted`, unchanged. It counts a FAILED probe (no token,
+///   a non-2xx, a network error) as exhausted on purpose
+///   (`commands::ai_settings::probe_result_exhausted`: a rejected probe means
+///   the account will not serve a request).
+/// * A marker whose window is open: [`HintGate::InsideWindow`].
+/// * A marker past its window: confirmed ONLY by this call's own probe being
+///   SUCCESSFUL and reading exhausted — decided from `src_probe` alone, never
+///   from the shared snapshot a concurrent probe may have rewritten. The
+///   operator chose to keep that session on its account, so stale limit text
+///   plus a transient probe failure must not move it (plan
+///   `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3).
+pub(crate) fn hint_gate(
+    marker: Option<super::usage_limit::RestoredLimitHit>,
+    now_ms: i64,
+    snapshot_exhausted: bool,
+    src_probe: Option<&crate::commands::ai_settings::AccountUsageInfo>,
+) -> HintGate {
+    match marker {
+        None => HintGate::Confirmed(snapshot_exhausted),
+        Some(m) if m.suppresses(now_ms) => HintGate::InsideWindow,
+        Some(_) => HintGate::Confirmed(src_probe.is_some_and(|p| {
+            p.error.is_none() && crate::commands::ai_settings::probe_result_exhausted(p)
+        })),
+    }
+}
+
+/// What [`decide_hint`] reads: the probe's verdict and the account's usage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HintFacts<'a> {
+    /// The probe agrees the session's account is exhausted.
+    pub confirmed: bool,
+    pub src: &'a str,
+    pub claude_session_id: &'a str,
+    /// The 5-hour window's reset (unix seconds), which sets the cooldown.
+    pub session_resets_at: Option<u64>,
+    /// When the exhausted window resets (unix millis), for the cohort row.
+    pub limit_reset_at_ms: Option<i64>,
+    pub now_ms: i64,
+}
+
+/// The side effects of a confirmed hint, injectable so the order of the
+/// guards is testable without a live account roster.
+pub(crate) trait HintEffects {
+    /// Cool the exhausted account down and repoint spawn-time selection.
+    fn cool_down(&mut self, src: &str, cooldown: std::time::Duration);
+    /// The restart prepare's account freeze (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3).
+    fn freeze_hit(
+        &mut self,
+        claude_session_id: &str,
+        limit_reset_at_ms: Option<i64>,
+    ) -> crate::restart_prep::prepare::FreezeHit;
+    fn cap_permits(&mut self, claude_session_id: &str, now_ms: i64) -> bool;
+    fn pick_target(&mut self, src: &str) -> Option<String>;
+}
+
+/// What a usage-limit hint comes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HintVerdict {
+    /// The probe did not confirm: nothing happens, nothing is marked.
+    NotConfirmed,
+    /// A restart prepare froze the account: no move, the cohort row is
+    /// `limit_hit`.
+    Frozen {
+        row_marked: bool,
+    },
+    CapReached,
+    NoTarget,
+    Migrate {
+        dst: String,
+    },
+}
+
+/// The cooldown for an exhausted account: until the 5-hour window's reset
+/// when the usage stats carry it (clamped), else the blanket hour.
+fn exhausted_cooldown(session_resets_at: Option<u64>, now_secs: i64) -> std::time::Duration {
+    session_resets_at
+        .and_then(|reset_ts| {
+            let secs = (reset_ts as i64) - now_secs;
+            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
+        })
+        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN)
+}
+
+/// When the account's EXHAUSTED window resets (unix millis): the later reset
+/// among the windows the probe reads as full (the 5-hour session window, the
+/// weekly one). `None` when the stats say neither is full — the reset is then
+/// UNKNOWN, not guessed from the 5-hour window.
+pub(crate) fn limit_reset_at_ms(
+    usage: &crate::commands::ai_settings::AccountUsageInfo,
+    now_ms: i64,
+) -> Option<i64> {
+    const FULL: f64 = 0.999;
+    let future = |secs: Option<u64>| {
+        secs.and_then(|s| i64::try_from(s).ok())
+            .map(|s| s.saturating_mul(1000))
+            .filter(|ms| *ms > now_ms)
+    };
+    let session = usage
+        .session_utilization
+        .filter(|u| *u >= FULL)
+        .and_then(|_| future(usage.session_resets_at));
+    let weekly = (usage.utilization >= FULL)
+        .then(|| future(usage.resets_at))
+        .flatten();
+    session.max(weekly)
+}
+
+/// A confirmed hint's decision, in the order the guards must run: the probe
+/// confirm, then the cooldown mark, then the restart prepare's freeze, then
+/// the migration cap and the target. The freeze sits AFTER the confirm (the
+/// scraper's patterns are generous, so an echoed limit message must mark
+/// nothing) and BEFORE the cap (a frozen session spends no cap slot).
+///
+/// Known limit, by placement: with auto-migration switched off, or fewer than
+/// two accounts, [`handle_usage_limit_hint`] returns before the probe and this
+/// is never reached, so such a session's cohort row is not marked
+/// `limit_hit`. Nothing would have migrated it either.
+pub(crate) fn decide_hint(effects: &mut dyn HintEffects, facts: HintFacts<'_>) -> HintVerdict {
+    if !facts.confirmed {
+        return HintVerdict::NotConfirmed;
+    }
+    // Keep spawn-time selection off the dead account, and repoint the global
+    // resolved dir so unrelated new sessions stop landing on it. When the
+    // usage stats carry the 5-hour window's actual reset time, cool down
+    // until then (clamped) instead of the blanket hour — the account comes
+    // back into rotation the moment its session window rolls over.
+    effects.cool_down(
+        facts.src,
+        exhausted_cooldown(facts.session_resets_at, facts.now_ms / 1000),
+    );
+    if let crate::restart_prep::prepare::FreezeHit::Frozen { row_marked } =
+        effects.freeze_hit(facts.claude_session_id, facts.limit_reset_at_ms)
+    {
+        return HintVerdict::Frozen { row_marked };
+    }
+    if !effects.cap_permits(facts.claude_session_id, facts.now_ms) {
+        return HintVerdict::CapReached;
+    }
+    match effects.pick_target(facts.src) {
+        Some(dst) => HintVerdict::Migrate { dst },
+        None => HintVerdict::NoTarget,
+    }
+}
+
+/// The live effects.
+struct LiveHintEffects;
+
+impl HintEffects for LiveHintEffects {
+    fn cool_down(&mut self, src: &str, cooldown: std::time::Duration) {
+        crate::ai_provider::mark_account_rate_limited_with_duration(src, cooldown);
+        crate::ai_provider::pick_best_account();
+    }
+    fn freeze_hit(
+        &mut self,
+        claude_session_id: &str,
+        limit_reset_at_ms: Option<i64>,
+    ) -> crate::restart_prep::prepare::FreezeHit {
+        crate::restart_prep::freeze_hit(claude_session_id, limit_reset_at_ms)
+    }
+    fn cap_permits(&mut self, claude_session_id: &str, now_ms: i64) -> bool {
+        migration_cap_permits(claude_session_id, now_ms)
+    }
+    fn pick_target(&mut self, src: &str) -> Option<String> {
+        crate::ai_provider::pick_migration_target(src)
+    }
+}
+
 /// The model the session was last actually running on, from the transcript's
 /// most recent assistant turn (`.message.model`). `None` when the transcript
 /// is unreadable or records no real model (synthetic error turns are
 /// skipped) — the respawn then omits `--model` and the CLI default applies.
-fn transcript_last_model(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+pub(crate) fn transcript_last_model(path: &Path) -> Option<String> {
+    transcript_last_model_in(&std::fs::read_to_string(path).ok()?)
+}
+
+/// [`transcript_last_model`] over the transcript's text, for a caller that has
+/// already read the file for another field.
+pub(crate) fn transcript_last_model_in(content: &str) -> Option<String> {
     for line in content.lines().rev() {
         // Cheap pre-filter before parsing multi-KB JSONL lines.
         if !line.contains("\"assistant\"") || !line.contains("\"model\"") {
@@ -304,7 +534,7 @@ it left off; if you were idle awaiting operator input, say so and wait.";
 ///
 /// Painted while Claude is mid-turn — if visible, the session already picked
 /// itself up (or the operator beat us to it) and no nudge is needed.
-const BUSY_MARKER: &str = "esc to interrupt";
+pub(crate) const BUSY_MARKER: &str = "esc to interrupt";
 
 /// What one grid read tells the idle watcher.
 #[derive(Debug, PartialEq, Eq)]
@@ -509,6 +739,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// does not silently drop to the target account's default model. A missing
     /// or unreadable file simply omits `--model`.
     pub model_transcript: std::path::PathBuf,
+    /// Effort level to re-apply as `--effort <level>`, through
+    /// [`crate::claude_session::launch_spec::LaunchSpec::effort`]. `None` omits
+    /// the flag (the account's own default applies) — every caller but the
+    /// restart restore, which passes the level the session ran at when that
+    /// differs from the account's baseline (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D5).
+    pub effort: Option<String>,
     /// `CLAUDE_CONFIG_DIR` for the new PTY — the TARGET account's dir. It also
     /// keeps the durable restore record consistent (the record stores the dir
     /// the session actually launched under).
@@ -581,6 +818,7 @@ pub(crate) fn spawn_resumed_pane(
         &crate::agent_runtime::resolve_claude_bin(),
         spec.claude_session_id,
         model,
+        spec.effort.clone(),
         &launch_cfg,
         // The hook carrier, spelled out because this respawn execs the
         // resolved `resolve_claude_bin()` DIRECTLY — the identity shim,
@@ -682,6 +920,7 @@ fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
     model: Option<String>,
+    effort: Option<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
     extra_required: Vec<String>,
 ) -> Vec<String> {
@@ -690,6 +929,7 @@ fn resume_respawn_argv(
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             resume_id: Some(claude_session_id.to_string()),
             model,
+            effort,
             extra_required,
             ..Default::default()
         },
@@ -871,6 +1111,9 @@ pub fn migrate_session(
                 &working_dir,
                 &record.claude_session_id,
             ),
+            // A migration carries no effort re-apply: the session is still
+            // running, and its effort is not this path's to change.
+            effort: None,
             config_dir: dst_config_dir,
             title: title.clone(),
             page_id: record.page_id.clone(),
@@ -1008,6 +1251,329 @@ fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- restart prepare's account freeze (plan
+    // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3) --
+
+    use crate::restart_prep::cohort::StateAtPrepare;
+    use crate::restart_prep::prepare::{FreezeHit, RestartPrep};
+
+    const PREP_T0: i64 = 1_790_000_000_000;
+
+    /// Effects that record what ran, with the freeze delegated to a REAL
+    /// prepare controller (or to none: no prepare on this runner).
+    struct Recorded<'a> {
+        prep: Option<&'a RestartPrep>,
+        cooled: Vec<String>,
+        cap_calls: usize,
+        target_calls: usize,
+    }
+
+    impl<'a> Recorded<'a> {
+        fn new(prep: Option<&'a RestartPrep>) -> Self {
+            Self {
+                prep,
+                cooled: vec![],
+                cap_calls: 0,
+                target_calls: 0,
+            }
+        }
+    }
+
+    impl HintEffects for Recorded<'_> {
+        fn cool_down(&mut self, src: &str, _cooldown: std::time::Duration) {
+            self.cooled.push(src.to_string());
+        }
+        fn freeze_hit(&mut self, id: &str, reset: Option<i64>) -> FreezeHit {
+            match self.prep {
+                Some(p) => p.freeze_hit(id, reset, PREP_T0 + 1_000),
+                None => FreezeHit::NotFrozen,
+            }
+        }
+        fn cap_permits(&mut self, _id: &str, _now_ms: i64) -> bool {
+            self.cap_calls += 1;
+            true
+        }
+        fn pick_target(&mut self, _src: &str) -> Option<String> {
+            self.target_calls += 1;
+            Some("/home/u/.claude-other".to_string())
+        }
+    }
+
+    fn facts(confirmed: bool) -> HintFacts<'static> {
+        HintFacts {
+            confirmed,
+            src: "/home/u/.claude-iris",
+            claude_session_id: "s-limit",
+            session_resets_at: None,
+            limit_reset_at_ms: Some(PREP_T0 + 3_600_000),
+            now_ms: PREP_T0 + 1_000,
+        }
+    }
+
+    fn row_state(prep: &RestartPrep) -> (StateAtPrepare, Option<i64>) {
+        let rec = prep.record().unwrap();
+        let row = rec
+            .cohort
+            .rows
+            .iter()
+            .find(|r| r.session.claude_session_id == "s-limit")
+            .unwrap();
+        (row.state_at_prepare, row.limit_reset_at)
+    }
+
+    #[test]
+    fn account_migration_a_usage_limit_hint_during_a_prepare_migrates_nothing_and_marks_limit_hit()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let prep = crate::restart_prep::prepare::active_controller_for_test(
+            dir.path(),
+            &["s-limit", "s-other"],
+            PREP_T0,
+        );
+        let mut fx = Recorded::new(Some(&prep));
+        let verdict = decide_hint(&mut fx, facts(true));
+        assert_eq!(verdict, HintVerdict::Frozen { row_marked: true });
+        assert_eq!(
+            fx.cooled,
+            ["/home/u/.claude-iris"],
+            "the cooldown mark still runs first"
+        );
+        assert_eq!(
+            fx.cap_calls, 0,
+            "a frozen session spends no migration-cap slot"
+        );
+        assert_eq!(fx.target_calls, 0, "no target is even picked");
+        assert_eq!(
+            row_state(&prep),
+            (StateAtPrepare::LimitHit, Some(PREP_T0 + 3_600_000))
+        );
+    }
+
+    /// A probe result for the session's account: `error` set = a FAILED probe;
+    /// otherwise `utilization` decides whether it reads exhausted.
+    fn probe(
+        error: Option<&str>,
+        utilization: f64,
+    ) -> crate::commands::ai_settings::AccountUsageInfo {
+        crate::commands::ai_settings::AccountUsageInfo {
+            config_dir: "/home/u/.claude-iris".to_string(),
+            error: error.map(str::to_string),
+            utilization,
+            ..Default::default()
+        }
+    }
+
+    /// A marker whose window ended long ago (rule 2 only).
+    fn past_window_marker() -> Option<super::super::usage_limit::RestoredLimitHit> {
+        Some(super::super::usage_limit::RestoredLimitHit::new(
+            Some(PREP_T0 - 86_400_000),
+            PREP_T0,
+        ))
+    }
+
+    fn verdict_of(gate: HintGate) -> HintVerdict {
+        let HintGate::Confirmed(confirmed) = gate else {
+            panic!("expected a probe verdict, got {gate:?}");
+        };
+        decide_hint(&mut Recorded::new(None), facts(confirmed))
+    }
+
+    fn migrate() -> HintVerdict {
+        HintVerdict::Migrate {
+            dst: "/home/u/.claude-other".to_string(),
+        }
+    }
+
+    /// A hand-restored limit_hit terminal after its window: a FAILED probe
+    /// (which the fleet-wide reading counts as exhausted) does not migrate it.
+    #[test]
+    fn a_restored_limit_hit_terminal_does_not_migrate_on_a_probe_error() {
+        let failed = probe(Some("Network error: timed out"), 1.0);
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&failed));
+        assert_eq!(gate, HintGate::Confirmed(false));
+        assert_eq!(verdict_of(gate), HintVerdict::NotConfirmed);
+        // No probe result for the account at all: not confirmed either.
+        assert_eq!(
+            hint_gate(past_window_marker(), PREP_T0, true, None),
+            HintGate::Confirmed(false)
+        );
+    }
+
+    /// ...but a SUCCESSFUL probe that reads exhausted migrates it as usual.
+    #[test]
+    fn a_restored_limit_hit_terminal_migrates_on_a_successful_exhausted_probe() {
+        let exhausted = probe(None, 1.0);
+        assert!(crate::commands::ai_settings::probe_result_exhausted(
+            &exhausted
+        ));
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&exhausted));
+        assert_eq!(verdict_of(gate), migrate());
+    }
+
+    /// Re-review S1: the verdict comes from this call's probe alone. A
+    /// successful probe reading NOT exhausted does not migrate, even when the
+    /// shared snapshot (possibly rewritten by a concurrent probe) says it is.
+    #[test]
+    fn a_restored_terminal_ignores_the_shared_snapshot() {
+        let fine = probe(None, 0.4);
+        assert!(!crate::commands::ai_settings::probe_result_exhausted(&fine));
+        let gate = hint_gate(past_window_marker(), PREP_T0, true, Some(&fine));
+        assert_eq!(gate, HintGate::Confirmed(false));
+        assert_eq!(verdict_of(gate), HintVerdict::NotConfirmed);
+    }
+
+    /// Re-review S2: a hint that reaches the handler inside the window (it was
+    /// dispatched before the terminal was marked) is dropped there.
+    #[test]
+    fn a_hint_inside_the_window_is_dropped_by_the_handler_gate() {
+        let open = super::super::usage_limit::RestoredLimitHit::new(None, PREP_T0);
+        let exhausted = probe(None, 1.0);
+        assert_eq!(
+            hint_gate(Some(open), PREP_T0 + 2_000, true, Some(&exhausted)),
+            HintGate::InsideWindow
+        );
+    }
+
+    /// Re-review N2: the handler composition — the marker is looked up by the
+    /// terminal id the hint names.
+    #[test]
+    fn the_gate_reads_the_marker_of_the_hints_own_terminal() {
+        let _l = super::super::usage_limit::marker_test_lock();
+        let tid = "account-migration-gate-terminal";
+        let now = chrono::Utc::now().timestamp_millis();
+        super::super::usage_limit::guard_restored_limit_hit(tid, None, now);
+        let failed = probe(Some("API error (500)"), 1.0);
+        assert_eq!(
+            hint_gate(
+                super::super::usage_limit::restored_marker(tid),
+                now + 1,
+                true,
+                Some(&failed)
+            ),
+            HintGate::InsideWindow
+        );
+        // Another terminal's hint is unaffected by this marker.
+        assert_eq!(
+            hint_gate(
+                super::super::usage_limit::restored_marker("account-migration-other"),
+                now + 1,
+                true,
+                Some(&failed)
+            ),
+            HintGate::Confirmed(true)
+        );
+    }
+
+    /// Any other terminal keeps the fleet-wide reading: a probe error still
+    /// counts as exhausted (`probe_result_exhausted` is unchanged).
+    #[test]
+    fn an_ordinary_terminal_still_treats_a_probe_error_as_exhausted() {
+        let failed = probe(Some("API error (429): rate limited"), 0.1);
+        assert!(crate::commands::ai_settings::probe_result_exhausted(
+            &failed
+        ));
+        assert_eq!(
+            hint_gate(None, PREP_T0, true, Some(&failed)),
+            HintGate::Confirmed(true)
+        );
+        assert_eq!(
+            hint_gate(None, PREP_T0, true, None),
+            HintGate::Confirmed(true)
+        );
+        assert_eq!(
+            hint_gate(None, PREP_T0, false, Some(&failed)),
+            HintGate::Confirmed(false)
+        );
+        assert_eq!(
+            verdict_of(hint_gate(None, PREP_T0, true, Some(&failed))),
+            migrate()
+        );
+    }
+
+    #[test]
+    fn account_migration_the_same_hint_with_no_prepare_still_migrates() {
+        let mut fx = Recorded::new(None);
+        assert_eq!(
+            decide_hint(&mut fx, facts(true)),
+            HintVerdict::Migrate {
+                dst: "/home/u/.claude-other".to_string()
+            }
+        );
+        assert_eq!((fx.cap_calls, fx.target_calls), (1, 1));
+        // A cancelled prepare is no prepare.
+        let dir = tempfile::tempdir().unwrap();
+        let prep = crate::restart_prep::prepare::active_controller_for_test(
+            dir.path(),
+            &["s-limit"],
+            PREP_T0 - crate::restart_prep::prepare::DEFAULT_HOLD_MS - 1,
+        );
+        let mut fx = Recorded::new(Some(&prep));
+        assert!(
+            matches!(
+                decide_hint(&mut fx, facts(true)),
+                HintVerdict::Migrate { .. }
+            ),
+            "a prepare past its until freezes nothing"
+        );
+    }
+
+    #[test]
+    fn account_migration_an_unconfirmed_hint_under_a_prepare_marks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let prep = crate::restart_prep::prepare::active_controller_for_test(
+            dir.path(),
+            &["s-limit"],
+            PREP_T0,
+        );
+        let before = row_state(&prep);
+        let mut fx = Recorded::new(Some(&prep));
+        assert_eq!(
+            decide_hint(&mut fx, facts(false)),
+            HintVerdict::NotConfirmed
+        );
+        assert_eq!(
+            row_state(&prep),
+            before,
+            "an echoed limit message marks no row"
+        );
+        assert_ne!(before.0, StateAtPrepare::LimitHit);
+        assert!(fx.cooled.is_empty() && fx.cap_calls == 0 && fx.target_calls == 0);
+    }
+
+    #[test]
+    fn account_migration_limit_reset_is_the_exhausted_windows_and_unknown_otherwise() {
+        let now = PREP_T0;
+        let secs = |ms: i64| Some(u64::try_from(ms / 1000).unwrap());
+        let mut info = crate::commands::ai_settings::AccountUsageInfo {
+            session_utilization: Some(1.0),
+            session_resets_at: secs(now + 3_600_000),
+            utilization: 0.4,
+            resets_at: secs(now + 86_400_000),
+            ..Default::default()
+        };
+        assert_eq!(limit_reset_at_ms(&info, now), Some(now + 3_600_000));
+        info.utilization = 1.0;
+        assert_eq!(
+            limit_reset_at_ms(&info, now),
+            Some(now + 86_400_000),
+            "both windows full: the later reset is when the account comes back"
+        );
+        info.session_utilization = Some(0.2);
+        info.utilization = 0.3;
+        assert_eq!(
+            limit_reset_at_ms(&info, now),
+            None,
+            "no window reads full: UNKNOWN"
+        );
+        info.session_utilization = Some(1.0);
+        info.session_resets_at = secs(now - 1_000);
+        assert_eq!(
+            limit_reset_at_ms(&info, now),
+            None,
+            "a reset in the past is no reset"
+        );
+    }
 
     // ---- idle-prompt watcher -------------------------------------------------
 
@@ -1182,6 +1748,7 @@ mod tests {
             bin,
             "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
             Some("claude-opus-5".to_string()),
+            None,
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             vec!["--settings".to_string(), "hooks.json".to_string()],
         );
@@ -1208,6 +1775,47 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    #[test]
+    fn a_refunded_slot_is_available_again() {
+        let id = "cap-refund-test-9d8e-account-migration";
+        let now = chrono::Utc::now().timestamp_millis();
+        for _ in 0..MIGRATION_CAP {
+            assert!(migration_cap_permits(id, now));
+        }
+        assert!(!migration_cap_permits(id, now), "the cap is full");
+        migration_cap_refund(id, now);
+        assert!(migration_cap_permits(id, now), "the refunded slot is free");
+        // Refunding a slot that was never taken changes nothing.
+        migration_cap_refund(id, now - 1);
+        assert!(!migration_cap_permits(id, now));
+    }
+
+    /// The restart restore's effort re-apply (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D5):
+    /// a `ResumeSpawn.effort` is rendered as one `--effort <level>` pair in the
+    /// resume argv, and no effort means no flag at all.
+    #[test]
+    fn resume_respawn_argv_renders_the_effort_re_apply() {
+        let sid = "7b4a9fb4-5526-4ab0-b89e-f13b6316874a";
+        let cfg = crate::claude_session::launch_spec::LaunchConfig::default();
+        let argv = resume_respawn_argv(
+            "/fake/bin/claude",
+            sid,
+            None,
+            Some("max".to_string()),
+            &cfg,
+            vec![],
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--effort", "max"]),
+            "{argv:?}"
+        );
+        assert_eq!(argv.iter().filter(|a| *a == "--effort").count(), 1);
+        assert!(argv.windows(2).any(|w| w == ["--resume", sid]), "{argv:?}");
+        let without = resume_respawn_argv("/fake/bin/claude", sid, None, None, &cfg, vec![]);
+        assert!(!without.iter().any(|a| a == "--effort"), "{without:?}");
     }
 
     #[test]

@@ -150,6 +150,7 @@ GET /container/status get_container_status
 GET /contexts list_all_contexts
 GET /contexts/categories list_context_categories
 GET /contexts/tags list_context_tags
+GET /control/restart-prep get_restart_prep
 GET /control/sessions/info get_sessions_info
 GET /control/sessions/ledger get_sessions_ledger
 GET /control/sessions/restore-census get_sessions_restore_census
@@ -958,6 +959,7 @@ MERGE reflection_api::routes
 MERGE registry_routes::routes
 MERGE regression_api::routes
 MERGE relay::routes
+MERGE restart_prep::routes
 MERGE restate_api::routes
 MERGE resume_door::routes
 MERGE reviews::routes
@@ -1265,6 +1267,7 @@ POST /sessions/{id}/continuation-verdict continuation_verdict
 POST /sessions/{id}/finish finish_session
 POST /sessions/{id}/message send_message
 POST /sessions/{id}/notification operator_touch_notification
+POST /sessions/{id}/session-end session_end
 POST /sessions/{session_id}/commit-progress commit_session_progress_handler
 POST /sessions/{session_id}/promote-to-worktree promote_session_to_worktree_handler
 POST /sessions/{session_id}/review/insert insert_handler

@@ -33,6 +33,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '@@SESSION_END_HOOK_SCRIPT@@'",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   },
   "permissions": {

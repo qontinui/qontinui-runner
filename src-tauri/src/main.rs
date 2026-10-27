@@ -238,6 +238,7 @@ mod repo_detection;
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
 mod resource_guard;
+mod restart_prep; // Operator "prepare for restart": cohort record, effort, reads (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore)
 mod restate;
 mod rework;
 mod routing;
@@ -253,6 +254,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
+mod shutdown_signals; // SIGTERM/SIGHUP mark the app quitting inside the signal handler, then die by default (round 11 M2)
 pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
@@ -2129,6 +2131,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `terminal::usage_limit`.
                 terminal::usage_limit::spawn_grid_scan_loop();
 
+                // A `claude` that ends under a living shell (the user's
+                // `/exit`) is closed `claude-ended` in seconds, not after the
+                // lifecycle poll's minutes-long debounce — so a runner killed
+                // meanwhile does not bring it back at boot.
+                session::claude_ended_watch::spawn();
+
+                // A SIGTERM / SIGHUP is a shutdown: mark it BEFORE the panes
+                // die, so their exits stay restart-shaped. Installed as a raw
+                // signal handler, NOT a runtime listener: see the module.
+                shutdown_signals::install();
+
                 // Visibility sweeper (Phase 5 of
                 // `plans/2026-07-28-runner-many-sessions-performance.md`).
                 // Settles the two deferred jobs the visibility tiers own —
@@ -2839,6 +2852,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::operator_doors::operator_run_composed_workflow,
             commands::operator_doors::operator_generate_unified_workflow_async,
             commands::operator_doors::operator_resume_task_run,
+            commands::operator_doors::operator_resume_sessions,
             commands::operator_doors::scheduler_run_task_now,
             mcp::steward::steward_start,
             commands::ai_session::generate_workflow_from_session,
@@ -4811,6 +4825,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             crate::coord_drain_state::SpawnOrigin::BootResume,
                         )
                         .allows();
+                        // The rows of a restart cohort the rebuilt runner is
+                        // restoring by hand (plan
+                        // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+                        // Phase 6): placeholders the boot restore deliberately
+                        // left alone, held against the orphan close until they
+                        // are restored, Finished or dismissed — and, from boot
+                        // until the boot step moves it to `restoring`, the rows
+                        // of a prepare the restarted runner will restore by
+                        // hand. Empty with no such record — the crash-boot path.
+                        let tick_restoring_cohort =
+                            crate::restart_prep::restore::withheld_cohort_ids();
                         let mut held_for_restore: usize = 0;
 
                         // Review F1 (plan 2026-09-12 Phase 5): a pane a
@@ -4867,6 +4892,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
+                                session::session_lifecycle_store::in_active_cohort(
+                                    &tick_restoring_cohort,
+                                    rec,
+                                ),
                             );
 
                             // Match the live terminal: by id first, then the
@@ -5043,6 +5072,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                         poll_lifecycle_store
                                             .clear_restore_pending(&rec.claude_session_id);
                                     }
+                                    // A restart-cohort row seen alive (a pane a
+                                    // PTY holder kept and the runner adopted, or
+                                    // one resumed by any path) is back: it
+                                    // leaves the waiting set, so a later crash
+                                    // boot auto-restores it like any session.
+                                    if tick_restoring_cohort.contains(&rec.claude_session_id) {
+                                        crate::restart_prep::restore::note_running(
+                                            &rec.claude_session_id,
+                                        );
+                                    }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
@@ -5067,10 +5106,33 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // unresumable record, recreating the same
                                     // blank terminal forever. See
                                     // `close_reason_for_dead_shell`.
-                                    let reason =
-                                        close_reason_for_dead_shell(rec.restore_tier.as_deref());
-                                    poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, reason);
+                                    // `claude-ended` (not restorable) only
+                                    // when claude is gone from a LIVING shell
+                                    // AND the session reported a deliberate
+                                    // end (`SessionEnd` `prompt_input_exit`):
+                                    // gone alone is equally an OOM kill, a
+                                    // SIGKILL or a crash, and keeps
+                                    // `poll-dead` (restorable), as does a dead
+                                    // PTY (its own exit decides) and anything
+                                    // during shutdown.
+                                    let cause = session::session_lifecycle_store::poll_exit_cause(
+                                        live_is_alive,
+                                        session::claude_ended_watch::deliberate_end(
+                                            &rec.claude_session_id,
+                                        ),
+                                    );
+                                    let reason = session::session_lifecycle_store::witnessed_close_reason(
+                                        close_reason_for_dead_shell(rec.restore_tier.as_deref()),
+                                        commands::terminal_windows::is_app_quitting(),
+                                        cause,
+                                    );
+                                    let outcome = poll_lifecycle_store.record_close_checked(
+                                        &rec.claude_session_id,
+                                        None,
+                                        reason,
+                                    );
+                                    // Consumed only by a close that landed.
+                                    session::claude_ended_watch::consume_marker_after(&outcome);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
@@ -5275,6 +5337,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // which tabs exist, and after the lifecycle store is managed
                 // (it records each outcome there).
                 session::wind_down_executor::start();
+
+                // Operator restart prepare's notice loop (plan
+                // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+                // Phase 4): while a prepare is in its window, tell each live
+                // session to save and pause, read each row's state from the
+                // restart census, and keep `ready_to_restart` current. A tick
+                // with no prepare does nothing.
+                restart_prep::notice::start();
 
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every

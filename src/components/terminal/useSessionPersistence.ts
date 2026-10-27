@@ -135,6 +135,18 @@ export function isDegradingSave(
 // Hook
 // ---------------------------------------------------------------------------
 
+/**
+ * The snapshot's tab type. A restart cohort's restore placeholder is saved as
+ * an ordinary terminal zone: the snapshot is cosmetics only (labels, notes,
+ * pins by zone), and the placeholder itself comes back from the backend's
+ * restore set, never from here.
+ */
+function savedTabType(
+  type: "terminal" | "plan" | "restore-placeholder" | undefined,
+): "terminal" | "plan" | undefined {
+  return type === "restore-placeholder" ? undefined : type;
+}
+
 export interface SaveSessionLayoutParams {
   layoutId: string;
   tabs: Array<{
@@ -143,7 +155,7 @@ export interface SaveSessionLayoutParams {
     workingDir?: string;
     claudeSessionId?: string;
     claudeConfigDir?: string;
-    type?: "terminal" | "plan";
+    type?: "terminal" | "plan" | "restore-placeholder";
     planFilePath?: string;
     remote?: RemoteTabIdentity;
   }>;
@@ -201,7 +213,7 @@ export function useSessionPersistence(pageId: string = "default") {
             isClaudeSession: !!sid.claudeSessionId,
             claudeSessionId: sid.claudeSessionId,
             claudeConfigDir: sid.claudeConfigDir,
-            type: tab.type,
+            type: savedTabType(tab.type),
             planFilePath: tab.planFilePath,
             remote: tab.remote,
           });
@@ -219,7 +231,7 @@ export function useSessionPersistence(pageId: string = "default") {
             isClaudeSession: !!sid.claudeSessionId,
             claudeSessionId: sid.claudeSessionId,
             claudeConfigDir: sid.claudeConfigDir,
-            type: tab.type,
+            type: savedTabType(tab.type),
             planFilePath: tab.planFilePath,
             remote: tab.remote,
           });
