@@ -376,8 +376,11 @@ pub(crate) enum StallAction {
 /// (round-11 review W3). And when any OTHER bottom row is a numbered choice
 /// or dialog chrome ([`DIALOG_CHROME_MARKERS`](crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS)),
 /// a dialog is showing beside the banner and the `Esc` would cancel it: not a
-/// limit wait. (A banner the CLI wrapped onto two rows therefore reads as
-/// not-a-wait — a reported stall, never a stray `Esc`.)
+/// limit wait. Nor is it one while a `❯` input row holds an unsent draft
+/// (the draft rule `input_prompt_ready` refuses on): the `Esc` could wipe
+/// what the operator typed (round-12 review S6). (A banner the CLI wrapped
+/// onto two rows therefore reads as not-a-wait — a reported stall, never a
+/// stray `Esc`.)
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
     let bottom = crate::terminal::usage_limit::bottom_rows_text(screen);
     let rows: Vec<&str> = bottom.lines().collect();
@@ -394,6 +397,7 @@ pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
         i != banner && {
             let n = normalize(row);
             crate::terminal::graceful_exit::is_numbered_option(row)
+                || crate::terminal::graceful_exit::row_holds_unsent_draft(row)
                 || crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS
                     .iter()
                     .any(|m| n.contains(m))
