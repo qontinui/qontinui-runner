@@ -161,6 +161,11 @@ mod git_supervision;
 // the worktree census, the reclaim-safety probe, the fleet tree publisher and
 // the build-drift baseline, none of which may assume `origin/main`.
 mod git_trunk;
+// Read-only git facts (HEAD, branch, last commit, ancestry, ahead/behind,
+// trunk) answered in-process with git2, the CLI as fallback — plan
+// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 4.
+mod git_read;
+mod paced_loop;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
 mod blind_spots;

@@ -575,7 +575,33 @@ fn resolve_base(
         .map_err(|e| format!("HEAD is not a commit: {e}"))?;
 
     if repo.is_worktree() {
-        let default = default_remote_branch(repo);
+        // origin's default branch as `(name, tip commit)`, from the ONE trunk
+        // resolver (`git_trunk`) — its in-process rung over this open
+        // repository first, its CLI rungs only if git2 declines. There is
+        // deliberately no `master` guess: a `master` repo without
+        // `origin/HEAD` is UNKNOWN here, the trunk module's rule that a wrong
+        // trunk is worse than an honest `None`. Until plan
+        // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+        // (Phase 4) this module carried a second resolver whose rungs differed.
+        let workdir = repo.workdir().unwrap_or_else(|| repo.path());
+        let default = match crate::git_trunk::resolve_trunk_ref_with(
+            Some(repo),
+            workdir,
+            &mut crate::git_read::Tally::default(),
+        ) {
+            Some(trunk) => match crate::git_trunk::trunk_branch_of(trunk.clone()) {
+                Some(name) => {
+                    let tip = repo
+                        .revparse_single(&trunk)
+                        .and_then(|o| o.peel_to_commit())
+                        .map_err(|e| format!("tip of {trunk}: {e}"))?
+                        .id();
+                    Some((name, tip))
+                }
+                None => None,
+            },
+            None => None,
+        };
         let on_default = matches!(
             (&default, head.is_branch().then(|| head.shorthand()).flatten()),
             (Some((name, _)), Some(branch)) if name == branch
@@ -614,26 +640,6 @@ fn resolve_base(
             sha: head_commit.id().to_string(),
         },
     ))
-}
-
-/// origin's default branch as `(name, tip)`: `refs/remotes/origin/HEAD`'s
-/// target when it is set, else `origin/main`, else `origin/master`.
-fn default_remote_branch(repo: &git2::Repository) -> Option<(String, git2::Oid)> {
-    const PREFIX: &str = "refs/remotes/origin/";
-    let symbolic = repo
-        .find_reference("refs/remotes/origin/HEAD")
-        .ok()
-        .and_then(|r| r.symbolic_target().map(str::to_string));
-    let candidates = symbolic
-        .into_iter()
-        .chain(["main", "master"].map(|b| format!("{PREFIX}{b}")));
-    for refname in candidates {
-        if let (Some(name), Ok(oid)) = (refname.strip_prefix(PREFIX), repo.refname_to_id(&refname))
-        {
-            return Some((name.to_string(), oid));
-        }
-    }
-    None
 }
 
 /// One file a session touched, paired with what it looked like BEFORE the
@@ -2890,6 +2896,52 @@ mod file_changes_tests {
             "{:?}",
             c.detail
         );
+    }
+
+    /// The base resolves through the ONE trunk resolver (`git_trunk`), which
+    /// has no `master` guess: a linked worktree whose repo carries
+    /// `origin/master` but no `origin/HEAD` is UNKNOWN, where the deleted
+    /// in-module resolver used to pick `origin/master`. With `origin/HEAD`
+    /// naming it, the same repo resolves to the merge base.
+    #[test]
+    fn a_master_trunk_resolves_only_through_origin_head() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let main_dir = root.path().join("main");
+        std::fs::create_dir_all(&main_dir).expect("mkdir");
+        let repo = init_repo(&main_dir);
+        write(&main_dir, "f.txt", b"v1\n");
+        let c1 = commit_all(&repo, "c1");
+        repo.reference("refs/remotes/origin/master", c1, true, "test")
+            .expect("origin/master");
+        let branch = repo
+            .branch("agent/m", &repo.find_commit(c1).expect("c1"), false)
+            .expect("branch");
+        let wt_dir = root.path().join("wt");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(branch.get()));
+        repo.worktree("wt", &wt_dir, Some(&opts))
+            .expect("worktree add");
+        let wt = git2::Repository::open(&wt_dir).expect("open worktree");
+        write(&wt_dir, "f.txt", b"v2\n");
+        commit_all(&wt, "c2");
+        let path = write(&wt_dir, "f.txt", b"v3\n");
+
+        let out = assemble_real(std::slice::from_ref(&path), &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.status, "unreadable", "no master guess: {c:?}");
+
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+            true,
+            "test",
+        )
+        .expect("origin/HEAD");
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.base_kind, Some(BaseKind::MergeBase), "{c:?}");
+        assert_eq!(c.base_sha.as_deref(), Some(c1.to_string().as_str()));
+        assert_eq!(c.before.as_deref(), Some("v1\n"));
     }
 
     /// The falsifier: a 50-path session in one repository resolves its base

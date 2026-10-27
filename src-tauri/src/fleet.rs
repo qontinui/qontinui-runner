@@ -64,6 +64,15 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// Which directories the tree publisher fetches, keyed by git COMMON dir
+/// (plan `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// Phase 2).
+mod tree_fetch;
+
+/// Reuse of an unchanged tree's `status` / `ls-files` across publisher cycles,
+/// bounded by `COORD_TREE_CAPTURE_MAX_AGE_SECS` (same plan, Phase 5).
+mod tree_capture_memo;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -4815,7 +4824,7 @@ fn last_skill_parity_at() -> &'static std::sync::Mutex<Option<std::time::Instant
 
 /// True when the parity check is due (never run, or last run at least
 /// [`skill_parity_interval`] ago). Records `now` when it returns true, so
-/// back-to-back ticks do not double-walk. Mirrors [`fetch_due`].
+/// back-to-back ticks do not double-walk. Mirrors [`tree_fetch::fetch_due`].
 fn skill_parity_due(now: std::time::Instant) -> bool {
     skill_parity_due_at(now, skill_parity_interval())
 }
@@ -4947,32 +4956,138 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
     Some(default_branch)
 }
 
-/// Capture the state of a single primary git tree at `repo_path`. Returns
-/// `None` when the directory isn't a git repo (no `.git/` dir). All
-/// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
-/// PATH-resolved git — same as the rest of the runner.
+/// `git status --porcelain=v1` and `git ls-files --others --exclude-standard`
+/// for `repo_str` — the two capture facts that stay on the CLI (plan D2), and
+/// the two [`tree_capture_memo`] reuses for an unchanged tree. `None` when
+/// `status` fails, which skips the repo this cycle.
+fn capture_local_facts(repo_str: &str) -> Option<tree_capture_memo::LocalFacts> {
+    let status_out = git_out(&["-C", repo_str, "status", "--porcelain=v1"]).ok()?;
+    if !status_out.status.success() {
+        return None;
+    }
+    // untracked_count: one line per untracked file. The orphan-untracked-file
+    // signal that catches sub-agent worktree builds spilling scratch into the
+    // primary tree.
+    let untracked_count: Option<i32> =
+        git_out(&["-C", repo_str, "ls-files", "--others", "--exclude-standard"])
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    let n: i32 = s.lines().filter(|l| !l.is_empty()).count() as i32;
+                    Some(n)
+                } else {
+                    None
+                }
+            });
+    Some(tree_capture_memo::LocalFacts {
+        status_porcelain: String::from_utf8_lossy(&status_out.stdout).into_owned(),
+        untracked_count,
+    })
+}
+
+/// `git rev-list --count <from>..<to>` — commits reachable from `to` and not
+/// from `from` — read in-process ([`crate::git_read::ahead_behind`]), the CLI
+/// as fallback. `None` when either side does not resolve, as on the CLI.
+fn rev_list_count(
+    open: Option<&git2::Repository>,
+    tally: &mut crate::git_read::Tally,
+    repo_str: &str,
+    from: &str,
+    to: &str,
+) -> Option<i32> {
+    crate::git_read::or_cli(
+        open,
+        tally,
+        |r| {
+            crate::git_read::ahead_behind(r, from, to)
+                .map(|ab| ab.and_then(|(_, right)| i32::try_from(right).ok()))
+        },
+        || {
+            git_out(&[
+                "-C",
+                repo_str,
+                "rev-list",
+                "--count",
+                &format!("{from}..{to}"),
+            ])
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<i32>()
+                        .ok()
+                } else {
+                    None
+                }
+            })
+        },
+    )
+}
+
+/// Capture the state of a single primary git tree at `repo_path`, counting
+/// its in-process reads and CLI fallbacks into `tally`. Returns `None` when
+/// the directory isn't a git repo (no `.git/`) or a required probe failed.
+///
+/// Since plan
+/// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// (Phase 4) HEAD, the branch, the last commit time, the trunk and the three
+/// behind/ahead counts are read in-process over ONE open repository
+/// ([`crate::git_read`]), each falling back to its old `git` call when git2
+/// declines; only `status` and `ls-files` still spawn, and Phase 5 reuses
+/// those for an unchanged tree ([`tree_capture_memo`]). Every `git` that does
+/// run uses `process_helpers::no_window("git")`, the operator's PATH-resolved
+/// git — same as the rest of the runner.
+fn capture_tree_counted(
+    repo_path: &std::path::Path,
+    tally: &mut crate::git_read::Tally,
+) -> Option<TreeStatePayload> {
+    capture_tree_over(repo_path, true, tally)
+}
+
+/// [`capture_tree_counted`] with the in-process reads switchable: `false`
+/// answers every fact through its CLI fallback and bypasses the
+/// unchanged-tree memo — the pre-Phase-4/5 capture, which the end-to-end
+/// parity test compares against.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
+fn capture_tree_over(
+    repo_path: &std::path::Path,
+    in_process: bool,
+    tally: &mut crate::git_read::Tally,
+) -> Option<TreeStatePayload> {
     let dot_git = repo_path.join(".git");
-    if !dot_git.exists() {
+    // A pruned worktree's dangling `.git` file still `exists()`; git can open
+    // no repository there, so the `rev-parse HEAD` below would only fail into
+    // the same `None` — one wasted git (3 processes on Windows) per cycle.
+    if !dot_git.exists() || qontinui_runner_lib::git_layout::git_provably_absent(repo_path) {
         return None;
     }
 
     let repo_name = repo_path.file_name()?.to_string_lossy().to_string();
+    let repo_str = repo_path.to_str()?;
+    let open = if in_process {
+        crate::git_read::open(repo_path).ok()
+    } else {
+        None
+    };
+    let open = open.as_ref();
 
     // HEAD SHA
-    let head_sha = git_out(&["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })?;
+    let head_sha = crate::git_read::or_cli(open, tally, crate::git_read::head_oid, || {
+        git_out(&["-C", repo_str, "rev-parse", "HEAD"])
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+    })?;
 
     // Current branch. A NON-ZERO EXIT is git's real answer "HEAD is detached";
     // an `Err` is the probe never answering (killed at FLEET_GIT_LOCAL_TIMEOUT,
@@ -4989,34 +5104,56 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // `?` instead: publish NO tree state for this repo this tick rather than a
     // fabricated one. That is exactly what the `git status` probe immediately
     // below has always done, and the publisher re-runs on the next tick.
-    let symbolic_ref = git_out(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
-        .map_err(|e| {
-            warn!(
-                "fleet: symbolic-ref for {} did not answer ({e}) — skipping this repo's \
-                 tree-state this tick rather than publishing a guessed branch",
-                repo_path.display()
-            );
-        })
-        .ok()?;
-    // Now always KNOWN: the `?` above returned when the probe did not answer,
-    // so we only reach here with git's own verdict. The payload field stays
+    //
+    // In-process, `Some(None)` is a detached HEAD and `Some(Some(b))` the
+    // branch; the CLI fallback keeps exactly the distinction above.
+    let head_branch: Option<Option<String>> = crate::git_read::or_cli(
+        open,
+        tally,
+        |r| crate::git_read::head_branch(r).map(Some),
+        || {
+            let symbolic_ref = git_out(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
+                .map_err(|e| {
+                    warn!(
+                        "fleet: symbolic-ref for {} did not answer ({e}) — skipping this repo's \
+                         tree-state this tick rather than publishing a guessed branch",
+                        repo_path.display()
+                    );
+                })
+                .ok()?;
+            Some(symbolic_ref.status.success().then(|| {
+                String::from_utf8_lossy(&symbolic_ref.stdout)
+                    .trim()
+                    .to_string()
+            }))
+        },
+    );
+    // Now always KNOWN: the `?` returns when the probe did not answer, so we
+    // only continue with git's own verdict. The payload field stays
     // `Option<bool>` (its `None` means "old runner / undeterminable" to coord)
     // and is wrapped at the construction site.
-    let head_detached = !symbolic_ref.status.success();
-    let branch = if symbolic_ref.status.success() {
-        String::from_utf8_lossy(&symbolic_ref.stdout)
-            .trim()
-            .to_string()
-    } else {
-        "(detached)".to_string()
-    };
+    let head_branch = head_branch?;
+    let head_detached = head_branch.is_none();
+    let branch = head_branch.unwrap_or_else(|| "(detached)".to_string());
 
-    // Dirty status — `git status --porcelain=v1` is one line per change.
-    let status_out = git_out(&["-C", repo_path.to_str()?, "status", "--porcelain=v1"]).ok()?;
-    if !status_out.status.success() {
-        return None;
-    }
-    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    // Dirty status — `git status --porcelain=v1` is one line per change —
+    // and the untracked count: the two facts still spawned, reused for a tree
+    // whose fingerprint has not moved within COORD_TREE_CAPTURE_MAX_AGE_SECS
+    // (Phase 5, `tree_capture_memo`). The CLI-only capture (`in_process ==
+    // false`, the parity reference) never touches the memo, so it always
+    // spawns both and cannot be answered by a git2 capture's stored entry.
+    let local = if in_process {
+        tree_capture_memo::CaptureMemo::global().local_facts(
+            repo_path,
+            &head_sha,
+            std::time::Instant::now(),
+            tree_capture_memo::max_age(),
+            || capture_local_facts(repo_str),
+        )?
+    } else {
+        capture_local_facts(repo_str)?
+    };
+    let status_str = local.status_porcelain.as_str();
     let dirty_files: Vec<String> = status_str
         .lines()
         .filter_map(|line| {
@@ -5057,19 +5194,33 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             })
             .max()
     } else {
-        // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
-        git_out(&["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|d| d.with_timezone(&chrono::Utc))
-                } else {
-                    None
-                }
-            })
+        // The HEAD commit's committer date (`log -1 --format=%cI` on the CLI
+        // fallback), read in-process.
+        crate::git_read::or_cli(
+            open,
+            tally,
+            |r| {
+                crate::git_read::head_commit(r).map(|c| {
+                    c.and_then(|c| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(c.committed_epoch, 0)
+                    })
+                })
+            },
+            || {
+                git_out(&["-C", repo_str, "log", "-1", "--format=%cI"])
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            chrono::DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|d| d.with_timezone(&chrono::Utc))
+                        } else {
+                            None
+                        }
+                    })
+            },
+        )
     };
 
     // behind_count: commits HEAD is behind `origin/<branch>` (or
@@ -5086,51 +5237,19 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // On the five governed `master`-trunk repos the old literal named a ref
     // that does not exist, so `rev-list` failed and `behind_count` collapsed
     // to `None` for every detached capture.
+    // Resolved ONCE per capture (it was resolved twice: here and for
+    // `local_ahead` below), in-process over the open repository.
+    let default_branch = crate::git_trunk::resolve_trunk_branch_with(open, repo_path, tally)
+        .unwrap_or_else(|| "main".to_string());
     let remote_ref = if head_detached || branch == "(detached)" {
-        format!("origin/{}", resolve_default_branch(repo_path))
+        format!("origin/{default_branch}")
     } else {
         format!("origin/{branch}")
     };
-    let behind_count: Option<i32> = git_out(&[
-        "-C",
-        repo_path.to_str()?,
-        "rev-list",
-        "--count",
-        &format!("HEAD..{remote_ref}"),
-    ])
-    .ok()
-    .and_then(|o| {
-        if o.status.success() {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<i32>()
-                .ok()
-        } else {
-            None
-        }
-    });
+    let behind_count = rev_list_count(open, tally, repo_str, "HEAD", &remote_ref);
 
-    // untracked_count: `git ls-files --others --exclude-standard` — one
-    // line per untracked file. The orphan-untracked-file signal that
-    // catches sub-agent worktree builds spilling scratch into the
-    // primary tree.
-    let untracked_count: Option<i32> = git_out(&[
-        "-C",
-        repo_path.to_str()?,
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-    ])
-    .ok()
-    .and_then(|o| {
-        if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let n: i32 = s.lines().filter(|l| !l.is_empty()).count() as i32;
-            Some(n)
-        } else {
-            None
-        }
-    });
+    // untracked_count: read with `status` above (`capture_local_facts`).
+    let untracked_count = local.untracked_count;
 
     // local_ahead: commits the LOCAL default branch is ahead of
     // `origin/<default>` — unpushed local commits on default. Computed
@@ -5140,29 +5259,17 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // default branch from `origin/HEAD` (e.g. `origin/main` -> `main`),
     // falling back to `main`. No network fetch — uses last-fetched refs,
     // same posture as `behind_count` above. This used to be an inlined
-    // duplicate of `resolve_default_branch`; both now share one resolver.
-    let default_branch = resolve_default_branch(repo_path);
-    let local_ahead: Option<i32> = git_out(&[
-        "-C",
-        repo_path.to_str()?,
-        "rev-list",
-        "--count",
-        &format!("origin/{default_branch}..{default_branch}"),
-    ])
-    .ok()
-    .and_then(|o| {
-        if o.status.success() {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<i32>()
-                .ok()
-        } else {
-            // Either ref unresolved (fresh clone, no local default
-            // ref, detached genesis) — report nothing; coord keeps
-            // the column's DEFAULT 0.
-            None
-        }
-    });
+    // duplicate of `resolve_default_branch`; both now share one resolver,
+    // resolved once above. Either ref unresolved (fresh clone, no local
+    // default ref, detached genesis) reports nothing; coord keeps the
+    // column's DEFAULT 0.
+    let local_ahead = rev_list_count(
+        open,
+        tally,
+        repo_str,
+        &format!("origin/{default_branch}"),
+        &default_branch,
+    );
 
     // behind_default_count: commits HEAD is behind `origin/<default>` —
     // ONLY when parked on a non-default named branch (see
@@ -5176,24 +5283,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // an error.
     let behind_default_count: Option<i32> =
         match behind_default_compare_branch(&branch, &default_branch) {
-            Some(cmp) => git_out(&[
-                "-C",
-                repo_path.to_str()?,
-                "rev-list",
-                "--count",
-                &format!("HEAD..origin/{cmp}"),
-            ])
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8_lossy(&o.stdout)
-                        .trim()
-                        .parse::<i32>()
-                        .ok()
-                } else {
-                    None
-                }
-            }),
+            Some(cmp) => rev_list_count(open, tally, repo_str, "HEAD", &format!("origin/{cmp}")),
             None => None,
         };
 
@@ -5276,49 +5366,8 @@ fn pull_executor_enabled() -> bool {
 // real throttle, not a kill switch — the default fetches every publish cycle.
 // =============================================================================
 
-/// Resolve the per-repo fetch interval. Reads `COORD_TREE_FETCH_INTERVAL_SECS`,
-/// falling back to `COORD_TREE_PUBLISH_INTERVAL_SECS`, then 60; floored at 5s.
-fn tree_fetch_interval() -> Duration {
-    let secs: u64 = std::env::var("COORD_TREE_FETCH_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(60)
-        .max(5);
-    Duration::from_secs(secs)
-}
-
-/// Process-global per-repo last-fetch timestamps for the interval gate.
-fn last_fetch_at(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
-    static LAST_FETCH: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
-    > = std::sync::OnceLock::new();
-    LAST_FETCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// True when `repo_path` is due a fetch (never fetched, or last fetch is at
-/// least `tree_fetch_interval()` ago). Records `now` as the attempt time when
-/// it returns true, so concurrent/back-to-back ticks don't double-fetch.
-fn fetch_due(repo_path: &std::path::Path, now: std::time::Instant) -> bool {
-    let interval = tree_fetch_interval();
-    let mut map = match last_fetch_at().lock() {
-        Ok(m) => m,
-        Err(p) => p.into_inner(),
-    };
-    let due = match map.get(repo_path) {
-        Some(prev) => now.duration_since(*prev) >= interval,
-        None => true,
-    };
-    if due {
-        map.insert(repo_path.to_path_buf(), now);
-    }
-    due
-}
+// The fetch interval and its per-key gate live in `fleet/tree_fetch.rs`, keyed
+// by git COMMON dir rather than by directory.
 
 /// Best-effort `git -C <path> fetch origin --prune` (no refspec). Blocking git;
 /// call from a blocking context. Non-zero/spawn errors `warn!` and return — a
@@ -5417,6 +5466,28 @@ fn apply_pull_verdict_blocking(
             git_op: None,
         },
         "default_ref_sync" => {
+            // `refs/heads/<default>` is ONE ref for a primary and every linked
+            // worktree of it, so a sync another checkout of the same repo
+            // already attempted this interval is not repeated (measured
+            // 2026-10-23: 17 of these ran on linked worktrees in 90 s).
+            if let Err(prior) =
+                tree_fetch::claim_ref_sync(repo_path, &default_branch, std::time::Instant::now())
+            {
+                return PullOutcome {
+                    chosen_option: "ref_sync_shared".to_string(),
+                    reasoning: format!(
+                        "local {default_branch} is shared with {} (same git common dir), \
+                         whose ref sync ran within the fetch interval with outcome {} — \
+                         not repeated",
+                        prior.dir.display(),
+                        prior
+                            .outcome
+                            .as_deref()
+                            .unwrap_or("UNKNOWN (still running)")
+                    ),
+                    git_op: None,
+                };
+            }
             // Pure local-default ref fast-forward; never touches the checked-out
             // tree. git refuses a non-ff ref update, so an unpushed local
             // default is safe.
@@ -5427,7 +5498,7 @@ fn apply_pull_verdict_blocking(
                 "origin",
                 &format!("{default_branch}:{default_branch}"),
             ]);
-            match out {
+            let outcome = match out {
                 Ok(o) if o.status.success() => PullOutcome {
                     chosen_option: "default_ref_sync".to_string(),
                     reasoning: format!("fast-forwarded local {default_branch} ref to origin"),
@@ -5453,7 +5524,9 @@ fn apply_pull_verdict_blocking(
                     reasoning: format!("git fetch invocation failed: {e}"),
                     git_op: None,
                 },
-            }
+            };
+            tree_fetch::record_ref_sync_outcome(repo_path, &default_branch, &outcome.chosen_option);
+            outcome
         }
         "pull" => {
             if !timing_now {
@@ -6100,6 +6173,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         return Ok(());
     }
+    // One generation for every fetch and ref sync this cycle attempts, so a
+    // repository is fetched once per cycle even when the cycle outlasts the
+    // fetch interval (`tree_fetch`).
+    let fetch_cycle = Some(tree_fetch::begin_cycle());
     // Phase 3 unified-devices rename: the on-disk file is still
     // `~/.qontinui/machine.json` (legacy filename, kept for tooling
     // back-compat) but the in-memory `DeviceFile` struct now exposes
@@ -6200,6 +6277,8 @@ pub async fn publish_tree_state() -> Result<(), String> {
 
     let mut total = 0usize;
     let mut posted = 0usize;
+    // This cycle's in-process git reads and CLI fallbacks (plan Phase 4).
+    let mut git_reads = crate::git_read::Tally::default();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -6226,24 +6305,29 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // on machines with no manual `git fetch` cadence. Interval-gated by
         // COORD_TREE_FETCH_INTERVAL_SECS; best-effort (failures warn, never
         // fail the cycle). Runs on the blocking pool like capture_tree below.
-        if fetch_due(&path, std::time::Instant::now()) {
+        // Keyed by git COMMON dir, and only for a directory git can open:
+        // a husk is never fetched, and linked worktrees share their
+        // primary's fetch (`tree_fetch`).
+        if tree_fetch::fetch_target(&path, std::time::Instant::now(), fetch_cycle).is_some() {
             let fetch_path = path.clone();
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
 
         let capture_path = path.clone();
-        let mut payload = match spawn_blocking_tracked(move || {
+        let (captured, tally) = spawn_blocking_tracked(move || {
             // Heal machine-local artifacts into `.git/info/exclude` BEFORE
             // capturing, so this cycle's dirty/verdict already reflects it —
             // otherwise the stray `.mcp.json` would pin the tree to a
             // `wip_on_default` Hold and the pull below would never fire.
             ensure_repo_info_exclude(&capture_path);
-            capture_tree(&capture_path)
+            let mut tally = crate::git_read::Tally::default();
+            let captured = capture_tree_counted(&capture_path, &mut tally);
+            (captured, tally)
         })
         .await
-        .ok()
-        .flatten()
-        {
+        .unwrap_or_default();
+        git_reads.add(tally);
+        let mut payload = match captured {
             Some(p) => p,
             None => {
                 debug!(
@@ -6337,15 +6421,25 @@ pub async fn publish_tree_state() -> Result<(), String> {
     if total > 0 {
         debug!("fleet::tree_publisher: published {posted}/{total} repos device_id={device_id}");
     }
+    // At most hourly at INFO when anything fell back (a 60 s cycle would
+    // otherwise repeat it 60 times an hour); DEBUG every cycle.
+    static LAST_FALLBACK_REPORT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    crate::git_read::report_throttled(
+        "fleet::tree_publisher",
+        git_reads,
+        &LAST_FALLBACK_REPORT,
+        3600,
+    );
     Ok(())
 }
 
 /// Spawn the periodic tree-state publisher on the ambient tokio runtime.
 ///
 /// Interval read from `COORD_TREE_PUBLISH_INTERVAL_SECS` (default 60s,
-/// floored at 5s). `MissedTickBehavior::Skip` mirrors `spawn_heartbeat`
-/// above. Failures `warn!` and retry on the next tick; the loop never
-/// panics.
+/// floored at 5s), measured from the END of each cycle, so a cycle longer
+/// than the interval can never run back to back. Failures `warn!` and retry
+/// on the next cycle; the loop never panics.
 pub fn spawn_tree_publisher() {
     // `coord.primary_trees` rows are keyed by this device and describe the repos
     // on the BOX, so they are machine-scoped by the same definition the budget is.
@@ -6368,31 +6462,48 @@ pub fn spawn_tree_publisher() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.tree_publisher",
         move |hb| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Rebuilt with the loop on a supervised restart, so a restart
             // starts with no streak — a fresh loop has no episode to back off
             // from.
-            let mut shed = crate::resource_guard::BackgroundShed::new(
-                "tree_publisher",
-                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
-            );
-            loop {
-                tick.tick().await;
-                // The heartbeat ticks whether or not the cycle is shed: a
-                // deliberately idle loop is a live loop, and the supervisor must
-                // not rebuild it for yielding.
-                hb.tick();
-                shed_gated_cycle(
-                    &mut shed,
-                    &crate::resource_guard::background_work_verdict(),
-                    "fleet::tree_publisher",
-                    publish_tree_state,
-                )
-                .await;
-            }
+            let mut cycle = PublisherCycle {
+                hb,
+                shed: crate::resource_guard::BackgroundShed::new(
+                    "tree_publisher",
+                    crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+                ),
+            };
+            // Paced from the END of each cycle (`paced_loop`), not on a fixed
+            // tick: a cycle longer than the interval restarted at once under
+            // the old `Skip` tick, so its git spawn rate was bounded only by
+            // process creation.
+            crate::paced_loop::run_paced(Duration::from_secs(secs), None, &mut cycle).await;
         },
     );
+}
+
+/// One tree-publisher cycle: tick the supervisor heartbeat, then run the
+/// shed-gated publish.
+struct PublisherCycle {
+    hb: crate::worker_supervisor::Heartbeat,
+    // Rebuilt with the loop on a supervised restart, so a restart starts with
+    // no streak — a fresh loop has no episode to back off from.
+    shed: crate::resource_guard::BackgroundShed,
+}
+
+impl crate::paced_loop::PacedCycle for PublisherCycle {
+    async fn run(&mut self) {
+        // The heartbeat ticks whether or not the cycle is shed: a deliberately
+        // idle loop is a live loop, and the supervisor must not rebuild it for
+        // yielding.
+        self.hb.tick();
+        shed_gated_cycle(
+            &mut self.shed,
+            &crate::resource_guard::background_work_verdict(),
+            "fleet::tree_publisher",
+            publish_tree_state,
+        )
+        .await;
+    }
 }
 
 /// One periodic tick of a fleet background loop, gated at its HEAD on the
@@ -6693,7 +6804,8 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
     let is_behind = {
         let repo = repo_path.clone();
         spawn_blocking_tracked(move || {
-            if fetch_due(&repo, std::time::Instant::now()) {
+            // Outside the publisher's cycle: the interval alone gates it.
+            if tree_fetch::fetch_target(&repo, std::time::Instant::now(), None).is_some() {
                 fetch_remote_refs_blocking(&repo);
             }
             check_if_behind(&repo)
@@ -7587,34 +7699,8 @@ mod tests {",
 
     // ---- repo-freshness Layer 1 — fetch interval gate ----
 
-    #[test]
-    fn fetch_due_first_call_true_then_immediate_false() {
-        // Unique path so the process-global last-fetch map can't collide with
-        // another test. The interval is >= 5s for any env config, so an
-        // immediately-following call is never due regardless of the knob.
-        let p = std::path::PathBuf::from(format!(
-            "/tmp/freshness-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let t0 = std::time::Instant::now();
-        // Never-fetched repo is due, and records the attempt.
-        assert!(fetch_due(&p, t0), "first call should be due");
-        // A call right after (well inside the >=5s interval) is not due.
-        assert!(
-            !fetch_due(&p, std::time::Instant::now()),
-            "immediate re-call should not be due"
-        );
-    }
-
-    #[test]
-    fn tree_fetch_interval_floored_at_5s() {
-        // Even with no env set the default is 60s; the floor guarantees >= 5s.
-        assert!(tree_fetch_interval() >= Duration::from_secs(5));
-    }
+    // `fetch_due` / `tree_fetch_interval` tests moved with the code to
+    // `fleet/tree_fetch.rs`.
 
     // ---- chkguard Phase 3 — restore_default executor (real temp git) ----
 
@@ -8370,6 +8456,66 @@ mod tests {",
             body.get("commits_behind").is_none(),
             "absent commits_behind (no drift check yet) must be omitted, got {body}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-
+    // fetch-into-empty-dirs, Phase 4: the publisher's capture reads HEAD,
+    // the branch, the last commit, the trunk and the three counts
+    // in-process. End to end, the payload must be the one the CLI-only
+    // capture publishes.
+    // -----------------------------------------------------------------
+
+    fn capture_both_ways(dir: &std::path::Path) -> (serde_json::Value, serde_json::Value) {
+        let mut in_process = crate::git_read::Tally::default();
+        let via_git2 = capture_tree_over(dir, true, &mut in_process).expect("git2 capture");
+        assert!(in_process.in_process > 0, "{in_process:?}");
+        assert_eq!(in_process.fell_back, 0, "{in_process:?}");
+        let mut cli = crate::git_read::Tally::default();
+        let via_cli = capture_tree_over(dir, false, &mut cli).expect("CLI capture");
+        assert_eq!(cli.in_process, 0, "{cli:?}");
+        assert!(cli.fell_back > 0, "{cli:?}");
+        (
+            serde_json::to_value(&via_git2).unwrap(),
+            serde_json::to_value(&via_cli).unwrap(),
+        )
+    }
+
+    #[test]
+    fn capture_tree_in_process_matches_the_cli_capture() {
+        use crate::git_read::fixtures::{clone_on_feature, commit, git};
+        let t = tempfile::tempdir().unwrap();
+        let c = clone_on_feature(t.path(), "main");
+        // Dirty AND untracked, so the CLI-only facts are non-trivial too.
+        std::fs::write(c.join("f1.txt"), b"edited").unwrap();
+        std::fs::write(c.join("scratch.txt"), b"x").unwrap();
+        let (a, b) = capture_both_ways(&c);
+        assert_eq!(a, b);
+        assert_eq!(a["branch"], "feature");
+        assert!(
+            a["behind_count"].is_null(),
+            "origin/feature does not exist: {a}"
+        );
+        assert_eq!(a["behind_default_count"], 3);
+        assert_eq!(a["untracked_count"], 1);
+        assert_eq!(a["dirty"], true);
+
+        // Clean, on the default branch, one local commit ahead of origin.
+        git(&c, &["checkout", "-q", "-f", "main"]);
+        std::fs::remove_file(c.join("scratch.txt")).unwrap();
+        commit(&c, "local.txt", "local");
+        let (a, b) = capture_both_ways(&c);
+        assert_eq!(a, b);
+        assert_eq!(a["local_ahead"], 1);
+        assert!(a["last_edit_at"].is_string(), "the commit time: {a}");
+
+        // Detached behind the trunk.
+        git(&c, &["checkout", "-q", "--detach", "origin/main~1"]);
+        let (a, b) = capture_both_ways(&c);
+        assert_eq!(a, b);
+        assert_eq!(a["branch"], "(detached)");
+        assert_eq!(a["head_detached"], true);
+        assert_eq!(a["behind_count"], 1);
     }
 
     // ---- behind_default_count (stale-primary-checkout guard, Phase 1c) ----

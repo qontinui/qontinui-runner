@@ -74,6 +74,8 @@ fn git_capture(git: Command, repo: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = git;
     scrub_repo_local_git_env(&mut cmd);
     cmd.arg("-C").arg(repo).args(args);
+    #[cfg(test)]
+    crate::agent_worktree::census::spawn_log::record(&cmd);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, TRUNK_GIT_TIMEOUT, "git_trunk: git") else {
         return None;
     };
@@ -124,8 +126,66 @@ fn host_git() -> Command {
 /// [`scrub_repo_local_git_env`] at construction, so the trunk NAME read here
 /// and the git that follows it answer for the same repo (coord finding
 /// `f110e194-7178-40ff-8952-906e238ba3aa`).
+///
+/// **In-process first.** The same rungs are answered from disk by
+/// [`crate::git_read::resolve_trunk_ref`] (git2) when the repository opens,
+/// and by the CLI rungs below only when it does not or git2 declines — plan
+/// `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs`
+/// Phase 4, whose parity tests (`git_read`) hold the two paths to the same
+/// answers. A caller that already holds the open repository passes it to
+/// [`resolve_trunk_ref_with`] instead of opening it twice.
 pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
+    let opened = crate::git_read::open(repo).ok();
+    resolve_trunk_ref_with(
+        opened.as_ref(),
+        repo,
+        &mut crate::git_read::Tally::default(),
+    )
+}
+
+/// [`resolve_trunk_ref`] over a repository the caller already opened (`None`
+/// when it did not open): the git2 rung first, the CLI rungs on any git2
+/// error. Which path answered is counted in `tally`, like every other
+/// [`crate::git_read::or_cli`] fact, so a pass's fallback report includes
+/// the trunk resolution.
+pub(crate) fn resolve_trunk_ref_with(
+    open: Option<&git2::Repository>,
+    repo: &Path,
+    tally: &mut crate::git_read::Tally,
+) -> Option<String> {
+    #[cfg(test)]
+    resolutions::note();
+    crate::git_read::or_cli(open, tally, crate::git_read::resolve_trunk_ref, || {
+        resolve_trunk_ref_on(repo, &host_git)
+    })
+}
+
+/// The CLI rungs alone — the parity reference `git_read`'s tests compare the
+/// git2 rung against.
+#[cfg(test)]
+pub(crate) fn resolve_trunk_ref_cli(repo: &Path) -> Option<String> {
     resolve_trunk_ref_on(repo, &host_git)
+}
+
+/// Test-only count of trunk resolutions on this thread, whichever rung
+/// answered — git2 reads are not processes, so a memo test that counted
+/// `symbolic-ref` spawns would read 0 whether or not the memo held.
+#[cfg(test)]
+pub(crate) mod resolutions {
+    use std::cell::Cell;
+
+    thread_local! {
+        static N: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Resolutions on this thread since the last call.
+    pub(crate) fn take() -> usize {
+        N.with(|n| n.replace(0))
+    }
 }
 
 /// [`resolve_trunk_ref`] building each `git` from `git` — the seam that lets a
@@ -179,14 +239,26 @@ fn resolve_trunk_ref_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String
 /// [`crate::process_helpers::no_window`] and so carries the same scrub (coord
 /// finding `f110e194-7178-40ff-8952-906e238ba3aa`).
 pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
-    resolve_trunk_branch_on(repo, &host_git)
+    trunk_branch_of(resolve_trunk_ref(repo)?)
+}
+
+/// [`resolve_trunk_branch`] over a repository the caller already opened.
+pub(crate) fn resolve_trunk_branch_with(
+    open: Option<&git2::Repository>,
+    repo: &Path,
+    tally: &mut crate::git_read::Tally,
+) -> Option<String> {
+    trunk_branch_of(resolve_trunk_ref_with(open, repo, tally)?)
+}
+
+/// `origin/<branch>` -> `<branch>`; `None` for a trunk on another remote.
+pub(crate) fn trunk_branch_of(trunk_ref: String) -> Option<String> {
+    trunk_ref.strip_prefix("origin/").map(str::to_string)
 }
 
 /// [`resolve_trunk_branch`] over [`resolve_trunk_ref_on`]'s seam.
 fn resolve_trunk_branch_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String> {
-    resolve_trunk_ref_on(repo, git)?
-        .strip_prefix("origin/")
-        .map(str::to_string)
+    trunk_branch_of(resolve_trunk_ref_on(repo, git)?)
 }
 
 /// Test support for proving a PRODUCTION git path ignores an INHERITED
