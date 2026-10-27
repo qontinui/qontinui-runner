@@ -100,6 +100,12 @@ rem where an unquoted `)` would abort the batch. Known divergence: FOR/CALL
 rem also split on `=`, `,` and `;`, so `--model=-v` can match here only.
 set "NON_SESSION=0"
 if /I not "%TOOL%"=="claude" goto :ns_done
+rem Parse the whole argument list once, the way the session scan below does,
+rem BEFORE any bare %1: an operator the caller caret-escaped without quoting
+rem (`claude a^&echo X`, `a^>f.txt`) reaches %* with its caret gone, and a
+rem bare `set FIRST=%1` would run or redirect it. Here it is a syntax error
+rem that aborts the batch before anything runs, as it always did.
+for %%A in (%*) do rem
 set FIRST=%1
 if defined FIRST set "FIRST=!FIRST:"=!"
 for %%S in (mcp doctor update upgrade install setup-token plugin plugins auth auto-mode agents logs rm stop kill purge import project) do if "!FIRST!"=="%%S" set "NON_SESSION=1"
@@ -233,7 +239,9 @@ rem of the caller's own quotes, so the `>` in `claude "a > f.txt"` redirected
 rem (and emptied f.txt) and the `&` in `claude "a&b"` ran b. It is set bare,
 rem which keeps the caller's quoting, and its quotes are then stripped through
 rem delayed expansion, which is also how the CRT argv parser reads
-rem `"--ver"sion`. The same rule covers FIRST above.
+rem `"--ver"sion`. The same rule covers FIRST above. Bare is safe only behind
+rem the FOR parse of %* before FIRST: it keeps the caller's quotes but not the
+rem caller's carets, so an unquoted, caret-escaped operator must abort first.
 :ns_scan
 set NS_RAW=%1
 if not defined NS_RAW goto :eof

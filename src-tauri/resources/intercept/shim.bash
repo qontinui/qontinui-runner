@@ -83,7 +83,12 @@ is_shim_dir() {
   done
   base="${base##*/}"
   base="${base##*\\}"
-  case "$base" in qontinui-identity-*|qontinui-shim-*) return 0 ;; esac
+  # Case-insensitive, as the exe's and the .cmd's skips are (a Windows PATH
+  # may spell the dir in any case). nocasematch rather than a lowercasing
+  # fork per PATH entry; bash 3.1+.
+  shopt -s nocasematch
+  case "$base" in qontinui-identity-*|qontinui-shim-*) shopt -u nocasematch; return 0 ;; esac
+  shopt -u nocasematch
   is_own_dir "$1"
 }
 

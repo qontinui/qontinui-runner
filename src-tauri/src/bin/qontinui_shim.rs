@@ -298,9 +298,9 @@ pub fn user_chose_session(args: &[String]) -> bool {
 /// Claude Code subcommands that manage the install/config and never open a
 /// conversation, checked against `claude --help` (2.1.311, 2026-10-27).
 /// `project` is hidden from `--help` (`claude project purge`) but registered.
-/// Deliberately absent: `resume` (not a 2.1.311 subcommand at all — `claude
-/// resume` prints the main usage; [`user_chose_session`] still reads the bare
-/// word as a session choice, which predates this list), and
+/// Deliberately absent: `resume` (not a 2.1.311 subcommand at all;
+/// [`user_chose_session`] still reads the bare word as a session choice,
+/// which predates this list), and
 /// `attach` / `respawn` / `ultrareview` / `gateway` / `remote-control` (`rc`),
 /// which open or run a session or a long-lived process. `config` and
 /// `migrate-installer` are no longer top-level subcommands there — `claude

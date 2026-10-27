@@ -2931,12 +2931,17 @@ mod cmd_shim_tests {
     /// inherited QONTINUI_* variable, so nothing reaches the live runner.
     /// Returns stdout+stderr; the caller reads the marker for what ran.
     fn run(rig: &Rig, tool: &str, argline: &str, path: &[String]) -> String {
+        run_line(rig, &format!("call {tool} {argline}"), path)
+    }
+
+    /// [`run`] with the driver's command line given whole.
+    fn run_line(rig: &Rig, line: &str, path: &[String]) -> String {
         let _ = std::fs::remove_file(&rig.marker);
         for e in std::fs::read_dir(&rig.cwd).unwrap() {
             let _ = std::fs::remove_file(e.unwrap().path());
         }
         let driver = rig.root.join("driver.bat");
-        std::fs::write(&driver, format!("@echo off\r\ncall {tool} {argline}\r\n")).unwrap();
+        std::fs::write(&driver, format!("@echo off\r\n{line}\r\n")).unwrap();
         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let mut cmd = Command::new("cmd");
         cmd.args(["/d", "/c"])
@@ -2958,7 +2963,7 @@ mod cmd_shim_tests {
             .env("QONTINUI_POLICY_DELIVERED_SHA", "inheritedsha")
             .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
         let out = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(60))
-            .unwrap_or_else(|e| panic!("{tool} {argline}: the shim did not return: {e}"));
+            .unwrap_or_else(|e| panic!("{line}: the shim did not return: {e}"));
         format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -3021,6 +3026,28 @@ mod cmd_shim_tests {
                     "{argline}: marker not dropped: {ran}"
                 );
             }
+        }
+        // Caret-escaped and unquoted: the driver's own parse consumes the
+        // caret (no CALL to double it), so %* carries a bare operator, the
+        // shape a CreateProcess of the .cmd gives (round-5 review). The batch
+        // may abort, as it does on main; it must never run or redirect.
+        for argline in [
+            "hi a^&echo INJECTED",
+            "a^>out.txt",
+            "a^|echo INJECTED",
+            "\"a\"^&echo INJECTED",
+            "--version a^&echo INJECTED",
+        ] {
+            let out = run_line(&rig, &format!("claude {argline}"), &path);
+            assert!(
+                !out.contains("INJECTED"),
+                "{argline}: prompt text ran as a command: {out}"
+            );
+            let created: Vec<_> = std::fs::read_dir(&rig.cwd).unwrap().collect();
+            assert!(
+                created.is_empty(),
+                "{argline}: the shim wrote into the cwd: {created:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&rig.root);
     }
