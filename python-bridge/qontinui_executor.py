@@ -77,6 +77,7 @@ logger.debug(
     f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
 )
 
+import runner_api  # noqa: E402
 from action_definitions import get_action_definition  # noqa: E402
 from capture_manager import CaptureManager  # noqa: E402
 
@@ -363,14 +364,13 @@ class QontinuiExecutor(
 
     @staticmethod
     def _get_runner_api_port() -> int:
-        """Get the runner API port from QONTINUI_PORT env var, defaulting to 9876."""
-        return int(os.environ.get("QONTINUI_PORT", "9876"))
+        """The runner API port (``runner_api.runner_api_port``)."""
+        return runner_api.runner_api_port()
 
     @staticmethod
     def _get_runner_api_base() -> str:
-        """Get the runner API base URL using 127.0.0.1 (more robust than localhost)."""
-        port = int(os.environ.get("QONTINUI_PORT", "9876"))
-        return f"http://127.0.0.1:{port}"
+        """The runner API base URL on 127.0.0.1 (``runner_api.runner_api_base``)."""
+        return runner_api.runner_api_base()
 
     def _try_reload_state_machine(self) -> None:
         """Attempt to reload a persisted state machine on startup."""
