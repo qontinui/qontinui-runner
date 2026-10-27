@@ -276,10 +276,10 @@ fn a_banner_over_an_unsent_draft_sends_no_esc() {
     assert!(screen_shows_limit_wait(placeholder));
 }
 
-/// Round-13 S4: the draft rule reads only the INPUT row (between the last two
-/// box rules). A prior prompt echoed above the banner, or a `❯ npm test`
-/// quoted in output, is history — the wait is still recognised; the real
-/// draft in the input box still blocks.
+/// Round-13 S4: the draft rule reads only rows BELOW the banner. A prior
+/// prompt echoed above it, or a `❯ npm test` quoted in output, is history —
+/// the wait is still recognised; the real draft in the input box still
+/// blocks.
 ///
 /// Mutation check: applying the draft rule to every bottom row (round 12)
 /// fails the first two assertions.
@@ -291,6 +291,19 @@ fn a_prompt_echoed_in_the_history_is_not_a_draft() {
     assert!(screen_shows_limit_wait(quoted));
     let drafted = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n";
     assert!(!screen_shows_limit_wait(drafted));
+}
+
+/// Round-14 W1: the draft below the banner blocks with NO box rules around
+/// it (an unfamiliar rule glyph, or a single rule): the `Esc` could wipe it.
+///
+/// Mutation check: reading the draft only inside a two-rule box (round 13)
+/// fails both assertions.
+#[test]
+fn a_draft_below_the_banner_blocks_without_box_rules() {
+    let bare = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n❯ half-typed operator draft\n";
+    assert!(!screen_shows_limit_wait(bare));
+    let one_rule = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n════════\n❯ half-typed operator draft\n";
+    assert!(!screen_shows_limit_wait(one_rule));
 }
 
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
