@@ -376,14 +376,18 @@ pub(crate) enum StallAction {
 /// (round-11 review W3). And when any OTHER bottom row is a numbered choice
 /// or dialog chrome ([`DIALOG_CHROME_MARKERS`](crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS)),
 /// a dialog is showing beside the banner and the `Esc` would cancel it: not a
-/// limit wait. Nor is it one while a `❯` row BELOW the banner holds an
-/// unsent draft (the draft rule `input_prompt_ready` refuses on): the `Esc`
-/// could wipe what the operator typed (round-12 review S6). Only rows below
-/// it: the live input is under the CLI's last output, while a `❯` row above
-/// the banner is a prompt echoed in the history or one quoted in output
-/// (round-13 review S4). No box rule is required — an input box drawn with
-/// an unfamiliar glyph, or a single rule, still has its draft seen
-/// (round-14 review W1). (A banner the CLI wrapped
+/// limit wait. Nor is it one while the LOWEST `❯` row of the bottom rows
+/// holds an unsent draft (the draft rule `input_prompt_ready` refuses on):
+/// the `Esc` could wipe what the operator typed (round-12 review S6). Only
+/// that row: the live input box is the lowest `❯` on screen, so a `❯` row
+/// above it is a prompt echoed in the history or one quoted in output
+/// (round-13 review S4). Where the banner sits does not matter — whether the
+/// CLI draws it above the input box or under it, as a status line, is
+/// unmeasured (round-16 review W1). No box rule is required either — an input
+/// box drawn with an unfamiliar glyph, or a single rule, still has its draft
+/// seen (round-14 review W1). With no input box on screen at all, an echoed
+/// prompt is that lowest row and reads as a draft: a reported stall, never a
+/// stray `Esc`. (A banner the CLI wrapped
 /// onto two rows therefore reads as not-a-wait — a reported stall, never a
 /// stray `Esc`.)
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
@@ -398,11 +402,16 @@ pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
     let Some(banner) = rows.iter().rposition(|row| is_banner(row)) else {
         return false;
     };
+    let input_row = (0..rows.len())
+        .rev()
+        .find(|&i| i != banner && crate::terminal::graceful_exit::is_prompt_row(rows[i]));
+    if input_row.is_some_and(|i| crate::terminal::graceful_exit::row_holds_unsent_draft(rows[i])) {
+        return false;
+    }
     !rows.iter().enumerate().any(|(i, row)| {
         i != banner && {
             let n = normalize(row);
             crate::terminal::graceful_exit::is_numbered_option(row)
-                || (i > banner && crate::terminal::graceful_exit::row_holds_unsent_draft(row))
                 || crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS
                     .iter()
                     .any(|m| n.contains(m))
