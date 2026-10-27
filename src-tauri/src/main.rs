@@ -5226,7 +5226,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &live_for_titles,
                             &snap,
                             &tick_registry,
-                        );
+                        )
+                        .await;
                         emit_session_bound(&poll_app_handle, &titles_outcome.rebinds);
 
                         // Duplicate-host report (same plan, Phase 5): a session
