@@ -17,6 +17,9 @@
 #   * extracted copy, QONTINUI_HOOK_REPO_ROOT exported -> that root
 #   * extracted copy, no export, cwd at a checkout     -> the cwd's top level
 #   * in place, run by path from an unrelated cwd      -> the script's checkout
+#   * an exported root that is not this repo (no src-tauri/) -> ignored
+#   * in place in a LINKED worktree, with the GIT_DIR git exports to hooks
+#                                                       -> that worktree
 
 set -uo pipefail
 
@@ -39,10 +42,12 @@ bad() { fail=$((fail+1)); echo "  FAIL  $1"; [ -n "${2:-}" ] && printf '%s\n' "$
 
 # A fixture "checkout" with no qontinui-schemas sibling. The hook prints the
 # lookup as "<root>/../qontinui-schemas", with <root> in pwd form.
-mkdir -p "$T/ws/repo" "$T/elsewhere" "$T/other/root"
+mkdir -p "$T/ws/repo" "$T/elsewhere" "$T/other/root/src-tauri" "$T/bogus/root"
 git -C "$T/ws/repo" init -q
+git -C "$T/ws/repo" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
 WS="$(cd "$T/ws" && pwd)"
 OTHER="$(cd "$T/other" && pwd)"
+BOGUS="$(cd "$T/bogus" && pwd)"
 
 # The extracted copy: the whole hook directory, outside any git checkout.
 mkdir -p "$T/extract"
@@ -70,6 +75,18 @@ expect_root "extracted copy with no export uses the cwd's checkout" "$WS/repo" "
 
 out="$(cd "$T/elsewhere" && bash "$INPLACE" </dev/null 2>&1)"
 expect_root "in-place copy run from an unrelated cwd uses its own checkout" "$WS/repo" "$out"
+
+out="$(cd "$T/ws/repo" && QONTINUI_HOOK_REPO_ROOT="$BOGUS/root" bash "$EXTRACTED" </dev/null 2>&1)"
+expect_root "an exported root without src-tauri/ is ignored for the cwd's checkout" "$WS/repo" "$out"
+
+# A linked worktree: git exports an absolute GIT_DIR (and no GIT_WORK_TREE) to
+# its hooks, which makes a naive `git -C <hooks dir> rev-parse --show-toplevel`
+# answer the hooks dir itself.
+git -C "$T/ws/repo" worktree add -q --detach "$T/ws/wt" 2>/dev/null
+cp -R "$HOOK_DIR" "$T/ws/wt/.pre-commit-hooks"
+WT_GIT_DIR="$(git -C "$T/ws/wt" rev-parse --absolute-git-dir)"
+out="$(cd "$T/ws/wt" && GIT_DIR="$WT_GIT_DIR" bash "$T/ws/wt/.pre-commit-hooks/gen-events-drift.sh" </dev/null 2>&1)"
+expect_root "in place in a linked worktree under the hook's GIT_DIR uses that worktree" "$WS/wt" "$out"
 
 echo "gen-events-drift-root: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
