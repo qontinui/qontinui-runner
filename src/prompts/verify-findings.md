@@ -15,7 +15,7 @@ You are verifying that the FindingsTracker in qontinui-runner correctly parses a
    - Build a list of "expected findings" that SHOULD have been recorded
 
 3. **Query Recorded Findings**
-   - Call the findings API: `Invoke-WebRequest -Uri "http://localhost:9876/findings" | ConvertFrom-Json`
+   - Call the findings API: `Invoke-WebRequest -Uri "http://127.0.0.1:9876/findings" | ConvertFrom-Json`
    - This returns what was actually recorded by the FindingsTracker
 
 4. **Compare Expected vs Actual**

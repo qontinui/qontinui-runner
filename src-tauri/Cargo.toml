@@ -514,6 +514,11 @@ tempfile = "3"
 rcgen = "0.14"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
+# A TLS fixture served with rustls (the production reqwest client's stack):
+# native-tls on Windows imports a PKCS#8 key only into an RSA container, so it
+# cannot serve rcgen's ECDSA leaf. Both are already in Cargo.lock via reqwest.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 # Deterministic mtime control for tests (e.g. transcript::get_latest_session_id
 # `since` filter coverage). Cross-platform; on Windows wraps SetFileTime.

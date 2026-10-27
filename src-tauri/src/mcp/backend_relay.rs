@@ -2201,9 +2201,9 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
         // can derive its `derived_status` from this.
         let ui_error_snapshot = api_state.app_state.ui_error.get().await;
         let recent_crash_snapshot = api_state.app_state.crash_dumps.get().await;
-        // `pg_reachable = None`: the web-backend heartbeat relay does not run
-        // a DB round-trip; the bounded PG liveness probe lives only in the
-        // `/health` handler.
+        // `pg_reachable` / `pg_schema_ok` come from the CACHED PG health
+        // snapshot (`database::pg::health`): no DB round-trip, age-bounded,
+        // and an open breaker reads `Some(false)`.
         //
         // `ui_dead` is NOT `None` here, and that matters: nothing polls
         // `/health` on an end user's machine, so this relay (and the
@@ -2223,6 +2223,7 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
         // close relays `healthy` to the web backend indefinitely.
         let native_ui =
             crate::ui_error::native_ui_liveness_now(&api_state.app_state.ui_bridge_last_pong);
+        let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
         let derived_status =
             crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                 has_ui_error: ui_error_snapshot.is_some(),
@@ -2230,6 +2231,8 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
                 ui_dead: Some(ui_dead),
                 native_ui_wedged: native_ui.wedged,
                 embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                pg_reachable,
+                pg_schema_ok,
                 relay_connected,
                 ..Default::default()
             })
@@ -4150,7 +4153,7 @@ async fn handle_http_request(api_state: &Arc<ApiState>, data: &Value) -> Option<
 }
 
 /// Transport-agnostic core of the `http_request` relay: given the loopback
-/// base URL (e.g. `http://localhost:9876`) and the inbound envelope, issue
+/// base URL (e.g. `http://127.0.0.1:9876`) and the inbound envelope, issue
 /// the local call and build the `command_response` reply frame. Split out so
 /// it can be unit-tested against a real local server without constructing a
 /// full `ApiState`. Always returns a `command_response` value.
