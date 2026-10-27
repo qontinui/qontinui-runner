@@ -133,6 +133,10 @@ pub struct ClaudeSession {
     user_has_interacted: Arc<AtomicBool>,
     /// Child process ID (for stop/kill).
     child_pid: u32,
+    /// The child's start token, read at spawn while it was unwaited
+    /// (`tree_kill::spawn_token`): what a per-task stop matches the pid's
+    /// recorded identity against.
+    spawn_token: Option<String>,
     /// Last activity timestamp (for timeout monitoring).
     last_activity: Arc<AtomicU64>,
     /// Whether the session has produced output.
@@ -541,12 +545,14 @@ impl ClaudeSession {
         info!("Claude CLI spawned with PID {}", child_pid);
 
         // Register PID for external stop support
-        if let Some(ref tracker) = pid_tracker {
-            if let Ok(mut pids) = tracker.lock() {
-                pids.push(child_pid);
+        let spawn_token = match pid_tracker {
+            Some(ref tracker) => {
+                let token = crate::tree_kill::track_ai_pid(tracker, child_pid);
                 info!("Registered AI process PID {}", child_pid);
+                token
             }
-        }
+            None => crate::tree_kill::spawn_token(child_pid),
+        };
 
         // Take stdin, stdout, stderr
         let stdin = child
@@ -1358,6 +1364,7 @@ impl ClaudeSession {
             accumulated_output,
             user_has_interacted,
             child_pid,
+            spawn_token,
             last_activity,
             has_output,
             stop_heartbeat: Some(stop_tx),
@@ -1405,6 +1412,11 @@ impl ClaudeSession {
     /// Get the child process PID.
     pub fn pid(&self) -> u32 {
         self.child_pid
+    }
+
+    /// The child's start token, read at spawn (`None` when unreadable).
+    pub fn spawn_token(&self) -> Option<&str> {
+        self.spawn_token.as_deref()
     }
 
     /// Get the last-activity tracker Arc (for Doctor health monitoring).

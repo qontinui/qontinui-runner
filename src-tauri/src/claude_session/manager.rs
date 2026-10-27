@@ -14,7 +14,10 @@ pub struct SessionManager {
     /// PIDs for inline (non-interactive) Claude sessions, keyed by task_run_id.
     /// These sessions don't have a full ClaudeSession object but still need to be
     /// visible to the stale task sweep so it can check process liveness.
-    inline_pids: Mutex<HashMap<String, u32>>,
+    /// Each pid carries its start token, captured at registration while its
+    /// `Child` was unwaited, so a per-task stop can tell it from a later
+    /// process at the same pid (`tree_kill::TaskPids`).
+    inline_pids: Mutex<HashMap<String, (u32, Option<String>)>>,
     /// Pending context to prepend to the next user message for a given task_run_id.
     /// Used for system notes that should be delivered with the next user message
     /// rather than sent as standalone messages (which would trigger unwanted response turns).
@@ -127,10 +130,12 @@ impl SessionManager {
     }
 
     /// Register an inline (non-interactive) session's PID for stale task sweep visibility.
-    /// Unlike `register`, this doesn't require a full ClaudeSession — just the PID.
-    pub fn register_inline_pid(&self, task_run_id: &str, pid: u32) {
+    /// Unlike `register`, this doesn't require a full ClaudeSession — just the PID
+    /// and its spawn token (`tree_kill::track_ai_pid`'s return, or
+    /// `tree_kill::spawn_token` read while the `Child` is unwaited).
+    pub fn register_inline_pid(&self, task_run_id: &str, pid: u32, token: Option<String>) {
         if let Ok(mut guard) = self.inline_pids.lock() {
-            guard.insert(task_run_id.to_string(), pid);
+            guard.insert(task_run_id.to_string(), (pid, token));
             info!(
                 "SessionManager: registered inline PID {} for {}",
                 pid, task_run_id
@@ -145,6 +150,38 @@ impl SessionManager {
                 info!("SessionManager: removed inline PID for {}", task_run_id);
             }
         }
+    }
+
+    /// The pid (with its spawn token) of every interactive session and every
+    /// inline-pid entry that belongs to task run `task_run_id`: its key is the
+    /// id itself, or starts with `{task_run_id}-` (workflow phase sessions are
+    /// keyed `{task_run_id}-agentic-N`). A per-task stop kills exactly these.
+    pub fn pids_for_task_run(&self, task_run_id: &str) -> Vec<(u32, Option<String>)> {
+        let prefix = format!("{task_run_id}-");
+        let belongs = |key: &str| key == task_run_id || key.starts_with(&prefix);
+        let mut pids: Vec<(u32, Option<String>)> = self
+            .sessions
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(k, _)| belongs(k))
+                    .map(|(_, s)| (s.pid(), s.spawn_token().map(str::to_string)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(guard) = self.inline_pids.lock() {
+            pids.extend(
+                guard
+                    .iter()
+                    .filter(|(k, _)| belongs(k))
+                    .map(|(_, entry)| entry.clone()),
+            );
+        }
+        pids.retain(|(p, _)| *p != 0);
+        pids.sort_unstable();
+        pids.dedup();
+        pids
     }
 
     /// List all sessions with their task_run_id, current state, and PID.
@@ -164,7 +201,7 @@ impl SessionManager {
 
         // Include inline PIDs with a synthetic Processing state
         if let Ok(guard) = self.inline_pids.lock() {
-            for (id, pid) in guard.iter() {
+            for (id, (pid, _)) in guard.iter() {
                 // Only add if not already covered by an interactive session
                 if !results.iter().any(|(k, _, _)| k == id) {
                     results.push((id.clone(), SessionState::Processing, *pid));
@@ -356,6 +393,12 @@ impl Default for SessionManager {
     }
 }
 
+impl crate::tree_kill::TaskPids for SessionManager {
+    fn pids_for_task_run(&self, task_run_id: &str) -> Vec<(u32, Option<String>)> {
+        SessionManager::pids_for_task_run(self, task_run_id)
+    }
+}
+
 impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count = self.sessions.lock().map(|g| g.len()).unwrap_or(0);
@@ -368,6 +411,22 @@ impl std::fmt::Debug for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pids_for_task_run_matches_the_id_and_its_dash_suffixes_only() {
+        let sm = SessionManager::new();
+        let token = |t: &str| Some(t.to_string());
+        sm.register_inline_pid("A", 11, token("a"));
+        sm.register_inline_pid("A-agentic-1", 12, None);
+        sm.register_inline_pid("AB", 13, token("ab"));
+        sm.register_inline_pid("B", 14, token("b"));
+        assert_eq!(
+            sm.pids_for_task_run("A"),
+            vec![(11, token("a")), (12, None)]
+        );
+        assert_eq!(sm.pids_for_task_run("B"), vec![(14, token("b"))]);
+        assert!(sm.pids_for_task_run("C").is_empty());
+    }
 
     #[test]
     fn worktree_path_matches_on_exact_string_without_touching_fs() {

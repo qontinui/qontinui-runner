@@ -47,6 +47,11 @@ const GUARDED: &[(&str, &str)] = &[
     ("sweep.rs", include_str!("sweep.rs")),
     // Phase 8: the holder upgrade carries the ring and the held input.
     ("handoff.rs", include_str!("handoff.rs")),
+    // Plan 2026-10-25-runner-kill-paths-never-kill-anything-off-windows: the
+    // shared pidfd and the Linux freeze-walk tree kill (it reads /proc
+    // cmdlines in its tests as raw bytes, never decoded).
+    ("pidfd.rs", include_str!("pidfd.rs")),
+    ("tree_freeze.rs", include_str!("tree_freeze.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned

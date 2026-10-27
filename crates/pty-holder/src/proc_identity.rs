@@ -91,6 +91,11 @@ pub fn is_same_process(pid: u32, token: Option<&str>) -> bool {
 /// The `/proc/<pid>/stat` fields the Linux reapers read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcStat {
+    /// The state letter (field 3): `R`, `S`, `D`, `T` (stopped), `t`
+    /// (tracing stop), `Z`, … — what lets a tree kill's tests say "never left
+    /// stopped" (plan `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`,
+    /// vet D9).
+    pub state: u8,
     /// State `Z`: exited, not yet reaped by its parent. A signal changes
     /// nothing about it, so reapers skip it.
     pub zombie: bool,
@@ -105,11 +110,24 @@ pub struct ProcStat {
 /// parenthesised and may itself contain `)` or spaces, so every field this
 /// reads is counted from after the LAST `)`.
 pub fn parse_stat(raw: &str) -> Option<ProcStat> {
-    let (_, rest) = raw.rsplit_once(')')?;
+    parse_stat_bytes(raw.as_bytes())
+}
+
+/// [`parse_stat`] over the raw bytes, which is how the file must be read: the
+/// comm is whatever the process named itself, and need not be UTF-8 (a
+/// `read_to_string` of such a file fails, and the process would read as
+/// absent). Only the tail after the LAST `)` is interpreted, and it is ASCII.
+pub fn parse_stat_bytes(raw: &[u8]) -> Option<ProcStat> {
+    let close = raw.iter().rposition(|&b| b == b')')?;
+    // Byte-to-char widening of the ASCII tail, not a decode: a stray
+    // non-ASCII byte becomes some Latin-1 char and fails the number parses.
+    let rest: String = raw[close + 1..].iter().map(|&b| char::from(b)).collect();
     let f: Vec<&str> = rest.split_whitespace().collect();
     // After the comm: state(0) ppid(1) pgrp(2) session(3) … starttime(19).
+    let state = *f.first()?.as_bytes().first()?;
     Some(ProcStat {
-        zombie: *f.first()? == "Z",
+        state,
+        zombie: state == b'Z',
         ppid: f.get(1)?.parse().ok()?,
         pgrp: f.get(2)?.parse().ok()?,
         session: f.get(3)?.parse().ok()?,
@@ -119,7 +137,7 @@ pub fn parse_stat(raw: &str) -> Option<ProcStat> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{parse_stat, ProcStat};
+    use super::{parse_stat_bytes, ProcStat};
 
     /// This boot's id, read once.
     pub fn boot_id() -> Option<&'static str> {
@@ -133,60 +151,96 @@ mod imp {
         .as_deref()
     }
 
+    /// `/proc/<pid>/stat`, read as bytes: `Ok(None)` when there is no such
+    /// process (`ENOENT`, or `ESRCH` from a process that exited mid-read),
+    /// `Err` when the entry exists but could not be read or parsed (`EMFILE`,
+    /// `ENFILE`, `EACCES`, …) — a caller that must not mistake "could not
+    /// look" for "not there" matches on that.
+    pub fn try_stat(pid: u32) -> std::io::Result<Option<ProcStat>> {
+        let path = format!("/proc/{pid}/stat");
+        match std::fs::read(&path) {
+            Ok(raw) => parse_stat_bytes(&raw).map(Some).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{path}: unparseable"),
+                )
+            }),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`try_stat`], forgiving: anything unreadable is `None`.
     pub fn stat(pid: u32) -> Option<ProcStat> {
-        parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+        try_stat(pid).ok().flatten()
     }
 
     pub fn start_token(pid: u32) -> Option<String> {
-        let st = stat(pid)?;
-        Some(format!("linux:{}:{}", boot_id()?, st.start_ticks))
+        start_token_of(&stat(pid)?)
     }
 
-    /// Every pid in `/proc`, unordered. A process that exits while this runs
-    /// may or may not be listed; callers re-verify each pid they act on.
+    /// The start token `stat` was read from: `linux:<boot id>:<start ticks>`,
+    /// the format [`super::start_token`] answers. For a caller that has
+    /// already read the stat inside its own identity window (a pidfd held
+    /// across the read) and must compare THAT read, not a second one.
+    pub fn start_token_of(stat: &ProcStat) -> Option<String> {
+        Some(format!("linux:{}:{}", boot_id()?, stat.start_ticks))
+    }
+
+    /// Every pid in `/proc`, unordered; `Err` when the listing cannot be read
+    /// to its end, so a caller can tell "no such process" from "could not
+    /// look" (plan `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`,
+    /// vet D4). A process that exits while this runs may or may not be listed;
+    /// callers re-verify each pid they act on.
+    pub fn try_list_pids() -> std::io::Result<Vec<u32>> {
+        read_pids(true)
+    }
+
+    /// [`try_list_pids`], forgiving: an unreadable `/proc` lists nothing, and
+    /// an entry that fails mid-listing is skipped, as this always did.
     pub fn list_pids() -> Vec<u32> {
-        std::fs::read_dir("/proc")
-            .map(|rd| {
-                rd.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        read_pids(false).unwrap_or_default()
+    }
+
+    fn read_pids(strict: bool) -> std::io::Result<Vec<u32>> {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            match entry {
+                Ok(e) => {
+                    if let Some(pid) = e.file_name().to_str().and_then(|n| n.parse().ok()) {
+                        pids.push(pid);
+                    }
+                }
+                Err(e) if strict => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(pids)
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{list_pids, stat};
+pub use imp::{list_pids, start_token_of, stat, try_list_pids, try_stat};
 
 #[cfg(windows)]
 mod imp {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// `GetExitCodeProcess`'s answer for a process that has not exited
     /// (`STILL_ACTIVE`, 259).
     const STILL_ACTIVE: u32 = 259;
 
-    /// The creation time of the process behind `handle`, as one 64-bit
-    /// FILETIME value.
-    ///
-    /// # Safety
-    /// `handle` must be a valid process handle with at least
-    /// `PROCESS_QUERY_LIMITED_INFORMATION` access.
-    pub unsafe fn creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
-        let zero = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-        // SAFETY: the caller guarantees `handle`; the four out-pointers are
-        // valid locals for the duration of the call.
-        let ok =
-            unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
-        (ok != 0)
-            .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
-    }
+    /// The creation time of the process behind `handle` — ONE implementation,
+    /// in runner-win32, shared with the pane-tree kill.
+    pub use qontinui_runner_win32::process_tree::creation_time;
 
     pub fn start_token(pid: u32) -> Option<String> {
         // SAFETY: OpenProcess takes no pointers; a non-null result is a handle
@@ -254,6 +308,7 @@ mod tests {
         assert_eq!(
             parse_stat(raw),
             Some(ProcStat {
+                state: b'S',
                 zombie: false,
                 ppid: 1,
                 pgrp: 1234,
@@ -261,13 +316,76 @@ mod tests {
                 start_ticks: 987654,
             })
         );
-        assert!(
-            parse_stat("9 (z) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5")
-                .unwrap()
-                .zombie
+        let zombie = parse_stat("9 (z) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5").unwrap();
+        assert!(zombie.zombie);
+        assert_eq!(zombie.state, b'Z');
+        assert_eq!(
+            parse_stat("9 (z) T 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5")
+                .map(|s| (s.state, s.zombie)),
+            Some((b'T', false)),
+            "a stopped process is told apart by its state letter"
+        );
+        // A comm that is not UTF-8 still parses: only the ASCII tail is read.
+        assert_eq!(
+            parse_stat_bytes(b"7 (a\xffb) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42").map(|s| (
+                s.state,
+                s.ppid,
+                s.start_ticks
+            )),
+            Some((b'S', 1, 42))
         );
         assert_eq!(parse_stat("no paren here"), None);
         assert_eq!(parse_stat("1 (x) S 1 2"), None, "truncated stat");
+    }
+
+    /// Review round 3, finding 6: a process whose comm is not UTF-8 parses
+    /// in full. Before `parse_stat_bytes` its stat file failed
+    /// `read_to_string` and the process read as ABSENT — to the freeze walk
+    /// and to `reap`'s `session_members` / `in_session` alike — so this pins
+    /// that such processes are now seen. The comm here also carries `)` and
+    /// spaces, and invalid UTF-8 on both sides of them.
+    #[test]
+    fn pty_holder_reap_parse_stat_bytes_reads_a_non_utf8_comm() {
+        let raw: &[u8] =
+            b"4242 (\xc3\x28 x) \xff\xfe) T 17 4242 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 123456";
+        // Precondition, without a decode (source_guard bans one here): byte
+        // 0xFF never occurs in UTF-8, and `\xc3\x28` is a broken sequence.
+        assert!(raw.contains(&0xff), "precondition: not UTF-8");
+        assert_eq!(
+            parse_stat_bytes(raw),
+            Some(ProcStat {
+                state: b'T',
+                zombie: false,
+                ppid: 17,
+                pgrp: 4242,
+                session: 4000,
+                start_ticks: 123456,
+            })
+        );
+        // A non-ASCII byte AFTER the comm is not a number: rejected, not
+        // misread.
+        assert_eq!(
+            parse_stat_bytes(b"1 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9\xff"),
+            None
+        );
+    }
+
+    /// Vet D4: the strict listing answers, and lists this process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_reap_try_list_pids_lists_this_process() {
+        let me = std::process::id();
+        assert!(try_list_pids().unwrap().contains(&me));
+        assert!(list_pids().contains(&me));
+        let mine = stat(me).unwrap();
+        assert_eq!(try_stat(me).unwrap(), Some(mine));
+        assert_eq!(
+            try_stat(u32::MAX).unwrap(),
+            None,
+            "no such process is Ok(None)"
+        );
+        assert_eq!(start_token_of(&mine), start_token(me));
+        assert_ne!(mine.state, b'T', "this process is running, not stopped");
     }
 
     #[cfg(any(target_os = "linux", windows))]

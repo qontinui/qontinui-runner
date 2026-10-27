@@ -227,8 +227,10 @@ Two further limits, which are about what the gate SAYS rather than what it
 finds:
 
   * A `#[cfg]`-GATED KILL still suppresses the `wait()` that follows it. The
-    real in-tree shape is a `#[cfg(not(windows))] { child.kill(); }` block
-    immediately above `child.wait()`, and every such arm in this tree has a
+    shape (which `ai_provider/pi_cli.rs` carried until plan
+    `2026-10-25-runner-kill-paths-never-kill-anything-off-windows`) is a
+    `#[cfg(not(windows))] { child.kill(); }` block immediately above
+    `child.wait()`, and every such arm this tree has carried has a
     sibling arm that also kills. But `#[cfg]` is not a proof: on a target where
     the cfg is false, no kill precedes that wait. A RUNTIME conditional
     (`if cond { child.kill(); }`) does NOT suppress — that hole is closed. Nor
@@ -1723,8 +1725,8 @@ def _block_is_conditional(body: str, open_idx: int) -> bool:
     diff) as the sanctioned reap-what-you-killed shape. `#[cfg(all())]`,
     `#[cfg(not(any()))]` and every nesting of them are decided the same way.
     A predicate that is merely *target*-dependent stays UNKNOWN and keeps the
-    old, deliberate tolerance — the in-tree `ai_provider/pi_cli.rs` shape,
-    whose every arm has a sibling arm that kills.
+    old, deliberate tolerance — the shape `ai_provider/pi_cli.rs` carried
+    until 2026-10, whose every arm had a sibling arm that killed.
     """
     p = body[max(0, open_idx - 300) : open_idx].rstrip()
     if p.endswith("=>"):  # a `match` arm
@@ -1753,8 +1755,8 @@ def _killed_before(body: str, offset: int, recv: str) -> bool:
         separate the two, and the span may not OPEN a block — a `wait()` nested
         inside a block that starts after the `kill()` is on a different path.
       * THE KILL MUST NOT BE CONDITIONAL. The span may CLOSE blocks, because the
-        real in-tree shape in `ai_provider/pi_cli.rs` is a `#[cfg]`-gated
-        `{ child.kill(); }` immediately above a `child.wait()`. Tolerating a
+        shape `ai_provider/pi_cli.rs` carried until 2026-10 was a
+        `#[cfg]`-gated `{ child.kill(); }` immediately above a `child.wait()`. Tolerating a
         closing `}` unconditionally, though, also swallowed
 
             if cond { let _ = child.kill(); }

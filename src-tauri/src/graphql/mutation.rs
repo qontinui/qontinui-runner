@@ -320,30 +320,22 @@ impl MutationRoot {
             )));
         }
 
-        // Kill tracked AI processes
-        let pids_to_kill: Vec<u32> = {
-            let mut pids =
-                crate::safe_lock::safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
-            let copy = pids.clone();
-            pids.clear();
-            copy
-        };
-        for pid in &pids_to_kill {
-            info!("GraphQL: Killing AI process PID {} for task {}", pid, id);
-            #[cfg(target_os = "windows")]
-            {
-                let _ = crate::process_helpers::no_window("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                // console-ok: the non-Windows arm; the Windows one above is suppressed.
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
-            }
-        }
+        // Kill THIS task run's process trees only; other tasks' stay alive.
+        let sessions = tauri::Manager::try_state::<Arc<crate::claude_session::SessionManager>>(
+            &state.app_handle,
+        )
+        .map(|sm| sm.inner().clone());
+        let stop = crate::tree_kill::stop_task_run_trees(
+            sessions
+                .as_deref()
+                .map(|sm| sm as &dyn crate::tree_kill::TaskPids),
+            &state.current_ai_pids,
+            &id,
+            std::time::Duration::from_secs(5),
+            &format!("GraphQL: stop task run {id}"),
+        )
+        .await;
+        info!("GraphQL: task {id}: {}", stop.summary());
 
         {
             let mut stopped = false;

@@ -72,6 +72,9 @@ pub struct ReapReport {
     pub unattributed: Vec<u32>,
     /// What ran, and anything that could not — one line each.
     pub notes: Vec<String>,
+    /// The process snapshot could not be read, so `unattributed` is UNKNOWN,
+    /// not empty: the caller must keep whatever it would drop on an empty one.
+    pub snapshot_unreadable: bool,
 }
 
 impl ReapReport {
@@ -162,55 +165,11 @@ pub fn reap_orphans_of_dead_holder(record: &LockRecord) -> ReapReport {
 #[cfg(target_os = "linux")]
 pub use linux::own_holder_scope_cgroup;
 
-/// Windows tree walk: whether a process the snapshot listed under `parent` is
-/// still that parent's child. Its creation time (FILETIME) must be no earlier
-/// than the parent's — Windows keeps a dead parent's pid in the child's
-/// record, and that pid may name a newer process — and no later than the
-/// snapshot — the listed pid itself may have exited and been reused by a
-/// process created after the snapshot was taken.
-#[cfg(any(windows, test))]
-fn admits_descendant(created: u64, parent_created: u64, snapshot_at: u64) -> bool {
-    created >= parent_created && created <= snapshot_at
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use super::ReapReport;
+    use crate::pidfd::{self, Opened};
     use crate::proc_identity::{list_pids, stat};
-
-    /// A pidfd, closed on drop.
-    struct PidFd(libc::c_int);
-
-    impl Drop for PidFd {
-        fn drop(&mut self) {
-            // SAFETY: a descriptor pidfd_open returned, closed exactly once.
-            unsafe {
-                libc::close(self.0);
-            }
-        }
-    }
-
-    enum Opened {
-        Fd(PidFd),
-        /// `pidfd_open` does not exist on this kernel.
-        NoPidFd,
-        /// The process is gone (or not ours to open).
-        Gone,
-    }
-
-    fn pidfd_open(pid: i32) -> Opened {
-        // SAFETY: pidfd_open(pid, 0) takes no pointers; the result is -1 or a
-        // new descriptor owned by the returned PidFd.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd >= 0 {
-            return Opened::Fd(PidFd(fd as libc::c_int));
-        }
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-            Opened::NoPidFd
-        } else {
-            Opened::Gone
-        }
-    }
 
     /// SIGKILL `pid` only if `still_ours(pid)` holds AFTER a handle on it was
     /// taken. `Some(detail)` names the route when a kill was delivered.
@@ -218,23 +177,13 @@ mod linux {
         pid: i32,
         still_ours: impl Fn(i32) -> bool,
     ) -> Option<&'static str> {
-        match pidfd_open(pid) {
-            Opened::Gone => None,
+        match pidfd::open(pid) {
+            Opened::Gone(_) => None,
             Opened::Fd(fd) => {
                 if !still_ours(pid) {
                     return None;
                 }
-                // SAFETY: a pidfd we own; null siginfo, no flags.
-                let rc = unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        fd.0,
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    )
-                };
-                (rc == 0).then_some("pidfd")
+                fd.send_signal(libc::SIGKILL).is_ok().then_some("pidfd")
             }
             Opened::NoPidFd => {
                 if !still_ours(pid) {
@@ -411,83 +360,41 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::ReapReport;
-    use crate::proc_identity::creation_time;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    use qontinui_runner_win32::process_tree::{
+        snapshot, terminate_tree_of, OwnedProcess, TreeKillError,
     };
 
-    /// An owned process handle.
-    struct Proc(HANDLE);
-
-    impl Drop for Proc {
-        fn drop(&mut self) {
-            // SAFETY: a handle OpenProcess returned, closed exactly once.
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-
-    fn open(pid: u32) -> Option<Proc> {
-        // SAFETY: no pointers; a non-null result is owned by `Proc`.
-        let h = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-                0,
-                pid,
-            )
-        };
-        (!h.is_null()).then_some(Proc(h))
-    }
-
-    /// `(pid, parent pid)` of every process, from one Toolhelp snapshot.
-    fn snapshot() -> Vec<(u32, u32)> {
-        let mut out = Vec::new();
-        // SAFETY: a plain snapshot call; the handle is closed below.
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snap.is_null() || snap == INVALID_HANDLE_VALUE {
-            return out;
-        }
-        // SAFETY: PROCESSENTRY32W is plain data; dwSize is set as required.
-        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        // SAFETY: a valid snapshot handle and a correctly sized entry.
-        let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
-        while more {
-            out.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            // SAFETY: as above.
-            more = unsafe { Process32NextW(snap, &mut entry) } != 0;
-        }
-        // SAFETY: closing the snapshot handle exactly once.
-        unsafe {
-            CloseHandle(snap);
-        }
-        out
-    }
+    /// Wall-clock cap on ending one dead holder's tree. The walk itself
+    /// (`qontinui_runner_win32::process_tree`) is shared with the runner's
+    /// pane close, so the boot sweep and a tab close kill a tree the same way.
+    const TREE_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Every process the snapshot records as a child of `parent` pid, as
     /// UNATTRIBUTED: the parent is gone or unverifiable, so the link proves
     /// nothing — but the processes must not drop out of the orphan ledger.
     fn unattributed_children_of(parent: u32, report: &mut ReapReport) {
-        report.unattributed = snapshot()
+        let procs = match snapshot() {
+            Ok(procs) => procs,
+            Err(e) => {
+                report.snapshot_unreadable = true;
+                report.note(format!(
+                    "process snapshot unreadable ({e}): the processes whose recorded parent \
+                     is pid {parent} are UNKNOWN, not none"
+                ));
+                return;
+            }
+        };
+        report.unattributed = procs
             .into_iter()
             .filter(|&(pid, ppid)| ppid == parent && pid != parent)
             .map(|(pid, _)| pid)
             .collect();
     }
 
-    /// The recorded child, if alive and verified, plus every descendant: a
-    /// process joins the tree only if its parent is in the tree AND it was
-    /// created no earlier than that parent (Windows keeps a dead parent's pid
-    /// in `th32ParentProcessID`, and that pid may since have been reused by a
-    /// process created later than the child it supposedly parents). Each is
-    /// verified through a handle opened before the check, then terminated
-    /// through that handle — descendants first.
+    /// The recorded child, if alive and verified, plus every descendant —
+    /// each joined to the tree only if created no earlier than its parent and
+    /// no later than the snapshot, verified through a handle opened before the
+    /// check and terminated through it, descendants first.
     pub(super) fn reap_recorded_child(child: u32, token: Option<&str>, report: &mut ReapReport) {
         let Some(token) = token else {
             unattributed_children_of(child, report);
@@ -499,7 +406,7 @@ mod imp {
             ));
             return;
         };
-        let Some(root) = open(child) else {
+        let Ok(root) = OwnedProcess::open(child) else {
             unattributed_children_of(child, report);
             report.note(format!(
                 "recorded child {child} is gone; {} process(es) whose recorded parent is pid \
@@ -509,8 +416,7 @@ mod imp {
             ));
             return;
         };
-        // SAFETY: `root` was opened with PROCESS_QUERY_LIMITED_INFORMATION.
-        let Some(root_created) = (unsafe { creation_time(root.0) }) else {
+        let Some(root_created) = root.creation_time() else {
             report.note(format!("recorded child {child}: creation time unreadable"));
             return;
         };
@@ -524,37 +430,40 @@ mod imp {
             "recorded child {child} is alive and verified (it was never contained by the \
              holder's job)"
         ));
-        // Taken BEFORE the snapshot: a pid the snapshot lists that was reused
-        // at any point after this instant names a process created after it,
-        // and is refused. (A real descendant created in the instant between
-        // the two is refused too: the error is toward signalling less.)
-        let snapshot_at = qontinui_runner_win32::holder_spawn::filetime_now();
-        let procs = snapshot();
-        let mut tree: Vec<(u32, u64, Proc)> = vec![(child, root_created, root)];
-        let mut i = 0;
-        while i < tree.len() {
-            let (parent, parent_created) = (tree[i].0, tree[i].1);
-            for &(pid, ppid) in &procs {
-                if ppid != parent || pid == parent || tree.iter().any(|t| t.0 == pid) {
-                    continue;
+        match terminate_tree_of(&root, child, TREE_KILL_BUDGET) {
+            Ok(tree) => {
+                if tree.budget_spent {
+                    report.note(format!(
+                        "tree kill of {child} ended unfinished (its {TREE_KILL_BUDGET:?} budget or \
+                         its pass cap) after {} pass(es)",
+                        tree.passes
+                    ));
                 }
-                let Some(p) = open(pid) else { continue };
-                // SAFETY: `p` was opened with PROCESS_QUERY_LIMITED_INFORMATION.
-                match unsafe { creation_time(p.0) } {
-                    Some(created)
-                        if super::admits_descendant(created, parent_created, snapshot_at) =>
-                    {
-                        tree.push((pid, created, p))
-                    }
-                    _ => {}
+                if tree.recheck_snapshot_failed {
+                    // A child forked during the kills may have been missed:
+                    // the tree's remainder is UNKNOWN, so keep the record.
+                    report.snapshot_unreadable = true;
+                    report.note(format!(
+                        "tree kill of {child}: a re-check snapshot was unreadable"
+                    ));
                 }
+                report.killed.extend(tree.killed);
             }
-            i += 1;
-        }
-        for (pid, _, p) in tree.iter().rev() {
-            // SAFETY: a handle opened with PROCESS_TERMINATE and verified above.
-            if unsafe { TerminateProcess(p.0, 1) } != 0 {
-                report.killed.push(*pid);
+            Err(e) => {
+                match &e {
+                    TreeKillError::SnapshotFailed { killed, .. } => {
+                        // Only the root was signalled; its descendants are
+                        // UNKNOWN, so keep the record for the next sweep.
+                        report.snapshot_unreadable = true;
+                        report.killed.extend(killed.iter().copied());
+                    }
+                    TreeKillError::RootSurvived { killed, .. } => {
+                        // The descendants that did die are still reported.
+                        report.killed.extend(killed.iter().copied());
+                    }
+                    TreeKillError::Root(_) => {}
+                }
+                report.note(format!("tree kill of {child} failed: {e}"));
             }
         }
     }
@@ -695,29 +604,68 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod admission_tests {
-    use super::admits_descendant;
+/// The Windows boot-sweep reap, through the walk it now shares with the
+/// runner's pane close: a recorded child whose start token does not match is
+/// left alone (a reused pid), and one whose token matches is ended WITH its
+/// tree (the `ping` below the recorded `cmd`).
+#[cfg(all(test, windows))]
+mod windows_reap_tests {
+    use super::*;
+    use qontinui_runner_win32::process_tree::{snapshot, OwnedProcess};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    /// Finding #1 of the 2026-10-14 review: a pid the Toolhelp snapshot listed
-    /// may have been reused after it, so a process created after the snapshot
-    /// is never admitted — nor one older than the parent it supposedly has.
     #[test]
-    fn pty_holder_reap_windows_tree_admission_bounds_creation_time() {
-        let (parent, snapshot) = (1_000, 5_000);
-        assert!(admits_descendant(1_000, parent, snapshot), "same instant");
-        assert!(admits_descendant(3_000, parent, snapshot));
+    fn pty_holder_reap_windows_ends_a_verified_tree_and_spares_a_wrong_token() {
+        // Every fixture process is in a kill-on-close job, so a failed
+        // assertion leaves nothing running.
+        let job = qontinui_runner_win32::ScopedKillOnCloseJob::create(None).expect("job");
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        // SAFETY: `child` is alive and owns its handle for this call.
+        unsafe { job.assign(child.as_raw_handle() as _) };
+        let pid = child.id();
+
+        let end = Instant::now() + Duration::from_secs(20);
+        let grandchild: OwnedProcess = loop {
+            let found = snapshot()
+                .expect("snapshot")
+                .into_iter()
+                .find(|&(p, pp)| pp == pid && p != pid)
+                .and_then(|(p, _)| OwnedProcess::open(p).ok());
+            if let Some(g) = found {
+                break g;
+            }
+            assert!(Instant::now() < end, "cmd never started ping");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let mut wrong = ReapReport::default();
+        imp::reap_recorded_child(pid, Some("windows:1"), &mut wrong);
+        assert!(wrong.killed.is_empty(), "{wrong:?}");
         assert!(
-            admits_descendant(5_000, parent, snapshot),
-            "at the snapshot"
+            matches!(child.try_wait(), Ok(None)) && !grandchild.has_exited(),
+            "a wrong token must not signal anything"
         );
-        assert!(
-            !admits_descendant(999, parent, snapshot),
-            "older than its parent"
-        );
-        assert!(
-            !admits_descendant(5_001, parent, snapshot),
-            "created after the snapshot"
-        );
+
+        let token = crate::proc_identity::start_token(pid).expect("token");
+        let mut right = ReapReport::default();
+        imp::reap_recorded_child(pid, Some(&token), &mut right);
+        assert!(right.killed.contains(&pid), "{right:?}");
+        let end = Instant::now() + Duration::from_secs(5);
+        while !(matches!(child.try_wait(), Ok(Some(_))) && grandchild.has_exited()) {
+            assert!(
+                Instant::now() < end,
+                "the verified tree survived: {right:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(job);
     }
 }

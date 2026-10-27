@@ -57,16 +57,6 @@
       "reason": "One-shot macOS `security find-generic-password` attribute query on the OAuth-refresh decision path, not a timer. It is a local Keychain read with no -w/-g, so it never prompts and never waits on a network or a lock."
     },
     {
-      "site": "src-tauri/src/ai_provider/pi_cli.rs::kill_child_tree",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Teardown path: `taskkill /F /T` against a pid we are already killing. It runs once per pi child at end-of-session, and blocking here is bounded by the OS's own terminate call rather than by the dead child."
-    },
-    {
       "site": "src-tauri/src/ai_provider/process.rs::spawn_and_wait_with_doctor",
       "waits": [
         "?",
@@ -129,16 +119,6 @@
       "reason": "One-shot macOS Keychain attribute query (`security find-generic-password`) inside `coord doctor`, an operator-invoked diagnostic. Attribute-only (no -w/-g), so it never prompts."
     },
     {
-      "site": "src-tauri/src/doctor/commands.rs::stop_process_by_pid",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Tauri command: the operator clicked 'force stop' on a specific pid. `taskkill /F /T` on a named pid, once per click."
-    },
-    {
       "site": "src-tauri/src/drain.rs::output_with_timeout",
       "waits": [
         "?"
@@ -146,29 +126,7 @@
       "reason_covers_waits": [
         "?"
       ],
-      "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain/taskkill caller was routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
-    },
-    {
-      "site": "src-tauri/src/graphql/mutation.rs::MutationRoot::stop_task_run",
-      "waits": [
-        "kill",
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "kill",
-        "taskkill"
-      ],
-      "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `taskkill /F /T /PID` on Windows and `kill -9` on the `#[cfg(not(windows))]` arm. Both are one-shot terminations of a named pid, bounded by the OS's own terminate call."
-    },
-    {
-      "site": "src-tauri/src/mcp/ai_session.rs::stop_ai_analysis",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "User/agent-requested stop of an AI analysis: `taskkill /F /T` once per tracked pid, on the stop path only."
+      "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain caller is routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
     },
     {
       "site": "src-tauri/src/mcp/code_semantics/cargo_check.rs::probe_cargo",
@@ -201,26 +159,6 @@
         "dyn:tsc"
       ],
       "reason": "`tsc --version` resolution for a typecheck scope. Runs on the operator/agent-initiated typecheck path, not a timer, and only after `find_tsc` has already located the binary on disk."
-    },
-    {
-      "site": "src-tauri/src/mcp/headless_browser.rs::spawn_headless",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Failure path only: the headless browser did not connect within its own timeout, so we `taskkill` the pid we just spawned. Reached once per failed spawn, on an agent-initiated request."
-    },
-    {
-      "site": "src-tauri/src/mcp/task_runs.rs::stop_task_run",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "User/agent-requested stop of a task run: `taskkill /F /T` once per tracked AI pid, on the stop path only."
     },
     {
       "site": "src-tauri/src/mcp/trace_verification.rs::extract_video_frames",

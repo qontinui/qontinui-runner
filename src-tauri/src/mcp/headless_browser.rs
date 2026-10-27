@@ -220,14 +220,31 @@ pub async fn close_session(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<CloseRequest>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let mut sessions = SESSION_MANAGER.sessions.lock().await;
+    // Released before the kill below, which may take its whole 5 s budget:
+    // every other session call waits on this lock.
+    let removed = SESSION_MANAGER
+        .sessions
+        .lock()
+        .await
+        .remove(&request.session_id);
 
-    if let Some(mut entry) = sessions.remove(&request.session_id) {
+    if let Some(mut entry) = removed {
         info!(
             "Closing headless browser: session={}, pid={}",
             request.session_id, entry.session.pid
         );
-        // Kill the child process
+        // The launcher's browser is its child (on Unix detached into its own
+        // session), and a kill of the root alone gives the launcher no chance
+        // to close it. End the whole tree while `entry.child` is held (which
+        // pins the pid: an open handle on Windows, an unreaped child on Unix),
+        // then kill and reap the root through the `Child` as a belt.
+        if let Some(pid) = entry.child.id() {
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, Duration::from_secs(5)).await
+            {
+                warn!("Headless close: tree kill of pid {pid} failed: {e}");
+            }
+        }
         let _ = entry.child.kill().await;
         Ok(Json(ApiResponse::success(format!(
             "Session {} closed",
@@ -330,7 +347,7 @@ pub async fn spawn_headless(
     // Prevent child from blocking on stdin
     cmd.stdin(std::process::Stdio::null());
 
-    let child = cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(ApiResponse::error(format!(
@@ -383,11 +400,16 @@ pub async fn spawn_headless(
             "spawn_headless: timeout waiting for SDK connection (app_id={}, session={})",
             request.app_id, session_id
         );
-        // Kill the child process since it failed to connect
-        if child.id().is_some() {
-            let _ = crate::process_helpers::no_window("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output();
+        // Kill the launcher AND its browser since it failed to connect: the
+        // tree, while `child` is held (pinning the pid), then the root
+        // through the `Child` as a belt. In-process: no process is created.
+        if let Some(pid) = child.id() {
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, Duration::from_secs(5)).await
+            {
+                warn!("spawn_headless: tree kill of pid {pid} failed: {e}");
+            }
+            let _ = child.start_kill();
         }
 
         return Err((
