@@ -291,6 +291,16 @@ fn the_carry_records_the_copys_last_line_boundary_as_the_tail_offset() {
     let root = scratch("offset");
     let (src, dst, carried) = seeded_carry(&root, b"{\"a\":1}\n{\"b\":2}\n{\"c\"");
     assert_eq!(carried.transcript_offset, Some(16));
+    // Round-12 S3: the destination is cut back to that boundary, so the
+    // resumed session's first append starts a fresh line.
+    //
+    // Mutation check: skipping `truncate_to_line_boundary` leaves the torn
+    // `{"c"` on the destination and fails this.
+    assert_eq!(
+        std::fs::read(&carried.path).unwrap(),
+        b"{\"a\":1}\n{\"b\":2}\n",
+        "the torn line is not left on the destination"
+    );
     append(&literal_transcript(&src), b":3}\n");
     match rescue(&src, &dst, &carried) {
         TailRescue::Rescued { bytes, scan, .. } => {
@@ -300,6 +310,27 @@ fn the_carry_records_the_copys_last_line_boundary_as_the_tail_offset() {
         }
         other => panic!("expected Rescued, got {other:?}"),
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Round-12 S3: the cut happens only for `0 < offset < len`.
+#[test]
+fn truncate_to_line_boundary_cuts_only_a_trailing_fragment() {
+    let root = scratch("truncate");
+    let f = root.join("t.jsonl");
+    std::fs::write(&f, b"{\"a\":1}\n{\"b\"").unwrap();
+    assert!(super::super::truncate_to_line_boundary(&f, 8).unwrap());
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"a\":1}\n");
+    assert!(
+        !super::super::truncate_to_line_boundary(&f, 8).unwrap(),
+        "at a boundary: nothing to cut"
+    );
+    std::fs::write(&f, b"{\"partial\"").unwrap();
+    assert!(
+        !super::super::truncate_to_line_boundary(&f, 0).unwrap(),
+        "no complete line: kept"
+    );
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"partial\"");
     let _ = std::fs::remove_dir_all(&root);
 }
 
