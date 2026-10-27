@@ -638,41 +638,52 @@ where
             }
         },
     };
-    let main_carry = match (main_verdict, main) {
+    // `settled` is `Some` exactly when this carry wrote `dst`: the outcome of
+    // settling the copy's end onto a line boundary ([`settle_jsonl_end`]),
+    // done on the `.partial` BEFORE its rename so the file that appears at
+    // `dst` already ends on one, and nothing reopens `dst` after the rename
+    // (round-13 review S2: a concurrent carry could have replaced it by then).
+    let (main_carry, settled) = match (main_verdict, main) {
         (Verdict::Write, _) => {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
             }
-            copy_via_partial(&src, &dst)
+            let settled = copy_via_partial_with(&src, &dst, settle_jsonl_end)
                 .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
-            if dst_len.is_some() {
+            let carry = if dst_len.is_some() {
                 MainCarry::ExtendedPrefix
             } else {
                 MainCarry::Copied
-            }
+            };
+            (carry, Some(settled))
         }
         // Byte-identical by `live_jsonl_verdict` — not re-judged by the stale
         // stats.
-        (Verdict::Current, MainTranscript::LiveSourceWins) => MainCarry::Present,
-        (Verdict::Current, _) if dst_len.is_some_and(|len| len >= src_len) => MainCarry::Present,
-        (Verdict::Current, _) => MainCarry::KeptExisting,
-        (Verdict::Diverged, MainTranscript::LiveSourceWins) => preserve_diverged_main(
-            &src,
-            &dst,
-            (
-                &src.with_file_name(claude_session_id),
-                &dst.with_file_name(claude_session_id),
-            ),
-            &mut rename_aside,
-        )?,
+        (Verdict::Current, MainTranscript::LiveSourceWins) => (MainCarry::Present, None),
+        (Verdict::Current, _) if dst_len.is_some_and(|len| len >= src_len) => {
+            (MainCarry::Present, None)
+        }
+        (Verdict::Current, _) => (MainCarry::KeptExisting, None),
+        (Verdict::Diverged, MainTranscript::LiveSourceWins) => {
+            let (carry, settled) = preserve_diverged_main(
+                &src,
+                &dst,
+                (
+                    &src.with_file_name(claude_session_id),
+                    &dst.with_file_name(claude_session_id),
+                ),
+                &mut rename_aside,
+            )?;
+            (carry, Some(settled))
+        }
         (Verdict::Diverged, _) => {
             warn!(
                 from = %src.display(),
                 to = %dst.display(),
                 "session transcript carry: the destination <sid>.jsonl is not a prefix of the source's (a fork) — kept, not overwritten"
             );
-            MainCarry::KeptExisting
+            (MainCarry::KeptExisting, None)
         }
     };
     // Which side ran the session last, decided once from the append-only main
@@ -710,41 +721,21 @@ where
     // Where the tail starts. When this carry wrote `dst`, the old writer may
     // have appended between the stat above and the copy, possibly part of a
     // line: the copied bytes, not the stat, say where the tail starts — at
-    // their last line boundary. Nothing else writes `dst` yet — the respawn
-    // comes after the carry. A destination the carry did not write, or a
-    // boundary that cannot be read, leaves the offset UNKNOWN.
-    //
-    // The torn last line belongs to the TAIL (the rescue reads it whole from
-    // the source), so `dst` is cut back to the boundary too: left in place,
-    // the resumed CLI's first append would glue a new record onto the
-    // fragment and corrupt one JSONL line (round-12 review S3).
-    let transcript_offset = match &main_carry {
-        MainCarry::Copied | MainCarry::ExtendedPrefix | MainCarry::DivergedPreserved { .. } => {
-            match line_boundary_offset(&dst) {
-                Ok(offset) => {
-                    if let Err(e) = truncate_to_line_boundary(&dst, offset) {
-                        warn!(
-                            session = %claude_session_id,
-                            dst = %dst.display(),
-                            offset,
-                            error = %e,
-                            "session transcript carry: could not cut the copy back to its last line boundary — the resumed session's first append may join a torn line"
-                        );
-                    }
-                    Some(offset)
-                }
-                Err(e) => {
-                    warn!(
-                        session = %claude_session_id,
-                        dst = %dst.display(),
-                        error = %e,
-                        "session transcript carry: could not read the copy's last line boundary — the tail rescue will report UNKNOWN"
-                    );
-                    None
-                }
-            }
+    // the line boundary [`settle_jsonl_end`] left them on. A destination the
+    // carry did not write, or a copy whose end could not be settled, leaves
+    // the offset UNKNOWN.
+    let transcript_offset = match settled {
+        Some(Ok(offset)) => Some(offset),
+        Some(Err(e)) => {
+            warn!(
+                session = %claude_session_id,
+                dst = %dst.display(),
+                error = %e,
+                "session transcript carry: could not settle the copy's end on a line boundary — the tail rescue will report UNKNOWN, and the resumed session's first append may join a torn line"
+            );
+            None
         }
-        MainCarry::Present | MainCarry::KeptExisting => None,
+        None => None,
     };
     let live_source_wins = main == MainTranscript::LiveSourceWins;
     // A main transcript moved aside already kept the fork's
@@ -840,16 +831,20 @@ enum PreserveError {
 /// [`MainTranscript::LiveSourceWins`] on a `.jsonl` destination that is
 /// neither byte-identical to the source nor a prefix of it: move the fork
 /// aside to a freshly claimed [`claim_diverged_backup`] name with
-/// `rename_aside`, then copy the source in its place. Returns the backup path.
+/// `rename_aside`, then copy the source in its place, running `settle` on the
+/// copy before it is renamed into place ([`copy_via_partial_with`]). Returns
+/// the backup path and what `settle` returned.
 /// When the copy fails after the move, the fork is moved back if the
 /// destination path is still free.
-fn preserve_diverged_and_copy<R>(
+fn preserve_diverged_and_copy<R, S, T>(
     src: &Path,
     dst: &Path,
     rename_aside: &mut R,
-) -> Result<PathBuf, PreserveError>
+    settle: S,
+) -> Result<(PathBuf, T), PreserveError>
 where
     R: FnMut(&Path, &Path) -> std::io::Result<()> + ?Sized,
+    S: FnOnce(&Path) -> T,
 {
     let backup = claim_diverged_backup(dst).map_err(|error| PreserveError::NotMovedAside {
         backup: None,
@@ -867,30 +862,33 @@ where
             error,
         });
     }
-    if let Err(error) = copy_via_partial(src, dst) {
-        // Check-then-rename, not atomic. The migration's per-session
-        // in-flight guard (`account_migration::begin_migration`), held across
-        // the whole carry, excludes only a CONCURRENT MIGRATION of this
-        // session; the resumed pane that will own the destination is not
-        // spawned yet. It does NOT exclude an earlier hop's detached step-4b
-        // delta sync, which runs outside the guard by design (the
-        // `account_migration` module doc's exception): after a fast hop back
-        // to an account the session left moments ago, that sync may still be
-        // writing into this same `<sid>/`. It writes only a destination still
-        // exactly as its own carry left it, so it backs off a file this carry
-        // moved aside — best-effort, not a lock. A write that lands before the
-        // check below leaves the fork at `backup` (`restored: false`); one
-        // that lands between the check and the rename is replaced by the fork.
-        // `path_is_free`, not `!exists()`: a stat error is not a free path,
-        // and a rename back over something there would replace it.
-        let restored = path_is_free(dst) && std::fs::rename(&backup, dst).is_ok();
-        return Err(PreserveError::CopyFailed {
-            backup,
-            restored,
-            error,
-        });
-    }
-    Ok(backup)
+    let settled = match copy_via_partial_with(src, dst, settle) {
+        Ok(settled) => settled,
+        Err(error) => {
+            // Check-then-rename, not atomic. The migration's per-session
+            // in-flight guard (`account_migration::begin_migration`), held across
+            // the whole carry, excludes only a CONCURRENT MIGRATION of this
+            // session; the resumed pane that will own the destination is not
+            // spawned yet. It does NOT exclude an earlier hop's detached step-4b
+            // delta sync, which runs outside the guard by design (the
+            // `account_migration` module doc's exception): after a fast hop back
+            // to an account the session left moments ago, that sync may still be
+            // writing into this same `<sid>/`. It writes only a destination still
+            // exactly as its own carry left it, so it backs off a file this carry
+            // moved aside — best-effort, not a lock. A write that lands before the
+            // check below leaves the fork at `backup` (`restored: false`); one
+            // that lands between the check and the rename is replaced by the fork.
+            // `path_is_free`, not `!exists()`: a stat error is not a free path,
+            // and a rename back over something there would replace it.
+            let restored = path_is_free(dst) && std::fs::rename(&backup, dst).is_ok();
+            return Err(PreserveError::CopyFailed {
+                backup,
+                restored,
+                error,
+            });
+        }
+    };
+    Ok((backup, settled))
 }
 
 /// [`preserve_diverged_and_copy`] for the main `<sid>.jsonl`. Errors — so the
@@ -909,15 +907,15 @@ fn preserve_diverged_main<R>(
     dst: &Path,
     session_dirs: (&Path, &Path),
     rename_aside: &mut R,
-) -> Result<MainCarry, String>
+) -> Result<(MainCarry, std::io::Result<u64>), String>
 where
     R: FnMut(&Path, &Path) -> std::io::Result<()>,
 {
     let (src_session_dir, dst_session_dir) = session_dirs;
     let keep_title_with =
         |backup: &Path| preserve_fork_custom_title(src_session_dir, dst_session_dir, dst, backup);
-    match preserve_diverged_and_copy(src, dst, rename_aside) {
-        Ok(backup) => {
+    match preserve_diverged_and_copy(src, dst, rename_aside, settle_jsonl_end) {
+        Ok((backup, settled)) => {
             warn!(
                 from = %src.display(),
                 to = %dst.display(),
@@ -927,7 +925,7 @@ where
             // Before `carry_session_dir` copies the live `custom-title.json`
             // over the fork's.
             keep_title_with(&backup);
-            Ok(MainCarry::DivergedPreserved { backup })
+            Ok((MainCarry::DivergedPreserved { backup }, settled))
         }
         // A rename that moved the fork and then reported an error: the fork is
         // at its backup, not at the destination. Same test as the subagent
@@ -1038,20 +1036,54 @@ pub(crate) fn line_boundary_offset(path: &Path) -> std::io::Result<u64> {
     Ok(0)
 }
 
-/// Cut `path` back to `offset` (its last line boundary, from
-/// [`line_boundary_offset`]) when bytes of a torn line follow it. Only when
-/// `0 < offset < len`: at `offset == len` there is nothing to cut, and a copy
-/// holding NO complete line (`offset == 0`) is left as it is rather than
-/// emptied, since the resume needs a transcript. `Ok(true)` when it cut.
-pub(crate) fn truncate_to_line_boundary(path: &Path, offset: u64) -> std::io::Result<bool> {
-    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+/// Settle the end of a copied `.jsonl` onto a line boundary and return the
+/// SOURCE offset the tail starts at. Run on the `.partial` before its rename
+/// ([`copy_via_partial_with`]), so the file that appears at the destination
+/// already ends on a boundary.
+///
+/// The bytes past the last `\n` ([`line_boundary_offset`]) are either:
+/// - a WHOLE record (they parse as a JSON object) whose `\n` the writer had
+///   not appended yet — it is kept and completed with a `\n`, and the offset
+///   is the copied length: the `\n` is the destination's own, so the source's
+///   tail starts where the copied bytes end (a `\n` the writer adds there
+///   reads as a blank line, which the rescue skips). Cutting it would drop a
+///   complete record from the resumed transcript (round-13 review S1);
+/// - a TORN line — cut back to the boundary, which is the offset: the tail
+///   rescue reads that line whole from the source, and left in place the
+///   resumed CLI's first append would glue a new record onto the fragment
+///   (round-12 review S3). A copy holding NO complete line (boundary 0) is
+///   kept as it is rather than emptied, since the resume needs a transcript.
+pub(crate) fn settle_jsonl_end(path: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let boundary = line_boundary_offset(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let len = file.metadata()?.len();
-    if offset == 0 || offset >= len {
-        return Ok(false);
+    if boundary >= len {
+        return Ok(len);
     }
-    file.set_len(offset)?;
+    let mut fragment = Vec::new();
+    file.seek(SeekFrom::Start(boundary))?;
+    file.read_to_end(&mut fragment)?;
+    if is_whole_json_object(&fragment) {
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        return Ok(len);
+    }
+    if boundary == 0 {
+        return Ok(0);
+    }
+    file.set_len(boundary)?;
     file.sync_all()?;
-    Ok(true)
+    Ok(boundary)
+}
+
+/// Whether `bytes` are one complete JSON object (a transcript record).
+fn is_whole_json_object(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v| v.is_object())
 }
 
 /// Copy `from` to a temporary `<to>.<pid>.<seq>.partial` and return its path.
@@ -1076,12 +1108,24 @@ fn write_partial(from: &Path, to: &Path) -> std::io::Result<PathBuf> {
 
 /// Copy `from` over `to` through [`write_partial`] + rename.
 fn copy_via_partial(from: &Path, to: &Path) -> std::io::Result<()> {
+    copy_via_partial_with(from, to, |_| ())
+}
+
+/// [`copy_via_partial`], running `settle` on the `.partial` BEFORE the atomic
+/// rename and returning what it returned — so whatever `settle` does to the
+/// copy is already true of the file that appears at `to`, and nothing reopens
+/// `to` afterwards, where a concurrent carry may have replaced it.
+fn copy_via_partial_with<S, T>(from: &Path, to: &Path, settle: S) -> std::io::Result<T>
+where
+    S: FnOnce(&Path) -> T,
+{
     let partial = write_partial(from, to)?;
+    let settled = settle(&partial);
     let renamed = rename_with_retry(&partial, to);
     if renamed.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
-    renamed
+    renamed.map(|()| settled)
 }
 
 /// `rename`, retried once after a short pause on `PermissionDenied` -- on
@@ -1449,8 +1493,8 @@ fn preserve_diverged_file(
     rename_aside: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
     carry: &mut SessionDirCarry,
 ) -> CarryWrite {
-    match preserve_diverged_and_copy(from, to, rename_aside) {
-        Ok(backup) => {
+    match preserve_diverged_and_copy(from, to, rename_aside, |_| ()) {
+        Ok((backup, ())) => {
             warn!(
                 from = %from.display(),
                 to = %to.display(),
