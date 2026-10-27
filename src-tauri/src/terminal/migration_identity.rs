@@ -52,8 +52,10 @@ use crate::terminal::graceful_exit::ProcIdentity;
 /// Whether this build's `procStart` clock has been checked against REAL
 /// Claude Code registry files (2026-10-23 review fix 3).
 ///
-/// Windows: yes — the FILETIME clock was validated against every live
-/// `sessions/<pid>.json` in the 2026-10-21 census. Elsewhere: the Linux clock
+/// Windows: yes — the live `sessions/<pid>.json` files carry `procStart` as
+/// a decimal-string FILETIME with `pidDomain` `"win32:<host>"` (e.g.
+/// `C:/claude/.claude-erik/sessions/47904.json`), the clock the snapshot
+/// reads. Elsewhere: the Linux clock
 /// (`ps -o lstart` in UTC, read from the CLI bundle — see the
 /// `claude_session_registry` module doc) is implemented but has never met a
 /// real Linux registry file. So off Windows a pane whose identity cannot be
@@ -197,8 +199,8 @@ pub fn decide_migration_identity(
     };
     let sid = row.session_id.clone();
 
-    // Another holder: outside the pane, interactive (the class the 2026-10-21
-    // census showed real forks in). Valid + same id ⇒ refuse; unknown + same
+    // Another holder: outside the pane, interactive (a real window, the
+    // class a forked conversation lives in). Valid + same id ⇒ refuse; unknown + same
     // (or unreadable) id ⇒ a fork cannot be ruled out ⇒ refuse; stale ⇒ not
     // evidence.
     let mut maybe: Option<(u32, &'static str)> = None;
