@@ -2764,6 +2764,66 @@ mod resolve_wait_tests {
             );
         }
     }
+
+    /// PATH can spell the shim's own dir differently from the rendered
+    /// SHIM_DIR: under Git Bash, PATH carries `/tmp/qontinui-identity-…` while
+    /// SHIM_DIR is rendered `C:\…\Temp\qontinui-identity-…`. The scan must
+    /// still skip it, by identity, or it resolves the shim ITSELF as the real
+    /// tool and execs itself forever (2026-10-27: a bare `claude --version`
+    /// hung from every Git Bash shell, recursion guard or not). A symlink is the
+    /// unix stand-in for the second spelling. The guard is set so the identity
+    /// shim goes straight to the resolve-and-exec path under test.
+    #[test]
+    fn shims_skip_their_own_dir_under_another_spelling() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (tool, body_for) in [
+            (
+                "claude",
+                (|d: &Path| render_identity_for_test("claude", d)) as fn(&Path) -> String,
+            ),
+            ("npm", |d: &Path| {
+                render_for_test(SHIM_BASH, ShimTool::Npm, d)
+            }),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (shim_dir, real_dir, alias) = (
+                tmp.path().join("shim"),
+                tmp.path().join("real"),
+                tmp.path().join("alias"),
+            );
+            std::fs::create_dir_all(&shim_dir).unwrap();
+            std::fs::create_dir_all(&real_dir).unwrap();
+            std::os::unix::fs::symlink(&shim_dir, &alias).unwrap();
+            let marker = tmp.path().join("ran");
+            write_exe(&real_dir.join(tool), &fake_claude_body(&marker));
+            write_exe(&shim_dir.join(tool), &body_for(&shim_dir));
+            let mut cmd = Command::new(bash());
+            cmd.arg(alias.join(tool))
+                .arg("--version")
+                .current_dir(tmp.path())
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!("{}:{}:/usr/bin:/bin", alias.display(), real_dir.display()),
+                )
+                .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0")
+                .env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1");
+            let out = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(15));
+            let out = match out {
+                Ok(o) => o,
+                Err(e) => panic!("{tool}: the shim did not finish (it resolved itself): {e}"),
+            };
+            assert!(
+                out.status.success(),
+                "{tool}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(marker.exists(), "{tool}: the real tool never ran");
+        }
+    }
 }
 
 /// The session-CLI publication guard (plan

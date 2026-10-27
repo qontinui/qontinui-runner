@@ -39,6 +39,20 @@ set -u
 TOOL="@@TOOL@@"
 SHIM_DIR="@@SHIM_DIR@@"
 
+# is_own_dir <dir>: whether <dir> is this shim's own bin dir, by IDENTITY and
+# not only by string. Under Git Bash, SHIM_DIR is rendered in Windows form
+# (C:\Users\...\Temp\qontinui-identity-...) while PATH carries the MSYS form
+# (/tmp/qontinui-identity-...). The string compare alone never matched there,
+# so the scan returned this shim as the "real" tool and every invocation from
+# a Git Bash shell exec'd itself forever (measured 2026-10-27: a bare
+# `claude --version` timed out even with the recursion guard set). `-ef`
+# compares device and inode, so it holds across spellings, and it is a
+# builtin, so a PATH entry costs no fork.
+is_own_dir() {
+  case "${1%/}" in "${SHIM_DIR%/}") return 0 ;; esac
+  [ "$1" -ef "$SHIM_DIR" ]
+}
+
 # ---------------------------------------------------------------------------
 # npm's PLACEHOLDER stub. @anthropic-ai/claude-code ships `bin/claude.exe` as a
 # ~500-byte shell script that only prints "claude native binary not installed"
@@ -74,9 +88,7 @@ scan_path() {
   local dir cand
   for dir in $PATH; do
     [ -z "$dir" ] && continue
-    case "${dir%/}" in
-      "${SHIM_DIR%/}") continue ;;
-    esac
+    is_own_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         if is_npm_placeholder "$cand"; then
@@ -193,7 +205,7 @@ exec_real() {
   local newpath="" d
   local IFS=':'
   for d in $PATH; do
-    case "${d%/}" in "${SHIM_DIR%/}") continue ;; esac
+    is_own_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is
