@@ -34,12 +34,12 @@ set "MODE=%QONTINUI_INSTALL_INTERCEPT_MODE%"
 if not defined MODE set "MODE=observe"
 set "OVERRIDE=%QONTINUI_INSTALL_OVERRIDE%"
 
-rem ---- resolve the REAL tool: first PATH match not inside SHIM_DIR ----------
+rem ---- resolve the REAL tool: first PATH match outside every runner shim dir ----------
 set "REAL="
 for %%E in (%TOOL%.cmd %TOOL%.exe %TOOL%.bat) do (
   for %%P in ("%%~$PATH:E") do rem noop
 )
-rem Robust scan: walk PATH entries, skip SHIM_DIR, take first existing
+rem Robust scan: walk PATH entries, skip every runner shim dir, take first existing
 rem TOOL.cmd/TOOL.exe/TOOL.bat.
 rem Bounded wait on a MISS (same rule as the bash shim and qontinui-shim.exe):
 rem a package manager reinstalling the tool (npm's reify renames the bin aside)
@@ -57,13 +57,26 @@ set "RW_NUM="
 set /a "RW_NUM=RESOLVE_WAIT" >nul 2>nul
 if not "%RW_NUM%"=="%RESOLVE_WAIT%" set "RESOLVE_WAIT=3"
 set "RESOLVE_TRIES=0"
+rem Every runner shim dir is skipped, not only SHIM_DIR: the dir itself by
+rem string, and any qontinui-identity-* / qontinui-shim-* dir by name, such as
+rem one an older runner build prepended for an outer pane. Two such dirs on one
+rem PATH resolve each other's %TOOL%.cmd and CALL back and forth until cmd's
+rem recursion limit; no real tool ever lives in one.
 :resolve_real
 for %%X in (cmd exe bat) do (
   if not defined REAL (
     for %%D in ("%PATH:;=" "%") do (
       if not defined REAL (
         set "DENTRY=%%~D"
-        if /I not "!DENTRY!"=="%SHIM_DIR%" (
+        set "DSKIP=0"
+        if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
+        set "DBASE="
+        set "DTRIM=!DENTRY!"
+        if defined DTRIM if "!DTRIM:~-1!"=="\" set "DTRIM=!DTRIM:~0,-1!"
+        if defined DTRIM for %%B in ("!DTRIM!") do set "DBASE=%%~nxB"
+        if defined DBASE if /I "!DBASE:~0,18!"=="qontinui-identity-" set "DSKIP=1"
+        if defined DBASE if /I "!DBASE:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+        if "!DSKIP!"=="0" (
           if exist "!DENTRY!\%TOOL%.%%X" set "REAL=!DENTRY!\%TOOL%.%%X"
         )
       )
@@ -72,7 +85,7 @@ for %%X in (cmd exe bat) do (
 )
 if defined REAL goto :resolved
 if !RESOLVE_TRIES! GEQ !RESOLVE_WAIT! goto :unresolved
-if "!RESOLVE_TRIES!"=="0" >&2 echo qontinui shim: !TOOL! not found on PATH ^(excluding !SHIM_DIR!^); waiting up to !RESOLVE_WAIT!s for it to reappear ^(a package-manager reinstall briefly removes it^)
+if "!RESOLVE_TRIES!"=="0" >&2 echo qontinui shim: !TOOL! not found on PATH ^(excluding runner shim dirs, this one being !SHIM_DIR!^); waiting up to !RESOLVE_WAIT!s for it to reappear ^(a package-manager reinstall briefly removes it^)
 set /a RESOLVE_TRIES+=1
 ping -n 2 127.0.0.1 >nul 2>nul
 goto :resolve_real
@@ -80,7 +93,7 @@ goto :resolve_real
 rem Whatever answers the bare-name dispatch below may be this very shim (cmd
 rem searches the shim dir again); it must not wait a second time.
 set "QONTINUI_SHIM_RESOLVE_WAIT_SECS=0"
->&2 echo qontinui shim: the real !TOOL! was not found on PATH after waiting !RESOLVE_WAIT!s; falling back to PATH dispatch. PATH searched ^(excluding !SHIM_DIR!^): !PATH!
+>&2 echo qontinui shim: the real !TOOL! was not found on PATH after waiting !RESOLVE_WAIT!s; falling back to PATH dispatch. PATH searched ^(excluding runner shim dirs, this one being !SHIM_DIR!^): !PATH!
 rem Already nested (guard set) and still unresolved: a by-name dispatch could
 rem only re-enter a shim of ours. Command-not-found instead of recursing.
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (

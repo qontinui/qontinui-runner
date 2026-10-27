@@ -24,7 +24,7 @@ rem   @@SHIM_DIR@@  absolute path of this shim's own bin dir
 set "TOOL=@@TOOL@@"
 set "SHIM_DIR=@@SHIM_DIR@@"
 
-rem ---- resolve the REAL provider: first PATH match not inside SHIM_DIR -------
+rem ---- resolve the REAL provider: first PATH match outside every shim dir --
 set "REAL="
 rem Bounded wait on a MISS (same rule as the bash shim and qontinui-shim.exe):
 rem a package manager reinstalling the tool (npm's reify renames the bin aside)
@@ -40,13 +40,26 @@ set "RW_NUM="
 set /a "RW_NUM=RESOLVE_WAIT" >nul 2>nul
 if not "%RW_NUM%"=="%RESOLVE_WAIT%" set "RESOLVE_WAIT=10"
 set "RESOLVE_TRIES=0"
+rem Every runner shim dir is skipped, not only SHIM_DIR: the dir itself by
+rem string, and any qontinui-identity-* / qontinui-shim-* dir by name, such as
+rem one an older runner build prepended for an outer pane. Two such dirs on one
+rem PATH resolve each other's %TOOL%.cmd and CALL back and forth until cmd's
+rem recursion limit; no real tool ever lives in one.
 :resolve_real
 for %%X in (cmd exe bat) do (
   if not defined REAL (
     for %%D in ("%PATH:;=" "%") do (
       if not defined REAL (
         set "DENTRY=%%~D"
-        if /I not "!DENTRY!"=="%SHIM_DIR%" (
+        set "DSKIP=0"
+        if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
+        set "DBASE="
+        set "DTRIM=!DENTRY!"
+        if defined DTRIM if "!DTRIM:~-1!"=="\" set "DTRIM=!DTRIM:~0,-1!"
+        if defined DTRIM for %%B in ("!DTRIM!") do set "DBASE=%%~nxB"
+        if defined DBASE if /I "!DBASE:~0,18!"=="qontinui-identity-" set "DSKIP=1"
+        if defined DBASE if /I "!DBASE:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+        if "!DSKIP!"=="0" (
           if exist "!DENTRY!\%TOOL%.%%X" set "REAL=!DENTRY!\%TOOL%.%%X"
         )
       )
@@ -55,7 +68,7 @@ for %%X in (cmd exe bat) do (
 )
 if defined REAL goto :resolved
 if !RESOLVE_TRIES! GEQ !RESOLVE_WAIT! goto :unresolved
-if "!RESOLVE_TRIES!"=="0" >&2 echo qontinui shim: !TOOL! not found on PATH ^(excluding !SHIM_DIR!^); waiting up to !RESOLVE_WAIT!s for it to reappear ^(a package-manager reinstall briefly removes it^)
+if "!RESOLVE_TRIES!"=="0" >&2 echo qontinui shim: !TOOL! not found on PATH ^(excluding runner shim dirs, this one being !SHIM_DIR!^); waiting up to !RESOLVE_WAIT!s for it to reappear ^(a package-manager reinstall briefly removes it^)
 set /a RESOLVE_TRIES+=1
 ping -n 2 127.0.0.1 >nul 2>nul
 goto :resolve_real
@@ -63,7 +76,7 @@ goto :resolve_real
 rem Whatever answers the bare-name dispatch below may be this very shim (cmd
 rem searches the shim dir again); it must not wait a second time.
 set "QONTINUI_SHIM_RESOLVE_WAIT_SECS=0"
->&2 echo qontinui shim: the real !TOOL! was not found on PATH after waiting !RESOLVE_WAIT!s; falling back to PATH dispatch. PATH searched ^(excluding !SHIM_DIR!^): !PATH!
+>&2 echo qontinui shim: the real !TOOL! was not found on PATH after waiting !RESOLVE_WAIT!s; falling back to PATH dispatch. PATH searched ^(excluding runner shim dirs, this one being !SHIM_DIR!^): !PATH!
 rem Already nested (guard set) and still unresolved: a by-name dispatch could
 rem only re-enter a shim of ours. Command-not-found instead of recursing.
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
@@ -78,7 +91,8 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
 rem ---- non-session invocation: the same pure passthrough --------------------
 rem claude --version / --help / a management subcommand (claude mcp list) is
 rem NOT a session, so it gets no --settings / --mcp-config / --session-id and
-rem no session-open. Mirrors `non_session_invocation` in
+rem no session-open, and it drops the inherited policy-delivered marker (see
+rem below). Mirrors `non_session_invocation` in
 rem src/bin/qontinui_shim.rs, the SOURCE OF TRUTH for both lists; keep the
 rem three surfaces in step. Exact case (no /I): Claude Code's own lookup is
 rem exact, so `claude Update the README` is a PROMPT. The flag scan is a CALLed
@@ -94,6 +108,8 @@ call :ns_scan %*
 if "%NON_SESSION%"=="1" (
   set "SETTINGS_ARGS="
   set "MCPCFG_ARGS="
+  set "QONTINUI_POLICY_DELIVERED_SHA="
+  set "QONTINUI_POLICY_DELIVERED_FILE="
   goto :passthrough
 )
 
@@ -209,14 +225,20 @@ if defined REAL (
 endlocal & exit /b %ERRORLEVEL%
 
 rem ---- :ns_scan <args...> -- NON_SESSION=1 on an exact version/help flag ----
-rem SHIFT walks this CALL's own copy of the args. Stops at `--` (what follows
-rem is a prompt) and at an empty argument (errs toward pinning).
+rem SHIFT walks this CALL's own copy of the args and stops at `--` (what
+rem follows is a prompt) or at the end of the list. Each argument is compared
+rem through a variable with delayed expansion, never as `"%~1"` in the IF line:
+rem a token with a quoted run that is not quoted end to end
+rem (C:\"Program Files"\x) split that operand and aborted the whole batch, so
+rem the real claude never ran.
 :ns_scan
-if "%~1"=="" goto :eof
-if "%~1"=="--" goto :eof
-if "%~1"=="--version" set "NON_SESSION=1"
-if "%~1"=="-v" set "NON_SESSION=1"
-if "%~1"=="--help" set "NON_SESSION=1"
-if "%~1"=="-h" set "NON_SESSION=1"
+set "NS_RAW=%1"
+if not defined NS_RAW goto :eof
+set "NS_ARG=%~1"
+if "!NS_ARG!"=="--" goto :eof
+if "!NS_ARG!"=="--version" set "NON_SESSION=1"
+if "!NS_ARG!"=="-v" set "NON_SESSION=1"
+if "!NS_ARG!"=="--help" set "NON_SESSION=1"
+if "!NS_ARG!"=="-h" set "NON_SESSION=1"
 shift
 goto :ns_scan

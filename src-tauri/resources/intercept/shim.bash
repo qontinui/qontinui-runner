@@ -57,20 +57,20 @@ NEVER_GATE="@@NEVER_GATE@@"
 
 # is_own_dir <dir>: whether <dir> is this shim's own bin dir, by IDENTITY and
 # not only by string. Under Git Bash, SHIM_DIR is rendered in Windows form
-# (C:\Users\...\Temp\qontinui-identity-...) while PATH carries the MSYS form
-# (/tmp/qontinui-identity-...). The string compare alone never matched there,
+# (C:\Users\...\Temp\qontinui-shim-...) while PATH carries the MSYS form
+# (/tmp/qontinui-shim-...). The string compare alone never matched there,
 # so the scan returned this shim as the "real" tool and every invocation from
-# a Git Bash shell exec'd itself forever (measured 2026-10-27: a bare
-# `claude --version` timed out even with the recursion guard set). `-ef`
-# compares device and inode, so it holds across spellings, and it is a
+# a Git Bash shell exec'd itself forever (measured 2026-10-27 on the identity
+# shim, which shares this resolver: a bare `claude --version` never returned).
+# `-ef` compares device and inode, so it holds across spellings, and it is a
 # builtin, so a PATH entry costs no fork.
 is_own_dir() {
   case "${1%/}" in "${SHIM_DIR%/}") return 0 ;; esac
   [ "$1" -ef "$SHIM_DIR" ]
 }
 
-# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or ANY runner
-# shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
+# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or a runner
+# shim dir named qontinui-identity-* / qontinui-shim-*, such as one an older runner
 # build prepended for an outer pane. Two such dirs on one PATH resolve each
 # other and exec back and forth forever, and no real tool ever lives in one, so
 # the scan and the PATH-strip fall-through skip them all. The name test runs
@@ -88,8 +88,8 @@ is_shim_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve the REAL tool: first match on PATH outside every runner shim dir
-# (is_shim_dir).
+# Resolve the REAL tool: first match on PATH outside the runner shim dirs
+# is_shim_dir names.
 # Mirrors pm_detect::pm_command intent (try <tool> then <tool>.cmd/.exe).
 # ---------------------------------------------------------------------------
 resolve_real() {

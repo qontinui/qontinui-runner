@@ -53,8 +53,8 @@ is_own_dir() {
   [ "$1" -ef "$SHIM_DIR" ]
 }
 
-# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or ANY runner
-# shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
+# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or a runner
+# shim dir named qontinui-identity-* / qontinui-shim-*, such as one an older runner
 # build prepended for an outer pane. Two such dirs on one PATH resolve each
 # other and exec back and forth forever, and no real tool ever lives in one, so
 # the scan and the PATH-strip fall-through skip them all. The name test runs
@@ -124,8 +124,8 @@ scan_path() {
   return 1
 }
 
-# Resolve the REAL provider: first match on PATH outside every runner shim
-# dir (is_shim_dir) that is not npm's placeholder stub.
+# Resolve the REAL provider: first match on PATH outside the runner shim
+# dirs is_shim_dir names that is not npm's placeholder stub.
 resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
@@ -257,7 +257,12 @@ if [ "$TOOL" = "claude" ]; then
     mcp|doctor|update|upgrade|install|setup-token|plugin|plugins|auth|auto-mode|agents|logs|rm|stop|kill|purge|import|project)
       non_session=1 ;;
   esac
-  [ "$non_session" = "1" ] && exec_real "$@"
+  if [ "$non_session" = "1" ]; then
+    # Never told it holds the policy body: an info call runs no SessionStart
+    # hook, and a session misread as one gets the full body (the safe way).
+    unset QONTINUI_POLICY_DELIVERED_SHA QONTINUI_POLICY_DELIVERED_FILE
+    exec_real "$@"
+  fi
 fi
 
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"

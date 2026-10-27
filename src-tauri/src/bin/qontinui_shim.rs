@@ -298,7 +298,9 @@ pub fn user_chose_session(args: &[String]) -> bool {
 /// Claude Code subcommands that manage the install/config and never open a
 /// conversation, checked against `claude --help` (2.1.311, 2026-10-27).
 /// `project` is hidden from `--help` (`claude project purge`) but registered.
-/// Deliberately absent: `resume` (already [`user_chose_session`]), and
+/// Deliberately absent: `resume` (not a 2.1.311 subcommand at all — `claude
+/// resume` prints the main usage; [`user_chose_session`] still reads the bare
+/// word as a session choice, which predates this list), and
 /// `attach` / `respawn` / `ultrareview` / `gateway` / `remote-control` (`rc`),
 /// which open or run a session or a long-lived process. `config` and
 /// `migrate-installer` are no longer top-level subcommands there — `claude
@@ -647,8 +649,16 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
 
     // Non-session invocation (`claude --version`, `claude mcp list`): the same
     // pure passthrough. Claude only — the subcommand list is Claude Code's.
+    // It also drops the inherited policy-delivered marker: an info call runs no
+    // SessionStart hook, and a session misread as one (an option whose value
+    // is `-v`) then gets the full body from the hook — the safe direction.
     if tool == IdentityTool::Claude && non_session_invocation(args) {
-        return exec_real(&real, tool.program(), args);
+        return exec_real_child_env(
+            &real,
+            tool.program(),
+            args,
+            &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV],
+        );
     }
 
     let pinned = env::var(PINNED_SESSION_ENV)
@@ -1999,10 +2009,34 @@ mod tests {
         let cmd_flags: BTreeSet<&str> = CMD
             .lines()
             .filter_map(|l| {
-                l.strip_prefix("if \"%~1\"==\"")?
+                l.strip_prefix("if \"!NS_ARG!\"==\"")?
                     .strip_suffix("\" set \"NON_SESSION=1\"")
             })
             .collect();
+        // Exact case on cmd (no `/I` on the subcommand compare) and the stop
+        // at `--` ahead of the flag arm on bash, as in the Rust predicate.
+        let cmd_sub_line = CMD
+            .lines()
+            .find(|l| l.starts_with("for %%S in ("))
+            .expect("cmd subcommand for-list");
+        assert!(
+            !cmd_sub_line.contains("/I"),
+            "cmd subcommand compare must be exact case"
+        );
+        let bash_lines: Vec<&str> = BASH.lines().map(str::trim).collect();
+        let flag_arm = bash_lines
+            .iter()
+            .position(|l| l.ends_with(") non_session=1; break ;;"))
+            .expect("bash flag case arm");
+        assert_eq!(
+            bash_lines[flag_arm - 1],
+            "--) break ;;",
+            "bash scan must stop at --"
+        );
+        assert!(
+            CMD.contains("if \"!NS_ARG!\"==\"--\" goto :eof"),
+            "cmd scan must stop at --"
+        );
 
         assert_eq!(bash_subs, subs, "identity_shim.bash subcommands");
         assert_eq!(cmd_subs, subs, "identity_shim.cmd subcommands");
