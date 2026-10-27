@@ -49,7 +49,6 @@ impl LoopController {
                     let should_complete = super::review_subtask::process_review_outcome(
                         &self.app_state.pg_db,
                         execution_id,
-                        parent_id,
                     )
                     .await;
                     if !should_complete {

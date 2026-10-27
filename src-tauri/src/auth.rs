@@ -14,7 +14,7 @@ use keyring::Entry;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// Service name used for keychain entries (legacy)
@@ -726,10 +726,14 @@ impl AuthManager {
         //     `.enc` file — doing so would mask the corruption (no forensics)
         //     and resurrect potentially-stale keychain tokens over a present
         //     store. So we suppress the migrate-write in this case.
+        //
+        // The per-read lines below are TRACE, not DEBUG: every periodic loop
+        // reads the token through here, so at DEBUG they flooded the log.
+        // Every `warn!` branch is unchanged.
         let store_present = self.secure_storage.store_file_exists();
         match self.secure_storage.get_access_token() {
             Ok(token) => {
-                debug!("Retrieved access token from secure storage");
+                trace!("Retrieved access token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
@@ -741,7 +745,7 @@ impl AuthManager {
                         e
                     );
                 } else {
-                    debug!("Access token not in secure storage (no store file): {}", e);
+                    trace!("Access token not in secure storage (no store file): {}", e);
                 }
             }
         }
@@ -768,7 +772,7 @@ impl AuthManager {
                 Ok(token)
             }
             Err(e) => {
-                debug!("Access token not in keychain: {}", e);
+                trace!("Access token not in keychain: {}", e);
                 Err(anyhow::anyhow!("Access token not found in any storage"))
             }
         }
@@ -833,11 +837,14 @@ impl AuthManager {
         // Try file storage first (primary)
         match self.secure_storage.get_refresh_token() {
             Ok(token) => {
-                debug!("Retrieved refresh token from secure storage");
+                // TRACE, like the access-token lines above: every refresh read
+                // lands here, on a paired store or (the two arms below) an
+                // unpaired one.
+                trace!("Retrieved refresh token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
-                debug!("Refresh token not in secure storage: {}", e);
+                trace!("Refresh token not in secure storage: {}", e);
             }
         }
 
@@ -848,7 +855,7 @@ impl AuthManager {
                 Ok(token)
             }
             Err(e) => {
-                debug!("Refresh token not in keychain: {}", e);
+                trace!("Refresh token not in keychain: {}", e);
                 Err(anyhow::anyhow!("Refresh token not found in any storage"))
             }
         }

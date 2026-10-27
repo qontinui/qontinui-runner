@@ -572,9 +572,9 @@
         "label": "Target Application",
         "description": "Which application to verify",
         "required": true,
-        "default": "http://localhost:9876/ui-bridge",
+        "default": "http://127.0.0.1:9876/ui-bridge",
         "options": [
-          { "label": "Runner UI", "value": "http://localhost:9876/ui-bridge" },
+          { "label": "Runner UI", "value": "http://127.0.0.1:9876/ui-bridge" },
           { "label": "Web Frontend", "value": "http://localhost:3001/api/ui-bridge" }
         ]
       },

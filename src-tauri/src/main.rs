@@ -318,6 +318,7 @@ mod ui_bridge_invoke;
 mod ui_bridge_invoke_probe;
 mod ui_bridge_plugin;
 mod ui_error;
+mod ui_ping;
 mod ui_thread_probe;
 mod unified_ai_session;
 mod unified_workflow_executor;
@@ -831,7 +832,6 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
                 .expect("degraded PG pool construction failed"),
         );
         crate::database::pg::PgDb::set_global(pg.clone());
-        crate::database::pg::set_pg_available(false);
         // Overwrites whatever `store_handle` recorded: on the connect-failure
         // path below the cluster may well be up, but this process has no
         // usable database, and `/health` must say so.
@@ -848,7 +848,6 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
                     info!("Connected to embedded PostgreSQL (standalone mode)");
                     let pg = Arc::new(pg);
                     crate::database::pg::PgDb::set_global(pg.clone());
-                    crate::database::pg::set_pg_available(true);
                     pg
                 }
                 Err(conn_err) => degrade(
@@ -1005,7 +1004,6 @@ fn select_db_arm(
                     .expect("degraded PG pool construction must not fail on a static DSN"),
             );
             crate::database::pg::PgDb::set_global(pg.clone());
-            crate::database::pg::set_pg_available(false);
             crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
             return pg;
         }
@@ -1026,7 +1024,6 @@ fn select_db_arm(
             info!("PostgreSQL connected successfully");
             let pg = Arc::new(pg);
             crate::database::pg::PgDb::set_global(pg.clone());
-            crate::database::pg::set_pg_available(true);
             crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::External);
             pg
         }
@@ -1051,7 +1048,6 @@ fn select_db_arm(
                     Ok(pg) => {
                         let pg = Arc::new(pg);
                         crate::database::pg::PgDb::set_global(pg.clone());
-                        crate::database::pg::set_pg_available(false);
                         crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
                         pg
                     }
@@ -1905,10 +1901,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
         let pg = select_db_arm(&rt, &profile);
 
-        // Gated on `pg_available()` rather than on the arm: before P4
-        // `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
-        // so an embedded-arm runner silently never ran it. Keep it here.
-        if crate::database::pg::pg_available() {
+        // Gated on `pg_available_since_boot()` rather than on the arm: before
+        // P4 `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
+        // so an embedded-arm runner silently never ran it. Keep it here. (Not
+        // `pg_available()`: that is the PG breaker's live state, and one
+        // runtime blip at this moment must not skip one-shot boot work.)
+        if crate::database::pg::pg_available_since_boot() {
             // spec-multi-app Stream F.1: register dev apps (runner, web,
             // supervisor) on startup so the multi-tenant Spec API has entries
             // to serve. Gated on `QONTINUI_DEV_BOOTSTRAP=1` so production
@@ -5614,6 +5612,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            // The 3s `ui-bridge-ping` emitter, on its OWN OS thread — never a
+            // tokio task. It used to be a `tokio::spawn` in
+            // `mcp_api::create_router`, which put it on `app-rt`: when
+            // `app-rt`'s workers were parked in synchronous process creation
+            // the ping stopped for minutes and `/health` called a pumping UI
+            // wedged. Started here — beside the API server spawn, so at the
+            // same point in boot as before, and ahead of the synchronous
+            // bridge/seed work below — but NOT from the router, because
+            // independence from the API runtime is the point (plan
+            // 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns,
+            // Phase 1). Idempotent per process.
+            match ui_ping::start_ui_ping_thread(app.handle().clone()) {
+                Ok(started) => info!(?started, "ui-bridge-ping thread"),
+                Err(e) => error!(
+                    error = %e,
+                    "the ui-bridge-ping thread did not start — the native-UI verdict will read ping_not_emitted (UNKNOWN), not wedged"
+                ),
+            }
+
             // Scan for crash dumps written by the previous process. Run in
             // parallel with the MCP server spawn above — the scan is a
             // read-only disk walk + ~1 file parse and completes in ms, so we
@@ -5785,7 +5802,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // per instance, so a temp runner resumes its own runs and never
             // the primary's (they share one embedded PG cluster). Plan
             // `2026-09-23-conductor-e2e-phase1-defects`, Phase 2.
-            if crate::database::pg::pg_available() {
+            if crate::database::pg::pg_available_since_boot() {
                 let resume_state: Arc<commands::AppState> =
                     app.state::<Arc<commands::AppState>>().inner().clone();
                 let resume_handle = app.handle().clone();
@@ -5793,6 +5810,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Same settle delay the scheduler takes: let the MCP API
                     // bind before workers that report through it are spawned.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    // One-shot: a runtime PG blip at this moment would make
+                    // every resume read fail fast and the runs would never be
+                    // resumed. Give the breaker a bounded chance to close.
+                    if !resume_state
+                        .pg_db
+                        .pool()
+                        .wait_available(tokio::time::Duration::from_secs(30))
+                        .await
+                    {
+                        tracing::warn!(
+                            "conductor restart-resume: PostgreSQL unavailable for 30 s after boot; \
+                             owned runs are NOT resumed this process"
+                        );
+                        return;
+                    }
                     orchestration_loop::loop_engine::resume_owned_runs(
                         resume_state.orchestration_loops.clone(),
                         resume_handle,

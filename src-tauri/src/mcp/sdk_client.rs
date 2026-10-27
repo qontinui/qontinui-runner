@@ -459,6 +459,10 @@ async fn select_app_payload(
 ///
 /// `http_body` falls back to `serde_json::Value::Null` when `None` to match
 /// the existing convention in `dispatch_app_request`.
+///
+/// An HTTP-transport app that answers `{success:false, error}` comes back as
+/// `Err(<the app's error>)`, whatever the status, the same as on
+/// `/apps/{id}/dispatch` (coord finding `fb3fb468`).
 pub async fn dispatch_app_request_by_id(
     state: &Arc<ApiState>,
     app_id: &str,
@@ -468,9 +472,34 @@ pub async fn dispatch_app_request_by_id(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let payload = select_app_payload(&state.app_registry, app_id, ws_payload, http_body).await;
-    state
-        .app_dispatcher
+    dispatch_app_request_by_id_with(
+        &state.app_registry,
+        &state.app_dispatcher,
+        app_id,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+}
+
+/// [`dispatch_app_request_by_id`] over the registry and dispatcher alone, so
+/// a test drives the real body without building an `ApiState`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_app_request_by_id_with(
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let payload = select_app_payload(registry, app_id, ws_payload, http_body).await;
+    dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
         .map_err(dispatch_err_to_string)
@@ -506,7 +535,10 @@ fn app_code_from_body(body: &str) -> Option<String> {
 /// app-answered `{success:false}`, `Timeout`, `Disconnected`, `Displaced`,
 /// `NotResponsive`, an HTTP send/non-2xx failure. `ui_bridge_request_sync`
 /// targets the RUNNER's Tauri window, never the app, so falling back would
-/// re-execute the action on the wrong UI. Those are answered with
+/// re-execute the action on the wrong UI — and, for a READ handler
+/// (`ai/search`, `ai/find`, `ai/snapshot`, `ai/summary`), would answer with
+/// the runner's own data shaped exactly like the app's, a successful read of
+/// the wrong surface. Those are answered with
 /// `Some(body)`: `{success:false, error, code, failure_origin, detail}`.
 ///
 /// Why not re-read the live connection state after the error (the former
@@ -518,19 +550,28 @@ fn app_code_from_body(body: &str) -> Option<String> {
 ///
 /// `failure_origin` is `"app"` when the app itself answered with a failure
 /// ([`DispatchError::AppAnswered`], or a wrapper `WrapperError` over the
-/// relay) and `"transport"` for everything else. `code` is the app's own code
-/// when the error carries one, else [`SDK_DISPATCH_FAILED`].
+/// relay) and `"transport"` for everything else — including a response frame
+/// the relay could not read (`UnreadableResponse`), whose outcome is unknown
+/// and which is never the app's own failure. `code` is the app's own code
+/// when the error carries one — for a WebSocket wrapper, the `code` of its
+/// structured failure frame (`NO_HANDLER`, `HANDLER_ERROR`, …) — else
+/// [`SDK_DISPATCH_FAILED`]. `retryable` is the wrapper's own retry verdict when
+/// it sent one, and `null` otherwise: UNKNOWN, never `false`.
 ///
 /// Plan `2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers`
 /// Case 1.
 fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::Value> {
     use super::command_relay::CommandRelayError;
-    let (origin, app_code) = match err {
+    let (origin, app_code, retryable) = match err {
         DispatchError::NotConnected => return None,
-        DispatchError::AppAnswered { code, .. } => ("app", code.clone()),
-        DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => ("app", None),
-        DispatchError::HttpStatus { body, .. } => ("transport", app_code_from_body(body)),
-        _ => ("transport", None),
+        DispatchError::AppAnswered {
+            code, retryable, ..
+        } => ("app", code.clone(), *retryable),
+        DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
+            ("app", failure.code.clone(), failure.retryable)
+        }
+        DispatchError::HttpStatus { body, .. } => ("transport", app_code_from_body(body), None),
+        _ => ("transport", None, None),
     };
     let detail = dispatch_err_message(err);
     let code = app_code.unwrap_or_else(|| SDK_DISPATCH_FAILED.to_string());
@@ -548,6 +589,7 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
         "code": code,
         "failure_origin": origin,
         "detail": detail,
+        "retryable": retryable,
     }))
 }
 
@@ -555,22 +597,12 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
 // Handlers
 // =============================================================================
 
-/// Normalize localhost to 127.0.0.1 to avoid IPv6 resolution issues on Windows.
-/// Windows often resolves `localhost` to `::1` (IPv6) first, but many dev servers
-/// (Next.js, FastAPI, etc.) only bind to IPv4 `0.0.0.0`. This causes reqwest to
-/// hang on the IPv6 connect attempt before falling back to IPv4, exceeding timeouts.
-fn normalize_localhost_url(url: &str) -> String {
-    url.replace("://localhost:", "://127.0.0.1:")
-        .replace("://localhost/", "://127.0.0.1/")
-        .replace("://localhost", "://127.0.0.1") // handle bare localhost without port
-}
-
 /// POST /ui-bridge/sdk/connect — Connect to an SDK app
 async fn handle_connect(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
-    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
+    let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     info!(url = %url, "Connecting to SDK app");
 
     // Check if we're already connected to this URL
@@ -1336,11 +1368,111 @@ async fn handle_heartbeat(State(state): State<Arc<ApiState>>) -> Json<serde_json
     }
 }
 
+/// The content role of an element as the ui-bridge SDK reads it
+/// (`ai/content-comparison.ts` `getContentRole`): its stated
+/// `contentMetadata.contentRole`, else the role its `type` implies. `None`
+/// means the element is not content by role. Every transport nests the role
+/// under `contentMetadata`; none sends it at the top level.
+fn element_content_role(el: &serde_json::Value) -> Option<String> {
+    let stated = el
+        .get("contentMetadata")
+        .and_then(|m| m.get("contentRole"))
+        .and_then(|v| v.as_str())
+        .filter(|r| !r.is_empty());
+    if let Some(role) = stated {
+        return Some(role.to_string());
+    }
+    let el_type = el
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let role = match el_type.as_str() {
+        "heading" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+        "metric-value" | "metric" => "metric",
+        "status-message" | "status" => "status",
+        "label" => "label",
+        "badge" => "badge",
+        "table-cell" => "table-cell",
+        "table-header" => "table-header",
+        "caption" => "caption",
+        _ => return None,
+    };
+    Some(role.to_string())
+}
+
+/// Whether the SDK counts an element as content (`isContentElement`): a
+/// `content` category, any truthy `contentMetadata`, or a content role.
+fn is_content_element(el: &serde_json::Value) -> bool {
+    if el.get("category").and_then(|v| v.as_str()) == Some("content") {
+        return true;
+    }
+    let metadata_truthy = match el.get("contentMetadata") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => false,
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Number(n)) => n.as_f64() != Some(0.0),
+        Some(_) => true,
+    };
+    metadata_truthy || element_content_role(el).is_some()
+}
+
+/// The `/sdk/elements` query filters, read once per request and applied to
+/// both transports' element lists.
+struct ElementFilters<'q> {
+    content_only: bool,
+    content_types: Option<Vec<&'q str>>,
+    include_content: bool,
+    content_role: Option<&'q str>,
+}
+
+impl<'q> ElementFilters<'q> {
+    fn from_query(query: &'q HashMap<String, String>) -> Self {
+        Self {
+            content_only: query.get("contentOnly").is_some_and(|v| v == "true"),
+            content_types: query
+                .get("contentTypes")
+                .map(|v| v.split(',').map(|s| s.trim()).collect()),
+            include_content: query.get("includeContent").is_none_or(|v| v != "false"),
+            content_role: query.get("contentRole").map(String::as_str),
+        }
+    }
+
+    fn keeps(&self, el: &serde_json::Value) -> bool {
+        let content = is_content_element(el);
+        let role = element_content_role(el);
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let in_types = |types: &[&str]| {
+            types.contains(&el_type) || role.as_deref().is_some_and(|r| types.contains(&r))
+        };
+        // contentOnly keeps content elements, plus any that match explicit contentTypes.
+        if self.content_only && !content {
+            match &self.content_types {
+                Some(types) if in_types(types) => {}
+                _ => return false,
+            }
+        }
+        if !self.include_content && content {
+            return false;
+        }
+        if let Some(types) = &self.content_types {
+            if !in_types(types) {
+                return false;
+            }
+        }
+        if let Some(wanted) = self.content_role {
+            if role.as_deref() != Some(wanted) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// GET /ui-bridge/sdk/elements — List all elements
 ///
 /// Supports optional query parameters for filtering:
 /// - `contentOnly=true` — return only content elements (exclude interactive)
-/// - `contentTypes=heading` — filter to specific element types (comma-separated)
+/// - `contentTypes=heading` — filter to elements whose type or content role is one of these (comma-separated)
 /// - `includeContent=false` — exclude content elements
 /// - `contentRole=metric` — filter to a specific content role
 ///
@@ -1365,51 +1497,10 @@ async fn handle_elements(
             let filtered: Vec<serde_json::Value> = if query.is_empty() {
                 elements
             } else {
-                let content_only = query
-                    .get("contentOnly")
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
-                let content_types: Option<Vec<&str>> = query
-                    .get("contentTypes")
-                    .map(|v| v.split(',').map(|s| s.trim()).collect());
-                let include_content = query
-                    .get("includeContent")
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-                let content_role = query.get("contentRole");
+                let filters = ElementFilters::from_query(&query);
                 elements
                     .into_iter()
-                    .filter(|el| {
-                        let category = el
-                            .get("category")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("interactive");
-                        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        let el_role = el.get("contentRole").and_then(|v| v.as_str());
-                        if content_only && category != "content" {
-                            if let Some(ref types) = content_types {
-                                if !types.contains(&el_type) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
-                            }
-                        }
-                        if !include_content && category == "content" {
-                            return false;
-                        }
-                        if let Some(ref types) = content_types {
-                            if !types.contains(&el_type) {
-                                return false;
-                            }
-                        }
-                        if let Some(role) = content_role {
-                            if el_role != Some(role.as_str()) {
-                                return false;
-                            }
-                        }
-                        true
-                    })
+                    .filter(|el| filters.keeps(el))
                     .collect()
             };
             let total = filtered.len();
@@ -1479,62 +1570,10 @@ async fn handle_elements(
             // so we fetch all elements and filter here.
             if !query.is_empty() {
                 if let Some(elements) = data.get("data").and_then(|d| d.as_array()).cloned() {
-                    let content_only = query
-                        .get("contentOnly")
-                        .map(|v| v == "true")
-                        .unwrap_or(false);
-                    let content_types: Option<Vec<&str>> = query
-                        .get("contentTypes")
-                        .map(|v| v.split(',').map(|s| s.trim()).collect());
-                    let include_content = query
-                        .get("includeContent")
-                        .map(|v| v != "false")
-                        .unwrap_or(true);
-                    let content_role = query.get("contentRole");
-
+                    let filters = ElementFilters::from_query(&query);
                     let filtered: Vec<_> = elements
                         .into_iter()
-                        .filter(|el| {
-                            let category = el
-                                .get("category")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("interactive");
-                            let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            let el_role = el.get("contentRole").and_then(|v| v.as_str());
-
-                            // contentOnly: keep only content category elements,
-                            // but also include elements matching explicit contentTypes
-                            if content_only && category != "content" {
-                                if let Some(ref types) = content_types {
-                                    if !types.contains(&el_type) {
-                                        return false;
-                                    }
-                                } else {
-                                    return false;
-                                }
-                            }
-
-                            // includeContent=false: exclude content elements
-                            if !include_content && category == "content" {
-                                return false;
-                            }
-
-                            // contentTypes: filter by element type
-                            if let Some(ref types) = content_types {
-                                if !types.contains(&el_type) {
-                                    return false;
-                                }
-                            }
-
-                            // contentRole: filter by content role
-                            if let Some(role) = content_role {
-                                if el_role != Some(role.as_str()) {
-                                    return false;
-                                }
-                            }
-
-                            true
-                        })
+                        .filter(|el| filters.keeps(el))
                         .collect();
 
                     if let Some(obj) = data.as_object_mut() {
@@ -1560,6 +1599,16 @@ async fn handle_elements(
                         .cloned()
                     {
                         data = serde_json::json!(inner);
+                    }
+                    // The query filters hold on this transport too.
+                    if !query.is_empty() {
+                        if let Some(elements) = data.as_array() {
+                            let filters = ElementFilters::from_query(&query);
+                            data = serde_json::json!(elements
+                                .iter()
+                                .filter(|el| filters.keeps(el))
+                                .collect::<Vec<_>>());
+                        }
                     }
                     let total = data.as_array().map(|a| a.len()).unwrap_or(0);
                     (
@@ -2321,7 +2370,7 @@ async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiSearch",
         body.clone(),
@@ -2339,8 +2388,14 @@ async fn handle_ai_search(
                 Json(data)
             }
         }
-        Err(_sdk_err) => {
-            // No SDK app connected — fall back to the runner's own UI via IPC
+        Err(sdk_err) => {
+            // Only "no SDK app connected" may search the runner's own UI. Any
+            // other error means an app WAS the target, and the runner's own
+            // elements would answer as a successful search of the wrong
+            // surface — indistinguishable from the app's own SearchResponse.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/search") {
+                return Json(refusal);
+            }
             debug!("SDK ai/search unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_search", payload).await {
@@ -2754,7 +2809,7 @@ async fn handle_network_request(
 
 /// GET /ui-bridge/sdk/ai/snapshot — Semantic AI snapshot
 async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getSemanticSnapshot",
         serde_json::json!({}),
@@ -2765,7 +2820,10 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/snapshot") {
+                return Json(refusal);
+            }
             debug!("SDK ai/snapshot unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
                 Ok(data) => Json(data),
@@ -2777,7 +2835,7 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
 
 /// GET /ui-bridge/sdk/ai/summary — Page summary
 async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getPageSummary",
         serde_json::json!({}),
@@ -2788,7 +2846,10 @@ async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_jso
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/summary") {
+                return Json(refusal);
+            }
             debug!("SDK ai/summary unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
                 Ok(data) => Json(data),
@@ -3708,7 +3769,7 @@ async fn handle_discover_and_cache(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<DiscoverAndCacheRequest>,
 ) -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
+    let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     let app_name = req.app_name.unwrap_or_else(|| "Unknown App".to_string());
 
     info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
@@ -5481,7 +5542,7 @@ async fn handle_ai_find(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiFind",
         body.clone(),
@@ -5492,7 +5553,10 @@ async fn handle_ai_find(
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/find") {
+                return Json(refusal);
+            }
             debug!("SDK ai/find unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_find", payload).await {
@@ -8088,49 +8152,9 @@ async fn handle_sse_event_stream(
 mod tests {
     use super::*;
 
-    #[test]
-    fn normalize_localhost_with_port() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost:3000/path"),
-            "http://127.0.0.1:3000/path"
-        );
-    }
-
-    #[test]
-    fn normalize_bare_localhost() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost"),
-            "http://127.0.0.1"
-        );
-    }
-
-    #[test]
-    fn normalize_localhost_with_trailing_slash() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost/"),
-            "http://127.0.0.1/"
-        );
-    }
-
-    #[test]
-    fn normalize_non_localhost_unchanged() {
-        let url = "http://192.168.1.10:3000/api";
-        assert_eq!(normalize_localhost_url(url), url);
-    }
-
-    #[test]
-    fn normalize_already_ip_unchanged() {
-        let url = "http://127.0.0.1:5000";
-        assert_eq!(normalize_localhost_url(url), url);
-    }
-
-    #[test]
-    fn normalize_preserves_path_and_query() {
-        assert_eq!(
-            normalize_localhost_url("http://localhost:8080/api/v1?key=val"),
-            "http://127.0.0.1:8080/api/v1?key=val"
-        );
-    }
+    // `normalize_localhost_url`'s cases moved with it to
+    // `mcp::types::canonical_loopback_url` (plan
+    // 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
 
     /// Every action name passed to `dispatch_app_request` (or the
     /// snapshot-synthesis tri-state shim `try_ws_dispatch` that still wraps
@@ -8291,6 +8315,64 @@ mod tests {
         assert_eq!(chosen, serde_json::Value::Null);
     }
 
+    /// A caller OTHER than `/apps/{id}/dispatch` sees an HTTP app's own
+    /// failure too. `dispatch_app_request_by_id` (the `?app_id=` handlers)
+    /// shares `AppDispatcher::dispatch`'s HTTP arm with `/apps/{id}/dispatch`
+    /// and with the spec validator's live-snapshot fetch. An app answering
+    /// 200 `{success:false, error}` used to come back to it as `Ok` with the
+    /// failure inside the value. It is now `Err` carrying the app's error,
+    /// for the wrapper's string and object `error` shapes alike.
+    #[tokio::test]
+    async fn by_id_dispatch_returns_an_http_apps_answered_failure_as_err() {
+        use axum::routing::post;
+        for answer in [
+            serde_json::json!({"success": false, "error": "no handler for getControlSnapshot", "code": "NO_HANDLER"}),
+            serde_json::json!({"success": false, "error": {"code": "NO_HANDLER", "message": "no handler for getControlSnapshot", "retryable": false}}),
+        ] {
+            let app = axum::Router::new().route(
+                "/dispatch",
+                post(move || {
+                    let answer = answer.clone();
+                    async move { Json(answer) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let registry = AppRegistry::new();
+            let mut discovered = sample_discovered("happ");
+            discovered.url = format!("http://127.0.0.1:{port}");
+            discovered.base_path = String::new();
+            registry
+                .upsert(discovered, None, AppTransport::Http, None, None)
+                .await;
+            let dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(
+                registry.clone(),
+                crate::mcp::command_relay::CommandRelay::new(
+                    crate::mcp::ws_relay::WsConnectionManager::new(),
+                ),
+            );
+            let got = dispatch_app_request_by_id_with(
+                &registry,
+                &dispatcher,
+                "happ",
+                "getControlSnapshot",
+                serde_json::json!({}),
+                Method::POST,
+                "/dispatch",
+                Some(serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(
+                got,
+                Err("no handler for getControlSnapshot".to_string()),
+                "the app's own failure reaches a by-id caller as Err"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Per-tab routing (Item #4) — `?tabId=` thread-through
     // ------------------------------------------------------------------
@@ -8392,6 +8474,7 @@ mod tests {
                 status: 200,
                 error: "element not found".into(),
                 code: None,
+                retryable: None,
             },
             DispatchError::InvalidJson("<html>".into()),
         ]
@@ -8453,6 +8536,7 @@ mod tests {
             status: 200,
             error: "element not found: btn-7".into(),
             code: Some("ELEMENT_NOT_FOUND".into()),
+            retryable: None,
         };
         let refusal = ipc_fallback_refusal(&err, "element action").expect("refused");
         assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
@@ -8482,6 +8566,66 @@ mod tests {
         assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
     }
 
+    /// A WebSocket wrapper's STRUCTURED failure (coord finding `fb3fb468`):
+    /// the refusal hands on the wrapper's own code and retry verdict instead
+    /// of the generic `SDK_DISPATCH_FAILED`, and is labelled app-answered.
+    /// The route is only the refusal's label. Phase 1 measured the IPC
+    /// fallback on the 30 s TIMEOUT, not on this error, and `handle_discover`
+    /// is gated only by runner#2119, not by this change.
+    #[test]
+    fn refusal_hands_on_a_websocket_wrappers_code_and_retry_verdict() {
+        let err = DispatchError::WebSocket(CommandRelayError::WrapperError(
+            crate::mcp::command_relay::WrapperFailure {
+                code: Some("NO_HANDLER".into()),
+                message: "No handler registered for action 'find'".into(),
+                retryable: Some(false),
+            },
+        ));
+        let refusal = ipc_fallback_refusal(&err, "element action")
+            .expect("a wrapper's refusal must never fall back to the runner's UI");
+        assert_eq!(refusal["success"], serde_json::json!(false));
+        assert_eq!(refusal["code"], serde_json::json!("NO_HANDLER"));
+        assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
+        assert_eq!(refusal["retryable"], serde_json::json!(false));
+        assert!(
+            refusal["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("NO_HANDLER: No handler registered for action 'find'")),
+            "{refusal}"
+        );
+        assert!(refusal["error"].as_str().is_some_and(
+            |e| e.starts_with("NO_HANDLER: element action: the connected SDK app answered")
+        ));
+
+        // A failure that did not say whether a retry helps reads UNKNOWN.
+        let unsaid = DispatchError::WebSocket(CommandRelayError::WrapperError("boom".into()));
+        let refusal = ipc_fallback_refusal(&unsaid, "element action").expect("refused");
+        assert_eq!(refusal["retryable"], serde_json::Value::Null);
+        assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+    }
+
+    /// A response frame the relay could not read is NOT the app's failure
+    /// (coord finding `fb3fb468`): the refusal labels it transport-origin,
+    /// keeps it out of the app-code slot, and reads its retryability as
+    /// unknown — `null`.
+    #[test]
+    fn an_unreadable_response_is_refused_as_transport_not_as_the_apps_failure() {
+        let err = DispatchError::WebSocket(CommandRelayError::UnreadableResponse(
+            "invalid type: string \"no\", expected a boolean".into(),
+        ));
+        let refusal = ipc_fallback_refusal(&err, "element action")
+            .expect("an app that answered must never be retried on the runner's UI");
+        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
+        assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+        assert_eq!(refusal["retryable"], serde_json::Value::Null);
+        assert!(
+            refusal["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("could not be read")),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn app_answered_renders_as_the_apps_error_string() {
         // The `Result<_, String>` call sites keep the pre-variant shape.
@@ -8490,6 +8634,7 @@ mod tests {
             status: 200,
             error: "element not found".into(),
             code: Some("X".into()),
+            retryable: None,
         };
         assert_eq!(dispatch_err_to_string(err), "element not found");
     }
@@ -8517,6 +8662,10 @@ mod tests {
             "handle_send_keys_to_page",
             "handle_find_by_text",
             "handle_navigate_by_adapter",
+            "handle_ai_search",
+            "handle_ai_find",
+            "handle_ai_snapshot",
+            "handle_ai_summary",
         ] {
             // A handler the journey ledger wraps keeps its original body in
             // `<handler>_dispatch`; the wrapper itself only records.
@@ -8559,24 +8708,22 @@ mod tests {
 
     /// Read-only handlers that KNOWINGLY keep the ungated IPC fallback: they
     /// only read (elements, snapshot, forms, routes, …), so a fallback cannot
-    /// re-execute an action on the wrong UI — at worst it answers with the
-    /// runner's own data. Gating them is a separate follow-up. A handler that
-    /// ACTS must never be added here; it must ask `ipc_fallback_refusal`.
-    const UNGATED_READ_ONLY_FALLBACKS: [&str; 16] = [
+    /// re-execute an action on the wrong UI. It can still answer with the
+    /// runner's own data as if it were the app's, which is why the four
+    /// `/ai/*` reads were gated and left this list; gating the rest is a
+    /// separate follow-up. A handler that ACTS must never be added here; it
+    /// must ask `ipc_fallback_refusal`.
+    const UNGATED_READ_ONLY_FALLBACKS: [&str; 12] = [
         "handle_elements",
         "handle_element",
         "handle_snapshot",
         "handle_discover",
         "handle_components",
         "handle_console_errors",
-        "handle_ai_search",
         "handle_forms",
         "handle_network_requests",
-        "handle_ai_snapshot",
-        "handle_ai_summary",
         "handle_undo_state",
         "handle_element_state",
-        "handle_ai_find",
         "handle_diagnostics",
         "handle_page_routes",
     ];
@@ -9314,5 +9461,135 @@ mod connect_bearer_scope_tests {
             leaked.is_empty(),
             "the operator bearer went out over plaintext http after an https -> http redirect: {leaked:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod element_filters_tests {
+    use super::{element_content_role, is_content_element, ElementFilters};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_role_is_read_from_content_metadata() {
+        let el = json!({"type": "div", "contentMetadata": {"contentRole": "metric"}});
+        assert_eq!(element_content_role(&el).as_deref(), Some("metric"));
+    }
+
+    #[test]
+    fn a_top_level_role_is_not_read() {
+        let el = json!({"type": "button", "contentRole": "badge"});
+        assert_eq!(element_content_role(&el), None);
+        assert!(!is_content_element(&el));
+    }
+
+    #[test]
+    fn the_type_implies_a_role_when_none_is_stated() {
+        assert_eq!(
+            element_content_role(&json!({"type": "H2"})).as_deref(),
+            Some("heading")
+        );
+        assert_eq!(
+            element_content_role(&json!({"type": "metric-value"})).as_deref(),
+            Some("metric")
+        );
+        assert_eq!(element_content_role(&json!({"type": "button"})), None);
+    }
+
+    #[test]
+    fn content_follows_the_sdk() {
+        assert!(is_content_element(
+            &json!({"category": "content", "type": "div"})
+        ));
+        assert!(is_content_element(
+            &json!({"type": "div", "contentMetadata": {}})
+        ));
+        assert!(is_content_element(&json!({"type": "h3"})));
+        assert!(!is_content_element(
+            &json!({"type": "button", "contentMetadata": null})
+        ));
+        assert!(!is_content_element(
+            &json!({"type": "button", "contentMetadata": ""})
+        ));
+    }
+
+    #[test]
+    fn content_types_match_a_role_as_well_as_a_type() {
+        let q = query(&[("contentTypes", "heading, badge")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(
+            filters.keeps(&json!({"type": "div", "contentMetadata": {"contentRole": "heading"}}))
+        );
+        assert!(filters.keeps(&json!({"type": "h1"})));
+        assert!(filters.keeps(&json!({"type": "badge"})));
+        assert!(!filters.keeps(&json!({"type": "button"})));
+    }
+
+    #[test]
+    fn content_role_reads_the_nested_role() {
+        let q = query(&[("contentRole", "metric")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(
+            filters.keeps(&json!({"type": "div", "contentMetadata": {"contentRole": "metric"}}))
+        );
+        assert!(
+            !filters.keeps(&json!({"type": "div", "contentMetadata": {"contentRole": "label"}}))
+        );
+    }
+
+    #[test]
+    fn content_only_keeps_content_by_any_sdk_signal() {
+        let q = query(&[("contentOnly", "true")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(filters.keeps(&json!({"type": "h2"})));
+        assert!(filters.keeps(&json!({"type": "div", "contentMetadata": {}})));
+        assert!(!filters.keeps(&json!({"type": "button"})));
+    }
+
+    #[test]
+    fn include_content_false_drops_content_by_any_sdk_signal() {
+        let q = query(&[("includeContent", "false")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(
+            !filters.keeps(&json!({"type": "div", "contentMetadata": {"contentRole": "heading"}}))
+        );
+        assert!(filters.keeps(&json!({"type": "button"})));
+    }
+
+    #[test]
+    fn content_only_also_keeps_an_explicit_type_match() {
+        let q = query(&[("contentOnly", "true"), ("contentTypes", "button")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(filters.keeps(&json!({"type": "button"})));
+        assert!(!filters.keeps(&json!({"type": "link"})));
+    }
+
+    #[test]
+    fn the_hardener_query_keeps_headings_by_any_sdk_signal() {
+        // workflow_generation/hardener: `?contentOnly=true&contentTypes=heading`.
+        let q = query(&[("contentOnly", "true"), ("contentTypes", "heading")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(filters.keeps(&json!({"type": "h1"})));
+        assert!(filters.keeps(&json!({
+            "category": "content", "type": "div",
+            "contentMetadata": {"contentRole": "heading"}
+        })));
+        assert!(!filters.keeps(&json!({"category": "content", "type": "p"})));
+        assert!(!filters.keeps(&json!({"type": "button"})));
+    }
+
+    #[test]
+    fn no_filters_keep_everything() {
+        let q = query(&[("recency", "fresh")]);
+        let filters = ElementFilters::from_query(&q);
+        assert!(filters.keeps(&json!({"type": "button"})));
+        assert!(filters.keeps(&json!({"category": "content"})));
     }
 }
