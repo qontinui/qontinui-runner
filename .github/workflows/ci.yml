@@ -1226,6 +1226,50 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1 (D4):
+      # say so when a Rust test step ran OUT OF MEMORY, so coord treats the red
+      # as CAPACITY rather than CODE. Job 122032841168 died in `Build Rust tests`
+      # with `rustc-LLVM ERROR: out of memory`; with no annotation coord read it
+      # as a compile error and sent a code fixer at a diff with nothing to fix.
+      #
+      # The matching lives in scripts/ci/oom-signature.sh (fixtures:
+      # scripts/tests/test_oom_signature.sh), which reads the two logs the Rust
+      # steps already `tee` and emits ONE `::error title=<step> OUT OF MEMORY
+      # (not a verdict on this PR)::<signature>` only on POSITIVE evidence. A
+      # `Build Rust tests` OOM — no test ran — also carries ` - killed IN THE
+      # BUILD`, which coord write-skips on main as `build_killed`; a run-phase
+      # OOM stays red and gets coord's one bounded same-commit re-run
+      # (`CiDeclaredInconclusive`). No match, or an unreadable log, prints
+      # nothing and the red stays an ordinary red.
+      #
+      # On Linux the step's own cgroup `memory.events` is passed so a `SIGKILL`
+      # counts only beside a non-zero `oom_kill` (job 111779867816's rustc was
+      # SIGKILLed by a runner shutdown, not an OOM). The MEMPEAK reading above
+      # is deliberately NOT a signature: Phase 0 measured hosted Windows
+      # pagefiles at 32767/32768 MB on jobs that failed in tests and 32551 on a
+      # green one, so saturation there is normal. `continue-on-error` and no
+      # `timeout-minutes`, like the two diagnostics above: it may never become
+      # a second way to fail the job.
+      - name: Annotate an out-of-memory Rust test step
+        if: failure() && (steps.build_rust_tests.outcome == 'failure' || steps.run_rust_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          memory_events=""
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+            memory_events="/sys/fs/cgroup${cgroup}/memory.events"
+          fi
+          if [ "${{ steps.build_rust_tests.outcome }}" = "failure" ]; then
+            bash scripts/ci/oom-signature.sh --step "Build Rust tests" --build-phase \
+              --log "$GITHUB_WORKSPACE/cargo-test-build.log" \
+              --memory-events "$memory_events"
+          else
+            bash scripts/ci/oom-signature.sh --step "Run Rust tests" \
+              --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+              --memory-events "$memory_events"
+          fi
+
       # Best-effort, non-gating: pushes this job's per-test outcomes into
       # coord.test_results so coord's already-shipped `flakiness_priors` has a
       # history to score for this repo (it has never had one — Phase 0 of the
