@@ -1269,15 +1269,34 @@ enum Want {
     Placeholder,
 }
 
-/// First candidate of kind `want` on `path_var`, skipping `own_dirs`.
+/// Name prefixes of the runner's per-PTY shim dirs. They mirror
+/// `IDENTITY_DIR_PREFIX` and `SHIM_DIR_PREFIX` in the runner's
+/// `shim_materializer`, which is in the runner bin rather than the lib, so the
+/// test `runner_shim_dir_prefixes_match_the_materializer` pins the copy.
+const RUNNER_SHIM_DIR_PREFIXES: &[&str] = &["qontinui-identity-", "qontinui-shim-"];
+
+/// Whether `dir` is a runner shim dir by NAME, such as another PTY's dir that
+/// [`own_shim_dirs`] does not list. No real tool lives in one, and two of them
+/// resolving each other would spawn without bound. Mirrors `is_shim_dir` in
+/// the bash shims and the `.cmd` scan; case-insensitive, as the `.cmd` is.
+fn is_runner_shim_dir(dir: &Path) -> bool {
+    let s = dir.to_string_lossy();
+    Path::new(s.trim_end_matches(['/', '\\']))
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|n| RUNNER_SHIM_DIR_PREFIXES.iter().any(|p| n.starts_with(p)))
+}
+
+/// First candidate of kind `want` on `path_var`, skipping `own_dirs` and every
+/// runner shim dir by name ([`is_runner_shim_dir`]).
 fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if own.contains(&normalize_dir(&dir)) {
-            continue; // skip our own dir(s) — never recurse
+        if own.contains(&normalize_dir(&dir)) || is_runner_shim_dir(&dir) {
+            continue; // skip our own dir(s) and every runner shim dir — never recurse
         }
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
@@ -1745,6 +1764,59 @@ mod tests {
             normalize_dir(&realbin),
             "must resolve the real tool OUTSIDE the shim dir"
         );
+    }
+
+    /// Two runner shim dirs on PATH that `own_dirs` does not name (another
+    /// PTY's dir, a stale SHIM_DIR_ENV): each is skipped by name, in any
+    /// spelling, or the two stubs spawn each other without bound.
+    #[test]
+    fn resolve_real_skips_every_runner_shim_dir_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let mk = |name: &str| {
+            let d = tmp.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(exe), b"\x7fELF stub").unwrap();
+            d
+        };
+        let (a, b, realbin) = (
+            mk("qontinui-identity-a"),
+            mk("QONTINUI-SHIM-b"),
+            mk("realbin"),
+        );
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let b = b.display().to_string();
+        for second in [b.clone(), format!("{b}/"), format!("{b}\\\\")] {
+            let path = format!("{}{sep}{second}{sep}{}", a.display(), realbin.display());
+            let got = resolve_real_in("claude", &[], OsStr::new(&path))
+                .unwrap_or_else(|| panic!("{second}: no real claude"));
+            assert_eq!(
+                normalize_dir(got.parent().unwrap()),
+                normalize_dir(&realbin),
+                "{second}"
+            );
+        }
+        assert!(!is_runner_shim_dir(Path::new("/opt/qontinui-runner/bin")));
+    }
+
+    #[test]
+    fn runner_shim_dir_prefixes_match_the_materializer() {
+        const SRC: &str =
+            include_str!("../install_effects_producer/intercept/shim_materializer.rs");
+        for (konst, prefix) in [
+            ("IDENTITY_DIR_PREFIX", RUNNER_SHIM_DIR_PREFIXES[0]),
+            ("SHIM_DIR_PREFIX", RUNNER_SHIM_DIR_PREFIXES[1]),
+        ] {
+            let decl = format!("pub const {konst}: &str = \"{prefix}\";");
+            assert!(
+                SRC.contains(&decl),
+                "shim_materializer no longer declares {decl}"
+            );
+        }
     }
 
     /// The 2026-10-21 shape: mid-reinstall, `claude` is present but is npm's
