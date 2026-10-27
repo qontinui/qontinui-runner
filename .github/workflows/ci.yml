@@ -438,7 +438,8 @@ jobs:
           free -h
           df -h
 
-      # 32 GB (was 16 → 24): headroom for CARGO_BUILD_JOBS=2 in the test step.
+      # 32 GB (was 16 → 24): sized as headroom for CARGO_BUILD_JOBS=2 in the test
+      # step. The test step runs JOBS=1 since 2026-10-27 (see below); the pagefile stays.
       # The May 2026 windows OOMs (runs 25612844640 / 75193978255, PR #65)
       # happened at JOBS=2 with a 16 GB pagefile — two concurrent large-crate
       # rustc codegens exhausted the 16 GB RAM + 16 GB pagefile commit limit.
@@ -865,7 +866,11 @@ jobs:
           #     measured 31-49 min over 8 green runs that day, and JOBS=1 was
           #     ~1.3x historically, so roughly 40-65 min against the 90-min
           #     step bound.
-          CARGO_BUILD_JOBS: "1"
+          #     Both arms are now '1', but the expression stays per-platform
+          #     on purpose. The legs are throttled for different reasons, and
+          #     ci_rust_test_steps_split.rs pins that each stays separately
+          #     tunable.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
