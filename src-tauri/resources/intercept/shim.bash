@@ -73,18 +73,23 @@ is_own_dir() {
 # shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
 # build prepended for an outer pane. Two such dirs on one PATH resolve each
 # other and exec back and forth forever, and no real tool ever lives in one, so
-# the scan and the PATH-strip fall-through skip them all.
+# the scan and the PATH-strip fall-through skip them all. The name test runs
+# first because it is pure string work; is_own_dir's `-ef` still runs after it,
+# since an alias of SHIM_DIR (a symlink, a junction) need not carry the prefix.
 is_shim_dir() {
-  is_own_dir "$1" && return 0
-  local base="${1%/}"
+  local base="$1"
+  while :; do
+    case "$base" in */|*\\) base="${base%?}" ;; *) break ;; esac
+  done
   base="${base##*/}"
   base="${base##*\\}"
   case "$base" in qontinui-identity-*|qontinui-shim-*) return 0 ;; esac
-  return 1
+  is_own_dir "$1"
 }
 
 # ---------------------------------------------------------------------------
-# Resolve the REAL tool: first match on PATH that is NOT inside SHIM_DIR.
+# Resolve the REAL tool: first match on PATH outside every runner shim dir
+# (is_shim_dir).
 # Mirrors pm_detect::pm_command intent (try <tool> then <tool>.cmd/.exe).
 # ---------------------------------------------------------------------------
 resolve_real() {
@@ -134,7 +139,7 @@ resolve_real_waiting() {
   if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
   local wait_secs; wait_secs="$(resolve_wait_secs)"
   [ "$wait_secs" -gt 0 ] || return 1
-  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it)\n' \
+  printf 'qontinui shim: %s not found on PATH (excluding runner shim dirs, this one being %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it)\n' \
     "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
   local deadline=$((SECONDS + wait_secs))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -147,7 +152,7 @@ resolve_real_waiting() {
 # The last-resort fall-through is about to dispatch by NAME — say plainly what
 # was searched, so a `not found` that follows is diagnosable from the pane.
 report_unresolved() {
-  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
+  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding runner shim dirs, this one being %s): %s\n' \
     "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
 }
 
@@ -185,12 +190,12 @@ exec_with_retry() {
 }
 
 # Fail-open: if we cannot even find the real tool, hand control back to the
-# shell's own PATH resolution (without our dir) as a last resort.
+# shell's own PATH resolution (without any runner shim dir) as a last resort.
 passthrough() {
   if [ -n "${REAL:-}" ]; then
     exec_with_retry exec "$REAL" "$@"
   fi
-  # No resolved real tool: strip our dir from PATH and re-dispatch by name so
+  # No resolved real tool: strip every runner shim dir from PATH and re-dispatch by name so
   # the shell finds whatever it would have without us.
   report_unresolved
   local newpath="" d

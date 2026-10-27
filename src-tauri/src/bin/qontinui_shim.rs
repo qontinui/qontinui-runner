@@ -329,6 +329,10 @@ const NON_SESSION_SUBCOMMANDS: &[&str] = &[
     "project",
 ];
 
+/// Exact flags that make an invocation non-session wherever they appear before
+/// `--`. Mirrored in `identity_shim.bash` / `identity_shim.cmd`.
+const NON_SESSION_FLAGS: &[&str] = &["--version", "-v", "--help", "-h"];
+
 /// Is this a NON-SESSION invocation (`claude --version`, `claude mcp list`)?
 /// Then the identity shim must be a pure passthrough, exactly like the
 /// recursion guard: no `--settings`, no `--mcp-config`, no `--session-id`, no
@@ -342,8 +346,9 @@ const NON_SESSION_SUBCOMMANDS: &[&str] = &[
 /// `claude Update the README` is a conversation. `-p`/`--print` is a session.
 /// A prompt that merely contains `-h` is one argv entry and does not match.
 /// Not handled: an option whose VALUE is exactly `-v`/`-h`
-/// (`--system-prompt -v`) reads as the flag; rare, and it errs toward
-/// passthrough of what Claude Code would also parse as that flag.
+/// (`--system-prompt -v`) reads as the flag. Claude Code takes `-v` there as
+/// the option's value and starts a session, so such a session goes UNPINNED
+/// (no `--session-id`, no session-open record). Rare enough to accept.
 ///
 /// SOURCE OF TRUTH for the mirrored checks in `identity_shim.bash` and
 /// `identity_shim.cmd`.
@@ -351,7 +356,7 @@ pub fn non_session_invocation(args: &[String]) -> bool {
     let flag = args
         .iter()
         .take_while(|a| a.as_str() != "--")
-        .any(|a| matches!(a.as_str(), "--version" | "-v" | "--help" | "-h"));
+        .any(|a| NON_SESSION_FLAGS.contains(&a.as_str()));
     flag || args
         .first()
         .is_some_and(|first| NON_SESSION_SUBCOMMANDS.contains(&first.as_str()))
@@ -1914,7 +1919,7 @@ mod tests {
     #[test]
     fn non_session_invocation_version_help_and_management_subcommands() {
         // Version/help flags, any position before `--`.
-        for tok in ["--version", "-v", "--help", "-h"] {
+        for tok in NON_SESSION_FLAGS {
             assert!(non_session_invocation(&strs(&[tok])), "{tok}");
             assert!(
                 non_session_invocation(&strs(&["--model", "opus", tok])),
@@ -1956,6 +1961,53 @@ mod tests {
         // After `--` everything is prompt text.
         assert!(!non_session_invocation(&strs(&["--", "--help"])));
         assert!(!non_session_invocation(&strs(&["-p", "--", "-v"])));
+    }
+
+    /// The bash and cmd shims carry their own copies of both lists; this pins
+    /// them to the Rust source of truth so a word added here cannot be missed
+    /// there.
+    #[test]
+    fn non_session_lists_match_the_bash_and_cmd_mirrors() {
+        use std::collections::BTreeSet;
+        const BASH: &str = include_str!("../../resources/intercept/identity_shim.bash");
+        const CMD: &str = include_str!("../../resources/intercept/identity_shim.cmd");
+        let subs: BTreeSet<&str> = NON_SESSION_SUBCOMMANDS.iter().copied().collect();
+        let flags: BTreeSet<&str> = NON_SESSION_FLAGS.iter().copied().collect();
+
+        let bash_subs: BTreeSet<&str> = BASH
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("mcp|"))
+            .and_then(|l| l.strip_suffix(')'))
+            .expect("bash subcommand case arm")
+            .split('|')
+            .collect();
+        let bash_flags: BTreeSet<&str> = BASH
+            .lines()
+            .find_map(|l| l.trim().strip_suffix(") non_session=1; break ;;"))
+            .expect("bash flag case arm")
+            .split('|')
+            .collect();
+        let cmd_subs: BTreeSet<&str> = CMD
+            .lines()
+            .find_map(|l| l.strip_prefix("for %%S in ("))
+            .and_then(|r| r.split_once(')'))
+            .expect("cmd subcommand for-list")
+            .0
+            .split_whitespace()
+            .collect();
+        let cmd_flags: BTreeSet<&str> = CMD
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("if \"%~1\"==\"")?
+                    .strip_suffix("\" set \"NON_SESSION=1\"")
+            })
+            .collect();
+
+        assert_eq!(bash_subs, subs, "identity_shim.bash subcommands");
+        assert_eq!(cmd_subs, subs, "identity_shim.cmd subcommands");
+        assert_eq!(bash_flags, flags, "identity_shim.bash flags");
+        assert_eq!(cmd_flags, flags, "identity_shim.cmd flags");
     }
 
     #[test]
@@ -2546,7 +2598,7 @@ mod tests {
             env::var("PATH").unwrap_or_default()
         );
         let status = Command::new(shim_dir.join("claude.exe"))
-            .args(["--append-system-prompt", multiline, "--version"])
+            .args(["--append-system-prompt", multiline, "hi"])
             .env("PATH", &path)
             .env("QONTINUI_E2E_ARGS_OUT", &args_out)
             .env("QONTINUI_PINNED_SESSION_ID", "e2e-pin-1")
@@ -2565,7 +2617,7 @@ mod tests {
             vec![
                 "--append-system-prompt",
                 multiline,
-                "--version",
+                "hi",
                 "--session-id",
                 "e2e-pin-1",
             ],

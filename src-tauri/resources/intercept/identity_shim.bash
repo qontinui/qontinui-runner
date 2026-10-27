@@ -57,16 +57,19 @@ is_own_dir() {
 # shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
 # build prepended for an outer pane. Two such dirs on one PATH resolve each
 # other and exec back and forth forever, and no real tool ever lives in one, so
-# the scan and the PATH-strip fall-through skip them all.
+# the scan and the PATH-strip fall-through skip them all. The name test runs
+# first because it is pure string work; is_own_dir's `-ef` still runs after it,
+# since an alias of SHIM_DIR (a symlink, a junction) need not carry the prefix.
 is_shim_dir() {
-  is_own_dir "$1" && return 0
-  local base="${1%/}"
+  local base="$1"
+  while :; do
+    case "$base" in */|*\\) base="${base%?}" ;; *) break ;; esac
+  done
   base="${base##*/}"
   base="${base##*\\}"
   case "$base" in qontinui-identity-*|qontinui-shim-*) return 0 ;; esac
-  return 1
+  is_own_dir "$1"
 }
-
 
 # ---------------------------------------------------------------------------
 # npm's PLACEHOLDER stub. @anthropic-ai/claude-code ships `bin/claude.exe` as a
@@ -93,7 +96,7 @@ is_npm_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# Scan PATH, skipping SHIM_DIR, for the first candidate of one kind:
+# Scan PATH, skipping every runner shim dir (is_shim_dir), for the first candidate of one kind:
 # `scan_path real` wants a tool that is NOT npm's placeholder stub,
 # `scan_path placeholder` wants the stub itself (only for the give-up message).
 # ---------------------------------------------------------------------------
@@ -121,8 +124,8 @@ scan_path() {
   return 1
 }
 
-# Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
-# and is not npm's placeholder stub.
+# Resolve the REAL provider: first match on PATH outside every runner shim
+# dir (is_shim_dir) that is not npm's placeholder stub.
 resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
@@ -151,7 +154,7 @@ resolve_real_waiting() {
   if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
   local wait_secs; wait_secs="$(resolve_wait_secs)"
   [ "$wait_secs" -gt 0 ] || return 1
-  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
+  printf 'qontinui shim: %s not found on PATH (excluding runner shim dirs, this one being %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
     "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
   local deadline=$((SECONDS + wait_secs))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -168,11 +171,11 @@ resolve_real_waiting() {
 report_unresolved() {
   local stub
   if stub="$(scan_path placeholder)"; then
-    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding %s): %s\n' \
+    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding runner shim dirs, this one being %s): %s\n' \
       "$TOOL" "$(resolve_wait_secs)" "$stub" "$SHIM_DIR" "$PATH" >&2
     return 0
   fi
-  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
+  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding runner shim dirs, this one being %s): %s\n' \
     "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
 }
 
@@ -210,7 +213,7 @@ exec_with_retry() {
 }
 
 # Run the real provider, replacing this process (we don't need an exit code
-# beyond what exec propagates). Strips our dir from PATH as a last resort when
+# beyond what exec propagates). Strips every runner shim dir from PATH as a last resort when
 # the real tool couldn't be resolved.
 exec_real() {
   if [ -n "${REAL:-}" ]; then
