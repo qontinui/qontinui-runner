@@ -56,18 +56,160 @@ struct AskQuestionPayload<'a> {
     /// The asking session's recommended answer, so the operator receives a
     /// fork WITH a recommendation rather than an open question (plan
     /// `2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen`,
-    /// Phase 3). Omitted from the wire when `None`: coord's
+    /// Phase 3). Omitted from the wire when `None`, and [`post_question`]
+    /// sends a blank one as `None`: coord's
     /// `AskQuestionRequest` is read with a plain (non-strict) `Json`
     /// extractor, so a coord without the field (every coord as of this
     /// change — the reader lands with the plan's coord Phase 3 PR) ignores the
     /// key, and one with it stores NULL for an absent one — sending `null`
     /// would say nothing more.
+    ///
+    /// That ignored key still answers 200, so the status says nothing about
+    /// whether the value was recorded: [`post_question`] reads that from the
+    /// reply's fork-shape disclosure instead ([`RecommendationRecorded`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     recommendation: Option<&'a str>,
     /// What changes if the operator overturns `recommendation`. Same
-    /// omit-when-`None` rule.
+    /// omit-when-`None` (or blank) rule, and the same read-back.
     #[serde(skip_serializing_if = "Option::is_none")]
     if_overturned: Option<&'a str>,
+}
+
+/// The `shape` a coord with the plan's Phase 3 reader serves for a pending
+/// question that carries a recommendation.
+const SHAPE_FORK: &str = "fork_with_recommendation";
+/// The `shape` it serves for one that does not: the operator is shown an open
+/// question.
+const SHAPE_OPEN: &str = "open_question";
+
+/// The `POST /agents/:agent_id/ask-question` reply: the row (only its id is
+/// read here) plus the fork-shape disclosure that the plan's coord Phase 3
+/// reader adds to a PENDING question's reply. That reader is unlanded as of
+/// this change, so every coord today sends none of the three disclosure keys.
+///
+/// With the reader, `shape` is on every pending reply, and
+/// `recommendation_recorded` + `recommendation_note` appear only when a
+/// supplied recommendation's recording is not confirmed. An auto-answered reply
+/// carries none of the three.
+///
+/// The disclosure keys are kept as raw JSON, so a malformed value reads as
+/// UNKNOWN instead of failing the decode of a question coord HAS recorded.
+#[derive(Debug, Clone, Deserialize)]
+struct AskQuestionReply {
+    question_id: Uuid,
+    /// How the operator will be shown the row: [`SHAPE_FORK`] or
+    /// [`SHAPE_OPEN`].
+    #[serde(default)]
+    shape: Option<JsonValue>,
+    /// `false` — nothing was written, so the operator sees an open question;
+    /// `true` — written, but reading it back failed. Absent when the write was
+    /// confirmed (or there was nothing to write).
+    #[serde(default)]
+    recommendation_recorded: Option<JsonValue>,
+    /// coord's reason, beside `recommendation_recorded`.
+    #[serde(default)]
+    recommendation_note: Option<JsonValue>,
+}
+
+/// Whether coord recorded the `recommendation` / `if_overturned` a question
+/// was posted with. Read from the ask reply's fork-shape disclosure, never
+/// inferred from the 200: a coord without the reader drops both fields under
+/// that same 200.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecommendationRecorded {
+    /// Neither field was supplied (each `None` or blank): nothing to record.
+    NotSupplied,
+    /// The reply says they were recorded. Either it carries a recognised
+    /// `shape` that does not contradict what was sent, and no
+    /// `recommendation_recorded`; or it says `recommendation_recorded: true`.
+    /// `note` is coord's `recommendation_note` in the second case: the write
+    /// succeeded but could not be read back.
+    Yes { note: Option<String> },
+    /// The reply says they were NOT recorded, so the operator is shown an open
+    /// question: `recommendation_recorded: false`, with `note` set to coord's
+    /// `recommendation_note`. Or a `shape` of `open_question` although a
+    /// recommendation was sent, with `note` saying so.
+    No { note: Option<String> },
+    /// The reply cannot say. Either it carries no fork-shape disclosure at all
+    /// (a coord without the reader, or an auto-answered reply), or it carries
+    /// a disclosure value this client does not recognise. Never to be read as
+    /// `Yes`.
+    Unknown { reason: String },
+}
+
+/// What [`post_question`] returns: the new question's id, and whether coord
+/// recorded the recommendation fields it was posted with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedQuestion {
+    pub question_id: Uuid,
+    pub recommendation: RecommendationRecorded,
+}
+
+/// What [`ask_via_coord`] returns: the operator's answer, plus whether the
+/// question it answers carried the recommendation. An answer to a fork and an
+/// answer to an open question are different evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredQuestion {
+    pub question_id: Uuid,
+    pub recommendation: RecommendationRecorded,
+    pub response: String,
+}
+
+/// A blank value is no value. It is sent as `None` (omitted from the wire),
+/// so it is never counted as supplied when the reply is read.
+fn non_blank(v: Option<&str>) -> Option<&str> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+/// Classify the reply's fork-shape disclosure against what was SENT (the
+/// already-[`non_blank`] values). PURE: [`post_question`] does the warning.
+fn recommendation_recorded(
+    recommendation: Option<&str>,
+    if_overturned: Option<&str>,
+    reply: &AskQuestionReply,
+) -> RecommendationRecorded {
+    if recommendation.is_none() && if_overturned.is_none() {
+        return RecommendationRecorded::NotSupplied;
+    }
+    let note = reply
+        .recommendation_note
+        .as_ref()
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    match &reply.recommendation_recorded {
+        None => {}
+        Some(JsonValue::Bool(false)) => return RecommendationRecorded::No { note },
+        Some(JsonValue::Bool(true)) => return RecommendationRecorded::Yes { note },
+        Some(other) => {
+            return RecommendationRecorded::Unknown {
+                reason: format!("the reply's recommendation_recorded is not a boolean: {other}"),
+            }
+        }
+    }
+    match &reply.shape {
+        None => RecommendationRecorded::Unknown {
+            reason: "the reply carries no fork-shape disclosure (`shape`): a coord without \
+                     the recommendation reader drops both fields under a 200, and an \
+                     auto-answered reply carries none either"
+                .to_string(),
+        },
+        Some(JsonValue::String(s)) if s == SHAPE_OPEN && recommendation.is_some() => {
+            RecommendationRecorded::No {
+                note: Some(format!(
+                    "the reply's shape is `{SHAPE_OPEN}`: the operator is shown an open \
+                     question although a recommendation was sent"
+                )),
+            }
+        }
+        // An `if_overturned` without a recommendation is an open question by
+        // definition, so `open_question` contradicts nothing there.
+        Some(JsonValue::String(s)) if s == SHAPE_FORK || s == SHAPE_OPEN => {
+            RecommendationRecorded::Yes { note: None }
+        }
+        Some(other) => RecommendationRecorded::Unknown {
+            reason: format!("the reply's shape {other} is not one this client recognises"),
+        },
+    }
 }
 
 /// Subset of the coord-returned row this client cares about. Coord
@@ -109,7 +251,10 @@ pub enum CoordQuestionError {
 // ---------------------------------------------------------------------------
 
 /// POST a question to coord's `coord.agent_questions`. Returns the new
-/// `question_id` on success.
+/// question's id, and whether coord recorded the `recommendation` /
+/// `if_overturned` it was posted with ([`PostedQuestion`]). That second half is
+/// read from the reply's fork-shape disclosure, never assumed from the 200. A
+/// `No`, an `Unknown` and an unconfirmed `Yes` are also warned here.
 ///
 /// `coord_base` is the HTTP base (no trailing slash, no `/ws` suffix) —
 /// resolve it via `profiles::connected_coord_base()` at the call site; this
@@ -130,12 +275,14 @@ pub async fn post_question(
     device_id: Option<Uuid>,
     recommendation: Option<&str>,
     if_overturned: Option<&str>,
-) -> Result<Uuid, CoordQuestionError> {
+) -> Result<PostedQuestion, CoordQuestionError> {
     let url = format!(
         "{}/agents/{}/ask-question",
         coord_base.trim_end_matches('/'),
         agent_id
     );
+    let recommendation = non_blank(recommendation);
+    let if_overturned = non_blank(if_overturned);
     let body = AskQuestionPayload {
         question,
         options,
@@ -168,14 +315,40 @@ pub async fn post_question(
                         text.chars().take(500).collect(),
                     ));
                 } else {
-                    let parsed: CoordQuestionRow = resp.json().await.map_err(|e| {
+                    let parsed: AskQuestionReply = resp.json().await.map_err(|e| {
                         CoordQuestionError::Parse(format!("decode ask-question response: {e}"))
                     })?;
+                    let question_id = parsed.question_id;
+                    let recorded = recommendation_recorded(recommendation, if_overturned, &parsed);
+                    match &recorded {
+                        RecommendationRecorded::NotSupplied
+                        | RecommendationRecorded::Yes { note: None } => {}
+                        RecommendationRecorded::Yes { note: Some(note) } => warn!(
+                            "coord_questions::post_question: question {question_id} (agent \
+                             {agent_id}): coord recorded its recommendation / if_overturned \
+                             but could not confirm the write: {note}"
+                        ),
+                        RecommendationRecorded::No { note } => warn!(
+                            "coord_questions::post_question: question {question_id} (agent \
+                             {agent_id}) is recorded WITHOUT its recommendation / \
+                             if_overturned, so the operator is shown an open question: {}",
+                            note.as_deref()
+                                .unwrap_or("coord gave no recommendation_note")
+                        ),
+                        RecommendationRecorded::Unknown { reason } => warn!(
+                            "coord_questions::post_question: question {question_id} (agent \
+                             {agent_id}): whether coord recorded its recommendation / \
+                             if_overturned is UNKNOWN: {reason}"
+                        ),
+                    }
                     debug!(
                         "coord_questions::post_question: posted question_id={} for agent_id={}",
-                        parsed.question_id, agent_id
+                        question_id, agent_id
                     );
-                    return Ok(parsed.question_id);
+                    return Ok(PostedQuestion {
+                        question_id,
+                        recommendation: recorded,
+                    });
                 }
             }
             Err(e) => {
@@ -279,7 +452,9 @@ pub async fn poll_answer(
 }
 
 /// Convenience wrapper: post + poll in one call. Returns the operator's
-/// response string. The eventual MCP tool calls this directly.
+/// response together with [`post_question`]'s verdict on the recommendation
+/// fields, so a caller can tell an answered fork from an answered open
+/// question. The eventual MCP tool calls this directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_via_coord(
     coord_base: &str,
@@ -293,8 +468,8 @@ pub async fn ask_via_coord(
     recommendation: Option<&str>,
     if_overturned: Option<&str>,
     poll_timeout: Duration,
-) -> Result<String, CoordQuestionError> {
-    let question_id = post_question(
+) -> Result<AnsweredQuestion, CoordQuestionError> {
+    let posted = post_question(
         coord_base,
         agent_id,
         plan_phase,
@@ -307,7 +482,12 @@ pub async fn ask_via_coord(
         if_overturned,
     )
     .await?;
-    poll_answer(coord_base, question_id, poll_timeout).await
+    let response = poll_answer(coord_base, posted.question_id, poll_timeout).await?;
+    Ok(AnsweredQuestion {
+        question_id: posted.question_id,
+        recommendation: posted.recommendation,
+        response,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +587,371 @@ mod tests {
         )
         .await
         .expect("post_question");
-        assert_eq!(out, qid);
+        assert_eq!(out.question_id, qid);
+        assert_eq!(out.recommendation, RecommendationRecorded::NotSupplied);
+    }
+
+    /// A fake coord whose ask reply is `reply`. Returns the base URL and every
+    /// POST body it received, so a test can see what went on the wire.
+    async fn spawn_ask_coord(
+        reply: serde_json::Value,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let app: Router = Router::new().route(
+            "/agents/{agent_id}/ask-question",
+            post(
+                move |AxumPath(_id): AxumPath<Uuid>, Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    let reply = reply.clone();
+                    async move {
+                        seen.lock().await.push(body);
+                        (StatusCode::OK, Json(reply))
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    /// Capture this thread's WARN-and-above `tracing` output until the guard
+    /// drops. A `#[tokio::test]` runtime is current-thread, so the client's
+    /// warnings are emitted here.
+    fn capture_warnings() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        #[derive(Clone)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::default());
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (tracing::subscriber::set_default(subscriber), buf.0)
+    }
+
+    /// The question id every fork-shape fixture reply carries.
+    const FORK_QID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    /// Post one question through the real POST path to a fake coord whose ask
+    /// reply is the row plus `disclosure` (the keys of coord's fork-shape
+    /// disclosure, `add_fork_shape_disclosure` in the plan's coord Phase 3 PR,
+    /// or none of them for a coord without it). Returns the verdict and the
+    /// WARN output the client logged.
+    async fn post_against_reply(
+        disclosure: serde_json::Value,
+        recommendation: Option<&str>,
+        if_overturned: Option<&str>,
+    ) -> (RecommendationRecorded, String) {
+        let _amb = crate::test_env::isolated_ambient();
+        let qid = Uuid::parse_str(FORK_QID).unwrap();
+        let mut reply = serde_json::json!({
+            "question_id": qid,
+            "response": null,
+            "responded_at": null,
+        });
+        for (k, v) in disclosure.as_object().unwrap() {
+            reply[k] = v.clone();
+        }
+        let (base, _) = spawn_ask_coord(reply).await;
+        let (guard, logs) = capture_warnings();
+        let out = post_question(
+            &base,
+            Uuid::new_v4(),
+            None,
+            "Q?",
+            &serde_json::json!(["a", "b"]),
+            None,
+            None,
+            None,
+            recommendation,
+            if_overturned,
+        )
+        .await
+        .expect("post_question");
+        drop(guard);
+        assert_eq!(out.question_id, qid);
+        let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        (out.recommendation, log)
+    }
+
+    /// The client warned with `fragment`, naming the question.
+    fn assert_warned(log: &str, fragment: &str) {
+        assert!(
+            log.contains(fragment) && log.contains(FORK_QID),
+            "expected a warning containing {fragment:?} and the question id, got: {log}"
+        );
+    }
+
+    /// The client logged no warning of its own.
+    fn assert_not_warned(log: &str) {
+        assert!(
+            !log.contains("coord_questions::post_question"),
+            "expected no warning, got: {log}"
+        );
+    }
+
+    /// A coord without the reader answers a bare 200 and drops both fields: the
+    /// reply cannot say, so the verdict is UNKNOWN and warned — never `Yes`.
+    #[tokio::test]
+    async fn recommendation_on_a_reply_without_a_disclosure_is_unknown() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({}),
+            Some("ship it"),
+            Some("the phase slips"),
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::Unknown { reason }
+                if reason.contains("no fork-shape disclosure")),
+            "{got:?}"
+        );
+        assert_warned(&log, "is UNKNOWN");
+    }
+
+    /// A confirmed write: a fork shape and no `recommendation_recorded` key.
+    #[tokio::test]
+    async fn recommendation_confirmed_as_a_fork_is_recorded() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({ "shape": "fork_with_recommendation" }),
+            Some("ship it"),
+            Some("the phase slips"),
+        )
+        .await;
+        assert_eq!(got, RecommendationRecorded::Yes { note: None });
+        assert_not_warned(&log);
+    }
+
+    /// `recommendation_recorded: false`: nothing was written, the operator is
+    /// shown an open question, and coord's note is carried and warned.
+    #[tokio::test]
+    async fn recommendation_coord_says_not_recorded_is_no() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({
+                "shape": "open_question",
+                "recommendation_recorded": false,
+                "recommendation_note": "the question is recorded, but its recommendation / \
+                    if_overturned could NOT be (the column is absent)",
+            }),
+            Some("ship it"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::No { note: Some(n) } if n.contains("could NOT be")),
+            "{got:?}"
+        );
+        assert_warned(&log, "recorded WITHOUT its recommendation");
+    }
+
+    /// `recommendation_recorded: true`: written but not read back. coord says
+    /// recorded, so `Yes` — carrying coord's note, which is warned.
+    #[tokio::test]
+    async fn recommendation_written_but_unconfirmed_is_yes_with_the_note() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({
+                "shape": "fork_with_recommendation",
+                "recommendation_recorded": true,
+                "recommendation_note": "the recommendation / if_overturned were recorded, but \
+                    the write could not be confirmed (read-back failed)",
+            }),
+            Some("ship it"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::Yes { note: Some(n) }
+                if n.contains("could not be confirmed")),
+            "{got:?}"
+        );
+        assert_warned(&log, "could not confirm the write");
+    }
+
+    /// A sent recommendation whose reply shape is `open_question` was not
+    /// recorded, whatever the reply omits: `No`, warned.
+    #[tokio::test]
+    async fn recommendation_sent_but_shown_as_an_open_question_is_no() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({ "shape": "open_question" }),
+            Some("ship it"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::No { note: Some(n) } if n.contains("open_question")),
+            "{got:?}"
+        );
+        assert_warned(&log, "recorded WITHOUT its recommendation");
+    }
+
+    /// `if_overturned` alone makes no fork, so `open_question` contradicts
+    /// nothing: recorded, not warned.
+    #[tokio::test]
+    async fn recommendation_if_overturned_alone_on_an_open_question_is_recorded() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({ "shape": "open_question" }),
+            None,
+            Some("the phase slips"),
+        )
+        .await;
+        assert_eq!(got, RecommendationRecorded::Yes { note: None });
+        assert_not_warned(&log);
+    }
+
+    /// A shape this client does not know is UNKNOWN, warned.
+    #[tokio::test]
+    async fn recommendation_with_an_unrecognised_shape_is_unknown() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({ "shape": "fork_with_two_recommendations" }),
+            Some("ship it"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::Unknown { reason }
+                if reason.contains("not one this client recognises")),
+            "{got:?}"
+        );
+        assert_warned(&log, "is UNKNOWN");
+    }
+
+    /// A non-boolean `recommendation_recorded` is UNKNOWN (and still decodes:
+    /// the question itself WAS recorded), warned.
+    #[tokio::test]
+    async fn recommendation_with_a_non_boolean_recorded_flag_is_unknown() {
+        let (got, log) = post_against_reply(
+            serde_json::json!({
+                "shape": "fork_with_recommendation",
+                "recommendation_recorded": "yes",
+            }),
+            Some("ship it"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&got, RecommendationRecorded::Unknown { reason } if reason.contains("not a boolean")),
+            "{got:?}"
+        );
+        assert_warned(&log, "is UNKNOWN");
+    }
+
+    /// Nothing sent, nothing to record: the reply's silence is not UNKNOWN.
+    #[tokio::test]
+    async fn recommendation_not_supplied_needs_no_disclosure() {
+        let (got, log) = post_against_reply(serde_json::json!({}), None, None).await;
+        assert_eq!(got, RecommendationRecorded::NotSupplied);
+        assert_not_warned(&log);
+    }
+
+    /// A blank recommendation is no recommendation: it is omitted from the
+    /// wire like `None` (so a reply with no disclosure is not UNKNOWN), and a
+    /// non-blank one is sent verbatim.
+    #[tokio::test]
+    async fn post_question_sends_a_blank_recommendation_as_none() {
+        let _amb = crate::test_env::isolated_ambient();
+        let qid = Uuid::parse_str("12121212-1212-1212-1212-121212121212").unwrap();
+        let (base, bodies) = spawn_ask_coord(serde_json::json!({
+            "question_id": qid,
+            "response": null,
+            "responded_at": null,
+        }))
+        .await;
+        let options = serde_json::json!(["a"]);
+        for (recommendation, if_overturned) in [(Some("   "), Some("")), (Some("ship it"), None)] {
+            let out = post_question(
+                &base,
+                Uuid::new_v4(),
+                None,
+                "Q?",
+                &options,
+                None,
+                None,
+                None,
+                recommendation,
+                if_overturned,
+            )
+            .await
+            .expect("post_question");
+            if recommendation == Some("   ") {
+                assert_eq!(out.recommendation, RecommendationRecorded::NotSupplied);
+            }
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        let blank = bodies[0].as_object().unwrap();
+        assert!(
+            !blank.contains_key("recommendation"),
+            "got: {:?}",
+            bodies[0]
+        );
+        assert!(!blank.contains_key("if_overturned"), "got: {:?}", bodies[0]);
+        assert_eq!(bodies[1]["recommendation"], "ship it");
+        assert!(!bodies[1].as_object().unwrap().contains_key("if_overturned"));
+    }
+
+    /// `ask_via_coord` hands back the post's recommendation verdict with the
+    /// answer, so the caller knows whether the operator answered a fork.
+    #[tokio::test]
+    async fn ask_via_coord_returns_the_recommendation_verdict_with_the_answer() {
+        let _amb = crate::test_env::isolated_ambient();
+        let qid = Uuid::parse_str("34343434-3434-3434-3434-343434343434").unwrap();
+        let post_body = Arc::new(Mutex::new(serde_json::json!({
+            "question_id": qid,
+            "response": null,
+            "responded_at": null,
+            "shape": "fork_with_recommendation",
+        })));
+        let get_bodies = Arc::new(Mutex::new(vec![serde_json::json!({
+            "question_id": qid,
+            "response": "b",
+            "responded_at": "2026-10-27T00:00:00Z",
+        })]));
+        let base = spawn_fake_coord(post_body, get_bodies, Arc::new(AtomicUsize::new(0))).await;
+
+        let answered = ask_via_coord(
+            &base,
+            Uuid::new_v4(),
+            None,
+            "Q?",
+            &serde_json::json!(["a", "b"]),
+            None,
+            None,
+            None,
+            Some("b"),
+            Some("the phase slips"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("ask_via_coord");
+        assert_eq!(
+            answered,
+            AnsweredQuestion {
+                question_id: qid,
+                recommendation: RecommendationRecorded::Yes { note: None },
+                response: "b".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
