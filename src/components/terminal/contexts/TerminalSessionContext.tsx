@@ -75,6 +75,7 @@ import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
+import { useTerminalReplacement } from "../useTerminalReplacement";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
@@ -300,6 +301,9 @@ const PageSessionScope = memo(function PageSessionScope({
     return keys;
   }, [tabs]);
   const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
+  // A pane the runner replaces (usage-limit account migration) hands its zone
+  // to its successor.
+  useTerminalReplacement(pageId, zoneLayout);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of

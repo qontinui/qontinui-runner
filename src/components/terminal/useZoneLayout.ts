@@ -183,6 +183,15 @@ export const FLOW_COLS = 3;
  */
 export const MIN_TILE_HEIGHT_PX = 300;
 
+const EMPTY_REPLACING: ReadonlySet<string> = new Set();
+
+/**
+ * Longest a replacement hold lasts when the old pane never leaves the roster
+ * (a lost close). The migration closes it right after the respawn, so this
+ * only bounds a failure.
+ */
+export const REPLACEMENT_HOLD_MS = 60_000;
+
 /**
  * Synthesize the scrolling flow-grid preset for `tabCount` live tabs: a fixed
  * {@link FLOW_COLS}-column grid with `ceil(tabCount / FLOW_COLS)` rows, one zone
@@ -235,14 +244,38 @@ export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
  *
  * Dead assignments (a tab already gone from `tabIds`, not yet dropped by the
  * reconcile effect) are ignored, so a closing tab cannot hold the grid open.
+ *
+ * `replacing` names panes a replacement is on its way for (see
+ * {@link zoneDemand}); each one and its replacement share a single slot.
  */
-export function flowGridSlotCount(tabIds: readonly string[], assignments: ZoneAssignments): number {
+export function flowGridSlotCount(
+  tabIds: readonly string[],
+  assignments: ZoneAssignments,
+  replacing: ReadonlySet<string> = EMPTY_REPLACING,
+): number {
   const live = new Set(tabIds);
   let highest = -1;
   for (const [zone, tabId] of Object.entries(assignments)) {
     if (tabId && live.has(tabId)) highest = Math.max(highest, Number(zone));
   }
-  return Math.max(tabIds.length, highest + 1);
+  return Math.max(zoneDemand(tabIds, replacing), highest + 1);
+}
+
+/**
+ * How many zones the live tabs need, counting a pane that is being replaced
+ * in place (an account migration: the replacement is spawned BEFORE the old
+ * pane closes) and its replacement as ONE. Both are listed for a moment, and
+ * counting them as two grew a full grid by a zone that the old pane's close
+ * then left empty, while the replacement landed in that new zone instead of
+ * the old pane's.
+ *
+ * Before the replacement arrives this is one under the true count. That only
+ * ever withholds a grow, never makes one, and the count is exact again the
+ * moment the old pane leaves `tabIds`.
+ */
+export function zoneDemand(tabIds: readonly string[], replacing: ReadonlySet<string>): number {
+  if (replacing.size === 0) return tabIds.length;
+  return tabIds.length - tabIds.filter((id) => replacing.has(id)).length;
 }
 
 /**
@@ -794,6 +827,47 @@ export function useZoneLayout(
     setRevealRequest((prev) => (prev && prev.seq === seq ? { ...prev, tabId: "" } : prev));
   }, []);
 
+  /**
+   * Panes a replacement is on its way for (an account migration announced it:
+   * `useTerminalReplacement`), so the moment both panes are listed does not
+   * grow the grid ({@link zoneDemand}). An entry only counts while its pane is
+   * still in `tabIds`, so it stops mattering the moment the old pane closes;
+   * it is dropped on an abandoned replacement, else after
+   * {@link REPLACEMENT_HOLD_MS}.
+   */
+  const [replacingTabIds, setReplacingTabIds] = useState<ReadonlySet<string>>(EMPTY_REPLACING);
+  const replacementTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const endReplacement = useCallback((oldId: string) => {
+    const timer = replacementTimers.current.get(oldId);
+    if (timer !== undefined) clearTimeout(timer);
+    replacementTimers.current.delete(oldId);
+    setReplacingTabIds((prev) => {
+      if (!prev.has(oldId)) return prev;
+      const next = new Set(prev);
+      next.delete(oldId);
+      return next;
+    });
+  }, []);
+  const beginReplacement = useCallback(
+    (oldId: string) => {
+      const prior = replacementTimers.current.get(oldId);
+      if (prior !== undefined) clearTimeout(prior);
+      replacementTimers.current.set(
+        oldId,
+        setTimeout(() => endReplacement(oldId), REPLACEMENT_HOLD_MS),
+      );
+      setReplacingTabIds((prev) => (prev.has(oldId) ? prev : new Set(prev).add(oldId)));
+    },
+    [endReplacement],
+  );
+  useEffect(() => {
+    const timers = replacementTimers.current;
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+
   // Zones explicitly claimed by a durable session record during restore.
   // The creation-order auto-fill below MUST NOT steal these even while the
   // record's tab hasn't landed in `tabIds` yet — otherwise a plain shell
@@ -813,7 +887,7 @@ export function useZoneLayout(
   // 9th. In flow mode that is one zone per live tab, stretched to reach the
   // highest assigned zone (`flowGridSlotCount`) so no assigned tab is ever
   // left without a zone. Presets ignore the count.
-  const layout = resolveLayout(layoutId, flowGridSlotCount(tabIds, assignments));
+  const layout = resolveLayout(layoutId, flowGridSlotCount(tabIds, assignments, replacingTabIds));
 
   // The committed state, for the handlers below that must read it outside a
   // state updater: `applyLayout`'s focus clamp (which sizes the flow-grid the
@@ -1007,11 +1081,11 @@ export function useZoneLayout(
   // After it grows, `layout.zones.length >= tabIds.length`, so the next run of
   // this effect (re-keyed by the new `layoutId`) computes `null` and is inert.
   useEffect(() => {
-    const target = computeAutoGrowLayoutId(layoutId, tabIds.length, workMode);
+    const target = computeAutoGrowLayoutId(layoutId, zoneDemand(tabIds, replacingTabIds), workMode);
     if (target) {
       applyLayout(target);
     }
-  }, [layoutId, tabIds.length, workMode, applyLayout]);
+  }, [layoutId, tabIds, replacingTabIds, workMode, applyLayout]);
 
   /**
    * Enter tmux mode: save the current grid as the snapshot to return to, pin
@@ -1484,6 +1558,8 @@ export function useZoneLayout(
     mru,
     showSpawnedTab,
     replaceTab,
+    beginReplacement,
+    endReplacement,
     reportMountedTabs,
     gridView,
     cosmeticZoneFor,

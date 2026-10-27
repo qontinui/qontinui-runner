@@ -19,6 +19,12 @@
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
 //!    session's account is exhausted. Conversation text that merely quotes a
 //!    limit message never migrates anything.
+//! 2b. **Weekly only** — classify which window ran out ([`classify_limit_window`])
+//!    and migrate only on the WEEKLY cap (the 7-day window, or a per-model
+//!    weekly cap). A 5-hour session limit is back within hours, so the session
+//!    stays on its account and waits; moving it would spend another account's
+//!    weekly capacity on a stall that resolves itself. A window neither the
+//!    probe nor the screen names is treated the same way.
 //! 3. **Pick target** — a non-exhausted, credential-valid, non-cooled account,
 //!    chosen by the selection mode's handoff strategy (`pick_migration_target`;
 //!    `AlternatingHandoff`, the default, and `WeightedRandom` are described in
@@ -37,8 +43,11 @@
 //!    (`<src>/projects/<slug>/<sid>.jsonl` → same slug under the target dir;
 //!    the source file is never touched), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
-//!    PTY pinned to the target account, on the same grid page/zone, and only
-//!    THEN close the old pane. The respawn re-keys the session's lifecycle
+//!    PTY pinned to the target account, on the same grid page/zone, carrying
+//!    the old session's name (`--name`, see [`carried_session_name`]), and only
+//!    THEN close the old pane. Between the two it emits
+//!    [`TERMINAL_REPLACED_EVENT`] so the webview puts the new pane in the old
+//!    one's zone instead of the next free one. The respawn re-keys the session's lifecycle
 //!    row onto the new PTY; the old pane's exit is answered as
 //!    `TerminalSuperseded` and closes nothing. A failed respawn leaves the
 //!    old pane in place.
@@ -89,6 +98,122 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     }
     entry.push(now_ms);
     true
+}
+
+/// Which usage window a probe-confirmed exhaustion belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitWindow {
+    /// The account's 7-day cap: days from resetting, so the session moves to
+    /// an account that can serve it.
+    Weekly,
+    /// The weekly cap scoped to the session's OWN model: the session cannot go
+    /// on for days, so it moves — but the account still serves every other
+    /// model, so it is not cooled for the week.
+    ModelWeekly,
+    /// The 5-hour session window: back within hours, so the session stays.
+    Session,
+    /// Neither the probe nor the screen says which window ran out.
+    Unknown,
+}
+
+/// Whether a per-model weekly cap named `cap_model` (the usage endpoint's
+/// display name, e.g. `Opus`) covers the session's model id (e.g.
+/// `claude-opus-5-5`): the cap's family word appears in the id.
+fn model_cap_covers(cap_model: &str, session_model: &str) -> bool {
+    cap_model
+        .split_whitespace()
+        .next()
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|family| {
+            !family.is_empty() && session_model.to_ascii_lowercase().contains(&family)
+        })
+}
+
+/// Classify a probe-confirmed exhaustion of the account `info` describes, for
+/// a session running `session_model` (`None` when its transcript names none).
+///
+/// The probe decides when its window numbers were read
+/// ([`crate::commands::ai_settings::probe_read_window_numbers`] — a header
+/// probe refused with a 429 still carries them; a transport failure carries
+/// none). In order:
+///
+/// 1. the 7-day `utilization` at/over the exhaustion threshold, or the header
+///    probe's `status` rejecting (that header IS the 7-day status; the OAuth
+///    path's `status` is any-limit severity and names no window) → `Weekly`;
+/// 2. a full per-model weekly cap covering the session's model →
+///    `ModelWeekly`. A cap on some OTHER model says nothing about this
+///    session, and an unknown session model matches no cap;
+/// 3. a full 5-hour window → `Session`. It comes after the weekly arms: both
+///    can be exhausted at once, and then the weekly one strands the session.
+///
+/// Otherwise the screen message decides by the window it names — a weekly
+/// banner beside a READ 7-day window that is not full being the per-model
+/// one — else `Unknown`.
+pub(crate) fn classify_limit_window(
+    info: Option<&crate::commands::ai_settings::AccountUsageInfo>,
+    session_model: Option<&str>,
+    matched_pattern: &str,
+) -> LimitWindow {
+    use crate::commands::ai_settings::{probe_read_window_numbers, EXHAUSTION_UTILIZATION as FULL};
+    let numbers = info.filter(|i| probe_read_window_numbers(i));
+    if let Some(info) = numbers {
+        let weekly_full = info.utilization >= FULL
+            || (info.source.as_deref() == Some("probe")
+                && info.status.as_deref().is_some_and(|s| {
+                    let s = s.to_ascii_lowercase();
+                    s.contains("reject") || s.contains("exceed")
+                }));
+        if weekly_full {
+            return LimitWindow::Weekly;
+        }
+        if let Some(model) = session_model {
+            if info
+                .model_limits
+                .iter()
+                .any(|m| m.utilization >= FULL && model_cap_covers(&m.model, model))
+            {
+                return LimitWindow::ModelWeekly;
+            }
+        }
+        if info.session_utilization.is_some_and(|u| u >= FULL) {
+            return LimitWindow::Session;
+        }
+    }
+    match matched_pattern {
+        // The probe READ the 7-day window and it is not full, so a weekly
+        // banner can only be a per-model one ("Opus weekly limit reached")
+        // whose model the session's transcript did not name.
+        "weekly limit reached" if numbers.is_some() => LimitWindow::ModelWeekly,
+        "weekly limit reached" => LimitWindow::Weekly,
+        "5-hour limit reached" | "session limit reached" => LimitWindow::Session,
+        _ => LimitWindow::Unknown,
+    }
+}
+
+/// How long to keep spawn-time selection off an account whose `window` ran
+/// out: until that window's reset when the probe reported one (a weekly reset
+/// clamped to [5 min, 7 days], a session reset to [5 min, 6 h]), else the
+/// blanket [`EXHAUSTED_ACCOUNT_COOLDOWN`]. A per-model cap gets the blanket
+/// cooldown: the account still serves every other model, so a week off the
+/// roster would waste it. `now` is unix seconds.
+fn limit_cooldown(
+    info: Option<&crate::commands::ai_settings::AccountUsageInfo>,
+    window: LimitWindow,
+    now: i64,
+) -> std::time::Duration {
+    let (reset, max_secs) = match window {
+        LimitWindow::Weekly => (info.and_then(|i| i.resets_at), 7 * 24 * 3600),
+        LimitWindow::ModelWeekly => return EXHAUSTED_ACCOUNT_COOLDOWN,
+        LimitWindow::Session | LimitWindow::Unknown => {
+            (info.and_then(|i| i.session_resets_at), 6 * 3600)
+        }
+    };
+    reset
+        .and_then(|reset_ts| {
+            let secs = (reset_ts as i64) - now;
+            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, max_secs)))
+        })
+        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN)
 }
 
 /// Outcome payload emitted on `session-account-migrated`.
@@ -173,23 +298,56 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     }
 
+    let src_usage = usage.iter().find(|i| i.config_dir == src);
+    // The model the session is running, so a per-model weekly cap counts only
+    // when it is THIS session's model that is capped.
+    let session_model = record.working_dir.as_deref().and_then(|wd| {
+        transcript_last_model(&super::transcript::session_transcript_path(
+            Path::new(&src),
+            wd,
+            &record.claude_session_id,
+        ))
+    });
+    let window = classify_limit_window(src_usage, session_model.as_deref(), matched_pattern);
+
     // Keep spawn-time selection off the dead account, and repoint the global
-    // resolved dir so unrelated new sessions stop landing on it. When the
-    // usage stats carry the 5-hour window's actual reset time, cool down
-    // until then (clamped) instead of the blanket hour — the account comes
-    // back into rotation the moment its session window rolls over.
-    let cooldown = usage
-        .iter()
-        .find(|i| i.config_dir == src)
-        .and_then(|i| i.session_resets_at)
-        .and_then(|reset_ts| {
-            let now = chrono::Utc::now().timestamp();
-            let secs = (reset_ts as i64) - now;
-            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
-        })
-        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN);
+    // resolved dir so unrelated new sessions stop landing on it — for either
+    // window: a NEW session has no reason to start on an account that cannot
+    // serve it right now. Cool down until the exhausted window's actual reset
+    // (clamped) instead of the blanket hour, so the account comes back into
+    // rotation the moment that window rolls over.
+    let cooldown = limit_cooldown(src_usage, window, chrono::Utc::now().timestamp());
     crate::ai_provider::mark_account_rate_limited_with_duration(&src, cooldown);
     crate::ai_provider::pick_best_account();
+
+    // Only a WEEKLY limit moves the session. A 5-hour session limit clears by
+    // itself within hours, so the session waits on its own account.
+    match window {
+        LimitWindow::Weekly | LimitWindow::ModelWeekly => {}
+        LimitWindow::Session => {
+            // The intended outcome, not a failure: no operator toast. The
+            // CLI's own banner already says when the window resets.
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                account = %src,
+                matched_pattern,
+                "5-hour session limit — leaving the session on its account until the window resets"
+            );
+            return;
+        }
+        LimitWindow::Unknown => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                account = %src,
+                matched_pattern,
+                "usage limit confirmed but neither the probe nor the screen names the window — not migrating"
+            );
+            emit_skipped(&app, &record, &src, "limit-window-unknown");
+            return;
+        }
+    }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !migration_cap_permits(&record.claude_session_id, now_ms) {
@@ -514,6 +672,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// the session actually launched under).
     pub config_dir: &'a str,
     pub title: String,
+    /// The session's display name, handed to the resumed CLI as `--name` and
+    /// to the webview as the tab's spawn name. Claude Code's live registry
+    /// names each PROCESS (one session id can carry several `<dir>-<2hex>`
+    /// auto-names, `crate::session::claude_session_registry`), so a resumed
+    /// process is not guaranteed the name its predecessor showed; a caller that
+    /// knows that name passes it here. `None` = no `--name`.
+    pub name: Option<String>,
     pub page_id: String,
     pub zone_index: i32,
     /// Work unit the resumed session belongs to, carried onto the new coord
@@ -581,6 +746,7 @@ pub(crate) fn spawn_resumed_pane(
         &crate::agent_runtime::resolve_claude_bin(),
         spec.claude_session_id,
         model,
+        spec.name.clone(),
         &launch_cfg,
         // The hook carrier, spelled out because this respawn execs the
         // resolved `resolve_claude_bin()` DIRECTLY — the identity shim,
@@ -605,8 +771,9 @@ pub(crate) fn spawn_resumed_pane(
         config_dir: Some(spec.config_dir.to_string()),
         working_dir: spec.working_dir.to_string(),
         title: spec.title.clone(),
-        // `--resume` does not re-pass `--name`; the name persists via the transcript.
-        spawn_name: None,
+        // The same name the argv carries as `--name`, so the tab shows it from
+        // the first frame rather than after the next registry poll.
+        spawn_name: spec.name.clone(),
         page_id: Some(spec.page_id.clone()),
         // `--resume <id>` names the exact session id → synchronous pinned
         // record (same row, new terminal/account/zone) + verification arm.
@@ -682,6 +849,7 @@ fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
     model: Option<String>,
+    name: Option<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
     extra_required: Vec<String>,
 ) -> Vec<String> {
@@ -690,6 +858,7 @@ fn resume_respawn_argv(
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             resume_id: Some(claude_session_id.to_string()),
             model,
+            name,
             extra_required,
             ..Default::default()
         },
@@ -795,6 +964,25 @@ pub fn migrate_session(
         ));
     }
 
+    // 1c. The name the session runs under, read while its old process is still
+    // alive (its registry file disappears with it), so the resumed session
+    // keeps it instead of coming back under a freshly derived name.
+    let name = carried_session_name(
+        crate::session::claude_session_registry::find_live_session_by_id(
+            &[std::path::PathBuf::from(src_config_dir)],
+            &record.claude_session_id,
+        )
+        .map(|live| (live.name, live.name_source)),
+        terminal_manager
+            .get(&record.terminal_id)
+            .and_then(|s| s.spawn_name()),
+    );
+
+    // 1d. Tell the webview a replacement for this pane is coming, so the
+    // moment the new pane and the old one are both listed does not read as
+    // one tab too many and grow the grid.
+    emit_terminal_replacement(app, &record.page_id, &record.terminal_id, None);
+
     // 2. Lift any gate-continuation registration off the old terminal
     // BEFORE the respawn: the new PTY is spawned with the carried gate identity
     // and the registration is re-pinned onto it on success. On failure it goes
@@ -873,6 +1061,7 @@ pub fn migrate_session(
             ),
             config_dir: dst_config_dir,
             title: title.clone(),
+            name,
             page_id: record.page_id.clone(),
             zone_index: record.zone_index,
             // The migration keeps the coord row it already had — it claims no
@@ -934,6 +1123,8 @@ pub fn migrate_session(
                     reservation,
                 );
             }
+            // No replacement is coming: the old pane keeps its place.
+            emit_terminal_replacement(app, &record.page_id, &record.terminal_id, Some(""));
             return Err(e);
         }
     };
@@ -946,6 +1137,16 @@ pub fn migrate_session(
     // `Closed`, and the workdir nonce the resumed pane still uses is kept.
     // There is no close-reason to record because the row is never closed —
     // which is also what keeps boot-restore from ever offering the old pane.
+    // The new pane takes the old one's place in the grid — its zone, or the
+    // shown slot in tmux mode — BEFORE the old one closes, so the zone is never
+    // empty and the replacement does not land in the next free one.
+    emit_terminal_replacement(
+        app,
+        &record.page_id,
+        &record.terminal_id,
+        Some(&new_terminal_id),
+    );
+
     store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
     if let Err(e) = terminal_manager.close(&record.terminal_id) {
         // Old pane was already gone (user closed it after exhaustion) — not
@@ -990,6 +1191,56 @@ pub fn migrate_session(
         warn!(error = %e, "failed to emit session-account-migrated");
     }
     Ok(outcome)
+}
+
+/// Emitted when a migration replaces one pane with another:
+/// `{ pageId, oldTerminalId, newTerminalId }`. Sent twice per migration —
+/// before the respawn with `newTerminalId: null` (a replacement is coming),
+/// then once it is settled with the new id, or with `""` when the respawn
+/// failed and the old pane stays. Consumed by `useTerminalReplacement`.
+pub const TERMINAL_REPLACED_EVENT: &str = "terminal-replaced";
+
+/// Emit [`TERMINAL_REPLACED_EVENT`]. `new_terminal_id` is `None` for the
+/// announcement, `Some("")` for an abandoned replacement.
+fn emit_terminal_replacement(
+    app: &tauri::AppHandle,
+    page_id: &str,
+    old_terminal_id: &str,
+    new_terminal_id: Option<&str>,
+) {
+    if let Err(e) = app.emit(
+        TERMINAL_REPLACED_EVENT,
+        json!({
+            "pageId": page_id,
+            "oldTerminalId": old_terminal_id,
+            "newTerminalId": new_terminal_id,
+        }),
+    ) {
+        warn!(error = %e, "failed to emit {TERMINAL_REPLACED_EVENT}");
+    }
+}
+
+/// The name a migrated session should keep, sanitised for `claude --name`.
+///
+/// `live` is the old process's registry row (`name`, `nameSource`) — the
+/// string the operator sees on the window. An operator-chosen name (a
+/// `/rename`, or a launch-time `--name`) wins; then the name the runner spawned
+/// the pane with; then even a `nameSource: "derived"` auto-name, because that
+/// is still what the window showed. `None` when none of them leaves anything.
+fn carried_session_name(
+    live: Option<(String, Option<String>)>,
+    spawn_name: Option<String>,
+) -> Option<String> {
+    use crate::claude_session::launch_spec::sanitize_session_name;
+    let (operator, derived) = match live {
+        Some((name, source)) if source.as_deref() == Some("derived") => (None, Some(name)),
+        Some((name, _)) => (Some(name), None),
+        None => (None, None),
+    };
+    [operator, spawn_name, derived]
+        .into_iter()
+        .flatten()
+        .find_map(|n| sanitize_session_name(&n))
 }
 
 fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &str, reason: &str) {
@@ -1182,6 +1433,7 @@ mod tests {
             bin,
             "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
             Some("claude-opus-5".to_string()),
+            None,
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             vec!["--settings".to_string(), "hooks.json".to_string()],
         );
@@ -1374,5 +1626,261 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("source transcript missing"), "got: {err}");
+    }
+
+    // ---- weekly-only migration ----------------------------------------------
+
+    use crate::commands::ai_settings::{AccountUsageInfo, ModelLimitInfo};
+
+    fn oauth(weekly: f64, session: Option<f64>) -> AccountUsageInfo {
+        AccountUsageInfo {
+            config_dir: "/acct/a".to_string(),
+            utilization: weekly,
+            session_utilization: session,
+            source: Some("oauth_usage".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_full_session_window_with_weekly_room_is_a_session_limit() {
+        let info = oauth(0.40, Some(1.0));
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "5-hour limit reached"),
+            LimitWindow::Session
+        );
+        // The probe outranks a generic screen phrase.
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "usage limit reached"),
+            LimitWindow::Session
+        );
+    }
+
+    #[test]
+    fn a_full_week_is_weekly_even_when_the_session_window_is_full_too() {
+        let info = oauth(1.0, Some(1.0));
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "5-hour limit reached"),
+            LimitWindow::Weekly
+        );
+    }
+
+    fn with_cap(mut info: AccountUsageInfo, model: &str) -> AccountUsageInfo {
+        info.model_limits = vec![ModelLimitInfo {
+            model: model.to_string(),
+            utilization: 1.0,
+            resets_at: None,
+        }];
+        info
+    }
+
+    #[test]
+    fn a_full_weekly_cap_on_the_sessions_own_model_is_model_weekly() {
+        let info = with_cap(oauth(0.30, Some(0.10)), "Opus");
+        assert_eq!(
+            classify_limit_window(Some(&info), Some("claude-opus-5-5"), "limit reached"),
+            LimitWindow::ModelWeekly
+        );
+    }
+
+    #[test]
+    fn a_full_cap_on_another_model_does_not_make_a_5_hour_limit_weekly() {
+        // The Fable-only cap ran out earlier in the week; this Opus session has
+        // just filled its 5-hour window.
+        let info = with_cap(oauth(0.40, Some(1.0)), "Fable");
+        assert_eq!(
+            classify_limit_window(Some(&info), Some("claude-opus-5-5"), "5-hour limit reached"),
+            LimitWindow::Session
+        );
+        // An unknown session model matches no cap.
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "5-hour limit reached"),
+            LimitWindow::Session
+        );
+    }
+
+    #[test]
+    fn a_weekly_banner_beside_a_week_that_is_not_full_is_the_per_model_cap() {
+        // The transcript named no model, so the cap could not be matched; the
+        // probe still proves the 7-day window has room.
+        let info = with_cap(oauth(0.40, Some(0.20)), "Opus");
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "weekly limit reached"),
+            LimitWindow::ModelWeekly
+        );
+    }
+
+    #[test]
+    fn a_header_probe_refused_at_the_weekly_cap_keeps_its_numbers() {
+        // The shape the real probe produces when the week is spent: a 429 with
+        // the 7-day headers attached.
+        let refused = AccountUsageInfo {
+            utilization: 1.0,
+            status: Some("rejected".to_string()),
+            error: Some("API error (429): rate_limit_error".to_string()),
+            source: Some("probe".to_string()),
+            session_utilization: Some(0.20),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_limit_window(Some(&refused), None, "usage limit reached"),
+            LimitWindow::Weekly
+        );
+        // The same refusal with the week fine and the 5-hour window full.
+        let session_refused = AccountUsageInfo {
+            utilization: 0.30,
+            status: Some("allowed".to_string()),
+            session_utilization: Some(1.0),
+            ..refused
+        };
+        assert_eq!(
+            classify_limit_window(Some(&session_refused), None, "usage limit reached"),
+            LimitWindow::Session
+        );
+    }
+
+    #[test]
+    fn a_rejected_7d_header_status_is_weekly_but_oauth_severity_is_not() {
+        let mut info = oauth(0.50, None);
+        info.source = Some("probe".to_string());
+        info.status = Some("rejected".to_string());
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "usage limit reached"),
+            LimitWindow::Weekly
+        );
+        // The OAuth path's `blocked` is any-limit severity: no window named.
+        info.source = Some("oauth_usage".to_string());
+        info.status = Some("blocked".to_string());
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "usage limit reached"),
+            LimitWindow::Unknown
+        );
+    }
+
+    #[test]
+    fn a_probe_with_no_numbers_falls_back_to_the_screen_message() {
+        // A transport failure forces `utilization` to 1.0; that is not a week.
+        let info = AccountUsageInfo {
+            utilization: 1.0,
+            error: Some("Network error: refused".to_string()),
+            source: Some("probe".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "usage limit reached"),
+            LimitWindow::Unknown
+        );
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "weekly limit reached"),
+            LimitWindow::Weekly
+        );
+        assert_eq!(
+            classify_limit_window(Some(&info), None, "session limit reached"),
+            LimitWindow::Session
+        );
+        assert_eq!(
+            classify_limit_window(None, None, "weekly limit reached"),
+            LimitWindow::Weekly
+        );
+    }
+
+    #[test]
+    fn a_model_cap_covers_its_family_only() {
+        assert!(model_cap_covers("Opus", "claude-opus-5-5"));
+        assert!(model_cap_covers("Fable 5", "claude-fable-5-1"));
+        assert!(!model_cap_covers("Fable", "claude-opus-5-5"));
+        assert!(!model_cap_covers("", "claude-opus-5-5"));
+    }
+
+    #[test]
+    fn cooldown_runs_to_the_reset_of_the_window_that_ran_out() {
+        let now = 1_000_000;
+        let info = AccountUsageInfo {
+            resets_at: Some((now + 3 * 24 * 3600) as u64),
+            session_resets_at: Some((now + 2 * 3600) as u64),
+            ..Default::default()
+        };
+        assert_eq!(
+            limit_cooldown(Some(&info), LimitWindow::Weekly, now),
+            std::time::Duration::from_secs(3 * 24 * 3600)
+        );
+        assert_eq!(
+            limit_cooldown(Some(&info), LimitWindow::Session, now),
+            std::time::Duration::from_secs(2 * 3600)
+        );
+        // A per-model cap leaves the account serving other models.
+        assert_eq!(
+            limit_cooldown(Some(&info), LimitWindow::ModelWeekly, now),
+            EXHAUSTED_ACCOUNT_COOLDOWN
+        );
+        // A reset already past, or none reported, is the blanket cooldown.
+        assert_eq!(
+            limit_cooldown(None, LimitWindow::Weekly, now),
+            EXHAUSTED_ACCOUNT_COOLDOWN
+        );
+        let past = AccountUsageInfo {
+            resets_at: Some((now - 10) as u64),
+            ..Default::default()
+        };
+        assert_eq!(
+            limit_cooldown(Some(&past), LimitWindow::Weekly, now),
+            EXHAUSTED_ACCOUNT_COOLDOWN
+        );
+    }
+
+    // ---- carried session name -------------------------------------------------
+
+    #[test]
+    fn an_operator_name_outranks_the_spawn_name_which_outranks_a_derived_one() {
+        let renamed = Some(("coord-1151 fix".to_string(), None));
+        assert_eq!(
+            carried_session_name(renamed, Some("spawned".to_string())).as_deref(),
+            Some("coord-1151 fix")
+        );
+        let derived = Some(("qontinui-root-ec".to_string(), Some("derived".to_string())));
+        assert_eq!(
+            carried_session_name(derived.clone(), Some("spawned".to_string())).as_deref(),
+            Some("spawned")
+        );
+        // A derived name is still what the window showed: carried when alone.
+        assert_eq!(
+            carried_session_name(derived, None).as_deref(),
+            Some("qontinui-root-ec")
+        );
+        assert_eq!(carried_session_name(None, None), None);
+    }
+
+    #[test]
+    fn a_carried_name_is_sanitised_and_an_empty_one_falls_through() {
+        assert_eq!(
+            carried_session_name(Some(("   ".to_string(), None)), Some("--x  y".to_string()))
+                .as_deref(),
+            Some("x y")
+        );
+    }
+
+    #[test]
+    fn resume_respawn_argv_carries_the_name() {
+        let argv = resume_respawn_argv(
+            "/usr/local/bin/claude",
+            "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
+            None,
+            Some("coord-1151 fix".to_string()),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            Vec::new(),
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--name", "coord-1151 fix"]),
+            "{argv:?}"
+        );
+        let unnamed = resume_respawn_argv(
+            "/usr/local/bin/claude",
+            "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
+            None,
+            None,
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            Vec::new(),
+        );
+        assert!(!unnamed.iter().any(|a| a == "--name"), "{unnamed:?}");
     }
 }
