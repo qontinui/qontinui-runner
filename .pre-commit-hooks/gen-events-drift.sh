@@ -107,7 +107,20 @@ set -euo pipefail
 STRICT="${QONTINUI_GEN_EVENTS_DRIFT_STRICT:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNNER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The repo root is NOT "$SCRIPT_DIR/..": the commit-sourced pre-push shim
+# (qontinui-claude-config install-repo-git-hooks.sh, shim v2) may run this hook
+# from a copy of .pre-commit-hooks/ extracted into a private temp dir, whose
+# parent is not the checkout - so a root derived from our own location would look
+# for ../qontinui-schemas in the temp dir and report CANNOT EVALUATE, checking
+# nothing. Order: the root the shim exports; the git checkout this script sits in
+# (in place, or run by path from a test); the checkout we were invoked from (the
+# shim and pre-commit both run hooks with cwd at the repo top level); and only
+# then our own parent directory.
+RUNNER_DIR="${QONTINUI_HOOK_REPO_ROOT:-}"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$SCRIPT_DIR/.."
+RUNNER_DIR="$(cd "$RUNNER_DIR" && pwd)"
 
 # `cd`-and-`pwd` only works on a path that exists; resolve defensively so a
 # missing sibling produces our own message rather than a bash error.
