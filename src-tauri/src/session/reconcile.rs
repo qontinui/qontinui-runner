@@ -90,8 +90,8 @@ use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_session_registry::RawRegistry;
 use crate::session::duplicate_hosts::HandoffExclusions;
 use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
-    ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
+    SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
+    ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -403,42 +403,19 @@ fn bind_record(
     confirmed: bool,
     zone_index: i32,
 ) -> TerminalSessionRecord {
-    TerminalSessionRecord {
-        claude_session_id: session_id.to_string(),
-        config_dir: Some(config_dir.to_string()),
-        working_dir: Some(pty.working_dir.clone()),
-        page_id: pty.page_id.clone(),
-        zone_index,
-        title: Some(pty.title.clone()),
-        terminal_id: pty.terminal_id.clone(),
-        opened_at: 0,
-        last_seen_at: 0,
-        state: "open".to_string(),
-        closed_at: None,
-        close_reason: None,
-        provider: DEFAULT_PROVIDER.to_string(),
-        origin: Some(origin.to_string()),
-        restore_pending_at: None,
-        awaiting_account_since: None,
-        confirmed_at: confirmed.then(|| chrono::Utc::now().timestamp_millis()),
-        handle: None,
-        account_label: None,
-        account_wrapper: None,
-        session_name: None,
-        name_source: None,
-        tenant_id: None,
-        task_run_id: None,
-        bypass_permissions: None,
-        restored_from_boot_at: None,
-        restore_tier: None,
-        finished_at: None,
-        wind_down_outcome: None,
-        wind_down_at: None,
-        finish_reason: None,
-        finish_synced: false,
-        spawn_device_default: None,
-        adopted_from: None,
-    }
+    TerminalSessionRecord::bound_to_pane(
+        session_id,
+        config_dir,
+        origin,
+        confirmed.then(|| chrono::Utc::now().timestamp_millis()),
+        crate::session::session_lifecycle_store::PaneBinding {
+            terminal_id: pty.terminal_id.clone(),
+            working_dir: Some(pty.working_dir.clone()),
+            page_id: pty.page_id.clone(),
+            zone_index,
+            title: Some(pty.title.clone()),
+        },
+    )
 }
 
 /// Lazily-evaluated transcript discovery for a `(working_dir)` — finds the
@@ -744,32 +721,13 @@ impl TranscriptIndex for DiskTranscriptIndex {
     }
 
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
-        !self
-            .transcript_config_dirs(session_id, working_dir)
-            .is_empty()
-    }
-}
-
-impl DiskTranscriptIndex {
-    /// Every config dir whose transcript for `session_id` exists. Empty for a
-    /// missing `working_dir` — the same bare answer `transcript_exists` gives,
-    /// which the store's guarded entry points map to UNKNOWN.
-    pub fn transcript_config_dirs(
-        &self,
-        session_id: &str,
-        working_dir: Option<&str>,
-    ) -> Vec<PathBuf> {
         let Some(working_dir) = working_dir else {
-            return Vec::new();
+            return false;
         };
-        self.config_dirs
-            .iter()
-            .filter(|dir| {
-                crate::terminal::transcript::session_transcript_path(dir, working_dir, session_id)
-                    .exists()
-            })
-            .cloned()
-            .collect()
+        self.config_dirs.iter().any(|dir| {
+            crate::terminal::transcript::session_transcript_path(dir, working_dir, session_id)
+                .exists()
+        })
     }
 }
 
@@ -966,18 +924,6 @@ impl TranscriptIndex for PrescannedTranscriptIndex {
 impl crate::session::snapshot_history::TranscriptProbe for DiskTranscriptIndex {
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
         TranscriptIndex::transcript_exists(self, session_id, working_dir)
-    }
-
-    fn transcript_config_dirs(
-        &self,
-        session_id: &str,
-        working_dir: Option<&str>,
-    ) -> Option<Vec<PathBuf>> {
-        Some(DiskTranscriptIndex::transcript_config_dirs(
-            self,
-            session_id,
-            working_dir,
-        ))
     }
 }
 
@@ -1469,10 +1415,8 @@ pub async fn run_at_boot(
     // pass is spawned with a delay and can run AFTER the frontend's on-mount
     // restore read, so the read itself is made collision-immune independently by
     // the one-live-session-per-terminal dedupe inside
-    // `SessionLifecycleStore::restorable_records` (both rank the same contenders
-    // — open rows bound to a terminal — by `open_authority_key`, so they agree on
-    // which row to keep; a row held for an account choice is unbound, so it is a
-    // contender in neither). Idempotent — a healthy registry closes
+    // `SessionLifecycleStore::restorable_records` (both use `open_authority_key`,
+    // so they agree on which row to keep). Idempotent — a healthy registry closes
     // nothing. Runs before the nothing-to-do fast path so a registry that holds
     // ONLY stale collided rows (no live PTYs) is still repaired.
     let repaired = store.repair_terminal_id_collisions();
@@ -1584,6 +1528,7 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
     use tempfile::tempdir;
 
     // ── Item 3b: the transcript walk must not run on a tokio worker ──────
@@ -1841,7 +1786,6 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
-            awaiting_account_since: None,
             confirmed_at: Some(1),
             handle: None,
             account_label: None,
@@ -2299,7 +2243,6 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
-            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -2468,7 +2411,6 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
-            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -2557,7 +2499,6 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
-            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,

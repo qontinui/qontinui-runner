@@ -399,39 +399,57 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // pane — a fork. The provider's own `sessions/<pid>.json` decides, and an
     // unresolved or elsewhere-held identity does not migrate. The source
     // account is the registry row's, not the record's.
-    let (record, src, old_writer) =
-        match resolve_migration_subject(&app, &store, &record, MigrationTrigger::UsageLimitHint)
-            .await
-        {
-            Ok(subject) => (subject.record, subject.src_config_dir, subject.old_writer),
-            Err(reason) => {
-                // The record's account, else the runner's resolved one — as
-                // the `ProceedOnRecord` path resolves it — never "" while one
-                // is known.
-                let src = record
-                    .config_dir
-                    .clone()
-                    .or_else(crate::ai_provider::get_resolved_config_dir)
-                    .unwrap_or_default();
-                emit_skipped(&app, &record, &src, &reason);
-                return;
-            }
-        };
+    let subject =
+        resolve_migration_subject(&app, &store, &record, MigrationTrigger::UsageLimitHint).await;
+    // The account the probe below checks: the registry row's on success; on a
+    // refusal the record's, else the runner's resolved one (as the
+    // `ProceedOnRecord` path resolves it), never "" while one is known.
+    let probe_src = match &subject {
+        Ok(subject) => subject.src_config_dir.clone(),
+        Err(_) => record
+            .config_dir
+            .clone()
+            .or_else(crate::ai_provider::get_resolved_config_dir)
+            .unwrap_or_default(),
+    };
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
-    // quote one; a resume repaint can re-render a historical one). Re-probe
-    // and require the account to actually be exhausted before acting.
+    // quote one; a resume repaint can re-render a historical one, including a
+    // migration-respawned pane's replayed banner once its suppression lifts).
+    // Re-probe and require the account to actually be exhausted before acting,
+    // and before REPORTING anything, an identity refusal included.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if !crate::ai_provider::account_known_exhausted(&src) {
+    let exhausted = crate::ai_provider::account_known_exhausted(&probe_src);
+    let subject = match subject {
+        Ok(subject) => subject,
+        Err(reason) => {
+            match identity_refusal_report(&reason, exhausted) {
+                Some(reason) => emit_skipped(&app, &record, &probe_src, reason),
+                None => info!(
+                    terminal_id,
+                    session = %record.claude_session_id,
+                    account = %probe_src,
+                    matched_pattern,
+                    reason = %reason,
+                    "usage-limit message NOT confirmed by probe, and the identity was refused — nothing to report (likely echoed text)"
+                ),
+            }
+            return;
+        }
+    };
+    if !exhausted {
         info!(
             terminal_id,
-            session = %record.claude_session_id,
-            account = %src,
+            session = %subject.record.claude_session_id,
+            account = %probe_src,
             matched_pattern,
             "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
         );
         return;
     }
+    // Confirmed: only now does a `Rebound` correction reach the store.
+    subject.commit_correction(&store);
+    let (record, src, old_writer) = (subject.record, subject.src_config_dir, subject.old_writer);
 
     // Keep spawn-time selection off the dead account, and repoint the global
     // resolved dir so unrelated new sessions stop landing on it. When the
@@ -1357,6 +1375,35 @@ pub(crate) struct MigrationSubject {
     /// How the identity was settled, in words — returned by the operator's
     /// command so a migration of an unverified identity says so.
     pub identity_note: String,
+    /// On `Rebound`, the record's (old) id: `record` is the correction, NOT
+    /// yet written; see [`Self::commit_correction`].
+    pub rebound_from: Option<String>,
+}
+
+impl MigrationSubject {
+    /// Write a `Rebound` correction to the lifecycle store (no-op otherwise).
+    ///
+    /// Deferred to the caller rather than done while resolving, so the
+    /// automatic path writes it only once the exhaustion probe has confirmed
+    /// the hint: an unconfirmed hint (quoted text, a replayed banner) changes
+    /// nothing. It must still precede [`migrate_session_off_runtime`], since
+    /// `begin_migration` re-reads the record by its (new) id.
+    pub(crate) fn commit_correction(
+        &self,
+        store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    ) {
+        let Some(from) = &self.rebound_from else {
+            return;
+        };
+        store.record_open(self.record.clone());
+        warn!(
+            terminal_id = %self.record.terminal_id,
+            record_session = %from,
+            provider_session = %self.record.claude_session_id,
+            account = %self.src_config_dir,
+            "account migration: the pane runs a different session than its record — record corrected from the provider's live registry, migrating the provider's id"
+        );
+    }
 }
 
 /// Resolve which session `record`'s pane provably runs (plan
@@ -1366,9 +1413,10 @@ pub(crate) struct MigrationSubject {
 ///
 /// `Err(reason)` is a refusal; `reason` is the typed skip reason
 /// (`session-live-in-another-process(pid N)` / `identity-unresolved(<why>)`).
-/// On `Rebound` the lifecycle record is corrected first (authoritative origin,
-/// confirmed iff the new id's transcript exists), so the respawn's re-key
-/// lands on the right row.
+/// On `Rebound` the returned record is the correction (authoritative origin,
+/// the new id's transcript proven to exist), which the caller writes with
+/// [`MigrationSubject::commit_correction`] before migrating, so the respawn's
+/// re-key lands on the right row. Nothing is written here.
 pub(crate) async fn resolve_migration_subject(
     app: &tauri::AppHandle,
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
@@ -1395,9 +1443,9 @@ pub(crate) async fn resolve_migration_subject(
                     "rebound: the pane runs {sid} under {src}, not the record's {from} (provider registry)"
                 ),
             };
-            let record = match rebound_from {
+            let record = match &rebound_from {
                 None => record.clone(),
-                Some(from) => {
+                Some(_) => {
                     // No transcript for the provider's id under its account:
                     // refuse BEFORE rewriting the record (two open records on
                     // one terminal, and a copy that would fail anyway). A stat
@@ -1429,16 +1477,7 @@ pub(crate) async fn resolve_migration_subject(
                         has_transcript,
                     )?;
                     let confirmed_at = Some(chrono::Utc::now().timestamp_millis());
-                    let corrected = rebound_record(record, &sid, &src, confirmed_at);
-                    store.record_open(corrected.clone());
-                    warn!(
-                        terminal_id = %record.terminal_id,
-                        record_session = %from,
-                        provider_session = %sid,
-                        account = %src,
-                        "account migration: the pane runs a different session than its record — record corrected from the provider's live registry, migrating the provider's id"
-                    );
-                    corrected
+                    rebound_record(record, &sid, &src, confirmed_at)
                 }
             };
             Ok(MigrationSubject {
@@ -1446,13 +1485,22 @@ pub(crate) async fn resolve_migration_subject(
                 src_config_dir: src,
                 old_writer,
                 identity_note,
+                rebound_from,
             })
         }
         MigrationVerdict::ProceedOnRecord { why } => {
+            // In the roster's spelling, like the `Proceed` arm: the usage
+            // snapshot, the cooldown map and the target picker all key on it.
             let src = record
                 .config_dir
                 .clone()
                 .or_else(crate::ai_provider::get_resolved_config_dir)
+                .map(|dir| {
+                    roster_spelling(
+                        Path::new(dir.trim()),
+                        &crate::settings::get_claude_config_dirs(),
+                    )
+                })
                 .ok_or("the session's current account is unknown — cannot migrate")?;
             warn!(
                 terminal_id = %record.terminal_id,
@@ -1468,6 +1516,7 @@ pub(crate) async fn resolve_migration_subject(
                 identity_note: format!(
                     "unresolved — migrated the runner's record of the session: {why}"
                 ),
+                rebound_from: None,
             })
         }
         MigrationVerdict::Refuse { reason } => {
@@ -1483,10 +1532,37 @@ pub(crate) async fn resolve_migration_subject(
     }
 }
 
-/// Pure: `record` re-keyed onto the provider's id `sid` under `config_dir`,
-/// stamped authoritative (the provider's own pid -> session index is the same
-/// evidence grade as a typed `--session-id`). Placement, terminal and working
-/// dir are kept; the old session's name is not carried onto the new id.
+/// Pure: what an identity refusal on the AUTOMATIC path reports. The hint
+/// that started it is only a hint (`limit reached` turns up in ordinary
+/// conversation text), so the refusal is reported (as
+/// `session-account-migration-skipped`, naming the identity reason) only when
+/// the probe CONFIRMED the account exhausted. Otherwise it ends silently,
+/// like any unconfirmed hint: reporting it toasted a false "out of tokens ...
+/// NOT migrated" every debounce (round-12 review W1).
+fn identity_refusal_report(reason: &str, confirmed_exhausted: bool) -> Option<&str> {
+    confirmed_exhausted.then_some(reason)
+}
+
+/// Pure: whether the operator's migration target is the session's current
+/// account, compared as paths ([`same_config_dir`]) rather than as strings,
+/// so a non-roster spelling of the same account is still refused instead of
+/// respawning into it.
+pub(crate) fn target_is_current_account(dst: &str, src: &str) -> bool {
+    same_config_dir(dst, src)
+}
+
+/// Pure: a record for the provider's id `sid` under `config_dir` on
+/// `record`'s PANE, stamped authoritative (the provider's own pid -> session
+/// index is the same evidence grade as a typed `--session-id`).
+///
+/// Built like the binder's own re-bind
+/// ([`TerminalSessionRecord::bound_to_pane`]): only pane-scoped fields carry
+/// over (terminal, working dir, placement, title, and the pane's provider,
+/// tenant, bypass flag and spawn-time device default). Everything that
+/// belongs to the OLD session (its name, coord handle, task run, finish /
+/// wind-down / restore stamps, account label) is unset: copying it marked the
+/// new id finished when the old one was, which dropped it from restore and
+/// let a drained runner wind it down (round-12 review W2).
 fn rebound_record(
     record: &TerminalSessionRecord,
     sid: &str,
@@ -1494,13 +1570,23 @@ fn rebound_record(
     confirmed_at: Option<i64>,
 ) -> TerminalSessionRecord {
     TerminalSessionRecord {
-        claude_session_id: sid.to_string(),
-        config_dir: Some(config_dir.to_string()),
-        origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
-        confirmed_at,
-        session_name: None,
-        name_source: None,
-        ..record.clone()
+        provider: record.provider.clone(),
+        tenant_id: record.tenant_id.clone(),
+        bypass_permissions: record.bypass_permissions,
+        spawn_device_default: record.spawn_device_default.clone(),
+        ..TerminalSessionRecord::bound_to_pane(
+            sid,
+            config_dir,
+            crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE,
+            confirmed_at,
+            crate::session::session_lifecycle_store::PaneBinding {
+                terminal_id: record.terminal_id.clone(),
+                working_dir: record.working_dir.clone(),
+                page_id: record.page_id.clone(),
+                zone_index: record.zone_index,
+                title: record.title.clone(),
+            },
+        )
     }
 }
 
@@ -2687,6 +2773,76 @@ mod tests {
         assert_eq!(r.session_name, None);
         assert_eq!(r.terminal_id, "314176b7");
         assert_eq!((r.page_id.as_str(), r.zone_index), ("page-1", 3));
+    }
+
+    /// Round-12 W2: a rebound from a FINISHED record that carried a coord
+    /// handle and a task run yields a record for the new id with none of the
+    /// old session's state: no finish / wind-down / restore stamps, no
+    /// handle, no task run, no account label. Pane-scoped facts carry over.
+    ///
+    /// Mutation check: building the correction with `..record.clone()`
+    /// again carries `finished_at`, `handle` and `task_run_id` and fails.
+    #[test]
+    fn a_rebound_from_a_finished_record_carries_none_of_its_session_state() {
+        let mut old = record("0c4e3025");
+        old.finished_at = Some(10);
+        old.finish_reason = Some("done".to_string());
+        old.finish_synced = true;
+        old.wind_down_outcome = Some("exited".to_string());
+        old.wind_down_at = Some(11);
+        old.handle = Some("fleet-handle".to_string());
+        old.task_run_id = Some("task-run-1".to_string());
+        old.restored_from_boot_at = Some(12);
+        old.account_label = Some("erik".to_string());
+        old.tenant_id = Some("tenant-a".to_string());
+        old.bypass_permissions = Some(true);
+        let r = rebound_record(&old, "506a0190", ".claude-lukas", Some(20));
+        assert_eq!(r.finished_at, None);
+        assert_eq!(r.finish_reason, None);
+        assert!(!r.finish_synced);
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
+        assert_eq!(r.handle, None);
+        assert_eq!(r.task_run_id, None);
+        assert_eq!(r.restored_from_boot_at, None);
+        assert_eq!(r.account_label, None);
+        assert_eq!(r.confirmed_at, Some(20));
+        assert_eq!(r.tenant_id.as_deref(), Some("tenant-a"), "pane-scoped");
+        assert_eq!(r.bypass_permissions, Some(true), "pane-scoped");
+        assert_eq!(r.working_dir.as_deref(), Some("D:/w"));
+        assert_eq!(r.title.as_deref(), Some("t"));
+    }
+
+    /// Round-12 W1: on the automatic path an identity refusal is reported
+    /// only once the probe has CONFIRMED the account exhausted; an
+    /// unconfirmed hint (quoted conversation text) ends silently.
+    ///
+    /// Mutation check: returning `Some(reason)` regardless of the probe
+    /// fails the first assertion.
+    #[test]
+    fn an_identity_refusal_is_reported_only_on_a_confirmed_exhaustion() {
+        let reason = "identity-unresolved(no valid registry row)";
+        assert_eq!(identity_refusal_report(reason, false), None);
+        assert_eq!(identity_refusal_report(reason, true), Some(reason));
+    }
+
+    /// Round-12 S7: the operator's target is the current account when it is
+    /// the same path under another spelling, not only the same string.
+    #[test]
+    fn a_respelled_current_account_is_not_a_migration_target() {
+        assert!(target_is_current_account(
+            "C:/claude/.claude-a",
+            "C:/claude/./.claude-a/"
+        ));
+        assert!(!target_is_current_account(
+            "C:/claude/.claude-a",
+            "C:/claude/.claude-b"
+        ));
+        #[cfg(windows)]
+        assert!(target_is_current_account(
+            r"C:\claude\.claude-A",
+            "c:/claude/.claude-a"
+        ));
     }
 
     fn agent(id: &str, description: Option<&str>) -> CarriedSubagent {
