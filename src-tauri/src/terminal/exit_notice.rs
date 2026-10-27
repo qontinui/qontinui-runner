@@ -51,13 +51,27 @@
 pub trait ExitNoticeSink {
     /// Deliver one exit notice for `terminal_id`.
     fn emit_exit(&self, terminal_id: &str, exit_code: Option<i32>);
+
+    /// Deliver the notice a HANDOFF close sends in place of the exit notice:
+    /// the session left this runner, but its process is still running in PTY
+    /// holder `holder_pid` for the next runner to adopt (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D2 step 7). A different event on purpose — the webview must not read
+    /// it as an exit (no `record_close`, no tab drop).
+    fn emit_handed_off(&self, terminal_id: &str, holder_pid: u32);
 }
+
+/// The Tauri event a handoff close emits ([`ExitNoticeSink::emit_handed_off`]).
+pub const TERMINAL_HANDED_OFF_EVENT: &str = "terminal-handed-off";
 
 /// Blanket forward through a reference, so a caller can hand out a borrowed
 /// sink (a test's recorder, say) without giving it away.
 impl<T: ExitNoticeSink + ?Sized> ExitNoticeSink for &T {
     fn emit_exit(&self, terminal_id: &str, exit_code: Option<i32>) {
         (**self).emit_exit(terminal_id, exit_code)
+    }
+    fn emit_handed_off(&self, terminal_id: &str, holder_pid: u32) {
+        (**self).emit_handed_off(terminal_id, holder_pid)
     }
 }
 
@@ -95,6 +109,24 @@ impl ExitNoticeSink for TauriExitSink<'_> {
             }),
         );
     }
+
+    /// The local webview only: the runner is going down, and a remote
+    /// consumer learns of the pane again from the next runner's adoption.
+    fn emit_handed_off(&self, terminal_id: &str, holder_pid: u32) {
+        use tauri::Emitter;
+
+        let payload = serde_json::json!({
+            "terminalId": terminal_id,
+            "holderPid": holder_pid,
+        });
+        if let Err(e) = self.app.emit(TERMINAL_HANDED_OFF_EVENT, &payload) {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "Failed to emit terminal handed-off event"
+            );
+        }
+    }
 }
 
 /// Records every notice it is handed, for assertions.
@@ -106,6 +138,7 @@ impl ExitNoticeSink for TauriExitSink<'_> {
 #[derive(Default)]
 pub(crate) struct RecordingExitSink {
     notices: std::sync::Mutex<Vec<(String, Option<i32>)>>,
+    handed_off: std::sync::Mutex<Vec<(String, u32)>>,
 }
 
 #[cfg(test)]
@@ -113,6 +146,11 @@ impl RecordingExitSink {
     /// Every `(terminal_id, exit_code)` this sink was handed, in order.
     pub(crate) fn notices(&self) -> Vec<(String, Option<i32>)> {
         self.notices.lock().unwrap().clone()
+    }
+
+    /// Every `(terminal_id, holder_pid)` handed-off notice, in order.
+    pub(crate) fn handed_off(&self) -> Vec<(String, u32)> {
+        self.handed_off.lock().unwrap().clone()
     }
 }
 
@@ -123,6 +161,12 @@ impl ExitNoticeSink for RecordingExitSink {
             .lock()
             .unwrap()
             .push((terminal_id.to_string(), exit_code));
+    }
+    fn emit_handed_off(&self, terminal_id: &str, holder_pid: u32) {
+        self.handed_off
+            .lock()
+            .unwrap()
+            .push((terminal_id.to_string(), holder_pid));
     }
 }
 

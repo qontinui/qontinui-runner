@@ -2633,6 +2633,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         prehydration_cache: Arc::new(
             crate::unified_workflow_executor::prehydration::PrehydrationCache::new(),
         ),
+        pending_close_mode: crate::terminal::PendingCloseMode::default(),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -6780,6 +6781,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // of WIP-ref capture and silently lose stashed work.
                 let worker_app_handle = window.app_handle().clone();
                 let worker_app_state = app_state.inner().clone();
+                // Taken HERE, once per main-window `CloseRequested`: the
+                // close-request door stages a handoff just before its
+                // `window.close()`, and taking it empties the slot, so a
+                // later X click can never inherit it. No staged mode (the
+                // window X) is `Kill` (plan
+                // `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`, D1).
+                let close_mode = worker_app_state.pending_close_mode.take();
+                debug_lifecycle::log_lifecycle(
+                    "SHUTDOWN",
+                    &format!("Close mode for this teardown: {close_mode:?}"),
+                );
                 std::thread::spawn(move || {
                     // ── ONE teardown per process, across BOTH doors ──
                     //
@@ -6832,6 +6844,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         &worker_app_handle,
                         &worker_app_state,
                         &budget,
+                        close_mode,
                     );
 
                     // ── Explicit exit request, anchored to WORKER COMPLETION ──

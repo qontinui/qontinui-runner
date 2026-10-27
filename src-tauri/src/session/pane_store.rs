@@ -145,6 +145,44 @@ impl PaneKey {
 pub struct PaneSessionStore {
     path: PathBuf,
     map: Mutex<HashMap<String, Uuid>>,
+    /// The coord binding of each LIVE holder-backed terminal, keyed by
+    /// terminal id ([`TerminalCoordBinding`]), persisted beside the pane map
+    /// in [`terminal_bindings_path`].
+    terminals: Mutex<HashMap<String, TerminalCoordBinding>>,
+}
+
+/// What a HOLDER-backed terminal's coord session was registered with, kept
+/// under its terminal id for the one restore that reuses a terminal id: the
+/// next runner's boot sweep adopting the pane (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D8). The create triple cannot serve there — the pane's working dir may have
+/// been reassigned to a worktree after that key was taken and its title renamed
+/// since, and the holder's restore metadata carries neither original — and a
+/// resume needs more than the row id: the TENANT (a non-default tenant's row
+/// probed under the default credential 404s and is re-registered in the wrong
+/// tenant) and the intent fields the row was declared with. Removed when the
+/// terminal really exits, so it does not accumulate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalCoordBinding {
+    pub coord_id: Uuid,
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub work_unit_slug: Option<String>,
+    #[serde(default)]
+    pub correlation_topic: Option<String>,
+}
+
+/// The terminal-binding file beside the pane map at `pane_map_path`:
+/// `<stem>-terminals.json`.
+pub fn terminal_bindings_path(pane_map_path: &Path) -> PathBuf {
+    let stem = pane_map_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pane-sessions".to_string());
+    pane_map_path.with_file_name(format!("{stem}-terminals.json"))
 }
 
 impl PaneSessionStore {
@@ -155,9 +193,11 @@ impl PaneSessionStore {
             std::fs::create_dir_all(parent)?;
         }
         let map = load_map(&path);
+        let terminals = load_json(&terminal_bindings_path(&path));
         Ok(Self {
             path,
             map: Mutex::new(map),
+            terminals: Mutex::new(terminals),
         })
     }
 
@@ -214,6 +254,71 @@ impl PaneSessionStore {
             warn!(error = %e, "pane_store: persist failed on remove");
         }
     }
+}
+
+impl PaneSessionStore {
+    /// The recorded coord binding of terminal `terminal_id`, if any.
+    pub fn get_terminal(&self, terminal_id: &str) -> Option<TerminalCoordBinding> {
+        self.terminals
+            .lock()
+            .ok()
+            .and_then(|m| m.get(terminal_id.trim()).cloned())
+    }
+
+    /// Record (or overwrite) terminal `terminal_id`'s coord binding.
+    pub fn put_terminal(&self, terminal_id: &str, binding: TerminalCoordBinding) {
+        self.mutate_terminals(|m| {
+            m.insert(terminal_id.trim().to_string(), binding.clone()) != Some(binding)
+        });
+    }
+
+    /// Forget terminal `terminal_id`'s coord binding (its real exit).
+    pub fn remove_terminal(&self, terminal_id: &str) {
+        self.mutate_terminals(|m| m.remove(terminal_id.trim()).is_some());
+    }
+
+    /// Apply `f` — which answers whether it CHANGED the map — and persist
+    /// only on a change, while still holding the lock. A remove of an absent
+    /// id (every in-process pane's exit, many at once during a handoff
+    /// teardown) therefore writes nothing, and two writers can never land a
+    /// stale snapshot over a newer one (review round 2).
+    fn mutate_terminals(&self, f: impl FnOnce(&mut HashMap<String, TerminalCoordBinding>) -> bool) {
+        let mut m = match self.terminals.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "pane_store: terminal-binding lock poisoned");
+                return;
+            }
+        };
+        if !f(&mut m) {
+            return;
+        }
+        if let Err(e) = write_json(&terminal_bindings_path(&self.path), &*m) {
+            warn!(error = %e, "pane_store: terminal-binding persist failed — kept in memory only");
+        }
+    }
+}
+
+fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    let Ok(bytes) = std::fs::read(path) else {
+        return T::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        warn!(error = %e, path = %path.display(), "pane_store: corrupt file — starting empty");
+        T::default()
+    })
+}
+
+/// Atomic replace through a temp file UNIQUE to this write (pid + counter), so
+/// no two writes — in this process or another — ever share one.
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn load_map(path: &Path) -> HashMap<String, Uuid> {
@@ -385,5 +490,73 @@ mod tests {
         let id = Uuid::new_v4();
         store.put(&key, id);
         assert_eq!(store.get(&key), Some(id));
+    }
+
+    #[test]
+    fn terminal_bindings_round_trip_through_their_own_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pane-sessions.json");
+        let binding = TerminalCoordBinding {
+            coord_id: Uuid::new_v4(),
+            tenant_id: Some(Uuid::new_v4()),
+            repo: Some("qontinui-runner".into()),
+            work_unit_slug: Some("wu".into()),
+            correlation_topic: None,
+        };
+        {
+            let store = PaneSessionStore::open(&path).unwrap();
+            store.put_terminal("term-1", binding.clone());
+        }
+        assert!(terminal_bindings_path(&path).exists());
+        let store = PaneSessionStore::open(&path).unwrap();
+        assert_eq!(store.get_terminal("term-1"), Some(binding));
+        assert!(store.get(&PaneKey::from_create("", "", "")).is_none());
+        store.remove_terminal("term-1");
+        assert_eq!(
+            PaneSessionStore::open(&path)
+                .unwrap()
+                .get_terminal("term-1"),
+            None
+        );
+    }
+
+    /// Review round 2: removing an id that was never recorded (an in-process
+    /// pane's exit) writes NOTHING — not even an empty file — and a write
+    /// leaves no temp file behind.
+    #[test]
+    fn removing_an_absent_terminal_binding_does_not_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pane-sessions.json");
+        let store = PaneSessionStore::open(&path).unwrap();
+        store.remove_terminal("never-recorded");
+        assert!(
+            !terminal_bindings_path(&path).exists(),
+            "no write for a no-op remove"
+        );
+
+        let binding = TerminalCoordBinding {
+            coord_id: Uuid::new_v4(),
+            tenant_id: None,
+            repo: None,
+            work_unit_slug: None,
+            correlation_topic: None,
+        };
+        store.put_terminal("t", binding);
+        let file = terminal_bindings_path(&path);
+        std::fs::write(&file, b"sentinel").unwrap();
+        store.remove_terminal("still-absent");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"sentinel",
+            "an absent remove leaves the file untouched"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "no temp file left behind"
+        );
     }
 }
