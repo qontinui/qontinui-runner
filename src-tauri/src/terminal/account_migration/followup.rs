@@ -376,47 +376,66 @@ pub(crate) enum StallAction {
 /// (round-11 review W3). And when any OTHER bottom row is a numbered choice
 /// or dialog chrome ([`DIALOG_CHROME_MARKERS`](crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS)),
 /// a dialog is showing beside the banner and the `Esc` would cancel it: not a
-/// limit wait. Nor is it one while the LOWEST `❯` row of the bottom rows
-/// holds an unsent draft (the draft rule `input_prompt_ready` refuses on):
-/// the `Esc` could wipe what the operator typed (round-12 review S6). Only
-/// that row: the live input box is the lowest `❯` on screen, so a `❯` row
-/// above it is a prompt echoed in the history or one quoted in output
-/// (round-13 review S4). Where the banner sits does not matter — whether the
-/// CLI draws it above the input box or under it, as a status line, is
-/// unmeasured (round-16 review W1). No box rule is required either — an input
-/// box drawn with an unfamiliar glyph, or a single rule, still has its draft
-/// seen (round-14 review W1). With no input box on screen at all, an echoed
-/// prompt is that lowest row and reads as a draft: a reported stall, never a
-/// stray `Esc`. (A banner the CLI wrapped
+/// limit wait.
+///
+/// Nor is it one unless the IDLE input box is seen: an `Esc` could wipe an
+/// unsent draft (round-12 review S6), so every way of not seeing the box ends
+/// in a reported stall, never a stray `Esc`. The input row is the LOWEST row
+/// the `❯` marker opens ([`is_prompt_row`](crate::terminal::graceful_exit::is_prompt_row)):
+/// a `❯` higher up is a prompt echoed in the history or quoted in output
+/// (round-13 review S4), and a status line that merely ENDS in `❯` (a
+/// starship-style prompt) is not one (round-17 review W2). It must exist — a
+/// long draft that scrolled its `❯` out of the bottom rows, or an input mode
+/// drawn with another marker, leaves none (round-17 W1, S3). It must hold no
+/// draft by the rule `input_prompt_ready` refuses on, and no row may sit
+/// between it and the box's bottom rule or the banner: that is a draft's
+/// continuation (round-17 W1). Where the banner sits does not matter, above
+/// the box or under it as a status line, which is unmeasured (round-16 W1);
+/// a box rule is not required (round-14 W1), though a row of an unfamiliar
+/// rule glyph under the `❯` reads as continuation. (A banner the CLI wrapped
 /// onto two rows therefore reads as not-a-wait — a reported stall, never a
 /// stray `Esc`.)
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
+    use crate::terminal::graceful_exit::{
+        is_box_edge, is_numbered_option, is_prompt_row, row_holds_unsent_draft,
+        DIALOG_CHROME_MARKERS,
+    };
     let bottom = crate::terminal::usage_limit::bottom_rows_text(screen);
     let rows: Vec<&str> = bottom.lines().collect();
-    let is_banner = |row: &str| {
-        let n = normalize(row);
-        n.contains("continuing automatically at")
-            || (n.contains("esc to cancel")
-                && crate::terminal::usage_limit::window_indicates_usage_limit(row).is_some())
-    };
-    let Some(banner) = rows.iter().rposition(|row| is_banner(row)) else {
+    let Some(banner) = rows.iter().rposition(|row| is_limit_wait_banner(row)) else {
         return false;
     };
-    let input_row = (0..rows.len())
-        .rev()
-        .find(|&i| i != banner && crate::terminal::graceful_exit::is_prompt_row(rows[i]));
-    if input_row.is_some_and(|i| crate::terminal::graceful_exit::row_holds_unsent_draft(rows[i])) {
-        return false;
-    }
-    !rows.iter().enumerate().any(|(i, row)| {
+    let dialog = rows.iter().enumerate().any(|(i, row)| {
         i != banner && {
             let n = normalize(row);
-            crate::terminal::graceful_exit::is_numbered_option(row)
-                || crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS
-                    .iter()
-                    .any(|m| n.contains(m))
+            is_numbered_option(row) || DIALOG_CHROME_MARKERS.iter().any(|m| n.contains(m))
         }
-    })
+    });
+    if dialog {
+        return false;
+    }
+    let Some(input) = (0..rows.len())
+        .rev()
+        .find(|&i| i != banner && is_prompt_row(rows[i]))
+    else {
+        return false;
+    };
+    let continued = (input + 1..rows.len())
+        .take_while(|&i| i != banner && !is_box_edge(rows[i]))
+        .next()
+        .is_some();
+    !row_holds_unsent_draft(rows[input]) && !continued
+}
+
+/// Pure: whether one row is the CLI's limit-wait banner
+/// (`… · continuing automatically at 6pm · esc to cancel`). A bare
+/// `esc to cancel` also labels many ordinary CLI dialogs, so it counts only
+/// beside a usage-limit phrase on the same row.
+fn is_limit_wait_banner(row: &str) -> bool {
+    let n = normalize(row);
+    n.contains("continuing automatically at")
+        || (n.contains("esc to cancel")
+            && crate::terminal::usage_limit::window_indicates_usage_limit(row).is_some())
 }
 
 /// Pure: whether the one `Esc` may be sent on `screen`, re-read IMMEDIATELY
@@ -496,7 +515,7 @@ pub(crate) fn evidence_line(screen: &str) -> String {
     let row = rows
         .iter()
         .rev()
-        .find(|row| screen_shows_limit_wait(row))
+        .find(|row| is_limit_wait_banner(row))
         .or_else(|| rows.last())
         .copied()
         .unwrap_or("");

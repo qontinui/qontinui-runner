@@ -18,8 +18,12 @@ const BLANK_RESUME: &str = "$ claude --permission-mode bypassPermissions --resum
 fn the_limit_wait_banner_is_recognised_and_a_plain_dialog_is_not() {
     assert!(screen_shows_limit_wait(LIMIT_WAIT));
     assert!(screen_shows_limit_wait(
-        "5-hour limit reached ∙ resets 3am · esc to cancel"
+        "5-hour limit reached ∙ resets 3am · esc to cancel\n────────\n❯ \n────────\n"
     ));
+    assert!(
+        !screen_shows_limit_wait("5-hour limit reached ∙ resets 3am · esc to cancel"),
+        "no input box seen: a stall, never an Esc (round-17 review)"
+    );
     assert!(!screen_shows_limit_wait(PLAIN_DIALOG));
     assert!(!screen_shows_limit_wait(BLANK_RESUME));
 }
@@ -317,6 +321,39 @@ fn a_draft_above_a_status_line_banner_blocks() {
     let drafted = "────────\n❯ half-typed operator draft\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
     assert!(!screen_shows_limit_wait(drafted));
     let idle = "────────\n❯ \n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(screen_shows_limit_wait(idle));
+}
+
+/// Round-17 W1 and S3: the idle input box must be SEEN. A long draft under
+/// a status-line banner that scrolled its `❯` out of the bottom rows, a draft
+/// whose first line is empty but which continues below, and an input mode
+/// drawn with another marker all leave no idle box: no `Esc`.
+///
+/// Mutation checks: treating a missing input row as idle fails the first and
+/// last assertions; dropping the continuation term fails the second.
+#[test]
+fn a_draft_the_gate_cannot_see_whole_is_not_a_wait() {
+    let wrapped = format!(
+        "────────\n❯ please refactor the module\n{}────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n",
+        "  and keep going with more of the instruction\n".repeat(6)
+    );
+    assert!(!screen_shows_limit_wait(&wrapped));
+    let continued = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n  second line of a draft\n────────\n";
+    assert!(!screen_shows_limit_wait(continued));
+    let bash_mode = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n! git status\n────────\n";
+    assert!(!screen_shows_limit_wait(bash_mode));
+}
+
+/// Round-17 W2: a status line under the box that ENDS in `❯` (a
+/// starship-style prompt) is not the input row, so the draft above it is
+/// still read.
+///
+/// Mutation check: counting any row containing `❯` as a prompt row fails it.
+#[test]
+fn a_status_line_ending_in_the_marker_does_not_hide_the_draft() {
+    let screen = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n~/proj on main ❯\n";
+    assert!(!screen_shows_limit_wait(screen));
+    let idle = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n────────\n~/proj on main ❯\n";
     assert!(screen_shows_limit_wait(idle));
 }
 
