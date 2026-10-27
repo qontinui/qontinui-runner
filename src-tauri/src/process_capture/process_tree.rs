@@ -58,8 +58,7 @@ pub struct ProcessSnapshot {
     /// 1601-01-01 UTC, the same domain Claude Code writes as `procStart` in
     /// `<config_dir>/sessions/<pid>.json` (`pidDomain: "win32:<host>"`). CIM
     /// reports `CreationDate` truncated to the MICROSECOND, so a live row's
-    /// `procStart` differs from the value here by 0-9 ticks (measured
-    /// 2026-10-21: `…058648` in the registry vs `…058640` from CIM). The
+    /// `procStart` differs from the value here by 0-9 ticks. The
     /// registry-row validity check
     /// ([`crate::session::claude_session_registry::registry_row_validity`])
     /// compares at that granularity.
