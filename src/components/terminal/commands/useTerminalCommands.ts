@@ -2103,6 +2103,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "separate from the runner's terminal tabs.",
     paramSchema: SCHEMA.empty,
     patterns: [/^(?:open\s+)?(?:elevated|admin(?:istrator)?)\s+(?:terminal|shell|powershell)$/i],
+    // It raises a UAC prompt and leaves an Administrator process the operator
+    // has to close by hand — the same spend as `terminal.spawn`. No literal
+    // slash collides with its pattern today; declared so a future one can
+    // never be silently rerouted into it by a Tier-2 pattern.
+    costly: true,
     handler: async (): Promise<CommandResult> => {
       try {
         await invoke("open_elevated_terminal");

@@ -8516,7 +8516,10 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        let _ = coord.start_flag_poll_task();
+        // Named, not `let _ =`: the handle is a future (`let_underscore_future`).
+        // Dropping it at scope end detaches the task, exactly as ignoring it
+        // did, and the binding compiles against either return type.
+        let _poll = coord.start_flag_poll_task();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if rec

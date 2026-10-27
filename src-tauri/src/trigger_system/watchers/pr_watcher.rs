@@ -27,7 +27,6 @@ pub struct PrWatchState {
     pub auto_resume_count: u32,
     pub max_auto_resumes: u32,
     pub workflow_id: String,
-    pub github_token: String,
     pub auto_resume_enabled: bool,
 }
 
@@ -173,15 +172,11 @@ pub fn start_pr_watcher(
 
 /// Poll all active PR watch entries and take appropriate actions.
 ///
-/// Groups watches by GitHub token so we create one client per unique token
-/// rather than one per PR (avoids wasteful reqwest client creation).
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
+/// Every watch is polled with the watcher's own client, built from its
+/// trigger's token. The runner reads no credential from a watch row.
 async fn poll_active_prs(
     pg_db: &PgDb,
-    default_client: &GitHubClient,
+    client: &GitHubClient,
     execution_deps: Option<&PrWatcherDeps>,
 ) -> Result<(), String> {
     let watches = pg_db.get_active_pr_watches().await?;
@@ -191,51 +186,14 @@ async fn poll_active_prs(
 
     tracing::debug!("PR watcher: polling {} active PR watches", watches.len());
 
-    // Group watches by token; empty token means use the default client.
-    // We create one GitHubClient per unique non-empty token to avoid
-    // wasteful per-PR client creation.
-    let mut by_token: HashMap<String, Vec<&PrWatchState>> = HashMap::new();
     for watch in &watches {
-        by_token
-            .entry(watch.github_token.clone())
-            .or_default()
-            .push(watch);
-    }
-
-    // Cache of token -> GitHubClient for non-default tokens
-    let mut client_cache: HashMap<String, GitHubClient> = HashMap::new();
-
-    for (token, token_watches) in &by_token {
-        let client_ref: &GitHubClient = if token.is_empty() {
-            default_client
-        } else {
-            if !client_cache.contains_key(token) {
-                match GitHubClient::new(token, "pr_watcher") {
-                    Ok(c) => {
-                        client_cache.insert(token.clone(), c);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "PR watcher: failed to create GitHub client for token ({}...): {}",
-                            &token[..token.len().min(4)],
-                            e
-                        );
-                        continue;
-                    }
-                }
-            }
-            client_cache.get(token).unwrap()
-        };
-
-        for watch in token_watches {
-            if let Err(e) = poll_single_pr(pg_db, client_ref, watch, execution_deps).await {
-                tracing::warn!(
-                    "PR watcher: error polling PR #{} for task {}: {}",
-                    watch.pr_number,
-                    watch.task_run_id,
-                    e
-                );
-            }
+        if let Err(e) = poll_single_pr(pg_db, client, watch, execution_deps).await {
+            tracing::warn!(
+                "PR watcher: error polling PR #{} for task {}: {}",
+                watch.pr_number,
+                watch.task_run_id,
+                e
+            );
         }
     }
 

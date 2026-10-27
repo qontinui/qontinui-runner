@@ -3109,20 +3109,15 @@ mod tests {
     ///
     /// Non-vacuous by construction: the transcript lives under
     /// `CLAUDE_CONFIG_DIR`, which `find_claude_config_dirs` returns (asserted
-    /// below), the file is seconds old, and the instance-identity env is
-    /// cleared so this process reads as the PRIMARY. A re-added net that scans
-    /// the config dirs from [`restore_candidates`] would therefore offer
-    /// `disk-only-sess` and fail the exact-set assertion.
+    /// below), the file is seconds old, and the instance identity is cleared
+    /// (by the fixture, and `QONTINUI_PORT` here) so this process reads as the
+    /// PRIMARY. A re-added net that scans the config dirs from
+    /// [`restore_candidates`] would therefore offer `disk-only-sess` and fail
+    /// the exact-set assertion.
     #[test]
     fn restore_candidates_never_offers_a_registry_absent_disk_transcript() {
         let amb = crate::test_env::isolated_ambient();
-        for key in [
-            "QONTINUI_INSTANCE_NAME",
-            "QONTINUI_PRIMARY_PORT",
-            "QONTINUI_PORT",
-        ] {
-            std::env::remove_var(key);
-        }
+        std::env::remove_var("QONTINUI_PORT");
 
         // A fresh, real-looking interactive transcript the registry never saw.
         let cfg = amb.dir().join("claude-cfg");
