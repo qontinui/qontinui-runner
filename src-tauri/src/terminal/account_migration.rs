@@ -402,15 +402,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     let subject =
         resolve_migration_subject(&app, &store, &record, MigrationTrigger::UsageLimitHint).await;
     // The account the probe below checks: the registry row's on success; on a
-    // refusal the record's, else the runner's resolved one (as the
-    // `ProceedOnRecord` path resolves it), never "" while one is known.
+    // refusal the record's, else the runner's resolved one, in the roster's
+    // spelling ([`record_source_account`], as the `ProceedOnRecord` path
+    // resolves it) — the usage snapshot is keyed on that spelling — never ""
+    // while one is known.
     let probe_src = match &subject {
         Ok(subject) => subject.src_config_dir.clone(),
-        Err(_) => record
-            .config_dir
-            .clone()
-            .or_else(crate::ai_provider::get_resolved_config_dir)
-            .unwrap_or_default(),
+        Err(_) => record_source_account(&record).unwrap_or_default(),
     };
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
@@ -1491,16 +1489,7 @@ pub(crate) async fn resolve_migration_subject(
         MigrationVerdict::ProceedOnRecord { why } => {
             // In the roster's spelling, like the `Proceed` arm: the usage
             // snapshot, the cooldown map and the target picker all key on it.
-            let src = record
-                .config_dir
-                .clone()
-                .or_else(crate::ai_provider::get_resolved_config_dir)
-                .map(|dir| {
-                    roster_spelling(
-                        Path::new(dir.trim()),
-                        &crate::settings::get_claude_config_dirs(),
-                    )
-                })
+            let src = record_source_account(record)
                 .ok_or("the session's current account is unknown — cannot migrate")?;
             warn!(
                 terminal_id = %record.terminal_id,
@@ -1530,6 +1519,32 @@ pub(crate) async fn resolve_migration_subject(
             Err(reason)
         }
     }
+}
+
+/// The account a session runs under by the runner's RECORD (not the
+/// provider's registry): the record's config dir, else the runner's resolved
+/// one, in the roster's spelling ([`roster_spelling`]) — the usage snapshot,
+/// the cooldown map and the target picker all key on that spelling, so a
+/// record spelled `C:\claude\.claude-x` must probe as the roster's
+/// `C:/claude/.claude-x` (round-13 review W1). `None` when neither is known.
+fn record_source_account(record: &TerminalSessionRecord) -> Option<String> {
+    record_source_account_in(
+        record.config_dir.as_deref(),
+        crate::ai_provider::get_resolved_config_dir,
+        &crate::settings::get_claude_config_dirs(),
+    )
+}
+
+/// Pure: [`record_source_account`] over an injected resolved dir and roster.
+fn record_source_account_in(
+    record_config_dir: Option<&str>,
+    resolved: impl FnOnce() -> Option<String>,
+    roster: &[String],
+) -> Option<String> {
+    record_config_dir
+        .map(str::to_string)
+        .or_else(resolved)
+        .map(|dir| roster_spelling(Path::new(dir.trim()), roster))
 }
 
 /// Pure: what an identity refusal on the AUTOMATIC path reports. The hint
@@ -2824,6 +2839,54 @@ mod tests {
         let reason = "identity-unresolved(no valid registry row)";
         assert_eq!(identity_refusal_report(reason, false), None);
         assert_eq!(identity_refusal_report(reason, true), Some(reason));
+    }
+
+    /// Round-13 W1: on a refusal, the probe reads the RECORD's account in the
+    /// roster's spelling, so an exhausted account whose record spells it
+    /// differently (backslashes on Windows; a trailing slash elsewhere) still
+    /// reports the refusal. The snapshot is keyed by the roster spelling, as
+    /// the probe that fills it keys it.
+    ///
+    /// Mutation check: probing the record's raw spelling misses the snapshot
+    /// entry and fails the final assertions.
+    #[test]
+    fn a_refusal_on_a_respelled_exhausted_account_is_reported() {
+        let roster = vec!["C:/claude/.claude-r13w1-exhausted".to_string()];
+        let record_spelling = if cfg!(windows) {
+            r"C:\claude\.claude-r13w1-exhausted"
+        } else {
+            "C:/claude/.claude-r13w1-exhausted/"
+        };
+        crate::ai_provider::record_account_usage(&[(roster[0].clone(), 1.0, None, None, true)]);
+        let probe_src = record_source_account_in(Some(record_spelling), || None, &roster)
+            .expect("the record names an account");
+        assert_eq!(probe_src, roster[0], "probed in the roster's spelling");
+        let exhausted = crate::ai_provider::account_known_exhausted(&probe_src);
+        for identity in [
+            crate::terminal::migration_identity::MigrationIdentity::Unknown(
+                "no valid registry row".into(),
+            ),
+            crate::terminal::migration_identity::MigrationIdentity::MaybeHeldElsewhere {
+                pid: 4242,
+                why: "its registry row could not be read".into(),
+            },
+        ] {
+            let MigrationVerdict::Refuse { reason } =
+                migration_verdict(identity, "sid", MigrationTrigger::UsageLimitHint)
+            else {
+                panic!("the automatic path refuses an unresolved identity");
+            };
+            assert_eq!(
+                identity_refusal_report(&reason, exhausted),
+                Some(reason.as_str())
+            );
+        }
+        // The resolved dir is the fallback, roster-spelled the same way.
+        assert_eq!(
+            record_source_account_in(None, || Some(record_spelling.to_string()), &roster),
+            Some(roster[0].clone())
+        );
+        assert_eq!(record_source_account_in(None, || None, &roster), None);
     }
 
     /// Round-12 S7: the operator's target is the current account when it is
