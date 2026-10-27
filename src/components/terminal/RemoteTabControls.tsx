@@ -123,7 +123,7 @@ export function RemoteTabControls({
       });
       // The new tab is already open (terminal-created + terminal-remote-identity);
       // retire the dead one it replaces.
-      session.closeTerminal(tab.id);
+      session.closeTerminal(tab.id, { immediate: true });
       session.setActiveId(info.id);
     } catch (err) {
       setNote(`reattach failed: ${attachErrorMessage(err)}`);

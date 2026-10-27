@@ -117,8 +117,8 @@ export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknow
    * Read TODAY by `rank.ts::safeToReroute`, the twin of {@link costly}: a
    * literal slash form is never rerouted INTO a destructive action by a
    * Tier-2 pattern. It is also the flag the Phase 4 executor's confirm modal
-   * will gate on (plan §5(3)); single-target actions additionally carry
-   * `undoable` for the 3s Undo affordance.
+   * will gate on (plan §5(3)). A single-target close needs no confirm: the
+   * terminal manager makes it undoable for 10 s itself.
    *
    * It went undeclared on every action for as long as it existed, which made
    * `safeToReroute`'s second half dead code — one declarant of `costly` was
@@ -143,8 +143,6 @@ export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknow
    * itself, next to the handler that does the spending.
    */
   costly?: boolean;
-  /** Pre-state snapshot captured by the executor for Undo. */
-  undoable?: boolean;
   /** The action body. */
   handler: (args: TArgs, ctx: ResolverContext) => Promise<CommandResult<TResult>>;
 }
