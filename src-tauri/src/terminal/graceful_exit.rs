@@ -168,9 +168,12 @@ fn is_unsent_draft(input: &str) -> bool {
     !input.is_empty() && !input.starts_with(PLACEHOLDER_PREFIX)
 }
 
-/// Whether `row` carries the `❯` input marker at all, draft or not.
+/// Whether the `❯` input marker OPENS `row` (after indentation or a box
+/// edge), draft or not. A status line that merely ends in `❯`, the shape of a
+/// starship-style shell prompt, is not an input row.
 pub(crate) fn is_prompt_row(row: &str) -> bool {
-    prompt_row(row).is_some()
+    row.trim_start_matches(|c: char| c.is_whitespace() || c == '│')
+        .starts_with('❯')
 }
 
 /// Whether `row` is a `❯` input row holding an unsent draft, by the same rule
@@ -197,7 +200,7 @@ pub(crate) fn is_numbered_option(text: &str) -> bool {
 }
 
 /// Only box-drawing characters: the input box's top edge.
-fn is_box_edge(line: &str) -> bool {
+pub(crate) fn is_box_edge(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
 }
