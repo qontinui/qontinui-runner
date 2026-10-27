@@ -25,6 +25,7 @@ import { memo, useCallback, useMemo, useRef, type RefObject } from "react";
 import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { SessionState, ZoneAssignments } from "../useZoneLayout";
+import { groupColorTint } from "../sessionGroupColors";
 import {
   TerminalInstance,
   type TerminalInstanceHandle,
@@ -581,7 +582,7 @@ function ZoneCellInner({
               animation: isFlashing ? "zone-flash-border 1s ease-out" : undefined,
               ...(firstTagColor
                 ? {
-                    background: `linear-gradient(135deg, ${firstTagColor}08 0%, transparent 60%)`,
+                    background: `linear-gradient(135deg, ${groupColorTint(firstTagColor, 3)} 0%, transparent 60%)`,
                   }
                 : {}),
             }

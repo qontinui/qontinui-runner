@@ -148,13 +148,13 @@ describe("windowTitleCounts", () => {
 });
 
 describe("splitWorking / formatWorking", () => {
-  it("scopes the headline to this page and reports external apart — THE DEFECT", () => {
+  it("headlines this runner's work and reports outside-runner work apart — THE DEFECT", () => {
     const split = splitWorking(5, 4);
-    expect(split).toEqual({ page: 1, external: 4 });
-    expect(formatWorking(split)).toBe("1 working +4 external");
+    expect(split).toEqual({ page: 1, outside: 4 });
+    expect(formatWorking(split)).toBe("1 working +4 outside runner");
   });
 
-  it("omits the suffix when nothing runs externally", () => {
+  it("omits the suffix when nothing runs outside the runner", () => {
     expect(formatWorking(splitWorking(2, 0))).toBe("2 working");
   });
 
@@ -163,7 +163,7 @@ describe("splitWorking / formatWorking", () => {
   });
 
   it("never renders a negative page count from an inconsistent pair", () => {
-    expect(splitWorking(1, 3)).toEqual({ page: 0, external: 1 });
-    expect(splitWorking(2, -1)).toEqual({ page: 2, external: 0 });
+    expect(splitWorking(1, 3)).toEqual({ page: 0, outside: 1 });
+    expect(splitWorking(2, -1)).toEqual({ page: 2, outside: 0 });
   });
 });

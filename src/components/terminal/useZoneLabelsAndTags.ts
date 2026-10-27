@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { groupColorAt } from "./sessionGroupColors";
 import { pageKey } from "./TerminalPageContext";
-
-const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
 
 export interface UseZoneLabelsAndTagsReturn {
   zoneLabels: Record<number, string>;
@@ -152,7 +151,10 @@ export function useZoneLabelsAndTags(
     }
     const uniqueTags = [...tagSet].sort();
     for (let i = 0; i < uniqueTags.length; i++) {
-      map[uniqueTags[i]] = GROUP_COLORS[i % GROUP_COLORS.length];
+      // The six non-attention group roles (D4 of plan
+      // 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search):
+      // a tag is never drawn in the attention layer's red or amber.
+      map[uniqueTags[i]] = groupColorAt(i);
     }
     return map;
   }, [zoneLabels]);

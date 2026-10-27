@@ -47,7 +47,7 @@
 //!   itself, so an entry whose PID is absent from the live process table is
 //!   dropped rather than reported as open.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -301,6 +301,46 @@ pub fn find_live_session_by_id(
     session_id: &str,
 ) -> Option<LiveClaudeSession> {
     let mut best: Option<LiveClaudeSession> = None;
+    for_each_registry_file(config_dirs, |session| {
+        if session.session_id == session_id && displaces(best.as_ref(), &session) {
+            best = Some(session);
+        }
+    });
+    best
+}
+
+/// Every registry file under `config_dirs`, indexed by session id with the
+/// SAME precedence [`find_live_session_by_id`] applies per id — one directory
+/// walk for a whole listing instead of one per row. Unfiltered by PID, for the
+/// same reason that function is.
+pub fn index_live_sessions_by_id(
+    config_dirs: &[std::path::PathBuf],
+) -> HashMap<String, LiveClaudeSession> {
+    let mut index: HashMap<String, LiveClaudeSession> = HashMap::new();
+    for_each_registry_file(config_dirs, |session| {
+        if displaces(index.get(&session.session_id), &session) {
+            index.insert(session.session_id.clone(), session);
+        }
+    });
+    index
+}
+
+/// Whether `candidate` replaces `held` for the same id: the first row wins,
+/// and only an operator-named row displaces an already-held one — and only
+/// when what it displaces is a derived auto-name.
+fn displaces(held: Option<&LiveClaudeSession>, candidate: &LiveClaudeSession) -> bool {
+    let operator_named = candidate.name_source.as_deref() != Some("derived");
+    match held {
+        None => true,
+        Some(prev) => operator_named && prev.name_source.as_deref() == Some("derived"),
+    }
+}
+
+/// Parse every `<config_dir>/sessions/*.json`, fail-open per file.
+fn for_each_registry_file(
+    config_dirs: &[std::path::PathBuf],
+    mut visit: impl FnMut(LiveClaudeSession),
+) {
     for dir in config_dirs {
         let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
             continue; // no sessions dir on this account — normal
@@ -313,25 +353,11 @@ pub fn find_live_session_by_id(
             let Ok(bytes) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Some(session) = parse_registry_file(&bytes, dir) else {
-                continue;
-            };
-            if session.session_id != session_id {
-                continue;
-            }
-            let operator_named = session.name_source.as_deref() != Some("derived");
-            let wins = match &best {
-                None => true,
-                // Only an operator-named row displaces an already-held one, and
-                // only when what it displaces is a derived auto-name.
-                Some(prev) => operator_named && prev.name_source.as_deref() == Some("derived"),
-            };
-            if wins {
-                best = Some(session);
+            if let Some(session) = parse_registry_file(&bytes, dir) {
+                visit(session);
             }
         }
     }
-    best
 }
 
 #[cfg(test)]
@@ -475,6 +501,13 @@ mod tests {
         );
         // A config dir with no sessions dir is normal, not an error.
         assert!(find_live_session_by_id(&[root.join(".claude-nothing")], "dup").is_none());
+
+        // The one-walk index applies the same precedence per id.
+        let index = index_live_sessions_by_id(&dirs);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["dup"].name, "merge train steward");
+        assert_eq!(index["other"].name, "unrelated");
+        assert!(!index.contains_key("absent"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -26,11 +26,9 @@ import { describe, it, expect } from "vitest";
 
 import { COMMAND_BAR_INPUT_ID, COMMAND_BAR_INPUT_ACTIONS } from "./CommandBar";
 import { sessionCardElementId } from "./SessionCard";
-import {
-  SEARCH_INPUT_ACTIONS,
-  SESSION_MANAGER_HEADER_IDS,
-  sessionManagerAccountFilterId,
-} from "./SessionManagerHeader";
+import { SESSION_MANAGER_HEADER_IDS } from "./SessionManagerHeader";
+import { QUERY_INPUT_ACTIONS } from "./SessionQueryBar";
+import { SESSION_QUERY_CONTROLS, sessionQueryControlId } from "./sessionQueryChips";
 import { SESSION_MANAGER_TOGGLE_ID } from "./SessionManagerToggle";
 
 describe("text inputs advertise sendKeys", () => {
@@ -38,8 +36,8 @@ describe("text inputs advertise sendKeys", () => {
     expect(COMMAND_BAR_INPUT_ACTIONS).toContain("sendKeys");
   });
 
-  it("the session search box advertises sendKeys", () => {
-    expect(SEARCH_INPUT_ACTIONS).toContain("sendKeys");
+  it("the session query box advertises sendKeys", () => {
+    expect(QUERY_INPUT_ACTIONS).toContain("sendKeys");
   });
 
   it("advertises sendKeys ALONGSIDE the inferred input actions, not instead of them", () => {
@@ -58,7 +56,7 @@ describe("text inputs advertise sendKeys", () => {
       "clear",
     ]) {
       expect(COMMAND_BAR_INPUT_ACTIONS).toContain(inferred);
-      expect(SEARCH_INPUT_ACTIONS).toContain(inferred);
+      expect(QUERY_INPUT_ACTIONS).toContain(inferred);
     }
   });
 
@@ -93,7 +91,7 @@ describe("text inputs advertise sendKeys", () => {
       "reset",
       "autocomplete",
     ]);
-    for (const action of [...COMMAND_BAR_INPUT_ACTIONS, ...SEARCH_INPUT_ACTIONS]) {
+    for (const action of [...COMMAND_BAR_INPUT_ACTIONS, ...QUERY_INPUT_ACTIONS]) {
       expect(STANDARD_ACTIONS.has(action)).toBe(true);
     }
   });
@@ -117,7 +115,8 @@ describe("author-stamped control ids", () => {
     for (const id of [
       COMMAND_BAR_INPUT_ID,
       sessionCardElementId("x"),
-      sessionManagerAccountFilterId("gmail"),
+      sessionQueryControlId("chip", "needs-you"),
+      ...Object.values(SESSION_QUERY_CONTROLS).map((c) => c.id),
       ...Object.values(SESSION_MANAGER_HEADER_IDS),
     ]) {
       expect(id.startsWith("terminal.")).toBe(true);

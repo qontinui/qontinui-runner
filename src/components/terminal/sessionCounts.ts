@@ -5,8 +5,8 @@
  * routinely and legitimately differ in both directions:
  *
  *   - **Claude sessions** (`useSessionManager`'s `claudeSessionCount`) —
- *     machine-wide transcript sessions, including `active-external` ones with
- *     no tab in this window.
+ *     machine-wide transcript sessions that may be running, including
+ *     `Outside runner` ones with no tab in this window.
  *   - **Open panes** (`tabs.length`) — PTY tabs owned by this page.
  *   - **Zones** (`layout.zones.length`) — CSS grid cells.
  *
@@ -18,6 +18,98 @@
  */
 
 import type { SessionState } from "./useZoneLayout";
+import { isPossiblyLive, type SessionActivity, type SessionStatus } from "./sessionStatusModel";
+
+/** Counts surfaced to the Terminal-page StatusStrip pills. */
+export interface StatusCounts {
+  claudeSessionCount: number;
+  /** `Working` + `Waiting on lock` — running, wherever it runs. */
+  workingCount: number;
+  /**
+   * The `Outside runner` share of `workingCount` — a live registry process this
+   * runner does not own, matched per session. Carried separately so the strip
+   * headlines the rest and reports these as `+M outside runner` (see
+   * {@link splitWorking}).
+   */
+  outsideWorkingCount: number;
+  /** `Idle at prompt` + `No output (mid-tool)`: alive and not producing. */
+  idleCount: number;
+  /** `Finished` + `Exited` (code 0 or unknown). */
+  completedCount: number;
+  /** `Exited — error`. */
+  errorCount: number;
+  /** Counted rows whose activity is `Unknown` — reported, never folded in. */
+  unknownCount: number;
+}
+
+/** Which strip bucket an activity lands in. `Needs you` is its own pill. */
+const ACTIVITY_BUCKET: Record<
+  SessionActivity,
+  "working" | "idle" | "completed" | "error" | "needs-you" | "unknown"
+> = {
+  "needs-you": "needs-you",
+  "waiting-on-lock": "working",
+  working: "working",
+  "idle-at-prompt": "idle",
+  "no-output-mid-tool": "idle",
+  finished: "completed",
+  exited: "completed",
+  "exited-error": "error",
+  unknown: "unknown",
+};
+
+/**
+ * Pure bucketing for the Terminal-page StatusStrip, over the two-axis status.
+ *
+ * Counts only Claude sessions that may be RUNNING — every location but
+ * `Not running`. A historical transcript whose process is gone (the bulk of
+ * what `transcript_list_sessions` returns on a long-lived machine: the old
+ * "438 sessions / 436 idle" over-count) is dropped by its location, not by a
+ * guess from its age. A row whose location is `Unknown` IS counted: dropping it
+ * would turn "could not tell" into "not running".
+ *
+ * The bucket map is a `Record` over every activity, so adding one forces a
+ * decision here rather than silently dropping it.
+ */
+export function computeStatusCounts(
+  sessions: readonly { status: Pick<SessionStatus, "location" | "activity"> }[],
+): StatusCounts {
+  const counts: StatusCounts = {
+    claudeSessionCount: 0,
+    workingCount: 0,
+    outsideWorkingCount: 0,
+    idleCount: 0,
+    completedCount: 0,
+    errorCount: 0,
+    unknownCount: 0,
+  };
+  for (const { status } of sessions) {
+    if (!isPossiblyLive(status.location)) continue;
+    counts.claudeSessionCount++;
+    switch (ACTIVITY_BUCKET[status.activity]) {
+      case "working":
+        counts.workingCount++;
+        if (status.location === "outside-runner") counts.outsideWorkingCount++;
+        break;
+      case "idle":
+        counts.idleCount++;
+        break;
+      case "completed":
+        counts.completedCount++;
+        break;
+      case "error":
+        counts.errorCount++;
+        break;
+      case "unknown":
+        counts.unknownCount++;
+        break;
+      case "needs-you":
+        // Counted in the total; the strip's needs-input pill reports it.
+        break;
+    }
+  }
+  return counts;
+}
 
 /**
  * How many PTY TABS on this page are currently in `state`.
@@ -116,7 +208,7 @@ export function unionSessionCount(claudeSessionCount: number, liveTabCount: numb
  * THE DEFECT: the pill counted Claude sessions while the two things it
  * advertises — "Tab to cycle" (`focusNextNeedsInput`, a walk over zone
  * assignments) and the `BatchActions` buttons rendered beside it
- * (`needsInputTabs`) — both operate on PTY tabs. An active-EXTERNAL session
+ * (`needsInputTabs`) — both operate on PTY tabs. An `Outside runner` session
  * waiting for input has no tab in this window, so the strip claimed "2 need
  * input · Tab to cycle" while cycling reached one of them and Approve-all
  * would have written to one. The count a control claims must be the count
@@ -137,36 +229,36 @@ export function splitNeedsInput(
 }
 
 /**
- * Split the working count into what runs ON THIS PAGE and what runs elsewhere.
+ * Split the working count into what runs in THIS RUNNER and what runs outside it.
  *
- * THE DEFECT (UI-4): `workingCount` buckets `active-in-zone` AND
- * `active-external` sessions — the latter are other `claude` processes on the
- * box with no tab in this window — while the strip it headlines is labelled
- * "Terminal page status". One page worker and four external sessions read
- * "5 working", a count of work this page is not doing.
+ * THE DEFECT (UI-4): `workingCount` counts every running session, including
+ * `Outside runner` ones — `claude` processes this runner does not own, with no
+ * tab in this window — while the strip it headlines is labelled "Terminal page
+ * status". One page worker and four outside sessions read "5 working", a count
+ * of work this page is not doing.
  *
- * Same shape as {@link splitNeedsInput}: the headline is page-scoped and the
- * external remainder is reported as `+M external` — surfaced, not folded in
- * and not dropped. The external share is clamped to `[0, workingCount]` so a
- * transiently inconsistent pair can never render a negative page count.
+ * Same shape as {@link splitNeedsInput}: the headline excludes them and the
+ * remainder is reported as `+M outside runner` — surfaced, not folded in and
+ * not dropped. The outside share is clamped to `[0, workingCount]` so a
+ * transiently inconsistent pair can never render a negative headline.
  */
 export function splitWorking(
   workingCount: number,
-  externalWorkingCount: number,
-): { page: number; external: number } {
-  const external = Math.max(0, Math.min(externalWorkingCount, workingCount));
-  return { page: workingCount - external, external };
+  outsideWorkingCount: number,
+): { page: number; outside: number } {
+  const outside = Math.max(0, Math.min(outsideWorkingCount, workingCount));
+  return { page: workingCount - outside, outside };
 }
 
 /**
  * Render the working segment of the state-breakdown pill: `N working`, plus
- * ` +M external` when external sessions are running. Returns `null` when there
- * is nothing to show, so the caller can gate the segment on it.
+ * ` +M outside runner` when outside sessions are running. Returns `null` when
+ * there is nothing to show, so the caller can gate the segment on it.
  */
-export function formatWorking(split: { page: number; external: number }): string | null {
-  if (split.page === 0 && split.external === 0) return null;
+export function formatWorking(split: { page: number; outside: number }): string | null {
+  if (split.page === 0 && split.outside === 0) return null;
   const headline = `${split.page} working`;
-  return split.external > 0 ? `${headline} +${split.external} external` : headline;
+  return split.outside > 0 ? `${headline} +${split.outside} outside runner` : headline;
 }
 
 /**
