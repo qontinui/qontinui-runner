@@ -6,7 +6,13 @@
 
 import { describe, it, expect } from "vitest";
 
-import { migratedToast, type MigratedPayload } from "./useAccountMigrationNotifications";
+import {
+  migratedToast,
+  stalledToast,
+  tailToast,
+  type MigratedPayload,
+  type TailPayload,
+} from "./useAccountMigrationNotifications";
 
 const base: MigratedPayload = {
   claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
@@ -109,5 +115,78 @@ describe("migratedToast", () => {
       "Session 0c4e3025 migrated: .claude-a ran out of tokens → resumed on .claude-b",
     );
     expect(toast.type).toBe("success");
+  });
+});
+
+describe("stalledToast", () => {
+  it("is an error naming the destination, the reason and the screen line", () => {
+    const toast = stalledToast({
+      claudeSessionId: base.claudeSessionId,
+      toConfigDir: base.toConfigDir,
+      reason: "retry-gave-up",
+      escSent: true,
+      screenLine: "Claude usage limit reached",
+    });
+    expect(toast.type).toBe("error");
+    expect(toast.message).toContain("Session 0c4e3025");
+    expect(toast.message).toContain(".claude-b");
+    expect(toast.message).toContain("STALLED");
+    expect(toast.message).toContain("retry-gave-up");
+    expect(toast.message).toContain("one Esc was sent");
+    expect(toast.message).toContain("Claude usage limit reached");
+  });
+
+  it("says the reason is unknown rather than inventing one", () => {
+    const toast = stalledToast({});
+    expect(toast.type).toBe("error");
+    expect(toast.message).toContain("unknown reason");
+    expect(toast.message).not.toContain("Esc");
+  });
+});
+
+describe("tailToast", () => {
+  const tail: TailPayload = {
+    claudeSessionId: base.claudeSessionId,
+    toConfigDir: base.toConfigDir,
+    transcriptTail: "rescued",
+    transcriptTailLines: 4,
+    transcriptTailPath: "C:/claude/.claude-b/x/migration-tail/t.jsonl",
+  };
+
+  it("stays quiet for an empty tail and for a tail that was handed over or had nothing to hand over", () => {
+    expect(tailToast({ ...tail, transcriptTail: "empty", transcriptTailLines: 0 })).toBeNull();
+    expect(tailToast({ ...tail, transcriptTailDelivery: "delivered" })).toBeNull();
+    expect(tailToast({ ...tail, transcriptTailDelivery: "none_to_deliver" })).toBeNull();
+  });
+
+  it("is an error naming the saved path when a rescued tail could not be handed over", () => {
+    for (const d of ["gave_up", "submit_failed"] as const) {
+      const toast = tailToast({ ...tail, transcriptTailDelivery: d });
+      expect(toast?.type).toBe("error");
+      expect(toast?.message).toContain("4 line(s)");
+      expect(toast?.message).toContain(d);
+      expect(toast?.message).toContain("migration-tail");
+    }
+  });
+
+  it("is info when auto-continue is off", () => {
+    const toast = tailToast({ ...tail, transcriptTailDelivery: "skipped_auto_continue_off" });
+    expect(toast?.type).toBe("info");
+    expect(toast?.message).toContain("auto-continue is off");
+  });
+
+  it("never renders an UNKNOWN tail as nothing lost, and never prints a null count as 0", () => {
+    for (const status of ["not-read", "source-shorter-unknown", "offset-unknown"] as const) {
+      const toast = tailToast({
+        ...tail,
+        transcriptTail: status,
+        transcriptTailLines: null,
+        transcriptTailDelivery: null,
+      });
+      expect(toast).not.toBeNull();
+      expect(toast?.message).toContain(status);
+      expect(toast?.message).toContain("could not check");
+      expect(toast?.message).not.toContain(" 0 ");
+    }
   });
 });
