@@ -159,11 +159,37 @@ pub fn replay_release_due(terminal_id: &str, now: Instant) -> bool {
         })
 }
 
-/// Forget respawned panes that are no longer live.
-pub fn retain_live_panes(live: &HashSet<&String>) {
+/// Forget respawned panes that are no longer live. `live` is the terminal
+/// list the scan took at `scan_started`; a pane respawned AFTER that instant
+/// is not in it yet, and is kept — dropping it would let the very next scan
+/// read its replayed banner as news (the 2026-10-22 churn this guard exists
+/// to stop; round-11 review W2).
+pub fn retain_live_panes(live: &HashSet<&String>, scan_started: Instant) {
     let mut guard = REPLAY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = guard.as_mut() {
-        map.retain(|tid, _| live.contains(tid));
+        retain_guards(map, live, scan_started);
+    }
+}
+
+/// Pure: [`retain_live_panes`] over one map — the unit-test seam (the global
+/// map is shared by every test in the process).
+fn retain_guards(
+    map: &mut HashMap<String, ReplayGuard>,
+    live: &HashSet<&String>,
+    scan_started: Instant,
+) {
+    map.retain(|tid, g| live.contains(tid) || g.respawned_at >= scan_started);
+}
+
+/// Record that the RUNNER submitted a prompt into `terminal_id` (the
+/// migration's continue nudge). Whatever the pane renders after that is the
+/// session working, not the transcript replaying, so it counts as a turn:
+/// the next scan lifts the suppression exactly as a seen spinner would. A
+/// pane with no guard is left alone.
+pub fn note_runner_submission(terminal_id: &str) {
+    let mut guard = REPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(terminal_id)) {
+        entry.turned = true;
     }
 }
 
@@ -268,6 +294,65 @@ mod tests {
         assert_eq!(
             usage_limit_replay_verdict(tid, false, past),
             ReplayVerdict::BottomRowsOnly
+        );
+    }
+
+    /// Round-11 W2: a scan takes its terminal list, then retains against it.
+    /// A pane respawned in between is not in that list but must survive the
+    /// retain; a pane respawned BEFORE the scan and absent from it is gone.
+    ///
+    /// Mutation check: retaining on `live.contains(tid)` alone drops the
+    /// mid-scan respawn and fails the first assertion.
+    #[test]
+    fn a_pane_respawned_during_a_scan_survives_that_scans_retain() {
+        let t0 = Instant::now();
+        let guard_at = |at: Instant| ReplayGuard {
+            respawned_at: at,
+            turned: false,
+            lifted: false,
+        };
+        let mut map = HashMap::new();
+        map.insert("closed-before".to_string(), guard_at(t0));
+        map.insert(
+            "mid-scan".to_string(),
+            guard_at(t0 + Duration::from_millis(5)),
+        );
+        let live_tid = "live".to_string();
+        map.insert(live_tid.clone(), guard_at(t0));
+        let live: HashSet<&String> = [&live_tid].into_iter().collect();
+        retain_guards(&mut map, &live, t0 + Duration::from_millis(1));
+        assert!(
+            map.contains_key("mid-scan"),
+            "respawned after the scan began"
+        );
+        assert!(map.contains_key("live"));
+        assert!(!map.contains_key("closed-before"), "gone before the scan");
+        retain_guards(&mut map, &live, t0 + Duration::from_millis(10));
+        assert!(
+            !map.contains_key("mid-scan"),
+            "the next scan, which did see the list after it, drops it"
+        );
+    }
+
+    /// Round-11 S5: a runner submission counts as a turn — the next scan
+    /// lifts the suppression — and touches no pane without a guard.
+    ///
+    /// Mutation check: making `note_runner_submission` a no-op fails the
+    /// second verdict.
+    #[test]
+    fn a_runner_submission_lifts_the_suppression_from_the_next_scan() {
+        let t0 = Instant::now();
+        let tid = "replay-test-submitted";
+        note_respawned_pane(tid, t0);
+        note_runner_submission(tid);
+        note_runner_submission("replay-test-never-noted");
+        assert_eq!(
+            usage_limit_replay_verdict(tid, false, t0 + Duration::from_secs(1)),
+            ReplayVerdict::BottomRowsOnly
+        );
+        assert_eq!(
+            usage_limit_replay_verdict("replay-test-never-noted", false, t0),
+            ReplayVerdict::NotRespawned
         );
     }
 }
