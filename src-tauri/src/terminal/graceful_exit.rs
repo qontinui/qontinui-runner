@@ -168,6 +168,11 @@ fn is_unsent_draft(input: &str) -> bool {
     !input.is_empty() && !input.starts_with(PLACEHOLDER_PREFIX)
 }
 
+/// Whether `row` carries the `❯` input marker at all, draft or not.
+pub(crate) fn is_prompt_row(row: &str) -> bool {
+    prompt_row(row).is_some()
+}
+
 /// Whether `row` is a `❯` input row holding an unsent draft, by the same rule
 /// [`input_prompt_ready`] refuses on. For screen rules that read rendered
 /// text without a cursor (the migration follow-up's limit-wait gate).

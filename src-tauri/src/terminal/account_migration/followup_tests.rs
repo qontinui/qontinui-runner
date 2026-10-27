@@ -306,6 +306,20 @@ fn a_draft_below_the_banner_blocks_without_box_rules() {
     assert!(!screen_shows_limit_wait(one_rule));
 }
 
+/// Round-16 W1: the banner drawn UNDER the input box (a status line) still
+/// has the box's draft seen — the lowest `❯` row decides, wherever the
+/// banner is; an empty box there is still the wait.
+///
+/// Mutation check: reading the draft only on rows below the banner (round
+/// 14) fails the first assertion.
+#[test]
+fn a_draft_above_a_status_line_banner_blocks() {
+    let drafted = "────────\n❯ half-typed operator draft\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(!screen_shows_limit_wait(drafted));
+    let idle = "────────\n❯ \n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(screen_shows_limit_wait(idle));
+}
+
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///
