@@ -107,7 +107,9 @@ pub(crate) struct TranscriptCopy {
     /// ([`MainCarry::Copied`], [`MainCarry::ExtendedPrefix`], and
     /// [`MainCarry::DivergedPreserved`]), after which the destination holds the
     /// source's bytes up to that boundary (plus that `\n`, in the whole-record
-    /// case).
+    /// case) — except with no complete line and a torn fragment, where the
+    /// offset is 0 and the destination still holds that fragment, so
+    /// `dst == src[..offset]` is not an invariant to splice on.
     ///
     /// `None` when this carry copied nothing because the destination already
     /// held the transcript ([`MainCarry::Present`], [`MainCarry::KeptExisting`]
