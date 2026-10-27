@@ -363,13 +363,23 @@ pub fn migration_verdict(
 /// would leave two open records on the terminal and the copy would fail
 /// anyway (2026-10-23 review fix 9) — refuse instead, before anything is
 /// written.
-pub fn rebound_transcript_gate(sid: &str, src: &str, has_transcript: bool) -> Result<(), String> {
-    if has_transcript {
-        Ok(())
-    } else {
-        Err(format!(
+///
+/// `has_transcript` is the result of a presence probe (`try_exists`), not a
+/// bool: a stat that FAILED is not "no transcript", and is refused with its
+/// own reason rather than as an absence.
+pub fn rebound_transcript_gate(
+    sid: &str,
+    src: &str,
+    has_transcript: std::io::Result<bool>,
+) -> Result<(), String> {
+    match has_transcript {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
             "identity-unresolved(rebound id {sid} has no transcript under {src})"
-        ))
+        )),
+        Err(e) => Err(format!(
+            "identity-unresolved(rebound id {sid}: its transcript under {src} could not be stat'ed: {e})"
+        )),
     }
 }
 
@@ -381,18 +391,50 @@ pub fn rebound_transcript_gate(sid: &str, src: &str, has_transcript: bool) -> Re
 pub fn roster_spelling(dir: &std::path::Path, roster: &[String]) -> String {
     roster
         .iter()
-        .find(|r| std::path::Path::new(r.trim()) == dir)
+        .find(|r| same_config_path(std::path::Path::new(r.trim()), dir))
         .map(|r| r.trim().to_string())
         .unwrap_or_else(|| dir.to_string_lossy().into_owned())
 }
 
 /// Whether two spellings of a config dir name the same account, by the
 /// comparison [`roster_spelling`] itself matches with: as paths, after
-/// trimming — so separators, `.` segments and a trailing slash do not count.
-/// Two spellings [`roster_spelling`] maps onto one roster entry are equal
-/// here too.
+/// trimming — so `.` segments and a trailing slash do not count, and on
+/// Windows neither do separators (`/` vs `\`) or letter case, because a
+/// Windows config dir lives on a case-insensitive filesystem and its spelling
+/// comes from several sources (settings, env, the discovery sweep). Two
+/// spellings [`roster_spelling`] maps onto one roster entry are equal here
+/// too.
 pub fn same_config_dir(a: &str, b: &str) -> bool {
-    std::path::Path::new(a.trim()) == std::path::Path::new(b.trim())
+    same_config_path(
+        std::path::Path::new(a.trim()),
+        std::path::Path::new(b.trim()),
+    )
+}
+
+/// The one path comparison [`same_config_dir`] and [`roster_spelling`] share.
+/// On Windows: component by component, each lowercased with `/` normalised to
+/// `\` (only a prefix such as a UNC `//host/share` can still carry one —
+/// `Path` already splits components on both separators and spells the root
+/// as `\`). Elsewhere: `Path` equality, case-sensitive like the filesystem.
+fn same_config_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        fn key(p: &std::path::Path) -> Vec<String> {
+            p.components()
+                .map(|c| {
+                    c.as_os_str()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .replace('/', "\\")
+                })
+                .collect()
+        }
+        key(a) == key(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 #[cfg(test)]
@@ -880,13 +922,66 @@ mod tests {
 
     /// Fix 9: a rebound id with no transcript refuses before any write.
     ///
-    /// Mutation check: returning `Ok(())` unconditionally fails.
+    /// Mutation check: returning `Ok(())` unconditionally fails; so does
+    /// reading a failed stat as `Ok(true)` (or as the absence message).
     #[test]
     fn a_rebound_id_without_a_transcript_is_refused() {
-        assert_eq!(rebound_transcript_gate("b", "C:/a", true), Ok(()));
+        assert_eq!(rebound_transcript_gate("b", "C:/a", Ok(true)), Ok(()));
         assert_eq!(
-            rebound_transcript_gate("b", "C:/a", false),
+            rebound_transcript_gate("b", "C:/a", Ok(false)),
             Err("identity-unresolved(rebound id b has no transcript under C:/a)".into())
         );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let refused = rebound_transcript_gate("b", "C:/a", Err(denied)).unwrap_err();
+        assert!(
+            refused.starts_with(
+                "identity-unresolved(rebound id b: its transcript under C:/a could not be stat'ed: "
+            ),
+            "a failed stat is refused as unreadable, not as absent: {refused}"
+        );
+    }
+
+    /// Windows config dirs compare case-insensitively and separator-blind,
+    /// in both `same_config_dir` and `roster_spelling` (they share one
+    /// comparison). Different accounts still differ.
+    ///
+    /// Mutation check: dropping the lowercase (or the `/` normalisation of a
+    /// UNC prefix) fails an assertion.
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_dirs_compare_case_insensitively_and_separator_blind() {
+        assert!(same_config_dir(
+            r"C:\Users\Me\.claude-a",
+            " c:/users/me/.CLAUDE-A/ "
+        ));
+        assert!(same_config_dir(
+            r"\\Host\Share\.claude-a",
+            "//host/share/.claude-a"
+        ));
+        assert!(!same_config_dir(
+            r"C:\Users\Me\.claude-a",
+            r"C:\Users\Me\.claude-b"
+        ));
+        assert!(!same_config_dir(
+            r"C:\Users\Me\.claude-a",
+            r"D:\Users\Me\.claude-a"
+        ));
+        let roster = vec![r"C:\Users\Me\.claude-a".to_string()];
+        assert_eq!(
+            roster_spelling(std::path::Path::new("c:/users/me/.claude-a"), &roster),
+            r"C:\Users\Me\.claude-a"
+        );
+    }
+
+    /// Elsewhere the comparison stays case-sensitive, like the filesystem,
+    /// while `.` segments and a trailing slash still do not count.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_config_dirs_compare_case_sensitively() {
+        assert!(same_config_dir(
+            "/home/me/.claude-a/",
+            "/home/me/./.claude-a"
+        ));
+        assert!(!same_config_dir("/home/me/.claude-a", "/home/me/.Claude-A"));
     }
 }
