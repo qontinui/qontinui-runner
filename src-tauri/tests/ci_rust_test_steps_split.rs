@@ -717,3 +717,75 @@ fn no_step_after_the_build_half_invokes_cargo_again() {
          `cargo-test-build.log` and run it directly, as `{RUN}` does."
     );
 }
+
+/// Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability` Phase 1: an
+/// out-of-memory Rust test step is annotated as CAPACITY, in the title coord
+/// reads as "not a verdict on this PR". The matching itself is fixture-tested
+/// by `scripts/tests/test_oom_signature.sh`; this pins the WIRING, whose
+/// failure modes are all silent — an emitter that never runs, reads the wrong
+/// log, or drops the build-phase suffix still leaves every job green-or-red
+/// exactly as before.
+#[test]
+fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
+    const EMITTER: &str = "Annotate an out-of-memory Rust test step";
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let emitter = find_step(&steps, EMITTER);
+
+    let cond = emitter
+        .get("if")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("`{EMITTER}` must carry an `if:` condition"));
+    assert!(
+        cond.contains("failure()"),
+        "`{EMITTER}`'s `if:` must include `failure()`, got `{cond}` — a default \
+         `success()` never runs on the one state it exists to explain"
+    );
+    assert_eq!(
+        emitter.get("continue-on-error").and_then(|v| v.as_bool()),
+        Some(true),
+        "`{EMITTER}` is a diagnostic and must carry `continue-on-error: true`"
+    );
+    assert!(
+        emitter.get("timeout-minutes").is_none(),
+        "`{EMITTER}` must NOT carry a step-level `timeout-minutes` (see the \
+         other two diagnostics)"
+    );
+    assert!(
+        position(&steps, RUN) < position(&steps, EMITTER),
+        "`{EMITTER}` must run after `{RUN}`, whose log it reads"
+    );
+
+    let body = command_lines(emitter, EMITTER);
+    assert!(
+        body.contains("scripts/ci/oom-signature.sh"),
+        "`{EMITTER}` must call scripts/ci/oom-signature.sh, the fixture-tested matcher"
+    );
+    // The build phase reads the BUILD log and carries `--build-phase` (the
+    // `killed IN THE BUILD` suffix coord write-skips); the run phase reads the
+    // RUN log without it, so a run-phase OOM stays red and is re-run.
+    let build_call = body
+        .split("bash scripts/ci/oom-signature.sh")
+        .find(|call| call.contains(&format!("--step \"{BUILD}\"")))
+        .unwrap_or_else(|| panic!("`{EMITTER}` never calls the emitter for `{BUILD}`"));
+    assert!(
+        build_call.contains("--build-phase") && build_call.contains("cargo-test-build.log"),
+        "the `{BUILD}` call must pass `--build-phase` and the build log: {build_call}"
+    );
+    let run_call = body
+        .split("bash scripts/ci/oom-signature.sh")
+        .find(|call| call.contains(&format!("--step \"{RUN}\"")))
+        .unwrap_or_else(|| panic!("`{EMITTER}` never calls the emitter for `{RUN}`"));
+    assert!(
+        !run_call.contains("--build-phase") && run_call.contains("cargo-test-output.log"),
+        "the `{RUN}` call must read the run log WITHOUT `--build-phase` (tests \
+         may have run, so it must stay red): {run_call}"
+    );
+    // A saturated pagefile is NOT OOM evidence (plan Phase 0: hosted Windows
+    // peaks at 32767 of 32768 MB on jobs that failed in tests, and near it on
+    // green ones), so the emitter must not be handed a MEMPEAK reading.
+    assert!(
+        !body.contains("MEMPEAK") && !body.contains("mempeak"),
+        "`{EMITTER}` must not read a MEMPEAK/pagefile reading as an OOM signature"
+    );
+}
