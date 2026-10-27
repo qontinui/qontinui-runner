@@ -637,6 +637,44 @@ fn the_carry_records_the_two_sidecar_dirs_it_used() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Round-14 S3: a subagent transcript copied mid-append is settled like the
+/// main one — its torn last line cut, a whole unterminated record completed —
+/// and a non-`.jsonl` sidecar is copied byte for byte.
+///
+/// Mutation check: copying `.jsonl` sidecars without `settle_subagent_jsonl`
+/// leaves the torn `{"b"` and fails the first assertion.
+#[test]
+fn a_subagent_transcript_copied_mid_append_is_settled() {
+    let tmp = scratch("subagent-settle");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-torn.jsonl", b"{\"a\":1}\n{\"b\""),
+            ("subagents/agent-whole.jsonl", b"{\"a\":1}\n{\"b\":2}"),
+            ("tool-results/r1.txt", b"line\npartial"),
+        ],
+    );
+    carry(&src, &dst);
+    let side = literal_sidecar(&dst);
+    assert_eq!(
+        std::fs::read(side.join("subagents").join("agent-torn.jsonl")).unwrap(),
+        b"{\"a\":1}\n"
+    );
+    assert_eq!(
+        std::fs::read(side.join("subagents").join("agent-whole.jsonl")).unwrap(),
+        b"{\"a\":1}\n{\"b\":2}\n"
+    );
+    assert_eq!(
+        std::fs::read(side.join("tool-results").join("r1.txt")).unwrap(),
+        b"line\npartial",
+        "not a transcript: copied as is"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn a_session_with_no_subagents_lists_none_but_still_carries_its_sidecars() {
     let tmp = scratch("zero");

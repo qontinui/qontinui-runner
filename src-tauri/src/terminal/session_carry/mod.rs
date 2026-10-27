@@ -1091,6 +1091,21 @@ pub(crate) fn settle_jsonl_end(path: &Path) -> std::io::Result<u64> {
     Ok(boundary)
 }
 
+/// [`settle_jsonl_end`] for a `.jsonl` under `<sid>/` (a subagent transcript),
+/// run on the `.partial` before its rename: a copy taken mid-append is cut back
+/// to its last line boundary (or its whole final record completed), so the
+/// resumed subagent's first append starts a fresh line (round-14 review S3).
+/// No tail offset is recorded for these, so a failure is logged, not fatal.
+fn settle_subagent_jsonl(partial: &Path) {
+    if let Err(e) = settle_jsonl_end(partial) {
+        warn!(
+            path = %partial.display(),
+            error = %e,
+            "session transcript carry: could not settle a subagent transcript copy on a line boundary — its first resumed append may join a torn line"
+        );
+    }
+}
+
 /// Whether `bytes` are one complete JSON object (a transcript record).
 fn is_whole_json_object(bytes: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v| v.is_object())
@@ -1346,7 +1361,13 @@ fn carry_walked_files(
                 let written = to
                     .parent()
                     .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|()| copy_via_partial(from, &to));
+                    .and_then(|()| {
+                        if is_jsonl(rel) {
+                            copy_via_partial_with(from, &to, settle_subagent_jsonl)
+                        } else {
+                            copy_via_partial(from, &to)
+                        }
+                    });
                 match written {
                     Ok(()) => {
                         carry.copied += 1;
@@ -1503,7 +1524,12 @@ fn preserve_diverged_file(
     rename_aside: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
     carry: &mut SessionDirCarry,
 ) -> CarryWrite {
-    match preserve_diverged_and_copy(from, to, rename_aside, |_| ()) {
+    let settle = |partial: &Path| {
+        if is_jsonl(to) {
+            settle_subagent_jsonl(partial);
+        }
+    };
+    match preserve_diverged_and_copy(from, to, rename_aside, settle) {
         Ok((backup, ())) => {
             warn!(
                 from = %from.display(),
