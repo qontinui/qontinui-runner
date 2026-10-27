@@ -54,3 +54,25 @@ export function zoneOfTab(
   }
   return null;
 }
+
+/**
+ * Drop the filters (and the open filter input) of tabs no longer live, so a
+ * closed session's entry does not outlive it. Same identity when nothing was
+ * dropped.
+ */
+export function pruneTabFilters(
+  filters: TabFilters,
+  openInput: string | null,
+  live: ReadonlySet<string>,
+): { filters: TabFilters; openInput: string | null } {
+  let next: Record<string, string> | null = null;
+  for (const tabId of Object.keys(filters)) {
+    if (live.has(tabId)) continue;
+    next ??= { ...filters };
+    delete next[tabId];
+  }
+  return {
+    filters: next ?? filters,
+    openInput: openInput !== null && !live.has(openInput) ? null : openInput,
+  };
+}

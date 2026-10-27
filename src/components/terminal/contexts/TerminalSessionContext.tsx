@@ -340,6 +340,7 @@ const PageSessionScope = memo(function PageSessionScope({
     zoneLayout.assignments,
     pageId,
     zoneLayout.layoutSwitch,
+    tabIds,
   );
 
   // Sync focused zone → active tab.
