@@ -2775,24 +2775,30 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         // A status-block `Area:` the parser rejected: warned here, once per
         // plan per reconcile pass, and nowhere else — the parse is pure, and
         // the plan-library body sync parses the same files. The push still
-        // runs, with `metadata.area` omitted. Deliberately repeated every
-        // pass: the declaration stays visible until the plan file is fixed.
+        // runs, and a rejected header counts as none, so the push CLEARS any
+        // stored `metadata.area`. Every arm does: the phases arm's wholesale
+        // `metadata` replace drops the key, and the phase-less patch and the
+        // archive stamp send `null`, an RFC 7396 delete. Deliberately repeated
+        // every pass: the declaration stays visible until the plan file is
+        // fixed.
         if let Some(why) = &u.area_rejected {
             tracing::warn!(
                 slug = %u.slug,
                 path = %u.source_path,
-                "plan adapter: status-block `Area:` rejected — {why}; \
-                 metadata.area omitted for this plan"
+                "plan adapter: status-block `Area:` rejected — {why}; a rejected \
+                 header counts as none, so this plan's push clears any stored \
+                 metadata.area"
             );
         }
-        // The same rule for `Initiative-Item:` — warned here, every pass, the
-        // push still runs with `metadata.initiative_item` omitted.
+        // The same rule for `Initiative-Item:`: warned here, every pass, and
+        // the push clears any stored `metadata.initiative_item` the same way.
         if let Some(why) = &u.initiative_item_rejected {
             tracing::warn!(
                 slug = %u.slug,
                 path = %u.source_path,
-                "plan adapter: status-block `Initiative-Item:` rejected — {why}; \
-                 metadata.initiative_item omitted for this plan"
+                "plan adapter: status-block `Initiative-Item:` rejected — {why}; a \
+                 rejected header counts as none, so this plan's push clears any \
+                 stored metadata.initiative_item"
             );
         }
         // A push coord has already refused is not re-issued: the request would
@@ -11230,8 +11236,9 @@ Body.
     }
 
     /// A rejected status-block `Area:` is warned by the reconcile — exactly
-    /// once per plan per pass — and the push still lands, with `metadata.area`
-    /// omitted. A unit with an accepted area is not warned and carries it.
+    /// once per plan per pass — and the push still lands, clearing any stored
+    /// `metadata.area`, which the warning says. A unit with an accepted area is
+    /// not warned and carries it.
     #[tokio::test]
     async fn reconcile_warns_once_per_pass_for_a_rejected_area() {
         use super::super::parser::HeaderRejection;
@@ -11283,9 +11290,9 @@ Body.
             2,
             "one warning per pass for the one bad plan: {log}"
         );
-        assert!(warned
-            .iter()
-            .all(|l| l.contains("2026-01-01-bad-area") && l.contains("agent_worktree")));
+        assert!(warned.iter().all(|l| l.contains("2026-01-01-bad-area")
+            && l.contains("agent_worktree")
+            && l.contains("push clears any stored metadata.area")));
 
         let upserts = sink.upserts.lock().unwrap();
         let meta_for = |slug: &str| {
@@ -11305,8 +11312,9 @@ Body.
     }
 
     /// `Initiative-Item:` mirrors `Area:`: a rejected declaration is warned
-    /// once per plan per pass and the push still lands with
-    /// `metadata.initiative_item` omitted; an accepted one is carried.
+    /// once per plan per pass, and the push still lands, clearing any stored
+    /// `metadata.initiative_item`, which the warning says; an accepted one is
+    /// carried.
     #[tokio::test]
     async fn reconcile_warns_once_per_pass_for_a_rejected_initiative_item() {
         use super::super::parser::HeaderRejection;
@@ -11358,9 +11366,9 @@ Body.
             2,
             "one warning per pass for the one bad plan: {log}"
         );
-        assert!(warned
-            .iter()
-            .all(|l| l.contains("2026-01-01-bad-item") && l.contains("One Screen")));
+        assert!(warned.iter().all(|l| l.contains("2026-01-01-bad-item")
+            && l.contains("One Screen")
+            && l.contains("push clears any stored metadata.initiative_item")));
 
         let upserts = sink.upserts.lock().unwrap();
         let meta_for = |slug: &str| {
