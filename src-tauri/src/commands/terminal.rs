@@ -2207,6 +2207,9 @@ pub async fn terminal_migrate_session_account(
     )
     .await
     .map_err(|reason| format!("migration refused: {reason}"))?;
+    // The click is the confirmation: a `Rebound` correction is written now,
+    // before the migration re-reads the record by its id.
+    subject.commit_correction(&store);
     let (record, src, identity_note) = (
         subject.record,
         subject.src_config_dir,
@@ -2225,7 +2228,7 @@ pub async fn terminal_migrate_session_account(
             "no usable target account (every other account exhausted/cooled/unauthenticated)",
         )?,
     };
-    if dst == src {
+    if crate::terminal::account_migration::target_is_current_account(&dst, &src) {
         return Err("target account equals the session's current account".to_string());
     }
     // A picked target is already in the handoff ledger; an explicit one is not.

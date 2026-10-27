@@ -836,6 +836,77 @@ pub struct TerminalSessionRecord {
     pub adopted_from: Option<String>,
 }
 
+/// The PANE a session record is bound to — the fields that belong to the
+/// terminal, not to the conversation running in it. See
+/// [`TerminalSessionRecord::bound_to_pane`].
+#[derive(Debug, Clone)]
+pub struct PaneBinding {
+    pub terminal_id: String,
+    pub working_dir: Option<String>,
+    pub page_id: String,
+    pub zone_index: i32,
+    pub title: Option<String>,
+}
+
+impl TerminalSessionRecord {
+    /// A fresh open record for `session_id` under `config_dir`, bound to
+    /// `pane`, with EVERY session-scoped field unset: no coord handle, task
+    /// run, finish / wind-down / restore stamps, account label or name.
+    ///
+    /// The one constructor for "this pane now runs a different session" —
+    /// the binder's bind/re-bind (`reconcile::bind_record`) and the account
+    /// migration's `Rebound` correction — so the two never disagree about
+    /// what carries over. Copying the old session's record instead carried
+    /// its `finished_at` / `handle` / `task_run_id` onto the new id (round-12
+    /// review W2): a pane `/clear`ed out of a finished session then read
+    /// finished, dropped out of restore and could be wound down. A caller
+    /// that knows further PANE-scoped facts (provider, tenant, bypass flag,
+    /// spawn-time device default) sets them on the result.
+    pub fn bound_to_pane(
+        session_id: &str,
+        config_dir: &str,
+        origin: &str,
+        confirmed_at: Option<i64>,
+        pane: PaneBinding,
+    ) -> Self {
+        TerminalSessionRecord {
+            claude_session_id: session_id.to_string(),
+            config_dir: Some(config_dir.to_string()),
+            working_dir: pane.working_dir,
+            page_id: pane.page_id,
+            zone_index: pane.zone_index,
+            title: pane.title,
+            terminal_id: pane.terminal_id,
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: DEFAULT_PROVIDER.to_string(),
+            origin: Some(origin.to_string()),
+            restore_pending_at: None,
+            confirmed_at,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
+            finish_reason: None,
+            finish_synced: false,
+            spawn_device_default: None,
+            adopted_from: None,
+        }
+    }
+}
+
 /// See [`TerminalSessionRecord::spawn_device_default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
