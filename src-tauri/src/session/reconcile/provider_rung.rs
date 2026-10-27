@@ -295,7 +295,10 @@ fn retain_live_terminals(set: &mut HashSet<(String, String)>, live: &[LivePty]) 
 /// each re-bind is RE-CHECKED against the store as of `now_ms` first
 /// ([`rebind_still_applies`]): one whose record moved on, or whose pane or
 /// session became part of a migration hand-off meanwhile, is skipped
-/// (round-13 review S3).
+/// (round-13 review S3). That re-check and the `record_open` after it are
+/// check-then-write, not one atomic step, so a hand-off can still land
+/// between them: the window is NARROWED from the whole transcript probe to
+/// that gap, not closed (round-14 review S2).
 pub fn apply_registry_rebinds(
     store: &SessionLifecycleStore,
     planned: Vec<(PlannedRebind, bool)>,
