@@ -116,9 +116,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # (in place, or run by path from a test); the checkout we were invoked from (the
 # shim and pre-commit both run hooks with cwd at the repo top level); and only
 # then our own parent directory.
-RUNNER_DIR="${QONTINUI_HOOK_REPO_ROOT:-}"
-[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+#
+# The two git lookups run WITHOUT the scope variables git exports to hooks: in a
+# linked worktree git sets GIT_DIR (and no GIT_WORK_TREE), so the work tree
+# becomes the cwd and `git -C "$SCRIPT_DIR" rev-parse --show-toplevel` answers
+# `.pre-commit-hooks` itself. gen_events_clear_inherited_git_env (below) cannot
+# simply move up here: it records GIT_INDEX_FILE against the hook's real GIT_DIR.
+# An exported root is accepted only when it looks like this repo (src-tauri/),
+# so a stale or foreign value falls through rather than aborting on `cd`.
+_root_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX git "$@"; }
+RUNNER_DIR=""
+if [ -n "${QONTINUI_HOOK_REPO_ROOT:-}" ] && [ -d "${QONTINUI_HOOK_REPO_ROOT}/src-tauri" ]; then
+    RUNNER_DIR="$QONTINUI_HOOK_REPO_ROOT"
+fi
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$RUNNER_DIR" ] || RUNNER_DIR="$SCRIPT_DIR/.."
 RUNNER_DIR="$(cd "$RUNNER_DIR" && pwd)"
 
