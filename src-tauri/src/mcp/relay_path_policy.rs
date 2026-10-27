@@ -54,9 +54,27 @@
 //!   ENTIRE runner API surface rides this arm: ~60 routes across its domain
 //!   clients. Each one below is a measured call site, not a guess.
 //! * **qontinui-web's own frontend.** `runnerProxyGet`
-//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s three reads,
-//!   and the co-pilot planner's `POST prompt-home/plan`
+//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s four reads —
+//!   the spec list, the spec graph and the snapshot are listed below, while
+//!   the fourth, `useRunnerApps`'s `GET /apps`, is on no entry, so this arm
+//!   answers it 403 — and the co-pilot planner's `POST prompt-home/plan`
 //!   (`lib/co-pilot/planClient.ts`).
+//!   The console's UI Bridge dashboard (`/admin/coord/ui-bridge`, plan
+//!   `2026-10-23-console-presentation-spaces` Phase 6) reuses those hooks and
+//!   makes four relay calls of its own from
+//!   `admin/coord/ui-bridge/_lib/relayReads.ts`, a module that phase's web
+//!   half adds (it is on qontinui-web main once that half lands):
+//!   `fetchRunnerHealth` (`GET /health`, listed below);
+//!   `fetchRunnerComponents` (`GET /ui-bridge/control/components`, through
+//!   `runnerProxyGet`) and `fetchRunnerPageHealth`
+//!   (`POST /ui-bridge/control/page-health`, through `runnerProxyPost`, the
+//!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`), the two
+//!   entries listed for it; and `fetchRunnerVisibility`
+//!   (`POST /ui-bridge/control/visibility`, the occlusion sweep), which this
+//!   arm also answers 403. The dashboard renders that 403 as a labelled
+//!   UNKNOWN, and `the_dashboard_reads_open_nothing_beside_them` pins the
+//!   refusal. The "Two web calls" paragraph below says why `GET /apps` and
+//!   the sweep are refused.
 //!
 //! Nothing else in the workspace sends an `http_request` frame.
 //!
@@ -68,6 +86,48 @@
 //! `/api/v1/...` SSE streams. Listing a route that does not exist would fail
 //! this module's own registration tripwire, and refusing a 404 with a 403
 //! changes nothing a client can observe. Add the entry WITH the route.
+//!
+//! Two web calls to routes the runner DOES register are refused as well, each
+//! for a reason of its own:
+//!
+//! * `GET /apps` (`useRunnerApps`) answers with whole `App` records
+//!   (`qontinui_types::apps::App`): each registered app's `repo_root` and
+//!   `ui_bridge_url`, and its `build_command` and `start_command`. Phase 6
+//!   was briefed to add the two dashboard entries above, and the plan's app
+//!   registry is the web's own `/api/v1/fleet/apps`, which needs no relay. So
+//!   opening `GET /apps` was not Phase 6's decision to make.
+//!   qontinui-runner#2178 (plan `2026-10-12-digital-twin-runner-panels-end-to-end`)
+//!   proposes the entry, together with its reasoning about that exposure.
+//! * `POST /ui-bridge/control/visibility` (`fetchRunnerVisibility`, the
+//!   occlusion sweep) was also outside Phase 6's brief, and it is not ready to
+//!   list. Its report quotes webview text, as page health's findings do: each
+//!   occlusion entry carries the covered element's label and text
+//!   (`screenshots::occlusion_entry`). Before it can be listed, it needs the
+//!   two things page health's entry came with. The first is an end-to-end
+//!   review of `screenshots::ui_bridge_visibility_handler` that establishes
+//!   it is read-only and bounded. The second is an arm in
+//!   `backend_relay::http_request_egress_refusal` that gives it the
+//!   snapshot's and page health's gate (terminal stream, strictest bound
+//!   tenant, refuse). The sweep is also the only route that serves
+//!   `occlusionDataObserved`: page health's report has no occlusion field. So
+//!   until this entry lands, the occlusion row that the plan's Phase 6 asks
+//!   the dashboard for reads UNKNOWN on every runner.
+//!
+//! `the_web_calls_the_docs_name_as_refused_stay_refused` pins both refusals,
+//! so an entry that opens either one fails that test until this paragraph and
+//! the bullet above are updated with it.
+//!
+//! # What a relayed request looks like to the local API
+//!
+//! The arm forwards the frame's method, path, query, headers and body. It
+//! drops `host`, `connection`, `transfer-encoding`, `content-length`,
+//! `origin` and `sec-fetch-site` from the headers, and adds one header of its
+//! own: [`RELAYED_REQUEST_HEADER`]. It is inserted after the frame's headers are
+//! copied, so every relayed request carries it and no frame can strip or
+//! replace it. A handler that must answer a REMOTE caller more narrowly
+//! than a local one reads it through [`is_relayed_request`]. One does today:
+//! the component read (`ui_bridge::elements::ComponentSources`), which keeps
+//! a relayed read to the runner's own registry.
 //!
 //! # The drift tripwire
 //!
@@ -127,6 +187,40 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/control/snapshot"),
     // -- qontinui-web: co-pilot planner (`planClient.ts`) ---------------
     ("POST", "/prompt-home/plan"),
+    // -- qontinui-web: UI Bridge dashboard (`/admin/coord/ui-bridge`) ---
+    // Both called from `admin/coord/ui-bridge/_lib/relayReads.ts`.
+    //
+    // `fetchRunnerComponents` (through `runnerProxyGet`). A LOCAL read of this
+    // route merges two sources: the runner's own webview registry, and the
+    // `getComponents` reply of every live WebSocket-registered app. Those
+    // replies are passed through unvalidated, and nothing in the merged list
+    // says which app sent which entry. A RELAYED read returns the runner's own
+    // registry only
+    // (`ui_bridge::elements::ComponentSources`, keyed on
+    // [`RELAYED_REQUEST_HEADER`]). No registered app is asked, which has two
+    // effects. None of them can hold the relay's read loop, which awaits this
+    // call inline, for the 30 s each dispatch may wait. And no third-party
+    // page's JSON reaches a remote caller as if it were the runner's. What
+    // flows is the runner's `serializeComponent` output: ids, names,
+    // descriptions, and actions with their declared `effect`. It carries no
+    // component state. Some names and descriptions embed runtime data: a saved
+    // project's name, and, while the runner's UI Bridge integration page lists
+    // a registered app, that app's self-declared name. The invocation route
+    // each action advertises,
+    // `POST /ui-bridge/control/component/{id}/action/{action_id}`, stays off.
+    ("GET", "/ui-bridge/control/components"),
+    // `fetchRunnerPageHealth` (through `runnerProxyPost`). POST because the
+    // route is registered as one. It changes no settings, sessions, files or
+    // app state. It ignores its body, sends the runner's own webview one
+    // `discover` on every call (`screenshots::discover_all_elements_payload`),
+    // and analyses the reply in bounded passes. The `discover` has one side
+    // effect, in the webview SDK: its executor clears its in-memory discovery
+    // cache and rebuilds it from the live DOM. Every `discover` does that,
+    // including the one the snapshot handler sends when the registry is
+    // empty, although that one sends a different payload. Page health's
+    // findings quote webview text, so its response takes the snapshot's
+    // egress gate (`backend_relay::http_request_egress_refusal`).
+    ("POST", "/ui-bridge/control/page-health"),
     // -- mobile: task runs, chat, workflow control ---------------------
     ("GET", "/task-runs"),
     ("GET", "/task-runs/running"),
@@ -212,6 +306,31 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     ("GET", "/analytics/account-usage"),
     ("GET", "/analytics/prepaid-balance"),
 ];
+
+/// The header the `http_request` arm adds to every request it forwards to the
+/// local API, so a handler can tell a REMOTE caller from a local one.
+///
+/// `backend_relay::relay_http_to_base` inserts it after copying the frame's
+/// own headers. `insert` replaces every value already under the name, so a
+/// relayed request always carries this header and a frame can neither strip
+/// it nor pre-empt it. Presence is the whole signal: the value only names the
+/// arm.
+///
+/// **It may only ever NARROW what a handler does.** Any local caller can send
+/// it too, so it is never a credential and never grants anything. A local
+/// caller that sends it gets the narrower answer a remote one gets, which
+/// costs it nothing it could not have by leaving the header out.
+pub const RELAYED_REQUEST_HEADER: &str = "x-qontinui-relayed";
+
+/// The value [`RELAYED_REQUEST_HEADER`] carries: the arm that forwarded the
+/// request.
+pub const RELAYED_REQUEST_HEADER_VALUE: &str = "http_request";
+
+/// Did this request reach the local API through the relay's `http_request`
+/// arm? Reads [`RELAYED_REQUEST_HEADER`] by presence, whatever its value.
+pub fn is_relayed_request(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RELAYED_REQUEST_HEADER)
+}
 
 /// What the relay may do with one `http_request` frame's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +766,151 @@ pub(crate) mod tests {
             relay_path_verdict("GET", "/files/read/etc/passwd"),
             RelayPathVerdict::NotAllowed
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The UI Bridge dashboard's two reads (plan
+    // 2026-10-23-console-presentation-spaces, Phase 6): each allowance is as
+    // wide as its one client call, and no wider
+    // ------------------------------------------------------------------
+
+    /// `fetchRunnerComponents`: the component registry relays as a GET, in
+    /// every spelling that normalises to it, and under no other method.
+    #[test]
+    fn the_dashboard_component_read_relays_as_a_get_only() {
+        for path in [
+            "/ui-bridge/control/components",
+            "ui-bridge/control/components",
+            "//ui-bridge//control/components",
+            "/UI-Bridge/Control/COMPONENTS",
+            "\\ui-bridge\\control\\components",
+            "/ui-bridge/control/compo%6Eents",
+            "/ui-bridge/control/components?appId=x1#top",
+        ] {
+            for method in ["GET", "get"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Allow,
+                    "{method} {path} is the dashboard's component read"
+                );
+            }
+            for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}: the component allowance is a read only"
+                );
+            }
+        }
+    }
+
+    /// `fetchRunnerPageHealth`: page health relays as a POST, the method its
+    /// route is registered with, in every spelling that normalises to it, and
+    /// under no other method.
+    #[test]
+    fn the_dashboard_page_health_read_relays_as_a_post_only() {
+        for path in [
+            "/ui-bridge/control/page-health",
+            "ui-bridge/control/page-health",
+            "/UI-BRIDGE/control/Page-Health",
+            "/ui-bridge/control/page%2Dhealth",
+            "/ui-bridge/./control/page-health",
+            "/ui-bridge/control/page-health?x=1",
+        ] {
+            for method in ["POST", "post"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Allow,
+                    "{method} {path} is the dashboard's page-health read"
+                );
+            }
+            for method in ["GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}: page health is allowed as the POST it is registered as"
+                );
+            }
+        }
+    }
+
+    /// Nothing beside the two dashboard reads opens with them: a path one
+    /// segment deeper, the singular component routes and the action
+    /// invocation the component read advertises, page health's siblings
+    /// (`/control/health`, `/control/visibility`, `/control/discover`,
+    /// `/control/page/*`), and re-cased or percent-encoded spellings that
+    /// normalise to any of those. Traversal out of an allowed path is refused
+    /// as malformed, never resolved into the route it names.
+    #[test]
+    fn the_dashboard_reads_open_nothing_beside_them() {
+        for path in [
+            "/ui-bridge/control/components/x1",
+            "/ui-bridge/control/components/x1/action/delete",
+            "/ui-bridge/control/component",
+            "/ui-bridge/control/component/x1",
+            "/ui-bridge/control/component/x1/state",
+            "/ui-bridge/control/component/x1/action/delete",
+            "/ui-bridge/control/component/x1/action/delete/predict",
+            "/ui-bridge/control/page-health/x1",
+            "/ui-bridge/control/health",
+            "/ui-bridge/control/health-signals",
+            "/ui-bridge/control/visibility",
+            "/ui-bridge/control/discover",
+            "/ui-bridge/control/elements",
+            "/ui-bridge/control/page",
+            "/ui-bridge/control/page/evaluate",
+            "/ui-bridge/control/page/close-request",
+            "/ui-bridge/control",
+            "/ui-bridge",
+            "/UI-Bridge/Control/Components/X1",
+            "/ui-bridge/control/components%2Fx1",
+            "/ui-bridge/control/component%2Fx1%2Faction%2Fdelete",
+            "/ui-bridge/control/page-health%2Fx1",
+            "/ui-bridge/control/page%2Fevaluate",
+        ] {
+            for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path} must not be relayable"
+                );
+            }
+        }
+        for path in [
+            "/ui-bridge/control/page-health/../page/evaluate",
+            "/ui-bridge/control/page-health%2F..%2Fpage%2Fevaluate",
+            "/ui-bridge/control/components/%2e%2e/component/x1/action/delete",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Malformed,
+                    "{method} {path}: traversal is refused, never resolved"
+                );
+            }
+        }
+    }
+
+    /// The module docs name two web calls to REGISTERED routes that this arm
+    /// refuses, and say why: `useRunnerApps`'s `GET /apps`, and the
+    /// dashboard's occlusion sweep, `POST /ui-bridge/control/visibility`. This
+    /// pins both, so the prose cannot outlive the fact it states. An entry that
+    /// opens either one turns it red, including an entry a rebase carries in
+    /// (qontinui-runner#2178 proposes one for `GET /apps`). Whoever adds such an
+    /// entry updates the docs' qontinui-web bullet and their "Two web calls"
+    /// paragraph together with this list. For the sweep, that paragraph also
+    /// names the review and the egress arm its entry needs first.
+    #[test]
+    fn the_web_calls_the_docs_name_as_refused_stay_refused() {
+        for (method, path) in [("GET", "/apps"), ("POST", "/ui-bridge/control/visibility")] {
+            assert_eq!(
+                relay_path_verdict(method, path),
+                RelayPathVerdict::NotAllowed,
+                "{method} {path} is relayable now, so the module docs that call it \
+                 refused are wrong: update the qontinui-web bullet and the \"Two web \
+                 calls\" paragraph, then this list"
+            );
+        }
     }
 
     /// The matcher itself, against a synthetic table.
@@ -2565,6 +2829,113 @@ fn e2e_mock() -> Router {
                 );
             }
         }
+    }
+
+    /// **The UI Bridge family relays exactly three reads.** The runner
+    /// registers hundreds of routes under `/ui-bridge/`: `page/evaluate`,
+    /// `page/close-request`, element and component actions, the SDK and
+    /// invoke proxies. Every path the two enumerations below find is asked
+    /// under every method, both as registered and with its placeholders
+    /// filled. Only the snapshot, the component registry and page health may
+    /// answer `Allow`, each under its one method, so a wildcard or an extra
+    /// method that reaches this family fails here and names the route.
+    /// Widening the family on purpose means adding its pair to `RELAYED`, with
+    /// the client that needs it named on the `RELAY_ALLOWED` entry.
+    ///
+    /// What is enumerated, exactly. The family is the union of two sources,
+    /// because each has a blind spot the other covers:
+    ///
+    /// - `registered_routes()`: every `.route("…", …)` call under `src/` whose
+    ///   first token is a string literal. It reaches `/ui-bridge/` routes
+    ///   registered outside `mcp::ui_bridge`, such as `/ui-bridge/ws`. It
+    ///   cannot see a literal preceded by a comment inside `.route(`, or
+    ///   either path an `add_dual!` registers through `concat!`.
+    /// - `ui_bridge::route_manifest()`, which
+    ///   `ui_bridge::manifest_drift_tests::manifest_matches_route_calls` holds
+    ///   equal to every `.route(` call in `mcp::ui_bridge`: comment-prefixed
+    ///   literals and both paths of every `add_dual!` included.
+    ///
+    /// At this test's writing, every `/ui-bridge/` registration under `src/`
+    /// takes one of those three forms: a plain literal, a comment-prefixed
+    /// literal, or an `add_dual!`. A registration in any other form, such as a
+    /// path from a constant, is invisible to both sources, and so to this test.
+    #[test]
+    fn the_ui_bridge_family_relays_exactly_the_three_named_reads() {
+        const RELAYED: &[(&str, &str)] = &[
+            ("GET", "/ui-bridge/control/snapshot"),
+            ("GET", "/ui-bridge/control/components"),
+            ("POST", "/ui-bridge/control/page-health"),
+        ];
+        for (method, path) in RELAYED {
+            assert_eq!(
+                relay_path_verdict(method, path),
+                RelayPathVerdict::Allow,
+                "{method} {path} is one of the family's relayed reads"
+            );
+        }
+
+        let family: std::collections::BTreeSet<String> = registered_routes()
+            .into_iter()
+            .map(|(_, path)| path)
+            .chain(
+                crate::mcp::ui_bridge::route_manifest()
+                    .iter()
+                    .map(|(_, path)| (*path).to_string()),
+            )
+            .filter(|path| path.starts_with("/ui-bridge/"))
+            .collect();
+        assert!(
+            family.len() > 300,
+            "the route scan found only {} `/ui-bridge/` registrations — it is broken, not the family",
+            family.len()
+        );
+        // The literal scan alone cannot see these, so their presence is what
+        // shows the manifest half of the union is in effect: both paths of an
+        // `add_dual!`, and a literal behind a comment inside `.route(`.
+        for unscannable in [
+            "/ui-bridge/control/wait-for-element",
+            "/ui-bridge/ai/wait-for-element",
+            "/ui-bridge/control/state-summary",
+        ] {
+            assert!(
+                family.contains(unscannable),
+                "{unscannable} is missing from the family. Either the manifest is no longer \
+                 part of the enumeration, or the route was renamed; if it was renamed, name \
+                 another `add_dual!` or comment-prefixed route here"
+            );
+        }
+        for path in &family {
+            let filled = with_placeholders_filled(path);
+            for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                let relayed = RELAYED.contains(&(method, path.as_str()));
+                for candidate in [path.as_str(), filled.as_str()] {
+                    let verdict = relay_path_verdict(method, candidate);
+                    if relayed {
+                        assert_eq!(verdict, RelayPathVerdict::Allow, "{method} {candidate}");
+                    } else {
+                        assert!(
+                            verdict.is_refusal(),
+                            "{method} {candidate} is relayable — the UI Bridge family relays \
+                             only {RELAYED:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `path` with every `{placeholder}` segment replaced by a concrete one.
+    fn with_placeholders_filled(path: &str) -> String {
+        path.split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    "x1"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     /// No entry is listed twice, and every one is spelled in the registered
