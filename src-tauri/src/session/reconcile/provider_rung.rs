@@ -207,29 +207,35 @@ fn deferred_logged() -> &'static std::sync::Mutex<HashSet<(String, String)>> {
     CELL.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
 
-/// Apply [`decide_registry_rebind`] to every live PTY with a confirmed record.
+/// One re-bind [`plan_registry_rebinds`] decided on, still to be gated on
+/// the new id's transcript existing.
+#[derive(Debug, Clone)]
+pub struct PlannedRebind {
+    pub pty: LivePty,
+    pub ai_pid: u32,
+    pub zone_index: i32,
+    pub rebind: RegistryRebind,
+}
+
+/// The decision half of [`rebind_confirmed_from_registry`]: every live PTY
+/// with a confirmed record whose pane's valid row names a different id
+/// ([`decide_registry_rebind`]) and that no [`binder_exclusion`] withholds.
+/// Reads no files and writes nothing, so a caller on the async runtime can
+/// probe the transcripts off it before [`apply_registry_rebinds`].
 ///
-/// The re-bind is written only when a transcript for the NEW id exists
-/// (`transcript_exists(config_dir, working_dir, sid)`), so it lands CONFIRMED
-/// and `record_open`'s single-tenant supersede retires the stale record on the
-/// same terminal in the same write. Without a transcript yet (a `/clear`
-/// before the first prompt) it is deferred to a later tick and logged once.
-/// Returns the `Bind` actions written, for the `session-bound` event.
-///
-/// A pane [`binder_exclusion`] names (forked id, migration hand-off) is never
-/// re-bound.
-pub fn rebind_confirmed_from_registry<N, F>(
+/// Also forgets deferred-re-bind log entries for terminals that are no
+/// longer live, so that set does not grow for the runner's lifetime.
+pub fn plan_registry_rebinds<N>(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     index: &N,
     snapshot: &ProcessSnapshot,
     exclusions: &HandoffExclusions,
-    transcript_exists: F,
-) -> Vec<ReconcileAction>
+) -> Vec<PlannedRebind>
 where
     N: ProviderSessionIndex,
-    F: Fn(&str, &str, &str) -> bool,
 {
+    prune_deferred_logged(live);
     let rows = valid_rows_for_ptys(live.iter(), index, snapshot);
     let forked = forked_session_ids(live.iter(), &rows);
     let mut out = Vec::new();
@@ -255,7 +261,48 @@ where
             );
             continue;
         }
-        if !transcript_exists(&rb.config_dir, &pty.working_dir, &rb.to_session_id) {
+        out.push(PlannedRebind {
+            pty: pty.clone(),
+            ai_pid,
+            zone_index: rec.zone_index,
+            rebind: rb,
+        });
+    }
+    out
+}
+
+/// Drop deferred-log entries whose terminal is not in `live`.
+fn prune_deferred_logged(live: &[LivePty]) {
+    if let Ok(mut set) = deferred_logged().lock() {
+        retain_live_terminals(&mut set, live);
+    }
+}
+
+/// Pure: keep only the `(terminal, sid)` entries whose terminal is in `live`.
+fn retain_live_terminals(set: &mut HashSet<(String, String)>, live: &[LivePty]) {
+    set.retain(|(terminal, _)| live.iter().any(|p| &p.terminal_id == terminal));
+}
+
+/// The write half of [`rebind_confirmed_from_registry`]: each planned re-bind
+/// paired with whether a transcript for the NEW id exists. With one, the
+/// re-bind is written CONFIRMED, so `record_open`'s single-tenant supersede
+/// retires the stale record on the same terminal in the same write. Without
+/// one yet (a `/clear` before the first prompt) it is deferred to a later
+/// tick and logged once. Returns the `Bind` actions written, for the
+/// `session-bound` event.
+pub fn apply_registry_rebinds(
+    store: &SessionLifecycleStore,
+    planned: Vec<(PlannedRebind, bool)>,
+) -> Vec<ReconcileAction> {
+    let mut out = Vec::new();
+    for (p, transcript_exists) in planned {
+        let PlannedRebind {
+            pty,
+            ai_pid,
+            zone_index,
+            rebind: rb,
+        } = p;
+        if !transcript_exists {
             let first = deferred_logged()
                 .lock()
                 .map(|mut s| s.insert((rb.terminal_id.clone(), rb.to_session_id.clone())))
@@ -272,12 +319,12 @@ where
             continue;
         }
         store.record_open(bind_record(
-            pty,
+            &pty,
             &rb.to_session_id,
             &rb.config_dir,
             ORIGIN_AUTHORITATIVE,
             true,
-            rec.zone_index,
+            zone_index,
         ));
         tracing::info!(
             terminal_id = %rb.terminal_id,
@@ -295,6 +342,40 @@ where
         });
     }
     out
+}
+
+/// Apply [`decide_registry_rebind`] to every live PTY with a confirmed record:
+/// [`plan_registry_rebinds`], then [`apply_registry_rebinds`] gated on
+/// `transcript_exists(config_dir, working_dir, sid)` for the NEW id. The
+/// synchronous composition, for callers already off the async runtime (and
+/// the tests); `refresh_titles_pass` probes on the blocking pool instead.
+///
+/// A pane [`binder_exclusion`] names (forked id, migration hand-off) is never
+/// re-bound.
+pub fn rebind_confirmed_from_registry<N, F>(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    index: &N,
+    snapshot: &ProcessSnapshot,
+    exclusions: &HandoffExclusions,
+    transcript_exists: F,
+) -> Vec<ReconcileAction>
+where
+    N: ProviderSessionIndex,
+    F: Fn(&str, &str, &str) -> bool,
+{
+    let planned = plan_registry_rebinds(store, live, index, snapshot, exclusions)
+        .into_iter()
+        .map(|p| {
+            let found = transcript_exists(
+                &p.rebind.config_dir,
+                &p.pty.working_dir,
+                &p.rebind.to_session_id,
+            );
+            (p, found)
+        })
+        .collect();
+    apply_registry_rebinds(store, planned)
 }
 
 #[cfg(test)]
@@ -887,13 +968,29 @@ mod tests {
         );
     }
 
+    /// Round-12 S4: the deferred-re-bind log forgets terminals that are no
+    /// longer live, instead of growing for the runner's lifetime. Exercised on
+    /// a local set: the process-global log is pruned by every parallel test
+    /// that runs a re-bind pass, so asserting on it races.
+    ///
+    /// Mutation check: making `retain_live_terminals` a no-op keeps the
+    /// closed terminal's entry and fails the first assertion.
+    #[test]
+    fn the_deferred_rebind_log_forgets_closed_terminals() {
+        let key = |t: &str| (t.to_string(), "to-sid".to_string());
+        let mut set: HashSet<(String, String)> = [key("closed"), key("live")].into();
+        retain_live_terminals(&mut set, &[pty_anchored("live", 1, 1, "C:/repo")]);
+        assert!(!set.contains(&key("closed")));
+        assert!(set.contains(&key("live")));
+    }
+
     /// Fix 8: the title / re-bind pass reads the tick's shared raw registry,
     /// never the disk — a registry built in memory renames the tab.
     ///
     /// Mutation check: making `refresh_titles_pass` build its index from a
     /// fresh disk read instead of `registry` leaves the title unchanged.
-    #[test]
-    fn the_title_pass_reads_the_ticks_shared_registry() {
+    #[tokio::test]
+    async fn the_title_pass_reads_the_ticks_shared_registry() {
         use crate::session::claude_session_registry::{RawRegistry, RawRegistryFile};
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
@@ -910,7 +1007,7 @@ mod tests {
             dir_errors: vec![],
             complete: true,
         };
-        let out = super::super::refresh_titles_pass(&store, &live, &snap(&[100]), &raw);
+        let out = super::super::refresh_titles_pass(&store, &live, &snap(&[100]), &raw).await;
         assert_eq!(out.titles.len(), 1, "{:?}", out.titles);
         assert_eq!(
             store
