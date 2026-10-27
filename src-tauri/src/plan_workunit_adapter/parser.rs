@@ -551,9 +551,12 @@ pub fn extract_area(body: &str) -> HeaderDecl {
 }
 
 /// Extract the plan's `Initiative-Item:` from the status blockquote — the key
-/// of the initiative `in_scope` entry the plan serves, which coord's
-/// project-state door counts the unit under (a unit without one is counted as
-/// `unattributed`, never guessed). Every rule is [`extract_area`]'s, applied to
+/// of the initiative `in_scope` entry the plan serves. The scanner only stores
+/// it, as `metadata.initiative_item`. Counting a unit under its key (and a
+/// unit without one as `unattributed`, never guessed) is the job of the
+/// project-state reader that lands with the plan's coord Phase 5 PR. No coord
+/// serves that reader as of this change, so until it lands nothing reads the
+/// stored value. Every rule is [`extract_area`]'s, applied to
 /// the key `Initiative-Item:`: the same block, the same two accepted key
 /// spellings, the same two rejected near-misses, the same value delimiting and
 /// the same [`is_kebab_case`] grammar, because the scanner is shared.
