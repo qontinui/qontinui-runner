@@ -713,10 +713,26 @@ where
     // their last line boundary. Nothing else writes `dst` yet — the respawn
     // comes after the carry. A destination the carry did not write, or a
     // boundary that cannot be read, leaves the offset UNKNOWN.
+    //
+    // The torn last line belongs to the TAIL (the rescue reads it whole from
+    // the source), so `dst` is cut back to the boundary too: left in place,
+    // the resumed CLI's first append would glue a new record onto the
+    // fragment and corrupt one JSONL line (round-12 review S3).
     let transcript_offset = match &main_carry {
         MainCarry::Copied | MainCarry::ExtendedPrefix | MainCarry::DivergedPreserved { .. } => {
             match line_boundary_offset(&dst) {
-                Ok(offset) => Some(offset),
+                Ok(offset) => {
+                    if let Err(e) = truncate_to_line_boundary(&dst, offset) {
+                        warn!(
+                            session = %claude_session_id,
+                            dst = %dst.display(),
+                            offset,
+                            error = %e,
+                            "session transcript carry: could not cut the copy back to its last line boundary — the resumed session's first append may join a torn line"
+                        );
+                    }
+                    Some(offset)
+                }
                 Err(e) => {
                     warn!(
                         session = %claude_session_id,
@@ -1020,6 +1036,22 @@ pub(crate) fn line_boundary_offset(path: &Path) -> std::io::Result<u64> {
         end = start;
     }
     Ok(0)
+}
+
+/// Cut `path` back to `offset` (its last line boundary, from
+/// [`line_boundary_offset`]) when bytes of a torn line follow it. Only when
+/// `0 < offset < len`: at `offset == len` there is nothing to cut, and a copy
+/// holding NO complete line (`offset == 0`) is left as it is rather than
+/// emptied, since the resume needs a transcript. `Ok(true)` when it cut.
+pub(crate) fn truncate_to_line_boundary(path: &Path, offset: u64) -> std::io::Result<bool> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if offset == 0 || offset >= len {
+        return Ok(false);
+    }
+    file.set_len(offset)?;
+    file.sync_all()?;
+    Ok(true)
 }
 
 /// Copy `from` to a temporary `<to>.<pid>.<seq>.partial` and return its path.
