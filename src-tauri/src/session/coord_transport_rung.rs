@@ -967,19 +967,26 @@ mod tests {
             operation_for_call("tools/call", Some("coord_memory_record")),
             OPERATION_WRITE
         );
-        // The overlord's proof reads and ledger read are reads; the ledger
-        // append (`coord_overlord_record`) stays a write.
+        // The overlord's proof reads and ledger reads are reads; the ledger
+        // appends (`coord_overlord_record`, and the triage-pass ledger's
+        // `coord_overlord_pass_record`) stay writes. The pass ledger's two reads
+        // are reads by the `coord_query_` prefix, with no exact entry.
         for tool in [
             "coord_watch_verdict",
             "coord_session_obligations",
             "coord_overlord_interventions",
+            "coord_query_overlord_passes",
+            "coord_query_overlord_flow",
         ] {
             assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
         }
-        assert_eq!(
-            operation_for_call("tools/call", Some("coord_overlord_record")),
-            OPERATION_WRITE
-        );
+        for tool in ["coord_overlord_record", "coord_overlord_pass_record"] {
+            assert_eq!(
+                operation_for_call("tools/call", Some(tool)),
+                OPERATION_WRITE,
+                "{tool} is a ledger append"
+            );
+        }
         // The one-screen reads: neither is prefix-covered (`coord_work_unit_list`
         // does not claim `coord_work_unit_overview`), so both are exact entries.
         assert_eq!(
