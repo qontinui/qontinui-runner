@@ -207,6 +207,25 @@ if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
   exec_real "$@"
 fi
 
+# Non-session invocation (claude --version / --help / a management subcommand
+# such as `claude mcp list`): the same pure passthrough — pinning one turned
+# `claude --version` into a hung session launch with a bogus session-open.
+# Mirrors `non_session_invocation` in src/bin/qontinui_shim.rs, the SOURCE OF
+# TRUTH for both lists; keep the three surfaces in step.
+if [ "$TOOL" = "claude" ]; then
+  non_session=0
+  shopt -s nocasematch
+  for a in "$@"; do
+    case "$a" in --version|-v|--help|-h) non_session=1; break ;; esac
+  done
+  case "${1:-}" in
+    mcp|doctor|update|upgrade|install|setup-token|plugin|plugins|auth|auto-mode|agents|logs|rm|stop|kill|purge|import)
+      non_session=1 ;;
+  esac
+  shopt -u nocasematch
+  [ "$non_session" = "1" ] && exec_real "$@"
+fi
+
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 
 # ---------------------------------------------------------------------------

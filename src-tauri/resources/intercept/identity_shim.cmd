@@ -75,6 +75,32 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
 rem ---- recursion guard: a nested invocation never re-pins -------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
 
+rem ---- non-session invocation: the same pure passthrough --------------------
+rem claude --version / --help / a management subcommand (claude mcp list) is
+rem NOT a session; pinning one turned `claude --version` into a hung session
+rem launch with a bogus session-open. Mirrors `non_session_invocation` in
+rem src/bin/qontinui_shim.rs, the SOURCE OF TRUTH for both lists; keep the
+rem three surfaces in step. Nothing is appended on this path.
+set "NON_SESSION=0"
+set "FIRST=%~1"
+if /I "%TOOL%"=="claude" (
+  for %%A in (%*) do (
+    set "TOK=%%~A"
+    if /I "!TOK!"=="--version" set "NON_SESSION=1"
+    if /I "!TOK!"=="-v" set "NON_SESSION=1"
+    if /I "!TOK!"=="--help" set "NON_SESSION=1"
+    if /I "!TOK!"=="-h" set "NON_SESSION=1"
+  )
+  for %%S in (mcp doctor update upgrade install setup-token plugin plugins auth auto-mode agents logs rm stop kill purge import) do (
+    if /I "!FIRST!"=="%%S" set "NON_SESSION=1"
+  )
+)
+if "%NON_SESSION%"=="1" (
+  set "SETTINGS_ARGS="
+  set "MCPCFG_ARGS="
+  goto :passthrough
+)
+
 set "PINNED=%QONTINUI_PINNED_SESSION_ID%"
 
 rem ---- Claude SessionStart hook delivery (plan SECTION 4, Phase 2) ----------

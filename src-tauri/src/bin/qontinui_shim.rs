@@ -295,6 +295,58 @@ pub fn user_chose_session(args: &[String]) -> bool {
     })
 }
 
+/// Claude Code subcommands that manage the install/config and never open a
+/// conversation, checked against `claude --help` (2.1.311, 2026-10-27).
+/// Deliberately absent: `resume` (already [`user_chose_session`]), and
+/// `attach` / `respawn` / `ultrareview` / `gateway`, which open or run a
+/// session or a long-lived process. `config` and `migrate-installer` are no
+/// longer subcommands there — `claude config` is a PROMPT — so they are out.
+const NON_SESSION_SUBCOMMANDS: &[&str] = &[
+    "mcp",
+    "doctor",
+    "update",
+    "upgrade",
+    "install",
+    "setup-token",
+    "plugin",
+    "plugins",
+    "auth",
+    "auto-mode",
+    "agents",
+    "logs",
+    "rm",
+    "stop",
+    "kill",
+    "purge",
+    "import",
+];
+
+/// Is this a NON-SESSION invocation (`claude --version`, `claude mcp list`)?
+/// Then the identity shim must be a pure passthrough, exactly like the
+/// recursion guard: no `--settings`, no `--mcp-config`, no `--session-id`, no
+/// session-open POST, no self-provision. Pinning one turned `claude --version`
+/// into a pinned session launch that hung and recorded a bogus session-open.
+///
+/// Narrow on purpose, so a real session is never mistaken for one: any token
+/// EXACTLY (case-insensitive) `--version`/`-v`/`--help`/`-h`, OR a FIRST token
+/// in [`NON_SESSION_SUBCOMMANDS`]. `-p`/`--print` is a session. A prompt that
+/// merely contains `-h` is one argv entry and does not match.
+///
+/// SOURCE OF TRUTH for the mirrored checks in `identity_shim.bash` and
+/// `identity_shim.cmd`.
+pub fn non_session_invocation(args: &[String]) -> bool {
+    let flag = args.iter().any(|a| {
+        matches!(
+            a.to_ascii_lowercase().as_str(),
+            "--version" | "-v" | "--help" | "-h"
+        )
+    });
+    flag || args.first().is_some_and(|first| {
+        let t = first.to_ascii_lowercase();
+        NON_SESSION_SUBCOMMANDS.contains(&t.as_str())
+    })
+}
+
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
 /// path is non-empty AND that file exists ⇒ `["--settings", <path>]` (two argv
 /// entries — native args, no quoting games). Otherwise empty (fail-open).
@@ -575,6 +627,12 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
+        return exec_real(&real, tool.program(), args);
+    }
+
+    // Non-session invocation (`claude --version`, `claude mcp list`): the same
+    // pure passthrough. Claude only — the subcommand list is Claude Code's.
+    if tool == IdentityTool::Claude && non_session_invocation(args) {
         return exec_real(&real, tool.program(), args);
     }
 
@@ -1840,6 +1898,46 @@ mod tests {
             "--append-system-prompt",
             "use --resume-like flows"
         ])));
+    }
+
+    #[test]
+    fn non_session_invocation_version_help_and_management_subcommands() {
+        // Version/help flags, any position, case-insensitive.
+        for tok in ["--version", "-v", "--help", "-h", "--VERSION", "-H"] {
+            assert!(non_session_invocation(&strs(&[tok])), "{tok}");
+            assert!(
+                non_session_invocation(&strs(&["--model", "opus", tok])),
+                "{tok} after other flags"
+            );
+        }
+        // A management subcommand as the FIRST token.
+        assert!(non_session_invocation(&strs(&["mcp", "list"])));
+        assert!(non_session_invocation(&strs(&["MCP", "list"])));
+        for sub in NON_SESSION_SUBCOMMANDS {
+            assert!(non_session_invocation(&strs(&[sub])), "{sub}");
+        }
+    }
+
+    #[test]
+    fn non_session_invocation_never_matches_a_real_session() {
+        // `-p`/`--print` is a session: keep pinning.
+        assert!(!non_session_invocation(&strs(&["-p", "hi"])));
+        assert!(!non_session_invocation(&strs(&["--print", "mcp"])));
+        assert!(!non_session_invocation(&strs(&["--model", "opus"])));
+        // A prompt that merely CONTAINS a flag is one argv entry.
+        assert!(!non_session_invocation(&strs(&["fix the -h flag"])));
+        // A bare `claude` is the canonical session launch.
+        assert!(!non_session_invocation(&strs(&[])));
+        // A subcommand word only counts in the FIRST position.
+        assert!(!non_session_invocation(&strs(&["-p", "mcp"])));
+        // Removed/not-a-subcommand words are prompts, and `resume` is
+        // user-chose, not non-session.
+        assert!(!non_session_invocation(&strs(&["config"])));
+        assert!(!non_session_invocation(&strs(&["resume"])));
+        assert!(!non_session_invocation(&strs(&["attach", "abc"])));
+        // Lookalikes are not exact tokens.
+        assert!(!non_session_invocation(&strs(&["--versions"])));
+        assert!(!non_session_invocation(&strs(&["-vv"])));
     }
 
     #[test]
