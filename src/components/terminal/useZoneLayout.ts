@@ -557,6 +557,10 @@ export function useZoneLayout(
    * re-run after `initialized` is already true) and set when that run opens
    * its auto-save gate. Until then tab counts are the drain's, and an owed
    * auto-trim waits. True for a page no restore is running on.
+   *
+   * An ABORTED restore (an indeterminate reconnect) leaves it false, so the
+   * trim stays held until the page's next restore run opens the gate,
+   * exactly as auto-save stays closed until then.
    */
   const [restoreSettled, setRestoreSettled] = useState(true);
   const [focusedZone, setFocusedZone] = useState<number>(

@@ -5,6 +5,7 @@ import {
   INITIAL_LAYOUT_SWITCH,
   migrateZoneMetadataByTab,
   migrateZoneSetByTab,
+  anchoredToSeenTabs,
   rememberVacatedZones,
   type LayoutSwitch,
 } from "./zoneAutoTrim";
@@ -40,6 +41,13 @@ export function useZoneLabelsAndTags(
    * takes the per-layout path below, unchanged.
    */
   layoutSwitch: LayoutSwitch = INITIAL_LAYOUT_SWITCH,
+  /**
+   * The page's live tab ids (`useZoneLayout`'s `tabIds`). Only a tab seen
+   * live in this mount anchors metadata for an `auto` re-deal: the persisted
+   * assignments name the previous run's tab ids, whose zones' labels must
+   * wait on their index for the resumed session rather than be dropped.
+   */
+  tabIds: readonly string[] = [],
 ): UseZoneLabelsAndTagsReturn {
   const pk = (key: string) => pageKey(pageId, key);
   // ── State ─────────────────────────────────────────────────────────────────
@@ -115,7 +123,9 @@ export function useZoneLabelsAndTags(
   // tab → new zone (`migrateZoneMetadataByTab`). It migrates FROM the last
   // assignments plus each vacated zone's departed tab (`rememberVacatedZones`),
   // so a close and its held trim landing in different commits still drop the
-  // closed tab's label instead of leaving it on the index.
+  // closed tab's label instead of leaving it on the index. Only tabs seen
+  // live in this mount anchor anything (`seenLiveRef`): a previous run's tab
+  // id from the persisted assignments never does.
   //
   // Any other layout change (operator, boot restore, tmux enter/exit) reloads
   // the target layout's stored sets and migrates pins by tab on top. In
@@ -127,12 +137,18 @@ export function useZoneLabelsAndTags(
   const prevLayoutIdRef2 = useRef(layoutId);
   const prevSwitchSeqRef = useRef(layoutSwitch.seq);
   const migrateFromRef = useRef<Record<number, string>>(assignments);
+  // Every tab id live at any point in this mount. Declared before the effect
+  // below so it is current when that effect runs in the same commit.
+  const seenLiveRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const id of tabIds) seenLiveRef.current.add(id);
+  }, [tabIds]);
 
   useEffect(() => {
     const switched = prevSwitchSeqRef.current !== layoutSwitch.seq;
     prevSwitchSeqRef.current = layoutSwitch.seq;
     if (switched && layoutSwitch.origin === "auto") {
-      const from = migrateFromRef.current;
+      const from = anchoredToSeenTabs(migrateFromRef.current, seenLiveRef.current);
       prevLayoutIdRef2.current = layoutId;
       migrateFromRef.current = assignments;
       setZoneLabels((prev) => migrateZoneMetadataByTab(prev, from, assignments));
@@ -171,7 +187,11 @@ export function useZoneLabelsAndTags(
     } else {
       // No layout change (a swap, a close, a fill): track the assignments,
       // remembering each vacated zone's departed tab for the next re-deal.
-      migrateFromRef.current = rememberVacatedZones(migrateFromRef.current, assignments);
+      migrateFromRef.current = rememberVacatedZones(
+        migrateFromRef.current,
+        assignments,
+        seenLiveRef.current,
+      );
     }
   }, [layoutId, assignments, layoutSwitch.seq]); // eslint-disable-line react-hooks/exhaustive-deps
 

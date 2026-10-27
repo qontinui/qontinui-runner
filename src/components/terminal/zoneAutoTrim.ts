@@ -220,18 +220,43 @@ export function migrateZoneSetByTab(
  * tab's label unanchored on its index, to be worn by whatever lands there;
  * with it, the label is dropped exactly as when both land in one commit. A
  * tab that merely moved to another zone is not remembered at its old one.
+ *
+ * Only a tab that was live in THIS mount (`seenLive`) is remembered. The
+ * persisted assignments a page mounts with name the previous runner run's tab
+ * ids; their sessions come back under new ids and are placed back on their
+ * recorded zones moments later, so those zones' labels must stay on their
+ * index rather than be dropped as a departed tab's.
  */
 export function rememberVacatedZones(
   remembered: ZoneAssignments,
   assignments: ZoneAssignments,
+  seenLive: ReadonlySet<string>,
 ): ZoneAssignments {
   const assigned = new Set(Object.values(assignments));
   let next: ZoneAssignments | null = null;
   for (const [z, tabId] of Object.entries(remembered)) {
     const zone = Number(z);
-    if (assignments[zone] || assigned.has(tabId)) continue;
+    if (assignments[zone] || assigned.has(tabId) || !seenLive.has(tabId)) continue;
     next ??= { ...assignments };
     next[zone] = tabId;
+  }
+  return next ?? assignments;
+}
+
+/**
+ * `assignments` without the zones whose tab was never live in this mount (a
+ * previous run's tab id, from the persisted state). Migrating FROM this map,
+ * such a zone's metadata is unanchored and stays on its index.
+ */
+export function anchoredToSeenTabs(
+  assignments: ZoneAssignments,
+  seenLive: ReadonlySet<string>,
+): ZoneAssignments {
+  let next: ZoneAssignments | null = null;
+  for (const [z, tabId] of Object.entries(assignments)) {
+    if (seenLive.has(tabId)) continue;
+    next ??= { ...assignments };
+    delete next[Number(z)];
   }
   return next ?? assignments;
 }

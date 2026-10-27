@@ -24,6 +24,7 @@ import {
   computeAutoTrimLayoutId,
   migrateZoneMetadataByTab,
   migrateZoneSetByTab,
+  anchoredToSeenTabs,
   rememberVacatedZones,
   parseLayoutOrigin,
   readAutoTrimEnabled,
@@ -194,26 +195,45 @@ describe("migrateZoneMetadataByTab", () => {
 });
 
 describe("rememberVacatedZones", () => {
+  const LIVE = new Set(["a", "b", "c"]);
+
+  it("does not remember a tab never live in this mount (a previous run's id)", () => {
+    const now = { 0: "a" };
+    expect(rememberVacatedZones({ 0: "a", 1: "old-id" }, now, LIVE)).toBe(now);
+  });
+
   it("is the assignments when nothing was vacated", () => {
     const now = { 0: "a", 1: "b" };
     expect(rememberVacatedZones({ 0: "a", 1: "b" }, now)).toBe(now);
   });
 
   it("remembers a closed tab on the zone it left", () => {
-    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a" })).toStrictEqual({ 0: "a", 1: "b" });
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a" }, LIVE)).toStrictEqual({
+      0: "a",
+      1: "b",
+    });
   });
 
   it("does not remember a tab that moved to another zone", () => {
-    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 2: "b" })).toStrictEqual({
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 2: "b" }, LIVE)).toStrictEqual({
       0: "a",
       2: "b",
     });
   });
 
   it("forgets the departed tab once a new tab fills the zone", () => {
-    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 1: "c" })).toStrictEqual({
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 1: "c" }, LIVE)).toStrictEqual({
       0: "a",
       1: "c",
     });
+  });
+});
+
+describe("anchoredToSeenTabs", () => {
+  it("drops zones whose tab was never live, keeps the rest, same identity if none", () => {
+    const seen = new Set(["a"]);
+    expect(anchoredToSeenTabs({ 0: "a", 1: "old" }, seen)).toStrictEqual({ 0: "a" });
+    const all = { 0: "a" };
+    expect(anchoredToSeenTabs(all, seen)).toBe(all);
   });
 });

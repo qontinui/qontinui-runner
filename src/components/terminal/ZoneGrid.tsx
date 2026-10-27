@@ -6,6 +6,7 @@ import { useDisplayTitleResolver } from "./displayTitle";
 import type { LayoutPreset } from "./useZoneLayout";
 import {
   clearTabFilter,
+  pruneTabFilters,
   setTabFilter,
   toggleFilterInputTab,
   zoneFiltersFor,
@@ -98,6 +99,7 @@ type GridAction =
   | { type: "SET_TAB_FILTER"; tabId: string; value: string }
   | { type: "CLEAR_TAB_FILTER"; tabId: string }
   | { type: "TOGGLE_FILTER_INPUT"; tabId: string }
+  | { type: "PRUNE_TAB_FILTERS"; live: ReadonlySet<string> }
   | { type: "SET_COL_RATIOS"; ratios: number[] }
   | { type: "SET_ROW_RATIOS"; ratios: number[] }
   | { type: "TICK_UPTIME" };
@@ -114,6 +116,13 @@ function gridReducer(state: GridState, action: GridAction): GridState {
       return { ...state, tabFilters: clearTabFilter(state.tabFilters, action.tabId) };
     case "TOGGLE_FILTER_INPUT":
       return { ...state, filterInputTab: toggleFilterInputTab(state.filterInputTab, action.tabId) };
+    case "PRUNE_TAB_FILTERS": {
+      const pruned = pruneTabFilters(state.tabFilters, state.filterInputTab, action.live);
+      if (pruned.filters === state.tabFilters && pruned.openInput === state.filterInputTab) {
+        return state;
+      }
+      return { ...state, tabFilters: pruned.filters, filterInputTab: pruned.openInput };
+    }
     case "SET_COL_RATIOS":
       return { ...state, colRatios: action.ratios };
     case "SET_ROW_RATIOS":
@@ -275,6 +284,10 @@ function ZoneGridInner({
     [gridState.tabFilters, gridAssignments],
   );
   const showFilterInput = zoneOfTab(gridAssignments, gridState.filterInputTab);
+  // A closed session's filter goes with it.
+  useEffect(() => {
+    dispatch({ type: "PRUNE_TAB_FILTERS", live: new Set(tabs.map((t) => t.id)) });
+  }, [tabs]);
 
   // ── Prompts panel: which sessions are showing the operator's own prompts ──
   //

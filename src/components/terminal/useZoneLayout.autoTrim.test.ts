@@ -90,7 +90,13 @@ function mount(
   function Host() {
     harness.beginRender();
     const zone = useZoneLayout(live, PAGE, windowLabel, undefined, undefined, initialized);
-    const labels = useZoneLabelsAndTags(zone.layoutId, zone.assignments, PAGE, zone.layoutSwitch);
+    const labels = useZoneLabelsAndTags(
+      zone.layoutId,
+      zone.assignments,
+      PAGE,
+      zone.layoutSwitch,
+      live,
+    );
     return { ...zone, labels };
   }
   const render = (next?: string[]) => {
@@ -459,6 +465,22 @@ describe("useZoneLayout auto-trim: metadata follows the tab (D5)", () => {
       [zoneOf("t1")]: "error",
       [zoneOf("t5")]: "WARN",
     });
+  });
+
+  it("a cold resume's grow keeps a recorded zone's label for the session placed back there", () => {
+    // The persisted assignments name the PREVIOUS run's tab ids; the sessions
+    // come back under new ids, and auto-grow (not held by the restore)
+    // re-deals before the recorded tab is placed on its zone.
+    store.set(`page:${PAGE}:zone-labels-split`, { 1: "recorded" });
+    const render = mount("split", [], { 0: "old0", 1: "old1" }, { origin: "auto" });
+    render();
+    const grown = render(["n0", "n2", "n1"]);
+    expect(grown.layoutId).toBe("quad");
+    expect(grown.labels.zoneLabels).toStrictEqual({ 1: "recorded" });
+    grown.placeRestoredTab(1, "n1");
+    const r = render();
+    expect(r.assignments[1]).toBe("n1");
+    expect(r.labels.zoneLabels).toStrictEqual({ 1: "recorded" });
   });
 
   it("a close and its HELD trim in different commits still drop the closed tab's label", () => {
