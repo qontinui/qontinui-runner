@@ -248,13 +248,9 @@ impl Server {
 
     // -- WebSocket wrappers ----------------------------------------------
 
-    async fn ws_open(&self, origin: Option<&str>) -> Ws {
-        self.ws_open_try(origin)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"))
-    }
-
-    /// [`Self::ws_open`] that reports a failed upgrade instead of panicking.
+    /// Open a WebSocket to the UI Bridge, sending `origin` as the `Origin`
+    /// header when given. `Err` names a timed-out or refused upgrade, or a
+    /// non-101 status.
     async fn ws_open_try(&self, origin: Option<&str>) -> Result<Ws, String> {
         let mut req = format!("ws://127.0.0.1:{}/ui-bridge/ws", self.port)
             .into_client_request()

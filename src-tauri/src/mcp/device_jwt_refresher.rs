@@ -12911,7 +12911,13 @@ mod tenant_slot_refresh_tests {
         let start = ts
             .find("export type CredentialDarkCause =")
             .expect("the CredentialDarkCause union");
-        let union = &ts[start..start + ts[start..].find(';').expect("union terminator")];
+        // `str::get`, not `&ts[a..b]`: both bounds come from `find` on `ts`
+        // itself, so they sit on char boundaries, but `clippy::string_slice`
+        // cannot see that (denied in Cargo.toml; seen by any `--all-targets` clippy).
+        let rest = ts.get(start..).expect("start is a find() offset into ts");
+        let union = rest
+            .get(..rest.find(';').expect("union terminator"))
+            .expect("the terminator is a find() offset into rest");
         let emitted = all
             .iter()
             .filter(|p| !p.can_answer())

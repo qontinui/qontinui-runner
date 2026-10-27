@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags; coord:priority and coord:clears-red are GitHub-applied only and refused here with the working gh route) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
 user-invocable: true
 ---
 
@@ -87,10 +87,22 @@ fires, so invalid labels never make it to GitHub or coord.
   now is a defect in one of the triggers rather than the known hole. Detail:
   `knowledge-base/qontinui-specific/coord-merge-train.md`.
 - **Pinning a required tag**: `coord:requires-tag=ts-v*`.
+- **Declaring that this PR clears ANOTHER repo's red main**:
+  `coord:clears-red=<repo>` is **GitHub-applied only** — this skill refuses it
+  and names the route: `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'`. See
+  [`coord:clears-red`](#coordclears-red--github-applied-only-a-declared-cross-repo-red-main-fix-edge).
 
 > **No label holds a PR** (holds retired 2026-06-20). To hold a PR:
-> **convert it to draft**, or **register a coord gate with a `MergePr`
-> continuation**. **`coord:blocked` and `coord:experimental` are RETIRED
+> **place a coord hold** once coord serves it — `coord_set_pr_hold {repo,
+> pr_number, held: true, reason}`; to release it on a condition, give the hold a
+> `gate_id`. It is served once coord's own `tools/list` offers
+> `coord_set_pr_hold` — read through a door that does not filter it, because a
+> runner proxy's allowlist can hide a served tool from your session (place it
+> then through coord's own door or the HTTP twin
+> `POST /coord/repos/:owner/:repo/pull-requests/:number/hold` — the tool and its
+> twin are PLANNED, and exist only once coord ships the hold); until then, convert the PR to draft (`gh pr ready --undo`), which works on
+> public repos, and on private repos until the GitHub Free downgrade takes
+> effect. **`coord:blocked` and `coord:experimental` are RETIRED
 > hold labels and this skill REFUSES them**, the same way it refuses
 > `coord:operator-review` and `coord:version-bump=*`. coord treats all four
 > as inert hold-shaped labels: `data/repo_branches.rs` `inert_hold_labels`
@@ -98,8 +110,12 @@ fires, so invalid labels never make it to GitHub or coord.
 > comment saying they do **not** hold the PR. The PR still auto-merges once
 > green. `blocked` and `experimental` only downgrade dequeue routing
 > (Contending, no fast-land), which is not what an author reaching for them
-> wants. A PR that must not land yet is a **draft**:
-> `gh pr ready --undo <n> --repo <owner/repo>`.
+> wants. A PR that must not land yet gets a **coord hold** once coord serves
+> it: `coord_set_pr_hold {repo, pr_number, held: true, reason}` (read it back
+> as the `hold` object on `coord_pr_status`). Until then it gets a draft
+> (`gh pr ready --undo`) — which after the GitHub Free downgrade no longer
+> exists on a private repo, so it is a stopgap, not an agent's lasting hold. Detail:
+> `knowledge-base/qontinui-specific/coord-merge-train.md` → "Holding a PR".
 
 > **Do NOT use `coord:stacked-on` / `coord:upstream-of` /
 > `coord:downstream-of` to order a *migration* stack.** When a PR's
@@ -116,10 +132,12 @@ fires, so invalid labels never make it to GitHub or coord.
 `coord:specialist-decision=*` — those are coord-set (read-only via
 this skill). The skill rejects them with a clear error.
 
-See `<workspace-root>/qontinui-dev-notes/docs/coord/pr-merge-labels.md`
-for the full namespace + semantics + conflict-resolution rules (if
-`<workspace-root>/qontinui-dev-notes` is not checked out, skip the
-reference — the summary above is sufficient).
+The summary above is sufficient to use this skill, plus one precedence
+rule: when a `Coord-*:` trailer in the PR body and a `coord:*` label
+disagree, the label wins. The authoritative namespace + semantics live in
+coord's own label validator and trailer parser (see "See Also");
+the long-form conflict-resolution notes are Qontinui's maintainer
+documentation and do not ship with the product.
 
 ## Inputs
 
@@ -190,15 +208,15 @@ QONTINUI_AGENT_ID=<uuid> \
 bash <path-to-this-skill-dir>/set-label.sh \
   --repo qontinui/qontinui-coord \
   --pr 75 \
-  --label "coord:downstream-of=qontinui/qontinui-dev-notes#1234" \
+  --label "coord:downstream-of=qontinui/example-plans-repo#1234" \
   --dry-run
 ```
 
 ```
 error: label is 52 characters; GitHub caps a label name at 50
-       "coord:downstream-of=qontinui/qontinui-dev-notes#1234"
+       "coord:downstream-of=qontinui/example-plans-repo#1234"
        drop the owner -- coord restores it via coord.tenant_repos:
-         --label "coord:downstream-of=qontinui-dev-notes#1234"   (43 chars)
+         --label "coord:downstream-of=example-plans-repo#1234"   (43 chars)
        NOTE: gh reports this as "'<label>' not found", which is NOT a
        missing-label problem -- gh label create cannot succeed either.
 ```
@@ -222,12 +240,13 @@ The skill enforces the namespace before sending — this table mirrors
 | `coord:stacked-on=#<n>` or `=[<owner>/]<repo>#<n>` | Contains `#`; `<n>` parses as a Rust **`i32`** (same domain as upstream-of — `#2147483648` is rejected); empty repo part = same repo, a **non-empty** one gets the same both-segments check. **Code stacks only — never for migration ordering (coord derives that from `down_revision`).** |
 | `coord:requires-tag=<pattern>`                     | Any non-empty value                                         |
 | `coord:merge-strategy=squash\|rebase\|merge`       | One of the three exact strings                              |
-| `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert (`inert_hold_labels`). To hold a PR, convert it to draft (`gh pr ready --undo <n>`) |
+| `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert (`inert_hold_labels`). To hold a PR, place a coord hold (`coord_set_pr_hold {repo, pr_number, held: true, reason}`) once served, else a draft (`gh pr ready --undo`) while drafts exist |
 | `coord:credibility-override`                       | Flag — Tier-7 credibility-gate escape hatch                 |
 | `coord:migrate-repair`                             | Flag — accepted. **The one flag here that RELEASES a hold** rather than restricting: it can make a land happen that otherwise would not. coord bounds it at the *consuming* end, not the validator — `merge_scheduler::migrate_self_blocking` refuses to honour it unless the land is genuinely self-blocking, **and is further scoped to `EXPECTED_WEB_REPO` and the `PendingHead` escalation arm only**. Setting it is cheap and auditable; acting on it is not, and coord keeps those two decisions apart |
 | `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist. **Any holder of repo write — agent or operator — applies it on its own authority**: merge-queue ordering is operational work (`decision_record/operational-work-is-autonomous`), not an escalation, and the `source='github'` gate is provenance, not authority. It reorders the queue only while the lane is armed (`COORD_MERGE_PRIORITY=on` in the DEPLOYED task definition), and only for a single-repo proposal inside `COORD_MERGE_PRIORITY_TTL_SECS`. Read the label back (`gh api repos/<owner>/<repo>/issues/<n>/labels`), then read its effect on the queued row's `priority_reason` (`coord_query_train_health` → `candidates_in_flight`); `deploy/taskdef.json` reading `on` is not proof the lane is deployed, this is. `label` = honoured; `label_expired` / `label_ignored_multi_repo` / `label_not_github` = lane on but this label does not count; `aged` = lane on and the row was promoted by AGE, so your label did not count (the label arm is tested first); `red_main_fix` = promoted by the red-main rule, which fires with the lane off too, so it says nothing about your label; `none` = lane off OR coord has not yet mirrored the label. It cannot help a PR that never became a proposal (conflicted, or CI abandoned by GitHub) |
+| `coord:clears-red` / `coord:clears-red=*`          | REJECTED — GitHub-applied only, exactly like `coord:priority`: set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'`. coord honours it only from `source='github'` (a holder of repo write applied it on GitHub) and its own label door refuses the key, so a skill-set row would be inert. While the named repo's main is red it promotes the PR to tier 0, recorded with reason `red_main_fix`; **inert** for the PR's own repo, for a repo not owned by EVERY owner tenant of the PR's repo, or a green main. Kill switch `COORD_MERGE_CLEARS_RED_DISABLED=1` (this arm only). *coord-side design, pending that coord PR's deploy* |
 | `coord:red-main-fix`                               | REJECTED — a flag with no `=`, so it lands on the generic `parameterised labels need "=value"`. coord has **no bespoke arm for it and this mirror must not invent one.** If you want it on the PR anyway, `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:red-main-fix'` — but understand it buys nothing: see below |
-| `coord:operator-review`                            | REJECTED — retired label; labels no longer hold PRs (convert the PR to draft, or register a coord gate with a `MergePr` continuation) |
+| `coord:operator-review`                            | REJECTED — retired label; labels no longer hold PRs (place a coord hold with `coord_set_pr_hold` once served — to release it on a condition, give the hold a `gate_id` — else a draft while drafts exist) |
 | `coord:version-bump` / `coord:version-bump=*`      | REJECTED — same retirement as operator-review (coord rejects the bare flag too) |
 | `coord:state=*`, `coord:blocked-by=*`, `coord:specialist-decision=*` | REJECTED — coord-SET labels, read-only through this surface; change them at the state-mutation surface, not here |
 
@@ -267,7 +286,7 @@ fits**.
 > the supported short form, canonicalized at coord's write surface via
 > `coord.tenant_repos`. It is not a workaround; it is the grammar's own
 > owner-optional arm. First hit 2026-08-19 wiring
-> qontinui-claude-config#296 to qontinui-dev-notes#167 (51 chars, one over).
+> a PR to `qontinui/<an 18-character repo name>#167` (51 chars, one over).
 >
 > **You do not have to count characters** — `set-label.sh` pre-flights the
 > ceiling before it calls `gh` and, for a dep label carrying an owner, prints
@@ -284,6 +303,46 @@ against `labels_routes.rs` must not delete it as "not in coord".
 Rejected labels exit non-zero with a one-line error. Coord-set labels
 (`coord:state=*` etc.) are explicitly rejected with a pointer to the
 state-mutation surface.
+
+### `coord:clears-red` — GitHub-applied only: a declared cross-repo red-main-fix edge
+
+`coord:clears-red=[<owner>/]<repo>` says *"landing this PR is what turns
+`<repo>`'s red main green"*. While `<repo>`'s main CI baseline is Red, coord's
+merge scheduler promotes the carrying PR to merge-train **tier 0**, and records
+the promotion with reason `red_main_fix` — the same reason as the single-repo
+arm. It is **inert**:
+
+- for the PR's **own** repo (its own red main is already covered by coord's
+  single-repo red-main-fix promotion);
+- unless the named repo is owned (role `owner`) by **every** owner tenant of
+  the PR's repo — so a PR on a repo with two owner tenants is inert unless
+  both own the target;
+- while the named main is green.
+
+Kill switches: `COORD_MERGE_CLEARS_RED_DISABLED=1` drops only this declared
+arm; `COORD_MERGE_RED_MAIN_FIX_PRIORITY_DISABLED=1` disables both red-main-fix
+arms. **These are the coord-side design, pending the deploy of that coord PR**
+— read the deployed coord before relying on any of them.
+
+**This skill refuses it, the same way and for the same reason as
+`coord:priority`.** coord honours the label ONLY when it was applied on GitHub
+(`source='github'`, i.e. by a holder of write on the repo), and coord's own
+label door refuses the key — a promotion lever must not be settable by any
+caller of an anonymous ingest. So set it on the PR itself:
+`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'`.
+
+The label is per-repo, not per-PR, and GitHub's issues-labels add is the route.
+It does **not** prove the PR fixes the red — the named repo's own checks still
+verify that; the label only orders the train.
+
+The standing user is the fleet's skill-bundle sync bot, which puts
+`coord:clears-red=<source repo>` on its bot PR in the runner repo through that
+same GitHub route: that carry is what turns the source repo's bundle-parity
+check green, and without the edge it waited the runner train's full latency
+(plan `2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-latency`
+Phase 5). A hand carry of the bundle may carry it too. A coord build that
+predates that phase's coord half does not read the label at all — read the
+deployed coord before relying on the lift.
 
 ### `coord:red-main-fix` — rejected here, and it buys nothing anywhere
 
@@ -399,14 +458,14 @@ sending anything — followed by the one thing a dry run structurally cannot
 establish:
 
 ```
-ok: label "coord:downstream-of=qontinui-dev-notes#167" is valid (42/50 chars) -- dry run, nothing sent
-note: NOT checked -- whether "coord:downstream-of=qontinui-dev-notes#167" exists as a label in qontinui/qontinui-claude-config.
+ok: label "coord:downstream-of=example-plans-repo#167" is valid (42/50 chars) -- dry run, nothing sent
+note: NOT checked -- whether "coord:downstream-of=example-plans-repo#167" exists as a label in qontinui/qontinui-claude-config.
       A dry run sends nothing, so it cannot ask. This is the one cause of
       "'<label>' not found" the ceiling check above does not cover.
       This key is open-valued, so its labels are not created on demand --
       a dep label's value is unique to the PR pair it wires. If nobody has
       created this one, a real send fails until you run:
-        gh label create "coord:downstream-of=qontinui-dev-notes#167" --repo qontinui/qontinui-claude-config
+        gh label create "coord:downstream-of=example-plans-repo#167" --repo qontinui/qontinui-claude-config
 ```
 
 The `gh label create` half appears only for an **open-valued key** —
@@ -529,13 +588,16 @@ it, run `gh api -X DELETE "repos/<owner>/<repo>/issues/<pr>/labels/<url-encoded 
 
 ## See Also
 
-These references live in repos you may not have checked out
-(`qontinui-dev-notes`, `qontinui-coord`); skip any whose repo is absent
-under `<workspace-root>/`.
+These references live in a repo you may not have checked out
+(`qontinui-coord`); skip them when that repo is absent under `<workspace-root>/`.
 
-- `<workspace-root>/qontinui-dev-notes/docs/coord/pr-merge-labels.md` —
-  full namespace + trailer equivalents + conflict resolution.
 - `<workspace-root>/qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs` —
-  coord-side validator + ingest handler (single source of truth).
-- `<workspace-root>/qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md` —
-  Phase 2 D2.6 spec.
+  coord-side validator + ingest handler (single source of truth for the
+  label namespace and its semantics).
+- `crates/coord/src/pr_merge/trailers.rs` in the same repo — the `Coord-*:`
+  PR-body trailer equivalents.
+
+The label grammar's design record is Qontinui's own plan
+`2026-05-21-pr-merge-orchestrator-design` (Phase 2 D2.6). It is held in the
+maintainers' plan corpus, not yours: it resolves only for a session working
+in the tenant that authored it, and nothing above depends on reading it.
