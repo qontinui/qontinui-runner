@@ -64,9 +64,10 @@
 //! - **Windows** writes a FILETIME (100-ns ticks since 1601 UTC) from Bun's
 //!   `windowsProcessCreationTime`, with `pidDomain: "win32:<host>"`. Compared
 //!   against [`ProcessSnapshot::creation_filetimes`] to the microsecond. This
-//!   is the form the live Windows registry files carry: `procStart` a
-//!   decimal-string FILETIME, `pidDomain` `"win32:<host>"` (e.g.
-//!   `C:/claude/.claude-erik/sessions/47904.json`).
+//!   is the form the live Windows registry files carry, e.g.
+//!   `"procStart":"134374313248442634"` (a decimal-string FILETIME) with
+//!   `"pidDomain":"win32:<host>"` (the CLI deletes its file on exit, so the
+//!   values are quoted here rather than a path).
 //! - **Linux / WSL** writes `ps -o lstart= -p <pid>` run with `TZ=UTC LC_ALL=C`
 //!   (`"Fri Oct 23 09:15:30 2026"`), with `pidDomain:
 //!   "win32:<machine-id>:<pid-ns>"` (sic — the prefix is the same string).
