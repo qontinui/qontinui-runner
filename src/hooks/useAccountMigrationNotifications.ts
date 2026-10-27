@@ -9,6 +9,12 @@
  * - `session-account-migration-skipped` when exhaustion was confirmed but no
  *   migration happened (no usable target / cap reached / mechanics failed) —
  *   surfaced as an error so the operator knows the session is stranded.
+ * - `session-account-migration-stalled` when the resumed session never took
+ *   the continue nudge (`account_migration/followup.rs`) — an error: the pane
+ *   is sitting idle or waiting and needs the operator.
+ * - `session-account-migration-tail` with what became of the lines the old
+ *   account wrote after the carry — toasted only when there is something to
+ *   act on (lines saved but not handed over) or the check itself was UNKNOWN.
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -145,6 +151,49 @@ interface SkippedPayload {
   reason?: string;
 }
 
+/** `session-account-migration-stalled` — `followup.rs` `report_stall`. */
+export interface StalledPayload {
+  claudeSessionId?: string;
+  terminalId?: string;
+  toConfigDir?: string;
+  /** `StallReason::as_str`, e.g. `retry-gave-up`, `limit-wait-on-exhausted-account`. */
+  reason?: string;
+  escSent?: boolean;
+  /** One bounded line of the pane's screen at the give-up. */
+  screenLine?: string;
+}
+
+/** `TailRescue` status — `followup.rs` `tail_event`. */
+export type TranscriptTailStatus =
+  | "rescued"
+  | "empty"
+  | "not-read"
+  | "source-shorter-unknown"
+  | "offset-unknown";
+
+/** `TailDelivery::as_str`; `null` when the tail is UNKNOWN. */
+export type TranscriptTailDelivery =
+  | "none_to_deliver"
+  | "delivered"
+  | "submit_failed"
+  | "gave_up"
+  | "skipped_auto_continue_off";
+
+/** `session-account-migration-tail` — `followup.rs` `tail_event`. */
+export interface TailPayload {
+  claudeSessionId?: string;
+  newTerminalId?: string;
+  toConfigDir?: string;
+  transcriptTail?: TranscriptTailStatus;
+  /** `null` when the tail is UNKNOWN — never 0. */
+  transcriptTailLines?: number | null;
+  transcriptTailUnparseable?: number | null;
+  transcriptTailTruncated?: boolean | null;
+  transcriptTailPath?: string | null;
+  transcriptTailDelivery?: TranscriptTailDelivery | null;
+  transcriptTailDelivered?: boolean;
+}
+
 /** Last path segment of a config dir (`C:\claude\.claude-gmail` → `.claude-gmail`). */
 function accountLabel(dir: string | undefined): string {
   if (!dir) return "unknown";
@@ -165,6 +214,64 @@ export function migratedToast(p: MigratedPayload): { message: string; type: Toas
   };
 }
 
+/** The toast for one `session-account-migration-stalled` event. */
+export function stalledToast(p: StalledPayload): { message: string; type: ToastType } {
+  const esc = p.escSent ? " (one Esc was sent and the retry gave up)" : "";
+  const screen = p.screenLine ? ` Screen: "${p.screenLine}"` : "";
+  return {
+    message: `Session ${(p.claudeSessionId ?? "").slice(0, 8)} was resumed on ${accountLabel(
+      p.toConfigDir,
+    )} but is STALLED — it never took the continue prompt (${
+      p.reason ?? "unknown reason"
+    })${esc}; open the pane and continue it by hand.${screen}`,
+    type: "error",
+  };
+}
+
+/**
+ * The toast for one `session-account-migration-tail` event, or `null` when
+ * there is nothing to say (no tail, or a tail with nothing to hand over, or
+ * one already handed to the resumed session).
+ */
+export function tailToast(p: TailPayload): { message: string; type: ToastType } | null {
+  const sid = (p.claudeSessionId ?? "").slice(0, 8);
+  const lines = p.transcriptTailLines;
+  const count = typeof lines === "number" ? `${lines} line(s)` : "lines";
+  const where = p.transcriptTailPath ? ` They are saved at ${p.transcriptTailPath}.` : "";
+  switch (p.transcriptTail) {
+    case "empty":
+      return null;
+    case "rescued":
+      switch (p.transcriptTailDelivery) {
+        case "none_to_deliver":
+        case "delivered":
+          return null;
+        case "skipped_auto_continue_off":
+          return {
+            message: `Session ${sid}: the old account wrote ${count} after the migration; auto-continue is off, so they were NOT handed to the resumed session.${where}`,
+            type: "info",
+          };
+        default:
+          // submit_failed / gave_up / an absent delivery on a rescued tail.
+          return {
+            message: `Session ${sid}: the old account wrote ${count} after the migration (task notifications or prompts) and they could NOT be handed to the resumed session (${
+              p.transcriptTailDelivery ?? "delivery unknown"
+            }).${where}`,
+            type: "error",
+          };
+      }
+    default:
+      // not-read / source-shorter-unknown / offset-unknown / an unrecognised
+      // status: UNKNOWN, which is never rendered as "nothing was lost".
+      return {
+        message: `Session ${sid}: could not check whether the old account wrote anything after the migration (${
+          p.transcriptTail ?? "unknown"
+        }); see the runner log.`,
+        type: "info",
+      };
+  }
+}
+
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
@@ -180,9 +287,19 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
         "error",
       );
     });
+    const unlistenStalled = listen<StalledPayload>("session-account-migration-stalled", (event) => {
+      const toast = stalledToast(event.payload ?? {});
+      showToast(toast.message, toast.type);
+    });
+    const unlistenTail = listen<TailPayload>("session-account-migration-tail", (event) => {
+      const toast = tailToast(event.payload ?? {});
+      if (toast) showToast(toast.message, toast.type);
+    });
     return () => {
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
+      unlistenStalled.then((fn) => fn());
+      unlistenTail.then((fn) => fn());
     };
   }, [showToast]);
 }
