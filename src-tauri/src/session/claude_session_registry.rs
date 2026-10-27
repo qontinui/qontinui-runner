@@ -35,9 +35,10 @@
 //!
 //! # Scope and limits
 //!
-//! - **Live processes only.** Claude Code removes the file when a process
-//!   exits, so this answers "what is open right now" and says nothing about
-//!   already-dead sessions. That is the right shape for the write-down →
+//! - **Live processes only.** Claude Code removes the file on a clean exit;
+//!   a killed process leaves it behind, which is why every row is validated
+//!   against the process table ([`registry_row_validity`]). So this answers
+//!   "what is open right now" and says nothing about already-dead sessions. That is the right shape for the write-down →
 //!   rebuild → resume loop; use `past_sessions` for history.
 //! - **A session id may have several rows.** "22 of 80" session ids did when
 //!   this was first written (2026-07-23) — but that count filtered rows by PID
@@ -66,8 +67,8 @@
 //!   against [`ProcessSnapshot::creation_filetimes`] to the microsecond. This
 //!   is the form the live Windows registry files carry, e.g.
 //!   `"procStart":"134374313248442634"` (a decimal-string FILETIME) with
-//!   `"pidDomain":"win32:<host>"` (the CLI deletes its file on exit, so the
-//!   values are quoted here rather than a path).
+//!   `"pidDomain":"win32:<host>"` (quoted here rather than a path: the CLI
+//!   deletes its file on a clean exit; a killed process leaves it).
 //! - **Linux / WSL** writes `ps -o lstart= -p <pid>` run with `TZ=UTC LC_ALL=C`
 //!   (`"Fri Oct 23 09:15:30 2026"`), with `pidDomain:
 //!   "win32:<machine-id>:<pid-ns>"` (sic — the prefix is the same string).
