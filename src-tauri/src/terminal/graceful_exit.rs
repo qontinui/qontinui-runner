@@ -192,7 +192,7 @@ pub(crate) fn is_numbered_option(text: &str) -> bool {
 }
 
 /// Only box-drawing characters: the input box's top edge.
-pub(crate) fn is_box_edge(line: &str) -> bool {
+fn is_box_edge(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
 }
