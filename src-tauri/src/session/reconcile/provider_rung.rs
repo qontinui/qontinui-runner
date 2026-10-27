@@ -290,10 +290,22 @@ fn retain_live_terminals(set: &mut HashSet<(String, String)>, live: &[LivePty]) 
 /// one yet (a `/clear` before the first prompt) it is deferred to a later
 /// tick and logged once. Returns the `Bind` actions written, for the
 /// `session-bound` event.
+///
+/// The plan was made before the caller's transcript probe, which awaits, so
+/// each re-bind is RE-CHECKED against the store as of `now_ms` first
+/// ([`rebind_still_applies`]): one whose record moved on, or whose pane or
+/// session became part of a migration hand-off meanwhile, is skipped
+/// (round-13 review S3).
 pub fn apply_registry_rebinds(
     store: &SessionLifecycleStore,
     planned: Vec<(PlannedRebind, bool)>,
+    now_ms: i64,
 ) -> Vec<ReconcileAction> {
+    let exclusions = if planned.is_empty() {
+        HandoffExclusions::default()
+    } else {
+        HandoffExclusions::current(store, now_ms)
+    };
     let mut out = Vec::new();
     for (p, transcript_exists) in planned {
         let PlannedRebind {
@@ -302,6 +314,16 @@ pub fn apply_registry_rebinds(
             zone_index,
             rebind: rb,
         } = p;
+        if let Err(why) = rebind_still_applies(store, &rb, &exclusions) {
+            tracing::debug!(
+                terminal_id = %rb.terminal_id,
+                record_session = %rb.from_session_id,
+                provider_session = %rb.to_session_id,
+                why,
+                "session binder: planned re-bind dropped — the store changed while its transcript was probed"
+            );
+            continue;
+        }
         if !transcript_exists {
             let first = deferred_logged()
                 .lock()
@@ -344,6 +366,32 @@ pub fn apply_registry_rebinds(
     out
 }
 
+/// Whether a planned re-bind still holds against the store NOW: the pane's open
+/// record is still the confirmed `rb.from_session_id` the plan saw, and
+/// [`binder_exclusion`] (over freshly read `exclusions`) still names nothing.
+/// The fork test is the plan's: it reads the process table, which this
+/// re-check does not re-read.
+fn rebind_still_applies(
+    store: &SessionLifecycleStore,
+    rb: &RegistryRebind,
+    exclusions: &HandoffExclusions,
+) -> Result<(), &'static str> {
+    let unchanged = store
+        .find_open_by_terminal(&rb.terminal_id)
+        .is_some_and(|r| r.claude_session_id == rb.from_session_id && r.confirmed_at.is_some());
+    if !unchanged {
+        return Err("the pane's record no longer names the session the plan re-binds from");
+    }
+    let row = ValidProviderRow {
+        session_id: rb.to_session_id.clone(),
+        config_dir: rb.config_dir.clone(),
+    };
+    match binder_exclusion(&rb.terminal_id, Some(&row), &HashSet::new(), exclusions) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
 /// Apply [`decide_registry_rebind`] to every live PTY with a confirmed record:
 /// [`plan_registry_rebinds`], then [`apply_registry_rebinds`] gated on
 /// `transcript_exists(config_dir, working_dir, sid)` for the NEW id. The
@@ -375,7 +423,7 @@ where
             (p, found)
         })
         .collect();
-    apply_registry_rebinds(store, planned)
+    apply_registry_rebinds(store, planned, chrono::Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
@@ -965,6 +1013,67 @@ mod tests {
                 origin: BindOrigin::Authoritative,
                 confirmed: false,
             }
+        );
+    }
+
+    /// Round-13 S3: a planned re-bind is re-checked when applied — after the
+    /// await — and skipped when the pane became one side of a hand-off, or
+    /// its record moved on, in the meantime. Unchanged, it is applied.
+    ///
+    /// Mutation check: dropping the `rebind_still_applies` gate in
+    /// `apply_registry_rebinds` writes both stale re-binds and fails the
+    /// first two assertions.
+    #[test]
+    fn a_planned_rebind_the_store_moved_past_is_skipped() {
+        let plan = |term: &str| PlannedRebind {
+            pty: pty_anchored(term, 100, 1_000, "C:/repo"),
+            ai_pid: 100,
+            zone_index: 0,
+            rebind: RegistryRebind {
+                terminal_id: term.to_string(),
+                from_session_id: "sid-old".to_string(),
+                to_session_id: format!("sid-new-{term}"),
+                config_dir: "C:/claude/.claude-r13s3".to_string(),
+            },
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // Superseded (a migration hand-off) during the probe.
+        store.record_open(confirmed("sid-old", "r13s3-handoff"));
+        store.mark_terminal_superseded("r13s3-handoff", "r13s3-handoff-new");
+        assert!(
+            apply_registry_rebinds(&store, vec![(plan("r13s3-handoff"), true)], now).is_empty(),
+            "a hand-off pane is not re-bound"
+        );
+
+        // The record was re-bound to another id during the probe.
+        store.record_open(confirmed("sid-other", "r13s3-moved"));
+        assert!(
+            apply_registry_rebinds(&store, vec![(plan("r13s3-moved"), true)], now).is_empty(),
+            "a record that moved on is not overwritten"
+        );
+        assert_eq!(
+            store
+                .find_open_by_terminal("r13s3-moved")
+                .unwrap()
+                .claude_session_id,
+            "sid-other"
+        );
+
+        // Control: nothing changed — applied.
+        store.record_open(confirmed("sid-old", "r13s3-same"));
+        assert_eq!(
+            apply_registry_rebinds(&store, vec![(plan("r13s3-same"), true)], now).len(),
+            1
+        );
+        assert_eq!(
+            store
+                .find_open_by_terminal("r13s3-same")
+                .unwrap()
+                .claude_session_id,
+            "sid-new-r13s3-same"
         );
     }
 
