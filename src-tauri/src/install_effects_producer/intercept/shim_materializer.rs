@@ -2893,7 +2893,7 @@ mod resolve_wait_tests {
 mod cmd_shim_tests {
     use super::*;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     struct Rig {
         root: PathBuf,
@@ -2957,16 +2957,8 @@ mod cmd_shim_tests {
             )
             .env("QONTINUI_POLICY_DELIVERED_SHA", "inheritedsha")
             .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
-        let mut child = cmd.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                panic!("{tool} {argline}: the shim did not return within 60 s");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let out = child.wait_with_output().unwrap();
+        let out = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("{tool} {argline}: the shim did not return: {e}"));
         format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
