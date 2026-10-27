@@ -309,15 +309,20 @@ pub struct UrlLockInfo {
 
 /// Normalize a URL to its base form for lock key purposes.
 ///
-/// Strips trailing slashes and path segments after the UI Bridge base.
+/// Canonicalizes a `localhost` host to the IPv4 loopback,
+/// then strips trailing slashes and path segments after the UI Bridge base.
 /// For example, `http://localhost:3001/api/ui-bridge/sdk/execute` becomes
-/// `http://localhost:3001/api/ui-bridge`.
+/// `http://127.0.0.1:3001/api/ui-bridge`. The host step is what keeps a
+/// persisted `localhost` step and a `127.0.0.1` step on the SAME runner
+/// mutually exclusive (plan
+/// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn normalize_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
+    let canonical = crate::mcp::types::canonical_loopback_url(url);
+    let trimmed = canonical.trim_end_matches('/');
 
     // If URL contains known SDK/control path segments, strip them
     for segment in &["/sdk/", "/control/"] {
@@ -542,6 +547,75 @@ mod tests {
         assert!(err.contains("task-1"));
     }
 
+    /// A `localhost` step and a `127.0.0.1` step on the same runner drive the
+    /// same UI, so they must contend for ONE lock. Before the key was
+    /// canonicalized, flipping the runner's default URL to `127.0.0.1` while
+    /// persisted steps kept `localhost` would have silently split the lock.
+    ///
+    /// Entered the way the population enters: `UrlLockManager::acquire`, the
+    /// call `UiBridgeHandler::execute` makes — a `127.0.0.1` acquirer must
+    /// BLOCK behind a `localhost` holder until it releases.
+    #[tokio::test]
+    async fn test_loopback_spellings_share_one_lock() {
+        let mgr = UrlLockManager::new();
+
+        UrlLockManager::acquire(
+            &mgr,
+            "http://localhost:9876/ui-bridge",
+            "task-1",
+            "Workflow A",
+        )
+        .await;
+
+        let waiter_mgr = mgr.clone();
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_flag = acquired.clone();
+        let waiter = tokio::spawn(async move {
+            UrlLockManager::acquire(
+                &waiter_mgr,
+                "http://127.0.0.1:9876/ui-bridge",
+                "task-2",
+                "Workflow B",
+            )
+            .await;
+            acquired_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "a 127.0.0.1 acquirer must wait behind the localhost holder"
+        );
+
+        for other in [
+            "http://127.0.0.1:9876/ui-bridge",
+            "http://127.0.0.1:9876/ui-bridge/control/snapshot",
+            "http://LOCALHOST:9876/ui-bridge/sdk/elements",
+        ] {
+            let result = mgr.try_acquire(other, "task-2", "Workflow B").await;
+            assert!(
+                result.is_err(),
+                "{other} must contend with the localhost holder"
+            );
+            assert!(mgr.is_locked(other).await, "{other}");
+        }
+        // An explicit [::1] is left as written (a deliberate IPv6 target), so it
+        // is a different key; a different port is a different runner.
+        assert!(!mgr.is_locked("http://[::1]:9876/ui-bridge").await);
+        assert!(!mgr.is_locked("http://127.0.0.1:9877/ui-bridge").await);
+        assert_eq!(mgr.info().await[0].url, "http://127.0.0.1:9876/ui-bridge");
+
+        // Releasing under the OTHER spelling frees the one key, and the waiter gets it.
+        assert!(
+            mgr.release("http://127.0.0.1:9876/ui-bridge", "task-1")
+                .await
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the 127.0.0.1 acquirer proceeds once the localhost holder releases")
+            .expect("waiter task panicked");
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn test_try_acquire_succeeds_same_holder() {
         let mgr = UrlLockManager::new();
@@ -638,19 +712,19 @@ mod tests {
     fn test_normalize_url_function() {
         assert_eq!(
             normalize_url("http://localhost:3001/api/ui-bridge/sdk/execute"),
-            "http://localhost:3001/api/ui-bridge"
+            "http://127.0.0.1:3001/api/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:3001/api/ui-bridge/control/snapshot"),
-            "http://localhost:3001/api/ui-bridge"
+            "http://127.0.0.1:3001/api/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:9876/ui-bridge/"),
-            "http://localhost:9876/ui-bridge"
+            "http://127.0.0.1:9876/ui-bridge"
         );
         assert_eq!(
             normalize_url("http://localhost:9876/ui-bridge"),
-            "http://localhost:9876/ui-bridge"
+            "http://127.0.0.1:9876/ui-bridge"
         );
     }
 }

@@ -424,17 +424,23 @@ also what makes the nested renewals below work at all: without an owner token,
   reserved the plan (you are nested under `/vet-imp`, or this run re-reserves
   its own key). If nothing did, treat it as `held` by a same-box peer — the
   rule below.
-  A scope flip does NOT license the reverse inference. Coord's acquire
-  compares tokens exactly, so if THIS session's earlier reserve read
-  `"device"` and this one reads `"session"`, your own bare-device hold answers
-  `held` naming THIS machine — but a reserve `held` carries only `holder` (a
-  machine, never a session), so it is indistinguishable from a same-box peer's
-  hold, or a peer that adopted yours (`coord_claim_check` reports only the
-  holder's machine too). Treat it as `held` by a same-box peer — the rule below.
+  A scope flip changes what `held` means. Coord's acquire compares tokens
+  exactly, so if THIS session's earlier reserve read `"device"` and this one
+  reads `"session"`, your own bare-device hold answers `held` naming THIS
+  machine (`holder`). Read the result's `current_holder_session`
+  (`coord_claim_check` carries it as `holder.session_id`): present and equal to
+  your own session id = YOUR hold, read it as `renewed`; present and different =
+  that peer session holds it. ABSENT = a bare-device hold: yours only if THIS
+  session, or the chain enclosing it, received `granted` on a device-scoped
+  (`owner_scope: "device"`) reserve of this key (a `renewed` does not count — it
+  can mean a same-box peer already held the bare-device token); otherwise a
+  same-box peer. A coord predating qontinui-coord#3213 sends no
+  `current_holder_session` on any reserve `held`, so keep the conservative
+  reading there — treat it as `held` by a same-box peer, the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not push, do not invoke `/vet-plan`.
   Report the holder and surface to the operator via `AskUserQuestion` (header
   `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
-  re-acquire). When `current_holder` equals THIS machine and
+  re-acquire). When `holder` equals THIS machine and
   `current_holder_session` differs, say so explicitly rather than implying a
   different box:
 
@@ -825,8 +831,11 @@ else
     # backslash and double quote (Step 5 passes the /name result through here
     # too), which would otherwise end the string early.
     title="$(printf '%s' "$slug" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    # 2>/dev/null goes BEFORE >>: redirections apply left to right, so a failed
+    # >> would print the shell's own open error (e.g. "Permission denied")
+    # before stderr was muted.
     if printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s","uuid":"%s","timestamp":"%s"}\n' \
-         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" >> "$sf" 2>/dev/null; then
+         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" 2>/dev/null >> "$sf"; then
       echo "session labeled: $slug"
     else
       echo "label not written: append to $sf failed (searched $searched)"

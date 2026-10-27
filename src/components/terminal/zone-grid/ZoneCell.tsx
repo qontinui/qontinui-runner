@@ -719,8 +719,7 @@ function ZoneCellInner({
                 const ref = terminalRefs.get(tab.id);
                 ref?.current?.scrollToBottom();
               }}
-              outputLineCount={lastLines.length}
-              outputByteSize={lastLines.reduce((sum, l) => sum + l.length, 0)}
+              totalOutputBytes={hot.totalBytes}
               onToggleFilter={cosmeticZone !== null ? handleToggleFilterInput : undefined}
               filterActive={!!zoneFilter}
               onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
