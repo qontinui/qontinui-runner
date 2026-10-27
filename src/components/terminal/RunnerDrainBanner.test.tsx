@@ -73,6 +73,33 @@ describe("drainBannerModel", () => {
     expect(m?.deferredLabel).toBe("1 deferred work item");
   });
 
+  it("keys dismissal on the episode, not on the per-read cause", () => {
+    const unknown = (cause: string) =>
+      drainBannerModel(
+        snap({
+          state: "unknown",
+          autonomousSpawnsAllowed: false,
+          since: "2026-09-14T09:00:00Z",
+          cause,
+        }),
+      )?.episodeKey;
+    // The backend rewrites the cause on every read; one episode keeps one key.
+    expect(unknown("3 consecutive failed drain read(s)")).toBe(
+      unknown("4 consecutive failed drain read(s)"),
+    );
+    const drained = (reason: string) =>
+      drainBannerModel(
+        snap({
+          state: "drained",
+          autonomousSpawnsAllowed: false,
+          until: "2026-09-14T12:00:00Z",
+          reason,
+        }),
+      )?.episodeKey;
+    expect(drained("rebuild")).not.toBe(drained("maintenance"));
+    expect(drained("rebuild")).not.toBe(unknown("3 consecutive failed drain read(s)"));
+  });
+
   it("omits the detail line for a drain with no until or reason", () => {
     expect(
       drainBannerModel(snap({ state: "drained", autonomousSpawnsAllowed: false }))?.detail,
