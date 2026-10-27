@@ -140,9 +140,10 @@ export function useZoneActions({
         hasEmptyZone,
         totalTabs,
       );
-      // A `spawn` request: it grows the grid in grid mode and is a no-op in
+      // An `auto` request (the runner chose this layout): it grows the grid in
+      // grid mode, records the layout as auto-trimmable, and is a no-op in
       // tmux mode, where the new terminal is shown in the one viewport instead.
-      if (targetLayout !== null) zoneLayout.setLayoutId(targetLayout, { source: "spawn" });
+      if (targetLayout !== null) zoneLayout.setLayoutId(targetLayout, { source: "auto" });
       zoneLayout.showSpawnedTab(tabId);
 
       return tabId;

@@ -304,7 +304,16 @@ const PageSessionScope = memo(function PageSessionScope({
     for (const t of tabs) if (t.claudeSessionId) keys.set(t.id, t.claudeSessionId);
     return keys;
   }, [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
+  // `initialized` holds auto-trim until the restore has settled: before then a
+  // falling tab count is the restore drain, not a close.
+  const zoneLayout = useZoneLayout(
+    tabIds,
+    pageId,
+    myWindowLabel,
+    liveTabIds,
+    sessionKeyByTab,
+    terminalManager.initialized,
+  );
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of
@@ -312,7 +321,13 @@ const PageSessionScope = memo(function PageSessionScope({
   // apply saved cosmetics to the right page. `ZoneMetadataProvider` re-exposes
   // this exact reference to the page tree, so downstream consumers are
   // unchanged.
-  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
+  const labelsAndTags = useZoneLabelsAndTags(
+    zoneLayout.layoutId,
+    zoneLayout.assignments,
+    pageId,
+    zoneLayout.layoutSwitch,
+    tabIds,
+  );
 
   // Sync focused zone → active tab.
   useEffect(() => {

@@ -1201,6 +1201,12 @@ interface UseTerminalInitializationParams {
     setFocusedZone: (zoneIdx: number) => void;
     /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
     gridView: { assignments: Record<number, string> };
+    /**
+     * Hold (false) or release (true) the page's auto-trim around a restore
+     * run (`useZoneLayout().setRestoreSettled`): while a run drains, a falling
+     * tab count is the drain, not a close. Mirrors the auto-save gate.
+     */
+    setRestoreSettled: (settled: boolean) => void;
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -1431,6 +1437,16 @@ export function useTerminalInitialization({
     // same finally / drain timer.
     const isDrainRerun = drainDeferredPages.current.delete(initPageId);
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
+    // The page's auto-trim waits for this run exactly as auto-save does: both
+    // are released together by `openRestoreGate`. The setter is the page's
+    // own (captured with this run), so a drain timer firing after a page
+    // switch still releases the right page.
+    const setRestoreSettled = zoneLayout.setRestoreSettled;
+    setRestoreSettled(false);
+    const openRestoreGate = () => {
+      restoreCompletePages.current.add(initPageId);
+      setRestoreSettled(true);
+    };
     // A re-run for the holder sweep's late settle restores only these. Ids
     // scheduled while this run is in flight wait for its end.
     const recheckOnly = beginRestoreRun(rerun, initPageId);
@@ -1981,7 +1997,7 @@ export function useTerminalInitialization({
             } finally {
               // Restored tabs now carry their claudeSessionId / scrollback —
               // safe to let the debounced auto-save persist this page's layout.
-              restoreCompletePages.current.add(initPageId);
+              openRestoreGate();
             }
           }, 1500);
         }
@@ -2009,7 +2025,7 @@ export function useTerminalInitialization({
         // auto-save suppressed. Not permanent: the retry flips it via this
         // same finally / its drain timer.
         if (!drainScheduled && !restoreAborted) {
-          restoreCompletePages.current.add(initPageId);
+          openRestoreGate();
         }
         // ALWAYS leave the loading state, even if restore threw. `initialized`
         // gates the whole page behind a "Loading terminals..." spinner, and the

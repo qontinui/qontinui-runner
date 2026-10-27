@@ -24,272 +24,43 @@ import {
   type SessionKeyOf,
   type TerminalWorkMode,
 } from "./terminalWorkMode";
+import {
+  autoTrimHold,
+  computeAutoTrimLayoutId,
+  parseLayoutOrigin,
+  readAutoTrimEnabled,
+  INITIAL_LAYOUT_SWITCH,
+  type LayoutOrigin,
+  type LayoutSwitch,
+} from "./zoneAutoTrim";
 
-// ── Layout Definitions ─────────────────────────────────────────────────────
-
-export interface ZoneDefinition {
-  /** CSS grid-column value */
-  col: string;
-  /** CSS grid-row value */
-  row: string;
-}
-
-export interface LayoutPreset {
-  id: string;
-  name: string;
-  /** Number of columns in the CSS grid */
-  columns: number;
-  /** Number of rows in the CSS grid */
-  rows: number;
-  zones: ZoneDefinition[];
-  /** Shortcut key (1-9) for quick switching */
-  shortcutKey?: number;
-}
-
-export const LAYOUT_PRESETS: LayoutPreset[] = [
-  {
-    id: "single",
-    name: "Single",
-    columns: 1,
-    rows: 1,
-    zones: [{ col: "1", row: "1" }],
-    shortcutKey: 1,
-  },
-  {
-    id: "split",
-    name: "Split",
-    columns: 2,
-    rows: 1,
-    zones: [
-      { col: "1", row: "1" },
-      { col: "2", row: "1" },
-    ],
-    shortcutKey: 2,
-  },
-  {
-    id: "triptych",
-    name: "Triptych",
-    columns: 3,
-    rows: 1,
-    zones: [
-      { col: "1", row: "1" },
-      { col: "2", row: "1" },
-      { col: "3", row: "1" },
-    ],
-    shortcutKey: 3,
-  },
-  {
-    id: "quad",
-    name: "Quad",
-    columns: 2,
-    rows: 2,
-    zones: [
-      { col: "1", row: "1" },
-      { col: "2", row: "1" },
-      { col: "1", row: "2" },
-      { col: "2", row: "2" },
-    ],
-    shortcutKey: 4,
-  },
-  {
-    id: "1-plus-4",
-    name: "Focus + 4",
-    columns: 4,
-    rows: 4,
-    zones: [
-      { col: "1 / 3", row: "1 / 5" }, // large left (2×4)
-      { col: "3 / 5", row: "1 / 3" }, // top-right (2×2)
-      { col: "3 / 5", row: "3 / 5" }, // bottom-right (2×2)
-    ],
-    shortcutKey: 5,
-  },
-  {
-    id: "six-pack",
-    name: "Six Pack",
-    columns: 3,
-    rows: 2,
-    zones: [
-      { col: "1", row: "1" },
-      { col: "2", row: "1" },
-      { col: "3", row: "1" },
-      { col: "1", row: "2" },
-      { col: "2", row: "2" },
-      { col: "3", row: "2" },
-    ],
-    shortcutKey: 6,
-  },
-  {
-    id: "command-center",
-    name: "Command Center",
-    columns: 4,
-    rows: 4,
-    zones: [
-      { col: "1 / 3", row: "1 / 5" }, // large left (2×4)
-      { col: "3", row: "1" },
-      { col: "4", row: "1" },
-      { col: "3", row: "2" },
-      { col: "4", row: "2" },
-      { col: "3", row: "3" },
-      { col: "4", row: "3" },
-      { col: "3", row: "4" },
-      { col: "4", row: "4" },
-    ],
-    shortcutKey: 7,
-  },
-  {
-    id: "full-grid",
-    name: "Full Grid",
-    columns: 3,
-    rows: 3,
-    zones: [
-      { col: "1", row: "1" },
-      { col: "2", row: "1" },
-      { col: "3", row: "1" },
-      { col: "1", row: "2" },
-      { col: "2", row: "2" },
-      { col: "3", row: "2" },
-      { col: "1", row: "3" },
-      { col: "2", row: "3" },
-      { col: "3", row: "3" },
-    ],
-    shortcutKey: 8,
-  },
-];
-
-/** Largest preset by zone count — the auto-grow ceiling. `full-grid` (9). */
-export const MAX_LAYOUT_ID = "full-grid";
-
-// ── Flow-grid (past-9 scrolling synthesis) ─────────────────────────────────
-//
-// Phase 1 of the terminal flow-grid plan: the fixed `LAYOUT_PRESETS` cap out at
-// `full-grid` (9 zones). Past 9 live tabs we STOP using presets and synthesize a
-// scrolling flow-grid instead — a fixed 3-column grid whose rows grow downward
-// so EVERY session gets a real, visible zone (no invisible offscreen tabs). The
-// synthesized preset carries the reserved id {@link FLOW_GRID_ID}; it is never a
-// member of `LAYOUT_PRESETS` (it's produced on demand by {@link resolveLayout}),
-// so every layout-id lookup/validation site must special-case this id or route
-// through `resolveLayout`, or the grow into flow mode silently no-ops.
-
-/** Reserved id for the synthesized past-9 scrolling flow-grid (NOT in `LAYOUT_PRESETS`). */
-export const FLOW_GRID_ID = "flow-grid";
-
-/** Fixed column count for the flow-grid. Deferred: viewport-derived columns. */
-export const FLOW_COLS = 3;
-
-/**
- * Minimum flow-grid tile height in px (≈24 PTY rows at the default font). Below
- * this a terminal is decorative, so rows keep at least this height and the page
- * scrolls rather than shrinking tiles into uselessness.
- */
-export const MIN_TILE_HEIGHT_PX = 300;
-
-/**
- * Synthesize the scrolling flow-grid preset for `tabCount` live tabs: a fixed
- * {@link FLOW_COLS}-column grid with `ceil(tabCount / FLOW_COLS)` rows, one zone
- * per tab laid out left-to-right, top-to-bottom. Pure — the zone `col`/`row`
- * strings match the shape of the static `LAYOUT_PRESETS` zones (single-track
- * `"N"` values), so `ZoneGrid`/`ZoneCell` render them identically.
- *
- * The caller passes {@link flowGridSlotCount}, not the bare tab count, so the
- * grid always reaches the highest assigned zone. Rows shrink as the highest
- * tiles close: the id stays {@link FLOW_GRID_ID}, so this is NOT a grow-only
- * violation — it's the same layout id re-sized, not a shrink to a smaller preset.
- */
-export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
-  const count = Math.max(tabCount, 1);
-  const rows = Math.ceil(count / FLOW_COLS);
-  const zones: ZoneDefinition[] = [];
-  for (let i = 0; i < count; i++) {
-    zones.push({
-      col: String((i % FLOW_COLS) + 1),
-      row: String(Math.floor(i / FLOW_COLS) + 1),
-    });
-  }
-  return {
-    id: FLOW_GRID_ID,
-    name: "Flow Grid",
-    columns: FLOW_COLS,
-    rows,
-    zones,
-  };
-}
-
-/**
- * How many zones the flow-grid must synthesize: one per live tab, and never
- * fewer than it takes to reach the highest zone a live tab is assigned to.
- *
- * Sizing by tab count alone made any assignment at or past `tabIds.length`
- * point at a zone that was never rendered — and `classifyTabs` still counts
- * such a tab as assigned, so it got neither a zone nor the hidden mount: alive,
- * holding its PTY, and drawn nowhere. Closing any tile but the last one did
- * exactly that to the last tile. A restore that skips a record (so the tabs
- * that did come back hold zones past the new count) did it too. Covering the
- * highest assigned zone makes that state unrepresentable.
- *
- * A closed tile therefore leaves an empty tile, exactly as a close leaves an
- * empty zone in the preset layouts, and the next new tab fills the lowest one
- * (`reconcileAssignments`). Nothing re-packs the survivors. Zone labels,
- * notes, pins and output filters are keyed by zone index, so a tile moved by
- * anything but the operator would silently wear another tile's metadata. The
- * grid still shrinks whenever the highest tiles close.
- *
- * Dead assignments (a tab already gone from `tabIds`, not yet dropped by the
- * reconcile effect) are ignored, so a closing tab cannot hold the grid open.
- */
-export function flowGridSlotCount(tabIds: readonly string[], assignments: ZoneAssignments): number {
-  const live = new Set(tabIds);
-  let highest = -1;
-  for (const [zone, tabId] of Object.entries(assignments)) {
-    if (tabId && live.has(tabId)) highest = Math.max(highest, Number(zone));
-  }
-  return Math.max(tabIds.length, highest + 1);
-}
-
-/**
- * Is `layoutId` one the page can lay out: a static preset or the synthesized
- * flow grid. Anything else would silently resolve to `single`.
- */
-export function isKnownLayoutId(layoutId: string): boolean {
-  return layoutId === FLOW_GRID_ID || LAYOUT_PRESETS.some((l) => l.id === layoutId);
-}
-
-/**
- * Resolve a layout id to a concrete preset: the static preset table UNION the
- * on-demand flow-grid synthesis. `FLOW_GRID_ID` synthesizes a preset sized to
- * `tabCount`; any other id is looked up in `LAYOUT_PRESETS`, falling back to the
- * first preset (`single`) for unknown ids. EVERY layout-id lookup that must
- * accept a persisted/auto-grown flow-grid id goes through here.
- */
-export function resolveLayout(layoutId: string, tabCount: number): LayoutPreset {
-  if (layoutId === FLOW_GRID_ID) return synthesizeFlowGrid(tabCount);
-  return LAYOUT_PRESETS.find((l) => l.id === layoutId) ?? LAYOUT_PRESETS[0];
-}
-
-/**
- * Pick the smallest layout preset whose zone count fits `totalTabs` live tabs,
- * growing past the largest fixed preset (`full-grid`, 9 zones) into the
- * synthesized `flow-grid`. Pure — exported so EVERY consumer shares ONE
- * mapping: the `+ new terminal` quick-launch path
- * ({@link computeQuickLaunchLayoutId}, called from `useZoneActions`), the
- * in-hook auto-grow effect ({@link computeAutoGrowLayoutId}), the
- * layout-mismatch suggestion chip (`suggestions/rules.ts`), and the unit test.
- * Inline copies once lived in `TerminalPage.tsx`, `useZoneActions.ts` and
- * `suggestions/rules.ts`; the latter two had drifted (no flow-grid rung).
- *
- * Mapping: 1→single, 2→split, 3-4→quad, 5-6→six-pack, 7-9→full-grid,
- * ≥10→flow-grid (the synthesized past-9 scrolling grid — no fixed preset ceiling
- * anymore). Skips the asymmetric presets (triptych / 1-plus-4 / command-center)
- * deliberately — the grow path wants the smallest *uniform* grid that fits,
- * matching the legacy inline behavior this extracted.
- */
-export function pickLayout(totalTabs: number): string {
-  if (totalTabs >= 10) return FLOW_GRID_ID;
-  if (totalTabs >= 7) return "full-grid";
-  if (totalTabs >= 5) return "six-pack";
-  if (totalTabs >= 3) return "quad";
-  if (totalTabs >= 2) return "split";
-  return "single";
-}
+// The preset table, flow-grid synthesis and the grow ladder live in the leaf
+// module `zoneLayoutPresets.ts` (so `zoneAutoTrim.ts` can use them without an
+// import cycle); re-exported here for the many existing importers.
+export {
+  FLOW_COLS,
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  MAX_LAYOUT_ID,
+  MIN_TILE_HEIGHT_PX,
+  flowGridSlotCount,
+  isKnownLayoutId,
+  pickLayout,
+  resolveLayout,
+  synthesizeFlowGrid,
+  type LayoutPreset,
+  type ZoneAssignments,
+  type ZoneDefinition,
+} from "./zoneLayoutPresets";
+import {
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  flowGridSlotCount,
+  isKnownLayoutId,
+  pickLayout,
+  resolveLayout,
+  type ZoneAssignments,
+} from "./zoneLayoutPresets";
 
 /**
  * Decide whether the layout must GROW to fit `tabCount` live tabs, returning the
@@ -298,8 +69,13 @@ export function pickLayout(totalTabs: number): string {
  *
  * Rules (all enforced here so the effect stays a thin wrapper, and the test can
  * assert them without React):
- *   - **grow only, never shrink**: only returns a target whose zone count is
- *     STRICTLY GREATER than the current layout's; fewer tabs → null.
+ *   - **this reducer only grows**: it only returns a target whose zone count
+ *     is STRICTLY GREATER than the current layout's; fewer tabs → null. The
+ *     shrink is a separate decision with its own guards
+ *     (`computeAutoTrimLayoutId`, `zoneAutoTrim.ts`): it trims only a layout
+ *     the runner chose, only after a tab-count decrease, and only once no
+ *     restore, compaction, maximize or tmux hold is active, so an operator's
+ *     roomy layout is never shrunk under them.
  *   - **capacity-driven**: only grows when `tabCount` exceeds the current
  *     layout's zone capacity.
  *   - **grows INTO `flow-grid` at tab 10** (via `pickLayout`): the flow-grid
@@ -349,9 +125,10 @@ export function computeAutoGrowLayoutId(
  * whatever holes existed, and the auto-grow effect regrew the layout but not
  * the arrangement — one silent re-shuffle of the operator's grid per spawn.
  *
- * Grow-only, like every other path `pickLayout` feeds: a target with fewer
- * zones than the current layout is refused (`null`), so this path can never
- * be the one that compacts assignments.
+ * Grow-only: a target with fewer zones than the current layout is refused
+ * (`null`), so a spawn never compacts assignments. Shrinking is auto-trim's
+ * job alone (`zoneAutoTrim.ts`), which runs after a close, never on a spawn,
+ * and carries zone metadata by tab when it moves a tile.
  */
 export function computeQuickLaunchLayoutId(
   currentLayoutId: string,
@@ -368,9 +145,6 @@ export function computeQuickLaunchLayoutId(
 }
 
 // ── Zone Assignment ────────────────────────────────────────────────────────
-
-/** Maps zone index → tab ID */
-export type ZoneAssignments = Record<number, string>;
 
 /** Shared empty assignments, so a memo over "no snapshot" keeps its identity. */
 const EMPTY_ASSIGNMENTS: ZoneAssignments = {};
@@ -397,6 +171,12 @@ interface PersistedState {
   mruSessionKeys?: Record<string, string>;
   /** The grid to restore when tmux mode exits (`null` in grid mode). */
   gridSnapshot?: GridSnapshot | null;
+  /**
+   * Who chose `layoutId` (`zoneAutoTrim.ts`): only an `auto` layout is
+   * trimmed when tabs close. Absent on pages saved before the field existed,
+   * which read as `operator`, so no page shrinks on upgrade.
+   */
+  layoutOrigin?: LayoutOrigin;
   // NOTE: older builds persisted a `pinned` latch here that suppressed
   // auto-grow. The concept is removed (it hid live sessions as zoneless
   // tabs); a stale `pinned` key in storage is simply ignored on load.
@@ -714,6 +494,12 @@ export function useZoneLayout(
    * grid zone across a runner restart, which re-creates its tab under a new id.
    */
   sessionKeyByTab?: ReadonlyMap<string, string>,
+  /**
+   * Has this page's restore settled (`useTerminalManager().initialized`)?
+   * Until it has, tab-count changes are the restore drain, not closes, so an
+   * owed auto-trim waits. Defaults to settled for callers with no restore.
+   */
+  initialized: boolean = true,
 ) {
   const [persistedState] = useState(() => loadPersistedState(pageId, windowLabel));
   const [initialMode] = useState(() => loadWorkModeState(persistedState));
@@ -749,6 +535,34 @@ export function useZoneLayout(
   const [assignments, setAssignments] = useState<ZoneAssignments>(
     persistedState?.assignments ?? {},
   );
+  /** Who chose `layoutId`; `undefined` = a page persisted before the field. */
+  const [layoutOrigin, setLayoutOrigin] = useState<LayoutOrigin | undefined>(() =>
+    parseLayoutOrigin(persistedState?.layoutOrigin),
+  );
+  /**
+   * The last layout switch or re-deal, committed with it: `seq` is bumped by
+   * every `layoutId` change and by a grid compaction (which re-deals every
+   * zone even when it keeps the id), `origin` is `auto` or `operator` as for
+   * `layoutOrigin`, or `null` for one that is neither (a boot restore, a tmux
+   * enter or toggle exit). `useZoneLabelsAndTags` keys on `seq` and carries
+   * labels, notes and pins by tab when the origin is `auto`.
+   */
+  const [layoutSwitch, setLayoutSwitch] = useState<LayoutSwitch>(INITIAL_LAYOUT_SWITCH);
+  const publishSwitch = useCallback((origin: LayoutOrigin | null) => {
+    setLayoutSwitch((prev) => ({ seq: prev.seq + 1, origin }));
+  }, []);
+  /**
+   * Has the page's current restore run settled? Cleared by
+   * `useTerminalInitialization` when a run starts (the first one, or a drain
+   * re-run after `initialized` is already true) and set when that run opens
+   * its auto-save gate. Until then tab counts are the drain's, and an owed
+   * auto-trim waits. True for a page no restore is running on.
+   *
+   * An ABORTED restore (an indeterminate reconnect) leaves it false, so the
+   * trim stays held until the page's next restore run opens the gate,
+   * exactly as auto-save stays closed until then.
+   */
+  const [restoreSettled, setRestoreSettled] = useState(true);
   const [focusedZone, setFocusedZone] = useState<number>(
     initialMode.workMode === "tmux" ? 0 : (persistedState?.focusedZone ?? 0),
   );
@@ -852,6 +666,8 @@ export function useZoneLayout(
       mru,
       mruSessionKeys,
       gridSnapshot,
+      // Written only once known: an absent origin must stay absent (legacy).
+      ...(layoutOrigin ? { layoutOrigin } : {}),
     });
   }, [
     pageId,
@@ -863,6 +679,7 @@ export function useZoneLayout(
     mru,
     mruSessionKeys,
     gridSnapshot,
+    layoutOrigin,
   ]);
 
   // Reconcile assignments with the live tabs. Grid: auto-assign tabs to empty
@@ -961,10 +778,11 @@ export function useZoneLayout(
   }, [assignments, maximizedZone, tabIds]);
 
   // Shared layout-application logic: switch the preset and redistribute
-  // assignments. Used by BOTH the operator-facing `setLayoutId` and the
-  // programmatic auto-grow effect.
+  // assignments. Used by the request-facing `setLayoutId` and the
+  // programmatic auto-grow and auto-trim effects. `origin` is who chose the
+  // layout; `null` (a boot restore) keeps the stored origin.
   const applyLayout = useCallback(
-    (id: string) => {
+    (id: string, origin: LayoutOrigin | null) => {
       // `resolveLayout` accepts the synthetic `flow-grid` id (auto-grow calls
       // `applyLayout` directly, so a plain `LAYOUT_PRESETS.find` returning
       // undefined would EAT the grow into flow mode). Unknown ids resolve to
@@ -979,7 +797,13 @@ export function useZoneLayout(
         resolveLayout(id, flowGridSlotCount(tabIds, current)).zones.length;
       const zoneCount = zoneCountFor(committedRef.current.assignments);
 
+      // An operator request always records the operator's choice. An `auto`
+      // one records only a layout it actually changed: re-asserting the
+      // operator's own quad must not hand it to the trim.
+      const changed = id !== committedRef.current.layoutId;
       setLayoutIdState(id);
+      if (origin === "operator" || (origin === "auto" && changed)) setLayoutOrigin(origin);
+      if (changed) publishSwitch(origin);
       setMaximizedZone(null);
 
       // Reassign: preserve every in-range assignment exactly; compact only
@@ -992,7 +816,7 @@ export function useZoneLayout(
       // Clamp focused zone
       setFocusedZone((prev) => (prev >= zoneCount ? 0 : prev));
     },
-    [tabIds],
+    [tabIds, publishSwitch],
   );
 
   // ── Phase 1: auto-grow layout to fit live tabs ───────────────────────────
@@ -1009,7 +833,7 @@ export function useZoneLayout(
   useEffect(() => {
     const target = computeAutoGrowLayoutId(layoutId, tabIds.length, workMode);
     if (target) {
-      applyLayout(target);
+      applyLayout(target, "auto");
     }
   }, [layoutId, tabIds.length, workMode, applyLayout]);
 
@@ -1049,10 +873,11 @@ export function useZoneLayout(
     setPendingShownKey(null);
     setWorkMode("tmux");
     setLayoutIdState("single");
+    publishSwitch(null);
     setMaximizedZone(null);
     setFocusedZone(0);
     setAssignments(shown === null ? {} : { 0: shown });
-  }, [tabIds, sessionKeyOf]);
+  }, [tabIds, sessionKeyOf, publishSwitch]);
 
   /**
    * Leave tmux mode for the grid the operator left: the snapshot, reconciled
@@ -1103,6 +928,10 @@ export function useZoneLayout(
       setGridSnapshot(null);
       setPendingShownKey(null);
       setLayoutIdState(next.layoutId);
+      // A preset pick is an operator choice of layout. A toggle exit returns
+      // to the grid as it was, with the origin it had.
+      if (presetId !== null) setLayoutOrigin("operator");
+      publishSwitch(presetId !== null ? "operator" : null);
       setAssignments(next.assignments);
       setFocusedZone(next.focusedZone);
       setMaximizedZone(null);
@@ -1113,7 +942,7 @@ export function useZoneLayout(
       const focusedTab = next.assignments[next.focusedZone];
       if (focusedTab) requestReveal(focusedTab);
     },
-    [tabIds, sessionKeyOf, requestReveal],
+    [tabIds, sessionKeyOf, requestReveal, publishSwitch],
   );
 
   const exitTmuxMode = useCallback(() => exitTmux(null), [exitTmux]);
@@ -1126,9 +955,15 @@ export function useZoneLayout(
    *   - `operator` (picker, layout chords, `/layout`, profile/workspace load):
    *     applied in grid mode; in tmux mode it is an explicit request for a
    *     grid, so it exits tmux and applies the preset over the restored grid.
-   *   - `spawn` (a new terminal growing the grid) and `restore` (mount
-   *     re-applying the saved preset): applied in grid mode; no-ops in tmux,
-   *     which would otherwise end on every spawn and every reload.
+   *   - `auto` (a layout the runner chose: a quick or AI launch growing the
+   *     grid) and `restore` (mount re-applying the saved preset): applied in
+   *     grid mode; no-ops in tmux, which would otherwise end on every spawn
+   *     and every reload.
+   *
+   * The source also records the layout's origin (`zoneAutoTrim.ts`), which
+   * decides whether closing tabs may trim it: `operator` and `auto` record
+   * themselves; `restore` keeps the stored origin, because stamping it would
+   * turn every auto page into a never-trimmed one (or the reverse) on restart.
    */
   const setLayoutId = useCallback(
     (id: string, request: { source: LayoutRequestSource }) => {
@@ -1140,7 +975,7 @@ export function useZoneLayout(
         if (request.source === "operator") exitTmux(id);
         return;
       }
-      applyLayout(id);
+      applyLayout(id, request.source === "restore" ? null : request.source);
     },
     [applyLayout, exitTmux],
   );
@@ -1233,6 +1068,8 @@ export function useZoneLayout(
       const snapshot = committedRef.current.gridSnapshot;
       const snapshotFocused = snapshot ? snapshot.assignments[snapshot.focusedZone] : undefined;
       const compacted = compactAssignments(ordered);
+      // The grid tmux returns to is now the runner's choice.
+      setLayoutOrigin("auto");
       setGridSnapshot({
         layoutId: pickLayout(ordered.length),
         assignments: compacted,
@@ -1243,10 +1080,64 @@ export function useZoneLayout(
     }
     const focusedTab = committedRef.current.assignments[focusedZone];
     setLayoutIdState(pickLayout(ordered.length));
+    setLayoutOrigin("auto");
+    // A re-deal even when `pickLayout` keeps the id (6 tabs → 5 is six-pack).
+    publishSwitch("auto");
     setAssignments(compactAssignments(ordered));
     setMaximizedZone(null);
     setFocusedZone(Math.max(0, focusedTab ? ordered.indexOf(focusedTab) : 0));
-  }, [pendingCompaction, tabIds, focusedZone, sessionKeyOf]);
+  }, [pendingCompaction, tabIds, focusedZone, sessionKeyOf, publishSwitch]);
+
+  // ── Auto-trim: shrink a runner-chosen layout when tabs close ──────────────
+  // A tab-count DECREASE latches a trim as owed; the owed trim applies once no
+  // hold is active (`autoTrimHold`), from the count as it is THEN. The holds
+  // are this effect's dependencies, so releasing one re-runs it: never a
+  // timer, never "the next close". Mount, load and upgrade never trim, since
+  // the count starts at the mount-time count and no decrease has been seen.
+  // No thrash with auto-grow: the target is
+  // `pickLayout(count)`, which fits the tabs, so neither reducer has anything
+  // to do after the other.
+  const prevTabCountRef = useRef(tabIds.length);
+  const trimOwedRef = useRef(false);
+  useEffect(() => {
+    const tabCount = tabIds.length;
+    if (tabCount < prevTabCountRef.current) trimOwedRef.current = true;
+    prevTabCountRef.current = tabCount;
+    if (!trimOwedRef.current) return;
+    const hold = autoTrimHold({
+      initialized,
+      restoreSettled,
+      compactionPending: pendingCompaction !== null,
+      maximizedZone,
+      workMode,
+    });
+    if (hold !== null) return;
+    trimOwedRef.current = false;
+    if (!readAutoTrimEnabled()) return;
+    const target = computeAutoTrimLayoutId(
+      layoutId,
+      layoutOrigin,
+      tabCount,
+      layout.zones.length,
+      workMode,
+    );
+    // A layout switch in reaction to committed state (a close, a hold
+    // releasing), exactly like auto-grow above: it cannot be derived during
+    // render, because the owed latch spans commits.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (target) applyLayout(target, "auto");
+  }, [
+    tabIds.length,
+    initialized,
+    restoreSettled,
+    pendingCompaction,
+    maximizedZone,
+    workMode,
+    layoutId,
+    layoutOrigin,
+    layout.zones.length,
+    applyLayout,
+  ]);
 
   const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
     // tmux mode renders zone 0 only: assigning there is a swap (the MRU effect
@@ -1464,6 +1355,9 @@ export function useZoneLayout(
   return {
     layout,
     layoutId,
+    layoutOrigin,
+    layoutSwitch,
+    setRestoreSettled,
     setLayoutId,
     assignments,
     assignTabToZone,
