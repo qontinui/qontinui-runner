@@ -53,9 +53,8 @@ use crate::terminal::graceful_exit::ProcIdentity;
 /// Claude Code registry files (2026-10-23 review fix 3).
 ///
 /// Windows: yes — the live `sessions/<pid>.json` files carry `procStart` as
-/// a decimal-string FILETIME with `pidDomain` `"win32:<host>"` (e.g.
-/// `C:/claude/.claude-erik/sessions/47904.json`), the clock the snapshot
-/// reads. Elsewhere: the Linux clock
+/// a decimal-string FILETIME, e.g. `"procStart":"134374313248442634"` with
+/// `"pidDomain":"win32:<host>"`, the clock the snapshot reads. Elsewhere: the Linux clock
 /// (`ps -o lstart` in UTC, read from the CLI bundle — see the
 /// `claude_session_registry` module doc) is implemented but has never met a
 /// real Linux registry file. So off Windows a pane whose identity cannot be
