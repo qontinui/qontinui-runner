@@ -18,7 +18,7 @@
  * Everything here is pure, so the tests assert the rules without React.
  */
 
-import type { ZoneAssignments } from "./useZoneLayout";
+import type { ZoneAssignments } from "./zoneLayoutPresets";
 import { MAX_WEBGL_PANES } from "./backends/webglContextLru";
 
 export type TerminalWorkMode = "grid" | "tmux";

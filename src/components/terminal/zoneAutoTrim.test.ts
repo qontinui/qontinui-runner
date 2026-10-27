@@ -24,6 +24,7 @@ import {
   computeAutoTrimLayoutId,
   migrateZoneMetadataByTab,
   migrateZoneSetByTab,
+  rememberVacatedZones,
   parseLayoutOrigin,
   readAutoTrimEnabled,
   writeAutoTrimEnabled,
@@ -61,6 +62,20 @@ describe("computeAutoTrimLayoutId", () => {
     expect(computeAutoTrimLayoutId(FLOW_GRID_ID, "auto", 9, 12, "grid")).toBe("full-grid");
   });
 
+  it("flow-grid whose highest tiles closed (12 → 9 tabs, 9 zones) still leaves for full-grid", () => {
+    // `flowGridSlotCount` is 9 here: full-grid's 9 zones are not FEWER, yet
+    // flow-grid at 9 tabs is exactly the grid auto-grow would not have made.
+    expect(computeAutoTrimLayoutId(FLOW_GRID_ID, "auto", 9, 9, "grid")).toBe("full-grid");
+  });
+
+  it("flow-grid down to 3 dense tabs (3 zones) trims to quad", () => {
+    expect(computeAutoTrimLayoutId(FLOW_GRID_ID, "auto", 3, 3, "grid")).toBe("quad");
+  });
+
+  it("an operator flow-grid at 3 tabs is still left alone", () => {
+    expect(computeAutoTrimLayoutId(FLOW_GRID_ID, "operator", 3, 3, "grid")).toBeNull();
+  });
+
   it("flow-grid at 10+ tabs stays flow-grid (no re-pack is a trim)", () => {
     expect(computeAutoTrimLayoutId(FLOW_GRID_ID, "auto", 10, 12, "grid")).toBeNull();
   });
@@ -83,7 +98,7 @@ describe("computeAutoTrimLayoutId", () => {
 describe("autoTrimHold", () => {
   const free: AutoTrimHoldInputs = {
     initialized: true,
-    reservedZoneCount: 0,
+    restoreSettled: true,
     compactionPending: false,
     maximizedZone: null,
     workMode: "grid",
@@ -95,7 +110,7 @@ describe("autoTrimHold", () => {
 
   it.each([
     [{ initialized: false }, "restoring"],
-    [{ reservedZoneCount: 1 }, "zone-reserved"],
+    [{ restoreSettled: false }, "restoring"],
     [{ compactionPending: true }, "compaction-pending"],
     [{ maximizedZone: 0 }, "maximized"],
     [{ workMode: "tmux" as const }, "tmux"],
@@ -175,5 +190,30 @@ describe("migrateZoneMetadataByTab", () => {
   it("pins migrate the same way", () => {
     const pins = migrateZoneSetByTab(new Set([3]), { 3: "c" }, { 2: "c" });
     expect([...pins]).toStrictEqual([2]);
+  });
+});
+
+describe("rememberVacatedZones", () => {
+  it("is the assignments when nothing was vacated", () => {
+    const now = { 0: "a", 1: "b" };
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, now)).toBe(now);
+  });
+
+  it("remembers a closed tab on the zone it left", () => {
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a" })).toStrictEqual({ 0: "a", 1: "b" });
+  });
+
+  it("does not remember a tab that moved to another zone", () => {
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 2: "b" })).toStrictEqual({
+      0: "a",
+      2: "b",
+    });
+  });
+
+  it("forgets the departed tab once a new tab fills the zone", () => {
+    expect(rememberVacatedZones({ 0: "a", 1: "b" }, { 0: "a", 1: "c" })).toStrictEqual({
+      0: "a",
+      1: "c",
+    });
   });
 });

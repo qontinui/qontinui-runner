@@ -41,7 +41,8 @@ import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useZoneLayout, zoneLayoutStorageKey, type ZoneAssignments } from "./useZoneLayout";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
-import { AUTO_TRIM_STORAGE_KEY, migrateZoneMetadataByTab, type LayoutOrigin } from "./zoneAutoTrim";
+import { AUTO_TRIM_STORAGE_KEY, type LayoutOrigin } from "./zoneAutoTrim";
+import { setTabFilter, zoneFiltersFor } from "./zone-grid/zoneFilters";
 
 const PAGE = "trim-test";
 
@@ -89,12 +90,7 @@ function mount(
   function Host() {
     harness.beginRender();
     const zone = useZoneLayout(live, PAGE, windowLabel, undefined, undefined, initialized);
-    const labels = useZoneLabelsAndTags(
-      zone.layoutId,
-      zone.assignments,
-      PAGE,
-      zone.layoutSwitchOrigin,
-    );
+    const labels = useZoneLabelsAndTags(zone.layoutId, zone.assignments, PAGE, zone.layoutSwitch);
     return { ...zone, labels };
   }
   const render = (next?: string[]) => {
@@ -168,6 +164,26 @@ describe("useZoneLayout auto-trim: what trims", () => {
     for (const id of ["t0", "t2", "t3", "t5", "t6", "t8"]) {
       expect(r.assignments[Number(id.slice(1))]).toBe(id);
     }
+  });
+
+  it("an auto flow-grid whose HIGHEST tiles close (12 → 9) leaves for full-grid", () => {
+    // `flowGridSlotCount` is 9 after t9..t11 close, so full-grid's 9 zones are
+    // not fewer: only the flow-grid exit rule can make this trim.
+    const before = ids(12);
+    const render = mount("flow-grid", before, dense(before), { origin: "auto" });
+    render();
+    const r = render(ids(9));
+    expect(r.layoutId).toBe("full-grid");
+    expect(r.assignments).toStrictEqual(dense(ids(9)));
+  });
+
+  it("an auto flow-grid down to 3 dense tabs trims to quad", () => {
+    const before = ids(12);
+    const render = mount("flow-grid", before, dense(before), { origin: "auto" });
+    render();
+    const r = render(ids(3));
+    expect(r.layoutId).toBe("quad");
+    expect(r.assignments).toStrictEqual(dense(ids(3)));
   });
 
   it("growth after a trim still works, and nothing thrashes", () => {
@@ -273,6 +289,17 @@ describe("useZoneLayout auto-trim: holds", () => {
     expect(render().layoutId).toBe("split");
   });
 
+  it("a drain re-run after initialized holds the trim until its gate opens", () => {
+    // `initialized` is already true; `useTerminalInitialization` clears the
+    // settled flag for the run and sets it where it opens the auto-save gate.
+    const before = ids(6);
+    const render = mount("six-pack", before, dense(before), { origin: "auto" });
+    render().setRestoreSettled(false);
+    expect(render(["t0", "t1"]).layoutId).toBe("six-pack");
+    render().setRestoreSettled(true);
+    expect(render().layoutId).toBe("split");
+  });
+
   it("the trim applies from the count when the hold releases, not the one that latched it", () => {
     const before = ids(6);
     const render = mount("six-pack", before, dense(before), {
@@ -333,6 +360,22 @@ describe("useZoneLayout auto-trim: origin", () => {
     render().setLayoutId("six-pack", { source: "auto" });
     expect(render().layoutOrigin).toBe("auto");
     expect(persistedOrigin()).toBe("auto");
+  });
+
+  it("an auto request that changes nothing leaves an operator layout the operator's", () => {
+    // A quick launch whose tabs already fit must not hand the operator's
+    // roomy quad to the trim.
+    const render = mount("quad", ["a", "b"], { 0: "a", 1: "b" }, { origin: "operator" });
+    render().setLayoutId("quad", { source: "auto" });
+    const r = render(["a", "b", "c"]);
+    expect(r.layoutOrigin).toBe("operator");
+    expect(render(["a", "b"]).layoutId).toBe("quad");
+  });
+
+  it("an operator re-pick of the current layout claims it", () => {
+    const render = mount("quad", ["a", "b"], { 0: "a", 1: "b" }, { origin: "auto" });
+    render().setLayoutId("quad", { source: "operator" });
+    expect(render().layoutOrigin).toBe("operator");
   });
 
   it("a boot restore keeps an auto page auto, so it still trims after the restart", () => {
@@ -400,10 +443,9 @@ describe("useZoneLayout auto-trim: metadata follows the tab (D5)", () => {
     r0.labels.setZoneLabel(3, "closing");
     r0.labels.setZoneNote(5, "watch the canary");
     r0.labels.togglePin(5);
-    const pre = render();
-    // Output filters are ZoneGrid reducer state, migrated with the same
-    // function over the grid's assignments on every assignment change.
-    const filtersBefore = { 1: "error", 5: "WARN" };
+    render();
+    // Output filters are ZoneGrid state keyed by tab (`zone-grid/zoneFilters`).
+    const filters = setTabFilter(setTabFilter({}, "t1", "error"), "t5", "WARN");
 
     const r = render(["t1", "t5"]);
     expect(r.layoutId).toBe("split");
@@ -413,12 +455,44 @@ describe("useZoneLayout auto-trim: metadata follows the tab (D5)", () => {
     expect(r.labels.zoneLabels).toStrictEqual({ [zoneOf("t1")]: "docs", [zoneOf("t5")]: "deploy" });
     expect(r.labels.zoneNotes).toStrictEqual({ [zoneOf("t5")]: "watch the canary" });
     expect([...r.labels.pinnedZones]).toStrictEqual([zoneOf("t5")]);
+    expect(zoneFiltersFor(filters, r.gridView.assignments)).toStrictEqual({
+      [zoneOf("t1")]: "error",
+      [zoneOf("t5")]: "WARN",
+    });
+  });
 
-    // The filters' migration: across the close (t3 gone) and then the trim.
-    const afterClose = { 0: "t0", 1: "t1", 2: "t2", 4: "t4", 5: "t5" };
-    const ignored = migrateZoneMetadataByTab(filtersBefore, pre.gridView.assignments, afterClose);
-    const filters = migrateZoneMetadataByTab(ignored, afterClose, r.gridView.assignments);
-    expect(filters).toStrictEqual({ [zoneOf("t1")]: "error", [zoneOf("t5")]: "WARN" });
+  it("a close and its HELD trim in different commits still drop the closed tab's label", () => {
+    const before = ids(6);
+    const render = mount("six-pack", before, dense(before), { origin: "auto" });
+    const r0 = render();
+    r0.labels.setZoneLabel(0, "keep");
+    r0.labels.setZoneLabel(3, "closed-tab");
+    render().setMaximizedZone(0);
+    // The close lands; the trim is held by the maximize.
+    const held = render(["t0", "t1", "t2"]);
+    expect(held.layoutId).toBe("six-pack");
+    held.setMaximizedZone(null);
+    const r = render();
+    expect(r.layoutId).toBe("quad");
+    // Zone 3 exists in quad and is empty: without the vacated-zone memory the
+    // closed tab's label would sit there for the next tab to wear.
+    expect(r.labels.zoneLabels).toStrictEqual({ 0: "keep" });
+  });
+
+  it("a compaction that keeps the layout id still carries labels and pins by tab", () => {
+    const all = ["s1", "a1", "a2", "a3", "a4", "a5"];
+    const render = mount("six-pack", all, dense(all), { origin: "auto" });
+    const r0 = render();
+    r0.labels.setZoneLabel(1, "a1-label");
+    r0.labels.setZoneLabel(5, "a5-label");
+    r0.labels.togglePin(5);
+    render().requestCompaction(["a5", "a1", "a2", "a3", "a4"], ["s1"]);
+    const r = render(["a1", "a2", "a3", "a4", "a5"]);
+    // pickLayout(5) is six-pack: the id is unchanged, the zones are re-dealt.
+    expect(r.layoutId).toBe("six-pack");
+    expect(r.assignments).toStrictEqual({ 0: "a5", 1: "a1", 2: "a2", 3: "a3", 4: "a4" });
+    expect(r.labels.zoneLabels).toStrictEqual({ 0: "a5-label", 1: "a1-label" });
+    expect([...r.labels.pinnedZones]).toStrictEqual([0]);
   });
 
   it("an operator switch keeps today's per-layout path: labels are not carried by tab", () => {
@@ -426,7 +500,7 @@ describe("useZoneLayout auto-trim: metadata follows the tab (D5)", () => {
     render().labels.setZoneLabel(3, "b-label");
     render().setLayoutId("split", { source: "operator" });
     const r = render();
-    expect(r.layoutSwitchOrigin).toBe("operator");
+    expect(r.layoutSwitch.origin).toBe("operator");
     expect(r.assignments).toStrictEqual({ 0: "a", 1: "b" });
     // b moved to zone 1; its label did not follow (an auto switch would
     // have put it on zone 1).

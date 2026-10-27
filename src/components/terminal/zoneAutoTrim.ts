@@ -14,14 +14,18 @@
  * that feeds it (a tab-count decrease latches a trim as owed, and the owed
  * trim applies once no {@link autoTrimHold} is active).
  *
- * Zone labels, notes, pins and output filters are keyed by zone index, so a
- * runner-originated switch that moves tiles carries them by TAB
- * ({@link migrateZoneMetadataByTab}): old zone → tab → new zone.
+ * Zone labels, notes and pins are keyed by zone index, so every
+ * runner-originated re-deal — a grow, a trim, a quick launch, and a
+ * compaction even when it keeps the layout id — carries them by TAB
+ * ({@link migrateZoneMetadataByTab}): old zone → tab → new zone. `useZoneLayout`
+ * publishes each such re-deal as a `layoutSwitch` token that
+ * `useZoneLabelsAndTags` keys on. Output filters are keyed by tab outright
+ * (`zone-grid/zoneFilters.ts`), so nothing has to carry them.
  */
 
 import { instanceStorage } from "@/lib/instance-storage";
 import type { TerminalWorkMode } from "./terminalWorkMode";
-import { pickLayout, resolveLayout, type ZoneAssignments } from "./useZoneLayout";
+import { FLOW_GRID_ID, pickLayout, resolveLayout, type ZoneAssignments } from "./zoneLayoutPresets";
 
 /**
  * Who chose the page's current layout. `auto`: the runner (auto-grow, a quick
@@ -31,6 +35,18 @@ import { pickLayout, resolveLayout, type ZoneAssignments } from "./useZoneLayout
  * the field, and reads as `operator` to the trim.
  */
 export type LayoutOrigin = "auto" | "operator";
+
+/**
+ * A layout switch or re-deal as `useZoneLayout` publishes it: `seq` changes on
+ * every one, `origin` says who made it (`null`: neither the runner nor the
+ * operator chose a layout — a boot restore, a tmux enter or toggle exit).
+ */
+export interface LayoutSwitch {
+  seq: number;
+  origin: LayoutOrigin | null;
+}
+
+export const INITIAL_LAYOUT_SWITCH: LayoutSwitch = { seq: 0, origin: null };
 
 /** Read a persisted origin: a known value, else absent (never guessed). */
 export function parseLayoutOrigin(raw: unknown): LayoutOrigin | undefined {
@@ -47,12 +63,15 @@ export function parseLayoutOrigin(raw: unknown): LayoutOrigin | undefined {
  *   - `tabCount >= 1`: a page this window owns no tabs of (popped out to its
  *     own window) is "not here", not "empty";
  *   - not tmux work mode, whose layout is pinned to `single`;
- *   - the target has STRICTLY fewer zones than `currentZoneCount`, the zone
- *     count the page renders now (for flow-grid, its `flowGridSlotCount`
- *     size, not the tab count);
  *   - the target is a different layout. Flow-grid at 10+ tabs stays
  *     flow-grid: it already re-sizes to its highest occupied tile, and
- *     re-packing its survivors into the holes is not a trim.
+ *     re-packing its survivors into the holes is not a trim;
+ *   - for a preset, the target has STRICTLY fewer zones than
+ *     `currentZoneCount`, the zone count the page renders now. Flow-grid at 9
+ *     tabs or fewer always leaves for the preset: auto-grow only enters
+ *     flow-grid at 10, and a flow-grid whose highest tiles closed renders
+ *     exactly one zone per tab (12 → 9 tabs: 9 zones), which no zone-count
+ *     comparison could ever shrink.
  */
 export function computeAutoTrimLayoutId(
   currentLayoutId: string,
@@ -66,16 +85,19 @@ export function computeAutoTrimLayoutId(
   if (workMode === "tmux") return null;
   const targetId = pickLayout(tabCount);
   if (targetId === currentLayoutId) return null;
+  if (currentLayoutId === FLOW_GRID_ID) return targetId;
   if (resolveLayout(targetId, tabCount).zones.length >= currentZoneCount) return null;
   return targetId;
 }
 
 /** Why an owed trim is waiting, in the order they are checked. */
 export type AutoTrimHold =
-  /** The page's restore has not settled (`useTerminalManager().initialized`). */
+  /**
+   * The page's restore has not settled: `useTerminalManager().initialized` is
+   * false, or a restore run (first or drain re-run) has not yet opened its
+   * auto-save gate (`useZoneLayout().setRestoreSettled`).
+   */
   | "restoring"
-  /** A session record has claimed a zone its tab has not filled yet. */
-  | "zone-reserved"
   /** A "keep AI sessions" compaction is about to re-deal every zone. */
   | "compaction-pending"
   /** Re-applying a layout un-maximizes; the operator is looking at one zone. */
@@ -85,7 +107,7 @@ export type AutoTrimHold =
 
 export interface AutoTrimHoldInputs {
   initialized: boolean;
-  reservedZoneCount: number;
+  restoreSettled: boolean;
   compactionPending: boolean;
   maximizedZone: number | null;
   workMode: TerminalWorkMode;
@@ -99,8 +121,7 @@ export interface AutoTrimHoldInputs {
  * a layout switch would clear, and tmux mode.
  */
 export function autoTrimHold(inputs: AutoTrimHoldInputs): AutoTrimHold | null {
-  if (!inputs.initialized) return "restoring";
-  if (inputs.reservedZoneCount > 0) return "zone-reserved";
+  if (!inputs.initialized || !inputs.restoreSettled) return "restoring";
   if (inputs.compactionPending) return "compaction-pending";
   if (inputs.maximizedZone !== null) return "maximized";
   if (inputs.workMode === "tmux") return "tmux";
@@ -189,4 +210,28 @@ export function migrateZoneSetByTab(
   for (const z of zones) asRecord[z] = true;
   const migrated = migrateZoneMetadataByTab(asRecord, prev, next);
   return new Set(Object.keys(migrated).map(Number));
+}
+
+/**
+ * The zone → tab map an `auto` re-deal migrates metadata FROM. It is the
+ * current assignments, plus each vacated zone's last tab when that tab is no
+ * longer in any zone (closed, or left without one). Without the memory a
+ * close and its held trim landing in different commits would leave the dead
+ * tab's label unanchored on its index, to be worn by whatever lands there;
+ * with it, the label is dropped exactly as when both land in one commit. A
+ * tab that merely moved to another zone is not remembered at its old one.
+ */
+export function rememberVacatedZones(
+  remembered: ZoneAssignments,
+  assignments: ZoneAssignments,
+): ZoneAssignments {
+  const assigned = new Set(Object.values(assignments));
+  let next: ZoneAssignments | null = null;
+  for (const [z, tabId] of Object.entries(remembered)) {
+    const zone = Number(z);
+    if (assignments[zone] || assigned.has(tabId)) continue;
+    next ??= { ...assignments };
+    next[zone] = tabId;
+  }
+  return next ?? assignments;
 }

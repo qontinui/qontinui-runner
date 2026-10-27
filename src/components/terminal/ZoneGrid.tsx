@@ -3,8 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { useDisplayTitleResolver } from "./displayTitle";
-import type { LayoutPreset, ZoneAssignments } from "./useZoneLayout";
-import { migrateZoneMetadataByTab } from "./zoneAutoTrim";
+import type { LayoutPreset } from "./useZoneLayout";
+import {
+  clearTabFilter,
+  setTabFilter,
+  toggleFilterInputTab,
+  zoneFiltersFor,
+  zoneOfTab,
+  type TabFilters,
+} from "./zone-grid/zoneFilters";
 import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
 import { tmuxMountedTabIds } from "./terminalWorkMode";
 import {
@@ -76,8 +83,10 @@ interface ZoneGridProps {
 interface GridState {
   dropTargetZone: number | null;
   contextMenu: { x: number; y: number; zoneIndex: number } | null;
-  zoneFilters: Record<number, string>;
-  showFilterInput: number | null;
+  /** Output filters by TAB id (`zone-grid/zoneFilters.ts`). */
+  tabFilters: TabFilters;
+  /** The tab whose filter input is open. */
+  filterInputTab: string | null;
   colRatios: number[];
   rowRatios: number[];
   uptimeTick: number;
@@ -86,10 +95,9 @@ interface GridState {
 type GridAction =
   | { type: "SET_DROP_TARGET"; zone: number | null }
   | { type: "SET_CONTEXT_MENU"; menu: { x: number; y: number; zoneIndex: number } | null }
-  | { type: "SET_ZONE_FILTER"; zoneIndex: number; value: string }
-  | { type: "CLEAR_ZONE_FILTER"; zoneIndex: number }
-  | { type: "TOGGLE_FILTER_INPUT"; zoneIndex: number }
-  | { type: "MIGRATE_ZONE_FILTERS"; prev: ZoneAssignments; next: ZoneAssignments }
+  | { type: "SET_TAB_FILTER"; tabId: string; value: string }
+  | { type: "CLEAR_TAB_FILTER"; tabId: string }
+  | { type: "TOGGLE_FILTER_INPUT"; tabId: string }
   | { type: "SET_COL_RATIOS"; ratios: number[] }
   | { type: "SET_ROW_RATIOS"; ratios: number[] }
   | { type: "TICK_UPTIME" };
@@ -100,34 +108,12 @@ function gridReducer(state: GridState, action: GridAction): GridState {
       return { ...state, dropTargetZone: action.zone };
     case "SET_CONTEXT_MENU":
       return { ...state, contextMenu: action.menu };
-    case "SET_ZONE_FILTER":
-      return {
-        ...state,
-        zoneFilters: { ...state.zoneFilters, [action.zoneIndex]: action.value },
-      };
-    case "CLEAR_ZONE_FILTER": {
-      const next = { ...state.zoneFilters };
-      delete next[action.zoneIndex];
-      return { ...state, zoneFilters: next };
-    }
-    case "MIGRATE_ZONE_FILTERS": {
-      // An output filter belongs to a session, not to a zone index: it follows
-      // its tab on EVERY assignment change, whatever moved it.
-      const zoneFilters = migrateZoneMetadataByTab(state.zoneFilters, action.prev, action.next);
-      const openInput =
-        state.showFilterInput === null
-          ? state.showFilterInput
-          : (Object.keys(
-              migrateZoneMetadataByTab({ [state.showFilterInput]: true }, action.prev, action.next),
-            ).map(Number)[0] ?? null);
-      if (zoneFilters === state.zoneFilters && openInput === state.showFilterInput) return state;
-      return { ...state, zoneFilters, showFilterInput: openInput };
-    }
+    case "SET_TAB_FILTER":
+      return { ...state, tabFilters: setTabFilter(state.tabFilters, action.tabId, action.value) };
+    case "CLEAR_TAB_FILTER":
+      return { ...state, tabFilters: clearTabFilter(state.tabFilters, action.tabId) };
     case "TOGGLE_FILTER_INPUT":
-      return {
-        ...state,
-        showFilterInput: state.showFilterInput === action.zoneIndex ? null : action.zoneIndex,
-      };
+      return { ...state, filterInputTab: toggleFilterInputTab(state.filterInputTab, action.tabId) };
     case "SET_COL_RATIOS":
       return { ...state, colRatios: action.ratios };
     case "SET_ROW_RATIOS":
@@ -145,8 +131,8 @@ function createInitialGridState(layout: LayoutPreset): GridState {
   return {
     dropTargetZone: null,
     contextMenu: null,
-    zoneFilters: {},
-    showFilterInput: null,
+    tabFilters: {},
+    filterInputTab: null,
     colRatios: parsedCols.length === layout.columns ? parsedCols : Array(layout.columns).fill(1),
     rowRatios: parsedRows.length === layout.rows ? parsedRows : Array(layout.rows).fill(1),
     uptimeTick: 0,
@@ -274,17 +260,21 @@ function ZoneGridInner({
   const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
 
-  // Output filters are keyed by the zone a cell's cosmetics live in (its grid
-  // zone; in tmux mode the snapshot's), so they follow their tab through the
-  // GRID's assignments: a swap, a drag, a close, a grow, a trim, a compaction.
+  // Output filters are stored by tab and shown per zone. A cell addresses its
+  // filter by the zone its cosmetics live in (its grid zone; in tmux mode the
+  // snapshot's), so the per-zone view is derived from the GRID's assignments
+  // and a cell's zone is resolved to its tab when it edits. Read through a
+  // ref in the handlers, so they stay stable for the memoized cells.
   const gridAssignments = zoneLayout.gridView.assignments;
-  const prevGridAssignmentsRef = useRef(gridAssignments);
+  const gridAssignmentsRef = useRef(gridAssignments);
   useEffect(() => {
-    const prev = prevGridAssignmentsRef.current;
-    if (prev === gridAssignments) return;
-    prevGridAssignmentsRef.current = gridAssignments;
-    dispatch({ type: "MIGRATE_ZONE_FILTERS", prev, next: gridAssignments });
+    gridAssignmentsRef.current = gridAssignments;
   }, [gridAssignments]);
+  const zoneFilters = useMemo(
+    () => zoneFiltersFor(gridState.tabFilters, gridAssignments),
+    [gridState.tabFilters, gridAssignments],
+  );
+  const showFilterInput = zoneOfTab(gridAssignments, gridState.filterInputTab);
 
   // ── Prompts panel: which sessions are showing the operator's own prompts ──
   //
@@ -598,18 +588,19 @@ function ZoneGridInner({
       dispatch({ type: "SET_CONTEXT_MENU", menu }),
     [],
   );
-  const toggleFilterInput = useCallback(
-    (zoneIndex: number) => dispatch({ type: "TOGGLE_FILTER_INPUT", zoneIndex }),
-    [],
-  );
-  const setZoneFilter = useCallback(
-    (zoneIndex: number, value: string) => dispatch({ type: "SET_ZONE_FILTER", zoneIndex, value }),
-    [],
-  );
-  const clearZoneFilter = useCallback(
-    (zoneIndex: number) => dispatch({ type: "CLEAR_ZONE_FILTER", zoneIndex }),
-    [],
-  );
+  // A zone with no tab has no session to filter: the edit is dropped.
+  const toggleFilterInput = useCallback((zoneIndex: number) => {
+    const tabId = gridAssignmentsRef.current[zoneIndex];
+    if (tabId) dispatch({ type: "TOGGLE_FILTER_INPUT", tabId });
+  }, []);
+  const setZoneFilter = useCallback((zoneIndex: number, value: string) => {
+    const tabId = gridAssignmentsRef.current[zoneIndex];
+    if (tabId) dispatch({ type: "SET_TAB_FILTER", tabId, value });
+  }, []);
+  const clearZoneFilter = useCallback((zoneIndex: number) => {
+    const tabId = gridAssignmentsRef.current[zoneIndex];
+    if (tabId) dispatch({ type: "CLEAR_TAB_FILTER", tabId });
+  }, []);
 
   // Layer 1 of plans/terminal-grid-bootstrap-redesign.md — exclusive
   // classification per render. Without this, a tab can briefly satisfy
@@ -712,8 +703,8 @@ function ZoneGridInner({
     isMultiZone: zoneLayout.isMultiZone,
     autoCompact,
     forceCompact,
-    showFilterInput: gridState.showFilterInput,
-    zoneFilters: gridState.zoneFilters,
+    showFilterInput,
+    zoneFilters,
     handleZoneMouseDown,
     onSetDropTarget: setDropTarget,
     onSetContextMenu: setContextMenu,

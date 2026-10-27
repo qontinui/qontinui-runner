@@ -42,7 +42,7 @@ import { StatusStrip } from "./StatusStrip";
 import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { HiddenWorkersChip } from "./HiddenWorkersChip";
-import { pickLayout } from "./useZoneLayout";
+import { computeQuickLaunchLayoutId } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
 import {
   planMaximizeZone,
@@ -1204,10 +1204,24 @@ function TerminalPageInner({
   const applyZoneProfile = useApplyZoneProfile({ createAndAssignTerminal, resolveTenantForSpawn });
   useZoneProfileRestore(applyZoneProfile);
 
+  // Make room for `count` new tabs before they spawn: the same grow-only
+  // decision as a single `+ new terminal` (`computeQuickLaunchLayoutId`), so a
+  // layout that already fits them — the operator's roomy quad included — is
+  // left alone and never re-stamped as the runner's to trim.
+  const growForLaunch = (count: number) => {
+    const zones = zoneLayout.layout.zones;
+    const emptyZones = zones.filter((_, idx) => !zoneLayout.assignments[idx]).length;
+    const target = computeQuickLaunchLayoutId(
+      zoneLayout.layoutId,
+      zones.length,
+      emptyZones >= count,
+      tabs.length + count,
+    );
+    if (target !== null) zoneLayout.setLayoutId(target, { source: "auto" });
+  };
+
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
-    const totalTabs = tabs.length + count;
-    const layoutId = pickLayout(totalTabs);
-    zoneLayout.setLayoutId(layoutId, { source: "auto" });
+    growForLaunch(count);
     const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
     // Plain shells have no `--tenant` grammar (F3 is `/spawn-ai` only), so
     // they always take the picker's current selection.
@@ -1231,9 +1245,7 @@ function TerminalPageInner({
     context?: string,
     tenantId?: string,
   ): Promise<string[]> => {
-    const totalTabs = tabs.length + count;
-    const layoutId = pickLayout(totalTabs);
-    zoneLayout.setLayoutId(layoutId, { source: "auto" });
+    growForLaunch(count);
     const spawnTenant = resolveTenantForSpawn(tenantId);
 
     const isWindows = navigator.platform.startsWith("Win");
