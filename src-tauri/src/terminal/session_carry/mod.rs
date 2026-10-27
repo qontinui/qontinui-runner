@@ -1058,6 +1058,11 @@ pub(crate) fn line_boundary_offset(path: &Path) -> std::io::Result<u64> {
 ///   resumed CLI's first append would glue a new record onto the fragment
 ///   (round-12 review S3). A copy holding NO complete line (boundary 0) is
 ///   kept as it is rather than emptied, since the resume needs a transcript.
+///
+/// The appended `\n` makes the destination NOT a byte-prefix of a source that
+/// has not yet written its own `\n`, so a `LiveSourceWins` retry inside that
+/// window reads `Diverged` and moves the byte-equal-plus-newline copy aside:
+/// that `.diverged-*` is not a real fork (round-14 review S1).
 pub(crate) fn settle_jsonl_end(path: &Path) -> std::io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let boundary = line_boundary_offset(path)?;
