@@ -1388,11 +1388,15 @@ pub(crate) async fn resolve_migration_subject(
                 Some(from) => {
                     // No transcript for the provider's id under its account:
                     // refuse BEFORE rewriting the record (two open records on
-                    // one terminal, and a copy that would fail anyway).
-                    let has_transcript = record.working_dir.as_deref().is_some_and(|wd| {
-                        super::transcript::session_transcript_path(Path::new(&src), wd, &sid)
-                            .exists()
-                    });
+                    // one terminal, and a copy that would fail anyway). A stat
+                    // that fails is refused as unreadable, not as absent.
+                    let has_transcript = match record.working_dir.as_deref() {
+                        None => Ok(false),
+                        Some(wd) => {
+                            super::transcript::session_transcript_path(Path::new(&src), wd, &sid)
+                                .try_exists()
+                        }
+                    };
                     crate::terminal::migration_identity::rebound_transcript_gate(
                         &sid,
                         &src,

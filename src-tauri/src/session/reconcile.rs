@@ -1241,9 +1241,23 @@ pub fn refresh_titles_pass(
             snapshot,
             &exclusions,
             |cfg, wd, sid| {
-                !cfg.is_empty()
-                    && crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid)
-                        .exists()
+                if cfg.is_empty() {
+                    return false;
+                }
+                let path =
+                    crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid);
+                // A failed stat is not proof of a transcript, so the re-bind is
+                // deferred exactly as for an absent one — but logged as what it
+                // is, not read as absence.
+                path.try_exists().unwrap_or_else(|e| {
+                    tracing::debug!(
+                        provider_session = %sid,
+                        path = %path.display(),
+                        error = %e,
+                        "session binder: re-bind transcript probe failed — deferring"
+                    );
+                    false
+                })
             },
         )
     };
