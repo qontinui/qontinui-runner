@@ -97,8 +97,9 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 mod provider_rung;
 pub use provider_rung::{
-    decide_provider_rung, decide_registry_rebind, rebind_confirmed_from_registry,
-    valid_provider_row, valid_rows_for_ptys, RegistryRebind, ValidProviderRow,
+    apply_registry_rebinds, decide_provider_rung, decide_registry_rebind, plan_registry_rebinds,
+    rebind_confirmed_from_registry, valid_provider_row, valid_rows_for_ptys, RegistryRebind,
+    ValidProviderRow,
 };
 
 /// One live PTY the reconcile considers, projected from
@@ -1168,7 +1169,7 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
 /// pass — an in-pane `/clear` / `/resume` or a rung-3 mis-bind is only
 /// correctable here. The re-bind runs first so the title refresh then sees the
 /// corrected record.
-pub fn refresh_titles_pass(
+pub async fn refresh_titles_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
@@ -1180,37 +1181,62 @@ pub fn refresh_titles_pass(
         Vec::new() // unreadable table: no row can be validated this tick
     } else {
         let exclusions = HandoffExclusions::current(store, chrono::Utc::now().timestamp_millis());
-        rebind_confirmed_from_registry(
-            store,
-            &live,
-            &index,
-            snapshot,
-            &exclusions,
-            |cfg, wd, sid| {
-                if cfg.is_empty() {
-                    return false;
-                }
-                let path =
-                    crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid);
-                // A failed stat is not proof of a transcript, so the re-bind is
-                // deferred exactly as for an absent one — but logged as what it
-                // is, not read as absence.
-                path.try_exists().unwrap_or_else(|e| {
-                    tracing::debug!(
-                        provider_session = %sid,
-                        path = %path.display(),
-                        error = %e,
-                        "session binder: re-bind transcript probe failed — deferring"
-                    );
-                    false
+        let planned = plan_registry_rebinds(store, &live, &index, snapshot, &exclusions);
+        if planned.is_empty() {
+            Vec::new()
+        } else {
+            // The transcript probe resolves the project dir (a directory scan)
+            // and stats a file: on the blocking pool, never on this async
+            // poll task — it repeats every tick while a re-bind is deferred.
+            let keys: Vec<(String, String, String)> = planned
+                .iter()
+                .map(|p| {
+                    (
+                        p.rebind.config_dir.clone(),
+                        p.pty.working_dir.clone(),
+                        p.rebind.to_session_id.clone(),
+                    )
                 })
-            },
-        )
+                .collect();
+            let n = keys.len();
+            let found = spawn_blocking_tracked(move || {
+                keys.iter()
+                    .map(|(cfg, wd, sid)| rebind_transcript_exists(cfg, wd, sid))
+                    .collect::<Vec<bool>>()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "session binder: re-bind transcript probe did not complete — deferring");
+                vec![false; n]
+            });
+            apply_registry_rebinds(store, planned.into_iter().zip(found).collect())
+        }
     };
     TitlesPassOutcome {
         titles: refresh_titles(store, &live, &index),
         rebinds,
     }
+}
+
+/// Whether a transcript for `sid` exists under account `cfg` for working dir
+/// `wd` — the re-bind's gate. Blocking (it resolves the project dir). A
+/// failed stat is not proof of a transcript, so the re-bind is deferred
+/// exactly as for an absent one, but logged as what it is, not read as
+/// absence.
+fn rebind_transcript_exists(cfg: &str, wd: &str, sid: &str) -> bool {
+    if cfg.is_empty() {
+        return false;
+    }
+    let path = crate::terminal::transcript::session_transcript_path(Path::new(cfg), wd, sid);
+    path.try_exists().unwrap_or_else(|e| {
+        tracing::debug!(
+            provider_session = %sid,
+            path = %path.display(),
+            error = %e,
+            "session binder: re-bind transcript probe failed — deferring"
+        );
+        false
+    })
 }
 
 /// What one [`refresh_titles_pass`] tick did.
