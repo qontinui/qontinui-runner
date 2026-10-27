@@ -405,7 +405,14 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         {
             Ok(subject) => (subject.record, subject.src_config_dir, subject.old_writer),
             Err(reason) => {
-                let src = record.config_dir.clone().unwrap_or_default();
+                // The record's account, else the runner's resolved one — as
+                // the `ProceedOnRecord` path resolves it — never "" while one
+                // is known.
+                let src = record
+                    .config_dir
+                    .clone()
+                    .or_else(crate::ai_provider::get_resolved_config_dir)
+                    .unwrap_or_default();
                 emit_skipped(&app, &record, &src, &reason);
                 return;
             }
@@ -1394,12 +1401,26 @@ pub(crate) async fn resolve_migration_subject(
                     // No transcript for the provider's id under its account:
                     // refuse BEFORE rewriting the record (two open records on
                     // one terminal, and a copy that would fail anyway). A stat
-                    // that fails is refused as unreadable, not as absent.
+                    // that fails is refused as unreadable, not as absent. The
+                    // stat is a disk read: on the blocking pool, never on the
+                    // async runtime.
                     let has_transcript = match record.working_dir.as_deref() {
                         None => Ok(false),
                         Some(wd) => {
-                            super::transcript::session_transcript_path(Path::new(&src), wd, &sid)
-                                .try_exists()
+                            let path = super::transcript::session_transcript_path(
+                                Path::new(&src),
+                                wd,
+                                &sid,
+                            );
+                            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                                move || path.try_exists(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(std::io::Error::other(format!(
+                                    "the stat task did not complete: {e}"
+                                )))
+                            })
                         }
                     };
                     crate::terminal::migration_identity::rebound_transcript_gate(
