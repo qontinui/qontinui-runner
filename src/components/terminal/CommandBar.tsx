@@ -535,6 +535,10 @@ export function CommandBar() {
       // Only the LATEST run may paint. Without this a slow command still in
       // flight lands after a newer one and overwrites its verdict.
       const runId = ++runIdRef.current;
+      // What the input held when this run started. A success clears and
+      // blurs the input only if the operator has not typed since — even
+      // while this run is still the latest one.
+      const inputAtStart = inputRef.current?.value ?? "";
       const paint = (next: StatusLine): void => {
         if (runIdRef.current === runId) setStatus(next);
       };
@@ -592,6 +596,8 @@ export function CommandBar() {
         // `CommandResult` and for which a no-op is `ok`. The harness now calls
         // the same function this line does.
         paint(renderCommandStatus(action.slash, result.value));
+        // Typed since this run started: leave the new line alone.
+        if ((inputRef.current?.value ?? "") !== inputAtStart) return;
         setQuery("");
         // Explicit even though the derived reset covers a query CHANGE:
         // running off an already-empty input (the recents palette) leaves
@@ -698,6 +704,8 @@ export function CommandBar() {
       if (e.key === "Escape") {
         e.preventDefault();
         setQuery("");
+        // Dismiss means dismiss: a run still in flight may not paint over it.
+        runIdRef.current += 1;
         setStatus(null);
         // Same reason as in `execute`: Escape on an already-empty input
         // is not a query change, so the derived reset does not fire.
@@ -870,7 +878,11 @@ export function CommandBar() {
                   aria-label="Dismiss status"
                   title="Dismiss (Esc)"
                   onMouseDown={(e) => e.preventDefault() /* keep input focus */}
-                  onClick={() => setStatus(null)}
+                  onClick={() => {
+                    // Same as Escape: retire any in-flight run's paint too.
+                    runIdRef.current += 1;
+                    setStatus(null);
+                  }}
                   className="ml-auto shrink-0 px-1 text-[12px] leading-none text-[#565f89] hover:text-[#c0caf5]"
                 >
                   ×
