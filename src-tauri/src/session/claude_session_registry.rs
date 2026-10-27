@@ -42,11 +42,11 @@
 //! - **A session id may have several rows.** "22 of 80" session ids did when
 //!   this was first written (2026-07-23) — but that count filtered rows by PID
 //!   membership only, with NO `procStart` check, so it counted stale files
-//!   whose pid Windows had since handed to another process. The 2026-10-21
-//!   census (plan
-//!   `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`,
-//!   Phase 1 findings) found 3 duplicate groups over 40 raw rows and **1** over
-//!   the 19 VALID rows — and that one was a true fork. The registry is keyed by
+//!   whose pid Windows had since handed to another process. Filtering by
+//!   [`registry_row_validity`] as well removes those stale duplicates; what
+//!   remains is two live processes on one id, which is a true fork (plan
+//!   `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`).
+//!   The registry is keyed by
 //!   PID, so this reader returns one entry per *file* and lets the caller
 //!   collapse by `session_id` if it wants; a caller that needs to know whether
 //!   a row is evidence uses [`registry_row_validity`] / [`read_registry_rows`].
@@ -58,12 +58,15 @@
 //!
 //! # The `procStart` clocks (which platforms validate)
 //!
-//! Read from the Claude Code 2.1.307 bundle on 2026-10-23 (no Linux
-//! `sessions/<pid>.json` exists on this fleet to read instead):
+//! Read from the Claude Code 2.1.307 bundle (recorded in the agent
+//! checkpoint `~/.qontinui/agent-checkpoints/2026-10-21-account-migration--phase-2b.md`;
+//! no Linux `sessions/<pid>.json` exists on this fleet to read instead):
 //! - **Windows** writes a FILETIME (100-ns ticks since 1601 UTC) from Bun's
 //!   `windowsProcessCreationTime`, with `pidDomain: "win32:<host>"`. Compared
 //!   against [`ProcessSnapshot::creation_filetimes`] to the microsecond. This
-//!   is the clock the 2026-10-21 census validated against live files.
+//!   is the form the live Windows registry files carry: `procStart` a
+//!   decimal-string FILETIME, `pidDomain` `"win32:<host>"` (e.g.
+//!   `C:/claude/.claude-erik/sessions/47904.json`).
 //! - **Linux / WSL** writes `ps -o lstart= -p <pid>` run with `TZ=UTC LC_ALL=C`
 //!   (`"Fri Oct 23 09:15:30 2026"`), with `pidDomain:
 //!   "win32:<machine-id>:<pid-ns>"` (sic — the prefix is the same string).
@@ -489,8 +492,8 @@ pub struct RegistryRow {
 }
 
 impl RegistryRow {
-    /// `kind == "interactive"` — the class the 2026-10-21 census showed forks
-    /// live in. An ABSENT kind counts as interactive, matching
+    /// `kind == "interactive"` — a real window, the class a forked
+    /// conversation lives in. An ABSENT kind counts as interactive, matching
     /// [`parse_registry_file`]'s default: dropping it would hide a live window.
     pub fn is_interactive(&self) -> bool {
         self.kind.as_deref().is_none_or(|k| k == "interactive")
@@ -1104,7 +1107,7 @@ mod tests {
 
     #[test]
     fn several_live_processes_may_share_one_session_id() {
-        // The unchecked "22 of 80" count (module doc) — at least one true fork per the 2026-10-21 census. Each process keeps its
+        // Two live processes on one id (module doc) — a fork. Each process keeps its
         // own auto-generated name, so the reader must return BOTH rows rather
         // than collapsing them — the caller decides how to present it.
         let root = tmpdir("shared");
@@ -1152,8 +1155,9 @@ mod tests {
 
     const W: Option<&str> = Some("win32:spaceship");
 
-    /// Measured 2026-10-21: registry `…058648`, CIM `…058640` — the same
-    /// process, 8 ticks apart. VALID. A 10-tick (1 µs) gap is not.
+    /// A registry `procStart` 8 ticks after the CIM value (CIM reports the
+    /// creation time truncated to the microsecond) is the same process:
+    /// VALID. A 10-tick (1 µs) gap is not.
     ///
     /// Mutation check: changing `< PROC_START_TOLERANCE_TICKS` to `== 0`
     /// fails the first assertion; to `<= 10` fails the boundary one.

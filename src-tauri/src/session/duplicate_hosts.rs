@@ -10,9 +10,9 @@
 //!
 //! Only rows that pass the ONE validity rule
 //! ([`registry_row_validity`](crate::session::claude_session_registry::registry_row_validity))
-//! and are `kind == interactive` count — the 2026-10-21 census found 3
-//! duplicate groups over raw rows but only 1 over valid rows, and that one was
-//! the real fork. A row of UNKNOWN validity is never a holder, but it can stop
+//! and are `kind == interactive` count: raw rows include stale files whose
+//! pid has since been reused, which would read as duplicates that are not
+//! forks. A row of UNKNOWN validity is never a holder, but it can stop
 //! the detector from saying "no duplicates" (2026-10-23 review fixes 2 and 3):
 //! an unreadable process table, a `sessions/` dir that could not be listed, a
 //! live claude's registry file too torn to read its id, a row of unknown
