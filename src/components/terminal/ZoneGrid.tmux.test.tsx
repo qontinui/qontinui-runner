@@ -202,6 +202,7 @@ function renderGridPage(
     layout,
     layoutId: layout.id,
     assignments,
+    gridView: { layoutId: layout.id, assignments, focusedZone: maximizedZone ?? 0 },
     focusedZone: maximizedZone ?? 0,
     maximizedZone,
     isMultiZone: true,
@@ -227,6 +228,9 @@ function renderGridPage(
  * the hook's most-recently-shown list (shown first); by default every tab, so
  * every one is warm.
  */
+/** The grid tmux would return to; these tests do not exercise it. */
+const TMUX_GRID_ASSIGNMENTS: Record<number, string> = {};
+
 function renderTmuxPage(
   tabs: TerminalTab[],
   shown: string,
@@ -237,6 +241,7 @@ function renderTmuxPage(
     layout: { id: "single", name: "Single", columns: 1, rows: 1, zones: [{ col: "1", row: "1" }] },
     layoutId: "single",
     assignments: { 0: shown },
+    gridView: { layoutId: "single", assignments: TMUX_GRID_ASSIGNMENTS, focusedZone: 0 },
     focusedZone: 0,
     maximizedZone: null,
     isMultiZone: false,
