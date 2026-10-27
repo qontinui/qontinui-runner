@@ -294,7 +294,7 @@ fn the_carry_records_the_copys_last_line_boundary_as_the_tail_offset() {
     // Round-12 S3: the destination is cut back to that boundary, so the
     // resumed session's first append starts a fresh line.
     //
-    // Mutation check: skipping `truncate_to_line_boundary` leaves the torn
+    // Mutation check: skipping the cut in `settle_jsonl_end` leaves the torn
     // `{"c"` on the destination and fails this.
     assert_eq!(
         std::fs::read(&carried.path).unwrap(),
@@ -313,24 +313,101 @@ fn the_carry_records_the_copys_last_line_boundary_as_the_tail_offset() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Round-12 S3: the cut happens only for `0 < offset < len`.
+/// Round-12 S3 / round-13 S1: a TORN fragment is cut back to the boundary;
+/// at a boundary nothing changes; a copy with no complete line is kept.
 #[test]
-fn truncate_to_line_boundary_cuts_only_a_trailing_fragment() {
-    let root = scratch("truncate");
+fn settle_jsonl_end_cuts_a_torn_fragment_only() {
+    let root = scratch("settle-torn");
     let f = root.join("t.jsonl");
     std::fs::write(&f, b"{\"a\":1}\n{\"b\"").unwrap();
-    assert!(super::super::truncate_to_line_boundary(&f, 8).unwrap());
+    assert_eq!(super::super::settle_jsonl_end(&f).unwrap(), 8);
     assert_eq!(std::fs::read(&f).unwrap(), b"{\"a\":1}\n");
-    assert!(
-        !super::super::truncate_to_line_boundary(&f, 8).unwrap(),
-        "at a boundary: nothing to cut"
+    assert_eq!(
+        super::super::settle_jsonl_end(&f).unwrap(),
+        8,
+        "at a boundary"
     );
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"a\":1}\n");
     std::fs::write(&f, b"{\"partial\"").unwrap();
-    assert!(
-        !super::super::truncate_to_line_boundary(&f, 0).unwrap(),
+    assert_eq!(super::super::settle_jsonl_end(&f).unwrap(), 0);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        b"{\"partial\"",
         "no complete line: kept"
     );
-    assert_eq!(std::fs::read(&f).unwrap(), b"{\"partial\"");
+    // A fragment that parses, but not as an object, is not a record.
+    std::fs::write(&f, b"{\"a\":1}\n42").unwrap();
+    assert_eq!(super::super::settle_jsonl_end(&f).unwrap(), 8);
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"a\":1}\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Round-13 S1: a WHOLE final record that only lacks its `\n` is kept and
+/// completed; the offset is the copied (source) length, so the tail starts
+/// where the copied bytes end.
+///
+/// Mutation check: cutting every fragment (the round-12 rule) drops `{"b":2}`
+/// and fails both assertions.
+#[test]
+fn settle_jsonl_end_completes_a_whole_final_record() {
+    let root = scratch("settle-whole");
+    let f = root.join("t.jsonl");
+    std::fs::write(&f, b"{\"a\":1}\n{\"b\":2}").unwrap();
+    assert_eq!(super::super::settle_jsonl_end(&f).unwrap(), 15);
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
+    // A lone whole record (no `\n` at all) is completed too.
+    std::fs::write(&f, b"{\"only\":true}").unwrap();
+    assert_eq!(super::super::settle_jsonl_end(&f).unwrap(), 13);
+    assert_eq!(std::fs::read(&f).unwrap(), b"{\"only\":true}\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Round-13 S1, through the carry: the destination keeps the whole final
+/// record, and the writer's later `\n` plus a new line rescue as ONE line.
+#[test]
+fn the_carry_keeps_a_whole_final_record_that_lacks_its_newline() {
+    let root = scratch("whole-final");
+    let (src, dst, carried) = seeded_carry(&root, b"{\"a\":1}\n{\"b\":2}");
+    assert_eq!(carried.transcript_offset, Some(15));
+    assert_eq!(
+        std::fs::read(&carried.path).unwrap(),
+        b"{\"a\":1}\n{\"b\":2}\n"
+    );
+    append(&literal_transcript(&src), b"\n{\"c\":3}\n");
+    match rescue(&src, &dst, &carried) {
+        TailRescue::Rescued { scan, .. } => {
+            assert_eq!(scan.lines, 1, "only the new record");
+            assert_eq!(scan.unparseable, 0);
+        }
+        other => panic!("expected Rescued, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Round-13 S2: the settle runs on the `.partial` BEFORE the rename — the
+/// destination does not exist yet when it runs, and the renamed file already
+/// ends on a line boundary.
+///
+/// Mutation check: settling after the rename (on `to`) fails the first
+/// assertion inside the closure.
+#[test]
+fn the_copy_is_settled_before_it_is_renamed_into_place() {
+    let root = scratch("settle-before-rename");
+    let (from, to) = (root.join("src.jsonl"), root.join("dst.jsonl"));
+    std::fs::write(&from, b"{\"a\":1}\n{\"b\"").unwrap();
+    let offset = super::super::copy_via_partial_with(&from, &to, |partial| {
+        assert!(!to.exists(), "settled before the rename");
+        assert_ne!(partial, to.as_path());
+        super::super::settle_jsonl_end(partial).unwrap()
+    })
+    .unwrap();
+    assert_eq!(offset, 8);
+    assert_eq!(std::fs::read(&to).unwrap(), b"{\"a\":1}\n");
+    assert_eq!(
+        std::fs::read(&from).unwrap(),
+        b"{\"a\":1}\n{\"b\"",
+        "source untouched"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
