@@ -1098,6 +1098,10 @@ pub(crate) fn settle_jsonl_end(path: &Path) -> std::io::Result<u64> {
 /// to its last line boundary (or its whole final record completed), so the
 /// resumed subagent's first append starts a fresh line (round-14 review S3).
 /// No tail offset is recorded for these, so a failure is logged, not fatal.
+/// The same false fork [`settle_jsonl_end`] names applies here: a retry that
+/// lands before the old writer's own `\n` reads the completed copy as
+/// diverged, and moves it aside (with its `.meta.json`) as a
+/// `.diverged-*` pair that is not a real fork; nothing is lost.
 fn settle_subagent_jsonl(partial: &Path) {
     if let Err(e) = settle_jsonl_end(partial) {
         warn!(
