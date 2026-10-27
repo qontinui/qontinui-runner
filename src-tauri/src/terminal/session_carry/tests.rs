@@ -1182,6 +1182,32 @@ fn a_migration_moves_a_same_size_different_bytes_subagent_aside() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Round-15 W1 — a diverged subagent whose live source is mid-append: the
+/// fork is moved aside and the copy put in its place is settled too, its torn
+/// last line cut.
+///
+/// Mutation check: passing a no-op settle to `preserve_diverged_and_copy`
+/// leaves the torn `{"b"` in the destination and fails the first assertion.
+#[test]
+fn a_diverged_subagent_copied_mid_append_is_settled() {
+    let (tmp, carried) = migrate_subagent("sub-diverged-torn", b"{\"a\":1}\n{\"b\"", b"a\nfork\n");
+    let dst = tmp.join(".claude-b");
+    assert_eq!(carried.session_dir.diverged_preserved, 1);
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"{\"a\":1}\n"
+    );
+    let backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// W2 — byte-identical stays `Present` (untouched, no backup); a strict
 /// prefix is extended in place (no backup).
 #[test]
