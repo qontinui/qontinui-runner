@@ -72,8 +72,7 @@ for %%X in (cmd exe bat) do (
         if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
         set "DBASE="
         set "DTRIM=!DENTRY!"
-        if defined DTRIM if "!DTRIM:~-1!"=="\" set "DTRIM=!DTRIM:~0,-1!"
-        if defined DTRIM for %%B in ("!DTRIM!") do set "DBASE=%%~nxB"
+        if defined DTRIM for %%B in ("!DTRIM!\.") do set "DBASE=%%~nxB"
         if defined DBASE if /I "!DBASE:~0,18!"=="qontinui-identity-" set "DSKIP=1"
         if defined DBASE if /I "!DBASE:~0,14!"=="qontinui-shim-" set "DSKIP=1"
         if "!DSKIP!"=="0" (

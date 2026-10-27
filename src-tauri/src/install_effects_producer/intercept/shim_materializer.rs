@@ -2883,6 +2883,214 @@ mod resolve_wait_tests {
     }
 }
 
+/// The rendered `.cmd` shims run under a real `cmd.exe`. A drift test on the
+/// template text cannot catch a parse hazard: `set "NS_RAW=%1"` read like a
+/// safe compare and still ran the text after the `&` in `claude "a&b"`, and a
+/// trailing-separator PATH spelling recursed until cmd's stack limit. Each
+/// case types `call <tool> <args>` into a driver batch file, the way a prompt
+/// would, against a fake real tool that records its argv to a file.
+#[cfg(all(test, windows))]
+mod cmd_shim_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Rig {
+        root: PathBuf,
+        real: PathBuf,
+        cwd: PathBuf,
+        marker: PathBuf,
+    }
+
+    /// A scratch tree holding a fake real `<tool>.cmd` and a working dir.
+    fn rig(label: &str, tool: &str) -> Rig {
+        let root =
+            std::env::temp_dir().join(format!("qontinui-cmdshim-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (real, cwd) = (root.join("realbin"), root.join("cwd"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = root.join("ran.txt");
+        let m = marker.display();
+        std::fs::write(
+            real.join(format!("{tool}.cmd")),
+            format!(
+                "@echo off\r\n>\"{m}\" echo SHA=[%QONTINUI_POLICY_DELIVERED_SHA%]\r\n>>\"{m}\" echo ARGS=%*\r\n"
+            ),
+        )
+        .unwrap();
+        Rig {
+            root,
+            real,
+            cwd,
+            marker,
+        }
+    }
+
+    /// Run `call <tool> <argline>` with `path` as PATH (plus system32) and no
+    /// inherited QONTINUI_* variable, so nothing reaches the live runner.
+    /// Returns stdout+stderr; the caller reads the marker for what ran.
+    fn run(rig: &Rig, tool: &str, argline: &str, path: &[String]) -> String {
+        let _ = std::fs::remove_file(&rig.marker);
+        for e in std::fs::read_dir(&rig.cwd).unwrap() {
+            let _ = std::fs::remove_file(e.unwrap().path());
+        }
+        let driver = rig.root.join("driver.bat");
+        std::fs::write(&driver, format!("@echo off\r\ncall {tool} {argline}\r\n")).unwrap();
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/d", "/c"])
+            .arg(&driver)
+            .current_dir(&rig.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, _) in std::env::vars() {
+            if k.starts_with("QONTINUI_") {
+                cmd.env_remove(k);
+            }
+        }
+        cmd.env("PATH", format!("{};{sysroot}\\system32", path.join(";")))
+            .env(
+                "QONTINUI_PINNED_SESSION_ID",
+                "00000000-0000-0000-0000-000000000000",
+            )
+            .env("QONTINUI_POLICY_DELIVERED_SHA", "inheritedsha")
+            .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{tool} {argline}: the shim did not return within 60 s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = child.wait_with_output().unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    fn shim_dir(rig: &Rig, name: &str, body: &str, tool: &str) -> PathBuf {
+        let dir = rig.root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{tool}.cmd")), body).unwrap();
+        dir
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn identity_cmd_passes_prompt_metacharacters_through_as_text() {
+        let rig = rig("ident-args", "claude");
+        let body = render_identity(
+            IDENTITY_SHIM_CMD,
+            "claude",
+            &rig.root.join("qontinui-identity-a"),
+        );
+        let a = shim_dir(&rig, "qontinui-identity-a", &body, "claude");
+        let path = [s(&a), s(&rig.real)];
+        // (argline, is a session)
+        let cases: &[(&str, bool)] = &[
+            ("--version", false),
+            ("\"\" --version", false),
+            ("mcp list", false),
+            ("-- --help", true),
+            ("-p hi", true),
+            ("\"write a > out.txt\"", true),
+            ("\"fix a&echo INJECTED\" more", true),
+            ("\"mcp & echo INJECTED\"", true),
+            ("C:\\\"Program Files\"\\x", true),
+            ("C:\\\"a&echo INJECTED\"\\x", true),
+            ("\"a<b\"", true),
+        ];
+        for &(argline, session) in cases {
+            let out = run(&rig, "claude", argline, &path);
+            let ran = std::fs::read_to_string(&rig.marker)
+                .unwrap_or_else(|_| panic!("{argline}: the real claude never ran: {out}"));
+            assert!(
+                !out.contains("INJECTED"),
+                "{argline}: prompt text ran as a command: {out}"
+            );
+            let created: Vec<_> = std::fs::read_dir(&rig.cwd).unwrap().collect();
+            assert!(
+                created.is_empty(),
+                "{argline}: the shim wrote into the cwd: {created:?}"
+            );
+            assert_eq!(ran.contains("--session-id"), session, "{argline}: {ran}");
+            if !session {
+                assert!(
+                    ran.contains("SHA=[]"),
+                    "{argline}: marker not dropped: {ran}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&rig.root);
+    }
+
+    /// Two runner shim dirs on PATH, the second spelled with a trailing
+    /// separator: each must skip the other, or they CALL each other until
+    /// cmd's recursion limit and the real tool never runs.
+    fn two_shim_dirs_reach_the_real_tool(
+        label: &str,
+        tool: &str,
+        names: [&str; 2],
+        body: &dyn Fn(&Path) -> String,
+    ) {
+        let rig = rig(label, tool);
+        let dirs: Vec<PathBuf> = names
+            .iter()
+            .map(|n| shim_dir(&rig, n, &body(&rig.root.join(n)), tool))
+            .collect();
+        let (a, b) = (s(&dirs[0]), s(&dirs[1]));
+        let fwd = b.replace('\\', "/");
+        for second in [
+            b.clone(),
+            format!("{b}\\"),
+            format!("{b}\\\\"),
+            fwd.clone(),
+            format!("{fwd}/"),
+        ] {
+            let out = run(
+                &rig,
+                tool,
+                "--version",
+                &[a.clone(), second.clone(), s(&rig.real)],
+            );
+            assert!(
+                rig.marker.exists(),
+                "PATH entry {second:?}: the real {tool} never ran: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&rig.root);
+    }
+
+    #[test]
+    fn identity_cmd_skips_every_shim_dir_spelling() {
+        two_shim_dirs_reach_the_real_tool(
+            "ident-dirs",
+            "claude",
+            ["qontinui-identity-a", "qontinui-identity-b"],
+            &|d| render_identity(IDENTITY_SHIM_CMD, "claude", d),
+        );
+    }
+
+    #[test]
+    fn install_cmd_skips_every_shim_dir_spelling() {
+        two_shim_dirs_reach_the_real_tool(
+            "install-dirs",
+            "npm",
+            ["qontinui-shim-a", "qontinui-shim-b"],
+            &|d| render(SHIM_CMD, ShimTool::Npm, d),
+        );
+    }
+}
+
 /// The session-CLI publication guard (plan
 /// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
 /// coord dossier `qontinui-pr-shim-zero-byte-opens-no-pr`). Every test here

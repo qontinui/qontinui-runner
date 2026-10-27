@@ -55,8 +55,7 @@ for %%X in (cmd exe bat) do (
         if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
         set "DBASE="
         set "DTRIM=!DENTRY!"
-        if defined DTRIM if "!DTRIM:~-1!"=="\" set "DTRIM=!DTRIM:~0,-1!"
-        if defined DTRIM for %%B in ("!DTRIM!") do set "DBASE=%%~nxB"
+        if defined DTRIM for %%B in ("!DTRIM!\.") do set "DBASE=%%~nxB"
         if defined DBASE if /I "!DBASE:~0,18!"=="qontinui-identity-" set "DSKIP=1"
         if defined DBASE if /I "!DBASE:~0,14!"=="qontinui-shim-" set "DSKIP=1"
         if "!DSKIP!"=="0" (
@@ -101,7 +100,8 @@ rem where an unquoted `)` would abort the batch. Known divergence: FOR/CALL
 rem also split on `=`, `,` and `;`, so `--model=-v` can match here only.
 set "NON_SESSION=0"
 if /I not "%TOOL%"=="claude" goto :ns_done
-set "FIRST=%~1"
+set FIRST=%1
+if defined FIRST set "FIRST=!FIRST:"=!"
 for %%S in (mcp doctor update upgrade install setup-token plugin plugins auth auto-mode agents logs rm stop kill purge import project) do if "!FIRST!"=="%%S" set "NON_SESSION=1"
 call :ns_scan %*
 :ns_done
@@ -226,15 +226,18 @@ endlocal & exit /b %ERRORLEVEL%
 
 rem ---- :ns_scan <args...> -- NON_SESSION=1 on an exact version/help flag ----
 rem SHIFT walks this CALL's own copy of the args and stops at `--` (what
-rem follows is a prompt) or at the end of the list. Each argument is compared
-rem through a variable with delayed expansion, never as `"%~1"` in the IF line:
-rem a token with a quoted run that is not quoted end to end
-rem (C:\"Program Files"\x) split that operand and aborted the whole batch, so
-rem the real claude never ran.
+rem follows is a prompt) or at the end of the list. The rule that keeps an
+rem argument from being parsed as commands: a raw %1 is never wrapped in
+rem quotes (`set "X=%1"` or `set "X=%~1"`). Quoting it flips the quote state
+rem of the caller's own quotes, so the `>` in `claude "a > f.txt"` redirected
+rem (and emptied f.txt) and the `&` in `claude "a&b"` ran b. It is set bare,
+rem which keeps the caller's quoting, and its quotes are then stripped through
+rem delayed expansion, which is also how the CRT argv parser reads
+rem `"--ver"sion`. The same rule covers FIRST above.
 :ns_scan
-set "NS_RAW=%1"
+set NS_RAW=%1
 if not defined NS_RAW goto :eof
-set "NS_ARG=%~1"
+set "NS_ARG=!NS_RAW:"=!"
 if "!NS_ARG!"=="--" goto :eof
 if "!NS_ARG!"=="--version" set "NON_SESSION=1"
 if "!NS_ARG!"=="-v" set "NON_SESSION=1"
