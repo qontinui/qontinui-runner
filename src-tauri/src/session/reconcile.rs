@@ -1209,7 +1209,12 @@ pub async fn refresh_titles_pass(
                 tracing::debug!(error = %e, "session binder: re-bind transcript probe did not complete — deferring");
                 vec![false; n]
             });
-            apply_registry_rebinds(store, planned.into_iter().zip(found).collect())
+            // Re-checked against the store as it is AFTER the await.
+            apply_registry_rebinds(
+                store,
+                planned.into_iter().zip(found).collect(),
+                chrono::Utc::now().timestamp_millis(),
+            )
         }
     };
     TitlesPassOutcome {
