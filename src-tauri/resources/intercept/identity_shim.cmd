@@ -77,24 +77,20 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
 
 rem ---- non-session invocation: the same pure passthrough --------------------
 rem claude --version / --help / a management subcommand (claude mcp list) is
-rem NOT a session; pinning one turned `claude --version` into a hung session
-rem launch with a bogus session-open. Mirrors `non_session_invocation` in
+rem NOT a session, so it gets no --settings / --mcp-config / --session-id and
+rem no session-open. Mirrors `non_session_invocation` in
 rem src/bin/qontinui_shim.rs, the SOURCE OF TRUTH for both lists; keep the
-rem three surfaces in step. Nothing is appended on this path.
+rem three surfaces in step. Exact case (no /I): Claude Code's own lookup is
+rem exact, so `claude Update the README` is a PROMPT. The flag scan is a CALLed
+rem label (:ns_scan) so the argument list is never expanded inside a block,
+rem where an unquoted `)` would abort the batch. Known divergence: FOR/CALL
+rem also split on `=`, `,` and `;`, so `--model=-v` can match here only.
 set "NON_SESSION=0"
+if /I not "%TOOL%"=="claude" goto :ns_done
 set "FIRST=%~1"
-if /I "%TOOL%"=="claude" (
-  for %%A in (%*) do (
-    set "TOK=%%~A"
-    if /I "!TOK!"=="--version" set "NON_SESSION=1"
-    if /I "!TOK!"=="-v" set "NON_SESSION=1"
-    if /I "!TOK!"=="--help" set "NON_SESSION=1"
-    if /I "!TOK!"=="-h" set "NON_SESSION=1"
-  )
-  for %%S in (mcp doctor update upgrade install setup-token plugin plugins auth auto-mode agents logs rm stop kill purge import) do (
-    if /I "!FIRST!"=="%%S" set "NON_SESSION=1"
-  )
-)
+for %%S in (mcp doctor update upgrade install setup-token plugin plugins auth auto-mode agents logs rm stop kill purge import project) do if "!FIRST!"=="%%S" set "NON_SESSION=1"
+call :ns_scan %*
+:ns_done
 if "%NON_SESSION%"=="1" (
   set "SETTINGS_ARGS="
   set "MCPCFG_ARGS="
@@ -211,3 +207,16 @@ if defined REAL (
   call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 )
 endlocal & exit /b %ERRORLEVEL%
+
+rem ---- :ns_scan <args...> -- NON_SESSION=1 on an exact version/help flag ----
+rem SHIFT walks this CALL's own copy of the args. Stops at `--` (what follows
+rem is a prompt) and at an empty argument (errs toward pinning).
+:ns_scan
+if "%~1"=="" goto :eof
+if "%~1"=="--" goto :eof
+if "%~1"=="--version" set "NON_SESSION=1"
+if "%~1"=="-v" set "NON_SESSION=1"
+if "%~1"=="--help" set "NON_SESSION=1"
+if "%~1"=="-h" set "NON_SESSION=1"
+shift
+goto :ns_scan

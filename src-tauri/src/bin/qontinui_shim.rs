@@ -297,10 +297,17 @@ pub fn user_chose_session(args: &[String]) -> bool {
 
 /// Claude Code subcommands that manage the install/config and never open a
 /// conversation, checked against `claude --help` (2.1.311, 2026-10-27).
+/// `project` is hidden from `--help` (`claude project purge`) but registered.
 /// Deliberately absent: `resume` (already [`user_chose_session`]), and
-/// `attach` / `respawn` / `ultrareview` / `gateway`, which open or run a
-/// session or a long-lived process. `config` and `migrate-installer` are no
-/// longer subcommands there — `claude config` is a PROMPT — so they are out.
+/// `attach` / `respawn` / `ultrareview` / `gateway` / `remote-control` (`rc`),
+/// which open or run a session or a long-lived process. `config` and
+/// `migrate-installer` are no longer top-level subcommands there — `claude
+/// config` is a PROMPT — so they are out.
+///
+/// Which way each miss fails: a subcommand a later Claude Code adds and this
+/// list lacks is PINNED (the old behaviour: harmless extra flags plus one
+/// spurious session-open); a word wrongly listed here would leave a real
+/// conversation UNPINNED. So add only words the CLI registers as commands.
 const NON_SESSION_SUBCOMMANDS: &[&str] = &[
     "mcp",
     "doctor",
@@ -319,32 +326,35 @@ const NON_SESSION_SUBCOMMANDS: &[&str] = &[
     "kill",
     "purge",
     "import",
+    "project",
 ];
 
 /// Is this a NON-SESSION invocation (`claude --version`, `claude mcp list`)?
 /// Then the identity shim must be a pure passthrough, exactly like the
 /// recursion guard: no `--settings`, no `--mcp-config`, no `--session-id`, no
-/// session-open POST, no self-provision. Pinning one turned `claude --version`
-/// into a pinned session launch that hung and recorded a bogus session-open.
+/// session-open POST, no self-provision. Without this an info call had session
+/// flags appended and was recorded as a session-open for the pinned id.
 ///
-/// Narrow on purpose, so a real session is never mistaken for one: any token
-/// EXACTLY (case-insensitive) `--version`/`-v`/`--help`/`-h`, OR a FIRST token
-/// in [`NON_SESSION_SUBCOMMANDS`]. `-p`/`--print` is a session. A prompt that
-/// merely contains `-h` is one argv entry and does not match.
+/// Narrow on purpose, so a real session is never mistaken for one: a token
+/// EXACTLY `--version`/`-v`/`--help`/`-h` before any `--` (after which every
+/// token is prompt text), OR a FIRST token in [`NON_SESSION_SUBCOMMANDS`].
+/// EXACT CASE throughout, because Claude Code's own lookup is exact:
+/// `claude Update the README` is a conversation. `-p`/`--print` is a session.
+/// A prompt that merely contains `-h` is one argv entry and does not match.
+/// Not handled: an option whose VALUE is exactly `-v`/`-h`
+/// (`--system-prompt -v`) reads as the flag; rare, and it errs toward
+/// passthrough of what Claude Code would also parse as that flag.
 ///
 /// SOURCE OF TRUTH for the mirrored checks in `identity_shim.bash` and
 /// `identity_shim.cmd`.
 pub fn non_session_invocation(args: &[String]) -> bool {
-    let flag = args.iter().any(|a| {
-        matches!(
-            a.to_ascii_lowercase().as_str(),
-            "--version" | "-v" | "--help" | "-h"
-        )
-    });
-    flag || args.first().is_some_and(|first| {
-        let t = first.to_ascii_lowercase();
-        NON_SESSION_SUBCOMMANDS.contains(&t.as_str())
-    })
+    let flag = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| matches!(a.as_str(), "--version" | "-v" | "--help" | "-h"));
+    flag || args
+        .first()
+        .is_some_and(|first| NON_SESSION_SUBCOMMANDS.contains(&first.as_str()))
 }
 
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
@@ -666,8 +676,9 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
     }
 
-    // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
-    // INCLUDING the don't-double-pin passthrough that sends no session-open —
+    // Fire-and-forget DIAGNOSTIC beacon on every invocation that reaches here
+    // (not a nested one, and not a non-session info call, which returned above)
+    // — INCLUDING the don't-double-pin passthrough that sends no session-open —
     // mirroring the `.bash`/`.cmd` shim beacons, with `"surface":"exe"` so the
     // runner logs reveal WHICH shim surface actually ran (post-#696 this exe is
     // the primary Windows surface; the `.cmd` is fail-open fallback only).
@@ -1902,8 +1913,8 @@ mod tests {
 
     #[test]
     fn non_session_invocation_version_help_and_management_subcommands() {
-        // Version/help flags, any position, case-insensitive.
-        for tok in ["--version", "-v", "--help", "-h", "--VERSION", "-H"] {
+        // Version/help flags, any position before `--`.
+        for tok in ["--version", "-v", "--help", "-h"] {
             assert!(non_session_invocation(&strs(&[tok])), "{tok}");
             assert!(
                 non_session_invocation(&strs(&["--model", "opus", tok])),
@@ -1912,7 +1923,7 @@ mod tests {
         }
         // A management subcommand as the FIRST token.
         assert!(non_session_invocation(&strs(&["mcp", "list"])));
-        assert!(non_session_invocation(&strs(&["MCP", "list"])));
+        assert!(non_session_invocation(&strs(&["project", "purge"])));
         for sub in NON_SESSION_SUBCOMMANDS {
             assert!(non_session_invocation(&strs(&[sub])), "{sub}");
         }
@@ -1938,6 +1949,13 @@ mod tests {
         // Lookalikes are not exact tokens.
         assert!(!non_session_invocation(&strs(&["--versions"])));
         assert!(!non_session_invocation(&strs(&["-vv"])));
+        // EXACT case, as Claude Code's own lookup: these are prompts.
+        assert!(!non_session_invocation(&strs(&["Update", "the", "README"])));
+        assert!(!non_session_invocation(&strs(&["MCP", "list"])));
+        assert!(!non_session_invocation(&strs(&["--VERSION"])));
+        // After `--` everything is prompt text.
+        assert!(!non_session_invocation(&strs(&["--", "--help"])));
+        assert!(!non_session_invocation(&strs(&["-p", "--", "-v"])));
     }
 
     #[test]

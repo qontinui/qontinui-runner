@@ -51,6 +51,10 @@ TOOL="@@TOOL@@"
 PM_WIRE_NAME="@@PM_WIRE_NAME@@"
 SHIM_DIR="@@SHIM_DIR@@"
 
+INSTALL_VERBS="@@INSTALL_VERBS@@"
+LOCKSYNC_VERBS="@@LOCKSYNC_VERBS@@"
+NEVER_GATE="@@NEVER_GATE@@"
+
 # is_own_dir <dir>: whether <dir> is this shim's own bin dir, by IDENTITY and
 # not only by string. Under Git Bash, SHIM_DIR is rendered in Windows form
 # (C:\Users\...\Temp\qontinui-identity-...) while PATH carries the MSYS form
@@ -64,9 +68,20 @@ is_own_dir() {
   case "${1%/}" in "${SHIM_DIR%/}") return 0 ;; esac
   [ "$1" -ef "$SHIM_DIR" ]
 }
-INSTALL_VERBS="@@INSTALL_VERBS@@"
-LOCKSYNC_VERBS="@@LOCKSYNC_VERBS@@"
-NEVER_GATE="@@NEVER_GATE@@"
+
+# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or ANY runner
+# shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
+# build prepended for an outer pane. Two such dirs on one PATH resolve each
+# other and exec back and forth forever, and no real tool ever lives in one, so
+# the scan and the PATH-strip fall-through skip them all.
+is_shim_dir() {
+  is_own_dir "$1" && return 0
+  local base="${1%/}"
+  base="${base##*/}"
+  base="${base##*\\}"
+  case "$base" in qontinui-identity-*|qontinui-shim-*) return 0 ;; esac
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Resolve the REAL tool: first match on PATH that is NOT inside SHIM_DIR.
@@ -77,8 +92,8 @@ resolve_real() {
   local dir cand
   for dir in $PATH; do
     [ -z "$dir" ] && continue
-    # Skip our own shim dir (by identity: see is_own_dir).
-    is_own_dir "$dir" && continue
+    # Skip our own and every other runner shim dir (see is_shim_dir).
+    is_shim_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         printf '%s' "$cand"
@@ -181,7 +196,7 @@ passthrough() {
   local newpath="" d
   local IFS=':'
   for d in $PATH; do
-    is_own_dir "$d" && continue
+    is_shim_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is

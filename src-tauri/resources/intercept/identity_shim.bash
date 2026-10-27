@@ -53,6 +53,21 @@ is_own_dir() {
   [ "$1" -ef "$SHIM_DIR" ]
 }
 
+# is_shim_dir <dir>: <dir> is this shim's own dir (is_own_dir) or ANY runner
+# shim dir (qontinui-identity-* / qontinui-shim-*), such as one an older runner
+# build prepended for an outer pane. Two such dirs on one PATH resolve each
+# other and exec back and forth forever, and no real tool ever lives in one, so
+# the scan and the PATH-strip fall-through skip them all.
+is_shim_dir() {
+  is_own_dir "$1" && return 0
+  local base="${1%/}"
+  base="${base##*/}"
+  base="${base##*\\}"
+  case "$base" in qontinui-identity-*|qontinui-shim-*) return 0 ;; esac
+  return 1
+}
+
+
 # ---------------------------------------------------------------------------
 # npm's PLACEHOLDER stub. @anthropic-ai/claude-code ships `bin/claude.exe` as a
 # ~500-byte shell script that only prints "claude native binary not installed"
@@ -88,7 +103,7 @@ scan_path() {
   local dir cand
   for dir in $PATH; do
     [ -z "$dir" ] && continue
-    is_own_dir "$dir" && continue
+    is_shim_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         if is_npm_placeholder "$cand"; then
@@ -205,7 +220,7 @@ exec_real() {
   local newpath="" d
   local IFS=':'
   for d in $PATH; do
-    is_own_dir "$d" && continue
+    is_shim_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is
@@ -220,21 +235,25 @@ if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
 fi
 
 # Non-session invocation (claude --version / --help / a management subcommand
-# such as `claude mcp list`): the same pure passthrough — pinning one turned
-# `claude --version` into a hung session launch with a bogus session-open.
-# Mirrors `non_session_invocation` in src/bin/qontinui_shim.rs, the SOURCE OF
-# TRUTH for both lists; keep the three surfaces in step.
+# such as `claude mcp list`): the same pure passthrough, so an info call gets
+# no --settings / --mcp-config / --session-id and is not recorded as a
+# session-open. Exact case: Claude Code's own command lookup is exact, so
+# `claude Update the README` is a PROMPT. The flag scan stops at `--`, after
+# which everything is a prompt. Mirrors `non_session_invocation` in
+# src/bin/qontinui_shim.rs, the SOURCE OF TRUTH for both lists; keep the three
+# surfaces in step.
 if [ "$TOOL" = "claude" ]; then
   non_session=0
-  shopt -s nocasematch
   for a in "$@"; do
-    case "$a" in --version|-v|--help|-h) non_session=1; break ;; esac
+    case "$a" in
+      --) break ;;
+      --version|-v|--help|-h) non_session=1; break ;;
+    esac
   done
   case "${1:-}" in
-    mcp|doctor|update|upgrade|install|setup-token|plugin|plugins|auth|auto-mode|agents|logs|rm|stop|kill|purge|import)
+    mcp|doctor|update|upgrade|install|setup-token|plugin|plugins|auth|auto-mode|agents|logs|rm|stop|kill|purge|import|project)
       non_session=1 ;;
   esac
-  shopt -u nocasematch
   [ "$non_session" = "1" ] && exec_real "$@"
 fi
 
@@ -347,7 +366,8 @@ notify_session_open() {
       -d "$body" >/dev/null 2>&1 || true
 }
 
-# Fire-and-forget DIAGNOSTIC beacon on EVERY real shim invocation (even the
+# Fire-and-forget DIAGNOSTIC beacon on every shim invocation that reaches here
+# (not a nested one or a non-session info call, both exec'd above; even the
 # don't-double-pin passthrough that sends no session-open). Log-only on the
 # runner side — makes "did the shim run for this terminal, and will it deliver
 # --session-id/--settings?" observable in the logs. Never blocks the exec.

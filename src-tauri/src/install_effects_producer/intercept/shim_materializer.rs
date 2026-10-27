@@ -2775,9 +2775,7 @@ mod resolve_wait_tests {
     /// shim goes straight to the resolve-and-exec path under test.
     #[test]
     fn shims_skip_their_own_dir_under_another_spelling() {
-        if system_claude_present() {
-            return;
-        }
+        // No system_claude_present() skip: real_dir precedes /usr/bin on PATH.
         let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (tool, body_for) in [
             (
@@ -2815,6 +2813,65 @@ mod resolve_wait_tests {
             let out = match out {
                 Ok(o) => o,
                 Err(e) => panic!("{tool}: the shim did not finish (it resolved itself): {e}"),
+            };
+            assert!(
+                out.status.success(),
+                "{tool}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(marker.exists(), "{tool}: the real tool never ran");
+        }
+    }
+
+    /// Two runner shim dirs on one PATH (an older build's, prepended for an
+    /// outer pane, and this one): each would resolve the other as the real tool
+    /// and they would exec back and forth forever. Every `qontinui-identity-*`
+    /// / `qontinui-shim-*` dir is skipped, so the real tool behind both runs.
+    #[test]
+    fn shims_skip_every_runner_shim_dir_on_path() {
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (tool, body_for) in [
+            (
+                "claude",
+                (|d: &Path| render_identity_for_test("claude", d)) as fn(&Path) -> String,
+            ),
+            ("npm", |d: &Path| {
+                render_for_test(SHIM_BASH, ShimTool::Npm, d)
+            }),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mine, older, real_dir) = (
+                tmp.path().join("qontinui-identity-new"),
+                tmp.path().join("qontinui-shim-older"),
+                tmp.path().join("real"),
+            );
+            for d in [&mine, &older, &real_dir] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let marker = tmp.path().join("ran");
+            write_exe(&real_dir.join(tool), &fake_claude_body(&marker));
+            write_exe(&mine.join(tool), &body_for(&mine));
+            write_exe(&older.join(tool), &body_for(&older));
+            let mut cmd = Command::new(bash());
+            cmd.arg(mine.join(tool))
+                .arg("--version")
+                .current_dir(tmp.path())
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}:{}:/usr/bin:/bin",
+                        mine.display(),
+                        older.display(),
+                        real_dir.display()
+                    ),
+                )
+                .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0")
+                .env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1");
+            let out = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(15));
+            let out = match out {
+                Ok(o) => o,
+                Err(e) => panic!("{tool}: the two shims exec'd each other: {e}"),
             };
             assert!(
                 out.status.success(),
