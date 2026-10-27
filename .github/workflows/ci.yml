@@ -452,7 +452,9 @@ jobs:
       # before cargo test is only ~330 MB (2026-07-08 run 28948290993) —
       # the commit spike is transient peak, not steady-state; disk cost on
       # D: is the only cost. If JOBS=2 OOMs again at 32 GB, stop climbing:
-      # revert the test step to JOBS=1 and keep this pagefile.
+      # revert the test step to JOBS=1 and keep this pagefile. (That happened
+      # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
+      # leg.)
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
         uses: al-cheb/configure-pagefile-action@v1.4
@@ -853,7 +855,17 @@ jobs:
           #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
           #     at a time, ~no swap pressure, slower wall-clock but
           #     deterministic.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
+          #   - 2026-10-27: the ladder's "revert" arm fired. JOBS=2 at the
+          #     32 GB pagefile OOM'd with the same `rustc-LLVM ERROR: out of
+          #     memory` compiling the qontinui_runner (bin) test binary on
+          #     BOTH attempts of main push run 40449994591 (sha 79aaafb7),
+          #     and on Windows legs of merge candidates through the morning.
+          #     That turned main red and held 28 PRs. Per the ladder: JOBS=1,
+          #     keep the 32 GB pagefile, stop climbing. Budget check: JOBS=2
+          #     measured 31-49 min over 8 green runs that day, and JOBS=1 was
+          #     ~1.3x historically, so roughly 40-65 min against the 90-min
+          #     step bound.
+          CARGO_BUILD_JOBS: "1"
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
