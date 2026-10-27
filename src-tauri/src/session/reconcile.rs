@@ -90,8 +90,8 @@ use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_session_registry::RawRegistry;
 use crate::session::duplicate_hosts::HandoffExclusions;
 use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
-    ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
+    SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
+    ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -403,41 +403,19 @@ fn bind_record(
     confirmed: bool,
     zone_index: i32,
 ) -> TerminalSessionRecord {
-    TerminalSessionRecord {
-        claude_session_id: session_id.to_string(),
-        config_dir: Some(config_dir.to_string()),
-        working_dir: Some(pty.working_dir.clone()),
-        page_id: pty.page_id.clone(),
-        zone_index,
-        title: Some(pty.title.clone()),
-        terminal_id: pty.terminal_id.clone(),
-        opened_at: 0,
-        last_seen_at: 0,
-        state: "open".to_string(),
-        closed_at: None,
-        close_reason: None,
-        provider: DEFAULT_PROVIDER.to_string(),
-        origin: Some(origin.to_string()),
-        restore_pending_at: None,
-        confirmed_at: confirmed.then(|| chrono::Utc::now().timestamp_millis()),
-        handle: None,
-        account_label: None,
-        account_wrapper: None,
-        session_name: None,
-        name_source: None,
-        tenant_id: None,
-        task_run_id: None,
-        bypass_permissions: None,
-        restored_from_boot_at: None,
-        restore_tier: None,
-        finished_at: None,
-        wind_down_outcome: None,
-        wind_down_at: None,
-        finish_reason: None,
-        finish_synced: false,
-        spawn_device_default: None,
-        adopted_from: None,
-    }
+    TerminalSessionRecord::bound_to_pane(
+        session_id,
+        config_dir,
+        origin,
+        confirmed.then(|| chrono::Utc::now().timestamp_millis()),
+        crate::session::session_lifecycle_store::PaneBinding {
+            terminal_id: pty.terminal_id.clone(),
+            working_dir: Some(pty.working_dir.clone()),
+            page_id: pty.page_id.clone(),
+            zone_index,
+            title: Some(pty.title.clone()),
+        },
+    )
 }
 
 /// Lazily-evaluated transcript discovery for a `(working_dir)` — finds the
@@ -1550,6 +1528,7 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
     use tempfile::tempdir;
 
     // ── Item 3b: the transcript walk must not run on a tokio worker ──────

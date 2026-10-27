@@ -16,6 +16,12 @@
 //! the new pane three times in 30 minutes and each probe correctly found the
 //! new account fine — churn, and a stale banner that could have spent the
 //! migration cap.
+//!
+//! The replayed banner sits just above the input box, inside the bottom rows,
+//! so when a suppression lifts with no turn it can still yield ONE hint per
+//! debounce. That hint is silent: `handle_usage_limit_hint` probes the account
+//! first and, when it is not exhausted, ends with an info log — no event, no
+//! record written, no identity refusal reported.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
