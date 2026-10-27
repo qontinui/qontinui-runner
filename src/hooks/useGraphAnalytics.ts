@@ -7,6 +7,7 @@
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getApiBase } from "@/lib/runner-api";
 
 // ============================================================================
 // Types
@@ -141,10 +142,8 @@ export interface UnifiedSearchResult {
 // Fetchers
 // ============================================================================
 
-const API_BASE = "http://localhost:9876";
-
 async function fetchJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`);
+  const res = await fetch(`${getApiBase()}${path}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = await res.json();
   return json.data ?? json;

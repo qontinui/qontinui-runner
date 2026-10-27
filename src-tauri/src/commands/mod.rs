@@ -385,7 +385,8 @@ pub struct AppState {
     /// Last frontend pong timestamp (epoch ms), or 0 if no UI has ever
     /// checked in.
     ///
-    /// Rust emits `ui-bridge-ping` unconditionally every 3s and the frontend
+    /// Rust emits `ui-bridge-ping` unconditionally every 3s (from its own OS
+    /// thread, `ui_ping.rs`, so a starved tokio runtime cannot stop it) and the frontend
     /// answers `ui-bridge-pong`, so this advances on its own whenever a UI is
     /// alive — no external driver required. That makes it the one signal that
     /// stays correct when the WebView2 host dies underneath a healthy Rust
