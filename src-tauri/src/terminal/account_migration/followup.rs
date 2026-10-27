@@ -376,9 +376,12 @@ pub(crate) enum StallAction {
 /// (round-11 review W3). And when any OTHER bottom row is a numbered choice
 /// or dialog chrome ([`DIALOG_CHROME_MARKERS`](crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS)),
 /// a dialog is showing beside the banner and the `Esc` would cancel it: not a
-/// limit wait. Nor is it one while a `❯` input row holds an unsent draft
-/// (the draft rule `input_prompt_ready` refuses on): the `Esc` could wipe
-/// what the operator typed (round-12 review S6). (A banner the CLI wrapped
+/// limit wait. Nor is it one while the INPUT row — the `❯` row between the
+/// last two box rules ([`input_box_row`]) — holds an unsent draft (the draft
+/// rule `input_prompt_ready` refuses on): the `Esc` could wipe what the
+/// operator typed (round-12 review S6). Only that row: a `❯` row elsewhere is
+/// a prompt echoed in the history, or one quoted in output (round-13 review
+/// S4). (A banner the CLI wrapped
 /// onto two rows therefore reads as not-a-wait — a reported stall, never a
 /// stray `Esc`.)
 pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
@@ -393,16 +396,32 @@ pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
     let Some(banner) = rows.iter().rposition(|row| is_banner(row)) else {
         return false;
     };
+    let input_row = input_box_row(&rows);
     !rows.iter().enumerate().any(|(i, row)| {
         i != banner && {
             let n = normalize(row);
             crate::terminal::graceful_exit::is_numbered_option(row)
-                || crate::terminal::graceful_exit::row_holds_unsent_draft(row)
+                || (Some(i) == input_row
+                    && crate::terminal::graceful_exit::row_holds_unsent_draft(row))
                 || crate::terminal::graceful_exit::DIALOG_CHROME_MARKERS
                     .iter()
                     .any(|m| n.contains(m))
         }
     })
+}
+
+/// Pure: the index of the CLI's input row among `rows` — the `❯` row between
+/// the LAST two box rules (rows of box-drawing characters only,
+/// [`is_box_edge`](crate::terminal::graceful_exit::is_box_edge)). `None`
+/// when there is no such box, or no `❯` inside it.
+fn input_box_row(rows: &[&str]) -> Option<usize> {
+    let rules: Vec<usize> = (0..rows.len())
+        .filter(|&i| crate::terminal::graceful_exit::is_box_edge(rows[i]))
+        .collect();
+    let [.., top, bottom] = rules.as_slice() else {
+        return None;
+    };
+    (top + 1..*bottom).find(|&i| rows[i].contains('❯'))
 }
 
 /// Pure: whether the one `Esc` may be sent on `screen`, re-read IMMEDIATELY

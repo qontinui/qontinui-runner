@@ -276,6 +276,23 @@ fn a_banner_over_an_unsent_draft_sends_no_esc() {
     assert!(screen_shows_limit_wait(placeholder));
 }
 
+/// Round-13 S4: the draft rule reads only the INPUT row (between the last two
+/// box rules). A prior prompt echoed above the banner, or a `❯ npm test`
+/// quoted in output, is history — the wait is still recognised; the real
+/// draft in the input box still blocks.
+///
+/// Mutation check: applying the draft rule to every bottom row (round 12)
+/// fails the first two assertions.
+#[test]
+fn a_prompt_echoed_in_the_history_is_not_a_draft() {
+    let echoed = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯\u{a0}\n────────\n";
+    assert!(screen_shows_limit_wait(echoed));
+    let quoted = "  Run it with:\n    ❯ npm test\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n────────\n";
+    assert!(screen_shows_limit_wait(quoted));
+    let drafted = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n";
+    assert!(!screen_shows_limit_wait(drafted));
+}
+
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///
