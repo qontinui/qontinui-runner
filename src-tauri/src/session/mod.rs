@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod census; // Machine-wide live Claude session census → POST /coord/session-census/:device_id (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account, Phases 2+4)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
