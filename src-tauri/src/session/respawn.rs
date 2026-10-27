@@ -513,7 +513,9 @@ fn materialize_from_with(
     };
     let mut last_error = None;
     for src in candidates {
-        if src == config_dir {
+        // The target itself, however it is spelled (case, separators, a
+        // verbatim prefix), is not a holder to copy from.
+        if crate::terminal::migration_identity::same_config_dir(src, config_dir) {
             continue;
         }
         let candidate = crate::terminal::transcript::session_transcript_path(
@@ -1703,6 +1705,41 @@ mod tests {
         )
         .unwrap());
         assert!(target_main.is_file(), "the next holder supplies it");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Round-11 S2: the target listed among the holders under another
+    /// spelling is skipped like the exact spelling — it is never stat'ed or
+    /// carried from as if it were a second account.
+    ///
+    /// Mutation check: comparing `src == config_dir` again stats the
+    /// respelled target as a holder and fails the count.
+    #[test]
+    fn the_target_respelled_among_the_holders_is_not_a_holder() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-self-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:/qontinui-root";
+        let sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+        let target = tmp.join(".claude-t");
+        seed_holder(&target, working_dir, sid, b"{}\n", &[]);
+        let respelled = format!("{}/", target.join(".").display());
+        let stats = std::cell::Cell::new(0_u32);
+        let found = materialize_from_with(
+            target.to_str().unwrap(),
+            &[respelled],
+            working_dir,
+            sid,
+            |p: &std::path::Path| {
+                stats.set(stats.get() + 1);
+                p.try_exists()
+            },
+        )
+        .unwrap();
+        assert!(found);
+        assert_eq!(stats.get(), 1, "only the target's own presence is probed");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
