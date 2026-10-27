@@ -466,12 +466,46 @@ fn materialize_from(
     working_dir: &str,
     claude_session_id: &str,
 ) -> Result<bool, RespawnError> {
+    materialize_from_with(
+        config_dir,
+        candidates,
+        working_dir,
+        claude_session_id,
+        |p| p.try_exists(),
+    )
+}
+
+/// [`materialize_from`] with the presence probe injected, so a stat that
+/// FAILS (rather than finding nothing) is testable.
+///
+/// `stat` answers `Ok(false)` only for a path that is provably absent
+/// (`NotFound`); any other error is an error, never absence. `exists()` would
+/// read a permission, sharing or unreachable-share failure on the TARGET's
+/// transcript as "absent" and pick [`RespawnCarry::ExtendPrefix`](crate::terminal::session_carry::RespawnCarry)
+/// instead of `KeepExisting` — rewriting the transcript this target resumes
+/// from a holder's copy. So a target whose presence cannot be read fails the
+/// call before anything is carried, and a holder whose transcript cannot be
+/// stat'ed is skipped with its error logged and kept: like a holder whose
+/// carry failed, it makes the call an error when no holder supplies the
+/// transcript.
+fn materialize_from_with(
+    config_dir: &str,
+    candidates: &[String],
+    working_dir: &str,
+    claude_session_id: &str,
+    stat: impl Fn(&std::path::Path) -> std::io::Result<bool>,
+) -> Result<bool, RespawnError> {
     let target_path = crate::terminal::transcript::session_transcript_path(
         std::path::Path::new(config_dir),
         working_dir,
         claude_session_id,
     );
-    let mut found = target_path.exists();
+    let mut found = stat(&target_path).map_err(|e| {
+        RespawnError::Transcript(format!(
+            "stat of the target transcript {} failed: {e}",
+            target_path.display()
+        ))
+    })?;
     let main = if found {
         crate::terminal::session_carry::RespawnCarry::KeepExisting
     } else {
@@ -487,8 +521,22 @@ fn materialize_from(
             working_dir,
             claude_session_id,
         );
-        if !candidate.exists() {
-            continue;
+        match stat(&candidate) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    session = %claude_session_id,
+                    from = %src,
+                    error = %e,
+                    "session respawn: could not stat a local account dir's transcript; trying the rest"
+                );
+                last_error = Some(format!(
+                    "stat of the holder transcript {} failed: {e}",
+                    candidate.display()
+                ));
+                continue;
+            }
         }
         match crate::terminal::session_carry::carry_for_respawn(
             src,
@@ -1571,6 +1619,90 @@ mod tests {
             ),
             "every holder failing is an error, never a silent absence"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A stat that FAILS is not absence. The target's presence unreadable:
+    /// the call fails before anything is carried — `exists()` would have read
+    /// it as absent and extended the target from the holder instead of
+    /// keeping it. A holder's presence unreadable: that holder is skipped and
+    /// its error kept, so it is an error when no other holder supplies the
+    /// transcript, and harmless when one does.
+    ///
+    /// Injected rather than real: a portable, non-`NotFound` stat failure is
+    /// not reliably producible on both Windows and Linux test boxes.
+    ///
+    /// Mutation check: `stat(..).unwrap_or(false)` for the target, or
+    /// `Err(_) => continue` without recording, each fail an assertion.
+    #[test]
+    fn a_failed_stat_is_an_error_not_an_absent_transcript() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-stat-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        let (target, holder, good) = (
+            tmp.join(".claude-t"),
+            tmp.join(".claude-h"),
+            tmp.join(".claude-g"),
+        );
+        seed_holder(&holder, working_dir, sid, b"{}\n", &[]);
+        seed_holder(&good, working_dir, sid, b"{}\n", &[]);
+        let target_main =
+            crate::terminal::transcript::session_transcript_path(&target, working_dir, sid);
+        let holder_main =
+            crate::terminal::transcript::session_transcript_path(&holder, working_dir, sid);
+        let denied = |bad: std::path::PathBuf| {
+            move |p: &std::path::Path| {
+                if p == bad {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    p.try_exists()
+                }
+            }
+        };
+        let holder_s = holder.to_str().unwrap().to_string();
+
+        let got = materialize_from_with(
+            target.to_str().unwrap(),
+            std::slice::from_ref(&holder_s),
+            working_dir,
+            sid,
+            denied(target_main.clone()),
+        );
+        assert!(
+            matches!(&got, Err(RespawnError::Transcript(m)) if m.contains("stat of the target transcript")),
+            "an unreadable target is an error, got {got:?}"
+        );
+        assert!(
+            !target_main.exists(),
+            "nothing is carried into a target whose presence is unknown"
+        );
+
+        let got = materialize_from_with(
+            target.to_str().unwrap(),
+            std::slice::from_ref(&holder_s),
+            working_dir,
+            sid,
+            denied(holder_main.clone()),
+        );
+        assert!(
+            matches!(&got, Err(RespawnError::Transcript(m)) if m.contains("stat of the holder transcript")),
+            "the only holder unreadable is an error, never a silent absence, got {got:?}"
+        );
+        assert!(!target_main.exists());
+
+        assert!(materialize_from_with(
+            target.to_str().unwrap(),
+            &[holder_s, good.to_str().unwrap().to_string()],
+            working_dir,
+            sid,
+            denied(holder_main),
+        )
+        .unwrap());
+        assert!(target_main.is_file(), "the next holder supplies it");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
