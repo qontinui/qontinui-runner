@@ -438,7 +438,8 @@ jobs:
           free -h
           df -h
 
-      # 32 GB (was 16 → 24): headroom for CARGO_BUILD_JOBS=2 in the test step.
+      # 32 GB (was 16 → 24): sized as headroom for CARGO_BUILD_JOBS=2 in the test
+      # step. The test step runs JOBS=1 since 2026-10-27 (see below); the pagefile stays.
       # The May 2026 windows OOMs (runs 25612844640 / 75193978255, PR #65)
       # happened at JOBS=2 with a 16 GB pagefile — two concurrent large-crate
       # rustc codegens exhausted the 16 GB RAM + 16 GB pagefile commit limit.
@@ -452,7 +453,9 @@ jobs:
       # before cargo test is only ~330 MB (2026-07-08 run 28948290993) —
       # the commit spike is transient peak, not steady-state; disk cost on
       # D: is the only cost. If JOBS=2 OOMs again at 32 GB, stop climbing:
-      # revert the test step to JOBS=1 and keep this pagefile.
+      # revert the test step to JOBS=1 and keep this pagefile. (That happened
+      # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
+      # leg.)
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
         uses: al-cheb/configure-pagefile-action@v1.4
@@ -853,7 +856,24 @@ jobs:
           #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
           #     at a time, ~no swap pressure, slower wall-clock but
           #     deterministic.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
+          #   - 2026-10-27: the ladder's "revert" arm fired. JOBS=2 at the
+          #     32 GB pagefile OOM'd with the same `rustc-LLVM ERROR: out of
+          #     memory` compiling the qontinui_runner (bin) test binary on
+          #     BOTH attempts of main push run 40449994591 (sha 79aaafb7),
+          #     and on Windows legs of merge candidates through the morning
+          #     (PR runner#2242 at 2deb22a2a OOM'd on both attempts on
+          #     2026-10-28). Even green runs sat at the ceiling: the pagefile
+          #     sampler read peak_mb=32767 of 32768 on main 4a7431d29 and
+          #     32648 on runner#2311 at 181f30b0a. Per the ladder: JOBS=1,
+          #     keep the 32 GB pagefile, stop climbing. Budget check: JOBS=1
+          #     was ~1.3x JOBS=2 (37m47s vs the 50-min baseline above), so a
+          #     ~49-min JOBS=2 build lands near 64 min against the 90-min step
+          #     bound. Read the first JOBS=1 Windows build times against that.
+          #     Both arms are now '1', but the expression stays per-platform
+          #     on purpose. The legs are throttled for different reasons, and
+          #     ci_rust_test_steps_split.rs pins that each stays separately
+          #     tunable.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1138,7 +1158,8 @@ jobs:
       # population that did not need measuring.
       #
       # Deliberately measurement-only. The retune (windows CARGO_BUILD_JOBS
-      # from 2 toward cargo's default) is Phase 3 step 2 and waits on a soak
+      # from 1 toward cargo's default; it was reverted from 2 to 1 on
+      # 2026-10-27 after OOMs at the 32 GB pagefile) is Phase 3 step 2 and waits on a soak
       # window of these readings; tuning first against an unmeasured quantity
       # is how the current value went stale.
       #
