@@ -1,0 +1,14 @@
+   Compiling qontinui-runner v1.0.11 (D:\a\qontinui-runner\qontinui-runner\src-tauri)
+rustc-LLVM ERROR: out of memory
+Allocation failed
+error: failed to run custom build command for `qontinui-schemas v0.4.0`
+error: could not compile `qontinui-runner` (lib test); 1 warning emitted
+
+Caused by:
+  process didn't exit successfully: `rustc.exe --crate-name qontinui_runner` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)
+error: linking with `link.exe` failed: exit code: 1120
+error: failed to spawn `rustc.exe`
+error: test failed, to rerun pass `--lib`
+error: process didn't exit successfully: `build-script-build` (exit code: 1)
+error: build failed
+##[error]Process completed with exit code 101.

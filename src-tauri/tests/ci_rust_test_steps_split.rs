@@ -761,25 +761,115 @@ fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
         body.contains("scripts/ci/oom-signature.sh"),
         "`{EMITTER}` must call scripts/ci/oom-signature.sh, the fixture-tested matcher"
     );
-    // The build phase reads the BUILD log and carries `--build-phase` (the
-    // `killed IN THE BUILD` suffix coord write-skips); the run phase reads the
-    // RUN log without it, so a run-phase OOM stays red and is re-run.
-    let build_call = body
-        .split("bash scripts/ci/oom-signature.sh")
-        .find(|call| call.contains(&format!("--step \"{BUILD}\"")))
-        .unwrap_or_else(|| panic!("`{EMITTER}` never calls the emitter for `{BUILD}`"));
+    // The BRANCH, not just the presence of two calls: `build outcome ==
+    // failure` must select the BUILD call and every other case (the run half
+    // failed) the RUN call. Swapping the arms leaves both calls present and
+    // annotates a build OOM as run-phase (kept red) and a run OOM as
+    // build-killed (write-skipped on main, hiding a possible real assertion).
+    const BUILD_BRANCH: &str =
+        "if [ \"${{ steps.build_rust_tests.outcome }}\" = \"failure\" ]; then";
+    let branch_at = body
+        .find(BUILD_BRANCH)
+        .unwrap_or_else(|| panic!("`{EMITTER}` must branch on `{BUILD_BRANCH}`; body:\n{body}"));
+    let after_branch = &body[branch_at + BUILD_BRANCH.len()..];
+    let lines: Vec<&str> = after_branch.lines().map(str::trim).collect();
+    let else_at = lines
+        .iter()
+        .position(|l| *l == "else")
+        .unwrap_or_else(|| panic!("`{EMITTER}`'s build-outcome branch has no `else`"));
+    let fi_at = lines
+        .iter()
+        .position(|l| *l == "fi")
+        .unwrap_or_else(|| panic!("`{EMITTER}`'s build-outcome branch has no `fi`"));
+    assert!(else_at < fi_at, "`else` must come before `fi`");
+    let build_call = lines[..else_at].join("\n");
+    let run_call = lines[else_at + 1..fi_at].join("\n");
+    for (call, which) in [(&build_call, "then"), (&run_call, "else")] {
+        assert_eq!(
+            call.matches("bash scripts/ci/oom-signature.sh").count(),
+            1,
+            "the `{which}` arm must make exactly one emitter call: {call}"
+        );
+        // The cgroup evidence: without `--memory-events` and a baseline the
+        // SIGKILL / `Killed` arms can never fire.
+        assert!(
+            call.contains("--memory-events \"$memory_events\""),
+            "the `{which}` arm must pass `--memory-events \"$memory_events\"`: {call}"
+        );
+    }
+    // `then` arm: the BUILD log, `--build-phase` (the `killed IN THE BUILD`
+    // suffix coord write-skips), and the baseline taken before the BUILD half.
     assert!(
-        build_call.contains("--build-phase") && build_call.contains("cargo-test-build.log"),
-        "the `{BUILD}` call must pass `--build-phase` and the build log: {build_call}"
+        build_call.contains(&format!("--step \"{BUILD}\""))
+            && build_call.contains("--build-phase")
+            && build_call.contains("cargo-test-build.log")
+            && !build_call.contains("cargo-test-output.log"),
+        "the build-failure arm must call the emitter for `{BUILD}` with \
+         `--build-phase` and the build log: {build_call}"
     );
-    let run_call = body
-        .split("bash scripts/ci/oom-signature.sh")
-        .find(|call| call.contains(&format!("--step \"{RUN}\"")))
-        .unwrap_or_else(|| panic!("`{EMITTER}` never calls the emitter for `{RUN}`"));
     assert!(
-        !run_call.contains("--build-phase") && run_call.contains("cargo-test-output.log"),
-        "the `{RUN}` call must read the run log WITHOUT `--build-phase` (tests \
-         may have run, so it must stay red): {run_call}"
+        build_call
+            .contains("--oom-kill-baseline \"${{ steps.oom_kill_before_build.outputs.count }}\""),
+        "the build-failure arm must pass the oom_kill count recorded before \
+         `{BUILD}`: {build_call}"
+    );
+    // `else` arm: the RUN log without `--build-phase` (tests may have run, so
+    // it must stay red and be re-run), and the baseline taken before the RUN
+    // half.
+    assert!(
+        run_call.contains(&format!("--step \"{RUN}\""))
+            && !run_call.contains("--build-phase")
+            && run_call.contains("cargo-test-output.log")
+            && !run_call.contains("cargo-test-build.log"),
+        "the else arm must call the emitter for `{RUN}` with the run log and \
+         WITHOUT `--build-phase`: {run_call}"
+    );
+    assert!(
+        run_call.contains("--oom-kill-baseline \"${{ steps.oom_kill_before_run.outputs.count }}\""),
+        "the else arm must pass the oom_kill count recorded before `{RUN}`: {run_call}"
+    );
+
+    // The two baselines: `oom_kill` is cumulative per cgroup, so each is read
+    // immediately before the half it baselines, Linux-only and best-effort.
+    for (id, half) in [
+        ("oom_kill_before_build", BUILD),
+        ("oom_kill_before_run", RUN),
+    ] {
+        let (at, step) = steps
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.get("id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap_or_else(|| panic!("no step carries `id: {id}`"));
+        assert!(
+            at < position(&steps, half),
+            "`{id}` must run BEFORE `{half}`, whose oom_kill rise it baselines"
+        );
+        assert_eq!(
+            step.get("if").and_then(|v| v.as_str()),
+            Some("runner.os == 'Linux'"),
+            "`{id}` reads a cgroup and must be Linux-only"
+        );
+        assert_eq!(
+            step.get("continue-on-error").and_then(|v| v.as_bool()),
+            Some(true),
+            "`{id}` is best-effort and must never fail the job"
+        );
+        let body = command_lines(step, id);
+        assert!(
+            body.contains("memory.events")
+                && body.contains("count=")
+                && body.contains("GITHUB_OUTPUT"),
+            "`{id}` must write the `oom_kill` count from memory.events as output `count`: {body}"
+        );
+    }
+    assert!(
+        position(&steps, BUILD)
+            < steps
+                .iter()
+                .position(|s| s.get("id").and_then(|v| v.as_str()) == Some("oom_kill_before_run"))
+                .unwrap(),
+        "`oom_kill_before_run` must come AFTER `{BUILD}`, or a build-phase kill \
+         is inside the run half's baseline window"
     );
     // A saturated pagefile is NOT OOM evidence (plan Phase 0: hosted Windows
     // peaks at 32767 of 32768 MB on jobs that failed in tests, and near it on
