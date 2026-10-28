@@ -728,6 +728,24 @@ jobs:
           echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
         shell: bash
 
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
+      # the cgroup `oom_kill` count BEFORE `Build Rust tests`, read by
+      # `Annotate an out-of-memory Rust test step`. `memory.events` is
+      # cumulative over the cgroup's lifetime (the runner service's, not this
+      # step's), so only a RISE over this baseline says a kill happened during
+      # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
+      # count writes an empty output, which the matcher reads as NO evidence.
+      - name: Record the cgroup oom_kill count before the build half
+        id: oom_kill_before_build
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+          count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
+          echo "oom_kill count before Build Rust tests: ${count:-<unreadable>}"
+          echo "count=$count" >>"$GITHUB_OUTPUT" || true
+
       # ── BUILD half of the old single `Run Rust tests` step ─────────────
       #
       # The split is plan 2026-09-17-the-windows-test-gate-is-a-90-minute-build-
@@ -900,6 +918,24 @@ jobs:
           fi
           cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
+      # the cgroup `oom_kill` count BEFORE `Run Rust tests`, read by
+      # `Annotate an out-of-memory Rust test step`. `memory.events` is
+      # cumulative over the cgroup's lifetime (the runner service's, not this
+      # step's), so only a RISE over this baseline says a kill happened during
+      # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
+      # count writes an empty output, which the matcher reads as NO evidence.
+      - name: Record the cgroup oom_kill count before the run half
+        id: oom_kill_before_run
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+          count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
+          echo "oom_kill count before Run Rust tests: ${count:-<unreadable>}"
+          echo "count=$count" >>"$GITHUB_OUTPUT" || true
 
       # ── RUN half ────────────────────────────────────────────
       #
@@ -1209,9 +1245,12 @@ jobs:
       # (`CiDeclaredInconclusive`). No match, or an unreadable log, prints
       # nothing and the red stays an ordinary red.
       #
-      # On Linux the step's own cgroup `memory.events` is passed so a `SIGKILL`
-      # counts only beside a non-zero `oom_kill` (job 111779867816's rustc was
-      # SIGKILLed by a runner shutdown, not an OOM). The MEMPEAK reading above
+      # On Linux the cgroup `memory.events` is passed with the `oom_kill` count
+      # recorded before the failed half, so a kill (cargo's `SIGKILL`, or bash's
+      # `Killed` for a test binary the run half execs) counts only when that
+      # count ROSE during the step (job 111779867816's rustc was SIGKILLed by a
+      # runner shutdown, not an OOM; and the count is cumulative). Elsewhere the
+      # baseline is empty and a kill is no evidence. The MEMPEAK reading above
       # is deliberately NOT a signature: Phase 0 measured hosted Windows
       # pagefiles at 32767/32768 MB on jobs that failed in tests and 32551 on a
       # green one, so saturation there is normal. `continue-on-error` and no
@@ -1230,11 +1269,13 @@ jobs:
           if [ "${{ steps.build_rust_tests.outcome }}" = "failure" ]; then
             bash scripts/ci/oom-signature.sh --step "Build Rust tests" --build-phase \
               --log "$GITHUB_WORKSPACE/cargo-test-build.log" \
-              --memory-events "$memory_events"
+              --memory-events "$memory_events" \
+              --oom-kill-baseline "${{ steps.oom_kill_before_build.outputs.count }}"
           else
             bash scripts/ci/oom-signature.sh --step "Run Rust tests" \
               --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
-              --memory-events "$memory_events"
+              --memory-events "$memory_events" \
+              --oom-kill-baseline "${{ steps.oom_kill_before_run.outputs.count }}"
           fi
 
       # Best-effort, non-gating: pushes this job's per-test outcomes into
