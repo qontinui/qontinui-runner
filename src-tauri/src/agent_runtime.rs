@@ -15375,9 +15375,6 @@ mod tests {
 
     const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
 
-    /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
-    /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
-    /// prefix followed by the same thread-pressure stamp continuations use.
     /// The two read-only registry doors the Stop-hook verdict and the finish
     /// relay use: only a LIVE entry carrying a gate is a gate continuation; a
     /// gate-less entry (a work-unit dispatch) and an unknown terminal are not.
@@ -15399,6 +15396,9 @@ mod tests {
         clear_continuation_registry();
     }
 
+    /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
+    /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
+    /// prefix followed by the same thread-pressure stamp continuations use.
     #[test]
     fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
         let _env_lock = env_lock();

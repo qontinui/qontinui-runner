@@ -611,11 +611,14 @@ fn one_status_from_body(body: &WireResponse, csid: &str) -> OneStatus {
 pub async fn fetch_one(csid: &str) -> OneStatus {
     // The id is interpolated into a CSV query parameter: only a UUID goes on
     // the wire, so a `,` or `&` in a payload can never reshape the request.
-    if uuid::Uuid::parse_str(csid.trim()).is_err() {
+    // Normalised once (hyphenated lowercase), and the SAME string is both sent
+    // and looked up, so a braced or uppercase id cannot miss its own row.
+    let Ok(id) = uuid::Uuid::parse_str(csid.trim()) else {
         return OneStatus::Unresolved(format!("`{csid}` is not a harness session UUID"));
-    }
-    match fetch_wire(&[csid.trim().to_string()]).await {
-        Ok((body, _)) => one_status_from_body(&body, csid),
+    };
+    let id = id.to_string();
+    match fetch_wire(std::slice::from_ref(&id)).await {
+        Ok((body, _)) => one_status_from_body(&body, &id),
         Err(note) => OneStatus::Unresolved(note),
     }
 }
