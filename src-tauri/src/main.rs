@@ -5073,6 +5073,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     rec,
                                     tick_boot_at_ms,
                                     awaiting_boot_restore,
+                                    snap_captured_at_ms,
                                 ) {
                                     held_unjudged.push(rec.claude_session_id.clone());
                                 }
