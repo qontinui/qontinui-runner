@@ -1003,7 +1003,8 @@ pub(crate) fn spawn_resumed_pane(
         // this respawn has no briefing, so it carries a BODY-ONLY composed
         // file when the tenant's cache exists, and nothing otherwise.
         resume_respawn_extra_required(
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // A migrated GATE continuation keeps its Stop-armed carrier.
+            crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some()),
             prompt_carrier.as_ref(),
         ),
     );
