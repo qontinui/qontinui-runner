@@ -1908,6 +1908,7 @@ fn record_from_seed(
         // age without knowing the wall clock. Absent means absent; these are
         // no longer hardcoded to `None`.
         restore_pending_at: seed.restore_pending_at.map(|off| now_ms + off),
+        awaiting_account_since: None,
         confirmed_at: seed.confirmed_at.map(|off| now_ms + off),
         handle: None,
         account_label: None,

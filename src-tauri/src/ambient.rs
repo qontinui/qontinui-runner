@@ -2402,8 +2402,17 @@ mod tests {
         ),
         (
             "session_archive/discovery.rs",
+            2,
+            "the user's Claude session archives (`~/.claude/projects`) — Claude Code's data — \
+             and the default Claude account home (`~/.claude`) the account-home scan and \
+             `is_default_config_home_from_env` compare against",
+        ),
+        (
+            "commands/terminal.rs",
             1,
-            "the user's Claude session archives (`~/.claude/projects`) — Claude Code's data",
+            "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
+             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
+             state",
         ),
         (
             "wrappers/clients.rs",
