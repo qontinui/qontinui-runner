@@ -601,6 +601,16 @@ async fn resume_one(
         return ResumeRow::skipped(&cand.id, why);
     }
 
+    // Pace and hold the PTY open (D1 of plan 2026-10-28-runner-spawn-bursts…): a
+    // resume-all is itself a burst. Still inside the in-flight claim, so a
+    // concurrent call naming this id is `skipped(in_flight)` while it waits.
+    crate::unattended_spawn_gate::admit(
+        SpawnOrigin::Respawn,
+        "resumed session",
+        &format!("resume:{}", cand.id),
+    )
+    .await;
+
     let spawn = {
         let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
         tokio::task::spawn_blocking(move || {

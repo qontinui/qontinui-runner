@@ -54,6 +54,19 @@ const SITES_REL: &str = "src/runner_spawn_sites.txt";
 const SELF_FILE: &str = "runner_spawn_sites.rs";
 const CLASSES: &[&str] = &["autonomous", "operator", "helper", "exempt"];
 
+/// The fifth column of an `autonomous` row: what the site opens.
+const SPAWN_KINDS: &[&str] = &["pty", "headless", "n/a"];
+
+/// What an `autonomous … pty` row's own fn body must name: the unattended
+/// spawn gate (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`, D1).
+const UNATTENDED_GATE_PATH: &str = "unattended_spawn_gate::";
+
+/// The unattended-gate calls that ANSWER rather than hold: a request-scoped
+/// door that discards one has not refused anything. (`admit(` is a hold, so a
+/// bare `.await;` of it is the whole point.)
+const UNATTENDED_VERDICT_CALLS: &[&str] = &["check_request(", "admit_or_refuse("];
+
 /// Calls that pass the drain gate. `authorize_spawn` and the fan-out variants
 /// run [`crate::coord_drain_state::drain_gate`] first for a `DrainAdmission::Origin`.
 const GATE_CALLS: &[&str] = &[
@@ -83,6 +96,8 @@ const GATE_DEFEATERS: &[&str] = &[
 struct Row {
     class: String,
     detail: String,
+    /// `pty` / `headless` / `n/a` on an `autonomous` row; `None` on every other.
+    spawn: Option<String>,
 }
 
 type Sources = BTreeMap<String, String>;
@@ -366,15 +381,25 @@ fn resolve_hop<'a>(hop: &'a str, site_file: &'a str) -> (&'a str, &'a str) {
 /// The gate calls in `body` whose result is DISCARDED: the statement is
 /// nothing but the (path-qualified) call, optionally `.await`-ed, ending in
 /// `;` — or `let _ = …;`. Returns the offending call tokens.
+fn bare_gate_calls(body: &str) -> Vec<&'static str> {
+    let verdicts: Vec<&'static str> = GATE_CALLS
+        .iter()
+        .copied()
+        .filter(|c| !HOLD_CALLS.contains(c))
+        .collect();
+    bare_calls(body, &verdicts)
+}
+
+/// [`bare_gate_calls`] over any list of verdict-returning call tokens.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn bare_gate_calls(body: &str) -> Vec<&'static str> {
+fn bare_calls(body: &str, calls: &[&'static str]) -> Vec<&'static str> {
     let path_only =
         Regex::new(r"^(?:let\s+_\s*=\s*)?(?:[A-Za-z_][A-Za-z0-9_]*::)*$").expect("path-only regex");
     let mut bare = Vec::new();
-    for call in GATE_CALLS.iter().filter(|c| !HOLD_CALLS.contains(c)) {
+    for call in calls {
         for m in token_re(call).find_iter(body) {
             // Statement start: the last `;`, `{` or `}` that ends its line.
             let before = &body[..m.start()];
@@ -483,6 +508,26 @@ fn autonomous_sites_bypassing_the_gate(sources: &Sources, rows: &Rows) -> Vec<St
     out
 }
 
+/// `autonomous … pty` rows whose own fn body does not pass the unattended
+/// spawn gate — it never names [`UNATTENDED_GATE_PATH`], or it discards the
+/// verdict of one of [`UNATTENDED_VERDICT_CALLS`]. PURE over the sources.
+fn pty_sites_bypassing_the_unattended_gate(sources: &Sources, rows: &Rows) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, r)| r.class == "autonomous" && r.spawn.as_deref() == Some("pty"))
+        .filter_map(|((file, func), _)| {
+            let Some(body) = sources.get(file).and_then(|s| fn_body(s, func)) else {
+                return Some(format!("{file}:{func} (fn not found)"));
+            };
+            if !body.contains(UNATTENDED_GATE_PATH) {
+                return Some(format!("{file}:{func} (no {UNATTENDED_GATE_PATH} call)"));
+            }
+            bare_calls(&body, UNATTENDED_VERDICT_CALLS)
+                .first()
+                .map(|call| format!("{file}:{func} (discards the result of {call})"))
+        })
+        .collect()
+}
+
 /// Operator rows that are not a `#[tauri::command]`.
 fn operator_sites_not_tauri_commands(sources: &Sources, rows: &Rows) -> Vec<String> {
     let decl = fn_decl_re();
@@ -555,11 +600,11 @@ fn parse_sites(text: &str) -> Rows {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let cells: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
-        assert_eq!(
-            cells.len(),
-            4,
-            "runner_spawn_sites.txt:{}: expected `file | fn | class | detail`, got {line:?}",
+        let cells: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
+        assert!(
+            cells.len() == 4 || cells.len() == 5,
+            "runner_spawn_sites.txt:{}: expected `file | fn | class | detail [| spawn]`, got \
+             {line:?}",
             n + 1
         );
         assert!(
@@ -587,11 +632,29 @@ fn parse_sites(text: &str) -> Rows {
                 }
             );
         }
+        let spawn = cells.get(4).map(|k| k.to_string());
+        if cells[2] == "autonomous" {
+            assert!(
+                spawn
+                    .as_deref()
+                    .is_some_and(|k| SPAWN_KINDS.contains(&k)),
+                "runner_spawn_sites.txt:{}: an autonomous row needs a fifth column, one of \
+                 {SPAWN_KINDS:?}, got {spawn:?}",
+                n + 1
+            );
+        } else {
+            assert!(
+                spawn.is_none(),
+                "runner_spawn_sites.txt:{}: only an autonomous row carries a spawn column",
+                n + 1
+            );
+        }
         let prev = out.insert(
             (cells[0].to_string(), cells[1].to_string()),
             Row {
                 class: cells[2].to_string(),
                 detail: cells[3].to_string(),
+                spawn,
             },
         );
         assert!(
@@ -707,6 +770,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            spawn: None,
         },
     );
     assert_eq!(
@@ -731,6 +795,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            spawn: None,
         },
     );
     assert!(operator_sites_reachable_by_an_automation(&clean).is_empty());
@@ -779,6 +844,7 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
         Row {
             class: "helper".into(),
             detail: "recipe(".into(),
+            spawn: None,
         },
     );
     let found: Vec<_> = scan_sites(&sources, &rows).into_iter().collect();
@@ -808,6 +874,7 @@ fn a_broken_chain_an_exempt_admission_or_an_operator_origin_fails_the_guard() {
     let row = |detail: &str| Row {
         class: "autonomous".into(),
         detail: detail.into(),
+        spawn: Some("n/a".into()),
     };
     let mut rows = BTreeMap::new();
     rows.insert(
@@ -844,6 +911,7 @@ fn an_operator_row_must_be_a_tauri_command() {
             Row {
                 class: "operator".into(),
                 detail: "-".into(),
+                spawn: None,
             },
         );
     }
@@ -880,6 +948,7 @@ fn a_bare_gate_call_whose_result_is_discarded_fails_the_guard() {
             Row {
                 class: "autonomous".into(),
                 detail: f.into(),
+                spawn: Some("n/a".into()),
             },
         );
     }
@@ -938,4 +1007,123 @@ fn a_star_led_code_line_is_code_and_a_block_comment_is_not() {
         comment_mask(&lines),
         vec![false, false, true, true, true, true, true, false]
     );
+}
+
+/// D1 of plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`:
+/// every autonomous site that opens a PTY passes the unattended spawn gate in
+/// its own body, immediately before the open.
+#[test]
+fn every_autonomous_terminal_site_passes_the_unattended_spawn_gate() {
+    let rows = load_rows();
+    let pty: Vec<String> = rows
+        .iter()
+        .filter(|(_, r)| r.class == "autonomous" && r.spawn.as_deref() == Some("pty"))
+        .map(|((file, func), _)| format!("{file}:{func}"))
+        .collect();
+    // The ten measured PTY sites (plan D1's eight, plus the `/tauri/invoke`
+    // `terminal_create` proxy and the session handoff, which the roster's
+    // primitive scan shows open a PTY too). Spelled out, so a row silently
+    // reclassified away from `pty` is red here rather than unguarded.
+    assert_eq!(
+        pty,
+        vec![
+            "agent_runtime.rs:run_condition_check_terminal",
+            "agent_runtime.rs:run_continuation_terminal",
+            "looping_agent_supervisor.rs:spawn_looping_agent_terminal",
+            "mcp/backend_relay.rs:handle_terminal_create",
+            "mcp/steward.rs:start_steward",
+            "mcp/tauri_proxy.rs:dispatch",
+            "mcp/terminals.rs:create_terminal_handler",
+            "session/handoff.rs:materialize",
+            "session/respawn.rs:materialize",
+            "session/resume_door.rs:resume_one",
+        ]
+    );
+    let violations = pty_sites_bypassing_the_unattended_gate(&load_sources(), &rows);
+    assert!(
+        violations.is_empty(),
+        "autonomous PTY sites that bypass the unattended spawn gate: {violations:#?}"
+    );
+}
+
+/// Mutation twin: remove the gate call from one real PTY site and the guard
+/// must go red on exactly that row.
+#[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
+fn removing_the_unattended_gate_from_a_pty_site_fails_the_guard() {
+    let mut sources = load_sources();
+    let rows = load_rows();
+    let file = "agent_runtime.rs".to_string();
+    let src = sources.get(&file).expect("agent_runtime.rs").clone();
+    let fn_at = src
+        .find("async fn run_continuation_terminal(")
+        .expect("run_continuation_terminal");
+    // A top-level fn ends at the first `}` in column 0 after its declaration.
+    let end = fn_at + src[fn_at..].find("\n}\n").expect("the fn's closing brace");
+    let mutated = format!(
+        "{}{}{}",
+        &src[..fn_at],
+        src[fn_at..end].replace("unattended_spawn_gate::", "removed_gate::"),
+        &src[end..]
+    );
+    assert_ne!(mutated, src, "the mutation must change the source");
+    sources.insert(file, mutated);
+    assert_eq!(
+        pty_sites_bypassing_the_unattended_gate(&sources, &rows),
+        vec![
+            "agent_runtime.rs:run_continuation_terminal (no unattended_spawn_gate:: call)"
+                .to_string()
+        ],
+        "exactly the mutated site must be reported"
+    );
+}
+
+#[test]
+fn a_discarded_unattended_verdict_or_a_missing_spawn_column_fails() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "x.rs".to_string(),
+        "async fn discards() {\n    crate::unattended_spawn_gate::check_request(o, w, k);\n    tm.create(a);\n}\n\
+         async fn refuses() {\n    if let Err(r) = crate::unattended_spawn_gate::check_request(o, w, k) {\n        return;\n    }\n    tm.create(a);\n}\n\
+         async fn holds() {\n    crate::unattended_spawn_gate::admit(o, w, k).await;\n    tm.create(a);\n}\n\
+         async fn headless() {\n    spawn_claude_child(a);\n}\n"
+            .to_string(),
+    );
+    let mut rows = BTreeMap::new();
+    for (f, kind) in [
+        ("discards", "pty"),
+        ("refuses", "pty"),
+        ("holds", "pty"),
+        ("headless", "headless"),
+    ] {
+        rows.insert(
+            ("x.rs".to_string(), f.to_string()),
+            Row {
+                class: "autonomous".into(),
+                detail: f.into(),
+                spawn: Some(kind.into()),
+            },
+        );
+    }
+    assert_eq!(
+        pty_sites_bypassing_the_unattended_gate(&sources, &rows),
+        vec!["x.rs:discards (discards the result of check_request()".to_string()]
+    );
+
+    let parsed = parse_sites("a.rs | f | autonomous | f | pty\nb.rs | g | operator | -\n");
+    assert_eq!(parsed[&("a.rs".into(), "f".into())].spawn.as_deref(), Some("pty"));
+    assert_eq!(parsed[&("b.rs".into(), "g".into())].spawn, None);
+    for bad in [
+        "a.rs | f | autonomous | f\n",
+        "a.rs | f | autonomous | f | terminal\n",
+        "b.rs | g | operator | - | pty\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_sites(bad)).is_err(),
+            "must refuse {bad:?}"
+        );
+    }
 }

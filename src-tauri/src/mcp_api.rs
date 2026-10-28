@@ -2686,6 +2686,15 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // Spawn admission (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-
+        // beyond-the-continuation-cap, D1). `unattendedGate`: the pacer-and-hold
+        // every unattended PTY spawn passes immediately before the PTY opens —
+        // spacing, re-probe and deadline in force, how many spawns it holds right
+        // now, releases by `why`, and request-scoped refusals. Open PR #1981 adds
+        // its own sibling block under this same object.
+        "spawnAdmission": {
+            "unattendedGate": crate::unattended_spawn_gate::health_json(),
+        },
         // The six per-tenant egress switches (plan
         // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
         // each flow, whether it may send right now, which rung decided it

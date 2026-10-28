@@ -6820,6 +6820,23 @@ async fn run_continuation_terminal(
         // and leave an unattended, interactive `claude` facing the trust dialog).
         crate::claude_session::trust_gate::warm_dial().await;
 
+        // Pace and hold the PTY open (plan 2026-10-28-runner-spawn-bursts…, D1):
+        // after the claim, so a loaded box waits here instead of burning the
+        // claimed continuation; bounded, after which the seam's ladder decides.
+        crate::unattended_spawn_gate::admit(
+            if payload.dispatch_id.is_some() {
+                crate::coord_drain_state::SpawnOrigin::UnitContinuation
+            } else {
+                crate::coord_drain_state::SpawnOrigin::GateContinuation
+            },
+            "gate-continuation terminal",
+            payload
+                .anchor_key
+                .as_deref()
+                .unwrap_or(&format!("agent:{agent_id}")),
+        )
+        .await;
+
         let result = crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,
             &session_registry,
@@ -7849,6 +7866,14 @@ async fn run_condition_check_terminal(
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
+
+    // Pace and hold the PTY open (D1 of plan 2026-10-28-runner-spawn-bursts…).
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+        "condition-check terminal",
+        &format!("condition_run:{}", payload.run_id),
+    )
+    .await;
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,

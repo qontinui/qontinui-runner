@@ -288,6 +288,20 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             {
                 return TauriInvokeResponse::err(reason);
             }
+            // The unattended spawn gate (D1 of plan 2026-10-28-runner-spawn-bursts…):
+            // a request-scoped door, so a loaded machine or a taken pace slot is
+            // refused at once. The text starts with `machine_loaded:` and names
+            // the retry delay, since this envelope carries no code field.
+            if let Err(refusal) = crate::unattended_spawn_gate::check_request(
+                crate::coord_drain_state::SpawnOrigin::Unknown,
+                "terminal session",
+                &crate::coord_drain_state::bounded_work_key(
+                    "proxy_terminal",
+                    a.title.as_deref().unwrap_or("untitled"),
+                ),
+            ) {
+                return TauriInvokeResponse::err(refusal.message);
+            }
             let spawn_tenant = match spawn_tenant_or_invoke_error(a.tenant_id.as_deref()) {
                 Ok(tenant) => tenant,
                 Err(refusal) => return refusal,

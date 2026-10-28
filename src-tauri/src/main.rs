@@ -316,6 +316,9 @@ mod ui_bridge_plugin;
 mod ui_error;
 mod ui_ping;
 mod ui_thread_probe;
+/// Paces and holds every unattended PTY spawn immediately before the PTY opens
+/// (plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`, D1).
+mod unattended_spawn_gate;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;

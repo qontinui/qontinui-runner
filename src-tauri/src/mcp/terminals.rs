@@ -306,6 +306,21 @@ pub async fn create_terminal_handler(
         ));
     }
 
+    // The unattended spawn gate (D1 of plan 2026-10-28-runner-spawn-bursts…): a
+    // request-scoped door, so a loaded machine or a taken pace slot is a 409
+    // `machine_loaded` with `retry_after_ms`, answered at once like the drain
+    // arm above — never a held request.
+    if let Err(refusal) = crate::unattended_spawn_gate::check_request(
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+        "terminal session",
+        &crate::coord_drain_state::bounded_work_key(
+            "http_terminal",
+            request.title.as_deref().unwrap_or("untitled"),
+        ),
+    ) {
+        return Err((StatusCode::CONFLICT, Json(refusal.http_body())));
+    }
+
     // The other half of D6: a `workingDir` the runner cannot use must come
     // back as a refusal naming the path, not as a 200 whose `workingDir` is
     // somewhere the caller never named. Checked here, on the REQUEST value,

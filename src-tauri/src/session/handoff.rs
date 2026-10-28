@@ -1004,6 +1004,15 @@ async fn materialize(
     // and the claims re-acquired below belong to that same tenant.
     let tenant = TenantScope::for_session(intent.tenant_id);
 
+    // Pace and hold the child's start (D1 of plan 2026-10-28-runner-spawn-bursts…):
+    // a PTY-kind handoff opens a terminal here.
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+        "handed-off session",
+        &format!("handoff:{}", handoff.source_session_id),
+    )
+    .await;
+
     // Start the child session locally with lineage back to the source.
     let child = registry
         .start_with_parent(intent, handoff.source_session_id)

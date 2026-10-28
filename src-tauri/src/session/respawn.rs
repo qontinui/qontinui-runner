@@ -750,6 +750,16 @@ async fn materialize(
     //    attempt that refuses at step 1–4 would let three failed reconnects
     //    lock a legitimate respawn out for 24 hours. Only a respawn that
     //    actually launches spends the budget.
+    // Pace and hold the PTY open (D1 of plan 2026-10-28-runner-spawn-bursts…).
+    // Before the account-hop budget below, which consumes a slot, so the slot is
+    // spent adjacent to the launch it pays for.
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::Respawn,
+        "respawned session",
+        &format!("respawn:{claude_session_id}"),
+    )
+    .await;
+
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !crate::terminal::account_migration::migration_cap_permits(&claude_session_id, now_ms) {
         return Err(RespawnError::CapReached {

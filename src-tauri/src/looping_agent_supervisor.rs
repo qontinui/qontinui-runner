@@ -1188,6 +1188,14 @@ async fn spawn_looping_agent_terminal(
     // first spawn after a runner start is not decided by a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // Pace and hold the PTY open (D1 of plan 2026-10-28-runner-spawn-bursts…).
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+        "looping-agent session",
+        &looping_agent_work_key(&def.id),
+    )
+    .await;
+
     let (terminal_id, _coord_session) =
         crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,

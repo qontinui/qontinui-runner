@@ -5575,6 +5575,22 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             "request_id": data.get("request_id"),
         }));
     }
+    // The unattended spawn gate (D1 of plan 2026-10-28-runner-spawn-bursts…): the
+    // reply lane is bounded, so a loaded machine or a taken pace slot is refused
+    // at once with `machine_loaded` + `retry_after_ms`, like the drain arm above.
+    // Before the grant gate, so a refusal spends no create grant.
+    if let Err(refusal) = crate::unattended_spawn_gate::check_request(
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+        "terminal session",
+        &crate::coord_drain_state::bounded_work_key(
+            "relay_terminal",
+            data.get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+        ),
+    ) {
+        return Some(refusal.relay_frame(data.get("request_id")));
+    }
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
     // one carrying a block is a REMOTE create, and `admitted` holds the

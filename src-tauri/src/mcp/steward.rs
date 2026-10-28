@@ -1013,6 +1013,8 @@ pub async fn steward_start_handler(
         kind,
         request,
         crate::coord_drain_state::SpawnOrigin::Steward,
+        // A request is waiting: a loaded machine answers 409 `machine_loaded`.
+        crate::unattended_spawn_gate::SpawnWait::Refuse,
     )
     .await
 }
@@ -1034,6 +1036,8 @@ pub async fn steward_start(
         kind,
         StewardStartRequest { mode, interval },
         crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+        // An operator origin: the gate passes it at once either way.
+        crate::unattended_spawn_gate::SpawnWait::Refuse,
     )
     .await
     {
@@ -1083,6 +1087,9 @@ pub(crate) async fn restart_after_drain(
             interval: None,
         },
         crate::coord_drain_state::SpawnOrigin::Steward,
+        // The runner's own task owns this start: hold on a loaded machine
+        // rather than answer a 409 nothing would retry.
+        crate::unattended_spawn_gate::SpawnWait::Hold,
     )
     .await
     {
@@ -1149,6 +1156,9 @@ async fn start_steward(
     kind: String,
     request: StewardStartRequest,
     origin: crate::coord_drain_state::SpawnOrigin,
+    // How the unattended spawn gate waits: `Hold` when a task owns the start,
+    // `Refuse` when an HTTP request is waiting on the answer.
+    wait: crate::unattended_spawn_gate::SpawnWait,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let spec = steward_spec(&kind).ok_or_else(|| unknown_kind_error(&kind))?;
     let terminal_manager: Arc<TerminalManager> =
@@ -1248,6 +1258,20 @@ async fn start_steward(
         "HTTP: Starting {} (mode={}, interval={})",
         spec.skill, mode, interval
     );
+
+    // Pace and hold — or, for a request, refuse — the PTY open (D1 of plan
+    // 2026-10-28-runner-spawn-bursts…). Inside the start claim, so a second
+    // start of this kind still reads "already starting".
+    if let Err(refusal) = crate::unattended_spawn_gate::admit_or_refuse(
+        wait,
+        origin,
+        "steward session",
+        &format!("steward:{}", spec.kind),
+    )
+    .await
+    {
+        return Err((StatusCode::CONFLICT, Json(refusal.http_body())));
+    }
 
     match terminal_manager.create(
         Some(spec.skill.to_string()),
