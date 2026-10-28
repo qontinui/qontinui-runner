@@ -31,6 +31,20 @@
 //! window, so a persistently-painted error keeps the (probe-guarded) migration
 //! path armed without hammering it. This preserves the original hook's effective
 //! behavior (where TUI repaints re-fed the bytes under the same debounce).
+//!
+//! ## A migration-respawned pane replays its banner
+//!
+//! A pane the account migration respawned (`claude --resume`) re-renders the
+//! old transcript, limit banner included, so its first matches are the replay,
+//! not news. Until that pane has produced one new turn ([`screen_shows_turn`])
+//! or [`super::migration_handoff::REPLAY_SUPPRESSION_WINDOW`] has passed, a
+//! match on it fires no hint (plan
+//! `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+//! Phase 2b). The suppression lifts from the scan AFTER the one that first
+//! sees the turn, and from then on only a banner in the pane's bottom rows
+//! ([`bottom_rows_text`]) counts — the replayed one may still sit higher up.
+//! A window that runs out on a static screen is noticed even though the grid
+//! gate would skip it (2026-10-23 review fixes 3 and 4).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -91,6 +105,89 @@ pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
     normalized_indicates_usage_limit(&normalize(window))
 }
 
+/// Painted by the Claude CLI's spinner row while a turn is in progress.
+const TURN_MARKER: &str = "esc to interrupt";
+
+/// How many non-blank rows from the bottom of the screen count as "what the
+/// CLI is showing NOW": the spinner, the limit-wait banner and any dialog sit
+/// just above (or in) the input box, so conversation text higher up that
+/// merely QUOTES a marker or a banner is not read as live state.
+pub(crate) const BOTTOM_ROWS: usize = 8;
+
+/// The bottom [`BOTTOM_ROWS`] non-blank rows of a rendered screen, in screen
+/// order, joined with `\n` — the ONE "live state" window every screen rule in
+/// the account migration reads ([`screen_shows_turn`], the replay-suppressed
+/// pane's matches here, the follow-up's limit-wait gate, the idle watcher's
+/// busy rule), so they never disagree about what "on screen" means.
+pub(crate) fn bottom_rows_text(screen: &str) -> String {
+    let mut rows: Vec<&str> = screen
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(BOTTOM_ROWS)
+        .collect();
+    rows.reverse();
+    rows.join("\n")
+}
+
+/// Whether the rendered screen shows a turn in progress — the spinner's
+/// `esc to interrupt` within [`bottom_rows_text`].
+pub fn screen_shows_turn(screen: &str) -> bool {
+    normalize(&bottom_rows_text(screen)).contains(TURN_MARKER)
+}
+
+/// Pure: the usage-limit match one scan of a pane yields under its replay
+/// verdict. A pane the migration respawned never matches while suppressed,
+/// and afterwards matches only a banner in [`bottom_rows_text`] — the replayed
+/// one can still sit higher up the screen (2026-10-23 review fix 3).
+fn match_for_verdict(
+    screen: &str,
+    verdict: super::migration_handoff::ReplayVerdict,
+) -> Option<&'static str> {
+    use super::migration_handoff::ReplayVerdict;
+    match verdict {
+        ReplayVerdict::NotRespawned => normalized_indicates_usage_limit(&normalize(screen)),
+        ReplayVerdict::Suppressed => None,
+        ReplayVerdict::BottomRowsOnly => {
+            normalized_indicates_usage_limit(&normalize(&bottom_rows_text(screen)))
+        }
+    }
+}
+
+/// One pane's scan: `None` when it is skipped (its grid has not changed and it
+/// has no replay suppression to release), else the match. A pane whose
+/// suppression is due to end is scanned even on an unchanged grid, so a
+/// banner frozen on a static screen fires once the window has passed
+/// (2026-10-23 review fix 4).
+fn scan_pane(
+    terminal_id: &str,
+    grid_changed: bool,
+    read_screen: impl FnOnce() -> String,
+    now: Instant,
+) -> Option<Option<&'static str>> {
+    let releasing = super::migration_handoff::replay_release_due(terminal_id, now);
+    if !grid_changed && !releasing {
+        return None;
+    }
+    let text = read_screen();
+    let verdict = super::migration_handoff::usage_limit_replay_verdict(
+        terminal_id,
+        screen_shows_turn(&text),
+        now,
+    );
+    let matched = match_for_verdict(&text, verdict);
+    if verdict == super::migration_handoff::ReplayVerdict::Suppressed {
+        if let Some(pattern) = normalized_indicates_usage_limit(&normalize(&text)) {
+            debug!(
+                terminal_id = %terminal_id,
+                pattern,
+                "usage-limit match on a migration-respawned pane before its first new turn — treated as the replayed banner, no hint"
+            );
+        }
+    }
+    Some(matched)
+}
+
 // ── Firing policy (per-terminal debounce) ─────────────────────────────────────
 
 /// Per-terminal last-hint-fired instant (`None` = never fired). The outer
@@ -139,6 +236,9 @@ pub fn scan_grids_once() {
     let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
         return;
     };
+    // Taken BEFORE the terminal list: a pane respawned after this instant may
+    // be missing from `sessions`, and the replay guard's retain keeps it.
+    let scan_started = Instant::now();
     let sessions = tm.sessions_snapshot();
 
     // Decide under the fire-state lock, then dispatch with NO lock held (the
@@ -154,19 +254,29 @@ pub fn scan_grids_once() {
             // Skip sessions whose grid has not been mutated since the last
             // pass — the rendered screen is byte-identical, so a limit message
             // frozen on an idle terminal is not re-detected. One atomic load
-            // instead of a grid lock + full screen render.
-            if !gate.should_scan(tid, session.grid_generation()) {
-                continue;
-            }
+            // instead of a grid lock + full screen render. The exception is a
+            // migration-respawned pane whose replay suppression is due to end
+            // (`scan_pane`). The gate is always consulted, so its watermark
+            // stays current.
+            let grid_changed = gate.should_scan(tid, session.grid_generation());
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
             // the VT-parsed cell buffer, so this sees text inside a full-screen
-            // TUI that synchronized-output batching hides from a byte scan.
-            let text = {
-                let grid = session.grid();
-                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-                guard.text_snapshot().text
+            // TUI that synchronized-output batching hides from a byte scan. A
+            // migration-respawned pane replays the old banner: its matches are
+            // ignored until it has produced a turn (or the window passed), and
+            // count only in the bottom rows afterwards.
+            let Some(matched) = scan_pane(
+                tid,
+                grid_changed,
+                || {
+                    let grid = session.grid();
+                    let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.text_snapshot().text
+                },
+                now,
+            ) else {
+                continue;
             };
-            let matched = normalized_indicates_usage_limit(&normalize(&text));
             // `entry` defaults to "never fired" → the first appearance fires
             // immediately; thereafter the debounce gates re-fires.
             let last_fired = map.entry(tid.clone()).or_insert(None);
@@ -178,6 +288,7 @@ pub fn scan_grids_once() {
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
         gate.retain_live(&live);
+        super::migration_handoff::retain_live_panes(&live, scan_started);
     } // fire-state + scan-gate locks released
 
     for (tid, pattern) in to_fire {
@@ -367,5 +478,163 @@ mod tests {
             Some("usage limit reached")
         );
         assert_eq!(last, Some(t1));
+    }
+
+    // ---- Phase 2b: what counts as a new turn --------------------------------
+
+    /// Mutation check: reading the whole screen instead of the bottom rows
+    /// fails the quoted-marker arm; dropping the marker check fails the
+    /// spinner arm.
+    #[test]
+    fn a_turn_is_the_spinner_near_the_bottom_not_a_quote_above_it() {
+        let rule = "─".repeat(40);
+        let working = format!(
+            "● earlier answer
+
+✻ Compiling… (esc to interrupt)
+{rule}
+❯ 
+{rule}
+  ⏵⏵ bypass permissions on
+"
+        );
+        assert!(screen_shows_turn(&working));
+
+        let idle = format!(
+            "● done
+{rule}
+❯ 
+{rule}
+  ⏵⏵ bypass permissions on
+"
+        );
+        assert!(!screen_shows_turn(&idle));
+
+        // The replayed limit-wait banner is not a turn.
+        let banner = format!(
+            "Usage limit reached · continuing automatically at 6pm · esc to cancel
+{rule}
+❯ 
+{rule}
+"
+        );
+        assert!(!screen_shows_turn(&banner));
+
+        // The marker quoted high up in the conversation is not a turn either.
+        let mut quoted = String::from(
+            "● the spinner reads `esc to interrupt` while busy
+",
+        );
+        for i in 0..12 {
+            quoted.push_str(&format!(
+                "line {i}
+"
+            ));
+        }
+        quoted.push_str(&idle);
+        assert!(!screen_shows_turn(&quoted));
+    }
+
+    // ---- 2026-10-23 review fixes: replay scans ------------------------------
+
+    fn idle_prompt_rows() -> String {
+        let rule = "─".repeat(40);
+        format!("{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on\n")
+    }
+
+    /// A screen whose limit banner is HIGH up: the replay, with more than
+    /// `BOTTOM_ROWS` rows of new output below it.
+    fn banner_high() -> String {
+        let mut s = String::from("Usage limit reached · resets 6pm\n");
+        for i in 0..BOTTOM_ROWS {
+            s.push_str(&format!("● new output line {i}\n"));
+        }
+        s.push_str(&idle_prompt_rows());
+        s
+    }
+
+    fn banner_low() -> String {
+        format!(
+            "● earlier\nUsage limit reached · resets 6pm\n{}",
+            idle_prompt_rows()
+        )
+    }
+
+    /// Fix 3: once lifted, a respawned pane matches only a banner in its
+    /// bottom rows; an ordinary pane matches anywhere; a suppressed one never.
+    ///
+    /// Mutation check: matching the whole screen for `BottomRowsOnly` fails
+    /// the high-banner assertion.
+    #[test]
+    fn a_lifted_respawned_pane_matches_only_a_bottom_row_banner() {
+        use super::super::migration_handoff::ReplayVerdict;
+        assert_eq!(
+            match_for_verdict(&banner_high(), ReplayVerdict::BottomRowsOnly),
+            None
+        );
+        assert!(match_for_verdict(&banner_low(), ReplayVerdict::BottomRowsOnly).is_some());
+        assert!(match_for_verdict(&banner_high(), ReplayVerdict::NotRespawned).is_some());
+        assert_eq!(
+            match_for_verdict(&banner_low(), ReplayVerdict::Suppressed),
+            None
+        );
+        assert_eq!(
+            bottom_rows_text("a\n\nb\n  \nc\n"),
+            "a\nb\nc",
+            "blank rows are skipped, order kept"
+        );
+    }
+
+    /// Fix 3 end to end through `scan_pane`: the scan that first sees the
+    /// turn fires nothing; the next scan of a bottom-row banner does.
+    #[test]
+    fn the_turns_own_scan_does_not_fire_but_the_next_does() {
+        let t0 = Instant::now();
+        let tid = "usage-limit-scan-turn";
+        super::super::migration_handoff::note_respawned_pane(tid, t0);
+        let turning = format!(
+            "Usage limit reached · resets 6pm\n✻ Working… (esc to interrupt)\n{}",
+            idle_prompt_rows()
+        );
+        assert_eq!(
+            scan_pane(tid, true, || turning.clone(), t0 + Duration::from_secs(3)),
+            Some(None)
+        );
+        assert!(
+            scan_pane(tid, true, banner_low, t0 + Duration::from_secs(6))
+                .is_some_and(|m| m.is_some())
+        );
+    }
+
+    /// Fix 4: a static (unchanged-grid) screen still showing the replayed
+    /// banner is skipped while suppressed, and scanned — and fires — once the
+    /// window has run out, though the grid never changed.
+    ///
+    /// Mutation check: dropping `releasing` from the skip test in `scan_pane`
+    /// makes the past-window scan `None`.
+    #[test]
+    fn a_static_screen_past_the_window_fires() {
+        let t0 = Instant::now();
+        let tid = "usage-limit-scan-static";
+        super::super::migration_handoff::note_respawned_pane(tid, t0);
+        assert_eq!(
+            scan_pane(tid, true, banner_low, t0 + Duration::from_secs(2)),
+            Some(None),
+            "suppressed"
+        );
+        assert_eq!(
+            scan_pane(tid, false, banner_low, t0 + Duration::from_secs(300)),
+            None,
+            "unchanged and nothing to release: skipped"
+        );
+        let past = t0
+            + super::super::migration_handoff::REPLAY_SUPPRESSION_WINDOW
+            + Duration::from_secs(1);
+        assert!(scan_pane(tid, false, banner_low, past).is_some_and(|m| m.is_some()));
+        assert_eq!(
+            scan_pane(tid, false, banner_low, past + Duration::from_secs(2)),
+            None,
+            "released once; back behind the grid gate"
+        );
     }
 }

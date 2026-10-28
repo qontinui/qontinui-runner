@@ -86,9 +86,15 @@ use tracing::{info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::graceful_exit::ProcIdentity;
+use crate::terminal::migration_identity::{
+    migration_verdict, resolve_migration_identity, roster_spelling, same_config_dir,
+    MigrationTrigger, MigrationVerdict,
+};
 use crate::terminal::session_carry::{
     copy_transcript, CarriedSubagent, DeltaSyncOutcome, TranscriptCopy,
 };
+
+mod followup;
 
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
@@ -259,13 +265,19 @@ fn claim_migration_slot(claude_session_id: &str) -> Result<MigrationInFlight, Mi
 /// [`MigrationRefusal::InFlight`]), and, under it, re-read the session's
 /// record (`current_record`) and refuse unless it is still open
 /// ([`MigrationRefusal::Closed`] — `current_record` answers closed rows too,
-/// and a closed session has no pane to migrate) and still runs under `src` in
-/// the caller's terminal ([`MigrationRefusal::AlreadyMoved`]) — a migration
-/// that finished while this one waited to be scheduled has already moved it.
+/// and a closed session has no pane to migrate) and still runs under the
+/// account the caller started from, in the caller's terminal
+/// ([`MigrationRefusal::AlreadyMoved`]) — a migration that finished while this
+/// one waited to be scheduled has already moved it.
 ///
-/// An unpinned record (no `config_dir`) has never been migrated — a
-/// migration always pins its destination — so the caller's fallback
-/// resolution of `src` stands for it.
+/// "The account the caller started from" is the caller's own snapshot of the
+/// record (`caller_record.config_dir`), NOT `src`: `src` is resolved from the
+/// provider's live registry ([`resolve_migration_subject`]), and may spell the
+/// same account differently from the record or name the account the process
+/// really runs under while the record is stale — neither is a move. Both sides
+/// are compared as paths ([`same_config_dir`]). An unpinned snapshot (no
+/// `config_dir`) has never been migrated — a migration always pins its
+/// destination — so for it the caller's resolution of `src` stands.
 ///
 /// The returned guard must be held until the migration has finished.
 pub(crate) fn begin_migration(
@@ -280,9 +292,11 @@ pub(crate) fn begin_migration(
 
 /// The caller's view of the session against `current` (the session's record
 /// as read NOW): it must still exist ([`MigrationRefusal::Unknown`]), be open
-/// ([`MigrationRefusal::Closed`]), and run under `src_config_dir` in the
-/// caller's terminal ([`MigrationRefusal::AlreadyMoved`]); an unpinned record
-/// (no `config_dir`) stands for `src_config_dir`.
+/// ([`MigrationRefusal::Closed`]), and run under the account the caller
+/// started from in the caller's terminal ([`MigrationRefusal::AlreadyMoved`]).
+/// "Started from" is the caller's snapshot (`caller_record.config_dir`),
+/// compared as a path ([`same_config_dir`]); an unpinned snapshot (no
+/// `config_dir`) stands for `src_config_dir`. See [`begin_migration`].
 ///
 /// Run twice per migration, both times under the session's in-flight guard:
 /// by [`begin_migration`] as it takes the guard, and by [`migrate_session`]
@@ -307,8 +321,12 @@ fn still_migratable(
             session: sid.clone(),
         });
     }
+    let started_from = caller_record
+        .config_dir
+        .as_deref()
+        .unwrap_or(src_config_dir);
     match current.config_dir.as_deref() {
-        Some(dir) if dir != src_config_dir => {
+        Some(dir) if !same_config_dir(dir, started_from) => {
             return Err(MigrationRefusal::AlreadyMoved {
                 to: dir.to_string(),
             })
@@ -362,22 +380,6 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    // Source account: the dir the session launched under, else the runner's
-    // currently-resolved global dir (pre-existing sessions registered before
-    // config_dir capture).
-    let Some(src) = record
-        .config_dir
-        .clone()
-        .or_else(crate::ai_provider::get_resolved_config_dir)
-    else {
-        warn!(
-            terminal_id,
-            session = %record.claude_session_id,
-            "usage-limit hint but the session's account is unknown — cannot migrate"
-        );
-        return;
-    };
-
     let ai_settings = crate::settings::get_ai_settings();
     if !ai_settings.claude_cli.auto_migrate_on_token_exhaustion {
         info!(
@@ -390,20 +392,62 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return; // nothing to migrate to
     }
 
+    // IDENTITY, before the exhaustion probe: which session does this pane
+    // PROVABLY run, and under which account? The lifecycle record is the
+    // binder's guess; on 2026-10-21 a mis-bound one made this path close a
+    // pane running something else and resume a session still live in another
+    // pane — a fork. The provider's own `sessions/<pid>.json` decides, and an
+    // unresolved or elsewhere-held identity does not migrate. The source
+    // account is the registry row's, not the record's.
+    let subject =
+        resolve_migration_subject(&app, &store, &record, MigrationTrigger::UsageLimitHint).await;
+    // The account the probe below checks: the registry row's on success; on a
+    // refusal the record's, else the runner's resolved one, in the roster's
+    // spelling ([`record_source_account`], as the `ProceedOnRecord` path
+    // resolves it) — the usage snapshot is keyed on that spelling — never ""
+    // while one is known.
+    let probe_src = match &subject {
+        Ok(subject) => subject.src_config_dir.clone(),
+        Err(_) => record_source_account(&record).unwrap_or_default(),
+    };
+
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
-    // quote one; a resume repaint can re-render a historical one). Re-probe
-    // and require the account to actually be exhausted before acting.
+    // quote one; a resume repaint can re-render a historical one, including a
+    // migration-respawned pane's replayed banner once its suppression lifts).
+    // Re-probe and require the account to actually be exhausted before acting,
+    // and before REPORTING anything, an identity refusal included.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if !crate::ai_provider::account_known_exhausted(&src) {
+    let exhausted = crate::ai_provider::account_known_exhausted(&probe_src);
+    let subject = match subject {
+        Ok(subject) => subject,
+        Err(reason) => {
+            match identity_refusal_report(&reason, exhausted) {
+                Some(reason) => emit_skipped(&app, &record, &probe_src, reason),
+                None => info!(
+                    terminal_id,
+                    session = %record.claude_session_id,
+                    account = %probe_src,
+                    matched_pattern,
+                    reason = %reason,
+                    "usage-limit message NOT confirmed by probe, and the identity was refused — nothing to report (likely echoed text)"
+                ),
+            }
+            return;
+        }
+    };
+    if !exhausted {
         info!(
             terminal_id,
-            session = %record.claude_session_id,
-            account = %src,
+            session = %subject.record.claude_session_id,
+            account = %probe_src,
             matched_pattern,
             "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
         );
         return;
     }
+    // Confirmed: only now does a `Rebound` correction reach the store.
+    subject.commit_correction(&store);
+    let (record, src, old_writer) = (subject.record, subject.src_config_dir, subject.old_writer);
 
     // Keep spawn-time selection off the dead account, and repoint the global
     // resolved dir so unrelated new sessions stop landing on it. When the
@@ -458,7 +502,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    let result = migrate_session_off_runtime(&app, &record, &src, &dst).await;
+    let result = migrate_session_off_runtime(&app, &record, &src, &dst, old_writer).await;
     settle_hint_migration(
         &record.claude_session_id,
         cap_stamp,
@@ -559,6 +603,8 @@ to its agent id instead of spawning a replacement (cancel any resume gate you bo
 first), and only if SendMessage reports \"No transcript found\" fall back to its checkpoint or \
 worktree.";
 
+/// What one grid read tells the idle watcher.
+///
 /// How the watcher decides the resumed CLI is ready for input:
 /// [`crate::terminal::graceful_exit::input_prompt_ready`], the predicate the
 /// session message poller already pastes through (`❯` on the cursor row, an
@@ -577,11 +623,9 @@ worktree.";
 /// it would have overridden every refusal (a draft, a dialog) the shared
 /// predicate makes, and a default-mode v2 pane draws `❯` as well.
 ///
-/// Painted while Claude is mid-turn — if visible, the session already picked
-/// itself up (or the operator beat us to it) and no nudge is needed.
-const BUSY_MARKER: &str = "esc to interrupt";
-
-/// What one grid read tells the idle watcher.
+/// A pane mid-turn (the spinner's `esc to interrupt` in its bottom rows,
+/// [`super::usage_limit::screen_shows_turn`]) already picked itself up (or the
+/// operator beat us to it), so no nudge is needed.
 #[derive(Debug, PartialEq, Eq)]
 enum IdlePromptProbe {
     /// Claude is mid-turn: the session picked itself up, no prompt is needed.
@@ -594,10 +638,12 @@ enum IdlePromptProbe {
 }
 
 /// Classify one rendered screen. Busy wins over ready, as before: a pane
-/// showing `esc to interrupt` never receives the prompt.
+/// showing `esc to interrupt` IN ITS BOTTOM ROWS never receives the prompt.
+/// The marker merely quoted higher up the conversation is not a turn
+/// (2026-10-23 review fix 6) — the same rule the usage-limit watcher's
+/// [`super::usage_limit::screen_shows_turn`] applies.
 fn probe_idle_prompt(screen: &crate::terminal::graceful_exit::ScreenText) -> IdlePromptProbe {
-    let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
-    if normalized.contains(BUSY_MARKER) {
+    if super::usage_limit::screen_shows_turn(&screen.lines.join("\n")) {
         return IdlePromptProbe::Busy;
     }
     match crate::terminal::graceful_exit::input_prompt_ready(screen) {
@@ -631,66 +677,45 @@ impl ReadyDebounce {
     }
 }
 
-/// Watch the freshly-respawned terminal until the resumed CLI paints its idle
-/// prompt, then submit [`CONTINUE_NUDGE`]. Detached and strictly best-effort:
-/// bounded (~3 min), one submission max, and it stands down when the session
-/// is already busy or the terminal goes away. Deliberately does NOT stand
-/// down on a visible usage-limit message: a `--resume` repaint can re-render
-/// the OLD account's historical banner (see the `usage_limit` module doc),
-/// and a genuinely-dry target is caught by the grid scanner firing a fresh
-/// migration hint on this terminal anyway.
-///
-/// It first waits for the step-4b delta sync (`sync_done`) to report, bounded
-/// by [`NUDGE_SYNC_WAIT`], so the resumed session is not told to `SendMessage`
-/// a subagent whose last lines are still being topped up. The sync starts no
-/// later than [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`] after
-/// it was spawned (its writer-exit wait counts no look that completes after
-/// that) and this wait starts after the sync was spawned, so the nudge
-/// normally goes after the sync. The bounded exception: a sync whose copy
-/// itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
-/// blocking pool) — the nudge then goes first, and the log says the sync had
-/// not reported. See [`run_continue_nudge`].
-///
-/// The subagents the nudge names are recomputed once that wait is over
-/// ([`crate::terminal::session_carry::resumable_subagents_now`]), so one the
-/// sync first copied is named and one still missing is not; the carry-time
-/// list is the fallback when that recompute fails.
-fn spawn_continue_nudge(
-    terminal_id: String,
-    carried: TranscriptCopy,
-    sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
-) {
-    let fallback = carried.subagents.clone();
-    tauri::async_runtime::spawn(run_continue_nudge(
-        terminal_id.clone(),
-        sync_done,
-        NUDGE_SYNC_WAIT,
-        fallback,
-        move || async move {
-            // A directory listing plus a few stats: still disk I/O, so off
-            // the async workers.
-            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                crate::terminal::session_carry::resumable_subagents_now(&carried)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| format!("subagent recompute task did not complete: {e}"))?
-        },
-        move |prompt| prompt_when_idle(terminal_id, prompt, "continue-nudge"),
-    ));
-}
+// The continue nudge ([`continue_nudge`]) is delivered by the migration's
+// detached follow-up ([`followup`]) through [`prompt_when_idle`]: bounded
+// (~3 min), one submission max, standing down when the session is already
+// busy or the terminal goes away. Deliberately NOT standing down on a visible
+// usage-limit message: a `--resume` repaint can re-render the OLD account's
+// historical banner (see the `usage_limit` module doc). When it gives up, the
+// follow-up decides between one `Esc` + retry and a reported stall (Phase 2b).
+//
+// The follow-up starts only once the step-4b delta sync has reported, bounded
+// by [`NUDGE_SYNC_WAIT`] — see [`run_after_delta_sync`] — so the resumed
+// session is not told to `SendMessage` a subagent whose last lines are still
+// being topped up, and the tail is read only after the old writer is proven
+// gone. One ordering: delta sync, tail rescue, nudge, catch-up. The sync
+// starts no later than [`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`]
+// after it was spawned (its writer-exit wait counts no look that completes
+// after that) and this wait starts after the sync was spawned, so the
+// follow-up normally goes after the sync. The bounded exception: a sync whose
+// copy itself outlasts [`DELTA_SYNC_REPORT_MARGIN`] (a slow disk, a saturated
+// blocking pool) — the follow-up then goes without it (the tail is not read;
+// the nudge still goes), and the log says the sync had not reported.
+//
+// The subagents the nudge names are recomputed once that gate is over
+// ([`nudge_text_after_sync`] over
+// [`crate::terminal::session_carry::resumable_subagents_now`]), so one the
+// sync first copied is named and one still missing is not; the carry-time list
+// is the fallback when that recompute fails.
 
 /// Time the delta sync gets to finish its copy and report after its
 /// writer-exit wait ([`crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT`])
-/// has ended, before the continue nudge stops waiting for it.
+/// has ended, before the migration's follow-up stops waiting for it.
 const DELTA_SYNC_REPORT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long the continue nudge waits for the delta sync to report: the sync's
-/// writer-exit wait plus [`DELTA_SYNC_REPORT_MARGIN`].
+/// How long the migration's follow-up (tail rescue, continue nudge, catch-up)
+/// waits for the delta sync to report: the sync's writer-exit wait plus
+/// [`DELTA_SYNC_REPORT_MARGIN`].
 const NUDGE_SYNC_WAIT: std::time::Duration =
     crate::terminal::session_carry::DELTA_SYNC_EXIT_WAIT.saturating_add(DELTA_SYNC_REPORT_MARGIN);
 
-/// What the continue nudge heard from the delta sync before it started.
+/// What the migration's follow-up heard from the delta sync before it started.
 #[derive(Debug, PartialEq, Eq)]
 enum SyncGate {
     /// No sync was started (no writer identity to wait on).
@@ -701,6 +726,20 @@ enum SyncGate {
     Dropped,
     /// Nothing within the deadline.
     TimedOut,
+}
+
+impl SyncGate {
+    /// Whether the old pane's `claude` is PROVEN gone. The sync runs — and so
+    /// can report `Synced` or `Failed` — only after its writer-exit wait
+    /// succeeded. Every other gate leaves the writer possibly live (no
+    /// identity to watch, still alive at the deadline, a task that died, no
+    /// report in time), so nothing may read the source transcript's tail.
+    fn writer_proven_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::Reported(DeltaSyncOutcome::Synced(_) | DeltaSyncOutcome::Failed(_))
+        )
+    }
 }
 
 /// Wait up to `deadline` for the delta sync's outcome.
@@ -718,42 +757,54 @@ async fn await_delta_sync(
     }
 }
 
-/// The continue nudge's body: wait for the delta sync (bounded by
-/// `deadline`), log what it heard, then `recompute` the resumable subagents
-/// and `deliver` the [`continue_nudge`] naming them. A sync that times out,
-/// fails or never reports holds the nudge no longer than `deadline`; the
-/// nudge still goes, and the log says why. A failed recompute falls back to
-/// `carry_time_subagents`, the list the carry produced.
-async fn run_continue_nudge<R, RF, D, DF>(
+/// The follow-up's gate: wait for the delta sync (bounded by `deadline`), log
+/// what it heard, then run `then` with it. A sync that times out, fails or
+/// never reports holds the follow-up no longer than `deadline`; the nudge
+/// still goes, and the log says why.
+async fn run_after_delta_sync<D, DF>(
     terminal_id: String,
     sync_done: Option<tokio::sync::oneshot::Receiver<DeltaSyncOutcome>>,
     deadline: std::time::Duration,
-    carry_time_subagents: Vec<CarriedSubagent>,
-    recompute: R,
-    deliver: D,
+    then: D,
 ) where
-    R: FnOnce() -> RF,
-    RF: std::future::Future<Output = Result<Vec<CarriedSubagent>, String>>,
-    D: FnOnce(String) -> DF,
+    D: FnOnce(SyncGate) -> DF,
     DF: std::future::Future<Output = ()>,
 {
-    match await_delta_sync(sync_done, deadline).await {
+    let gate = await_delta_sync(sync_done, deadline).await;
+    match &gate {
         SyncGate::NoSync | SyncGate::Reported(DeltaSyncOutcome::Synced(_)) => {}
         SyncGate::Reported(other) => info!(
             terminal_id,
             outcome = ?other,
-            "continue-nudge: the delta sync did not complete — nudging anyway"
+            "migration follow-up: the delta sync did not complete — nudging anyway"
         ),
         SyncGate::Dropped => warn!(
             terminal_id,
-            "continue-nudge: the delta sync ended without reporting — nudging anyway"
+            "migration follow-up: the delta sync ended without reporting — nudging anyway"
         ),
         SyncGate::TimedOut => warn!(
             terminal_id,
             wait_s = deadline.as_secs(),
-            "continue-nudge: the delta sync did not report within its deadline — nudging anyway"
+            "migration follow-up: the delta sync did not report within its deadline — nudging anyway"
         ),
     }
+    then(gate).await;
+}
+
+/// The continue nudge's text once the follow-up's gate is over:
+/// [`continue_nudge`] naming the subagents `recompute` finds resumable at the
+/// destination NOW — after the delta sync — rather than the carry's list. A
+/// failed recompute falls back to `carry_time_subagents`, the list the carry
+/// produced.
+async fn nudge_text_after_sync<R, RF>(
+    terminal_id: &str,
+    carry_time_subagents: Vec<CarriedSubagent>,
+    recompute: R,
+) -> String
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<Vec<CarriedSubagent>, String>>,
+{
     let subagents = match recompute().await {
         Ok(now) => now,
         Err(e) => {
@@ -765,7 +816,21 @@ async fn run_continue_nudge<R, RF, D, DF>(
             carry_time_subagents
         }
     };
-    deliver(continue_nudge(&subagents)).await;
+    continue_nudge(&subagents)
+}
+
+/// The production `recompute` for [`nudge_text_after_sync`]: the subagents
+/// resumable at the destination now
+/// ([`crate::terminal::session_carry::resumable_subagents_now`]). A directory
+/// listing plus a few stats: still disk I/O, so off the async workers.
+async fn resumable_subagents_after_sync(
+    carried: TranscriptCopy,
+) -> Result<Vec<CarriedSubagent>, String> {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        crate::terminal::session_carry::resumable_subagents_now(&carried).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("subagent recompute task did not complete: {e}"))?
 }
 
 /// How many carried subagents [`continue_nudge`] names before summarising the
@@ -819,82 +884,160 @@ fn continue_nudge(subagents: &[CarriedSubagent]) -> String {
     )
 }
 
-/// The generalized idle-watcher behind [`spawn_continue_nudge`]: wait for the
-/// resumed CLI to paint its idle prompt, then submit `prompt` once.
-///
-/// Extracted so the respawn receiver
-/// ([`crate::session::respawn`]) can deliver coord's optional
-/// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
-/// instead of growing a second one that would drift from it. `label` only
-/// names the caller in the log lines.
-pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
-    tauri::async_runtime::spawn(prompt_when_idle(terminal_id, prompt, label));
+/// How one [`prompt_when_idle`] run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdlePromptOutcome {
+    /// The prompt was typed and submitted.
+    Submitted,
+    /// The session was already mid-turn ([`IdleWait::stand_down_on_busy`]):
+    /// it picked itself up, nothing was typed.
+    AlreadyBusy,
+    /// The terminal (or the app) went away.
+    TerminalGone,
+    /// The PTY write failed.
+    SubmitFailed(String),
+    /// The deadline passed with no submission; `last_refusal` is why the last
+    /// read was not ready.
+    GaveUp { last_refusal: String },
 }
 
-/// The body of [`spawn_prompt_when_idle`]; its ~3 min bound starts when this
-/// future is first polled.
-async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+/// How long, and how patiently, [`prompt_when_idle`] waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleWait {
+    pub deadline: std::time::Duration,
+    /// `true`: a mid-turn read ends the wait (the session picked itself up,
+    /// so a nudge is moot). `false`: wait THROUGH the turn for the next idle
+    /// prompt — for a message that must arrive regardless (the Phase 2b
+    /// transcript-tail catch-up).
+    pub stand_down_on_busy: bool,
+}
+
+impl IdleWait {
+    /// The continue nudge and coord's respawn `initial_prompt`: ~3 min,
+    /// standing down on a busy session.
+    pub(crate) const NUDGE: Self = Self {
+        deadline: std::time::Duration::from_secs(180),
+        stand_down_on_busy: true,
+    };
+}
+
+/// What one grid read tells the watcher loop to do.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleStep {
+    Submit,
+    StandDown,
+    /// Read again; carries why this read was not ready.
+    Wait(String),
+}
+
+/// Pure: one rendered screen through [`probe_idle_prompt`] and the
+/// [`ReadyDebounce`], under `wait`'s busy policy.
+fn idle_step(
+    screen: crate::terminal::graceful_exit::ScreenText,
+    debounce: &mut ReadyDebounce,
+    wait: IdleWait,
+) -> IdleStep {
+    match probe_idle_prompt(&screen) {
+        IdlePromptProbe::Busy if wait.stand_down_on_busy => IdleStep::StandDown,
+        IdlePromptProbe::Busy => {
+            debounce.reset();
+            IdleStep::Wait("the session is mid-turn".to_string())
+        }
+        IdlePromptProbe::NotYet(why) => {
+            debounce.reset();
+            IdleStep::Wait(why)
+        }
+        IdlePromptProbe::Ready if !debounce.settled(screen) => IdleStep::Wait(
+            "idle prompt seen once; waiting for an identical second read".to_string(),
+        ),
+        IdlePromptProbe::Ready => IdleStep::Submit,
+    }
+}
+
+/// The generalized idle-watcher: wait for the resumed CLI to paint its idle
+/// prompt, then submit `prompt` once, and say how it ended.
+///
+/// One watcher for every caller — the migration's continue nudge and
+/// transcript-tail catch-up ([`followup`]) and the respawn receiver's coord
+/// `initial_prompt` ([`spawn_prompt_when_idle`]) — so they never drift.
+/// `label` only names the caller in the log lines.
+pub(crate) async fn prompt_when_idle(
+    terminal_id: &str,
+    prompt: &str,
+    label: &'static str,
+    wait: IdleWait,
+) -> IdlePromptOutcome {
     use tauri::Manager;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + wait.deadline;
     let mut debounce = ReadyDebounce::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let Some(app) = crate::tauri_app_handle::current() else {
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
         let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>() else {
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
-        let Some(session) = tm.get(&terminal_id) else {
+        let Some(session) = tm.get(terminal_id) else {
             info!(
                 terminal_id,
                 label, "prompt-when-idle: terminal gone — standing down"
             );
-            return;
+            return IdlePromptOutcome::TerminalGone;
         };
-        let screen = session.grid_screen();
-        let refusal = match probe_idle_prompt(&screen) {
-            IdlePromptProbe::Busy => {
+        let refusal = match idle_step(session.grid_screen(), &mut debounce, wait) {
+            IdleStep::StandDown => {
                 info!(
                     terminal_id,
                     label, "prompt-when-idle: session already working — no prompt needed"
                 );
-                return;
+                return IdlePromptOutcome::AlreadyBusy;
             }
-            IdlePromptProbe::NotYet(why) => {
-                debounce.reset();
-                why
-            }
-            IdlePromptProbe::Ready if !debounce.settled(screen) => {
-                "idle prompt seen once; waiting for an identical second read".to_string()
-            }
-            IdlePromptProbe::Ready => {
-                // Composes both sides of the 2026-08-29 rebase: OUR generalized
-                // `prompt`/`label` seam (one impl for the migration nudge and the
-                // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-                // returning `()` in fee48d4c, which now reports the neutralized body.
-                match session.submit_prompt(
-                    &prompt,
+            IdleStep::Wait(why) => why,
+            IdleStep::Submit => {
+                // `submit_prompt` reports the neutralized body (fee48d4c).
+                return match session.submit_prompt(
+                    prompt,
                     crate::terminal::session::PtyWriteCaller::AccountMigration,
                 ) {
-                    Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                    Err(e) => {
-                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                    Ok(_) => {
+                        info!(terminal_id, label, "prompt-when-idle submitted");
+                        // Anything the pane renders after a RUNNER submission
+                        // is the session working, not the transcript
+                        // replaying: lift a migration's replay guard from the
+                        // next scan on (no-op for a pane without one).
+                        crate::terminal::migration_handoff::note_runner_submission(terminal_id);
+                        IdlePromptOutcome::Submitted
                     }
-                }
-                return;
+                    Err(e) => {
+                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed");
+                        IdlePromptOutcome::SubmitFailed(e)
+                    }
+                };
             }
         };
         if std::time::Instant::now() >= deadline {
             warn!(
                 terminal_id,
                 label,
+                wait_s = wait.deadline.as_secs(),
                 last_refusal = %refusal,
-                "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
+                "prompt-when-idle: resumed CLI never painted its idle prompt within the wait — giving up"
             );
-            return;
+            return IdlePromptOutcome::GaveUp {
+                last_refusal: refusal,
+            };
         }
     }
+}
+
+/// [`prompt_when_idle`] detached, with the [`IdleWait::NUDGE`] policy — the
+/// respawn receiver ([`crate::session::respawn`]) delivers coord's optional
+/// `initial_prompt` through it.
+pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        prompt_when_idle(&terminal_id, &prompt, label, IdleWait::NUDGE).await;
+    });
 }
 
 /// One resumed-Claude PTY spawn, described.
@@ -1151,6 +1294,12 @@ pub(crate) async fn migrate_session_off_runtime(
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
+    // The old pane's `claude`, identified BEFORE anything is closed: the
+    // detached delta sync waits for exactly this process to leave the table.
+    // Taken by [`resolve_migration_subject`] from the same snapshot that
+    // resolved the identity, because a snapshot is async and
+    // `migrate_session` is not.
+    old_writer: Option<ProcIdentity>,
 ) -> Result<MigrationOutcome, MigrateError> {
     use tauri::Manager;
     let store = app
@@ -1166,11 +1315,9 @@ pub(crate) async fn migrate_session_off_runtime(
                 store.get(&record.claude_session_id)
             })
         },
-        // The old pane's `claude`, identified BEFORE anything is closed: the
-        // detached delta sync waits for exactly this process to leave the
-        // table. Taken here because the snapshot is async and
-        // `migrate_session` is not.
-        || old_pane_claude(app, &record.terminal_id),
+        // Nothing async left to prepare: `old_writer` was taken with the
+        // identity, before this guard.
+        || std::future::ready(old_writer),
         move |old_writer| migrate_session(&app_owned, &record_owned, &src, &dst, old_writer),
     )
     .await
@@ -1213,20 +1360,249 @@ where
     .map_err(MigrateError::from)
 }
 
-/// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
-/// `terminal_id`, from one process-table snapshot. `None` when the pane is
-/// gone, remote (no local pid), hosts no `claude`, or the table is unreadable.
-async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<ProcIdentity> {
+/// The session a migration acts on, as the provider's registry proves it.
+pub(crate) struct MigrationSubject {
+    /// The lifecycle record to migrate — already corrected to the provider's
+    /// id on `Rebound`.
+    pub record: TerminalSessionRecord,
+    /// The account to migrate OUT of: the registry row's (in the roster's
+    /// spelling), or the record's on the operator's unresolved fallback.
+    pub src_config_dir: String,
+    /// The old pane's `claude` anchor, for the post-close delta sync.
+    pub old_writer: Option<ProcIdentity>,
+    /// How the identity was settled, in words — returned by the operator's
+    /// command so a migration of an unverified identity says so.
+    pub identity_note: String,
+    /// On `Rebound`, the record's (old) id: `record` is the correction, NOT
+    /// yet written; see [`Self::commit_correction`].
+    pub rebound_from: Option<String>,
+}
+
+impl MigrationSubject {
+    /// Write a `Rebound` correction to the lifecycle store (no-op otherwise).
+    ///
+    /// Deferred to the caller rather than done while resolving, so the
+    /// automatic path writes it only once the exhaustion probe has confirmed
+    /// the hint: an unconfirmed hint (quoted text, a replayed banner) changes
+    /// nothing. It must still precede [`migrate_session_off_runtime`], since
+    /// `begin_migration` re-reads the record by its (new) id.
+    pub(crate) fn commit_correction(
+        &self,
+        store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    ) {
+        let Some(from) = &self.rebound_from else {
+            return;
+        };
+        store.record_open(self.record.clone());
+        warn!(
+            terminal_id = %self.record.terminal_id,
+            record_session = %from,
+            provider_session = %self.record.claude_session_id,
+            account = %self.src_config_dir,
+            "account migration: the pane runs a different session than its record — record corrected from the provider's live registry, migrating the provider's id"
+        );
+    }
+}
+
+/// Resolve which session `record`'s pane provably runs (plan
+/// `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`
+/// Phase 3) and decide what the migration does with it — the step both async
+/// callers of [`migrate_session`] take ABOVE the continuation GUARD window.
+///
+/// `Err(reason)` is a refusal; `reason` is the typed skip reason
+/// (`session-live-in-another-process(pid N)` / `identity-unresolved(<why>)`).
+/// On `Rebound` the returned record is the correction (authoritative origin,
+/// the new id's transcript proven to exist), which the caller writes with
+/// [`MigrationSubject::commit_correction`] before migrating, so the respawn's
+/// re-key lands on the right row. Nothing is written here.
+pub(crate) async fn resolve_migration_subject(
+    app: &tauri::AppHandle,
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    record: &TerminalSessionRecord,
+    trigger: MigrationTrigger,
+) -> Result<MigrationSubject, String> {
     use tauri::Manager;
-    let manager = app
-        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
-        .inner()
-        .clone();
-    let root = manager.get(terminal_id)?.pane_root_pid()?;
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    let (pid, started_at) =
-        crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)?;
-    Some(ProcIdentity { pid, started_at })
+    let pane_root = app
+        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+        .and_then(|m| m.inner().get(&record.terminal_id))
+        .and_then(|session| session.pane_root_pid());
+    let (identity, old_writer) =
+        resolve_migration_identity(pane_root, &record.claude_session_id).await;
+    match migration_verdict(identity, &record.claude_session_id, trigger) {
+        MigrationVerdict::Proceed {
+            sid,
+            config_dir,
+            rebound_from,
+        } => {
+            let src = roster_spelling(&config_dir, &crate::settings::get_claude_config_dirs());
+            let identity_note = match &rebound_from {
+                None => format!("confirmed: the pane runs {sid} under {src} (provider registry)"),
+                Some(from) => format!(
+                    "rebound: the pane runs {sid} under {src}, not the record's {from} (provider registry)"
+                ),
+            };
+            let record = match &rebound_from {
+                None => record.clone(),
+                Some(_) => {
+                    // No transcript for the provider's id under its account:
+                    // refuse BEFORE rewriting the record (two open records on
+                    // one terminal, and a copy that would fail anyway). A stat
+                    // that fails is refused as unreadable, not as absent. The
+                    // stat is a disk read: on the blocking pool, never on the
+                    // async runtime.
+                    let has_transcript = match record.working_dir.as_deref() {
+                        None => Ok(false),
+                        Some(wd) => {
+                            let path = super::transcript::session_transcript_path(
+                                Path::new(&src),
+                                wd,
+                                &sid,
+                            );
+                            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                                move || path.try_exists(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(std::io::Error::other(format!(
+                                    "the stat task did not complete: {e}"
+                                )))
+                            })
+                        }
+                    };
+                    crate::terminal::migration_identity::rebound_transcript_gate(
+                        &sid,
+                        &src,
+                        has_transcript,
+                    )?;
+                    let confirmed_at = Some(chrono::Utc::now().timestamp_millis());
+                    rebound_record(record, &sid, &src, confirmed_at)
+                }
+            };
+            Ok(MigrationSubject {
+                record,
+                src_config_dir: src,
+                old_writer,
+                identity_note,
+                rebound_from,
+            })
+        }
+        MigrationVerdict::ProceedOnRecord { why } => {
+            // In the roster's spelling, like the `Proceed` arm: the usage
+            // snapshot, the cooldown map and the target picker all key on it.
+            let src = record_source_account(record)
+                .ok_or("the session's current account is unknown — cannot migrate")?;
+            warn!(
+                terminal_id = %record.terminal_id,
+                session = %record.claude_session_id,
+                trigger = ?trigger,
+                why = %why,
+                "account migration: the pane's identity was NOT established — migrating the runner's record of the session (identity not checked)"
+            );
+            Ok(MigrationSubject {
+                record: record.clone(),
+                src_config_dir: src,
+                old_writer,
+                identity_note: format!(
+                    "unresolved — migrated the runner's record of the session: {why}"
+                ),
+                rebound_from: None,
+            })
+        }
+        MigrationVerdict::Refuse { reason } => {
+            warn!(
+                terminal_id = %record.terminal_id,
+                session = %record.claude_session_id,
+                pane_claude_pid = ?old_writer.as_ref().map(|w| w.pid),
+                reason = %reason,
+                "account migration refused: the pane's session identity is not proven safe to move"
+            );
+            Err(reason)
+        }
+    }
+}
+
+/// The account a session runs under by the runner's RECORD (not the
+/// provider's registry): the record's config dir, else the runner's resolved
+/// one, in the roster's spelling ([`roster_spelling`]) — the usage snapshot,
+/// the cooldown map and the target picker all key on that spelling, so a
+/// record spelled `C:\claude\.claude-x` must probe as the roster's
+/// `C:/claude/.claude-x` (round-13 review W1). `None` when neither is known.
+fn record_source_account(record: &TerminalSessionRecord) -> Option<String> {
+    record_source_account_in(
+        record.config_dir.as_deref(),
+        crate::ai_provider::get_resolved_config_dir,
+        &crate::settings::get_claude_config_dirs(),
+    )
+}
+
+/// Pure: [`record_source_account`] over an injected resolved dir and roster.
+fn record_source_account_in(
+    record_config_dir: Option<&str>,
+    resolved: impl FnOnce() -> Option<String>,
+    roster: &[String],
+) -> Option<String> {
+    record_config_dir
+        .map(str::to_string)
+        .or_else(resolved)
+        .map(|dir| roster_spelling(Path::new(dir.trim()), roster))
+}
+
+/// Pure: what an identity refusal on the AUTOMATIC path reports. The hint
+/// that started it is only a hint (`limit reached` turns up in ordinary
+/// conversation text), so the refusal is reported (as
+/// `session-account-migration-skipped`, naming the identity reason) only when
+/// the probe CONFIRMED the account exhausted. Otherwise it ends silently,
+/// like any unconfirmed hint: reporting it toasted a false "out of tokens ...
+/// NOT migrated" every debounce (round-12 review W1).
+fn identity_refusal_report(reason: &str, confirmed_exhausted: bool) -> Option<&str> {
+    confirmed_exhausted.then_some(reason)
+}
+
+/// Pure: whether the operator's migration target is the session's current
+/// account, compared as paths ([`same_config_dir`]) rather than as strings,
+/// so a non-roster spelling of the same account is still refused instead of
+/// respawning into it.
+pub(crate) fn target_is_current_account(dst: &str, src: &str) -> bool {
+    same_config_dir(dst, src)
+}
+
+/// Pure: a record for the provider's id `sid` under `config_dir` on
+/// `record`'s PANE, stamped authoritative (the provider's own pid -> session
+/// index is the same evidence grade as a typed `--session-id`).
+///
+/// Built like the binder's own re-bind
+/// ([`TerminalSessionRecord::bound_to_pane`]): only pane-scoped fields carry
+/// over (terminal, working dir, placement, title, and the pane's provider,
+/// tenant, bypass flag and spawn-time device default). Everything that
+/// belongs to the OLD session (its name, coord handle, task run, finish /
+/// wind-down / restore stamps, account label) is unset: copying it marked the
+/// new id finished when the old one was, which dropped it from restore and
+/// let a drained runner wind it down (round-12 review W2).
+fn rebound_record(
+    record: &TerminalSessionRecord,
+    sid: &str,
+    config_dir: &str,
+    confirmed_at: Option<i64>,
+) -> TerminalSessionRecord {
+    TerminalSessionRecord {
+        provider: record.provider.clone(),
+        tenant_id: record.tenant_id.clone(),
+        bypass_permissions: record.bypass_permissions,
+        spawn_device_default: record.spawn_device_default.clone(),
+        ..TerminalSessionRecord::bound_to_pane(
+            sid,
+            config_dir,
+            crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE,
+            confirmed_at,
+            crate::session::session_lifecycle_store::PaneBinding {
+                terminal_id: record.terminal_id.clone(),
+                working_dir: record.working_dir.clone(),
+                page_id: record.page_id.clone(),
+                zone_index: record.zone_index,
+                title: record.title.clone(),
+            },
+        )
+    }
 }
 
 /// Perform the migration mechanics: transcript copy → trust for the
@@ -1475,6 +1851,15 @@ fn migrate_session(
         }
     };
 
+    // The usage-limit watcher must not read the new pane's replayed banner as
+    // news until the pane has produced a turn (Phase 2b). Noted the moment
+    // the respawn is known good — before the old pane closes — so no scan
+    // runs between the new pane existing and its guard (round-11 review W2).
+    crate::terminal::migration_handoff::note_respawned_pane(
+        &new_terminal_id,
+        std::time::Instant::now(),
+    );
+
     // 4. The replacement is up: close the old pane. Its lifecycle row already
     // belongs to the new terminal (step 3), so the exit hook's later
     // `(session id, old terminal)` close must not be resolved against the map
@@ -1484,6 +1869,13 @@ fn migrate_session(
     // There is no close-reason to record because the row is never closed —
     // which is also what keeps boot-restore from ever offering the old pane.
     store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
+    // The duplicate-host detector must not read this hand-off (old pane still
+    // alive, resumed pane already up) as a fork.
+    crate::terminal::migration_handoff::note_migration_respawn(
+        &new_terminal_id,
+        &record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
     if let Err(e) = terminal_manager.close(&record.terminal_id) {
         // Old pane was already gone (user closed it after exhaustion) — not
         // fatal, the replacement is what matters. Its exit-close then either
@@ -1511,17 +1903,27 @@ fn migrate_session(
         carried.clone(),
     );
 
-    // 5. Optionally nudge the resumed session to pick the task back up once
-    // the CLI paints its idle prompt — a bare `--resume` restores context but
-    // then sits at the input box with nobody typing. The nudge waits for 4b's
-    // outcome first, bounded by 4b's writer-exit wait plus a report margin
-    // (`NUDGE_SYNC_WAIT`), so it normally goes after the sync.
-    if crate::settings::get_ai_settings()
+    // 5. The detached follow-up ([`followup`]), gated on 4b's outcome: once
+    // 4b proves the old writer gone, rescue the main transcript's tail beside
+    // the session; then (when enabled) nudge the resumed session to pick the
+    // task back up once the CLI paints its idle prompt — a bare `--resume`
+    // restores context but then sits at the input box with nobody typing —
+    // recovering or reporting a nudge that gives up; last, deliver the tail's
+    // catch-up.
+    let auto_continue = crate::settings::get_ai_settings()
         .claude_cli
-        .auto_continue_after_migration
-    {
-        spawn_continue_nudge(new_terminal_id.clone(), carried.clone(), sync_done);
-    }
+        .auto_continue_after_migration;
+    followup::spawn_post_migration(
+        followup::PostMigration {
+            src_config_dir: src_config_dir.to_string(),
+            dst_config_dir: dst_config_dir.to_string(),
+            claude_session_id: record.claude_session_id.clone(),
+            new_terminal_id: new_terminal_id.clone(),
+            carried: carried.clone(),
+            auto_continue,
+        },
+        sync_done,
+    );
 
     let outcome = MigrationOutcome {
         new_terminal_id: new_terminal_id.clone(),
@@ -1633,6 +2035,35 @@ mod tests {
             2,
         );
         assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Busy);
+    }
+
+    /// 2b review fix 6: the marker QUOTED high up the conversation is not a
+    /// turn, so the nudge does not stand down as `AlreadyBusy` on it. (The
+    /// shared idle predicate still declines such a screen, so the watcher
+    /// keeps reading — `NotYet` — rather than submitting.)
+    ///
+    /// Mutation check: reading the whole screen for the marker again makes
+    /// this `Busy`.
+    #[test]
+    fn a_marker_quoted_in_history_is_not_busy() {
+        let rule = "─".repeat(75);
+        let mut rows: Vec<String> =
+            vec!["● the spinner reads `esc to interrupt` while it works".to_string()];
+        rows.extend((0..12).map(|i| format!("  line {i}")));
+        rows.extend([
+            rule.clone(),
+            "❯\u{a0}".to_string(),
+            rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+        ]);
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let prompt_row = refs.len() - 3;
+        let s = v2_screen(&refs, prompt_row as u16, 2);
+        assert!(
+            matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)),
+            "{:?}",
+            probe_idle_prompt(&s)
+        );
     }
 
     /// An operator draft on the input line must never receive the prompt
@@ -1871,7 +2302,8 @@ mod tests {
         assert!(panicked.is_err());
         assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
         // A refusal by the moved-check releases the slot it took.
-        assert!(begin_migration(&rec, "C:/stale", || Some(rec.clone())).is_err());
+        let moved = session_record(sid, "t-1", Some("C:/b"));
+        assert!(begin_migration(&rec, "C:/a", || Some(moved.clone())).is_err());
         assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
     }
 
@@ -1907,6 +2339,55 @@ mod tests {
         assert!(begin_migration(&unpinned, "C:/a", || Some(unpinned.clone())).is_ok());
     }
 
+    /// The "already moved" check compares the re-read record with the
+    /// caller's own snapshot, as paths — never with the registry-derived
+    /// `src` for a pinned record. The same account spelled differently (by
+    /// the store or by the registry), and a registry that names the account
+    /// the process really runs under while the record is stale, are not
+    /// moves.
+    ///
+    /// Mutation checks: comparing the strings (`!=`) fails the first
+    /// assertion; comparing against `src` instead of the snapshot fails the
+    /// third.
+    #[test]
+    fn the_same_account_spelled_differently_is_not_a_move() {
+        let sid = "test/account_migration/spelling";
+        let seen = session_record(sid, "t-1", Some("/claude/.claude-lukas"));
+        let respelled = session_record(sid, "t-1", Some("/claude/./.claude-lukas/"));
+        assert!(
+            begin_migration(&seen, "/claude/.claude-lukas", || Some(respelled.clone())).is_ok(),
+            "the store re-spelled the same account"
+        );
+        assert!(
+            begin_migration(&seen, "/claude/./.claude-lukas", || Some(seen.clone())).is_ok(),
+            "the registry spells the same account differently"
+        );
+        assert!(
+            begin_migration(&seen, "/claude/.claude-niklas", || Some(seen.clone())).is_ok(),
+            "the record is unchanged since the caller read it; src is the registry's account"
+        );
+    }
+
+    /// A record that really moved after the caller read it is refused —
+    /// pinned or not when the caller read it.
+    #[test]
+    fn a_record_that_really_moved_is_refused() {
+        let sid = "test/account_migration/really-moved";
+        let seen = session_record(sid, "t-1", Some("/claude/.claude-lukas"));
+        let moved = session_record(sid, "t-1", Some("/claude/.claude-niklas"));
+        assert_eq!(
+            begin_migration(&seen, "/claude/.claude-lukas", || Some(moved.clone())).unwrap_err(),
+            MigrationRefusal::AlreadyMoved {
+                to: "/claude/.claude-niklas".to_string()
+            }
+        );
+        let unpinned = session_record(sid, "t-1", None);
+        assert!(matches!(
+            begin_migration(&unpinned, "/claude/.claude-lukas", || Some(moved.clone())),
+            Err(MigrationRefusal::AlreadyMoved { .. })
+        ));
+    }
+
     // ---- the guard's async shape (S6) ---------------------------------------
 
     /// The migration future dropped while it is still in its async prepare
@@ -1919,7 +2400,7 @@ mod tests {
         let rec = session_record(sid, "t-1", Some("C:/a"));
         let mut migration = Box::pin(run_migration_guarded(
             || begin_migration(&rec, "C:/a", || Some(rec.clone())),
-            // `old_pane_claude`'s stand-in: never completes.
+            // An async prepare that never completes.
             std::future::pending::<()>,
             |()| -> Result<(), String> { unreachable!("the blocking work is never spawned") },
         ));
@@ -1980,7 +2461,11 @@ mod tests {
         assert!(begin_migration(&rec, "C:/a", || Some(rec.clone())).is_ok());
 
         let refused = run_migration_guarded(
-            || begin_migration(&rec, "C:/stale", || Some(rec.clone())),
+            || {
+                begin_migration(&rec, "C:/a", || {
+                    Some(session_record(sid, "t-1", Some("C:/b")))
+                })
+            },
             || async { panic!("a refused migration prepares nothing") },
             |()| -> Result<(), String> { unreachable!() },
         )
@@ -2246,6 +2731,184 @@ mod tests {
 
     // ---- continue nudge (plan 2026-10-21-…-forks-live-sessions, Phase 2) ----
 
+    fn record(sid: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: sid.to_string(),
+            config_dir: Some(".claude-tiohorst".to_string()),
+            working_dir: Some("D:/w".to_string()),
+            page_id: "page-1".to_string(),
+            zone_index: 3,
+            title: Some("t".to_string()),
+            terminal_id: "314176b7".to_string(),
+            opened_at: 1,
+            last_seen_at: 2,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some("observed".to_string()),
+            restore_pending_at: None,
+            awaiting_account_since: None,
+            confirmed_at: Some(5),
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: Some("old name".to_string()),
+            name_source: Some("operator".to_string()),
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
+            finish_reason: None,
+            finish_synced: false,
+            spawn_device_default: None,
+            adopted_from: None,
+        }
+    }
+
+    /// The `Rebound` correction re-keys the record onto the provider's id and
+    /// account, authoritative, on the SAME terminal and placement, and drops
+    /// the old session's name.
+    ///
+    /// Mutation check: leaving `origin` as the record's (`observed`), or
+    /// keeping `config_dir`, fails this.
+    #[test]
+    fn a_rebound_record_is_the_provider_identity_on_the_same_pane() {
+        let r = rebound_record(&record("0c4e3025"), "506a0190", ".claude-lukas", None);
+        assert_eq!(r.claude_session_id, "506a0190");
+        assert_eq!(r.config_dir.as_deref(), Some(".claude-lukas"));
+        assert_eq!(
+            r.origin.as_deref(),
+            Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE)
+        );
+        assert_eq!(r.confirmed_at, None);
+        assert_eq!(r.session_name, None);
+        assert_eq!(r.terminal_id, "314176b7");
+        assert_eq!((r.page_id.as_str(), r.zone_index), ("page-1", 3));
+    }
+
+    /// Round-12 W2: a rebound from a FINISHED record that carried a coord
+    /// handle and a task run yields a record for the new id with none of the
+    /// old session's state: no finish / wind-down / restore stamps, no
+    /// handle, no task run, no account label. Pane-scoped facts carry over.
+    ///
+    /// Mutation check: building the correction with `..record.clone()`
+    /// again carries `finished_at`, `handle` and `task_run_id` and fails.
+    #[test]
+    fn a_rebound_from_a_finished_record_carries_none_of_its_session_state() {
+        let mut old = record("0c4e3025");
+        old.finished_at = Some(10);
+        old.finish_reason = Some("done".to_string());
+        old.finish_synced = true;
+        old.wind_down_outcome = Some("exited".to_string());
+        old.wind_down_at = Some(11);
+        old.handle = Some("fleet-handle".to_string());
+        old.task_run_id = Some("task-run-1".to_string());
+        old.restored_from_boot_at = Some(12);
+        old.account_label = Some("erik".to_string());
+        old.tenant_id = Some("tenant-a".to_string());
+        old.bypass_permissions = Some(true);
+        let r = rebound_record(&old, "506a0190", ".claude-lukas", Some(20));
+        assert_eq!(r.finished_at, None);
+        assert_eq!(r.finish_reason, None);
+        assert!(!r.finish_synced);
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
+        assert_eq!(r.handle, None);
+        assert_eq!(r.task_run_id, None);
+        assert_eq!(r.restored_from_boot_at, None);
+        assert_eq!(r.account_label, None);
+        assert_eq!(r.confirmed_at, Some(20));
+        assert_eq!(r.tenant_id.as_deref(), Some("tenant-a"), "pane-scoped");
+        assert_eq!(r.bypass_permissions, Some(true), "pane-scoped");
+        assert_eq!(r.working_dir.as_deref(), Some("D:/w"));
+        assert_eq!(r.title.as_deref(), Some("t"));
+    }
+
+    /// Round-12 W1: on the automatic path an identity refusal is reported
+    /// only once the probe has CONFIRMED the account exhausted; an
+    /// unconfirmed hint (quoted conversation text) ends silently.
+    ///
+    /// Mutation check: returning `Some(reason)` regardless of the probe
+    /// fails the first assertion.
+    #[test]
+    fn an_identity_refusal_is_reported_only_on_a_confirmed_exhaustion() {
+        let reason = "identity-unresolved(no valid registry row)";
+        assert_eq!(identity_refusal_report(reason, false), None);
+        assert_eq!(identity_refusal_report(reason, true), Some(reason));
+    }
+
+    /// Round-13 W1: on a refusal, the probe reads the RECORD's account in the
+    /// roster's spelling, so an exhausted account whose record spells it
+    /// differently (backslashes on Windows; a trailing slash elsewhere) still
+    /// reports the refusal. The snapshot is keyed by the roster spelling, as
+    /// the probe that fills it keys it.
+    ///
+    /// Mutation check: probing the record's raw spelling misses the snapshot
+    /// entry and fails the final assertions.
+    #[test]
+    fn a_refusal_on_a_respelled_exhausted_account_is_reported() {
+        let roster = vec!["C:/claude/.claude-r13w1-exhausted".to_string()];
+        let record_spelling = if cfg!(windows) {
+            r"C:\claude\.claude-r13w1-exhausted"
+        } else {
+            "C:/claude/.claude-r13w1-exhausted/"
+        };
+        crate::ai_provider::record_account_usage(&[(roster[0].clone(), 1.0, None, None, true)]);
+        let probe_src = record_source_account_in(Some(record_spelling), || None, &roster)
+            .expect("the record names an account");
+        assert_eq!(probe_src, roster[0], "probed in the roster's spelling");
+        let exhausted = crate::ai_provider::account_known_exhausted(&probe_src);
+        for identity in [
+            crate::terminal::migration_identity::MigrationIdentity::Unknown(
+                "no valid registry row".into(),
+            ),
+            crate::terminal::migration_identity::MigrationIdentity::MaybeHeldElsewhere {
+                pid: 4242,
+                why: "its registry row could not be read".into(),
+            },
+        ] {
+            let MigrationVerdict::Refuse { reason } =
+                migration_verdict(identity, "sid", MigrationTrigger::UsageLimitHint)
+            else {
+                panic!("the automatic path refuses an unresolved identity");
+            };
+            assert_eq!(
+                identity_refusal_report(&reason, exhausted),
+                Some(reason.as_str())
+            );
+        }
+        // The resolved dir is the fallback, roster-spelled the same way.
+        assert_eq!(
+            record_source_account_in(None, || Some(record_spelling.to_string()), &roster),
+            Some(roster[0].clone())
+        );
+        assert_eq!(record_source_account_in(None, || None, &roster), None);
+    }
+
+    /// Round-12 S7: the operator's target is the current account when it is
+    /// the same path under another spelling, not only the same string.
+    #[test]
+    fn a_respelled_current_account_is_not_a_migration_target() {
+        assert!(target_is_current_account(
+            "C:/claude/.claude-a",
+            "C:/claude/./.claude-a/"
+        ));
+        assert!(!target_is_current_account(
+            "C:/claude/.claude-a",
+            "C:/claude/.claude-b"
+        ));
+        #[cfg(windows)]
+        assert!(target_is_current_account(
+            r"C:\claude\.claude-A",
+            "c:/claude/.claude-a"
+        ));
+    }
+
     fn agent(id: &str, description: Option<&str>) -> CarriedSubagent {
         CarriedSubagent {
             agent_id: id.to_string(),
@@ -2299,19 +2962,14 @@ mod tests {
 
     fn delivery_flag() -> (
         Arc<AtomicBool>,
-        impl FnOnce(String) -> std::future::Ready<()> + Send + 'static,
+        impl FnOnce(SyncGate) -> std::future::Ready<()> + Send + 'static,
     ) {
         let delivered = Arc::new(AtomicBool::new(false));
         let flag = delivered.clone();
-        (delivered, move |_prompt| {
+        (delivered, move |_gate| {
             flag.store(true, Ordering::SeqCst);
             std::future::ready(())
         })
-    }
-
-    /// A recompute that finds no subagent.
-    fn no_subagents() -> std::future::Ready<Result<Vec<CarriedSubagent>, String>> {
-        std::future::ready(Ok(Vec::new()))
     }
 
     /// The nudge is not delivered while the delta sync is still running — not
@@ -2321,12 +2979,10 @@ mod tests {
     async fn the_continue_nudge_is_not_delivered_before_the_delta_sync_reports() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (delivered, deliver) = delivery_flag();
-        let nudge = tokio::spawn(run_continue_nudge(
+        let nudge = tokio::spawn(run_after_delta_sync(
             "t-1".to_string(),
             Some(rx),
             NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
             deliver,
         ));
         tokio::time::sleep(NUDGE_SYNC_WAIT - Duration::from_secs(1)).await;
@@ -2353,15 +3009,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         let (delivered, deliver) = delivery_flag();
         let started = tokio::time::Instant::now();
-        run_continue_nudge(
-            "t-2".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-2".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         assert!(started.elapsed() >= NUDGE_SYNC_WAIT);
         assert!(started.elapsed() < NUDGE_SYNC_WAIT + Duration::from_secs(1));
@@ -2402,17 +3050,10 @@ mod tests {
         let (delivered, deliver) = delivery_flag();
         let delivered_at = Arc::new(std::sync::Mutex::new(None));
         let at = delivered_at.clone();
-        run_continue_nudge(
-            "t-4".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            move |prompt| {
-                *at.lock().unwrap() = Some(tokio::time::Instant::now());
-                deliver(prompt)
-            },
-        )
+        run_after_delta_sync("t-4".to_string(), Some(rx), NUDGE_SYNC_WAIT, move |gate| {
+            *at.lock().unwrap() = Some(tokio::time::Instant::now());
+            deliver(gate)
+        })
         .await;
         sync.await.unwrap();
         assert!(delivered.load(Ordering::SeqCst));
@@ -2433,15 +3074,7 @@ mod tests {
     async fn with_no_delta_sync_to_wait_for_the_nudge_goes_at_once() {
         let started = tokio::time::Instant::now();
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge(
-            "t-3".to_string(),
-            None,
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-3".to_string(), None, NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
@@ -2453,45 +3086,21 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<DeltaSyncOutcome>();
         drop(tx);
         let (delivered, deliver) = delivery_flag();
-        run_continue_nudge(
-            "t-3b".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            Vec::new(),
-            no_subagents,
-            deliver,
-        )
-        .await;
+        run_after_delta_sync("t-3b".to_string(), Some(rx), NUDGE_SYNC_WAIT, deliver).await;
         assert!(delivered.load(Ordering::SeqCst));
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     // ---- the nudge names the subagents as they are after the sync (S4) -------
 
-    /// Run the nudge with the sync already reported; returns the typed prompt.
+    /// The nudge text from a carry-time list and what the recompute returned.
+    /// The follow-up builds it only after its delta-sync gate
+    /// (`followup::run`), so the recompute sees what the sync copied.
     async fn nudge_text(
         carry_time: Vec<CarriedSubagent>,
         recomputed: Result<Vec<CarriedSubagent>, String>,
     ) -> String {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tx.send(DeltaSyncOutcome::Synced(DeltaSync::default()))
-            .unwrap();
-        let typed = Arc::new(std::sync::Mutex::new(None));
-        let sink = typed.clone();
-        run_continue_nudge(
-            "t-5".to_string(),
-            Some(rx),
-            NUDGE_SYNC_WAIT,
-            carry_time,
-            move || std::future::ready(recomputed),
-            move |prompt| {
-                *sink.lock().unwrap() = Some(prompt);
-                std::future::ready(())
-            },
-        )
-        .await;
-        let text = typed.lock().unwrap().take().expect("delivered");
-        text
+        nudge_text_after_sync("t-6", carry_time, move || std::future::ready(recomputed)).await
     }
 
     /// The carry-time list named `a1` and missed `n9` (written by the old pane
@@ -2515,5 +3124,114 @@ mod tests {
 
         let text = nudge_text(vec![agent("a1", None)], Ok(Vec::new())).await;
         assert_eq!(text, CONTINUE_NUDGE, "nothing resumable now: nothing named");
+    }
+
+    /// The follow-up reads the transcript tail only when the delta sync's
+    /// report proves the old writer gone. Mutation check: widening
+    /// `writer_proven_gone` to `WriterNotGone` (or to any gate) fails here.
+    #[test]
+    fn only_a_sync_that_ran_proves_the_old_writer_gone() {
+        assert!(
+            SyncGate::Reported(DeltaSyncOutcome::Synced(DeltaSync::default())).writer_proven_gone()
+        );
+        assert!(
+            SyncGate::Reported(DeltaSyncOutcome::Failed("io".to_string())).writer_proven_gone()
+        );
+        for gate in [
+            SyncGate::Reported(DeltaSyncOutcome::WriterNotGone),
+            SyncGate::NoSync,
+            SyncGate::Dropped,
+            SyncGate::TimedOut,
+        ] {
+            assert!(!gate.writer_proven_gone(), "{gate:?} proved nothing");
+        }
+    }
+
+    /// The gate hands its verdict to the follow-up, so the tail decision is
+    /// made on what the sync actually reported.
+    #[tokio::test(start_paused = true)]
+    async fn the_follow_up_receives_the_sync_report() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(DeltaSyncOutcome::WriterNotGone).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        run_after_delta_sync("t-5".to_string(), Some(rx), NUDGE_SYNC_WAIT, move |gate| {
+            *sink.lock().unwrap() = Some(gate);
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(SyncGate::Reported(DeltaSyncOutcome::WriterNotGone))
+        );
+    }
+
+    // ---- Phase 2b: the watcher's busy policy -------------------------------
+
+    fn busy_screen() -> crate::terminal::graceful_exit::ScreenText {
+        let rule = "─".repeat(75);
+        v2_screen(
+            &["✻ Compiling… (esc to interrupt)", &rule, "❯\u{a0}", &rule],
+            2,
+            2,
+        )
+    }
+
+    /// Mutation check: dropping the `stand_down_on_busy` guard makes the
+    /// catch-up stand down on a busy pane (the second assert fails).
+    #[test]
+    fn the_nudge_stands_down_on_a_busy_pane_but_the_catch_up_waits_through_it() {
+        let mut debounce = ReadyDebounce::default();
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, IdleWait::NUDGE),
+            IdleStep::StandDown
+        );
+        let through = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        assert_eq!(
+            idle_step(busy_screen(), &mut debounce, through),
+            IdleStep::Wait("the session is mid-turn".to_string())
+        );
+    }
+
+    /// The debounce still governs submission: a busy read between two ready
+    /// reads restarts it.
+    #[test]
+    fn a_busy_read_restarts_the_ready_debounce() {
+        let rule = "─".repeat(75);
+        let ready = v2_screen(
+            &[
+                "● Done.",
+                &rule,
+                "❯\u{a0}",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            2,
+            2,
+        );
+        let wait = IdleWait {
+            stand_down_on_busy: false,
+            ..IdleWait::NUDGE
+        };
+        let mut debounce = ReadyDebounce::default();
+        assert!(matches!(
+            idle_step(ready.clone(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(matches!(
+            idle_step(busy_screen(), &mut debounce, wait),
+            IdleStep::Wait(_)
+        ));
+        assert!(
+            matches!(
+                idle_step(ready.clone(), &mut debounce, wait),
+                IdleStep::Wait(_)
+            ),
+            "the busy read reset the debounce"
+        );
+        assert_eq!(idle_step(ready, &mut debounce, wait), IdleStep::Submit);
     }
 }

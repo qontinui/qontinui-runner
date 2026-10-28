@@ -149,11 +149,44 @@ struct PromptLine {
 
 fn prompt_line(screen: &ScreenText) -> Option<PromptLine> {
     let row = screen.lines.get(usize::from(screen.cursor_row))?;
+    prompt_row(row)
+}
+
+/// The `❯` marker's column on `row` and the text after it, trimmed
+/// (including a non-breaking space and a box edge `│`); `None` without one.
+fn prompt_row(row: &str) -> Option<PromptLine> {
     let chars: Vec<char> = row.chars().collect();
     let marker_col = chars.iter().position(|&c| c == '❯')?;
     let rest: String = chars[marker_col + 1..].iter().collect();
     let input = rest.trim().trim_end_matches('│').trim().to_string();
     Some(PromptLine { marker_col, input })
+}
+
+/// The ONE draft rule: input-line text that is neither empty nor the CLI's
+/// empty-prompt placeholder is something the operator typed and has not sent.
+fn is_unsent_draft(input: &str) -> bool {
+    !input.is_empty() && !input.starts_with(PLACEHOLDER_PREFIX)
+}
+
+/// Whether the `❯` input marker OPENS `row` (after indentation or a box
+/// edge), draft or not. A status line that merely ends in `❯`, the shape of a
+/// starship-style shell prompt, is not an input row.
+pub(crate) fn is_prompt_row(row: &str) -> bool {
+    row.trim_start_matches(|c: char| c.is_whitespace() || c == '│')
+        .starts_with('❯')
+}
+
+/// Whether `row`, the cursor's row with the cursor at `cursor_col`, is an
+/// EMPTY `❯` input line by the rules [`input_prompt_ready`] applies: the
+/// marker opens the row, the cursor sits at the input start, and nothing but
+/// the placeholder follows the marker. The cursor is what tells the
+/// placeholder from a typed draft that begins `Try "`, which leaves the
+/// cursor after its text. For the migration follow-up's limit-wait gate.
+pub(crate) fn row_is_idle_input_at(row: &str, cursor_col: u16) -> bool {
+    is_prompt_row(row)
+        && prompt_row(row).is_some_and(|line| {
+            usize::from(cursor_col) == input_start(&line) && !is_unsent_draft(&line.input)
+        })
 }
 
 /// The column typed input starts at: the marker, one separator, then input.
@@ -166,14 +199,14 @@ fn input_start(line: &PromptLine) -> usize {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn is_numbered_option(text: &str) -> bool {
+pub(crate) fn is_numbered_option(text: &str) -> bool {
     let body = text.trim_start_matches(|c: char| c.is_whitespace() || c == '│' || c == '❯');
     let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
     digits > 0 && body[digits..].starts_with(". ")
 }
 
 /// Only box-drawing characters: the input box's top edge.
-fn is_box_edge(line: &str) -> bool {
+pub(crate) fn is_box_edge(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
 }
@@ -183,7 +216,7 @@ fn is_box_edge(line: &str) -> bool {
 /// these do not turn up in an ordinary finished turn ("Do you want me to run
 /// the tests?", "the allowlist"), so a check that must ADMIT the common idle
 /// screen can scan for them without refusing it.
-const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+pub(crate) const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
 
 /// May `/exit` be typed now? `Ok` only for an idle screen whose cursor sits at
 /// the start of an empty `❯` input line with no dialog showing. The `Err`
@@ -230,7 +263,7 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
             screen.cursor_col
         ));
     }
-    if !line.input.is_empty() && !line.input.starts_with(PLACEHOLDER_PREFIX) {
+    if is_unsent_draft(&line.input) {
         return Err(
             "the input line holds text that is not the empty-prompt placeholder".to_string(),
         );

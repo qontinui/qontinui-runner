@@ -54,6 +54,19 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// `creation_filetimes[pid] -> Windows FILETIME` — 100-ns ticks since
+    /// 1601-01-01 UTC, the same domain Claude Code writes as `procStart` in
+    /// `<config_dir>/sessions/<pid>.json` (`pidDomain: "win32:<host>"`). CIM
+    /// reports `CreationDate` truncated to the MICROSECOND, so a live row's
+    /// `procStart` differs from the value here by 0-9 ticks. The
+    /// registry-row validity check
+    /// ([`crate::session::claude_session_registry::registry_row_validity`])
+    /// compares at that granularity.
+    ///
+    /// Populated on Windows only. Empty elsewhere (and for a pid CIM reported
+    /// no creation time for), which that check reads as UNKNOWN — never as a
+    /// match and never as a mismatch.
+    pub creation_filetimes: HashMap<u32, u64>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -603,7 +616,7 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 async fn snapshot_process_table() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
+        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,@{n='CreationFileTime';e={if($_.CreationDate){$_.CreationDate.ToFileTimeUtc()}}}) | \
         ConvertTo-Json -Compress -Depth 3";
 
     let probe = match spawn_blocking_tracked(|| {
@@ -631,7 +644,85 @@ async fn snapshot_process_table() -> ProcessSnapshot {
         return ProcessSnapshot::default();
     };
 
-    parse_powershell_snapshot(&String::from_utf8_lossy(&stdout))
+    let mut snap = parse_powershell_snapshot(&String::from_utf8_lossy(&stdout));
+    // Exact creation FILETIMEs for the claude pids, off the runtime: a handful
+    // of OpenProcess/GetProcessTimes calls, but still syscalls.
+    let pids = claude_image_pids(&snap);
+    let exact = spawn_blocking_tracked(move || {
+        pids.into_iter()
+            .filter_map(|pid| process_creation_filetime(pid).map(|ft| (pid, ft)))
+            .collect::<HashMap<u32, u64>>()
+    })
+    .await
+    .unwrap_or_default();
+    overlay_exact_creation_filetimes(&mut snap, &exact);
+    snap
+}
+
+/// Every pid whose image is a claude (shim or not) — the pids a registry row
+/// can name.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn claude_image_pids(snap: &ProcessSnapshot) -> Vec<u32> {
+    snap.names
+        .iter()
+        .filter(|(_, name)| is_claude_image(Some(name)))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Replace the CIM-derived creation FILETIME of each pid in `exact` (claude
+/// images, from `GetProcessTimes`) with the kernel's own value (2026-10-23
+/// review fix 10). CIM reports `CreationDate` as a LOCAL time with a UTC
+/// offset, and `ToFileTimeUtc()` of a local time inside the autumn DST
+/// fall-back hour is ambiguous — a claude started then would read an hour off
+/// and its live registry row `Stale(ProcStartMismatch)`. `GetProcessTimes`
+/// returns the UTC FILETIME the process was created at, which is what Claude
+/// Code writes as `procStart`. A pid it could not open keeps the CIM value.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn overlay_exact_creation_filetimes(snap: &mut ProcessSnapshot, exact: &HashMap<u32, u64>) {
+    for (pid, ft) in exact {
+        if *ft > 0 && snap.names.contains_key(pid) {
+            snap.creation_filetimes.insert(*pid, *ft);
+        }
+    }
+}
+
+/// The kernel's creation FILETIME (100-ns ticks since 1601 UTC) for `pid`, or
+/// `None` when it cannot be opened (exited, access denied).
+#[cfg(windows)]
+fn process_creation_filetime(pid: u32) -> Option<u64> {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the handle is checked for null before use and closed exactly
+    // once; the four out-pointers are valid for the call and only the
+    // creation one is read, after a successful return.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = MaybeUninit::<FILETIME>::uninit();
+        let mut exit = MaybeUninit::<FILETIME>::uninit();
+        let mut kernel = MaybeUninit::<FILETIME>::uninit();
+        let mut user = MaybeUninit::<FILETIME>::uninit();
+        let ok = GetProcessTimes(
+            handle,
+            creation.as_mut_ptr(),
+            exit.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        );
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        let creation = creation.assume_init();
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
 }
 
 #[cfg(windows)]
@@ -649,6 +740,11 @@ struct WmiProcessRow {
     /// absent means "not a shim", see [`ProcessSnapshot::exe_paths`]).
     #[serde(rename = "ExecutablePath", default)]
     executable_path: Option<String>,
+    /// `CreationDate.ToFileTimeUtc()` — FILETIME ticks, µs-truncated. `null`
+    /// for a process CIM reports no creation time for (see
+    /// [`ProcessSnapshot::creation_filetimes`]).
+    #[serde(rename = "CreationFileTime", default)]
+    creation_file_time: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -679,6 +775,9 @@ fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
         }
         if let Some(path) = row.executable_path.filter(|p| !p.trim().is_empty()) {
             snap.exe_paths.insert(row.process_id, path);
+        }
+        if let Some(ft) = row.creation_file_time.filter(|ft| *ft > 0) {
+            snap.creation_filetimes.insert(row.process_id, ft);
         }
     }
     snap
@@ -1722,6 +1821,26 @@ mod tests {
         assert_eq!(snap.creation_times.get(&2).copied(), Some(1715911100));
     }
 
+    /// The FILETIME creation time (the registry-row validity input) is parsed
+    /// from the computed `CreationFileTime` column; `null` and an absent key
+    /// stay ABSENT (UNKNOWN), never 0.
+    #[cfg(windows)]
+    #[test]
+    fn parse_powershell_snapshot_captures_creation_filetime() {
+        let json = r#"[
+            {"ProcessId":28448,"ParentProcessId":0,"Name":"claude.exe","CreationFileTime":134369923919058640},
+            {"ProcessId":4,"ParentProcessId":0,"Name":"System","CreationFileTime":null},
+            {"ProcessId":5,"ParentProcessId":0,"Name":"x.exe"}
+        ]"#;
+        let snap = parse_powershell_snapshot(json);
+        assert_eq!(
+            snap.creation_filetimes.get(&28448).copied(),
+            Some(134_369_923_919_058_640)
+        );
+        assert!(!snap.creation_filetimes.contains_key(&4));
+        assert!(!snap.creation_filetimes.contains_key(&5));
+    }
+
     #[cfg(windows)]
     #[test]
     fn parse_powershell_snapshot_captures_name() {
@@ -1749,5 +1868,46 @@ mod tests {
             &snap,
             1_715_911_000_000
         ));
+    }
+
+    /// Review fix 10: a claude whose CIM creation time came back an hour off
+    /// (the DST fall-back ambiguity) gets the kernel's exact FILETIME, so its
+    /// live registry row validates; a non-claude pid and a pid the kernel did
+    /// not answer for keep the CIM value.
+    ///
+    /// Mutation check: making `overlay_exact_creation_filetimes` a no-op
+    /// leaves the row `Stale(ProcStartMismatch)`.
+    #[test]
+    fn exact_creation_filetimes_override_an_ambiguous_cim_time() {
+        use crate::session::claude_session_registry::{registry_row_validity, RowValidity};
+        const EXACT: u64 = 134_369_923_919_058_648;
+        const HOUR: u64 = 36_000_000_000;
+        let mut snap = ProcessSnapshot::default();
+        snap.names.insert(46416, "claude.exe".into());
+        snap.names.insert(7, "pwsh.exe".into());
+        snap.names.insert(8, "claude.exe".into());
+        snap.creation_filetimes.insert(46416, EXACT - HOUR);
+        snap.creation_filetimes.insert(7, 5);
+        snap.creation_filetimes.insert(8, 6);
+        let mut pids = claude_image_pids(&snap);
+        pids.sort_unstable();
+        assert_eq!(pids, vec![8, 46416]);
+
+        let before =
+            registry_row_validity(46416, Some("134369923919058648"), Some("win32:x"), &snap);
+        assert!(matches!(before, RowValidity::Stale(_)), "{before:?}");
+
+        let exact: HashMap<u32, u64> = [(46416, EXACT), (999, 1)].into_iter().collect();
+        overlay_exact_creation_filetimes(&mut snap, &exact);
+        assert_eq!(
+            registry_row_validity(46416, Some("134369923919058648"), Some("win32:x"), &snap),
+            RowValidity::Valid
+        );
+        assert_eq!(snap.creation_filetimes.get(&7), Some(&5));
+        assert_eq!(snap.creation_filetimes.get(&8), Some(&6));
+        assert!(
+            !snap.creation_filetimes.contains_key(&999),
+            "a pid not in the table is not added"
+        );
     }
 }

@@ -637,6 +637,44 @@ fn the_carry_records_the_two_sidecar_dirs_it_used() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Round-14 S3: a subagent transcript copied mid-append is settled like the
+/// main one — its torn last line cut, a whole unterminated record completed —
+/// and a non-`.jsonl` sidecar is copied byte for byte.
+///
+/// Mutation check: copying `.jsonl` sidecars without `settle_subagent_jsonl`
+/// leaves the torn `{"b"` and fails the first assertion.
+#[test]
+fn a_subagent_transcript_copied_mid_append_is_settled() {
+    let tmp = scratch("subagent-settle");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(
+        &src,
+        WD,
+        SID,
+        &[
+            ("subagents/agent-torn.jsonl", b"{\"a\":1}\n{\"b\""),
+            ("subagents/agent-whole.jsonl", b"{\"a\":1}\n{\"b\":2}"),
+            ("tool-results/r1.txt", b"line\npartial"),
+        ],
+    );
+    carry(&src, &dst);
+    let side = literal_sidecar(&dst);
+    assert_eq!(
+        std::fs::read(side.join("subagents").join("agent-torn.jsonl")).unwrap(),
+        b"{\"a\":1}\n"
+    );
+    assert_eq!(
+        std::fs::read(side.join("subagents").join("agent-whole.jsonl")).unwrap(),
+        b"{\"a\":1}\n{\"b\":2}\n"
+    );
+    assert_eq!(
+        std::fs::read(side.join("tool-results").join("r1.txt")).unwrap(),
+        b"line\npartial",
+        "not a transcript: copied as is"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn a_session_with_no_subagents_lists_none_but_still_carries_its_sidecars() {
     let tmp = scratch("zero");
@@ -1137,6 +1175,32 @@ fn a_migration_moves_a_same_size_different_bytes_subagent_aside() {
         )
         .unwrap(),
         b"a\nlive\n"
+    );
+    let backups = subagent_backups(&dst, "agent-a1.jsonl");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"a\nfork\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Round-15 W1 — a diverged subagent whose live source is mid-append: the
+/// fork is moved aside and the copy put in its place is settled too, its torn
+/// last line cut.
+///
+/// Mutation check: passing a no-op settle to `preserve_diverged_and_copy`
+/// leaves the torn `{"b"` in the destination and fails the first assertion.
+#[test]
+fn a_diverged_subagent_copied_mid_append_is_settled() {
+    let (tmp, carried) = migrate_subagent("sub-diverged-torn", b"{\"a\":1}\n{\"b\"", b"a\nfork\n");
+    let dst = tmp.join(".claude-b");
+    assert_eq!(carried.session_dir.diverged_preserved, 1);
+    assert_eq!(
+        std::fs::read(
+            literal_sidecar(&dst)
+                .join("subagents")
+                .join("agent-a1.jsonl")
+        )
+        .unwrap(),
+        b"{\"a\":1}\n"
     );
     let backups = subagent_backups(&dst, "agent-a1.jsonl");
     assert_eq!(backups.len(), 1, "{backups:?}");
@@ -2597,6 +2661,7 @@ fn a_compare_failure_keeps_the_forks_meta_through_the_carry_and_the_sync() {
                 main: MainCarry::Present,
                 src_session_dir: src_side.clone(),
                 dst_session_dir: dst_side.clone(),
+                transcript_offset: None,
                 session_dir: tally,
                 files,
                 subagents: Vec::new(),
@@ -3059,6 +3124,7 @@ fn a_destination_stat_error_is_never_read_as_absent() {
             main: MainCarry::Present,
             src_session_dir: src_side.clone(),
             dst_session_dir: dst_side.clone(),
+            transcript_offset: None,
             session_dir: tally,
             files,
             subagents: Vec::new(),
@@ -3140,6 +3206,7 @@ fn a_meta_whose_transcript_has_no_carry_record_stays_with_the_destination() {
                 main: MainCarry::Present,
                 src_session_dir: src_side.clone(),
                 dst_session_dir: dst_side.clone(),
+                transcript_offset: None,
                 session_dir: tally,
                 files,
                 subagents: Vec::new(),

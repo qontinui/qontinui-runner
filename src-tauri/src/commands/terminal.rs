@@ -2191,11 +2191,30 @@ pub async fn terminal_migrate_session_account(
     let record = store
         .get(&claude_session_id)
         .ok_or_else(|| format!("unknown session: {claude_session_id}"))?;
-    let src = record
-        .config_dir
-        .clone()
-        .or_else(crate::ai_provider::get_resolved_config_dir)
-        .ok_or("the session's current account is unknown — cannot migrate")?;
+    // Which session does the pane PROVABLY run, under which account? Resolved
+    // from the provider's live registry before anything is lifted or spawned
+    // (plan 2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions,
+    // Phase 3). The click NAMES a session id, so a pane provably running a
+    // different id is refused (naming both), and so is a session live — or
+    // possibly live — in another process; an identity that merely could not
+    // be established falls back to the record, since the click is the
+    // operator's own confirmation, and the response says so.
+    let subject = crate::terminal::account_migration::resolve_migration_subject(
+        &app,
+        &store,
+        &record,
+        crate::terminal::migration_identity::MigrationTrigger::OperatorCommand,
+    )
+    .await
+    .map_err(|reason| format!("migration refused: {reason}"))?;
+    // The click is the confirmation: a `Rebound` correction is written now,
+    // before the migration re-reads the record by its id.
+    subject.commit_correction(&store);
+    let (record, src, identity_note) = (
+        subject.record,
+        subject.src_config_dir,
+        subject.identity_note,
+    );
 
     let explicit_target = target_config_dir.is_some();
     let dst = match target_config_dir {
@@ -2209,7 +2228,7 @@ pub async fn terminal_migrate_session_account(
             "no usable target account (every other account exhausted/cooled/unauthenticated)",
         )?,
     };
-    if dst == src {
+    if crate::terminal::account_migration::target_is_current_account(&dst, &src) {
         return Err("target account equals the session's current account".to_string());
     }
     // A picked target is already in the handoff ledger; an explicit one is not.
@@ -2217,27 +2236,32 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
-    let outcome =
-        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
-            .await
-            .map_err(|e| {
-                // The session never reached `dst`: it must not count as a handoff.
-                crate::ai_provider::unrecord_handoff(&dst);
-                // A refusal (already migrating / already moved / closed /
-                // gone) reads as its own sentence, exactly as before the typed
-                // error.
-                e.to_string()
-            })?;
+    let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
+        &app,
+        &record,
+        &src,
+        &dst,
+        subject.old_writer,
+    )
+    .await
+    .map_err(|e| {
+        // The session never reached `dst`: it must not count as a handoff.
+        crate::ai_provider::unrecord_handoff(&dst);
+        // A refusal (already migrating / already moved / closed / gone) reads
+        // as its own sentence, exactly as before the typed error.
+        e.to_string()
+    })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
-            "migrated session {claude_session_id} to {}",
-            outcome.to_config_dir
+            "migrated session {} to {} (identity {identity_note})",
+            record.claude_session_id, outcome.to_config_dir
         )),
         data: Some(serde_json::json!({
             "newTerminalId": outcome.new_terminal_id,
             "fromConfigDir": outcome.from_config_dir,
             "toConfigDir": outcome.to_config_dir,
+            "identity": identity_note,
         })),
     })
 }

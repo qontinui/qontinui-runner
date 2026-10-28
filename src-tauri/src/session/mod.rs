@@ -65,6 +65,7 @@ pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
+pub mod duplicate_hosts; // Report a session live in two processes from the provider registry, report-only (plan 2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions, Phase 5)
 pub mod handoff;
 pub mod intent;
 pub mod local_store;

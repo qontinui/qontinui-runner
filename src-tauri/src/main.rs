@@ -5158,6 +5158,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // store / cmdline / snapshot op inside swallows its own
                         // errors, so a failure degrades to "bound nothing this
                         // tick", never a panic that would break the liveness loop.
+                        // ONE read of every account's `sessions/*.json` per
+                        // tick, on the blocking pool, shared by the bind pass,
+                        // the title / re-bind pass and the duplicate-host
+                        // detector below (plan 2026-10-21-account-migration-…,
+                        // review fix 8). An incomplete read is "no evidence"
+                        // to every consumer, never "no rows".
+                        let tick_registry = session::reconcile::read_registry_off_runtime().await;
                         if needs_reconcile {
                             let live_ptys: Vec<session::reconcile::LivePty> = live
                                 .iter()
@@ -5177,6 +5184,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 &poll_lifecycle_store,
                                 &live_ptys,
                                 &snap,
+                                &tick_registry,
                                 "periodic",
                             )
                             .await;
@@ -5207,10 +5215,33 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 ai_start_unix: None,
                             })
                             .collect();
-                        session::reconcile::refresh_titles_pass(
+                        //
+                        // The same unguarded pass re-binds a CONFIRMED record
+                        // whose pane's VALID provider-registry row names a
+                        // different session (in-pane /clear, or a rung-3
+                        // mis-bind) — plan 2026-10-21-account-migration-…
+                        // Phase 4. Its binds reach the tab like the bind pass's.
+                        let titles_outcome = session::reconcile::refresh_titles_pass(
                             &poll_lifecycle_store,
                             &live_for_titles,
                             &snap,
+                            &tick_registry,
+                        )
+                        .await;
+                        emit_session_bound(&poll_app_handle, &titles_outcome.rebinds);
+
+                        // Duplicate-host report (same plan, Phase 5): a session
+                        // id held by two VALID interactive processes is a forked
+                        // conversation. Report-only — one warn + one coord
+                        // finding per new occurrence; never closes anything.
+                        // Unguarded for the same reason as the titles pass, and
+                        // reuses this tick's `snap` (an unreadable one is
+                        // UNKNOWN, never "no duplicates").
+                        session::duplicate_hosts::run_duplicate_hosts_pass(
+                            &poll_lifecycle_store,
+                            &live_for_titles,
+                            &snap,
+                            &tick_registry,
                         );
 
                         poll_lifecycle_store.prune(
