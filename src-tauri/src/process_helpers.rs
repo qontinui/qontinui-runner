@@ -2820,28 +2820,28 @@ mod timeout_tests {
 // release builds are users.
 //
 // So the rule needs a test rather than a reviewer.
+//
+// Two scans, because there are two ways to ship a console:
+// 1. a `Command::new(` that never gets `CREATE_NO_WINDOW`, and
+// 2. a `creation_flags(..)` call that hands a command `CREATE_NEW_CONSOLE`,
+//    wherever the command came from. `creation_flags` REPLACES the flags, so
+//    a command built through `no_window(..)` and then given
+//    `CREATE_NEW_CONSOLE` opens a window, and scan 1 never looks at it: no
+//    `Command::new(` is written there. (Scan 1 also counts ANY nearby
+//    `creation_flags` as suppression, so a raw `Command::new` given
+//    `CREATE_NEW_CONSOLE` passed it too.) `mcp/shared.rs`'s
+//    `spawn_python_with_console` was exactly that shape until 2026-10-28.
 
+/// Source-scanning helpers shared by the guards below: the `.rs` walk and
+/// the ONE test-code skipper. Every guard in this file reads production text
+/// through [`source_scan::production_lines`]; a guard with a skipper of its
+/// own is how the console guard came to stop reading a file at its first
+/// `#[cfg(test)]` while the git guard read on.
 #[cfg(test)]
-mod console_window_guard {
+mod source_scan {
     use std::path::{Path, PathBuf};
 
-    /// How far below a `Command::new(` line a suppression (`creation_flags`,
-    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
-    /// spawn. Generous on purpose: the builders in this crate set the flag
-    /// after a run of `.arg()` calls.
-    const FLAG_WINDOW: usize = 25;
-
-    /// Files the rule does not apply to.
-    ///
-    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
-    /// `qontinui_shim`). They already own a console, their children inherit it,
-    /// and nothing flashes — the defect is specific to the GUI binary.
-    fn exempt(rel: &Path) -> bool {
-        let s = rel.to_string_lossy().replace('\\', "/");
-        s.starts_with("bin/") || s == "process_helpers.rs"
-    }
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    pub(super) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -2855,164 +2855,70 @@ mod console_window_guard {
         }
     }
 
-    /// Every `Command::new(` in production code must either be suppressed
-    /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
-    /// `creation_flags`) or carry a `console-ok:` marker saying why a console
-    /// there is fine — a non-Windows-only arm, a deliberately visible terminal,
-    /// or a builder that is never spawned.
-    #[test]
-    fn every_spawn_site_is_suppressed_or_marked_console_ok() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rs_files(&root, &mut files);
-        assert!(
-            files.len() > 100,
-            "walked only {} files under {} — the guard scanned nothing",
-            files.len(),
-            root.display()
-        );
-
-        let mut violations: Vec<String> = Vec::new();
-
-        for file in files {
-            let rel = file.strip_prefix(&root).unwrap_or(&file).to_path_buf();
-            if exempt(&rel) {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            // Production text only: a spawn written inside a test module is
-            // not shipped, so it cannot flash anything on a user's machine.
-            let prod = src
-                .split_once("\n#[cfg(test)]")
-                .map(|(before, _)| before)
-                .unwrap_or(&src);
-            let lines: Vec<&str> = prod.lines().collect();
-
-            for (i, line) in lines.iter().enumerate() {
-                if !line.contains("Command::new(") {
-                    continue;
-                }
-                let trimmed = line.trim_start();
-                // Prose, not code.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Suppressed inline, a few lines down — either the raw flag
-                // or a helper that sets it on an already-built command
-                // (`pm_detect::no_window(&mut cmd)`).
-                let end = (i + FLAG_WINDOW).min(lines.len());
-                if lines[i..end]
-                    .iter()
-                    .any(|l| l.contains("creation_flags") || l.contains("no_window("))
-                {
-                    continue;
-                }
-                // Explicitly marked, on the line or just above it.
-                let start = i.saturating_sub(3);
-                if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
-                    continue;
-                }
-                violations.push(format!(
-                    "{}:{}: {}",
-                    rel.to_string_lossy().replace('\\', "/"),
-                    i + 1,
-                    trimmed
-                ));
-            }
+    /// Is `line` a column-0 attribute that compiles the next item ONLY under
+    /// test? `#[cfg(test)]`, or an `all(..)` with a top-level `test` term
+    /// (`all(test, unix)`, `all(feature = "e2e", test)`). The whole line must
+    /// be the attribute. `any(test, ..)` and `not(test)` are not test-only,
+    /// and an indented attribute is not column 0: those are scanned as
+    /// production, which can only fail loudly, never hide a site.
+    pub(super) fn is_test_only_cfg(line: &str) -> bool {
+        if !line.starts_with("#[cfg(") {
+            return false;
         }
-
-        assert!(
-            violations.is_empty(),
-            "un-suppressed console spawn site(s) — on Windows each of these pops a \
-             console window on every call in a release build.\n\n{}\n\nFix: build the \
-             command with `crate::process_helpers::no_window(..)` / `tokio_no_window(..)` \
-             instead of `Command::new(..)`. If a console there is CORRECT (a \
-             non-Windows-only arm, a deliberately visible terminal, a builder that is \
-             never spawned), say so with a `// console-ok: <reason>` comment on the line \
-             or just above it.",
-            violations.join("\n")
-        );
-    }
-}
-
-/// Every production git spawn goes through [`no_window`] / [`tokio_no_window`],
-/// because that is where BOTH git postures are applied: the prompt-closing env
-/// and the repository-local scrub. A raw `Command::new("git")` skips both — it
-/// can hang on a credential prompt, and under a `GIT_DIR` inherited from the
-/// runner's launcher it reads and WRITES the launcher's repo instead of the one
-/// `-C` names (`git reset --hard`, `worktree remove`, `git config --local`).
-///
-/// A deliberate exception carries a `git-env-ok: <reason>` marker on the line
-/// or just above it. Today there is exactly one: `bin/qontinui_cli.rs`, a
-/// console tool that acts on the user's OWN shell repo, where the inherited
-/// environment is what the user means.
-#[cfg(test)]
-mod raw_git_guard {
-    use std::path::{Path, PathBuf};
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                rs_files(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
-
-    /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
-    /// marker comment may run to several lines.
-    const MARKER_WINDOW: usize = 6;
-
-    /// Is this line a raw git spawn? Whitespace is removed first, so
-    /// `Command::new( "git" )`, `Command::new(r"git")`, `"git.exe"` and
-    /// `"git".to_string()` all count.
-    fn is_raw_git_spawn(line: &str) -> bool {
         let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        [
-            "Command::new(\"git",
-            "Command::new(r\"git",
-            "Command::new(r#\"git",
-        ]
-        .iter()
-        .any(|needle| {
-            compact.match_indices(needle).any(|(i, _)| {
-                let rest = compact.get(i + needle.len()..).unwrap_or("");
-                rest.starts_with('"')
-                    || rest.starts_with(".exe\"")
-                    || rest.starts_with("\"#")
-                    || rest.starts_with(".exe\"#")
-            })
-        })
+        let Some(pred) = compact
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        if pred == "test" {
+            return true;
+        }
+        let Some(terms) = pred
+            .strip_prefix("all(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let mut depth = 0_i32;
+        let mut term = String::new();
+        let mut has_test = false;
+        for c in terms.chars().chain(std::iter::once(',')) {
+            if c == ',' && depth == 0 {
+                has_test |= term == "test";
+                term.clear();
+                continue;
+            }
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            term.push(c);
+        }
+        has_test
     }
 
     /// The production lines of `src`, as `(1-based line number, line)`.
     ///
-    /// Skips exactly the item each column-0 `#[cfg(test)]` applies to — a
-    /// `mod` of any visibility, a helper fn, a `use` — then keeps scanning, so
-    /// a test module in the middle of a file hides neither the production
-    /// code before it nor after it. The item is the first non-attribute line
-    /// after the cfg: one ending in `;`, or opening and closing its braces on
-    /// that line, is the whole item; otherwise it runs to the next line that
-    /// is exactly `}` — rustfmt closes every top-level item that way, and
-    /// unlike brace counting this is not fooled by braces inside the string
-    /// literals source-scanning tests are full of. A head line with no brace
-    /// (a multi-line `static`, `use a::{..};`) ends at its first `;` line, and
-    /// a multi-line attribute is skipped by bracket depth. Only a column-0
-    /// `#[cfg(test)]` starts a skip: an indented one, or `cfg(all(test, ..))`,
-    /// is scanned as production — which can only fail loudly, never hide a
-    /// spawn.
-    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+    /// Skips exactly the item each column-0 test-only cfg
+    /// ([`is_test_only_cfg`]) applies to — a `mod` of any visibility, a
+    /// helper fn, a `use` — then keeps scanning, so a test module in the
+    /// middle of a file hides neither the production code before it nor
+    /// after it. The item is the first non-attribute line after the cfg: one
+    /// ending in `;`, or opening and closing its braces on that line, is the
+    /// whole item; otherwise it runs to the next line that is exactly `}` —
+    /// rustfmt closes every top-level item that way, and unlike brace
+    /// counting this is not fooled by braces inside the string literals
+    /// source-scanning tests are full of. A head line with no brace (a
+    /// multi-line `static`, `use a::{..};`) ends at its first `;` line, and a
+    /// multi-line attribute is skipped by bracket depth.
+    pub(super) fn production_lines(src: &str) -> Vec<(usize, &str)> {
         let mut out = Vec::new();
         let mut lines = src.lines().enumerate();
         while let Some((i, line)) = lines.next() {
-            if !line.starts_with("#[cfg(test)]") {
+            if !is_test_only_cfg(line) {
                 out.push((i + 1, line));
                 continue;
             }
@@ -3066,6 +2972,481 @@ mod raw_git_guard {
             }
         }
         out
+    }
+
+    /// The skip triggers on exactly the test-only cfgs. A cfg that can be
+    /// production must not start a skip, or it would hide a shipped site.
+    #[test]
+    fn only_a_test_only_cfg_starts_a_skip() {
+        for test_only in [
+            "#[cfg(test)]",
+            "#[cfg(all(test, unix))]",
+            "#[cfg(all(test, windows))]",
+            "#[cfg(all(feature = \"e2e\", test))]",
+            "#[cfg(all(test, not(windows)))]",
+        ] {
+            assert!(is_test_only_cfg(test_only), "{test_only} is test-only");
+        }
+        for production in [
+            "#[cfg(not(test))]",
+            "#[cfg(any(test, debug_assertions))]",
+            "#[cfg(any(windows, test))]",
+            "#[cfg(all(not(test), unix))]",
+            "#[cfg(all(testing, unix))]",
+            "#[cfg(target_os = \"windows\")]",
+            "    #[cfg(test)]",
+            "#[cfg(test)] mod tests;",
+        ] {
+            assert!(
+                !is_test_only_cfg(production),
+                "{production} can be production"
+            );
+        }
+        // The production code after an `all(test, ..)` module is scanned,
+        // and the module itself is not.
+        let src = "fn a() {}\n#[cfg(all(test, unix))]\nmod t {\n    fn g() {}\n}\nfn b() {}\n";
+        assert_eq!(
+            production_lines(src),
+            vec![(1, "fn a() {}"), (6, "fn b() {}")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod console_window_guard {
+    use super::source_scan::{production_lines, rs_files};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// How far below a `Command::new(` line a suppression (`creation_flags`,
+    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
+    /// spawn. Generous on purpose: the builders in this crate set the flag
+    /// after a run of `.arg()` calls.
+    const FLAG_WINDOW: usize = 25;
+
+    /// How far above a site a `console-ok:` marker still covers it.
+    const MARKER_WINDOW: usize = 3;
+
+    /// How many lines below a `creation_flags(` line its argument may run.
+    const ARG_WINDOW: usize = 10;
+
+    /// `CREATE_NEW_CONSOLE`.
+    const CREATE_NEW_CONSOLE_BIT: u64 = 0x0000_0010;
+
+    /// Files scan 1 (`Command::new(`) does not apply to.
+    ///
+    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
+    /// `qontinui_shim`). They already own a console, their children inherit it,
+    /// and nothing flashes — the defect is specific to the GUI binary.
+    /// `process_helpers.rs` is where `no_window` itself calls `Command::new`.
+    ///
+    /// Scan 2 (`CREATE_NEW_CONSOLE`) applies to every file: that flag opens a
+    /// new window for a console binary's child as surely as for the GUI's.
+    fn exempt_from_command_new_scan(rel: &str) -> bool {
+        rel.starts_with("bin/") || rel == "process_helpers.rs"
+    }
+
+    /// A `console-ok:` marker on line `idx` or up to [`MARKER_WINDOW`] lines
+    /// above it.
+    fn marked(lines: &[(usize, &str)], idx: usize) -> bool {
+        let start = idx.saturating_sub(MARKER_WINDOW);
+        lines[start..=idx]
+            .iter()
+            .any(|(_, l)| l.contains("console-ok:"))
+    }
+
+    fn strip_line_comment(line: &str) -> &str {
+        line.split_once("//").map_or(line, |(code, _)| code)
+    }
+
+    /// Scan 1: the indices of `Command::new(` lines with no suppression in
+    /// the next [`FLAG_WINDOW`] lines and no marker.
+    fn unsuppressed_command_new(lines: &[(usize, &str)]) -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&i| {
+                let line = lines[i].1;
+                // Prose, not code.
+                if !line.contains("Command::new(") || line.trim_start().starts_with("//") {
+                    return false;
+                }
+                // Suppressed inline, a few lines down — either the raw flag
+                // or a helper that sets it on an already-built command
+                // (`pm_detect::no_window(&mut cmd)`).
+                let end = (i + FLAG_WINDOW).min(lines.len());
+                let suppressed = lines[i..end]
+                    .iter()
+                    .any(|(_, l)| l.contains("creation_flags") || l.contains("no_window("));
+                !suppressed && !marked(lines, i)
+            })
+            .collect()
+    }
+
+    /// The value of an integer literal token (`0x10`, `0x0000_0010`, `16u32`),
+    /// or `None` when `tok` is not one.
+    fn integer_literal(tok: &str) -> Option<u64> {
+        if !tok.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let tok = tok.replace('_', "");
+        let (digits, radix) = match tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (tok.as_str(), 10),
+        };
+        // Drop a type suffix (`u32`): the digits are the leading run.
+        let run: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
+        u64::from_str_radix(&run, radix).ok()
+    }
+
+    /// Does `expr` name the console flag — an identifier in `names`, or an
+    /// integer literal with the `CREATE_NEW_CONSOLE` bit set?
+    fn names_new_console(expr: &str, names: &HashSet<String>) -> bool {
+        expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| !tok.is_empty())
+            .any(|tok| {
+                names.contains(tok)
+                    || integer_literal(tok).is_some_and(|v| v & CREATE_NEW_CONSOLE_BIT != 0)
+            })
+    }
+
+    /// A one-line binding — `const NAME: T = EXPR;`, `let [mut] NAME = EXPR;`,
+    /// or `NAME |= EXPR;` — as `(NAME, EXPR)`.
+    fn binding(line: &str) -> Option<(&str, &str)> {
+        let body = strip_line_comment(line).trim().strip_suffix(';')?;
+        if let Some((name, expr)) = body.split_once("|=") {
+            return Some((name.trim(), expr));
+        }
+        let decl = [
+            "pub(crate) const ",
+            "pub(super) const ",
+            "pub const ",
+            "const ",
+            "static ",
+            "let mut ",
+            "let ",
+        ]
+        .iter()
+        .find_map(|prefix| body.strip_prefix(prefix))?;
+        let (lhs, expr) = decl.split_once('=')?;
+        Some((lhs.split(':').next()?.trim(), expr))
+    }
+
+    /// `CREATE_NEW_CONSOLE` plus every file-local binding whose value names
+    /// it, followed through aliases of aliases. File-local and scope-blind on
+    /// purpose: it can only over-report. A flag value imported from another
+    /// module is not followed.
+    fn console_flag_names(lines: &[(usize, &str)]) -> HashSet<String> {
+        let bindings: Vec<(&str, &str)> = lines.iter().filter_map(|(_, l)| binding(l)).collect();
+        let mut names = HashSet::from(["CREATE_NEW_CONSOLE".to_string()]);
+        loop {
+            let before = names.len();
+            for (name, expr) in &bindings {
+                if !names.contains(*name) && names_new_console(expr, &names) {
+                    names.insert((*name).to_string());
+                }
+            }
+            if names.len() == before {
+                return names;
+            }
+        }
+    }
+
+    /// The argument text of each `creation_flags(` call that starts on line
+    /// `idx`, read across the following lines until its parentheses balance,
+    /// with `//` comments dropped.
+    fn creation_flags_args(lines: &[(usize, &str)], idx: usize) -> Vec<String> {
+        const NEEDLE: &str = "creation_flags(";
+        let line = strip_line_comment(lines[idx].1);
+        let mut args = Vec::new();
+        for (pos, _) in line.match_indices(NEEDLE) {
+            let first = line.get(pos + NEEDLE.len()..).unwrap_or("");
+            let rest = lines
+                .iter()
+                .skip(idx + 1)
+                .take(ARG_WINDOW)
+                .map(|(_, l)| strip_line_comment(l));
+            let mut arg = String::new();
+            let mut depth = 1_usize;
+            'call: for text in std::iter::once(first).chain(rest) {
+                for c in text.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break 'call;
+                            }
+                        }
+                        _ => {}
+                    }
+                    arg.push(c);
+                }
+                arg.push('\n');
+            }
+            args.push(arg);
+        }
+        args
+    }
+
+    /// Scan 2: the indices of `creation_flags(` lines whose argument names
+    /// `CREATE_NEW_CONSOLE` (by name, by a file-local alias, or as a literal
+    /// with its bit set) and carry no marker — whatever built the command.
+    fn new_console_overrides(lines: &[(usize, &str)]) -> Vec<usize> {
+        let names = console_flag_names(lines);
+        (0..lines.len())
+            .filter(|&idx| {
+                creation_flags_args(lines, idx)
+                    .iter()
+                    .any(|arg| names_new_console(arg, &names))
+                    && !marked(lines, idx)
+            })
+            .collect()
+    }
+
+    /// The unsuppressed, unmarked console spawn sites in one file's
+    /// PRODUCTION text, as `rel:line: code`. Production text only: a spawn
+    /// written inside a test item is not shipped, so it cannot flash anything
+    /// on a user's machine.
+    fn file_violations(rel: &str, src: &str) -> Vec<String> {
+        let lines = production_lines(src);
+        let mut hits = new_console_overrides(&lines);
+        if !exempt_from_command_new_scan(rel) {
+            hits.extend(unsuppressed_command_new(&lines));
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits.into_iter()
+            .map(|idx| {
+                let (n, line) = lines[idx];
+                format!("{rel}:{n}: {}", line.trim_start())
+            })
+            .collect()
+    }
+
+    /// The `spawn_python_with_console` shape (`mcp/shared.rs`; the override was
+    /// deleted in the change that added this test, and the function renamed
+    /// `spawn_python_script`): a command built through
+    /// `no_window(..)` and then handed `CREATE_NEW_CONSOLE`, which REPLACES
+    /// the `CREATE_NO_WINDOW` the helper set. The `Command::new(` scan never
+    /// looked at it, so the override shipped a visible console window.
+    #[test]
+    fn a_new_console_override_is_a_violation_unless_marked() {
+        let overridden = "fn spawn() -> std::io::Result<std::process::Child> {\n\
+                          \x20   let mut cmd = crate::process_helpers::no_window(\"python\");\n\
+                          \x20   #[cfg(target_os = \"windows\")]\n\
+                          \x20   {\n\
+                          \x20       cmd.creation_flags(CREATE_NEW_CONSOLE);\n\
+                          \x20   }\n\
+                          \x20   cmd.spawn()\n\
+                          }\n";
+        assert_eq!(
+            file_violations("mcp/shared.rs", overridden),
+            vec!["mcp/shared.rs:5: cmd.creation_flags(CREATE_NEW_CONSOLE);".to_string()],
+            "a no_window(..) command overridden with CREATE_NEW_CONSOLE went unseen"
+        );
+
+        // A raw `Command::new(` whose own suppression check is satisfied by
+        // the very call that opens the console.
+        let raw = "fn f() {\n    let mut c = std::process::Command::new(\"x\");\n    \
+                   c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", raw).len(), 1, "{raw}");
+
+        // Every spelling of the flag: the literal in any width, combined
+        // into a mask, behind a file-local const, and an argument that
+        // spans lines (reported at the `creation_flags(` line).
+        for (case, src) in [
+            ("hex 0x10", "fn f(c: &mut C) { c.creation_flags(0x10); }\n"),
+            (
+                "hex 0x00000010",
+                "fn f(c: &mut C) { c.creation_flags(0x00000010); }\n",
+            ),
+            (
+                "underscored 0x0000_0010",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0010); }\n",
+            ),
+            (
+                "masked 0x0800_0010",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0010); }\n",
+            ),
+            ("decimal 16", "fn f(c: &mut C) { c.creation_flags(16u32); }\n"),
+            (
+                "path-qualified const",
+                "fn f(c: &mut C) { c.creation_flags(Threading::CREATE_NEW_CONSOLE.0); }\n",
+            ),
+            (
+                "file-local alias const",
+                "const VISIBLE: u32 = 0x0000_0010;\nfn f(c: &mut C) { c.creation_flags(VISIBLE); }\n",
+            ),
+            (
+                "multi-line argument",
+                "fn f(c: &mut C) {\n    c.creation_flags(\n        CREATE_NEW_PROCESS_GROUP\n            \
+                 | CREATE_NEW_CONSOLE,\n    );\n}\n",
+            ),
+        ] {
+            assert_eq!(file_violations("a.rs", src).len(), 1, "{case}: {src}");
+        }
+
+        // Not the console flag: CREATE_NO_WINDOW, a process group, wider
+        // literals that merely START with `0x10`, and a const named like
+        // it but distinct as a token.
+        for (case, src) in [
+            (
+                "CREATE_NO_WINDOW",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); }\n",
+            ),
+            (
+                "process group",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0200 | CREATE_NO_WINDOW); }\n",
+            ),
+            ("0x100", "fn f(c: &mut C) { c.creation_flags(0x100); }\n"),
+            ("0x1000", "fn f(c: &mut C) { c.creation_flags(0x1000); }\n"),
+            (
+                "decimal 512",
+                "fn f(c: &mut C) { c.creation_flags(512); }\n",
+            ),
+            (
+                "trailing comment",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); } // not CREATE_NEW_CONSOLE\n",
+            ),
+            (
+                "longer identifier",
+                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X); }\n",
+            ),
+        ] {
+            assert_eq!(
+                file_violations("a.rs", src),
+                Vec::<String>::new(),
+                "{case}: {src}"
+            );
+        }
+
+        // A deliberate console says so, and is then allowed.
+        let marked =
+            "fn f(c: &mut C) {\n    // console-ok: the operator asked for this window.\n    \
+                      c.creation_flags(CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", marked), Vec::<String>::new());
+        // Prose and test code are not production.
+        let prose = "fn f() {\n    // was: c.creation_flags(CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", prose), Vec::<String>::new());
+        let in_test = "fn f() {}\n#[cfg(test)]\nmod t {\n    fn g(c: &mut C) {\n        \
+                       c.creation_flags(CREATE_NEW_CONSOLE);\n    }\n}\n";
+        assert_eq!(file_violations("a.rs", in_test), Vec::<String>::new());
+    }
+
+    /// A test item in the middle of a file must hide neither the production
+    /// code before it nor the code after it. The `split_once` skipper this
+    /// guard used until this test was added threw away everything after the
+    /// FIRST column-0 `#[cfg(test)]`, so a `#[cfg(test)]` helper fn halfway
+    /// down `ai_provider/oauth_refresh.rs` hid the raw spawn below it.
+    #[test]
+    fn a_spawn_after_a_mid_file_test_item_is_still_scanned() {
+        let src = "fn a() {}\n\
+                   #[cfg(test)]\n\
+                   fn helper() { let _ = std::process::Command::new(\"t\"); }\n\
+                   fn prod() { let _ = std::process::Command::new(\"x\"); }\n\
+                   #[cfg(all(test, unix))]\n\
+                   mod unix_tests {\n\
+                   \x20   fn g() { let _ = std::process::Command::new(\"u\"); }\n\
+                   }\n\
+                   fn prod_after() { let _ = std::process::Command::new(\"y\"); }\n";
+        assert_eq!(
+            file_violations("a.rs", src),
+            vec![
+                "a.rs:4: fn prod() { let _ = std::process::Command::new(\"x\"); }".to_string(),
+                "a.rs:9: fn prod_after() { let _ = std::process::Command::new(\"y\"); }"
+                    .to_string(),
+            ],
+            "only the two production spawns are sites; the test helper and the \
+             all(test, unix) module are not"
+        );
+    }
+
+    /// Every `Command::new(` in production code must either be suppressed
+    /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
+    /// `creation_flags`) or carry a `console-ok:` marker saying why a console
+    /// there is fine — a non-Windows-only arm, a deliberately visible terminal,
+    /// or a builder that is never spawned. And no production
+    /// `creation_flags(..)` may hand a command `CREATE_NEW_CONSOLE` without
+    /// the same marker, however the command was built.
+    #[test]
+    fn every_spawn_site_is_suppressed_or_marked_console_ok() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "walked only {} files under {} — the guard scanned nothing",
+            files.len(),
+            root.display()
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for file in files {
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            violations.extend(file_violations(&rel, &src));
+        }
+
+        assert!(
+            violations.is_empty(),
+            "un-suppressed console spawn site(s) — on Windows each of these pops a \
+             console window on every call in a release build.\n\n{}\n\nFix: build the \
+             command with `crate::process_helpers::no_window(..)` / `tokio_no_window(..)` \
+             instead of `Command::new(..)`, and do not override its flags with \
+             `CREATE_NEW_CONSOLE`. If a console there is CORRECT (a non-Windows-only \
+             arm, a deliberately visible terminal, a builder that is never spawned), say \
+             so with a `// console-ok: <reason>` comment on the line or just above it.",
+            violations.join("\n")
+        );
+    }
+}
+
+/// Every production git spawn goes through [`no_window`] / [`tokio_no_window`],
+/// because that is where BOTH git postures are applied: the prompt-closing env
+/// and the repository-local scrub. A raw `Command::new("git")` skips both — it
+/// can hang on a credential prompt, and under a `GIT_DIR` inherited from the
+/// runner's launcher it reads and WRITES the launcher's repo instead of the one
+/// `-C` names (`git reset --hard`, `worktree remove`, `git config --local`).
+///
+/// A deliberate exception carries a `git-env-ok: <reason>` marker on the line
+/// or just above it. Today there is exactly one: `bin/qontinui_cli.rs`, a
+/// console tool that acts on the user's OWN shell repo, where the inherited
+/// environment is what the user means.
+#[cfg(test)]
+mod raw_git_guard {
+    use super::source_scan::{production_lines, rs_files};
+    use std::path::PathBuf;
+
+    /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
+    /// marker comment may run to several lines.
+    const MARKER_WINDOW: usize = 6;
+
+    /// Is this line a raw git spawn? Whitespace is removed first, so
+    /// `Command::new( "git" )`, `Command::new(r"git")`, `"git.exe"` and
+    /// `"git".to_string()` all count.
+    fn is_raw_git_spawn(line: &str) -> bool {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        [
+            "Command::new(\"git",
+            "Command::new(r\"git",
+            "Command::new(r#\"git",
+        ]
+        .iter()
+        .any(|needle| {
+            compact.match_indices(needle).any(|(i, _)| {
+                let rest = compact.get(i + needle.len()..).unwrap_or("");
+                rest.starts_with('"')
+                    || rest.starts_with(".exe\"")
+                    || rest.starts_with("\"#")
+                    || rest.starts_with(".exe\"#")
+            })
+        })
     }
 
     /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in

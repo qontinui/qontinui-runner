@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::context;
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::{
-    emit_ai_output, get_workspace_paths_internal, spawn_python_with_console, FINDING_INSTRUCTIONS,
+    emit_ai_output, get_workspace_paths_internal, spawn_python_script, FINDING_INSTRUCTIONS,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::prompts;
@@ -3024,7 +3024,7 @@ If your task requires running visual automation, use the Runner API to execute w
             // set. The Python wrapper forwards each verbatim to `claude`.
             //
             // We hold the formatted strings (max_turns_str) in this scope so
-            // their `OsStr` borrow stays valid until spawn_python_with_console
+            // their `OsStr` borrow stays valid until spawn_python_script
             // returns.
             let max_turns_str = remote_max_turns_for_spawn.map(|n| n.to_string());
 
@@ -3056,9 +3056,11 @@ If your task requires running visual automation, use the Runner API to execute w
                 spawn_args.push(std::ffi::OsStr::new(cd.as_str()));
             }
 
-            // Spawn Claude independently using the spawn script
-            // Use spawn_python_with_console to ensure Claude CLI gets a console window
-            let spawn_result = spawn_python_with_console("python", &spawn_args, &workspace_root);
+            // Spawn Claude independently using the spawn script, with no
+            // console window: `claude` runs under the script's own
+            // `powershell.exe` child, not in python's console (see
+            // `spawn_python_script`).
+            let spawn_result = spawn_python_script("python", &spawn_args, &workspace_root);
 
             match spawn_result {
                 Ok(child) => {
