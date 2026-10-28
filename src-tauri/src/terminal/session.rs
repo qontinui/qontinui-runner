@@ -1544,6 +1544,11 @@ pub struct TerminalSession {
     /// grid generation has not moved between observations
     /// ([`qontinui_runner_lib::wind_down::GridIdleTracker`]).
     grid_idle_tracker: Mutex<qontinui_runner_lib::wind_down::GridIdleTracker>,
+    /// Since when THIS process has seen the screen unchanged — the per-process
+    /// floor of the wind-down grace clock
+    /// ([`qontinui_runner_lib::wind_down::ScreenQuietTracker`]). A pane adopted
+    /// after a runner start gets a fresh one, so its window starts here.
+    screen_quiet_tracker: Mutex<qontinui_runner_lib::wind_down::ScreenQuietTracker>,
     /// Unix timestamp in milliseconds when the session was created.
     created_at: u64,
     /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
@@ -1616,6 +1621,13 @@ pub struct TerminalSession {
     /// Written after bytes reach the wire; read by the phantom-turn detector
     /// via [`Self::last_input`]. See [`PtyInputSlots`].
     last_input: Mutex<PtyInputSlots>,
+    /// WALL-CLOCK time (unix millis) of the last INPUT written to this PTY —
+    /// a write or a submit from any producer, operator or runner; never a
+    /// terminal control response. `0` means none since this process created
+    /// the session. The wind-down grace clock's input floor
+    /// ([`Self::last_input_at_ms`]): it catches operator activity that leaves
+    /// the screen as it was between two observations.
+    last_input_wall_ms: std::sync::atomic::AtomicI64,
 }
 
 /// The settled screen behind a [`TerminalSession::idle_quiescence_probe`].
@@ -2532,12 +2544,16 @@ impl TerminalSession {
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
+            screen_quiet_tracker: Mutex::new(
+                qontinui_runner_lib::wind_down::ScreenQuietTracker::new(),
+            ),
             on_exit,
             exit_snapshot,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            last_input_wall_ms: std::sync::atomic::AtomicI64::new(0),
             pinned_session_id,
             wire_flow,
         })
@@ -3675,6 +3691,14 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// When input was last written to this PTY (wall clock, unix millis),
+    /// through either choke point and from any producer; `None` when none has
+    /// been since this process created the session. Never a terminal control
+    /// response.
+    pub fn last_input_at_ms(&self) -> Option<i64> {
+        Some(self.last_input_wall_ms.load(Ordering::Acquire)).filter(|&ms| ms > 0)
+    }
+
     /// A snapshot of who last wrote to this PTY, through either choke point.
     pub fn last_input(&self) -> PtyInputSlots {
         self.last_input
@@ -3688,6 +3712,13 @@ impl TerminalSession {
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
     fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
+        if slot != InputSlot::ControlResponse {
+            // Every producer counts, the runner's own automated writes
+            // included: for the wind-down floor an extra restart only fails
+            // closed.
+            self.last_input_wall_ms
+                .fetch_max(chrono::Utc::now().timestamp_millis(), Ordering::AcqRel);
+        }
         let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
         match slot {
             InputSlot::Write => slots.last_write = Some(obs),
@@ -4624,6 +4655,28 @@ impl TerminalSession {
         }
     }
 
+    /// One screen read for the wind-down verdict: the input-area screen the
+    /// grid's veto judges, and since when this process has seen the screen
+    /// unchanged (`None` on a poisoned tracker — never a fresh window, which
+    /// would be a confident "quiet since now" on a failure).
+    pub fn observe_screen_quiet(
+        &self,
+    ) -> (crate::terminal::graceful_exit::ScreenText, Option<i64>) {
+        let screen = self.grid_screen();
+        let fingerprint = qontinui_runner_lib::looping_agent::idle::screen_fingerprint(
+            &screen.lines,
+            screen.cursor_row,
+            screen.cursor_col,
+        );
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        let since = self
+            .screen_quiet_tracker
+            .lock()
+            .ok()
+            .map(|mut tracker| tracker.observe(fingerprint, observed_at_ms));
+        (screen, since)
+    }
+
     /// Debounced idle gate: the grid looks idle
     /// ([`qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle`]), and
     /// after `debounce` it still looks idle AND renders identical text — nothing
@@ -4679,7 +4732,8 @@ impl TerminalSession {
     /// bracketed by two reads of the grid generation, timestamped when it was
     /// read, folded through this pane's
     /// [`qontinui_runner_lib::wind_down::GridIdleTracker`]. A generation that
-    /// moved during the read counts as busy; the tracker extends an idle window
+    /// moved during the read counts as busy (evidence `generation_moved`; any
+    /// other busy read carries the clause of the predicate that vetoed idle); the tracker extends an idle window
     /// only across observations with an unchanged generation, which is what
     /// stands in for a quiescence debounce. A poisoned tracker is
     /// `GridIdle::Unknown`, never a fresh window.
@@ -4703,21 +4757,22 @@ impl TerminalSession {
     /// they disagree — so a stepped window is refused rather than acted on. See
     /// that module's "Hazard 1" section.
     pub fn observe_grid_idle(&self) -> qontinui_runner_lib::wind_down::GridIdle {
-        use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+        use qontinui_runner_lib::looping_agent::idle::snapshot_idle_verdict;
+        use qontinui_runner_lib::wind_down::GridBusyEvidence;
 
         let generation_before = self.grid_generation();
         let (lines, cursor_row) = self.grid_text();
         let observed_at_ms = chrono::Utc::now().timestamp_millis();
         let generation_after = self.grid_generation();
-        let looks_idle =
-            generation_before == generation_after && snapshot_looks_idle(&lines, cursor_row);
+        let busy = GridBusyEvidence::of_observation(
+            generation_before,
+            generation_after,
+            snapshot_idle_verdict(&lines, cursor_row),
+        );
         match self.grid_idle_tracker.lock() {
-            Ok(mut tracker) => tracker.observe(
-                looks_idle,
-                generation_before,
-                generation_after,
-                observed_at_ms,
-            ),
+            Ok(mut tracker) => {
+                tracker.observe(busy, generation_before, generation_after, observed_at_ms)
+            }
             Err(_) => qontinui_runner_lib::wind_down::GridIdle::Unknown,
         }
     }
@@ -5650,6 +5705,13 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`make_test_session`], marked alive so a paste reaches its writer.
+    pub(crate) fn make_live_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
+        let session = make_test_session(buf);
+        session.is_alive.store(true, Ordering::SeqCst);
+        session
+    }
+
     /// Construct a minimum-viable `TerminalSession` whose `writer` field
     /// is a `CapturingWriter` and whose other fields are inert. The
     /// reader/waiter threads are NOT spawned — `submit_prompt` only
@@ -5695,6 +5757,9 @@ pub(crate) mod tests {
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
+            screen_quiet_tracker: Mutex::new(
+                qontinui_runner_lib::wind_down::ScreenQuietTracker::new(),
+            ),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             // No real Tauri app in unit fixtures — the input-line warn
@@ -5702,6 +5767,7 @@ pub(crate) mod tests {
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            last_input_wall_ms: std::sync::atomic::AtomicI64::new(0),
             pinned_session_id: "test-pinned-session".to_string(),
         }
     }
@@ -6165,6 +6231,88 @@ pub(crate) mod tests {
             panic!("still idle");
         };
         assert!(restarted > first, "{restarted} > {first}");
+    }
+
+    /// The input floor: input written to the PTY is timestamped even when the
+    /// screen ends up exactly as it was (a draft typed and deleted), while a
+    /// terminal emulator's own control replies are not input.
+    #[test]
+    fn input_is_timestamped_but_control_responses_are_not() {
+        let session = make_live_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(session.last_input_at_ms(), None);
+        session.write(b"\x1b[I", PtyWriteCaller::Test).unwrap();
+        assert_eq!(
+            session.last_input_at_ms(),
+            None,
+            "a focus report is not input"
+        );
+        let before = chrono::Utc::now().timestamp_millis();
+        session.write(b"x\x7f", PtyWriteCaller::Test).unwrap();
+        let at = session.last_input_at_ms().expect("a keystroke is input");
+        assert!(at >= before, "{at} >= {before}");
+    }
+
+    /// The grace floor: the first observation by this process starts it, an
+    /// unchanged screen keeps it, a typed character restarts it.
+    #[test]
+    fn observe_screen_quiet_floors_at_first_sight_and_restarts_on_change() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let feed = |bytes: &str| {
+            let grid = session.grid();
+            let mut g = grid.lock().unwrap();
+            g.feed(&mut vte::Parser::new(), bytes.as_bytes());
+        };
+        feed(EMPTY_PROMPT);
+        let (_, first) = session.observe_screen_quiet();
+        let first = first.expect("a healthy tracker answers");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(session.observe_screen_quiet().1, Some(first));
+        feed("x");
+        std::thread::sleep(Duration::from_millis(5));
+        let (_, after) = session.observe_screen_quiet();
+        assert!(after.unwrap() > first);
+    }
+
+    /// A busy observation carries the clause that vetoed idle, and a
+    /// completed-turn line above the prompt no longer does (plan
+    /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`).
+    #[test]
+    fn observe_grid_idle_reports_the_busy_clause() {
+        use qontinui_runner_lib::wind_down::{GridBusyEvidence, GridIdle};
+
+        fn observe(frame: &str) -> GridIdle {
+            let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            {
+                let grid = session.grid();
+                let mut g = grid.lock().unwrap();
+                let mut parser = vte::Parser::new();
+                g.feed(&mut parser, frame.as_bytes());
+            }
+            session.observe_grid_idle()
+        }
+
+        assert_eq!(
+            observe("\u{273b} Cooking\u{2026} (12s \u{b7} esc to interrupt)\r\n\u{276f} "),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::Indicator("esc to interrupt")
+            }
+        );
+        assert_eq!(
+            observe("\u{2736} Pondering\r\n\u{276f} "),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::Glyph('\u{2736}')
+            }
+        );
+        assert_eq!(
+            observe("just output"),
+            GridIdle::Busy {
+                evidence: GridBusyEvidence::NoPrompt
+            }
+        );
+        assert!(matches!(
+            observe("\u{273b} Cooked for 5m 33s \u{b7} done 8:55 PM\r\n\u{276f} "),
+            GridIdle::Idle { .. }
+        ));
     }
 
     /// `idle_quiescence_probe` is the ONE debounce, and it hands back the
