@@ -460,6 +460,25 @@ fn a_hint_wrapped_across_two_rows_is_not_a_wait() {
     assert!(!screen_shows_limit_wait(&scr(wrapped_mid_word)));
 }
 
+/// Round-19 S3: under a status-line banner, a long todo list pushes the
+/// running turn's spinner above the bottom rows. The turn hint is read on
+/// every visible row, so the turn still refuses the `Esc`.
+///
+/// Mutation check: dropping the whole-screen turn check fails the first
+/// assertion; the second pins that the idle screen is still the wait.
+#[test]
+fn a_turn_hint_above_the_bottom_rows_is_not_a_wait() {
+    let todos = "  ☐ one more step of the plan\n".repeat(10);
+    let busy = format!(
+        "✻ Germinating… (12s · esc to interrupt)\n{todos}────────\n❯ ▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n"
+    );
+    assert!(!screen_shows_limit_wait(&scr(&busy)));
+    let idle = format!(
+        "● Done.\n{todos}────────\n❯ ▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n"
+    );
+    assert!(screen_shows_limit_wait(&scr(&idle)));
+}
+
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///

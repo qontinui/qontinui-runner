@@ -382,7 +382,10 @@ pub(crate) enum StallAction {
 /// Nor is it one while any other bottom row carries an `esc to …` hint: a
 /// view that `Esc` would close (`esc to go back`), or a turn under way
 /// (`esc to interrupt`) — round-18 review S3 — including a hint a narrow
-/// pane wrapped across two rows (round-19 review W1).
+/// pane wrapped across two rows (round-19 review W1). A running turn's
+/// `esc to interrupt` is read on every visible row, not only the bottom
+/// ones, because a todo list under a status-line banner can push the
+/// spinner above them (round-19 review S3).
 ///
 /// Nor is it one unless the IDLE input box is seen, read where the CLI's
 /// cursor is ([`row_is_idle_input_at`](crate::terminal::graceful_exit::row_is_idle_input_at)):
@@ -439,6 +442,22 @@ pub(crate) fn screen_shows_limit_wait(screen: &ScreenText) -> bool {
     let joined = normalize(&others.join("\n"));
     let squeezed: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
     if joined.contains("esc to ") || squeezed.contains("escto") {
+        return false;
+    }
+    // A running turn's hint can sit above the bottom rows: under a
+    // status-line banner a long todo list pushes the spinner out of them. So
+    // the turn's hint is read on EVERY visible row but the banner rows. A
+    // turn hint merely quoted higher up then refuses too, which costs only a
+    // reported stall (round-19 review S3).
+    let screen_rest: Vec<&str> = screen
+        .lines
+        .iter()
+        .map(String::as_str)
+        .filter(|row| !is_limit_wait_banner(row))
+        .collect();
+    let whole = normalize(&screen_rest.join("\n"));
+    let whole_squeezed: String = whole.chars().filter(|c| !c.is_whitespace()).collect();
+    if whole.contains("esc to interrupt") || whole_squeezed.contains("esctointerrupt") {
         return false;
     }
     let row = usize::from(screen.cursor_row);
