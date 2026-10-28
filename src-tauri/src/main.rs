@@ -4609,9 +4609,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::time::Duration;
 
                     use session::session_lifecycle_store::{
-                        boot_restore_phase, classify, close_reason_for_dead_shell,
-                        hold_for_withheld_boot_restore, match_live_terminal,
-                        withheld_boot_restore_candidate, PollAction, WorkerPlane,
+                        boot_restore_hold, boot_restore_phase, classify,
+                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
+                        match_live_terminal, PollAction, WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -4891,16 +4891,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Is this a prior-boot record whose boot restore
-                            // is being withheld? Decided BEFORE matching: such a
-                            // record gets the id match only (see
-                            // `match_live_terminal`).
-                            let held = withheld_boot_restore_candidate(
+                            // is being withheld, or that is still waiting for
+                            // its page's restore? Decided BEFORE matching: a
+                            // withheld record gets the id match only (see
+                            // `match_live_terminal`); a waiting one keeps the
+                            // triple fallback and is only kept from the orphan
+                            // close (see `BootRestoreHold`).
+                            let boot_hold = boot_restore_hold(
                                 rec.last_seen_at,
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
                                 tick_boot_census.is_some_and(|c| c.awaits_restore(rec)),
                             );
+                            let held = boot_hold.hold;
 
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
@@ -4915,7 +4919,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 triple,
                                 &live_by_id,
                                 &live_by_triple,
-                                held,
+                                boot_hold.id_match_only,
                             );
 
                             // A `needs-account` row the boot restore left for

@@ -4817,12 +4817,15 @@ fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>)
 /// Monotonic: `NotYetRun → Withheld → Ran`, or `NotYetRun → Ran`. Once the
 /// restore has run, normal orphan handling resumes for good; a later drain does
 /// not re-arm the hold. The restore runs per PAGE (the active one first), so
-/// this latch alone cannot keep the rows of a page not yet opened. That gap
-/// (the plan's recorded follow-up "Non-active pages at an UNDRAINED boot") is
-/// closed by the boot-census arm of [`withheld_boot_restore_candidate`]: a row
-/// in the boot-latched restorable set is held in every phase (plan
+/// this latch alone cannot keep the rows of a page not yet opened. The
+/// boot-census arm of [`withheld_boot_restore_candidate`] closes that gap (the
+/// plan's recorded follow-up "Non-active pages at an UNDRAINED boot") for the
+/// life of THIS process: a row in the boot-latched restorable set is held in
+/// every phase (plan
 /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
-/// Phase 4).
+/// Phase 4). It does not survive a second restart: a held row is never touched,
+/// so the next boot measures it against this process's observation epoch and
+/// drops it — a recorded follow-up of that plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRestorePhase {
     /// The restore path has not been asked yet (the frontend has not mounted)
@@ -4954,11 +4957,14 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   terminal by design, and closing it `no-terminal` after
 ///   `NO_TERMINAL_ORPHAN_TICKS` strands it for good. Its own restore makes the
 ///   hold moot: the restore re-asserts the row (`record_open`) or re-points its
-///   terminal (a rebind), so the poll matches it by id and judges it on that
-///   live terminal, which the hold never overrides, and its first touch moves
-///   it past the boot line. A close or a finish by the operator ends the hold,
-///   and so does the `OPEN_STALE_MS` prune. A row outside the latched set is a
-///   genuine orphan and closes as before.
+///   terminal (a rebind), so the poll matches it to that live terminal — by
+///   id, or by the `(page_id, title, working_dir)` fallback, which this arm
+///   never disables ([`boot_restore_hold`]) — and judges it there, which the
+///   hold never overrides; its first touch moves it past the boot line. A
+///   close or a finish by the operator ends the hold, and so does the
+///   `OPEN_STALE_MS` prune. A row outside the latched set is a genuine orphan
+///   and closes as before. The hold lasts for THIS process only (see
+///   [`BootRestorePhase`]).
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
@@ -4979,6 +4985,55 @@ pub fn withheld_boot_restore_candidate(
         BootRestorePhase::Ran => false,
         BootRestorePhase::Withheld => true,
         BootRestorePhase::NotYetRun => drain_defers_boot_resume,
+    }
+}
+
+/// The two flags the liveness poll derives per row from
+/// [`withheld_boot_restore_candidate`]. They differ in one input, and on
+/// purpose:
+///
+/// - `id_match_only` — the drain/phase hold alone (no boot-census arm). It is
+///   what [`match_live_terminal`] takes: while the boot restore is withheld, a
+///   prior-boot row may match only its OWN terminal id, never another tab
+///   through the `(page_id, title, working_dir)` fallback.
+/// - `hold` — that hold OR the boot-census arm. It is what
+///   [`hold_for_withheld_boot_restore`] takes: a row it covers is never closed
+///   `no-terminal` this tick.
+///
+/// The census arm widens only `hold`. Before it existed, the `Ran` phase kept
+/// the triple fallback, and that is how an auto-resume row whose re-assert
+/// was lost still finds its live tab and is touched; narrowing the match for
+/// every latched row would leave such a row untouched until the next boot
+/// dropped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootRestoreHold {
+    pub id_match_only: bool,
+    pub hold: bool,
+}
+
+/// See [`BootRestoreHold`].
+pub fn boot_restore_hold(
+    last_seen_at: i64,
+    boot_at_ms: Option<i64>,
+    phase: BootRestorePhase,
+    drain_defers_boot_resume: bool,
+    awaiting_boot_restore: bool,
+) -> BootRestoreHold {
+    BootRestoreHold {
+        id_match_only: withheld_boot_restore_candidate(
+            last_seen_at,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            false,
+        ),
+        hold: withheld_boot_restore_candidate(
+            last_seen_at,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            awaiting_boot_restore,
+        ),
     }
 }
 
@@ -10610,11 +10665,17 @@ mod tests {
         );
     }
 
-    /// The documented one-boot transition: with NO epoch (first boot after the
-    /// upgrade, or a pre-fix prior process) the open anchor is the prior
-    /// process's stamps plus the clean marker, exactly as before — so the
-    /// starved cohort still strands. Pinned so the fallback is a decision,
-    /// not an accident.
+    /// The rows of [`starved_cohort_fixture`] within the open-row grace of the
+    /// cohort's own newest stamp (`t + 39m`): what self-anchoring admits.
+    const STARVED_COHORT_NEWEST_BAND: [&str; 2] = ["starved-0030", "starved-0039"];
+
+    /// The documented one-boot transition, as production runs it: NO epoch
+    /// (first boot after the upgrade, or a pre-fix prior process), and the
+    /// old marker carries no `teardown_complete` field, so it reads `false`
+    /// and boot attaches `false`. The open anchor is then the prior process's
+    /// row stamps alone: the rows within the grace of the cohort's newest
+    /// stamp restore and the older ones still strand. Pinned so the fallback
+    /// is a decision, not an accident.
     #[test]
     fn restorable_records_snapshot_starved_cohort_without_epoch_still_strands() {
         let dir = tempdir().unwrap();
@@ -10623,16 +10684,37 @@ mod tests {
         write_fixture(&path, starved_cohort_fixture(t));
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        store.attach_prior_teardown_complete(false);
         let epoch = attach_epoch(&store, dir.path(), None);
         assert!(
             epoch.boot_notice().is_some(),
             "the absent epoch is announced"
         );
 
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT_NEWEST_BAND.map(str::to_string).to_vec()
+        );
+    }
+
+    /// With no teardown evidence attached at all (the store used standalone),
+    /// the marker anchors open rows as it always did, so with no epoch the
+    /// whole starved cohort strands.
+    #[test]
+    fn restorable_records_without_epoch_or_teardown_evidence_keeps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), None);
+
         assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
     }
 
-    /// A corrupt sidecar reads as absent — the same fallback as no epoch.
+    /// A corrupt sidecar reads as absent — the same fallback as no epoch, in
+    /// the production shape (the pre-field marker attaches `false`).
     #[test]
     fn restorable_records_corrupt_epoch_falls_back_to_prior() {
         let dir = tempdir().unwrap();
@@ -10641,6 +10723,7 @@ mod tests {
         write_fixture(&path, starved_cohort_fixture(t));
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        store.attach_prior_teardown_complete(false);
         std::fs::write(
             dir.path()
                 .join(crate::session::observation_epoch::EPOCH_FILE_NAME),
@@ -10649,7 +10732,10 @@ mod tests {
         .unwrap();
         attach_epoch(&store, dir.path(), None);
 
-        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT_NEWEST_BAND.map(str::to_string).to_vec()
+        );
     }
 
     /// An epoch OLDER than every row (the poll last saw the table an hour
@@ -11769,13 +11855,14 @@ mod tests {
                     .get(&rec.claude_session_id)
                     .copied()
                     .unwrap_or(0);
-                let held = withheld_boot_restore_candidate(
+                let held = boot_restore_hold(
                     rec.last_seen_at,
                     boot_at_ms,
                     phase,
                     drain_defers_boot_resume,
                     census.is_some_and(|c| c.awaits_restore(&rec)),
-                );
+                )
+                .hold;
                 let action = hold_for_withheld_boot_restore(
                     classify(
                         None,
@@ -12060,6 +12147,58 @@ mod tests {
         assert!(!withheld_boot_restore_candidate(
             999, None, Ran, false, true
         ));
+    }
+
+    /// Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+    /// restore-set, Phase 4: the boot-census arm widens the HOLD, never the
+    /// MATCH. After the restore ran, a latched row whose own terminal id is
+    /// stale still finds its live tab through the `(page_id, title,
+    /// working_dir)` fallback, as it did before the hold existed. The
+    /// drain/phase hold still narrows the match to the id.
+    #[test]
+    fn the_census_hold_never_narrows_the_live_terminal_match() {
+        use BootRestorePhase::*;
+        let boot = Some(1_000);
+
+        let waiting = boot_restore_hold(999, boot, Ran, false, true);
+        assert!(waiting.hold, "a latched prior-boot row is held after Ran");
+        assert!(
+            !waiting.id_match_only,
+            "the census arm must not disable the triple fallback"
+        );
+
+        let withheld = boot_restore_hold(999, boot, Withheld, false, false);
+        assert!(withheld.hold && withheld.id_match_only);
+
+        let neither = boot_restore_hold(999, boot, Ran, false, false);
+        assert!(!neither.hold && !neither.id_match_only);
+
+        let triple = ("page-1", "claude", "D:/work");
+        let live_tab = "live-tab";
+        let by_id: HashMap<&str, &str> = HashMap::new();
+        let by_triple: HashMap<(&str, &str, &str), &str> = HashMap::from([(triple, live_tab)]);
+        assert_eq!(
+            match_live_terminal(
+                "stale-term",
+                Some(triple),
+                &by_id,
+                &by_triple,
+                waiting.id_match_only
+            ),
+            Some(live_tab),
+            "a waiting row keeps its live tab"
+        );
+        assert_eq!(
+            match_live_terminal(
+                "stale-term",
+                Some(triple),
+                &by_id,
+                &by_triple,
+                withheld.id_match_only
+            ),
+            None,
+            "a withheld row matches its own id only"
+        );
     }
 
     /// Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
