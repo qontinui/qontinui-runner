@@ -12087,6 +12087,47 @@ CREATE TABLE project.journey_edge_observations (
 
 
 --
+-- Name: journey_explorations; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_explorations (
+    run_id text NOT NULL,
+    app_id text NOT NULL,
+    runner_build_id text NOT NULL,
+    runner_instance text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone DEFAULT now() NOT NULL,
+    start jsonb NOT NULL,
+    budget_max_actions integer NOT NULL,
+    budget_max_depth integer NOT NULL,
+    budget_max_wall_clock_s integer NOT NULL,
+    spent_actions integer NOT NULL,
+    spent_depth integer NOT NULL,
+    spent_wall_clock_ms bigint NOT NULL,
+    stopped_because text NOT NULL,
+    stop_node jsonb,
+    edges_added integer NOT NULL,
+    frontier_remaining_by_reason jsonb NOT NULL,
+    invalidated_at timestamp with time zone,
+    invalidated_reason text,
+    invalidated_by text,
+    invalidation_token text,
+    stop_detail jsonb,
+    CONSTRAINT ck_journey_explorations_auth_wall_names_node CHECK (((stopped_because <> 'auth_wall'::text) OR (stop_node IS NOT NULL))),
+    CONSTRAINT ck_journey_explorations_budget_positive CHECK (((budget_max_actions > 0) AND (budget_max_depth >= 0) AND (budget_max_wall_clock_s > 0))),
+    CONSTRAINT ck_journey_explorations_edges_added CHECK (((edges_added >= 0) AND (edges_added <= spent_actions))),
+    CONSTRAINT ck_journey_explorations_finished_after_started CHECK ((finished_at >= started_at)),
+    CONSTRAINT ck_journey_explorations_frontier_remaining_object CHECK ((jsonb_typeof(frontier_remaining_by_reason) = 'object'::text)),
+    CONSTRAINT ck_journey_explorations_spent_non_negative CHECK (((spent_actions >= 0) AND (spent_depth >= 0) AND (spent_wall_clock_ms >= 0))),
+    CONSTRAINT ck_journey_explorations_spent_within_budget CHECK (((spent_actions <= budget_max_actions) AND (spent_depth <= budget_max_depth))),
+    CONSTRAINT ck_journey_explorations_start_object CHECK ((jsonb_typeof(start) = 'object'::text)),
+    CONSTRAINT ck_journey_explorations_stop_detail CHECK (((stop_detail IS NULL) OR ((stopped_because = 'frontier_unsettled'::text) AND (jsonb_typeof(stop_detail) = 'object'::text)))),
+    CONSTRAINT ck_journey_explorations_stop_node_object CHECK (((stop_node IS NULL) OR (jsonb_typeof(stop_node) = 'object'::text))),
+    CONSTRAINT ck_journey_explorations_stopped_because CHECK ((stopped_because = ANY (ARRAY['budget_actions'::text, 'budget_depth'::text, 'budget_time'::text, 'frontier_exhausted'::text, 'frontier_unsettled'::text, 'app_unreachable'::text, 'auth_wall'::text])))
+);
+
+
+--
 -- Name: journey_frontier; Type: TABLE; Schema: project; Owner: -
 --
 
@@ -22130,6 +22171,14 @@ ALTER TABLE ONLY project.iteration_logs
 
 ALTER TABLE ONLY project.journey_edge_observations
     ADD CONSTRAINT journey_edge_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_explorations journey_explorations_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_explorations
+    ADD CONSTRAINT journey_explorations_pkey PRIMARY KEY (run_id);
 
 
 --
@@ -32940,6 +32989,13 @@ CREATE INDEX ix_journey_edge_observations_app_observed_at ON project.journey_edg
 --
 
 CREATE INDEX ix_journey_edge_observations_app_run ON project.journey_edge_observations USING btree (app_id, run_id);
+
+
+--
+-- Name: ix_journey_explorations_app_finished_at; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_explorations_app_finished_at ON project.journey_explorations USING btree (app_id, finished_at DESC) WHERE (invalidated_at IS NULL);
 
 
 --

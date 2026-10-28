@@ -20,13 +20,19 @@
 //! - [`read`]      bounded reads of the ledger for the query routes
 //! - [`routes`]    `GET /apps/{app_id}/journey/*` — the Phase 2 query door
 //!   and the Phase 4 `edge-timing` read
+//! - [`explorer`]  `POST /apps/{app_id}/journey/explore` — the Phase 3
+//!   budgeted, D4-safe explorer and its `journey_explorations` row
+//! - [`observe`]   `POST /apps/{app_id}/journey/observe` — Phase 3 passive
+//!   real-session capture
 //! - `route_coverage` (test) every POST route under `/ui-bridge` is classified
 
 pub mod capture;
 pub mod cursor;
+pub mod explorer;
 pub mod frontier;
 pub mod health;
 pub mod node;
+pub mod observe;
 pub mod read;
 pub mod retention;
 pub mod routes;

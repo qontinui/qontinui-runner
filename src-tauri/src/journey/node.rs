@@ -228,6 +228,10 @@ pub(crate) struct ElementAffordance {
     pub affordance: Affordance,
     /// `customActions[].id` → its declared effect (absent = undeclared).
     pub action_effects: BTreeMap<String, Option<IrEffect>>,
+    /// The element lists the standard `click` among its `actions`. Read off
+    /// the same snapshot layer as everything above, so a check of it can
+    /// never look at a different layer of the answer than the index did.
+    pub offers_click: bool,
 }
 
 /// Every affordance a snapshot exposes, indexed the way triggers name them.
@@ -422,6 +426,12 @@ pub(crate) fn extract_affordances(snapshot: &serde_json::Value) -> AffordanceInd
                 Some((id.to_string(), parse_effect(a.get("effect"))))
             })
             .collect();
+        let offers_click = element
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+            .any(|a| a.as_str() == Some("click"));
         index.elements.insert(
             id.to_string(),
             ElementAffordance {
@@ -438,6 +448,7 @@ pub(crate) fn extract_affordances(snapshot: &serde_json::Value) -> AffordanceInd
                     declared_effect: element_declared_effect(element),
                 },
                 action_effects,
+                offers_click,
             },
         );
     }
@@ -757,6 +768,7 @@ mod tests {
                         navigation: false,
                     },
                     action_effects: BTreeMap::new(),
+                    offers_click: false,
                 },
             );
         }
