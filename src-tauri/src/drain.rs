@@ -384,8 +384,6 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
     summary
 }
 
-/// Block (polling) until `session` leaves `Processing` or `deadline` passes.
-/// A session not currently processing returns immediately.
 /// The drain's shutdown-marker stamp: `clean:true` with the teardown NOT
 /// complete. A drain flushes turns, stashes WIP and heartbeats claims, but
 /// closes no terminal, and it stamps even when it timed out, so it can never
@@ -397,6 +395,8 @@ pub(crate) fn stamp_drained_marker(marker_path: &std::path::Path) {
     crate::session::shutdown_marker::mark_clean_shutdown(marker_path);
 }
 
+/// Block (polling) until `session` leaves `Processing` or `deadline` passes.
+/// A session not currently processing returns immediately.
 fn wait_for_checkpoint(session: &ClaudeSession, deadline: Instant) {
     while session.state() == SessionState::Processing {
         if Instant::now() >= deadline {
