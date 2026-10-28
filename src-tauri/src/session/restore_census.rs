@@ -802,6 +802,9 @@ mod tests {
         store.attach_observation_epoch(std::sync::Arc::new(
             crate::session::observation_epoch::ObservationEpoch::open(&epoch_path, boot_at),
         ));
+        // ...and the teardown bit from the same classification the latch
+        // reads: admission takes it from the store, not from the argument.
+        store.attach_prior_teardown_complete(false);
 
         let rows = boot_expected(
             &store,

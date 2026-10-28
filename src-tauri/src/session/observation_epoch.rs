@@ -25,11 +25,16 @@
 //!
 //! ## Two values, two processes
 //!
-//! - [`ObservationEpoch::prior_observed`] — the PRIOR process's last epoch,
-//!   read from disk once at [`ObservationEpoch::open`], BEFORE this process
-//!   writes. It never moves afterwards, so nothing this process does (a
-//!   restore's re-asserts, its own successful ticks) can move the window the
-//!   prior cohort is judged against.
+//! - [`ObservationEpoch::prior_observed`] — the last epoch any EARLIER process
+//!   of this instance wrote, read from disk once at [`ObservationEpoch::open`],
+//!   BEFORE this process writes. Normally that is the prior process's; a prior
+//!   process that never completed a successful tick leaves an older one in
+//!   place, and then every row it wrote postdates that epoch and is admitted
+//!   (the never-looked rule), bounded by the `OPEN_STALE_MS` prune. The value
+//!   never moves afterwards, so nothing this process does (a restore's
+//!   re-asserts, its own successful ticks) can move the window the prior
+//!   cohort is judged against. The record's `bootMs` names the writer, and
+//!   [`ObservationEpoch::open`] logs it.
 //! - [`ObservationEpoch::current_observed`] — THIS process's last successful
 //!   tick, in memory. It anchors rows this process wrote: if this process never
 //!   observed successfully, nothing it wrote is stale.
@@ -53,8 +58,7 @@ use tracing::{info, warn};
 pub const EPOCH_FILE_NAME: &str = "observation-epoch.json";
 
 /// Logged once at boot when there is no prior epoch to anchor against.
-pub const NO_EPOCH_NOTICE: &str =
-    "restore admission: no observation epoch — anchoring open rows to the prior process's stamps";
+pub const NO_EPOCH_NOTICE: &str = "restore admission: no observation epoch — anchoring open rows to the prior process's stamps (plus the clean marker when its teardown finished)";
 
 /// The persisted epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +110,14 @@ impl ObservationEpoch {
             prior: read_epoch(path),
             current: Mutex::new(None),
         };
-        if let Some(notice) = epoch.boot_notice() {
-            info!(path = %path.display(), "{notice}");
+        match epoch.prior {
+            None => info!(path = %path.display(), "{NO_EPOCH_NOTICE}"),
+            Some(prior) => info!(
+                path = %path.display(),
+                observed_ok_at = prior.observed_ok_at,
+                writer_boot_ms = prior.boot_ms,
+                "restore admission: latched the prior observation epoch"
+            ),
         }
         epoch
     }
@@ -284,8 +294,9 @@ mod tests {
     /// touches) would claim an observation no row reflects and recreate the
     /// strand. The poll loop lives in `main.rs` (an async closure over the
     /// whole runtime), so this pins the ORDER at the call site: exactly one
-    /// `record_tick` call, after the KeepAlive `touch` and after the last
-    /// classify arm.
+    /// `record_tick` call, OUTSIDE the per-record classify loop (after the
+    /// brace that closes `for rec in &open`, so no arm can host it) and before
+    /// the tick's held-records log that follows the loop.
     #[test]
     fn epoch_not_advanced_by_a_tick_that_never_classified() {
         let main_rs = std::fs::read_to_string(
@@ -306,12 +317,54 @@ mod tests {
         let touch = main_rs
             .find("poll_lifecycle_store.touch(&rec.claude_session_id)")
             .expect("the poll's KeepAlive touch");
-        let last_arm = main_rs
-            .find("session lifecycle poll: closing orphan session (no matching terminal)")
-            .expect("the classify loop's last close arm");
+        let header = main_rs[..touch]
+            .rfind("for rec in &open {")
+            .expect("the classify loop that hosts the touch");
+        let loop_end = closing_brace(&main_rs, header + "for rec in &open ".len());
+        assert!(touch < loop_end, "the touch sits inside the classify loop");
+        let held_log = main_rs
+            .find("if held_for_restore > 0 {")
+            .expect("the tick's held-records log after the loop");
         assert!(
-            calls[0] > touch && calls[0] > last_arm,
-            "record_tick must run after the per-record classify loop"
+            calls[0] > loop_end && calls[0] < held_log,
+            "record_tick must run once per tick, after the per-record classify loop"
         );
+    }
+
+    /// Byte offset of the `}` matching the `{` at `open`, skipping braces in
+    /// string literals and `//` comments.
+    fn closing_brace(src: &str, open: usize) -> usize {
+        let bytes = src.as_bytes();
+        assert_eq!(
+            bytes[open], b'{',
+            "the offset must point at an opening brace"
+        );
+        let (mut depth, mut i) = (0_i32, open);
+        let (mut in_str, mut in_comment) = (false, false);
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_comment {
+                in_comment = b != b'\n';
+            } else if in_str {
+                match b {
+                    b'\\' => i += 1,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+            } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                in_comment = true;
+            } else if b == b'"' {
+                in_str = true;
+            } else if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces after offset {open}");
     }
 }
