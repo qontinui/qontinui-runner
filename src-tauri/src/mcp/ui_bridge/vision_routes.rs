@@ -2442,6 +2442,18 @@ pub struct AssertRequest {
     /// instead — see [`super::vision_frame_source`].
     #[serde(default)]
     pub target: Option<String>,
+    /// A journey edge-observation id (plan
+    /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+    /// Phase 4): the timeline stored on that ledger row is what the timeline
+    /// assertions (`animation_settled`, `settled_within`,
+    /// `state_entered_within`) evaluate against. A ref that does not resolve
+    /// to a stored timeline leaves those assertions `unknown`, with the
+    /// resolution's own code — never an error-as-pass. The ref is scoped to
+    /// the app the assertions are about: `target` when one is sent, else the
+    /// runner's own app (the default frame source); a ref naming another
+    /// app's observation does not resolve.
+    #[serde(default, alias = "timeline_ref")]
+    pub timeline_ref: Option<String>,
 }
 
 impl RequestHints for AssertRequest {
@@ -2455,10 +2467,15 @@ impl RequestHints for AssertRequest {
              typography_consistent, no_layout_shift_since, no_clipping, animation_settled, \
              contrast_meets_wcag, image_palette_within, no_near_duplicate_images, \
              no_placeholder_images, image_focal_visible, transparent_image_legible, \
-             salience_order, image_sharpness_at_least, image_blockiness_within."
+             salience_order, image_sharpness_at_least, image_blockiness_within, \
+             settled_within, state_entered_within."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
-             `ocr_blocks` (from /vision/extract), `target` (device/app id)."
+             `ocr_blocks` (from /vision/extract), `target` (device/app id), \
+             `timelineRef` (a journey edge-observation id whose stored timeline the \
+             timeline assertions read; it resolves only within the app the request is \
+             about — `target` when sent, else the runner's own app — so a ref from \
+             another app leaves them unknown)."
                 .to_string(),
         ])
     }
@@ -2484,7 +2501,9 @@ impl RequestHints for AssertRequest {
                 "transparent_image_legible",
                 "salience_order",
                 "image_sharpness_at_least",
-                "image_blockiness_within"
+                "image_blockiness_within",
+                "settled_within",
+                "state_entered_within"
             ],
             "exampleAssertion": {
                 "type": "no_overlap",
@@ -2580,6 +2599,111 @@ pub struct AssertResponse {
     /// confused with the REQUEST's `snapshot` field, which is an
     /// `ElementSnapshot` and a completely different shape.
     pub snapshot_attribution: SnapshotAttribution,
+    /// How the request's `timelineRef` resolved; omitted when none was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline_ref: Option<TimelineRefResolution>,
+}
+
+/// How a `/vision/assert` `timelineRef` resolved.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRefResolution {
+    /// The edge-observation id as sent.
+    pub id: String,
+    /// The app the ref was resolved within.
+    pub app_id: String,
+    /// Whether a stored timeline was loaded and fed to the evaluator.
+    pub loaded: bool,
+    /// Why not, when it was not: the code every timeline assertion then
+    /// carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<qontinui_vision_core::UnknownInfo>,
+}
+
+impl TimelineRefResolution {
+    /// Map a ledger lookup to the timeline to evaluate against and the
+    /// resolution the response reports. Pure.
+    pub(crate) fn of(
+        id: &str,
+        app_id: &str,
+        lookup: crate::journey::read::TimelineRefLookup,
+    ) -> (
+        Option<Box<qontinui_vision_core::ChangeTimeline>>,
+        TimelineRefResolution,
+    ) {
+        use crate::journey::read::{LedgerUnavailable, TimelineRefLookup as L};
+        use qontinui_vision_core::{UnknownCode as C, UnknownInfo};
+        let fail = |code: C, detail: String| {
+            (
+                None,
+                TimelineRefResolution {
+                    id: id.to_string(),
+                    app_id: app_id.to_string(),
+                    loaded: false,
+                    unknown: Some(UnknownInfo::new(code, detail)),
+                },
+            )
+        };
+        match lookup {
+            L::Found(t) => (
+                Some(t),
+                TimelineRefResolution {
+                    id: id.to_string(),
+                    app_id: app_id.to_string(),
+                    loaded: true,
+                    unknown: None,
+                },
+            ),
+            L::NotFound => fail(
+                C::NoObservations,
+                format!("timelineRef {id:?} names no journey edge observation of app {app_id:?}"),
+            ),
+            L::NoTimeline => fail(
+                C::InputMissing,
+                format!(
+                    "journey edge observation {id:?} recorded no timeline (the action sent \
+                     `timeline: false`, or its choke point records none)"
+                ),
+            ),
+            L::Withdrawn(at) => fail(
+                C::StaleInput,
+                format!("journey edge observation {id:?} was withdrawn at {at}"),
+            ),
+            L::Unparseable => fail(
+                C::ProducerFailed,
+                format!("the timeline stored on journey edge observation {id:?} does not parse"),
+            ),
+            L::Unavailable(LedgerUnavailable::SchemaAbsent) => fail(
+                C::LedgerSchemaAbsent,
+                "the journey tables do not exist in this database".to_string(),
+            ),
+            L::Unavailable(LedgerUnavailable::Failed(e)) => fail(
+                C::ProducerFailed,
+                format!("the journey ledger could not be read: {e}"),
+            ),
+        }
+    }
+
+    /// Give every timeline assertion that came back `unknown` for want of a
+    /// timeline this resolution's code and detail, so the reader sees WHY the
+    /// ref did not supply one rather than the generic "no timeline".
+    pub(crate) fn annotate(&self, results: &mut [qontinui_vision_core::AssertionResult]) {
+        let Some(why) = &self.unknown else {
+            return;
+        };
+        for r in results.iter_mut() {
+            let is_timeline = matches!(
+                r.assertion,
+                qontinui_vision_core::Assertion::AnimationSettled { .. }
+                    | qontinui_vision_core::Assertion::SettledWithin { .. }
+                    | qontinui_vision_core::Assertion::StateEnteredWithin { .. }
+            );
+            if is_timeline && r.outcome.is_unknown() {
+                r.code = Some(why.code);
+                r.detail = Some(why.detail.clone());
+            }
+        }
+    }
 }
 
 impl AssertResponse {
@@ -2611,6 +2735,7 @@ impl AssertResponse {
             coverage: snapshot.map(qontinui_vision_core::SnapshotCoverage::of),
             evaluated_at,
             snapshot_attribution: SnapshotAttribution::of(snapshot),
+            timeline_ref: None,
         }
     }
 }
@@ -2750,6 +2875,14 @@ async fn vision_analyze_handler(
 /// `POST /ui-bridge/vision/assert` — evaluate a list of declarative
 /// assertions over a captured frame + caller-supplied snapshot/OCR.
 /// Returns per-assertion pass/fail + reason.
+///
+/// `timelineRef` (alias `timeline_ref`) names a journey edge observation
+/// whose stored timeline feeds the timeline assertions. It is SCOPED to the
+/// request's app: `target` when one is sent, else the runner's own app
+/// (`qontinui-runner`, the default frame source). A ref naming another app's
+/// observation, an unknown id, a withdrawn row or a row with no timeline
+/// leaves every timeline assertion `unknown` with that resolution's code —
+/// reported in `timelineRef` on the response, never a pass.
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<AssertRequest>,
@@ -2794,13 +2927,31 @@ async fn vision_assert_handler(
     // handler: the L1 image assertions read the frame and hash, cluster and
     // filter image crops. Everything the evaluation borrows moves in owned;
     // the frame and snapshot come back out for the response.
+    // `timelineRef`: the timeline stored on that journey edge row (plan
+    // 2026-09-20 Phase 4). Unresolved, the timeline assertions stay unknown.
+    // Read before the blocking hop, which only evaluates.
+    let (timeline, timeline_ref) = match req.timeline_ref.as_deref() {
+        None => (None, None),
+        Some(id) => {
+            let app_id = req
+                .target
+                .as_deref()
+                .unwrap_or(crate::spec_api::storage::RUNNER_APP_ID);
+            let lookup =
+                crate::journey::read::read_timeline_by_id(&state.app_state.pg_db, app_id, id).await;
+            let (t, resolution) = TimelineRefResolution::of(id, app_id, lookup);
+            (t, Some(resolution))
+        }
+    };
+
     let AssertRequest {
         assertions,
         snapshot,
         ocr_blocks,
         target: _,
+        timeline_ref: _,
     } = req;
-    let (results, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
+    let (mut results, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
         let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
             ocr_blocks.as_ref().map(|blocks| {
                 blocks
@@ -2826,6 +2977,7 @@ async fn vision_assert_handler(
             frame: frame.as_ref(),
             ocr_blocks: ocr_borrowed.as_deref(),
             baselines: Some(&baselines_owned),
+            timeline: timeline.as_deref(),
         };
 
         let results: Vec<_> = assertions
@@ -2846,6 +2998,9 @@ async fn vision_assert_handler(
             ))),
         )
     })?;
+    if let Some(resolution) = &timeline_ref {
+        resolution.annotate(&mut results);
+    }
     info!(
         "vision/assert: {} assertions, {} passed, {} failed",
         results.len(),
@@ -2853,13 +3008,15 @@ async fn vision_assert_handler(
         results.iter().filter(|r| !r.passed).count()
     );
 
-    Ok(Json(ApiResponse::success(AssertResponse::of(
+    let mut response = AssertResponse::of(
         results,
         snapshot.as_ref(),
         frame.as_ref(),
         frame_error,
         evaluated_at,
-    ))))
+    );
+    response.timeline_ref = timeline_ref;
+    Ok(Json(ApiResponse::success(response)))
 }
 
 /// `POST /ui-bridge/vision/baseline` — capture a baseline image + record
@@ -3070,12 +3227,14 @@ mod tests {
             A::SalienceOrder { .. } => "salience_order",
             A::ImageSharpnessAtLeast { .. } => "image_sharpness_at_least",
             A::ImageBlockinessWithin { .. } => "image_blockiness_within",
+            A::SettledWithin { .. } => "settled_within",
+            A::StateEnteredWithin { .. } => "state_entered_within",
         }
     }
 
     /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
     /// two together: an arm added there belongs here too.
-    const ASSERTION_WIRE_NAMES: [&str; 20] = [
+    const ASSERTION_WIRE_NAMES: [&str; 22] = [
         "no_overlap",
         "element_above",
         "contains_text",
@@ -3096,6 +3255,8 @@ mod tests {
         "salience_order",
         "image_sharpness_at_least",
         "image_blockiness_within",
+        "settled_within",
+        "state_entered_within",
     ];
 
     /// One parsed instance of every assertion type, from the wire form a
@@ -3125,7 +3286,9 @@ mod tests {
                 {"type":"transparent_image_legible","element":"logo","min_ratio":3.0},
                 {"type":"salience_order","cta_id":"cta"},
                 {"type":"image_sharpness_at_least","element":"hero","min_sharpness":50.0},
-                {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}
+                {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5},
+                {"type":"settled_within","ms":500},
+                {"type":"state_entered_within","state":"checkout","ms":500}
             ]"#,
         )
         .expect("every advertised assertion type must parse against the linked vision-core")
@@ -3286,9 +3449,10 @@ mod tests {
     /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
     /// a derivation of it — the enum has no `strum`-style variant iterator.
     /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
-    /// image assertions (image plan Phase 15) from 12 to 20; without a pin, a
-    /// variant added upstream stays undiscoverable while `evaluate_assertion`
-    /// (which is variant-agnostic) handles it fine.
+    /// image assertions (image plan Phase 15) from 12 to 20, and the timeline
+    /// assertions (plan 2026-09-20 Phase 4) to 22; without a pin, a variant
+    /// added upstream stays undiscoverable while `evaluate_assertion` (which
+    /// is variant-agnostic) handles it fine.
     ///
     /// What ties the list to the enum, and how far: [`assertion_wire_name`]
     /// has no `_` arm, so a variant vision-core adds fails this test build
@@ -3303,7 +3467,7 @@ mod tests {
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 20] = [
+        const EXPECTED: [&str; 22] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -3324,6 +3488,8 @@ mod tests {
             "salience_order",
             "image_sharpness_at_least",
             "image_blockiness_within",
+            "settled_within",
+            "state_entered_within",
         ];
 
         // The names the exhaustive match knows are the advertised ones.
@@ -4319,5 +4485,128 @@ mod capture_fallback_tests {
             2,
             "monitor_crop_count must bump to 2 after the second fallback frame"
         );
+    }
+}
+
+/// Plan 2026-09-20 Phase 4 acceptance 3 through `/vision/assert`'s
+/// `timelineRef` path: the timeline a ref resolves to is what
+/// `animation_settled` evaluates; an unresolved ref is unknown, never a pass.
+#[cfg(test)]
+mod timeline_ref_tests {
+    use super::*;
+    use crate::journey::read::{LedgerUnavailable, TimelineRefLookup};
+    use crate::journey::test_fixtures::{anim, timeline};
+    use qontinui_vision_core::{Assertion, AssertionOutcome, EvalContext, UnknownCode};
+
+    fn evaluate(lookup: TimelineRefLookup) -> (Vec<AssertionResult>, TimelineRefResolution) {
+        let (t, resolution) = TimelineRefResolution::of("ref-1", "qontinui-web", lookup);
+        let ctx = EvalContext {
+            timeline: t.as_deref(),
+            ..Default::default()
+        };
+        let mut results: Vec<_> = [
+            Assertion::AnimationSettled { region: None },
+            Assertion::SettledWithin { ms: 500 },
+        ]
+        .iter()
+        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+        .collect();
+        resolution.annotate(&mut results);
+        (results, resolution)
+    }
+
+    use qontinui_vision_core::AssertionResult;
+
+    /// The stored projection, as the ledger read returns it.
+    fn stored(events: Vec<serde_json::Value>) -> TimelineRefLookup {
+        TimelineRefLookup::Found(Box::new(timeline(events, 120).for_ledger()))
+    }
+
+    #[test]
+    fn animation_settled_fails_when_the_last_event_is_animation_started() {
+        let (r, res) = evaluate(stored(vec![anim("animation-started", 50, "spin")]));
+        assert!(res.loaded);
+        assert_eq!(r[0].outcome, AssertionOutcome::Failed, "{r:?}");
+    }
+
+    #[test]
+    fn animation_settled_passes_when_it_ended() {
+        let (r, _) = evaluate(stored(vec![
+            anim("animation-started", 50, "spin"),
+            anim("animation-ended", 90, "spin"),
+        ]));
+        assert_eq!(r[0].outcome, AssertionOutcome::Passed, "{r:?}");
+        assert_eq!(
+            r[1].outcome,
+            AssertionOutcome::Passed,
+            "settled at 120 <= 500"
+        );
+    }
+
+    #[test]
+    fn a_bad_ref_is_unknown_with_the_resolution_code_never_a_pass() {
+        for (lookup, code) in [
+            (TimelineRefLookup::NotFound, UnknownCode::NoObservations),
+            (TimelineRefLookup::NoTimeline, UnknownCode::InputMissing),
+            (TimelineRefLookup::Unparseable, UnknownCode::ProducerFailed),
+            (
+                TimelineRefLookup::Withdrawn("2026-10-01T00:00:00Z".into()),
+                UnknownCode::StaleInput,
+            ),
+            (
+                TimelineRefLookup::Unavailable(LedgerUnavailable::SchemaAbsent),
+                UnknownCode::LedgerSchemaAbsent,
+            ),
+            (
+                TimelineRefLookup::Unavailable(LedgerUnavailable::Failed("x".into())),
+                UnknownCode::ProducerFailed,
+            ),
+        ] {
+            let (r, res) = evaluate(lookup);
+            assert!(!res.loaded);
+            for result in &r {
+                assert_eq!(result.outcome, AssertionOutcome::Unknown, "{result:?}");
+                assert!(!result.passed);
+                assert_eq!(result.code, Some(code));
+            }
+        }
+    }
+
+    /// A ref the app-scoped read did not find (another app's observation
+    /// included) is unknown and says which app it was looked up in.
+    #[test]
+    fn a_ref_not_found_in_the_app_names_the_app() {
+        let (r, res) = evaluate(TimelineRefLookup::NotFound);
+        assert_eq!(res.app_id, "qontinui-web");
+        assert!(res
+            .unknown
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("of app \"qontinui-web\""));
+        assert!(r.iter().all(|x| x.outcome == AssertionOutcome::Unknown));
+    }
+
+    /// The agent-facing hint states the scoping, so a caller is never left to
+    /// discover it from an unknown.
+    #[test]
+    fn the_request_hint_states_that_timeline_ref_is_app_scoped() {
+        let prose = <AssertRequest as RequestHints>::shape_error_suggestions()
+            .unwrap()
+            .join(" ");
+        assert!(prose.contains("timelineRef"), "{prose}");
+        assert!(prose.contains("resolves only within the app"), "{prose}");
+        assert!(prose.contains("`target`"), "{prose}");
+    }
+
+    #[test]
+    fn the_request_accepts_both_spellings_of_timeline_ref() {
+        for body in [
+            r#"{"assertions":[{"type":"animation_settled"}],"timelineRef":"abc"}"#,
+            r#"{"assertions":[{"type":"animation_settled"}],"timeline_ref":"abc"}"#,
+        ] {
+            let req: AssertRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(req.timeline_ref.as_deref(), Some("abc"));
+        }
     }
 }

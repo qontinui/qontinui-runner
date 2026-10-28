@@ -4554,13 +4554,14 @@ async fn handle_ct_execute_with_diff(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let active_app = active_app_identity(&state).await;
+    let (ws_payload, http_body) = execute_with_diff_forward(&body);
     let response = match dispatch_app_request(
         &state,
         "executeWithDiff",
-        body.clone(),
+        ws_payload,
         Method::POST,
         "/ai/execute-with-diff",
-        Some(body.clone()),
+        Some(http_body),
     )
     .await
     {
@@ -4588,6 +4589,16 @@ async fn handle_ct_execute_with_diff(
         );
     }
     Json(response)
+}
+
+/// What `handle_ct_execute_with_diff` forwards to the SDK: the WS payload and
+/// the HTTP body, each the caller's body WHOLE. `ActionWithDiffRequest` keeps
+/// growing (`timeline`, default-on since plan 2026-09-20 Phase 4, so a
+/// `timeline: false` opt-out must survive; `timelineInterval`; `expectStates`
+/// with `withinMs`), and a hop that rebuilt the body field by field would
+/// drop whichever this runner had not heard of yet.
+fn execute_with_diff_forward(body: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    (body.clone(), body.clone())
 }
 
 /// Read an `execute_with_diff` result's `actionSuccess`, at the top level (the
@@ -8899,6 +8910,81 @@ mod tests {
             out.get("code").is_none(),
             "only codes the producer set are hoisted"
         );
+    }
+    /// Plan 2026-09-20 Phase 4 wire-through: the default-on `timeline` and the
+    /// `expectStates` / `withinMs` answers survive the guard on every arm, so
+    /// the journey ledger (and the caller) receive what the SDK produced.
+    #[test]
+    fn execute_with_diff_keeps_the_timeline_on_every_arm() {
+        let timeline = crate::journey::test_fixtures::timeline_json(vec![], 120);
+        let arms = [
+            // Relay success (top-level ActionDiffResult).
+            serde_json::json!({ "actionSuccess": true, "diff": {}, "timeline": timeline.clone() }),
+            // In-process success envelope.
+            serde_json::json!({ "success": true, "data": {
+                "actionSuccess": true, "diff": {}, "timeline": timeline.clone() } }),
+            // Relay failure.
+            serde_json::json!({ "actionSuccess": false, "diff": {}, "timeline": timeline.clone() }),
+            // In-process failure.
+            serde_json::json!({ "success": true, "data": {
+                "actionSuccess": false, "diff": {}, "timeline": timeline.clone() } }),
+            // A producer that does not report actionSuccess.
+            serde_json::json!({ "actionResult": {}, "diff": {}, "timeline": timeline.clone() }),
+        ];
+        for body in arms {
+            let out = guard_execute_with_diff(body.clone());
+            let kept = out
+                .get("timeline")
+                .or_else(|| out.get("data").and_then(|d| d.get("timeline")));
+            assert_eq!(kept, Some(&timeline), "timeline stripped from {body}");
+            assert!(
+                matches!(
+                    crate::journey::capture::diff_timeline(&out),
+                    crate::journey::capture::DiffTimeline::Parsed(_)
+                ),
+                "the ledger reader finds it on {body}"
+            );
+        }
+    }
+
+    /// The four Phase 4 request fields reach the SDK on BOTH transports: the
+    /// handler's own forward, through the real transport selection.
+    #[tokio::test]
+    async fn execute_with_diff_forwards_the_phase_4_request_fields_on_both_transports() {
+        let body = serde_json::json!({
+            "elementAction": { "elementId": "save", "action": "click" },
+            "timeline": false,
+            "timelineInterval": 25,
+            "expectStates": ["saved-toast"],
+            "withinMs": 2000,
+        });
+        let registry = AppRegistry::new();
+        registry
+            .upsert(
+                sample_discovered("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        registry
+            .upsert(
+                sample_discovered("happ"),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        for app in ["wapp", "happ"] {
+            let (ws, http) = execute_with_diff_forward(&body);
+            let sent = select_app_payload(&registry, app, ws, Some(http)).await;
+            for field in ["timeline", "timelineInterval", "expectStates", "withinMs"] {
+                assert_eq!(sent[field], body[field], "{app}: {field} was not forwarded");
+            }
+            assert_eq!(sent, body, "{app}: the body is forwarded whole");
+        }
     }
 }
 
