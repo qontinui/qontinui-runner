@@ -10867,8 +10867,12 @@ mod tests {
         let cohort = SELF_ANCHORED_COHORT.map(str::to_string).to_vec();
         for (complete, expected) in [(false, cohort), (true, Vec::new())] {
             let dir = tempdir().unwrap();
-            let store =
-                store_with_teardown(dir.path(), self_anchored_cohort(t), t + 3 * 3_600_000, complete);
+            let store = store_with_teardown(
+                dir.path(),
+                self_anchored_cohort(t),
+                t + 3 * 3_600_000,
+                complete,
+            );
             assert_eq!(
                 restorable_ids(&store, marker, true),
                 expected,
@@ -10924,7 +10928,15 @@ mod tests {
     #[test]
     fn restorable_records_lone_ghost_restores_only_after_an_interrupted_teardown() {
         let shutdown = 1_700_000_000_000_i64;
-        let ghost = || vec![fixture_rec("ghost", "open", shutdown - 72 * 3_600_000, None, None)];
+        let ghost = || {
+            vec![fixture_rec(
+                "ghost",
+                "open",
+                shutdown - 72 * 3_600_000,
+                None,
+                None,
+            )]
+        };
         for (complete, expected) in [(false, vec!["ghost".to_string()]), (true, Vec::new())] {
             let dir = tempdir().unwrap();
             let store = store_with_teardown(dir.path(), ghost(), shutdown + 3_600_000, complete);
@@ -10946,7 +10958,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = store_with_teardown(
             dir.path(),
-            vec![fixture_rec("old-exit", "closed", exited, Some(exited), Some("pty-exit"))],
+            vec![fixture_rec(
+                "old-exit",
+                "closed",
+                exited,
+                Some(exited),
+                Some("pty-exit"),
+            )],
             shutdown + 3_600_000,
             false,
         );
