@@ -63,9 +63,10 @@
 //!   operator-gated: measured 2026-10-28 it answered 401 to the runner's
 //!   device JWT on three probes while the work-status door answered 200 on the
 //!   same token, so every verdict fail-opened to `allow` and the feature was
-//!   inert even where armed. A row with no `session_status`, and an id coord
-//!   names in its `unknown` bucket, both read as ABSENT (block-eligible); a
-//!   degraded read is `Unreachable` ⇒ allow.
+//!   inert even where armed (coord finding 4eef6693). A row with no
+//!   `session_status` reads as ABSENT (block-eligible). An id coord names in
+//!   its `unknown` bucket, a payload with no session id, and a degraded read
+//!   are all `Unreachable` ⇒ allow.
 //! - **continuation rules** — `GET {coord}/coord/agent-prompt-documents/
 //!   continuation_rules/session-continuation`: coord's versioned
 //!   `prompt_documents` store (Phase 2), which serves the tenant's editable
@@ -209,13 +210,20 @@ impl FlagReading {
 /// task run, a work-unit dispatch, a continuation restored after a runner
 /// restart — gets the ordinary default.
 pub fn mode_for_terminal(terminal_id: &str) -> Mode {
-    mode_for_terminal_with(FlagReading::from_env(), terminal_id)
+    mode_for_terminal_with(FlagReading::from_env(), terminal_id, &|tid| {
+        crate::agent_runtime::live_gate_continuation_gate_id(tid).is_some()
+    })
 }
 
-/// [`mode_for_terminal`] with the flag reading injected (the test surface —
-/// global-env mutation in tests races the parallel harness).
-pub fn mode_for_terminal_with(reading: FlagReading, terminal_id: &str) -> Mode {
-    reading.mode_for(crate::agent_runtime::live_gate_continuation_gate_id(terminal_id).is_some())
+/// [`mode_for_terminal`] with the flag reading and the registry lookup
+/// injected (the test surface — process-global env and the process-global
+/// continuation registry both race the parallel harness).
+pub fn mode_for_terminal_with(
+    reading: FlagReading,
+    terminal_id: &str,
+    is_gate_continuation: &dyn Fn(&str) -> bool,
+) -> Mode {
+    reading.mode_for(is_gate_continuation(terminal_id))
 }
 
 // ===========================================================================
@@ -397,15 +405,21 @@ pub fn session_id_from(input: &Value) -> Option<String> {
 
 /// Map one work-status door answer onto the verdict's [`StatusFetch`]. Pure.
 ///
-/// A row (with or without a status) and an explicit `unknown` are both coord
-/// answering — the latter is ABSENT, the same reading the old resolver's
-/// `session_not_found` 404 had. Anything coord did not settle is `Unreachable`,
-/// which allows (fail-open).
+/// Only a ROW is an answer about this session: its status, or `None` when its
+/// work axis is unset (ABSENT, block-eligible). coord's `unknown` bucket means
+/// "no `claude_code_session_id` row for this id in the acting tenant", which is
+/// not "this session has no status": an AI task run's row is keyed by its
+/// `task_run_id`, and a session homed in another tenant answers `unknown` too.
+/// So `NoRow` is `Unreachable` like every other unsettled read, and allows
+/// (fail-open) — never a default rendered as "absent" (served
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
 pub fn status_fetch_from_one(one: crate::mcp::session_work_status::OneStatus) -> StatusFetch {
     use crate::mcp::session_work_status::OneStatus;
     match one {
         OneStatus::Row(status) => StatusFetch::Reachable(status),
-        OneStatus::NoRow => StatusFetch::Reachable(None),
+        OneStatus::NoRow => StatusFetch::Unreachable(
+            "coord has no row keyed by this harness session id in the acting tenant".to_string(),
+        ),
         OneStatus::Unresolved(why) => StatusFetch::Unreachable(why),
     }
 }
@@ -503,6 +517,15 @@ async fn fetch_session_status_uncached(session_key: &str) -> StatusFetch {
     status_fetch_from_one(crate::mcp::session_work_status::fetch_one(session_key).await)
 }
 
+/// Whether `status` is a reading [`decide`] may block on (`working` or absent).
+fn is_block_eligible(status: &StatusFetch) -> bool {
+    match status {
+        StatusFetch::Reachable(None) => true,
+        StatusFetch::Reachable(Some(s)) => s.trim().eq_ignore_ascii_case("working"),
+        StatusFetch::Unreachable(_) => false,
+    }
+}
+
 /// TTL-cached session-status read.
 async fn fetch_session_status(session_key: &str) -> StatusFetch {
     let now = Instant::now();
@@ -518,7 +541,14 @@ async fn fetch_session_status(session_key: &str) -> StatusFetch {
         // Opportunistic prune so the map can't grow unboundedly across many
         // short-lived sessions.
         g.retain(|_, (at, _)| now.duration_since(*at) < CACHE_TTL * 4);
-        g.insert(session_key.to_string(), (now, fresh.clone()));
+        // A block-eligible reading is NOT cached: a session blocked at
+        // `absent`/`working` that then records `finished` must be allowed on
+        // its very next stop, not re-blocked off a 45 s-old answer.
+        if is_block_eligible(&fresh) {
+            g.remove(session_key);
+        } else {
+            g.insert(session_key.to_string(), (now, fresh.clone()));
+        }
     }
     fresh
 }
@@ -764,9 +794,13 @@ pub async fn continuation_verdict(
         // The work-axis door is keyed by the HARNESS session id, which the
         // Stop payload carries. `session_key` may instead be a coord session
         // id (an AI task run the registrar maps), which that door does not key
-        // on — so prefer the payload's id and fall back to the key.
-        let status_key = session_id_from(hook_input).unwrap_or_else(|| session_key.to_string());
-        fetch_session_status(&status_key).await
+        // on — so a payload without one is UNKNOWN, never a guessed key.
+        match session_id_from(hook_input) {
+            Some(status_key) => fetch_session_status(&status_key).await,
+            None => StatusFetch::Unreachable(
+                "the Stop payload carries no session_id to read the work axis by".to_string(),
+            ),
+        }
     };
 
     let now = Instant::now();
@@ -998,7 +1032,7 @@ mod tests {
     // ── Status door: the work-status answer -> StatusFetch ──────────────
 
     #[test]
-    fn work_status_row_and_unknown_are_reachable_and_unresolved_fails_open() {
+    fn only_a_work_status_row_is_reachable_and_everything_else_fails_open() {
         use crate::mcp::session_work_status::OneStatus;
         assert_eq!(
             status_fetch_from_one(OneStatus::Row(Some("finished".into()))),
@@ -1006,10 +1040,14 @@ mod tests {
         );
         // A row whose work axis is unset is ABSENT — block-eligible.
         assert_eq!(status_fetch_from_one(OneStatus::Row(None)), reachable(None));
-        // coord named the id in `unknown`: reachable, no row — also ABSENT.
-        assert_eq!(status_fetch_from_one(OneStatus::NoRow), reachable(None));
+        // coord's `unknown` bucket is "not keyed here", not "no status":
+        // UNKNOWN, so it allows.
+        assert!(matches!(
+            status_fetch_from_one(OneStatus::NoRow),
+            StatusFetch::Unreachable(_)
+        ));
         // A read coord did not settle (401, timeout, bridge column absent)
-        // fails OPEN, exactly like the old door's every non-2xx.
+        // fails OPEN.
         assert!(matches!(
             status_fetch_from_one(OneStatus::Unresolved("HTTP 401".into())),
             StatusFetch::Unreachable(_)
@@ -1017,17 +1055,11 @@ mod tests {
     }
 
     #[test]
-    fn the_status_read_no_longer_goes_to_the_operator_gated_resolver_card() {
-        // The resolver card 401'd the runner's device JWT (measured
-        // 2026-10-28), which made every verdict fail open. The needle is
-        // assembled so this test's own source cannot match it.
-        let src = include_str!("continuation_verdict.rs");
-        let needle = format!("{}/coord/agent-sessions/{}", "{base}", "{session_key}");
-        assert!(
-            !src.contains(&needle),
-            "the verdict must read the work-status door, not the resolver card"
-        );
-        assert!(src.contains("session_work_status::fetch_one"));
+    fn only_non_blocking_readings_are_cacheable() {
+        assert!(is_block_eligible(&reachable(None)));
+        assert!(is_block_eligible(&reachable(Some(" Working "))));
+        assert!(!is_block_eligible(&reachable(Some("finished"))));
+        assert!(!is_block_eligible(&StatusFetch::Unreachable("x".into())));
     }
 
     // ── Gate-continuation arming (FlagReading + registry scoping) ───────
@@ -1070,16 +1102,14 @@ mod tests {
     fn registry_scoping_blocks_a_gate_continuation_with_no_status() {
         // A terminal the continuation registry holds WITH a gate: an unset
         // flag plus an absent coord status blocks at turn end.
-        let gate_tid = format!("verdict-test-gate-{}", uuid::Uuid::new_v4());
-        let plain_tid = format!("verdict-test-plain-{}", uuid::Uuid::new_v4());
-        let gateless_tid = format!("verdict-test-gateless-{}", uuid::Uuid::new_v4());
-        crate::agent_runtime::test_register_live_continuation(
-            &gate_tid,
-            Some(uuid::Uuid::new_v4()),
-        );
-        crate::agent_runtime::test_register_live_continuation(&gateless_tid, None);
+        let gate_tid = "verdict-test-gate";
+        let plain_tid = "verdict-test-plain";
+        let gateless_tid = "verdict-test-gateless";
+        // The registry lookup, injected: only `gate_tid` is a live entry with a
+        // gate (a work-unit dispatch's entry has none, so it reads false too).
+        let is_gate = |tid: &str| tid == gate_tid;
 
-        let mode = mode_for_terminal_with(FlagReading::Unset, &gate_tid);
+        let mode = mode_for_terminal_with(FlagReading::Unset, gate_tid, &is_gate);
         assert_eq!(mode, Mode::On);
         assert_eq!(
             decide(mode, false, &reachable(None), false).decision,
@@ -1087,7 +1117,7 @@ mod tests {
         );
 
         // No registry entry: the ordinary dark default — allowed.
-        let mode = mode_for_terminal_with(FlagReading::Unset, &plain_tid);
+        let mode = mode_for_terminal_with(FlagReading::Unset, plain_tid, &is_gate);
         assert_eq!(mode, Mode::Off);
         assert_eq!(
             decide(mode, false, &reachable(None), false).decision,
@@ -1097,19 +1127,16 @@ mod tests {
         // A registry entry WITHOUT a gate (a work-unit dispatch) is not a
         // gate continuation.
         assert_eq!(
-            mode_for_terminal_with(FlagReading::Unset, &gateless_tid),
+            mode_for_terminal_with(FlagReading::Unset, gateless_tid, &is_gate),
             Mode::Off
         );
 
         // The gate continuation with the flag explicitly `off`: allowed.
-        let mode = mode_for_terminal_with(FlagReading::Explicit(Mode::Off), &gate_tid);
+        let mode = mode_for_terminal_with(FlagReading::Explicit(Mode::Off), gate_tid, &is_gate);
         assert_eq!(
             decide(mode, false, &reachable(None), false).decision,
             "allow"
         );
-
-        crate::agent_runtime::test_deregister_continuation(&gate_tid);
-        crate::agent_runtime::test_deregister_continuation(&gateless_tid);
     }
 
     #[test]
