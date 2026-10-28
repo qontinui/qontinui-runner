@@ -2831,7 +2831,7 @@ A workflow configuration has been auto-loaded:
 **Runner MCP API (port 9876):**
 - GET /status - Check runner and config status
 - POST /run-workflow - Run a workflow by name
-  Example: `Invoke-RestMethod -Uri "http://localhost:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
+  Example: `Invoke-RestMethod -Uri "http://127.0.0.1:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
 - GET /monitors - List available monitors
 
 If your task requires running visual automation, use the Runner API to execute workflows.

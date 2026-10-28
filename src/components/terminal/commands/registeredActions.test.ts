@@ -34,11 +34,6 @@ vi.mock("../result-card", () => ({
   buildMetricsCardSpec: () => ({ title: "m", sections: [] }),
   buildHistoryCardSpec: () => ({ title: "h", sections: [] }),
 }));
-vi.mock("../liveClaudeSessions", () => ({
-  extractLiveSessions: () => [],
-  groupByAccount: () => new Map(),
-  sharedSessionIds: () => new Set(),
-}));
 vi.mock("../contexts", () => ({
   useTerminalSession: () => ({
     tabs: [{ id: "tab-a" }],
@@ -184,6 +179,7 @@ describe("registered actions — the cost/destruction declarations are not empty
         .sort(),
     ).toEqual([
       "terminal.analyze",
+      "terminal.elevated",
       "terminal.generate-workflow",
       "terminal.orchestrate",
       "terminal.plan-implement",

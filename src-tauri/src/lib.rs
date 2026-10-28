@@ -131,6 +131,14 @@ pub mod mcp_spill;
 pub mod embedded_pg;
 pub mod env_agent;
 
+// The runner's one circuit-breaker state machine, and the PostgreSQL checkout
+// point built on it (plan
+// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`). Lib,
+// not bin, because `env_agent` above holds a clone of the boot pool: a
+// bin-side breaker could not cover it.
+pub mod circuit;
+pub mod pg_circuit;
+
 // THE `source()`-chain renderer, shared by the lib and the bin.
 //
 // Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`.
