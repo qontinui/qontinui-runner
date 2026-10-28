@@ -164,6 +164,29 @@ pub(crate) fn share(cap: HostCapacity, n: u32) -> HostCapacity {
     }
 }
 
+/// The build-token memory `admitted` concurrent dispatches are sized to use,
+/// in bytes: `admitted × derive(share(cap, admitted)).cargo_build_jobs ×`
+/// [`BYTES_PER_BUILD_TOKEN`]. PURE. `None` when memory is unreadable — the
+/// sizing then falls back to a conservative guess, and a guess is not a burst
+/// anyone promised.
+///
+/// This is the burst the node has PROMISED to allow, in this module's own
+/// units — which is what plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`'s
+/// resolved Open question 1 prices as the alternative to scaling the commit
+/// ladder linearly in the commit limit (`resource_guard::admitted_concurrency_scale`).
+/// Shadow-logged only; nothing enforces on it.
+pub(crate) fn admitted_build_burst_bytes(cap: HostCapacity, admitted: u32) -> Option<u64> {
+    cap.mem_bytes.filter(|m| *m > 0)?;
+    let admitted = admitted.max(1);
+    let per_build = derive(share(cap, admitted)).cargo_build_jobs as u64;
+    Some(
+        (admitted as u64)
+            .saturating_mul(per_build)
+            .saturating_mul(BYTES_PER_BUILD_TOKEN),
+    )
+}
+
 /// Read the host's capacity. Blocking (a sysinfo memory refresh), so callers
 /// run it once per dispatch rather than per step.
 ///
