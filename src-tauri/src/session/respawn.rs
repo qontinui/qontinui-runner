@@ -738,6 +738,7 @@ async fn materialize(
             // so its continuation registration — and the consuming device id
             // coord keys the outcome write on — are not this box's to carry.
             gate_identity: None,
+            origin: crate::coord_drain_state::SpawnOrigin::Respawn,
         },
     )
     .map_err(RespawnError::Spawn)?;

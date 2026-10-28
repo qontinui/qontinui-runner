@@ -307,20 +307,35 @@ export function reduceCreatedTerminal(
 }
 
 /**
+ * The `terminal-created` event payload: the session's `TerminalInfo` plus the
+ * runner-local `surface` hint (Rust `TerminalCreatedEvent`, flattened beside
+ * the info because `TerminalInfo` is the cross-repo wire schema). `surface` is
+ * the runner's focus-coalescer verdict: always `true` for an operator-created
+ * tab, at most once per minute across unattended spawns (plan
+ * `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+ * D3).
+ */
+export type TerminalCreatedPayload = TerminalInfo & { surface?: boolean };
+
+/**
  * Pure helper: resolve the `activeId` to set after a `terminal-created` ingest.
  *
- * Returns `info.id` when this is a genuinely-NEW tab (`isNewTab === true`) so a
- * freshly-docked gate continuation is auto-selected the moment it lands —
- * surfacing it the same way the frontend-initiated `createTerminal` path does
- * (`setActiveId(info.id)`). Returns `null` (caller keeps the current selection)
- * when the ingest is a dedup'd re-delivery so a re-delivered event never steals
- * focus.
+ * Returns `info.id` only when this is a genuinely-NEW tab (`isNewTab === true`)
+ * AND the runner said to surface it (`info.surface === true`) — so the first
+ * continuation of a burst is auto-selected the moment it lands (the same way
+ * the frontend-initiated `createTerminal` path calls `setActiveId(info.id)`),
+ * while the rest of the burst appear as tabs without stealing the selection.
+ * Returns `null` (caller keeps the current selection) otherwise: a dedup'd
+ * re-delivery never steals focus, and an absent `surface` is not a yes.
  *
  * Exported so `useTerminalManager.test.ts` can drive the auto-select contract
  * without booting React (the listener is a thin `if (id) setActiveId(id)`).
  */
-export function nextActiveIdAfterIngest(info: TerminalInfo, isNewTab: boolean): string | null {
-  return isNewTab ? info.id : null;
+export function nextActiveIdAfterIngest(
+  info: TerminalCreatedPayload,
+  isNewTab: boolean,
+): string | null {
+  return isNewTab && info.surface === true ? info.id : null;
 }
 
 /**
@@ -1014,7 +1029,7 @@ export function useTerminalManager(
   // (`shouldIngestCreatedTerminal`), and dedups by id (`reduceCreatedTerminal`).
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen<TerminalInfo>("terminal-created", (event) => {
+    listen<TerminalCreatedPayload>("terminal-created", (event) => {
       const info = event.payload;
       // Route the event to the page it belongs to. A terminal created for
       // another page is ignored here — its own page's manager will claim it.
@@ -1040,9 +1055,13 @@ export function useTerminalManager(
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
       setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
-      if (selectId !== null) {
+      if (wasNew) {
         ingestedIds.current.add(info.id);
-        logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
+        logger.info(
+          `External terminal created: ${info.id} (${info.title}) [page ${pageId}] surface=${info.surface === true}`,
+        );
+      }
+      if (selectId !== null) {
         // Auto-select the just-appended externally-created tab so a docked gate
         // continuation is surfaced (selected) the moment it lands — matching
         // `createTerminal`'s `setActiveId(info.id)` (the frontend-initiated

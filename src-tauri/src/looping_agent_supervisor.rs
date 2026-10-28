@@ -950,7 +950,11 @@ async fn do_spawn(
             if focus {
                 // First-ever spawn (operator just enabled it): surface the tab.
                 // Relaunches/respawns deliberately do NOT yank focus.
-                crate::agent_runtime::emit_terminal_focus_request(app, &terminal_id);
+                crate::agent_runtime::emit_terminal_focus_request(
+                    app,
+                    &terminal_id,
+                    crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+                );
             }
         }
         Err(e) if e.starts_with(crate::resource_guard::CRITICAL_REFUSAL_PREFIX) => {
@@ -1181,6 +1185,7 @@ async fn spawn_looping_agent_terminal(
         ),
         // From the SAME carrier the argv above was built from.
         policy_delivery,
+        spawn_origin: crate::coord_drain_state::SpawnOrigin::LoopingAgent,
     };
 
     // The PTY seam derives workspace trust for `selected_config_dir` through

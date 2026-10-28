@@ -5878,6 +5878,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             crate::terminal::TrustArm::AccountChosenLater,
             // No spawn tenant — see the allocate above.
             None,
+            // A relay create names no reason — the same origin its drain gate uses.
+            crate::coord_drain_state::SpawnOrigin::Unknown,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {

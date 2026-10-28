@@ -4436,15 +4436,47 @@ struct TerminalFocusRequest<'a> {
     terminal_id: &'a str,
 }
 
-/// Emit a `terminal-focus-request` to the MAIN window only.
+/// The spawn origin of a delivered continuation: a work-unit dispatch when it
+/// carries a `dispatch_id`, otherwise a gate continuation — the same split
+/// [`continuation_drain_admission`] makes.
+fn continuation_spawn_origin(payload: &GateContinuationPayload) -> crate::coord_drain_state::SpawnOrigin {
+    if payload.dispatch_id.is_some() {
+        crate::coord_drain_state::SpawnOrigin::UnitContinuation
+    } else {
+        crate::coord_drain_state::SpawnOrigin::GateContinuation
+    }
+}
+
+/// A condition check is coord-dispatched (the origin its drain gate uses).
+const CONDITION_CHECK_SPAWN_ORIGIN: crate::coord_drain_state::SpawnOrigin =
+    crate::coord_drain_state::SpawnOrigin::CoordDispatch;
+
+/// Emit a `terminal-focus-request` to the MAIN window only — when the focus
+/// coalescer surfaces it.
+///
+/// `origin` is why the terminal was spawned. Unattended origins are coalesced
+/// to at most one view switch per minute across all of them
+/// ([`crate::terminal::focus_coalescer`], plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// D3); a terminal whose create-time `terminal-created` already carried the
+/// decision reuses it, so a tab that was not selected is never followed by a
+/// view switch to it. A suppressed request is a `debug!` and a `/health`
+/// `focusCoalescer.suppressedTotal` count, never silent.
 ///
 /// Uses `emit_to(get_main_window_label(), …)` — NOT the bare global `emit`
 /// (the `terminal-created` broadcast pattern) — so a pop-out webview is not
 /// yanked to this tab. The canonical main-window-label accessor
 /// (`qontinui_runner_lib::get_main_window_label()`, returns `"main"`) matches
 /// the #473 `ui-bridge:invoke-request` scoping.
-pub(crate) fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
+pub(crate) fn emit_terminal_focus_request(
+    app: &tauri::AppHandle,
+    terminal_id: &str,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) {
     use tauri::Emitter;
+    if !crate::terminal::focus_coalescer::decide_for_focus(origin, terminal_id) {
+        return;
+    }
     let payload = TerminalFocusRequest { terminal_id };
     if let Err(e) = app.emit_to(
         qontinui_runner_lib::get_main_window_label(),
@@ -4470,7 +4502,11 @@ fn focus_existing_continuation(terminal_id: &str) {
                 "agent_runtime: duplicate continuation folded onto existing live \
                  terminal_id={terminal_id} — emitting focus-request"
             );
-            emit_terminal_focus_request(&app, terminal_id);
+            emit_terminal_focus_request(
+                &app,
+                terminal_id,
+                crate::coord_drain_state::SpawnOrigin::GateContinuation,
+            );
         }
         None => {
             debug!(
@@ -6732,6 +6768,7 @@ async fn run_continuation_terminal(
             ),
             // Settled below, from the SAME carrier the argv is built from.
             policy_delivery: None,
+            spawn_origin: continuation_spawn_origin(payload),
         };
 
         // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -6969,7 +7006,7 @@ async fn run_continuation_terminal(
                 // SCOPED to the MAIN window (`emit_to`, NOT bare `emit`) so a pop-out
                 // window is not yanked to this tab — `terminal-created` is a global
                 // broadcast, but a focus action must target only `main`.
-                emit_terminal_focus_request(&app, &terminal_id);
+                emit_terminal_focus_request(&app, &terminal_id, continuation_spawn_origin(payload));
                 report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
                     .await;
                 return Ok(TerminalStart {
@@ -7844,6 +7881,7 @@ async fn run_condition_check_terminal(
         ),
         // From the SAME carrier the argv above was built from.
         policy_delivery,
+        spawn_origin: CONDITION_CHECK_SPAWN_ORIGIN,
     };
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
@@ -7881,7 +7919,7 @@ async fn run_condition_check_terminal(
             );
             // Surface it: switch the main view to the Terminal panel + select the
             // tab (scoped to the MAIN window, same as the gate path).
-            emit_terminal_focus_request(&app, &terminal_id);
+            emit_terminal_focus_request(&app, &terminal_id, CONDITION_CHECK_SPAWN_ORIGIN);
             // A CREATED pty is not a STARTED session (the 2026-10-01 incident the
             // gate path's start verdict exists for: `exec: claude: not found`,
             // pty gone in 73 ms). A condition check that never started has no

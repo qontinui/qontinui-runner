@@ -262,6 +262,8 @@ pub async fn terminal_create(
             // the account is chosen after this point.
             crate::terminal::TrustArm::AccountChosenLater,
             spawn_tenant_id,
+            // The runner UI's own "new terminal": always surfaces.
+            crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
     .await
@@ -2217,7 +2219,13 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
+    let outcome = crate::terminal::account_migration::migrate_session(
+        &app,
+        &record,
+        &src,
+        &dst,
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+    )
         .inspect_err(|_| {
             // The session never reached `dst`: it must not count as a handoff.
             crate::ai_provider::unrecord_handoff(&dst);
@@ -2323,6 +2331,11 @@ pub(crate) struct SessionCaptureHint {
     /// from the runner's own environment cannot vouch for a delivery this child
     /// never received.
     pub policy_delivery: Option<crate::session::spawn_prompt::PolicyDelivery>,
+    /// Why this backend spawn happens. Decides whether its tab is selected on
+    /// `terminal-created` (unattended origins are coalesced to one per
+    /// minute, [`crate::terminal::focus_coalescer`]); no default, so every
+    /// caller states it.
+    pub spawn_origin: crate::coord_drain_state::SpawnOrigin,
 }
 
 /// Env var carrying the `coord.gates` row id a continuation session must report
@@ -2600,6 +2613,11 @@ pub(crate) fn create_terminal_session_backend(
         crate::terminal::TrustArm::Pinned(capture_hint.as_ref().and_then(|h| h.config_dir.clone())),
         // A gate continuation is coord-spawned: no picker chose a tenant.
         None,
+        // Every tracked caller states its origin on the hint; a hint-less
+        // spawn cannot, and is coalesced as unattended (fail closed).
+        capture_hint
+            .as_ref()
+            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| h.spawn_origin),
     )?;
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
@@ -2760,6 +2778,8 @@ pub(crate) fn create_terminal_session_backend(
                 coord_lineage: _,
                 // Consumed earlier (env injection at spawn); not needed here.
                 policy_delivery: _,
+                // Consumed earlier (the `terminal-created` surface decision).
+                spawn_origin: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".
@@ -3523,6 +3543,7 @@ mod tests {
             gate_identity: None,
             coord_lineage,
             policy_delivery: None,
+            spawn_origin: crate::coord_drain_state::SpawnOrigin::GateContinuation,
         };
 
         let pinned = hint(Some(CoordSessionLineage::for_pinned_session("pinned-1")));
@@ -3570,6 +3591,7 @@ mod tests {
             gate_identity: None,
             coord_lineage: None,
             policy_delivery: None,
+            spawn_origin: crate::coord_drain_state::SpawnOrigin::GateContinuation,
         });
         warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");
         assert_eq!(

@@ -634,6 +634,7 @@ async fn resume_one(
                     // The source's continuation registration, if any, is not
                     // re-claimed from a closed row.
                     gate_identity: None,
+                    origin: crate::coord_drain_state::SpawnOrigin::BootResume,
                 },
             )
         })

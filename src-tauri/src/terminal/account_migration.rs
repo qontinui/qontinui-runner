@@ -226,7 +226,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    match migrate_session(&app, &record, &src, &dst) {
+    match migrate_session(
+        &app,
+        &record,
+        &src,
+        &dst,
+        crate::coord_drain_state::SpawnOrigin::Respawn,
+    ) {
         Ok(outcome) => {
             info!(
                 session = %record.claude_session_id,
@@ -540,6 +546,9 @@ pub(crate) struct ResumeSpawn<'a> {
     /// `None` on the cross-machine respawn receiver, whose source session's
     /// continuation registration lives on a different device entirely.
     pub gate_identity: Option<crate::commands::terminal::GateIdentity>,
+    /// Why this pane is being spawned — decides whether its tab is selected
+    /// (`terminal-created` `surface`, [`crate::terminal::focus_coalescer`]).
+    pub origin: crate::coord_drain_state::SpawnOrigin,
 }
 
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
@@ -620,6 +629,7 @@ pub(crate) fn spawn_resumed_pane(
         // must answer. Dropping it here would leave the resumed session unable
         // to report `work_completed` for work it goes on to finish.
         gate_identity: spec.gate_identity,
+        spawn_origin: spec.origin,
         coord_lineage: spec.coord_lineage,
         // From the SAME carrier the argv above was built from — withheld when
         // an operator template put a replacement prompt in that argv.
@@ -737,6 +747,9 @@ pub fn migrate_session(
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
+    // `OperatorTerminal` for the operator's click (its new tab is selected);
+    // `Respawn` for the automatic usage-limit path, which is coalesced.
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<MigrationOutcome, String> {
     use tauri::Manager;
 
@@ -896,6 +909,7 @@ pub fn migrate_session(
             // (its source is already closed) and passes `false`.
             resource_override: true,
             gate_identity: carried_gate_identity,
+            origin,
         },
     );
     // GUARD: anchor-held window closes at the `restore_continuation_registration`

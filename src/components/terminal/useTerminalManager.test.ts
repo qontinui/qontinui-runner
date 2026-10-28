@@ -29,6 +29,7 @@ import {
   type TerminalTab,
   type SessionIdsByTerminal,
 } from "./useTerminalManager";
+import type { TerminalCreatedPayload } from "./useTerminalManager";
 import type { TerminalSessionRecord } from "./types";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -45,8 +46,8 @@ const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => (
 const createdEvent = (
   id: string,
   pageId: string,
-  overrides: Partial<TerminalInfo> = {},
-): TerminalInfo => ({
+  overrides: Partial<TerminalCreatedPayload> = {},
+): TerminalCreatedPayload => ({
   id,
   title: id,
   pid: 100,
@@ -147,18 +148,60 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
 // nothing. `nextActiveIdAfterIngest` is the pure decision the listener consults
 // before `setActiveId`. (Plan: 2026-06-07-gate-continuation-auto-surface-and-focus.)
 describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
-  it("returns the new terminal id when this is a genuinely-new tab", () => {
-    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), true)).toBe("cont-1");
+  const surfaced = { surface: true };
+
+  it("returns the new terminal id when this is a genuinely-new tab the runner surfaced", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default", surfaced), true)).toBe(
+      "cont-1",
+    );
   });
 
   it("returns null for a dedup'd re-delivery so focus is never stolen", () => {
-    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), false)).toBeNull();
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default", surfaced), false)).toBeNull();
+  });
+
+  // Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+  // continuation-cap, D3: the runner coalesces unattended spawns to one
+  // surfaced tab per minute; the rest carry `surface: false` and must appear
+  // as tabs WITHOUT taking the selection.
+  it("surface:false — a new tab the runner coalesced is NOT selected", () => {
+    expect(
+      nextActiveIdAfterIngest(createdEvent("cont-3", "default", { surface: false }), true),
+    ).toBeNull();
+  });
+
+  it("surface:true — a new tab the runner surfaced IS selected", () => {
+    expect(
+      nextActiveIdAfterIngest(createdEvent("cont-4", "default", { surface: true }), true),
+    ).toBe("cont-4");
+  });
+
+  it("an absent surface is not a yes", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-5", "default"), true)).toBeNull();
+  });
+
+  it("a burst: only the surfaced tab of three new tabs is selected, all three are appended", () => {
+    let tabs: TerminalTab[] = [];
+    const selected: string[] = [];
+    for (const [id, surface] of [
+      ["b-1", true],
+      ["b-2", false],
+      ["b-3", false],
+    ] as const) {
+      const info = createdEvent(id, "default", { surface });
+      const isNew = !tabs.some((t) => t.id === info.id);
+      tabs = reduceCreatedTerminal(tabs, info);
+      const sel = nextActiveIdAfterIngest(info, isNew);
+      if (sel !== null) selected.push(sel);
+    }
+    expect(tabs.map((t) => t.id)).toEqual(["b-1", "b-2", "b-3"]);
+    expect(selected).toEqual(["b-1"]);
   });
 
   it("end-to-end: a fresh continuation ingest both appends AND selects the tab", () => {
     // Mirror the listener: reduce (append) + decide selection from is-new.
     const prev: TerminalTab[] = [];
-    const info = createdEvent("cont-2", "default");
+    const info = createdEvent("cont-2", "default", surfaced);
     const isNew = !prev.some((t) => t.id === info.id);
     const next = reduceCreatedTerminal(prev, info);
     expect(next).not.toBe(prev); // appended
@@ -167,7 +210,7 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
 
   it("end-to-end: a re-delivered continuation neither re-appends NOR re-selects", () => {
     const prev: TerminalTab[] = [tab("cont-2")];
-    const info = createdEvent("cont-2", "default");
+    const info = createdEvent("cont-2", "default", surfaced);
     const isNew = !prev.some((t) => t.id === info.id);
     const next = reduceCreatedTerminal(prev, info);
     expect(next).toBe(prev); // dedup'd — same identity

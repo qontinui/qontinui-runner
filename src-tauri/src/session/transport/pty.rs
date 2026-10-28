@@ -91,6 +91,8 @@ impl Transport for PtyTransport {
                 crate::terminal::TrustArm::AccountChosenLater,
                 // No tenant choice on this transport.
                 None,
+                // `SessionIntent` carries no spawn origin.
+                crate::coord_drain_state::SpawnOrigin::Unknown,
             )
             .map_err(TransportError::Runtime)?;
 

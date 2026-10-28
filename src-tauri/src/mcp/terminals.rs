@@ -423,6 +423,8 @@ pub async fn create_terminal_handler(
         // by whatever the caller types into the shell.
         trust_arm,
         spawn_tenant,
+        // The HTTP `POST /terminals` door cannot name its caller's reason.
+        crate::coord_drain_state::SpawnOrigin::Unknown,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {
