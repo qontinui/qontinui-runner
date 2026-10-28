@@ -4407,6 +4407,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     std::sync::Arc::new(session::reconcile::DiskTranscriptIndex::discover());
                 lifecycle_store.attach_transcript_probe(transcript_index.clone());
 
+                // Observation epoch (plan 2026-10-28-force-exited-runner-strands-
+                // open-sessions-out-of-the-restore-set): latch the PRIOR
+                // process's last successful observation BEFORE the census
+                // latches, so census, restore read and ledger roster share one
+                // admission. The liveness poll advances it below.
+                lifecycle_store.attach_observation_epoch(std::sync::Arc::new(
+                    session::observation_epoch::ObservationEpoch::open(
+                        &session::observation_epoch::epoch_path(),
+                        session::session_ledger::process_boot_ms(),
+                    ),
+                ));
+
                 // RESTORE CENSUS (plan
                 // `2026-08-16-runner-session-info-dropdown-and-restore-verification`
                 // D6/P5) — LATCH the pre-restart `expected` set RIGHT HERE, and
@@ -4728,6 +4740,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // stays the only per-record syscall. The claude-present
                         // signal needs image names and the PID-reuse guard needs
                         // creation times — both carried on the snapshot.
+                        let snap_captured_at_ms = chrono::Utc::now().timestamp_millis();
                         let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
                         // A totally-empty system parent_map means the snapshot
                         // helper failed → classify Skips every matched record.
@@ -5135,6 +5148,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // Uncertain — do NOT touch the counters.
                                 }
                             }
+                        }
+
+                        // The classify loop has run to completion, so every
+                        // live row this snapshot saw has been touched: only
+                        // NOW may the observation epoch advance (never on a
+                        // failed snapshot — it observed nothing).
+                        if let Some(epoch) = poll_lifecycle_store.observation_epoch() {
+                            epoch.record_tick(tick_snapshot_ok, snap_captured_at_ms);
                         }
 
                         if held_for_restore > 0 {
