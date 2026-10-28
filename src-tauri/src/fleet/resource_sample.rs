@@ -965,10 +965,10 @@ fn collect_host_lane() -> ResourceSample {
     // Same volume probe the disk floor gates on, so the dashboard's disk figure
     // and the gate's are literally one reading.
     if let Some(root) = crate::agent_runtime::qontinui_root_dir() {
-        if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
-            s.disk_mount = Some(mount.to_string_lossy().to_string());
-            s.disk_total_bytes = Some(total);
-            s.disk_free_bytes = Some(free);
+        if let Some(volume) = crate::ci_node::admission::probe_volume_for(&root) {
+            s.disk_mount = Some(volume.mount.to_string_lossy().to_string());
+            s.disk_total_bytes = Some(volume.total);
+            s.disk_free_bytes = Some(volume.available);
         }
     }
 
@@ -1380,10 +1380,10 @@ fn attach_wsl_disk(sample: &mut ResourceSample) {
     // The SAME single enumeration site the host lane and the CI-node disk floor
     // read, so the dashboard's number and the gate's are one reading rather
     // than two instruments that agree on a name.
-    if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
-        sample.disk_mount = Some(mount.to_string_lossy().to_string());
-        sample.disk_total_bytes = Some(total);
-        sample.disk_free_bytes = Some(free);
+    if let Some(volume) = crate::ci_node::admission::probe_volume_for(&root) {
+        sample.disk_mount = Some(volume.mount.to_string_lossy().to_string());
+        sample.disk_total_bytes = Some(volume.total);
+        sample.disk_free_bytes = Some(volume.available);
     }
 }
 
