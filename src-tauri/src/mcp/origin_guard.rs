@@ -534,6 +534,11 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-test"),
     ("POST", "/ai/suggest-exploration-strategy"),
     ("POST", "/api-request/import-curl"),
+    // passive real-session capture: the embedding app's page relays each
+    // human interaction, with the snapshot relay's trust (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 3)
+    ("POST", "/apps/{app_id}/journey/observe"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/awas/actions"),
     ("GET", "/check-groups"),

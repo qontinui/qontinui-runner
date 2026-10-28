@@ -224,6 +224,7 @@ mod tests {
             app_id: "app".into(),
             runner_instance: "primary".into(),
             scope: None,
+            explorer: false,
         };
         cursors.observe(&key, seen(), aff, now);
         cursors.open(
@@ -286,6 +287,7 @@ mod tests {
                         navigation: false,
                     },
                     action_effects: BTreeMap::new(),
+                    offers_click: true,
                 },
             );
         }

@@ -485,6 +485,31 @@ pub async fn dispatch_app_request_by_id(
     .await
 }
 
+/// [`dispatch_app_request_by_id`] keeping the typed error, for a caller that
+/// must tell an app's own failure from a transport one
+/// ([`dispatch_failure_origin`]).
+async fn dispatch_app_request_by_id_typed(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    dispatch_app_request_by_id_typed_with(
+        &state.app_registry,
+        &state.app_dispatcher,
+        app_id,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+}
+
 /// [`dispatch_app_request_by_id`] over the registry and dispatcher alone, so
 /// a test drives the real body without building an `ApiState`.
 #[allow(clippy::too_many_arguments)]
@@ -498,11 +523,105 @@ async fn dispatch_app_request_by_id_with(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    dispatch_app_request_by_id_typed_with(
+        registry,
+        dispatcher,
+        app_id,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+    .map_err(dispatch_err_to_string)
+}
+
+/// The one body of the by-id dispatch: pick the payload for the app's
+/// transport, then dispatch.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_app_request_by_id_typed_with(
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
     let payload = select_app_payload(registry, app_id, ws_payload, http_body).await;
     dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
-        .map_err(dispatch_err_to_string)
+}
+
+/// Where a dispatch failure came from — three values, decided by the error's
+/// CLASS (an exhaustive match, so a new class must be placed):
+///
+/// - `"app"`: the app itself answered with a failure
+///   ([`DispatchError::AppAnswered`], a wrapper `WrapperError`);
+/// - `"transport"`: the request was never delivered to the app, so no UI
+///   was touched — not registered, not connected, short-circuited as
+///   unresponsive, a WebSocket closed before delivery, a frame that could
+///   not be encoded, or an HTTP request that never connected (or was never
+///   built);
+/// - `"unknown"`: it may have reached the app, but what the app did could not
+///   be read — a relay timeout, an unreadable response frame, a displaced
+///   in-flight command, a non-2xx or non-JSON HTTP reply, or an HTTP failure
+///   after connecting (a timeout, a broken body). Never the app's own
+///   failure, and never "unreachable": the app may have acted.
+pub(crate) fn dispatch_failure_origin(err: &DispatchError) -> &'static str {
+    use super::command_relay::CommandRelayError;
+    match err {
+        DispatchError::AppAnswered { .. }
+        | DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => "app",
+        DispatchError::NotRegistered(_)
+        | DispatchError::NotConnected
+        | DispatchError::NotResponsive(_)
+        | DispatchError::WebSocket(
+            CommandRelayError::NotConnected(_)
+            | CommandRelayError::Disconnected
+            | CommandRelayError::EncodeFailed(_),
+        ) => "transport",
+        DispatchError::HttpSend { source, .. } if source.is_connect() || source.is_builder() => {
+            "transport"
+        }
+        DispatchError::HttpSend { .. }
+        | DispatchError::HttpStatus { .. }
+        | DispatchError::InvalidJson(_)
+        | DispatchError::WebSocket(
+            CommandRelayError::UnreadableResponse(_)
+            | CommandRelayError::Timeout(_)
+            | CommandRelayError::Displaced(_),
+        ) => "unknown",
+    }
+}
+
+/// The answer of an ACTING SDK route whose NAMED-app (`?app_id=`) by-id
+/// dispatch failed. Labelled by the error's class
+/// ([`dispatch_failure_origin`]), exactly as `handle_snapshot`'s by-id branch
+/// labels a snapshot failure: an app that ANSWERED with a failure
+/// ([`DispatchError::AppAnswered`], a wrapper `WrapperError`) is
+/// `failure_origin: "app"` — the journey ledger writes its `error` edge and
+/// the explorer reads a failed activation, never `app_unreachable`; one whose
+/// answer could not be read is `"unknown"` (the explorer's
+/// `action_outcome_unknown`); only a request never delivered is
+/// `"transport"`. A named app is never retried on the runner's own webview,
+/// whatever the class.
+pub(crate) fn named_dispatch_refusal(route: &str, err: &DispatchError) -> serde_json::Value {
+    ipc_fallback_refusal(err, route)
+        .unwrap_or_else(|| no_fallback_refusal(route, &dispatch_err_message(err)))
+}
+
+/// The explorer's own fallback gate, asked by an acting route after
+/// [`ipc_fallback_refusal`] has allowed the runner-webview fallback: inside an
+/// explorer run ([`crate::journey::capture::in_explorer_run`]) the answer is a
+/// transport refusal — the explorer acts only on the app it named, and a
+/// click must never land on the runner's own webview instead. `None` outside
+/// a run: the fallback proceeds.
+pub(crate) fn explorer_fallback_refusal(route: &str) -> Option<serde_json::Value> {
+    crate::journey::capture::in_explorer_run().then(|| no_fallback_refusal(route, "explorer run"))
 }
 
 /// Fallback `code` on the failure body a handler answers when the IPC
@@ -548,11 +667,11 @@ fn app_code_from_body(body: &str) -> Option<String> {
 /// `Disconnected`/`Displaced` would read "not connected" and fall back —
 /// the very retargeting this gate exists to refuse.
 ///
-/// `failure_origin` is `"app"` when the app itself answered with a failure
-/// ([`DispatchError::AppAnswered`], or a wrapper `WrapperError` over the
-/// relay) and `"transport"` for everything else — including a response frame
-/// the relay could not read (`UnreadableResponse`), whose outcome is unknown
-/// and which is never the app's own failure. `code` is the app's own code
+/// `failure_origin` is [`dispatch_failure_origin`]'s: `"app"` when the app
+/// itself answered with a failure, `"unknown"` when it may have been reached
+/// but its answer could not be read (a timeout, an unreadable frame, a
+/// non-2xx or non-JSON reply), `"transport"` when the request was never
+/// delivered. `code` is the app's own code
 /// when the error carries one — for a WebSocket wrapper, the `code` of its
 /// structured failure frame (`NO_HANDLER`, `HANDLER_ERROR`, …) — else
 /// [`SDK_DISPATCH_FAILED`]. `retryable` is the wrapper's own retry verdict when
@@ -562,23 +681,26 @@ fn app_code_from_body(body: &str) -> Option<String> {
 /// Case 1.
 fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::Value> {
     use super::command_relay::CommandRelayError;
-    let (origin, app_code, retryable) = match err {
+    let (app_code, retryable) = match err {
         DispatchError::NotConnected => return None,
         DispatchError::AppAnswered {
             code, retryable, ..
-        } => ("app", code.clone(), *retryable),
+        } => (code.clone(), *retryable),
         DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
-            ("app", failure.code.clone(), failure.retryable)
+            (failure.code.clone(), failure.retryable)
         }
-        DispatchError::HttpStatus { body, .. } => ("transport", app_code_from_body(body), None),
-        _ => ("transport", None, None),
+        DispatchError::HttpStatus { body, .. } => (app_code_from_body(body), None),
+        _ => (None, None),
     };
+    let origin = dispatch_failure_origin(err);
     let detail = dispatch_err_message(err);
     let code = app_code.unwrap_or_else(|| SDK_DISPATCH_FAILED.to_string());
-    let what = if origin == "app" {
-        "the connected SDK app answered with a failure"
-    } else {
-        "dispatch to the connected SDK app failed"
+    let what = match origin {
+        "app" => "the connected SDK app answered with a failure",
+        "unknown" => {
+            "the connected SDK app's answer could not be read, so whether it acted is unknown"
+        }
+        _ => "dispatch to the connected SDK app failed",
     };
     Some(serde_json::json!({
         "success": false,
@@ -1683,6 +1805,120 @@ pub struct SdkActionQueryParams {
         alias = "target_tab_id"
     )]
     pub tab_id: Option<String>,
+    /// Dispatch to this REGISTERED app by id (as `GET /ui-bridge/sdk/snapshot
+    /// ?app_id=` does) instead of the active connection — and never fall back
+    /// to the runner's own webview: a by-id action that cannot reach its app
+    /// is a transport refusal. The journey explorer always names its app
+    /// (plan 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-
+    /// of-time, Phase 3), so a connection that drops or switches between its
+    /// check and the dispatch can never redirect a click onto another UI.
+    #[serde(default, alias = "appId")]
+    pub app_id: Option<String>,
+}
+
+/// The answer of an SDK action route that refused to fall back to the
+/// runner's own webview: a TRANSPORT-origin refusal, which the journey ledger
+/// records nothing for (no UI was acted on).
+pub(crate) fn no_fallback_refusal(route: &str, why: &str) -> serde_json::Value {
+    serde_json::json!({
+        "success": false,
+        "error": format!("{route}: {why}; not falling back to the runner's own webview"),
+        "code": "SDK_DISPATCH_FAILED",
+        "failure_origin": "transport",
+    })
+}
+
+/// The named-app (`?app_id=`) arm of [`handle_element_action`], over the
+/// registry and dispatcher alone so a test drives the real answer
+/// construction: `(body, success, error)`.
+///
+/// An answer with no boolean `success` is normalised to an explicit failure
+/// (`INDETERMINATE:`, [`ws_element_action_result`]) and ALSO tagged
+/// `failure_origin: "unknown"`: the app answered, but whether it acted cannot
+/// be read from what it said — so the explorer reads an unknown outcome, never
+/// a failed attempt.
+async fn named_element_action_with(
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    app: &str,
+    ws_payload: serde_json::Value,
+    path: &str,
+    body: serde_json::Value,
+) -> (serde_json::Value, bool, Option<String>) {
+    match dispatch_app_request_by_id_typed_with(
+        registry,
+        dispatcher,
+        app,
+        "executeElementAction",
+        ws_payload,
+        Method::POST,
+        path,
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => {
+            let (data, outcome) = indeterminate_is_unknown(data);
+            let err = outcome.error_message();
+            (data, outcome.succeeded(), err)
+        }
+        Err(e) => {
+            let refusal = named_dispatch_refusal("element action", &e);
+            let err = refusal["error"].as_str().map(String::from);
+            (refusal, false, err)
+        }
+    }
+}
+
+/// The named-app (`?app_id=`) arm of [`handle_page_navigate`], over the
+/// registry and dispatcher alone so a test drives the real answer
+/// construction.
+async fn named_page_navigate_with(
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    app: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    match dispatch_app_request_by_id_typed_with(
+        registry,
+        dispatcher,
+        app,
+        "pageNavigate",
+        body.clone(),
+        Method::POST,
+        "/control/page/navigate",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => indeterminate_is_unknown(data).0,
+        Err(e) => named_dispatch_refusal("page/navigate", &e),
+    }
+}
+
+/// Normalise an app's action answer ([`ws_element_action_result`]'s rule): an
+/// answer with no boolean `success` becomes an explicit failure
+/// (`INDETERMINATE:`) and is ALSO tagged `failure_origin: "unknown"` — the
+/// app answered, but whether it acted cannot be read from what it said.
+fn indeterminate_is_unknown(
+    data: serde_json::Value,
+) -> (serde_json::Value, super::ui_bridge::request::ActionOutcome) {
+    let (mut data, outcome) = super::ui_bridge::request::normalize_action_result(data);
+    if outcome == super::ui_bridge::request::ActionOutcome::Indeterminate {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("failure_origin".to_string(), serde_json::json!("unknown"));
+        }
+    }
+    (data, outcome)
+}
+
+/// The `app_id` / `appId` an SDK request names, trimmed; `None` when absent.
+fn named_app(query: &HashMap<String, String>) -> Option<String> {
+    query
+        .get("app_id")
+        .or_else(|| query.get("appId"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Append a `tabId=<id>` query parameter to an SDK-relay HTTP path, preserving
@@ -1735,7 +1971,7 @@ fn ipc_element_action_result(data: serde_json::Value) -> (serde_json::Value, boo
 /// The active SDK connection's `(app_id, version)`, if one is connected —
 /// the app `dispatch_active` will route to. Used by the journey ledger to
 /// attribute an action or snapshot to the app it actually reached.
-async fn active_app_identity(state: &Arc<ApiState>) -> Option<(String, Option<String>)> {
+pub(crate) async fn active_app_identity(state: &Arc<ApiState>) -> Option<(String, Option<String>)> {
     let guard = state.sdk_connection.lock().await;
     guard
         .active_connection()
@@ -1779,7 +2015,7 @@ fn record_journey_snapshot(
 }
 
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
-async fn handle_element_action(
+pub(crate) async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SdkActionQueryParams>,
@@ -1813,81 +2049,110 @@ async fn handle_element_action(
     // The app this action lands on, for the journey ledger: the active SDK
     // connection (read here, before dispatch, exactly as dispatch reads it),
     // or the runner's own webview when the IPC fallback below runs instead.
-    let active_app = active_app_identity(&state).await;
+    let named = query
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let active_app = match &named {
+        Some(app) => Some((app.clone(), app_version_for(&state, app).await)),
+        None => active_app_identity(&state).await,
+    };
     let mut acted_via_ipc = false;
-    let result = match dispatch_app_request_typed(
-        &state,
-        "executeElementAction",
-        ws_payload,
-        Method::POST,
-        &path,
-        Some(body.clone()),
-    )
-    .await
-    {
-        Ok(data) => {
-            // Normalised at THIS boundary: the app's JSON is forwarded to the
-            // caller and logged below, so a body with no boolean `success` (a
-            // relay frame whose `result` was absent arrives as `null`) is
-            // rewritten to an explicit `success: false` + `INDETERMINATE:`
-            // error instead of reading as success here and at every
-            // permissive consumer downstream.
-            let (data, success, err) = ws_element_action_result(data);
-            (Json(data), success, err)
-        }
-        Err(e) => {
-            // An SDK app is connected: its dispatch error IS the answer. Never
-            // retarget the action onto the runner's own UI (Case 1).
-            if let Some(refusal) = ipc_fallback_refusal(&e, "element action") {
-                let err = refusal
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                // Recorded as a FAILED action_executed event below. The
-                // journey ledger decides on the refusal's `failure_origin`
-                // (N3): a TRANSPORT refusal reached no UI and records nothing
-                // (the control twin's 4xx rule); an APP-origin failure
-                // reached the app and is an `error` edge.
-                (Json(refusal), false, err)
-            } else {
-                acted_via_ipc = true;
-                // Fall back to IPC — wrap action in an object to match the format
-                // expected by the TypeScript handler (action.action, action.params, etc.)
-                let params = body
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                let wait_options = body
-                    .get("waitOptions")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                // Forward the D3 effect-calculus per-request opt-in so the IPC path
-                // matches the WS/HTTP path (which forwards the body verbatim). Without
-                // this, `effect_check` would never receive `effectVerification` when
-                // the executor falls back to IPC.
-                let verify_effect = body
-                    .get("verifyEffect")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                let payload = serde_json::json!({
-                    "elementId": id,
-                    "action": {
-                        "action": action_name,
-                        "params": params,
-                        "waitOptions": wait_options,
-                        "verifyEffect": verify_effect
+    let result = if let Some(app) = &named {
+        // A NAMED app: by-id dispatch, no fallback (see `app_id`); a failure
+        // says whether the APP answered it (`named_dispatch_refusal`).
+        let (data, success, err) = named_element_action_with(
+            &state.app_registry,
+            &state.app_dispatcher,
+            app,
+            ws_payload,
+            &path,
+            body.clone(),
+        )
+        .await;
+        (Json(data), success, err)
+    } else {
+        match dispatch_app_request_typed(
+            &state,
+            "executeElementAction",
+            ws_payload,
+            Method::POST,
+            &path,
+            Some(body.clone()),
+        )
+        .await
+        {
+            Ok(data) => {
+                // Normalised at THIS boundary: the app's JSON is forwarded to the
+                // caller and logged below, so a body with no boolean `success` (a
+                // relay frame whose `result` was absent arrives as `null`) is
+                // rewritten to an explicit `success: false` + `INDETERMINATE:`
+                // error instead of reading as success here and at every
+                // permissive consumer downstream.
+                let (data, success, err) = ws_element_action_result(data);
+                (Json(data), success, err)
+            }
+            Err(e) => {
+                // An SDK app is connected: its dispatch error IS the answer. Never
+                // retarget the action onto the runner's own UI (Case 1).
+                if let Some(refusal) = ipc_fallback_refusal(&e, "element action") {
+                    let err = refusal
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    // Recorded as a FAILED action_executed event below. The
+                    // journey ledger decides on the refusal's `failure_origin`
+                    // (N3): a TRANSPORT refusal reached no UI and records nothing
+                    // (the control twin's 4xx rule); an APP-origin failure
+                    // reached the app and is an `error` edge.
+                    (Json(refusal), false, err)
+                } else if let Some(refusal) = explorer_fallback_refusal("element action") {
+                    // The explorer acts only on the app it named; a click must
+                    // never land on the runner's own webview instead.
+                    let err = refusal["error"].as_str().map(String::from);
+                    (Json(refusal), false, err)
+                } else {
+                    acted_via_ipc = true;
+                    // Fall back to IPC — wrap action in an object to match the format
+                    // expected by the TypeScript handler (action.action, action.params, etc.)
+                    let params = body
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    let wait_options = body
+                        .get("waitOptions")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    // Forward the D3 effect-calculus per-request opt-in so the IPC path
+                    // matches the WS/HTTP path (which forwards the body verbatim). Without
+                    // this, `effect_check` would never receive `effectVerification` when
+                    // the executor falls back to IPC.
+                    let verify_effect = body
+                        .get("verifyEffect")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    let payload = serde_json::json!({
+                        "elementId": id,
+                        "action": {
+                            "action": action_name,
+                            "params": params,
+                            "waitOptions": wait_options,
+                            "verifyEffect": verify_effect
+                        }
+                    });
+                    match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                        Ok(data) => {
+                            let (data, success, err) = ipc_element_action_result(data);
+                            (Json(data), success, err)
+                        }
+                        Err(e) => (
+                            Json(serde_json::json!({ "success": false, "error": e })),
+                            false,
+                            Some(e),
+                        ),
                     }
-                });
-                match ui_bridge_request_sync(&state, "execute_action", payload).await {
-                    Ok(data) => {
-                        let (data, success, err) = ipc_element_action_result(data);
-                        (Json(data), success, err)
-                    }
-                    Err(e) => (
-                        Json(serde_json::json!({ "success": false, "error": e })),
-                        false,
-                        Some(e),
-                    ),
                 }
             }
         }
@@ -1919,6 +2184,7 @@ async fn handle_element_action(
             crate::journey::cursor::Provenance {
                 app_version,
                 run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
+                ..Default::default()
             },
             !result.1,
         );
@@ -1971,7 +2237,7 @@ async fn handle_element_action(
 /// directly (via `AppDispatcher::dispatch`) instead of relying on the
 /// active SDK connection. Mirrors the per-app-id query param accepted by
 /// `handle_component_action`.
-async fn handle_snapshot(
+pub(crate) async fn handle_snapshot(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -2033,9 +2299,16 @@ async fn handle_snapshot(
     // Per-app-id dispatch: route to the named registered app and skip
     // both the active-SDK-connection probe and the IPC fallback (the
     // caller asked for a specific app — silently falling back would mask
-    // the real failure mode).
-    if let Some(app_id) = query.get("app_id").map(|s| s.as_str()) {
-        return match dispatch_app_request_by_id(
+    // the real failure mode). A failure says whether the APP answered it
+    // (`failure_origin: "app"`), whether it may have reached the app but its
+    // answer could not be read (`"unknown"`), or it never reached the app
+    // (`"transport"`): the explorer reads only the last as `app_unreachable`
+    // (plan 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-
+    // of-time, Phase 3).
+    // The same reading of `app_id` / `appId`, trimmed, as the acting routes.
+    if let Some(app_id) = named_app(&query) {
+        let app_id = app_id.as_str();
+        return match dispatch_app_request_by_id_typed(
             &state,
             app_id,
             "getControlSnapshot",
@@ -2054,7 +2327,11 @@ async fn handle_snapshot(
             }
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "success": false, "error": e })),
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": dispatch_err_message(&e),
+                    "failure_origin": dispatch_failure_origin(&e),
+                })),
             )
                 .into_response(),
         };
@@ -3185,17 +3462,34 @@ async fn handle_page_refresh_dispatch(
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
 /// `/sdk/page/navigate` is a `navigation` edge (`push`, or `replace` when the request says so); the URL is never recorded.
-async fn handle_page_navigate(
+pub(crate) async fn handle_page_navigate(
     State(state): State<Arc<ApiState>>,
     Query(journey_query): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let active_app = active_app_identity(&state).await;
     let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
     let action = crate::journey::cursor::ActionSpec::navigation(
         "navigate",
         crate::journey::cursor::push_or_replace(&body),
     );
+    if let Some(app) = named_app(&journey_query) {
+        // A NAMED app: by-id dispatch, no fallback (see
+        // `SdkActionQueryParams::app_id`).
+        let version = app_version_for(&state, &app).await;
+        let response = Json(
+            named_page_navigate_with(&state.app_registry, &state.app_dispatcher, &app, body).await,
+        );
+        crate::journey::capture::record_sdk_result(
+            &state,
+            Some((app, version)),
+            scope.as_deref(),
+            false,
+            &response.0,
+            action,
+        );
+        return response;
+    }
+    let active_app = active_app_identity(&state).await;
     let response = handle_page_navigate_dispatch(State(Arc::clone(&state)), Json(body)).await;
     crate::journey::capture::record_sdk_result(
         &state,
@@ -3227,6 +3521,9 @@ async fn handle_page_navigate_dispatch(
         Ok(data) => Json(data),
         Err(sdk_err) => {
             if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "page/navigate") {
+                return Json(refusal);
+            }
+            if let Some(refusal) = explorer_fallback_refusal("page/navigate") {
                 return Json(refusal);
             }
             // Runner-local fallback: `dispatch_app_request` failing means no
@@ -4584,6 +4881,7 @@ async fn handle_ct_execute_with_diff(
             crate::journey::cursor::Provenance {
                 app_version,
                 run_id: None,
+                ..Default::default()
             },
             failed,
         );
@@ -5211,6 +5509,7 @@ fn record_sdk_component_action(
         crate::journey::cursor::Provenance {
             app_version,
             run_id: None,
+            ..Default::default()
         },
         sdk_response_failed(response),
     );
@@ -5246,6 +5545,7 @@ fn record_sdk_batch(
         crate::journey::cursor::Provenance {
             app_version,
             run_id: None,
+            ..Default::default()
         },
         sdk_response_failed(response),
     );
@@ -8298,15 +8598,173 @@ mod tests {
 
     #[test]
     fn refusal_labels_transport_failures() {
-        let err = DispatchError::WebSocket(CommandRelayError::Timeout(
-            std::time::Duration::from_secs(30),
-        ));
+        let err = DispatchError::WebSocket(CommandRelayError::Disconnected);
         let refusal = ipc_fallback_refusal(&err, "ai/execute").expect("refused");
         assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
         assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
         assert!(refusal["error"]
             .as_str()
             .is_some_and(|e| e.starts_with("SDK_DISPATCH_FAILED: ai/execute: dispatch")));
+    }
+
+    #[test]
+    fn a_named_snapshot_failure_names_its_origin() {
+        // `handle_snapshot`'s by-id branch labels a failure with this, so the
+        // explorer reads an app that answered as reachable.
+        let app = DispatchError::AppAnswered {
+            url: "http://127.0.0.1:3000/x".into(),
+            status: 200,
+            error: "no registry".into(),
+            code: None,
+            retryable: None,
+        };
+        assert_eq!(dispatch_failure_origin(&app), "app");
+        assert_eq!(
+            dispatch_failure_origin(&DispatchError::WebSocket(CommandRelayError::WrapperError(
+                crate::mcp::command_relay::WrapperFailure::message_only("boom")
+            ))),
+            "app"
+        );
+        // Never delivered: no UI was touched.
+        for transport in [
+            DispatchError::NotRegistered("qontinui-web".into()),
+            DispatchError::NotConnected,
+            DispatchError::NotResponsive("no active tab".into()),
+            DispatchError::WebSocket(CommandRelayError::NotConnected("wapp".into())),
+            DispatchError::WebSocket(CommandRelayError::Disconnected),
+        ] {
+            assert_eq!(
+                dispatch_failure_origin(&transport),
+                "transport",
+                "{transport:?}"
+            );
+        }
+        // It may have reached the app; what it did could not be read.
+        for unknown in [
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(
+                30,
+            ))),
+            DispatchError::WebSocket(CommandRelayError::UnreadableResponse("bad frame".into())),
+            DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
+            DispatchError::HttpStatus {
+                url: "http://127.0.0.1:3000/x".into(),
+                status: 502,
+                body: "bad gateway".into(),
+            },
+            DispatchError::InvalidJson("<html>".into()),
+        ] {
+            assert_eq!(dispatch_failure_origin(&unknown), "unknown", "{unknown:?}");
+            let refusal = ipc_fallback_refusal(&unknown, "element action").expect("refused");
+            assert_eq!(refusal["failure_origin"], serde_json::json!("unknown"));
+            assert!(
+                refusal["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("whether it acted is unknown")),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// An HTTP dispatch that never CONNECTED was never delivered
+    /// (`transport`); one that connected and then timed out may have been
+    /// (`unknown`). Real reqwest errors, from a closed port and a silent one.
+    #[tokio::test]
+    async fn an_http_send_failure_is_transport_only_when_it_never_connected() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let refused = client
+            .get(format!("http://127.0.0.1:{closed_port}/x"))
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        assert!(refused.is_connect(), "{refused:?}");
+        let err = DispatchError::HttpSend {
+            url: "x".into(),
+            source: refused,
+        };
+        assert_eq!(dispatch_failure_origin(&err), "transport");
+
+        // Accepts the connection, never answers.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let (_sock, _) = silent.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let timed_out = client
+            .get(format!("http://127.0.0.1:{silent_port}/x"))
+            .send()
+            .await
+            .expect_err("the server never answers");
+        assert!(
+            timed_out.is_timeout() && !timed_out.is_connect(),
+            "{timed_out:?}"
+        );
+        let err = DispatchError::HttpSend {
+            url: "x".into(),
+            source: timed_out,
+        };
+        assert_eq!(dispatch_failure_origin(&err), "unknown");
+        hold.abort();
+    }
+
+    /// A named action whose answer could not be read (a non-JSON reply) is an
+    /// UNKNOWN outcome on both acting arms: the explorer reads
+    /// `OutcomeUnknown`, never `app_unreachable` and never a failed attempt.
+    #[tokio::test]
+    async fn a_named_action_whose_answer_could_not_be_read_is_an_unknown_outcome() {
+        use crate::journey::explorer::{classify_answer, DriveFailure};
+        let app = axum::Router::new().fallback(|| async { "<html>not json</html>" });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let registry = AppRegistry::new();
+        let mut discovered = sample_discovered("garbled");
+        discovered.url = format!("http://127.0.0.1:{port}");
+        discovered.base_path = String::new();
+        registry
+            .upsert(discovered, None, AppTransport::Http, None, None)
+            .await;
+        let dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(
+            registry.clone(),
+            crate::mcp::command_relay::CommandRelay::new(
+                crate::mcp::ws_relay::WsConnectionManager::new(),
+            ),
+        );
+        let (act, success, _) = named_element_action_with(
+            &registry,
+            &dispatcher,
+            "garbled",
+            serde_json::json!({}),
+            "/control/element/x/action",
+            serde_json::json!({"action": "click"}),
+        )
+        .await;
+        assert!(!success);
+        let nav =
+            named_page_navigate_with(&registry, &dispatcher, "garbled", serde_json::json!({}))
+                .await;
+        for body in [act, nav] {
+            assert_eq!(
+                body["failure_origin"],
+                serde_json::json!("unknown"),
+                "{body}"
+            );
+            assert!(
+                matches!(
+                    classify_answer(body.clone()),
+                    Err(DriveFailure::OutcomeUnknown(_))
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -8343,7 +8801,8 @@ mod tests {
         };
         let refusal = ipc_fallback_refusal(&http, "page/navigate").expect("refused");
         assert_eq!(refusal["code"], serde_json::json!("RENDER_FAILED"));
-        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
+        // A non-2xx reply reached the app, but what it did is not readable.
+        assert_eq!(refusal["failure_origin"], serde_json::json!("unknown"));
     }
 
     /// A WebSocket wrapper's STRUCTURED failure (coord finding `fb3fb468`):
@@ -8385,17 +8844,18 @@ mod tests {
     }
 
     /// A response frame the relay could not read is NOT the app's failure
-    /// (coord finding `fb3fb468`): the refusal labels it transport-origin,
-    /// keeps it out of the app-code slot, and reads its retryability as
-    /// unknown — `null`.
+    /// (coord finding `fb3fb468`): the refusal labels its origin unknown (the
+    /// app answered; what it did could not be read — never "transport", never
+    /// unreachable), keeps it out of the app-code slot, and reads its
+    /// retryability as unknown — `null`.
     #[test]
-    fn an_unreadable_response_is_refused_as_transport_not_as_the_apps_failure() {
+    fn an_unreadable_response_is_refused_as_unknown_not_as_the_apps_failure() {
         let err = DispatchError::WebSocket(CommandRelayError::UnreadableResponse(
             "invalid type: string \"no\", expected a boolean".into(),
         ));
         let refusal = ipc_fallback_refusal(&err, "element action")
             .expect("an app that answered must never be retried on the runner's UI");
-        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
+        assert_eq!(refusal["failure_origin"], serde_json::json!("unknown"));
         assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
         assert_eq!(refusal["retryable"], serde_json::Value::Null);
         assert!(
@@ -8419,6 +8879,14 @@ mod tests {
         assert_eq!(dispatch_err_to_string(err), "element not found");
     }
 
+    /// This file's source with every `pub(crate) async fn` spelled `async fn`,
+    /// so the source scans below split on one marker whatever a handler's
+    /// visibility (the journey explorer calls some handlers directly, which
+    /// makes them `pub(crate)`).
+    fn source_with_every_async_fn_at_column_zero() -> String {
+        include_str!("sdk_client.rs").replace("\npub(crate) async fn ", "\nasync fn ")
+    }
+
     /// Every handler that used to fall back to `ui_bridge_request_sync` on ANY
     /// dispatch error keeps the TYPED error and asks the class gate BEFORE the
     /// fallback — and never re-reads the live connection state to decide.
@@ -8427,7 +8895,7 @@ mod tests {
     /// `ws_dispatch_action_names_are_well_formed`).
     #[test]
     fn gated_handlers_ask_before_falling_back_to_ipc() {
-        let src = include_str!("sdk_client.rs");
+        let src = source_with_every_async_fn_at_column_zero();
         for handler in [
             "handle_element_action",
             "handle_ai_execute",
@@ -8515,7 +8983,7 @@ mod tests {
     /// ungated (or live-state-gated) fallback fails here without being listed.
     #[test]
     fn every_dispatching_fallback_is_gated_or_an_exempt_read() {
-        let src = include_str!("sdk_client.rs");
+        let src = source_with_every_async_fn_at_column_zero();
         let production = src
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
@@ -8527,6 +8995,7 @@ mod tests {
                 "dispatch_app_request(",
                 "dispatch_app_request_typed(",
                 "dispatch_app_request_by_id(",
+                "dispatch_app_request_by_id_typed(",
                 "dispatch_active(",
                 "sdk_request(",
                 "try_ws_dispatch(",
@@ -8559,6 +9028,316 @@ mod tests {
                 exempt_seen.contains(&name),
                 "stale exemption: {name} no longer dispatches with a fallback"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A NAMED app's failure says whether the APP answered it (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 3): the explorer reads an app that answered as a failed
+    // activation, never as `app_unreachable`.
+    // ------------------------------------------------------------------
+
+    /// A registry + dispatcher whose one HTTP app answers `answer` to every
+    /// request, registered as `app_id`.
+    async fn http_app_answering(
+        app_id: &str,
+        answer: serde_json::Value,
+    ) -> (
+        Arc<AppRegistry>,
+        Arc<crate::mcp::app_dispatch::AppDispatcher>,
+    ) {
+        let app = axum::Router::new().fallback(move || {
+            let answer = answer.clone();
+            async move { Json(answer) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let registry = AppRegistry::new();
+        let mut discovered = sample_discovered(app_id);
+        discovered.url = format!("http://127.0.0.1:{port}");
+        discovered.base_path = String::new();
+        registry
+            .upsert(discovered, None, AppTransport::Http, None, None)
+            .await;
+        let dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(
+            registry.clone(),
+            crate::mcp::command_relay::CommandRelay::new(
+                crate::mcp::ws_relay::WsConnectionManager::new(),
+            ),
+        );
+        (registry, dispatcher)
+    }
+
+    /// The app's own `{success:false}` to a named element action is an
+    /// APP-origin failure: the explorer's classifier reads a failed
+    /// activation (the producer writes an `error` edge), never an
+    /// unreachable app. Drives the handler's named arm itself.
+    #[tokio::test]
+    async fn a_named_element_action_the_app_refused_is_an_app_failure() {
+        use crate::journey::explorer::{classify_answer, ActResult};
+        let (registry, dispatcher) = http_app_answering(
+            "named-act",
+            serde_json::json!({"success": false, "error": "element not found: x", "code": "ELEMENT_NOT_FOUND"}),
+        )
+        .await;
+        let (body, success, err) = named_element_action_with(
+            &registry,
+            &dispatcher,
+            "named-act",
+            serde_json::json!({"id": "x", "request": {"action": "click"}}),
+            "/control/element/x/action",
+            serde_json::json!({"action": "click"}),
+        )
+        .await;
+        assert!(!success);
+        assert!(err.is_some());
+        assert_eq!(body["failure_origin"], serde_json::json!("app"), "{body}");
+        assert_eq!(
+            body["code"],
+            serde_json::json!("ELEMENT_NOT_FOUND"),
+            "{body}"
+        );
+        assert!(
+            !crate::journey::capture::sdk_refusal(&body),
+            "an error edge, not a refusal"
+        );
+        assert!(
+            matches!(classify_answer(body.clone()), Ok(ActResult::Failed(_))),
+            "{body}"
+        );
+    }
+
+    /// The same for a named page navigation (the explorer's start URL): an
+    /// app that refused it ANSWERED, so the run's start is refused (a 422 with
+    /// no row), never `app_unreachable`.
+    #[tokio::test]
+    async fn a_named_navigation_the_app_refused_is_an_app_failure() {
+        use crate::journey::explorer::{classify_answer, ActResult};
+        let (registry, dispatcher) = http_app_answering(
+            "named-nav",
+            serde_json::json!({"success": false, "error": "no such route"}),
+        )
+        .await;
+        let body = named_page_navigate_with(
+            &registry,
+            &dispatcher,
+            "named-nav",
+            serde_json::json!({"url": "/nowhere"}),
+        )
+        .await;
+        assert_eq!(body["failure_origin"], serde_json::json!("app"), "{body}");
+        assert!(
+            matches!(classify_answer(body.clone()), Ok(ActResult::Failed(_))),
+            "{body}"
+        );
+    }
+
+    /// A named app that is not there is a TRANSPORT refusal on both arms:
+    /// nothing reached a UI, so the explorer reads `app_unreachable`.
+    #[tokio::test]
+    async fn a_named_app_that_is_not_there_is_a_transport_refusal() {
+        use crate::journey::explorer::{classify_answer, DriveFailure};
+        let (registry, dispatcher) =
+            http_app_answering("present", serde_json::json!({"success": true})).await;
+        let (act, success, _) = named_element_action_with(
+            &registry,
+            &dispatcher,
+            "absent",
+            serde_json::json!({}),
+            "/control/element/x/action",
+            serde_json::json!({"action": "click"}),
+        )
+        .await;
+        assert!(!success);
+        let nav =
+            named_page_navigate_with(&registry, &dispatcher, "absent", serde_json::json!({})).await;
+        for body in [act, nav] {
+            assert_eq!(
+                body["failure_origin"],
+                serde_json::json!("transport"),
+                "{body}"
+            );
+            assert!(
+                matches!(
+                    classify_answer(body.clone()),
+                    Err(DriveFailure::Unreachable(_))
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// A named NAVIGATION the app answered without a boolean `success` (`{}`)
+    /// is the same unknown outcome — never read as having navigated.
+    #[tokio::test]
+    async fn a_named_navigation_with_no_success_flag_is_an_unknown_outcome() {
+        use crate::journey::explorer::{classify_answer, DriveFailure};
+        let (registry, dispatcher) =
+            http_app_answering("shrugging-nav", serde_json::json!({})).await;
+        let body = named_page_navigate_with(
+            &registry,
+            &dispatcher,
+            "shrugging-nav",
+            serde_json::json!({"url": "/home"}),
+        )
+        .await;
+        assert_eq!(body["success"], serde_json::json!(false), "{body}");
+        assert_eq!(
+            body["failure_origin"],
+            serde_json::json!("unknown"),
+            "{body}"
+        );
+        assert!(
+            matches!(
+                classify_answer(body.clone()),
+                Err(DriveFailure::OutcomeUnknown(_))
+            ),
+            "{body}"
+        );
+        // A navigation the app says it did is still acted.
+        let (registry, dispatcher) =
+            http_app_answering("nav-ok", serde_json::json!({"success": true})).await;
+        let body =
+            named_page_navigate_with(&registry, &dispatcher, "nav-ok", serde_json::json!({})).await;
+        assert!(
+            matches!(
+                classify_answer(body.clone()),
+                Ok(crate::journey::explorer::ActResult::Acted)
+            ),
+            "{body}"
+        );
+    }
+
+    /// A named action the app answered WITHOUT a boolean `success` is an
+    /// indeterminate result: an explicit failure on the wire, tagged
+    /// `failure_origin: "unknown"`, which the explorer reads as an unknown
+    /// outcome — never a failed attempt, never unreachable.
+    #[tokio::test]
+    async fn a_named_action_with_no_success_flag_is_an_unknown_outcome() {
+        use crate::journey::explorer::{classify_answer, DriveFailure};
+        let (registry, dispatcher) =
+            http_app_answering("shrugging", serde_json::json!({"result": null})).await;
+        let (body, success, err) = named_element_action_with(
+            &registry,
+            &dispatcher,
+            "shrugging",
+            serde_json::json!({}),
+            "/control/element/x/action",
+            serde_json::json!({"action": "click"}),
+        )
+        .await;
+        assert!(!success);
+        assert!(err.is_some());
+        assert_eq!(body["success"], serde_json::json!(false), "{body}");
+        assert_eq!(
+            body["failure_origin"],
+            serde_json::json!("unknown"),
+            "{body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("INDETERMINATE")),
+            "{body}"
+        );
+        assert!(
+            matches!(
+                classify_answer(body.clone()),
+                Err(DriveFailure::OutcomeUnknown(_))
+            ),
+            "{body}"
+        );
+    }
+
+    /// The two acting routes' named arms go through the helpers above (so the
+    /// tests above drive what they run), never the untyped dispatch that
+    /// labelled every failure `transport`.
+    #[test]
+    fn the_named_arms_label_failures_by_origin() {
+        let src = source_with_every_async_fn_at_column_zero();
+        let body_of = |name: &str| {
+            src.split(format!("\nasync fn {name}(").as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} not found"))
+                .split("\nasync fn ")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (handler, helper) in [
+            ("handle_element_action", "named_element_action_with("),
+            ("handle_page_navigate", "named_page_navigate_with("),
+        ] {
+            let body = body_of(handler);
+            assert!(body.contains(helper), "{handler} must call {helper}");
+            assert!(
+                !body.contains("dispatch_app_request_by_id("),
+                "{handler} must not use the untyped by-id dispatch"
+            );
+            assert!(
+                !body.contains("no_fallback_refusal(\"element action\", &e)")
+                    && !body.contains("no_fallback_refusal(\"page/navigate\", &e)"),
+                "{handler} must not label a named failure transport by fiat"
+            );
+        }
+        // The snapshot route reads the named app the same way (`app_id` /
+        // `appId`, trimmed).
+        let snapshot = body_of("handle_snapshot");
+        assert!(snapshot.contains("named_app(&query)"), "handle_snapshot");
+        assert!(
+            !snapshot.contains("query.get(\"app_id\")"),
+            "handle_snapshot"
+        );
+        for helper in ["named_element_action_with", "named_page_navigate_with"] {
+            let body = body_of(helper);
+            assert!(
+                body.contains("dispatch_app_request_by_id_typed_with("),
+                "{helper}"
+            );
+            assert!(body.contains("named_dispatch_refusal("), "{helper}");
+        }
+    }
+
+    /// Only an explorer scope refuses the runner-webview fallback, and both
+    /// acting routes that can fall back ask that gate before doing so.
+    #[tokio::test]
+    async fn only_an_explorer_scope_refuses_the_webview_fallback() {
+        use crate::journey::capture::{as_explorer, ExplorerRun};
+        assert_eq!(
+            explorer_fallback_refusal("element action"),
+            None,
+            "outside a run the fallback proceeds"
+        );
+        let inside = as_explorer(ExplorerRun::new("r"), async {
+            explorer_fallback_refusal("page/navigate")
+        })
+        .await
+        .expect("refused inside an explorer run");
+        assert_eq!(inside["success"], serde_json::json!(false));
+        assert_eq!(inside["failure_origin"], serde_json::json!("transport"));
+        assert!(crate::journey::capture::sdk_refusal(&inside));
+
+        let src = source_with_every_async_fn_at_column_zero();
+        for handler in ["handle_element_action", "handle_page_navigate_dispatch"] {
+            let body = src
+                .split(format!("\nasync fn {handler}(").as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} not found"))
+                .split("\nasync fn ")
+                .next()
+                .unwrap_or_default();
+            let gate = body
+                .find("explorer_fallback_refusal(")
+                .unwrap_or_else(|| panic!("{handler} must ask explorer_fallback_refusal"));
+            let fallback = body
+                .find("ui_bridge_request_sync(")
+                .or_else(|| body.find("crate::mcp::ui_bridge::"))
+                .unwrap_or_else(|| panic!("{handler} no longer falls back"));
+            assert!(gate < fallback, "{handler} must ask before falling back");
         }
     }
 

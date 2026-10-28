@@ -1189,6 +1189,7 @@ pub async fn ui_bridge_execute_action_handler(
             crate::journey::cursor::Provenance {
                 app_version: None,
                 run_id: crate::journey::capture::run_id_from_task_run(task_run_id),
+                ..Default::default()
             },
             failed,
         );
