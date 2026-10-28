@@ -851,6 +851,11 @@ impl TerminalManager {
 
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
+        // The whole close the operator waits for: the tree kill (its own
+        // `terminal_close.kill` span, inside `PaneIo::kill`), the joins and the
+        // writer/master release (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
+        let _span = tracing::debug_span!("terminal_close", terminal_id = %id).entered();
         let session = {
             let mut sessions = self
                 .sessions
