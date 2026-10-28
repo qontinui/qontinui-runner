@@ -3788,10 +3788,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let boot = session::shutdown_marker::classify_boot(&marker_path);
                 if boot.crash_recovery {
                     warn!(
+                        teardown_complete = boot.teardown_complete,
                         "boot classification: previous shutdown was NOT clean — crash recovery"
                     );
                 } else {
-                    info!("boot classification: previous shutdown was clean — planned restart");
+                    info!(
+                        teardown_complete = boot.teardown_complete,
+                        "boot classification: previous shutdown was clean — planned restart"
+                    );
                 }
 
                 // Phase 4 (P1) crash observability — when the prior shutdown
@@ -4418,6 +4422,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         session::session_ledger::process_boot_ms(),
                     ),
                 ));
+                // Same plan, Phase 3: the prior marker anchors open rows only
+                // when it says the teardown FINISHED — also before the latch.
+                lifecycle_store.attach_prior_teardown_complete(
+                    session::shutdown_marker::boot_classification()
+                        .is_some_and(|b| b.teardown_complete),
+                );
 
                 // RESTORE CENSUS (plan
                 // `2026-08-16-runner-session-info-dropdown-and-restore-verification`
@@ -6808,7 +6818,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let watchdog_label = win_label.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(force_exit_at);
+                    // The marker the next boot will classify (plan
+                    // 2026-10-28-force-exited-runner-strands-open-sessions-out-
+                    // of-the-restore-set, Phase 3): a cut-short teardown leaves
+                    // it clean but `teardown_complete=false`.
                     warn!(
+                        marker = %session::shutdown_marker::describe_on_disk(
+                            &session::shutdown_marker::marker_path()
+                        ),
                         "Force-exit watchdog: shutdown did not complete within {}s of the \
                          close request — exiting process",
                         force_exit_at.as_secs()

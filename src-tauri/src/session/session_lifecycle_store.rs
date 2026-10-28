@@ -969,6 +969,12 @@ pub struct SessionLifecycleStore {
     /// bounds the open-row anchor by it ([`RestoreAnchors`]). Unattached →
     /// no prior epoch, and this process has never observed.
     observation_epoch: OnceLock<Arc<ObservationEpoch>>,
+    /// Whether the prior shutdown marker attests a FINISHED teardown
+    /// ([`crate::session::shutdown_marker::BootClassification::teardown_complete`]),
+    /// attached at boot beside the epoch. It decides whether the marker may
+    /// anchor open rows ([`RestoreAnchors`]). Unattached → the marker the
+    /// caller passes is used as it always was.
+    prior_teardown_complete: OnceLock<bool>,
     /// Optional restore-registry → coord mirror (plan
     /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
     /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
@@ -1233,6 +1239,7 @@ impl SessionLifecycleStore {
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             observation_epoch: OnceLock::new(),
+            prior_teardown_complete: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
@@ -1309,6 +1316,14 @@ impl SessionLifecycleStore {
     /// successful ticks through it.
     pub fn observation_epoch(&self) -> Option<&Arc<ObservationEpoch>> {
         self.observation_epoch.get()
+    }
+
+    /// Attach whether the prior shutdown's teardown finished (once, at
+    /// startup, BEFORE the restore census latches — it is an admission input).
+    pub fn attach_prior_teardown_complete(&self, complete: bool) {
+        if self.prior_teardown_complete.set(complete).is_err() {
+            warn!("session_lifecycle_store: prior teardown bit already attached — ignoring");
+        }
     }
 
     /// Attach the restore-record cloud-mirror emitter (once, at startup).
@@ -3469,6 +3484,7 @@ impl SessionLifecycleStore {
             .get()
             .map(|e| e.observed())
             .unwrap_or_default();
+        let marker_teardown_complete = self.prior_teardown_complete.get().copied();
         let boot_ms = self.boot_ms.load(Ordering::Relaxed);
         match self.map.lock() {
             Ok(m) => {
@@ -3477,6 +3493,7 @@ impl SessionLifecycleStore {
                     m.values(),
                     prior_marker_at,
                     boot_was_clean,
+                    marker_teardown_complete,
                     prior_heartbeat_ms,
                     observed,
                     boot_ms,
@@ -4229,6 +4246,29 @@ fn default_boot_ms() -> i64 {
 /// strand is untouched: a short-lived intermediate boot that never observed
 /// writes no epoch, and one that did can only lower the bound.
 ///
+/// ## The marker and the teardown (open rows only)
+///
+/// Both clean writers stamp the marker BEFORE the terminal teardown, so a
+/// clean marker says a shutdown STARTED, not that it finished. An interrupted
+/// teardown is the shape of the 2026-10-27 strand: a runner too loaded to
+/// finish closing its terminals had also stopped touching its rows, and its
+/// marker sat 38 minutes past every one of them. So the marker joins the open
+/// anchor `prior` only when the store's attached
+/// [`crate::session::shutdown_marker::BootClassification::teardown_complete`]
+/// says the teardown finished, or when the prior process left an observation
+/// epoch. With an epoch the open anchor is capped at it, so the marker can
+/// lift the anchor no further than the last successful observation, and an
+/// interrupted teardown does not weaken that evidence. Keeping the marker
+/// there is also what keeps out a lone ghost that the poll observed dead.
+/// With neither, an interrupted teardown's open rows are judged by their own
+/// stamps alone. A lone ghost then self-anchors and restores, accepted
+/// deliberately: a ghost pane can be closed, a dropped session cannot be
+/// rebuilt. Teardown evidence that was never attached keeps the marker.
+///
+/// The closed arms (`prior_closed`) keep the clean marker whatever its
+/// teardown bit. A close stamp is an observed end, not a poll touch, and the
+/// marker instant is still a moment the prior process was alive.
+///
 /// ## Held rows
 ///
 /// A row held for an account choice ([`awaiting_account_hold`] at the same
@@ -4240,9 +4280,12 @@ fn default_boot_ms() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RestoreAnchors {
     boot_ms: i64,
-    /// Prior-process row stamps, plus the shutdown marker on a clean boot.
+    /// Prior-process row stamps, plus the shutdown marker on a clean boot
+    /// when the marker may anchor open rows (see "The marker and the
+    /// teardown").
     prior: Option<i64>,
-    /// `prior`, plus the snapshot-history heartbeat on a crash boot.
+    /// Prior-process row stamps plus the clean-boot marker whatever its
+    /// teardown bit, plus the snapshot-history heartbeat on a crash boot.
     prior_closed: Option<i64>,
     live: Option<i64>,
     /// The PRIOR process's observation epoch (before `boot_ms`), if it left one.
@@ -4279,6 +4322,7 @@ fn restore_anchors<'a>(
     records: impl Iterator<Item = &'a TerminalSessionRecord> + Clone,
     prior_marker_at: Option<i64>,
     boot_was_clean: bool,
+    marker_teardown_complete: Option<bool>,
     prior_heartbeat_ms: Option<i64>,
     observed: Observed,
     boot_ms: i64,
@@ -4291,23 +4335,29 @@ fn restore_anchors<'a>(
     let clean_marker = prior_marker_at
         .filter(|_| boot_was_clean)
         .filter(|at| *at < boot_ms);
+    // Like the marker, an epoch counts only when it predates this boot.
+    let prior_observed = observed.prior.filter(|at| *at < boot_ms);
+    // See "The marker and the teardown": the open anchor takes the marker
+    // only when the teardown finished, or an epoch caps the anchor anyway.
+    let open_marker = clean_marker
+        .filter(|_| marker_teardown_complete.unwrap_or(true) || prior_observed.is_some());
     let crash_heartbeat = prior_heartbeat_ms
         .filter(|_| !boot_was_clean)
         .filter(|at| *at < boot_ms);
-    let prior = stamps
-        .clone()
-        .filter(|at| *at < boot_ms)
+    let prior_rows = stamps.clone().filter(|at| *at < boot_ms).max();
+    let prior = prior_rows.into_iter().chain(open_marker).max();
+    let prior_closed = prior_rows
+        .into_iter()
         .chain(clean_marker)
+        .chain(crash_heartbeat)
         .max();
-    let prior_closed = prior.into_iter().chain(crash_heartbeat).max();
     let live = stamps.chain(prior_closed).max();
     RestoreAnchors {
         boot_ms,
         prior,
         prior_closed,
         live,
-        // Like the marker, an epoch counts only when it predates this boot.
-        prior_observed: observed.prior.filter(|at| *at < boot_ms),
+        prior_observed,
         current_observed: observed.current,
     }
 }
@@ -10647,6 +10697,154 @@ mod tests {
         assert_eq!(roster, vec!["touched-at-t30".to_string()]);
     }
 
+    // Phase 3: the marker anchors open rows only after a FINISHED teardown.
+
+    const SELF_ANCHORED_COHORT: [&str; 3] = ["cohort-00", "cohort-05", "cohort-09"];
+
+    /// Three open rows within 10 minutes of each other, so they self-anchor:
+    /// only a marker can exclude them.
+    fn self_anchored_cohort(t: i64) -> Vec<TerminalSessionRecord> {
+        SELF_ANCHORED_COHORT
+            .iter()
+            .zip([0_i64, 5, 9])
+            .map(|(id, m)| fixture_rec(id, "open", t + m * 60_000, None, None))
+            .collect()
+    }
+
+    /// A store over `recs`, booted at `boot`, carrying the prior teardown bit.
+    fn store_with_teardown(
+        dir: &Path,
+        recs: Vec<TerminalSessionRecord>,
+        boot: i64,
+        teardown_complete: bool,
+    ) -> SessionLifecycleStore {
+        let path = dir.join("terminal-sessions.json");
+        write_fixture(&path, recs);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        store.attach_prior_teardown_complete(teardown_complete);
+        store
+    }
+
+    /// No epoch: a clean marker 77 minutes past a self-anchored cohort does
+    /// not exclude it when its teardown was cut short. The finished-teardown
+    /// marker in the same place excludes all three, as it always did.
+    #[test]
+    fn restorable_records_incomplete_teardown_marker_does_not_exclude_the_cohort() {
+        let t = 1_700_000_000_000_i64;
+        let marker = Some(t + 77 * 60_000);
+        let cohort = SELF_ANCHORED_COHORT.map(str::to_string).to_vec();
+        for (complete, expected) in [(false, cohort), (true, Vec::new())] {
+            let dir = tempdir().unwrap();
+            let store =
+                store_with_teardown(dir.path(), self_anchored_cohort(t), t + 3 * 3_600_000, complete);
+            assert_eq!(
+                restorable_ids(&store, marker, true),
+                expected,
+                "teardown_complete={complete}"
+            );
+        }
+    }
+
+    /// (i) With an observation epoch the teardown bit changes nothing: the
+    /// epoch caps the open anchor either way. The lone ghost the poll observed
+    /// dead is the shape that tells them apart if the gate ignored the epoch
+    /// (the incomplete marker would leave it to self-anchor), so it is pinned
+    /// beside the starved cohort.
+    #[test]
+    fn restorable_records_with_an_epoch_the_teardown_bit_changes_nothing() {
+        let t = 1_700_000_000_000_i64;
+        let shapes = [
+            (
+                "starved cohort",
+                starved_cohort_fixture(t),
+                t,
+                t + 77 * 60_000,
+                STARVED_COHORT.map(str::to_string).to_vec(),
+            ),
+            (
+                "lone ghost",
+                vec![fixture_rec("ghost", "open", t - 72 * 3_600_000, None, None)],
+                t - 60_000,
+                t,
+                Vec::new(),
+            ),
+        ];
+        for (shape, recs, epoch_at, marker_at, expected) in shapes {
+            for complete in [true, false] {
+                let dir = tempdir().unwrap();
+                let store =
+                    store_with_teardown(dir.path(), recs.clone(), t + 3 * 3_600_000, complete);
+                attach_epoch(&store, dir.path(), Some(epoch_at));
+                assert_eq!(
+                    restorable_ids(&store, Some(marker_at), true),
+                    expected,
+                    "{shape}, teardown_complete={complete}"
+                );
+            }
+        }
+    }
+
+    /// (ii) No epoch and an interrupted teardown: a lone ghost self-anchors
+    /// and RESTORES. Asserted so the trade is a decision, not an accident: a
+    /// ghost pane can be closed, a dropped session cannot be rebuilt. A
+    /// finished teardown's marker still excludes it (the
+    /// `restorable_records_marker_anchor_excludes_lone_ghost` shape).
+    #[test]
+    fn restorable_records_lone_ghost_restores_only_after_an_interrupted_teardown() {
+        let shutdown = 1_700_000_000_000_i64;
+        let ghost = || vec![fixture_rec("ghost", "open", shutdown - 72 * 3_600_000, None, None)];
+        for (complete, expected) in [(false, vec!["ghost".to_string()]), (true, Vec::new())] {
+            let dir = tempdir().unwrap();
+            let store = store_with_teardown(dir.path(), ghost(), shutdown + 3_600_000, complete);
+            assert_eq!(
+                restorable_ids(&store, Some(shutdown), true),
+                expected,
+                "teardown_complete={complete}"
+            );
+        }
+    }
+
+    /// The closed arms keep the marker whatever its teardown bit: a session
+    /// exited `pty-exit` an hour before an interrupted teardown is still an
+    /// old exit, not a restore candidate.
+    #[test]
+    fn restorable_records_interrupted_teardown_keeps_the_marker_for_closed_rows() {
+        let shutdown = 1_700_000_000_000_i64;
+        let exited = shutdown - 3_600_000;
+        let dir = tempdir().unwrap();
+        let store = store_with_teardown(
+            dir.path(),
+            vec![fixture_rec("old-exit", "closed", exited, Some(exited), Some("pty-exit"))],
+            shutdown + 3_600_000,
+            false,
+        );
+        assert!(restorable_ids(&store, Some(shutdown), true).is_empty());
+    }
+
+    /// The drain's own marker stamp, end to end through the boot classifier
+    /// into admission: a drain stamps `clean` but never a finished teardown,
+    /// so a self-anchored cohort its marker sits 77 minutes past is still
+    /// admitted on the next boot.
+    #[test]
+    fn restorable_records_admit_the_cohort_behind_a_drain_only_marker() {
+        let dir = tempdir().unwrap();
+        let marker_path = dir.path().join("last-shutdown.json");
+        crate::drain::stamp_drained_marker(&marker_path);
+        let boot = crate::session::shutdown_marker::read_classification(&marker_path, i64::MAX);
+        let marker_at = boot.prior_marker_at.expect("the drain wrote a marker");
+        let store = store_with_teardown(
+            dir.path(),
+            self_anchored_cohort(marker_at - 77 * 60_000),
+            marker_at + 3_600_000,
+            boot.teardown_complete,
+        );
+        assert_eq!(
+            restorable_ids(&store, boot.prior_marker_at, !boot.crash_recovery),
+            SELF_ANCHORED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
     /// The in-process arm of the same strand: THIS process booted before the
     /// cohort was spawned, its snapshots then failed, so nothing it wrote was
     /// ever touched. The ledger roster (what the poll captures every tick) must
@@ -10868,6 +11066,7 @@ mod tests {
             rows.iter(),
             None,
             false,
+            None,
             None,
             Observed::default(),
             i64::MAX,
