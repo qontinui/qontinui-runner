@@ -13,7 +13,7 @@
 //!
 //! ## Where `expected` comes from — and why not the shutdown marker
 //!
-//! [`crate::session::shutdown_marker::ShutdownMarker`] is `{clean, at}`: a
+//! [`crate::session::shutdown_marker::ShutdownMarker`] is `{clean, at, teardown_complete}`: a
 //! BOUNDARY, carrying no session census. It cannot supply `expected`, and R3
 //! forbids the only other available source — the POST-restart registry, which
 //! would make the census self-referential ("everything that came back was
@@ -279,6 +279,7 @@ pub fn latch_expected(
     info!(
         expected = expected_count,
         clean_shutdown = boot_was_clean,
+        teardown_complete = boot.is_some_and(|c| c.teardown_complete),
         "restore_census: latched the pre-restore expected set"
     );
 }
@@ -793,6 +794,8 @@ mod tests {
                 crash_recovery: false,
                 prior_marker_at: Some(t + 77 * 60_000),
                 booted_at_ms: boot_at,
+                // The incident's marker: stamped clean, teardown cut short.
+                teardown_complete: false,
             }),
         );
         let got: Vec<&str> = rows.iter().map(|r| r.claude_session_id.as_str()).collect();
