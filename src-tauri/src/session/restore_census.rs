@@ -211,6 +211,24 @@ pub struct BootCensus {
     pub expected: Vec<CensusExpected>,
 }
 
+impl BootCensus {
+    /// Does `rec` still await the boot restore that latched it? True when it
+    /// is in the latched `expected` set, which is the restorable set, and has
+    /// not been FINISHED since (a finished session is never restored). The
+    /// liveness poll holds such a row open rather than closing it `no-terminal`
+    /// before its page is opened (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 4; see
+    /// [`crate::session::session_lifecycle_store::withheld_boot_restore_candidate`]).
+    pub fn awaits_restore(&self, rec: &TerminalSessionRecord) -> bool {
+        rec.finished_at.is_none()
+            && self
+                .expected
+                .iter()
+                .any(|e| e.claude_session_id == rec.claude_session_id)
+    }
+}
+
 static BOOT_CENSUS: OnceLock<BootCensus> = OnceLock::new();
 
 /// A row's terminal id as the census emits it: `None` for a blank id (an

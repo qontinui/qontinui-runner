@@ -4834,6 +4834,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let tick_boot_at_ms = session::shutdown_marker::boot_classification()
                             .map(|c| c.booted_at_ms);
                         let tick_restore_phase = boot_restore_phase();
+                        // The boot-latched restorable set (plan 2026-10-28-
+                        // force-exited-runner-strands-open-sessions-out-of-the-
+                        // restore-set, Phase 4): its rows are held until their
+                        // page's restore runs, in every phase.
+                        let tick_boot_census = session::restore_census::latched();
                         let tick_drain_defers_boot_resume = !crate::coord_drain_state::drain_gate(
                             crate::coord_drain_state::SpawnOrigin::BootResume,
                         )
@@ -4894,6 +4899,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
+                                tick_boot_census.is_some_and(|c| c.awaits_restore(rec)),
                             );
 
                             // Match the live terminal: by id first, then the
@@ -5171,7 +5177,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::debug!(
                                 held = held_for_restore,
                                 phase = ?tick_restore_phase,
-                                "session lifecycle poll: holding prior-boot records open — their boot restore is withheld"
+                                "session lifecycle poll: holding prior-boot records open pending their boot restore"
                             );
                         }
 
