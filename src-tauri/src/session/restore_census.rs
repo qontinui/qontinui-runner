@@ -295,7 +295,10 @@ pub(crate) fn boot_expected(
     // Exactly the two arguments `terminal_session_list_open` passes (the boot
     // line is the store's own), so the latched set IS the set the restore path
     // will consume.
-    expected_rows(store.restorable_records(prior_marker_at, boot_was_clean), probe)
+    expected_rows(
+        store.restorable_records(prior_marker_at, boot_was_clean),
+        probe,
+    )
 }
 
 /// The latched pre-restart census, if [`latch_expected`] has run. `None` means
@@ -746,13 +749,19 @@ mod tests {
     /// a cohort whose liveness touches starved (rows spread T..T+39m, never
     /// touched after T) and a clean marker at T+77m. The boot census must
     /// expect all five, not zero — it reads the same admission the restore
-    /// read does.
+    /// read does — with the observation epoch the boot attaches first.
     #[test]
     fn boot_expected_sees_a_snapshot_starved_cohort() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
-        let ids = ["starved-0000", "starved-0010", "starved-0020", "starved-0030", "starved-0039"];
+        let ids = [
+            "starved-0000",
+            "starved-0010",
+            "starved-0020",
+            "starved-0030",
+            "starved-0039",
+        ];
         let mut map = std::collections::HashMap::new();
         for (m, id) in [0_i64, 10, 20, 30, 39].iter().zip(ids) {
             let mut r = record(id, true);
@@ -764,6 +773,16 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         let boot_at = t + 3 * 3_600_000;
         store.set_boot_ms_for_test(boot_at);
+        // The prior process last SAW the process table at T (its snapshots
+        // failed afterwards); main.rs attaches the epoch before the latch.
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        crate::session::observation_epoch::ObservationEpoch::open(&epoch_path, t - 3_600_000)
+            .record_ok(t);
+        store.attach_observation_epoch(std::sync::Arc::new(
+            crate::session::observation_epoch::ObservationEpoch::open(&epoch_path, boot_at),
+        ));
 
         let rows = boot_expected(
             &store,
@@ -777,7 +796,11 @@ mod tests {
             }),
         );
         let got: Vec<&str> = rows.iter().map(|r| r.claude_session_id.as_str()).collect();
-        assert_eq!(got, ids.to_vec(), "the census expects the whole starved cohort");
+        assert_eq!(
+            got,
+            ids.to_vec(),
+            "the census expects the whole starved cohort"
+        );
     }
 
     /// Review fixes 6, item 5: an unbound row (blank terminal id) emits NO

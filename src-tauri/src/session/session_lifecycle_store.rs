@@ -58,6 +58,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
@@ -131,15 +132,23 @@ const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
 /// Anchored-recency grace for `state == "open"` rows in
 /// [`SessionLifecycleStore::restorable_records`]. An open row is restorable
-/// iff `anchor - last_seen_at <= grace`, where `anchor` is the registry's
-/// LAST MOMENT OF LIFE (max of every row's `last_seen_at` / `closed_at`,
-/// plus the prior shutdown marker's `at`). Recency relative to the anchor —
-/// not wall-clock now — survives arbitrary downtime: a crash followed by an
-/// hours-later boot still restores the rows that were fresh when the
-/// previous process died, while a multi-day ghost row stays excluded on
-/// EVERY boot kind. 10 minutes in millis (matches the close-grace windows;
-/// live sessions are touched every ~45s by the poll, so anything on screen
-/// at shutdown sits well inside it).
+/// iff `anchor - last_seen_at <= grace`, where `anchor` is the EARLIER of
+/// the registry's LAST MOMENT OF LIFE (max of every row's `last_seen_at` /
+/// `closed_at`, plus the prior shutdown marker's `at`) and the OBSERVATION
+/// EPOCH — the last poll tick whose process snapshot succeeded
+/// ([`crate::session::observation_epoch`]; see [`RestoreAnchors`]).
+///
+/// A row's `last_seen_at` only advances when a SUCCESSFUL poll tick touches
+/// it, so its staleness is evidence of death only while the poll could see.
+/// A stretch of failed snapshots freezes every stamp; measuring against the
+/// last observation keeps that unobservable stretch from reading as "dead"
+/// (the 2026-10-27 force-exit stranded 64 of 65 sessions that way: no touch
+/// landed for 77 minutes before the clean marker). Recency relative to the
+/// anchor — not wall-clock now — survives arbitrary downtime: a crash
+/// followed by an hours-later boot still restores the rows that were fresh
+/// when the previous process last looked, while a multi-day ghost row (one
+/// successful ticks kept NOT finding alive) stays excluded on EVERY boot
+/// kind. 10 minutes in millis (matches the close-grace windows).
 const RESTORABLE_OPEN_ANCHOR_GRACE_MS: i64 = 600_000;
 /// Number of consecutive claude-absent ticks a *live* shell (`Some(true)` with
 /// no Claude in its inclusive subtree) must accumulate before the poll closes
@@ -972,6 +981,12 @@ pub struct SessionLifecycleStore {
     /// history is DERIVED from this store — never read back by it or by the
     /// restore path.
     snapshot_history: OnceLock<Arc<SnapshotHistory>>,
+    /// Optional observation epoch ([`crate::session::observation_epoch`]): the
+    /// last instant the liveness poll could see the process table, for the
+    /// prior process (latched at boot) and for this one. Restore admission
+    /// bounds the open-row anchor by it ([`RestoreAnchors`]). Unattached →
+    /// no prior epoch, and this process has never observed.
+    observation_epoch: OnceLock<Arc<ObservationEpoch>>,
     /// Optional restore-registry → coord mirror (plan
     /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
     /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
@@ -1236,6 +1251,7 @@ impl SessionLifecycleStore {
             superseded_terminals: Mutex::new(HashSet::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
+            observation_epoch: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
@@ -1298,6 +1314,20 @@ impl SessionLifecycleStore {
         if self.snapshot_history.set(history).is_err() {
             warn!("session_lifecycle_store: snapshot history already attached — ignoring");
         }
+    }
+
+    /// Attach the observation epoch (once, at startup, BEFORE the restore
+    /// census latches — it is an admission input).
+    pub fn attach_observation_epoch(&self, epoch: Arc<ObservationEpoch>) {
+        if self.observation_epoch.set(epoch).is_err() {
+            warn!("session_lifecycle_store: observation epoch already attached — ignoring");
+        }
+    }
+
+    /// The attached observation epoch — the liveness poll records its
+    /// successful ticks through it.
+    pub fn observation_epoch(&self) -> Option<&Arc<ObservationEpoch>> {
+        self.observation_epoch.get()
     }
 
     /// Attach the restore-record cloud-mirror emitter (once, at startup).
@@ -3474,6 +3504,11 @@ impl SessionLifecycleStore {
             .snapshot_history
             .get()
             .and_then(|h| h.prior_last_append_ms());
+        let observed = self
+            .observation_epoch
+            .get()
+            .map(|e| e.observed())
+            .unwrap_or_default();
         let boot_ms = self.boot_ms.load(Ordering::Relaxed);
         match self.map.lock() {
             Ok(m) => {
@@ -3483,6 +3518,7 @@ impl SessionLifecycleStore {
                     prior_marker_at,
                     boot_was_clean,
                     prior_heartbeat_ms,
+                    observed,
                     boot_ms,
                     now_ms,
                 );
@@ -4205,6 +4241,34 @@ fn default_boot_ms() -> i64 {
 /// already-observed end — resurrecting a long-exited session is the worse
 /// error there, and an intermediate boot can only make that arm stricter.
 ///
+/// ## The observation epoch (open rows only)
+///
+/// An open row's `last_seen_at` advances only when a poll tick whose process
+/// snapshot SUCCEEDED touches it — nothing else refreshes a live session. So
+/// "stale relative to the anchor" is evidence of death only for the stretch
+/// the poll could actually see. When snapshots fail, every stamp freezes
+/// while later stamps (a spawn, the clean marker written before teardown)
+/// still move `prior` — the 2026-10-27 force-exit stranded 64 of 65 open
+/// sessions that way. The open arm is therefore bounded by the observation
+/// epoch ([`crate::session::observation_epoch`]):
+///
+/// - a PRIOR-process row is measured against `min(prior, prior_observed)`
+///   when the prior process left an epoch, else `prior` (the first boot after
+///   the upgrade — logged once at boot). The epoch was latched before this
+///   process wrote one, so nothing this process does moves it. A ghost stays
+///   excluded: successful ticks ran after it went stale, so the epoch is past
+///   it.
+/// - a row written by THIS process is measured against
+///   `min(live, current_observed)`, or `min(live, boot_ms)` when this process
+///   has never observed successfully — if it never looked, nothing it wrote
+///   is stale. This is what keeps the ledger roster (captured every poll tick)
+///   from shedding a starved cohort while the process is still running.
+///
+/// `min` only ever moves the open anchor EARLIER, so the epoch can admit more
+/// rows than `prior` alone, never fewer. The 2026-07-19 intermediate-boot
+/// strand is untouched: a short-lived intermediate boot that never observed
+/// writes no epoch, and one that did can only lower the bound.
+///
 /// ## Held rows
 ///
 /// A row held for an account choice ([`awaiting_account_hold`] at the same
@@ -4221,15 +4285,22 @@ pub(crate) struct RestoreAnchors {
     /// `prior`, plus the snapshot-history heartbeat on a crash boot.
     prior_closed: Option<i64>,
     live: Option<i64>,
+    /// The PRIOR process's observation epoch (before `boot_ms`), if it left one.
+    prior_observed: Option<i64>,
+    /// THIS process's last successful observation, if any.
+    current_observed: Option<i64>,
 }
 
 impl RestoreAnchors {
-    /// The anchor an `open` row last seen at `stamp` is measured against.
+    /// The anchor an `open` row last seen at `stamp` is measured against —
+    /// bounded by the observation epoch (see "The observation epoch" above).
     fn for_open(&self, stamp: i64) -> Option<i64> {
         if stamp < self.boot_ms {
             self.prior
+                .map(|p| self.prior_observed.map_or(p, |o| p.min(o)))
         } else {
             self.live
+                .map(|l| l.min(self.current_observed.unwrap_or(self.boot_ms)))
         }
     }
 
@@ -4249,6 +4320,7 @@ fn restore_anchors<'a>(
     prior_marker_at: Option<i64>,
     boot_was_clean: bool,
     prior_heartbeat_ms: Option<i64>,
+    observed: Observed,
     boot_ms: i64,
     now_ms: i64,
 ) -> RestoreAnchors {
@@ -4274,6 +4346,9 @@ fn restore_anchors<'a>(
         prior,
         prior_closed,
         live,
+        // Like the marker, an epoch counts only when it predates this boot.
+        prior_observed: observed.prior.filter(|at| *at < boot_ms),
+        current_observed: observed.current,
     }
 }
 
@@ -4380,7 +4455,8 @@ fn boot_restore_needs_account(r: &TerminalSessionRecord, probe: &dyn TranscriptP
 /// ([`RestoreAnchors`]), never wall-clock now, so the length of the downtime
 /// never matters:
 ///
-/// - `open`: `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`;
+/// - `open`: `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, the
+///   anchor bounded by the observation epoch ([`RestoreAnchors::for_open`]);
 /// - closed `pty-exit`: `anchor - closed_at <= RESTORABLE_PTY_EXIT_MS` — a
 ///   graceful stop stamps every PTY at the shutdown instant, which on a clean
 ///   boot IS the prior anchor, so a rebuild of any length restores them while a
@@ -10415,10 +10491,36 @@ mod tests {
             .zip(STARVED_COHORT)
             .map(|(m, id)| fixture_rec(id, "open", t + m * minute, None, None))
             .collect();
-        recs.push(fixture_rec("ghost-72h", "open", t - 72 * 3_600_000, None, None));
+        recs.push(fixture_rec(
+            "ghost-72h",
+            "open",
+            t - 72 * 3_600_000,
+            None,
+            None,
+        ));
         recs
     }
 
+    /// Attach an observation epoch to `store` as THIS process would at boot:
+    /// when `prior_observed_at` is set, a PRIOR process first records it into
+    /// the sidecar under `dir`.
+    fn attach_epoch(
+        store: &SessionLifecycleStore,
+        dir: &Path,
+        prior_observed_at: Option<i64>,
+    ) -> Arc<ObservationEpoch> {
+        let path = dir.join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        if let Some(at) = prior_observed_at {
+            assert!(ObservationEpoch::open(&path, at - 3_600_000).record_tick(true, at));
+        }
+        let epoch = Arc::new(ObservationEpoch::open(&path, i64::MAX - 1));
+        store.attach_observation_epoch(epoch.clone());
+        epoch
+    }
+
+    /// The prior process's last SUCCESSFUL observation was at T (no touch
+    /// landed after it), so the cohort is fresh relative to what the runner
+    /// could see; the 72h ghost — stale long before T — stays out.
     #[test]
     fn restorable_records_snapshot_starved_cohort_survives_early_clean_marker() {
         let dir = tempdir().unwrap();
@@ -10428,12 +10530,252 @@ mod tests {
         write_fixture(&path, starved_cohort_fixture(t));
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(t));
 
         assert_eq!(
             restorable_ids(&store, Some(marker_at), true),
             STARVED_COHORT.map(str::to_string).to_vec(),
             "every session on screen when the snapshots starved is restored; the 72h ghost is not"
         );
+    }
+
+    /// The documented one-boot transition: with NO epoch (first boot after the
+    /// upgrade, or a pre-fix prior process) the open anchor is the prior
+    /// process's stamps plus the clean marker, exactly as before — so the
+    /// starved cohort still strands. Pinned so the fallback is a decision,
+    /// not an accident.
+    #[test]
+    fn restorable_records_snapshot_starved_cohort_without_epoch_still_strands() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        let epoch = attach_epoch(&store, dir.path(), None);
+        assert!(
+            epoch.boot_notice().is_some(),
+            "the absent epoch is announced"
+        );
+
+        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+    }
+
+    /// A corrupt sidecar reads as absent — the same fallback as no epoch.
+    #[test]
+    fn restorable_records_corrupt_epoch_falls_back_to_prior() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        std::fs::write(
+            dir.path()
+                .join(crate::session::observation_epoch::EPOCH_FILE_NAME),
+            b"{\"observedOkAt\": \"not a number\"}",
+        )
+        .unwrap();
+        attach_epoch(&store, dir.path(), None);
+
+        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+    }
+
+    /// An epoch OLDER than every row (the poll last saw the table an hour
+    /// before the cohort's earliest stamp) admits the whole cohort; the 72h
+    /// ghost is still 71h behind it.
+    #[test]
+    fn restorable_records_epoch_older_than_every_row_admits_the_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(t - 3_600_000));
+
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The grace boundary, both sides, measured from an epoch NEWER than the
+    /// rows: 9:59 behind it is admitted, 10:01 behind it is not.
+    #[test]
+    fn restorable_records_epoch_newer_than_rows_keeps_the_grace_boundary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let epoch_at = 1_700_000_000_000_i64;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("behind-0959", "open", epoch_at - 599_000, None, None),
+                fixture_rec("behind-1001", "open", epoch_at - 601_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(epoch_at + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(epoch_at));
+
+        assert_eq!(
+            restorable_ids(&store, Some(epoch_at + 3_600_000), true),
+            vec!["behind-0959".to_string()]
+        );
+    }
+
+    /// A CRASH boot (no clean marker counts) with an epoch: the rows alone
+    /// anchor at T+39m and strand the early cohort; the epoch at T admits it.
+    #[test]
+    fn restorable_records_crash_boot_with_epoch_admits_the_starved_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        // Control: without the epoch the crash cohort anchors at its newest
+        // spawn and loses every row more than 10 minutes older.
+        assert_eq!(
+            restorable_ids(&store, Some(t - 3_600_000), false),
+            vec!["starved-0030".to_string(), "starved-0039".to_string()]
+        );
+        attach_epoch(&store, dir.path(), Some(t));
+        assert_eq!(
+            restorable_ids(&store, Some(t - 3_600_000), false),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// An epoch THIS process writes never feeds the prior arm: its own ticks
+    /// (or a restore's re-asserts) cannot move the window the prior cohort
+    /// is judged against — in either direction.
+    #[test]
+    fn restorable_records_this_process_epoch_does_not_feed_prior() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let boot = t + 3 * 3_600_000;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        // No prior epoch: this process observing early (t) must not rescue
+        // the prior cohort, and observing late must not age it further.
+        let epoch = attach_epoch(&store, dir.path(), None);
+        epoch.record_ok(t);
+        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+
+        let dir2 = tempdir().unwrap();
+        let path2 = dir2.path().join("terminal-sessions.json");
+        write_fixture(&path2, starved_cohort_fixture(t));
+        let store2 = SessionLifecycleStore::open(&path2).unwrap();
+        store2.set_boot_ms_for_test(boot);
+        let epoch2 = attach_epoch(&store2, dir2.path(), Some(t));
+        epoch2.record_ok(boot + 5 * 3_600_000);
+        assert_eq!(
+            restorable_ids(&store2, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// A second boot reads the epoch the first boot's poll wrote.
+    #[test]
+    fn restorable_records_second_boot_reads_the_first_boots_epoch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        // First boot: a failed tick, then a successful one at T, then failures.
+        let first = ObservationEpoch::open(&epoch_path, t - 3_600_000);
+        assert!(!first.record_tick(false, t - 45_000));
+        assert!(first.record_tick(true, t));
+        assert!(!first.record_tick(false, t + 45_000));
+        drop(first);
+
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        let second = Arc::new(ObservationEpoch::open(&epoch_path, t + 3 * 3_600_000));
+        assert_eq!(second.prior_observed(), Some(t));
+        store.attach_observation_epoch(second);
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The ghost guard rails hold with an epoch set AFTER the ghost went
+    /// stale: successful ticks kept not finding it alive.
+    #[test]
+    fn ghost_exclusions_hold_with_an_epoch_after_the_ghost() {
+        let shutdown = 1_700_000_000_000_i64;
+        // `restorable_records_marker_anchor_excludes_lone_ghost` shape.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        write_fixture(
+            &path,
+            vec![fixture_rec(
+                "ghost",
+                "open",
+                shutdown - 72 * 3_600_000,
+                None,
+                None,
+            )],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        attach_epoch(&store, dir.path(), Some(shutdown - 60_000));
+        assert!(restorable_ids(&store, Some(shutdown), true).is_empty());
+
+        // `restorable_records_exclude_stale_open_ghost_after_clean_restart` shape.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec(
+                    "onscreen",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("pty-exit"),
+                ),
+                fixture_rec("ghost", "open", shutdown - 72 * 3_600_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        attach_epoch(&store, dir.path(), Some(shutdown - 60_000));
+        assert_eq!(
+            restorable_ids(&store, Some(shutdown), true),
+            vec!["onscreen".to_string()]
+        );
+    }
+
+    /// The live arm still ages out a row this process OBSERVED dead: with a
+    /// successful observation 30 minutes after a row's last touch, that row
+    /// is stale — the epoch only stops UNOBSERVED stretches counting.
+    #[test]
+    fn live_arm_still_ages_out_a_row_this_process_observed_dead() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("touched-at-t", "open", t, None, None),
+                fixture_rec("touched-at-t30", "open", t + 30 * 60_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t - 60_000);
+        attach_epoch(&store, dir.path(), None).record_ok(t + 30 * 60_000);
+        let roster: Vec<String> = store
+            .roster_records(Some(t - 120_000), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(roster, vec!["touched-at-t30".to_string()]);
     }
 
     /// The in-process arm of the same strand: THIS process booted before the
@@ -10653,7 +10995,15 @@ mod tests {
         let mut held = fixture_rec("held", "open", now - 60_000, None, None);
         held.awaiting_account_since = Some(now - 86_400_000);
         let rows = [cohort, expired, held];
-        let anchors = restore_anchors(rows.iter(), None, false, None, i64::MAX, now);
+        let anchors = restore_anchors(
+            rows.iter(),
+            None,
+            false,
+            None,
+            Observed::default(),
+            i64::MAX,
+            now,
+        );
         assert_eq!(
             anchors.prior,
             Some(now - 3_600_000),
