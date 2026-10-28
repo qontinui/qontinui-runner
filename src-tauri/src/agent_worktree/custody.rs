@@ -1708,8 +1708,11 @@ pub mod coord {
     ///   `nextCursor` key ABSENT) must hold FEWER ledger rows than the limit
     ///   sent: coord applies `LIMIT` to ledger rows tenant-wide, so a full
     ///   page may have cut off the very session asked about — and a missing
-    ///   row would read as "nothing attributed". A cursor-walked page is
-    ///   bounded by [`walk_pages`] instead, whose `partial` the caller refuses.
+    ///   row would read as "nothing attributed". A cursor-walked index is
+    ///   bounded by [`walk_pages`] instead, whose `partial` the caller refuses;
+    ///   [`merge_pages`] always sets `nextCursor`, so on the live path this
+    ///   row-limit rule is a backstop that the walk's own `partial` arm
+    ///   already covers, kept for any caller that hands in an unmerged page.
     pub fn validate_complete_page(
         page: &CoordSessionWorktrees,
         state: &str,
@@ -1732,24 +1735,85 @@ pub mod coord {
         Ok(())
     }
 
-    /// PURE: validate every `(state, page)` and union them into one index.
+    /// PURE: validate every `(state, page)` and union them into one index,
+    /// each page read as ONE snapshot (see [`ownership_from_walks`]).
     pub fn ownership_from_pages(
         pages: Vec<(&str, CoordSessionWorktrees)>,
         limit: usize,
     ) -> Result<CoordOwnership, String> {
+        let empty = std::collections::HashMap::new();
+        ownership_from_walks(
+            pages
+                .into_iter()
+                .map(|(state, page)| StateWalk {
+                    state,
+                    page,
+                    pages_read: 1,
+                })
+                .collect(),
+            limit,
+            &empty,
+            &empty,
+        )
+    }
+
+    /// One live state's cursor walk: the merged page and how many pages it
+    /// took.
+    #[derive(Debug, Clone)]
+    pub struct StateWalk<'a> {
+        pub state: &'a str,
+        pub page: CoordSessionWorktrees,
+        pub pages_read: usize,
+    }
+
+    /// PURE: validate every state's walk and union them into one index, and
+    /// mark which sessions on them are positively live AND complete.
+    ///
+    /// A walk that came back on ONE page was one database snapshot, so every
+    /// session on it was live with ALL of its rows for that state — marked
+    /// live, as before the cursor existed. A walk that took SEVERAL pages is
+    /// several snapshots over up to [`SURVEY_WALK_BUDGET`], ordered by
+    /// `(agent_id, repo)` rather than by session, so a session that changed
+    /// state mid-walk can be on it with only SOME of its rows — and custody
+    /// over a partial row set can read `Clean` while an unread worktree is
+    /// dirty. A session on a multi-page walk is therefore marked live only
+    /// when both work-status reads (`before` / `after`, taken around every
+    /// walk) name that same coord row in THAT walk's state: it held the
+    /// state across the whole read, so the walk saw every row. Anything else
+    /// is left unmarked, which the custody gate reads as Unknown. The same
+    /// residual as [`agreeing_live_sessions`] remains: a session that leaves
+    /// a state and returns to it between the two reads still agrees.
+    pub fn ownership_from_walks(
+        walks: Vec<StateWalk<'_>>,
+        limit: usize,
+        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+    ) -> Result<CoordOwnership, String> {
+        let held: std::collections::HashSet<(String, String)> = before
+            .iter()
+            .filter(|(claude_id, pre)| after.get(*claude_id) == Some(*pre))
+            .map(|(_, pre)| (pre.coord_session_id.to_ascii_lowercase(), pre.state.clone()))
+            .collect();
         let mut sessions: Vec<CoordSessionRow> = Vec::new();
-        for (state, page) in pages {
-            validate_complete_page(&page, state, limit)?;
-            sessions.extend(page.sessions);
+        let mut live: Vec<String> = Vec::new();
+        for walk in walks {
+            validate_complete_page(&walk.page, walk.state, limit)?;
+            for s in &walk.page.sessions {
+                let one_snapshot = walk.pages_read <= 1;
+                if one_snapshot
+                    || held.contains(&(s.session_id.to_ascii_lowercase(), walk.state.to_string()))
+                {
+                    live.push(s.session_id.clone());
+                }
+            }
+            sessions.extend(walk.page.sessions);
         }
-        let on_live_pages: Vec<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
         let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
             sessions,
             session_bridge_column_present: Some(true),
             ..Default::default()
         });
-        // Every session on a validated live page was live when the page was read.
-        index.mark_live(on_live_pages.iter().map(String::as_str));
+        index.mark_live(live.iter().map(String::as_str));
         Ok(index)
     }
 
@@ -1817,8 +1881,10 @@ pub mod coord {
     /// EARLIER between two of them and appear on no page while its rows exist.
     /// Absence is therefore ambiguous, and no single liveness read settles it.
     ///
-    /// So a session on a live page is live (its rows are on that page, which
-    /// is complete), and a session on NO page is taken as live-with-no-rows
+    /// So a session on a live state's walk is live when that walk was one
+    /// page (one snapshot, so its rows are all there) or, for a walk that took
+    /// several pages, when both work-status reads put it in that state (see
+    /// [`ownership_from_walks`]); and a session on NO page is taken as live-with-no-rows
     /// only when `/coord/sessions/work-status` — read once BEFORE the pages and
     /// once AFTER — names the same coord row in the same live state both times
     /// ([`agreeing_live_sessions`]). Disagreement, an absent row, or a read
@@ -1849,7 +1915,9 @@ pub mod coord {
         let mut pages = Vec::new();
         for state in LIVE_SESSION_STATES {
             let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let mut pages_read = 0usize;
             let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
+                pages_read += 1;
                 let url = state_page_url(&base_url, state, cursor.as_deref());
                 let client = client.clone();
                 async move {
@@ -1885,10 +1953,19 @@ pub mod coord {
             if let Some(reason) = partial {
                 return Err(format!("state={state}: {reason}"));
             }
-            pages.push((state, merged));
+            pages.push(StateWalk {
+                state,
+                page: merged,
+                pages_read,
+            });
         }
-        let mut index = ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)?;
         let after = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        let mut index = ownership_from_walks(
+            pages,
+            SESSION_WORKTREES_PAGE_LIMIT,
+            &before.liveness_by_session_id,
+            &after.liveness_by_session_id,
+        )?;
         let rowless = agreeing_live_sessions(
             &before.liveness_by_session_id,
             &after.liveness_by_session_id,
@@ -2388,6 +2465,44 @@ pub mod coord {
             assert!(
                 !CoordOwnership::from_response(page(r#"{"sessions":[]}"#)).is_known_live("s-page")
             );
+        }
+
+        /// A walk that took several pages is several snapshots, so a session
+        /// on it may carry only some of its rows (it changed state mid-walk).
+        /// It is live only when both work-status reads held it in THAT state;
+        /// a one-page walk is one snapshot and needs no agreement.
+        #[test]
+        fn a_multi_page_walk_marks_a_session_live_only_when_both_reads_held_its_state() {
+            let walked = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"S-HELD","worktrees":[{"worktreePath":"wt/h"}]},
+                    {"sessionId":"s-moved","worktrees":[{"worktreePath":"wt/m1"}]},
+                    {"sessionId":"s-silent","worktrees":[{"worktreePath":"wt/s"}]}]}"#,
+            );
+            let before = liveness(&[
+                ("claude-h", "s-held", "stale"),
+                ("claude-m", "s-moved", "stale"),
+            ]);
+            let after = liveness(&[
+                ("claude-h", "s-held", "stale"),
+                ("claude-m", "s-moved", "active"),
+            ]);
+            let walk = |pages_read| StateWalk {
+                state: "stale",
+                page: walked.clone(),
+                pages_read,
+            };
+            let idx = ownership_from_walks(vec![walk(3)], 500, &before, &after).unwrap();
+            assert!(idx.is_known_live("s-held"), "held stale across the read");
+            assert!(!idx.is_known_live("s-moved"), "moved to active mid-walk");
+            assert!(!idx.is_known_live("s-silent"), "no work-status agreement");
+            // The rows are still indexed; only liveness is withheld.
+            assert_eq!(idx.worktrees_for_session("s-moved").len(), 1);
+
+            let one = ownership_from_walks(vec![walk(1)], 500, &before, &after).unwrap();
+            for sid in ["s-held", "s-moved", "s-silent"] {
+                assert!(one.is_known_live(sid), "{sid} on a one-page walk");
+            }
         }
 
         /// Both reads name the same coord row in the same live state: rowless.
