@@ -2589,7 +2589,7 @@ impl SessionLifecycleStore {
             // continues, so no boundary is drawn.
             Some(rec) if rec.state == "open" => {
                 rec.restore_pending_at = Some(now);
-                (rec.clone(), BootBoundary::default())
+                (rec.clone(), None)
             }
             _ => return,
         };

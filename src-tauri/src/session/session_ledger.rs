@@ -2425,6 +2425,8 @@ mod tests {
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,
+            spawn: None,
+            run: Default::default(),
             confirmed_at: None,
             handle: None,
             account_label: Some("x".to_string()),
