@@ -522,6 +522,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "hooks/useUIBridgeDiscovery.ts",
   "hooks/useWebSocketEvents.ts",
   "lib/compile-state-machine.ts",
+  "lib/hook-gen-prompt-builder.test.ts",
   "lib/step-output-handlers/code-execution-handler.ts",
   "lib/step-output-handlers/command-handler.ts",
   "lib/step-output-handlers/prompt-handler.ts",
