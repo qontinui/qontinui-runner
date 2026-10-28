@@ -52,6 +52,7 @@ pub mod terminals;
 pub mod toasts;
 pub mod types;
 pub mod vision_ai;
+pub mod vision_capture_access;
 pub mod vision_frame_source;
 pub mod vision_routes;
 pub mod window_probe;

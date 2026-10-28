@@ -1087,8 +1087,11 @@ pub async fn ui_bridge_list_runner_windows_handler(
 /// atomic and were indistinguishable after the fact:
 ///
 /// * `?source=event` — the `ui-bridge-ping` Tauri event was DELIVERED to the
-///   renderer. The pong itself may still travel back over HTTP (the JS→Rust
-///   `emit` fallback for the WebView2 IPC failure mode), but delivery of the
+///   renderer. Since the 2026-10-19 ui-wedge plan this is the PRIMARY answer
+///   to a ping (`answerPing` in `src/hooks/ui-bridge-events/utils.ts`): a JS
+///   `emit` is an async Tauri command run on `app-rt`, which never settles
+///   while `app-rt` is starved, whereas this route is served on `mcp-api-rt`.
+///   The Tauri `ui-bridge-pong` event is the fallback leg. Delivery of the
 ///   ping is proof the native message loop pumped, so this stamps the
 ///   event-provenance clock.
 /// * `?source=safety-net` — the frontend's unconditional 3s interval, which is

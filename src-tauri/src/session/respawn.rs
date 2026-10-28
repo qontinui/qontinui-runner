@@ -837,6 +837,7 @@ mod tests {
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,

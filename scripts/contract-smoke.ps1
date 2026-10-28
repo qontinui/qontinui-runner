@@ -1324,12 +1324,14 @@ try {
         $exitCode = 1
     }
 
-    # Probe 4: /vision/capture returns the Phase-2 envelope shape
-    # POST {"contract":"claude"} should yield:
-    #   200 + { success: true, data: { path, sha256, width, height, bytes,
+    # Probe 4: /vision/capture returns the envelope shape and its url serves
+    # the bytes. POST {"contract":"claude"} should yield:
+    #   200 + { success: true, data: { url, sha256, width, height, bytes,
     #          format: "jpeg", contract: "claude_vision_v1" } }
-    # path must start with "tmp_vision_cache/" and bytes must be < 5 MiB
-    # (Claude vision input ceiling from the OutputContract pipeline).
+    # url must be /ui-bridge/vision/cache/<64 hex> (sha256 is the cache-KEY
+    # hash, not a content hash), bytes must be < 5 MiB (Claude vision input
+    # ceiling from the OutputContract pipeline, and the inline cap), there is
+    # no `path` field, and GET <url> must return exactly `bytes` bytes.
     try {
         $body = '{"contract":"claude"}'
         $cap = Invoke-Probe -Method "POST" -Url "$runnerBase/vision/capture" -Body $body
@@ -1347,7 +1349,7 @@ try {
             } else {
                 $d = $obj.data
                 $errs = @()
-                foreach ($key in @('path','sha256','width','height','bytes','format','contract')) {
+                foreach ($key in @('url','sha256','width','height','bytes','format','contract')) {
                     if (-not ($d.PSObject.Properties.Name -contains $key)) {
                         $errs += "missing $key"
                     }
@@ -1361,14 +1363,38 @@ try {
                 if ($d.bytes -and [int]$d.bytes -ge (5 * 1024 * 1024)) {
                     $errs += "bytes=$($d.bytes) >= 5 MiB ceiling"
                 }
-                if ($d.path -and -not ($d.path -match '^tmp_vision_cache[\\/].+\.(jpe?g|webp|png)$')) {
-                    $errs += "path=$($d.path) (expected tmp_vision_cache/<sha>.<ext>)"
+                if ($d.PSObject.Properties.Name -contains 'path') {
+                    $errs += "path=$($d.path) (removed: the response names its bytes by url)"
+                }
+                if ($d.PSObject.Properties.Name -contains 'base64') {
+                    $errs += "base64 present without inline:true"
+                }
+                if (-not ($d.url -match '^/ui-bridge/vision/cache/[0-9a-f]{64}$')) {
+                    $errs += "url=$($d.url) (expected /ui-bridge/vision/cache/<64 hex>)"
+                } elseif ($d.url -ne "/ui-bridge/vision/cache/$($d.sha256)") {
+                    $errs += "url=$($d.url) does not name sha256=$($d.sha256)"
+                } else {
+                    # GET the url against the runner origin; its body must be the
+                    # capture's bytes. RawContentStream is byte-exact on PS 5.1
+                    # and 7 regardless of the image content type.
+                    $origin = $runnerBase -replace '/ui-bridge$', ''
+                    try {
+                        $img = Invoke-WebRequest -Uri "$origin$($d.url)" -Method GET -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                        $got = $img.RawContentStream.Length
+                        if ([int]$img.StatusCode -ne 200) {
+                            $errs += "GET url -> $($img.StatusCode) (expected 200)"
+                        } elseif ($got -ne [int64]$d.bytes) {
+                            $errs += "GET url returned $got bytes, response said bytes=$($d.bytes)"
+                        }
+                    } catch {
+                        $errs += "GET url failed: $($_.Exception.Message)"
+                    }
                 }
                 if ($errs.Count -gt 0) {
                     Record "FAIL" "POST" "/vision/capture (shape)" ($errs -join "; ")
                     $exitCode = 1
                 } else {
-                    Record "PASS" "POST" "/vision/capture (shape)" "$($d.width)x$($d.height) $($d.bytes)b $($d.format) $($d.contract)"
+                    Record "PASS" "POST" "/vision/capture (shape)" "$($d.width)x$($d.height) $($d.bytes)b $($d.format) $($d.contract); GET url byte-exact"
                 }
             }
         }
