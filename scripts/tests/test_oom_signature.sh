@@ -285,6 +285,39 @@ alloc_log 18446744073709551615
 assert_eq "N = usize::MAX (an overflowed capacity), default total" "" \
   "$(run_emitter --step 'Run Rust tests' --log "$work/alloc-18446744073709551615.log")"
 
+echo "(o) ANSI-coloured verdicts (CI sets CARGO_TERM_COLOR=always) still win"
+assert_eq "coloured error[E0308] + rustc-LLVM OOM" "" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/colored-e0308-and-llvm-oom.txt" --build-phase)"
+assert_eq "coloured deny-lint \`error: unused variable\` + rustc-LLVM OOM" "" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/colored-deny-lint-and-llvm-oom.txt" --build-phase)"
+
+echo "(p) anchors: a signature QUOTED mid-line is not one"
+assert_eq "allocation abort quoted mid-line" "" \
+  "$(run_emitter --step 'Run Rust tests' --log "$fx/alloc-abort-quoted-mid-line.txt" --mem-total-bytes 17179869184)"
+assert_eq "STATUS_NO_MEMORY exit quoted mid-line" "" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/status-no-memory-quoted-mid-line.txt" --build-phase)"
+# A captured block left open (no `failures:` / `test result:`) ends at the
+# next binary's `Running` line, so that binary's OOM is still evidence.
+assert_eq "OOM after the Running line that closes a captured block" \
+  "::error title=$RUN_TITLE::memory allocation failed: memory allocation of 2097152 bytes failed" \
+  "$(run_emitter --step 'Run Rust tests' --log "$fx/captured-block-ended-by-running.txt" --mem-total-bytes 17179869184)"
+
+echo "(q) rustc's own \`error: … (os error 1455)\` is the commit limit, not a verdict"
+assert_eq "could not exec the linker (os error 1455)" \
+  "::error title=$BUILD_TITLE::commit limit (os error 1455): error: could not exec the linker \`link.exe\`: The paging file is too small for this operation to complete. (os error 1455)" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/rustc-linker-exec-os-error-1455.txt" --build-phase)"
+assert_eq "failed to write …rlib (os error 1455)" \
+  "::error title=$BUILD_TITLE::commit limit (os error 1455): error: failed to write D:\\a\\qontinui-runner\\qontinui-runner\\src-tauri\\target\\debug\\deps\\libqontinui_schemas-9f8e7d6c.rlib: The paging file is too small for this operation to complete. (os error 1455)" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/rustc-write-rlib-os-error-1455.txt" --build-phase)"
+assert_eq "(os error 1455) error beside a separate error[E0308] stays silent" "" \
+  "$(run_emitter --step 'Build Rust tests' --log "$fx/rustc-os-error-1455-and-e0308.txt" --build-phase)"
+
+echo "(r) a FAILED verdict not at line start still wins"
+assert_eq "\`noise test b ... FAILED\` + allocation abort" "" \
+  "$(run_emitter --step 'Run Rust tests' --log "$fx/failed-mid-line-then-alloc-abort.txt" --mem-total-bytes 17179869184)"
+assert_eq "bare \`FAILED\` line + allocation abort" "" \
+  "$(run_emitter --step 'Run Rust tests' --log "$fx/bare-failed-then-alloc-abort.txt" --mem-total-bytes 17179869184)"
+
 echo "(k) the cross-repo title contract, byte for byte"
 # See the BUILD_TITLE / RUN_TITLE comment: coord's constants are the other half.
 title_of() { sed -n 's/^::error title=\([^:]*\)::.*/\1/p'; }
