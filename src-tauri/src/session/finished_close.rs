@@ -167,10 +167,15 @@ pub fn plan_pass(
 /// PURE: the `(claude_session_id, terminal_id)` pairs this arm may consider —
 /// [`select_candidates`]' `Eligible`, top-level, one-per-pane set, narrowed to
 /// [`SessionKind::Terminal`]. Looping agents and stewards stay drain-only.
+/// Nothing at all when the looping-agent registry did not answer this pass:
+/// a looping agent's pane would then resolve to `Terminal` and be admitted.
 pub fn select_finished_close_candidates(
     processes: &[LiveClaudeProcess],
     observed: &ObservedInputs,
 ) -> Vec<(String, String)> {
+    if !observed.looping_registry_resolved {
+        return Vec::new();
+    }
     select_candidates(processes, observed)
         .into_iter()
         .filter(|(_, terminal_id)| observed.kind_for(terminal_id) == SessionKind::Terminal)

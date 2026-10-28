@@ -108,8 +108,8 @@ struct WireRow {
     /// RFC 3339. Absent on a coord that predates the field.
     #[serde(default)]
     since: Option<String>,
-    /// WHICH `coord.sessions` row answered (the key is not unique). Absent on
-    /// a coord that predates the field.
+    /// WHICH `coord.sessions` row answered (the latest for the harness id —
+    /// the key is not unique). Absent on a coord that predates the field.
     #[serde(default)]
     coord_session_id: Option<String>,
     /// That row's LIVENESS axis (`expected` | `active` | `pending_resolution` |

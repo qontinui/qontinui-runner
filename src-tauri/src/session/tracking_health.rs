@@ -378,6 +378,17 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 /// reconnected mid-session, a node-hosted nested agent) — is work, so the
 /// error is always toward keeping the session open.
 ///
+/// Known limits, both in the direction of keeping a session open or of a
+/// short-lived misread while a turn is visibly running:
+/// - an MCP server launched THROUGH a shell (`cmd /c npx …`, `sh -c …`) is a
+///   shell child and always counts as work, so such a session never reads
+///   idle — the fleet's `coord-mcp-shim.py` runs under `python3` directly;
+/// - a non-shell child a tool starts in the first
+///   [`SESSION_START_CHILD_WINDOW_S`] (a direct `rg` from a turn that begins
+///   at boot, a job `exec`'d into within the window) reads as infrastructure
+///   while it lives, and work running UNDER a boot-time MCP server is not
+///   seen, since only direct children are inspected.
+///
 /// Counting boot-time MCP servers as work made every MCP-equipped session
 /// permanently "busy", so wind-down could never close one (plan
 /// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,

@@ -676,11 +676,18 @@ pub fn recheck_is_owed(arm: CloseArm, index: usize) -> bool {
 /// invisible otherwise: deleting the re-check, or weakening its condition to
 /// an index no batch reaches, is green across the whole suite and walks past
 /// the kill-path tripwire, which forbids literals and pins nothing positive.
+///
+/// For [`CloseArm::FinishedClose`] the fresh verdict must ALSO still be for a
+/// [`SessionKind::Terminal`] session: a pane that became a looping agent or a
+/// steward since the census is drain-only, and its eligibility no longer
+/// requires `finished`.
 pub fn recheck_admits(arm: CloseArm, index: usize, view: Option<&wind_down::WindDownView>) -> bool {
     if !recheck_is_owed(arm, index) {
         return true;
     }
-    view.is_some_and(wind_down::WindDownView::is_eligible)
+    view.is_some_and(|v| {
+        v.is_eligible() && (arm != CloseArm::FinishedClose || v.kind == SessionKind::Terminal)
+    })
 }
 
 /// PURE: did `claude` leave the pane? See the `stopped_by_drain` comment in
@@ -2144,6 +2151,7 @@ mod tests {
                 .iter()
                 .map(|(s, t)| (s.to_string(), t.to_string()))
                 .collect(),
+            looping_registry_resolved: true,
             ..Default::default()
         }
     }
@@ -3059,6 +3067,40 @@ mod tests {
             inputs.kind,
         ));
         proc
+    }
+
+    /// A pane the looping-agent registry could not classify resolves to
+    /// `Terminal` — the one kind `finished_close` may close — so a pass whose
+    /// registry did not answer considers nothing; and a re-check that finds the
+    /// pane is no longer a `Terminal` session refuses the close on that arm
+    /// while the drain arm still admits it.
+    #[test]
+    fn finished_close_never_closes_a_pane_whose_kind_is_unknown_or_changed() {
+        let processes = vec![judged("s-t1", &finished_idle(), GRACE_MS)];
+        let mut observed = observed_with(&[("s-t1", "t1")]);
+        assert_eq!(
+            select_finished_close_candidates(&processes, &observed).len(),
+            1
+        );
+        observed.looping_registry_resolved = false;
+        assert!(select_finished_close_candidates(&processes, &observed).is_empty());
+
+        let looping_now = wind_down::WindDownView {
+            eligibility: "eligible",
+            since: Some(1),
+            until: None,
+            reason: None,
+            kind: SessionKind::Looping,
+            custody: None,
+        };
+        for index in 0..4 {
+            assert!(!recheck_admits(
+                CloseArm::FinishedClose,
+                index,
+                Some(&looping_now)
+            ));
+        }
+        assert!(recheck_admits(CloseArm::Drain, 1, Some(&looping_now)));
     }
 
     /// THE property: an eligible, finished, idle, custody-clean terminal

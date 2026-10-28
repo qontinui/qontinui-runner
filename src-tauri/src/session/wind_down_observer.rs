@@ -76,6 +76,12 @@ pub struct ObservedInputs {
     pub by_terminal: HashMap<String, TerminalObservation>,
     pub steward_terminal_ids: HashSet<String>,
     pub looping_terminal_ids: HashSet<String>,
+    /// Whether the looping-agent registry answered this pass. When it did
+    /// not, `looping_terminal_ids` is empty and every looping agent's pane
+    /// resolves to [`SessionKind::Terminal`] — the strictest kind for the drain
+    /// arm, but the ONE kind the `finished_close` arm may close, so that arm
+    /// considers nothing on a pass where this is `false` (unknown never closes).
+    pub looping_registry_resolved: bool,
     /// The instant every verdict in the pass was judged at.
     pub now_ms: i64,
 }
@@ -137,7 +143,9 @@ pub fn observe_and_apply(
     // cost of two registry reads, which can only make an idle window look
     // longer than it was — the one direction that must never drift.
     let steward_terminal_ids = crate::mcp::steward::steward_terminal_ids();
-    let looping_terminal_ids = looping_terminal_ids(app);
+    let looping = looping_terminal_ids(app);
+    let looping_registry_resolved = looping.is_some();
+    let looping_terminal_ids = looping.unwrap_or_default();
     let observations = observe_terminals(manager.as_deref(), wanted);
     let now_ms = chrono::Utc::now().timestamp_millis();
     apply_wind_down(
@@ -155,6 +163,7 @@ pub fn observe_and_apply(
         by_terminal: observations,
         steward_terminal_ids,
         looping_terminal_ids,
+        looping_registry_resolved,
         now_ms,
     }
 }
@@ -298,7 +307,9 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
 /// minutes ago.
 ///
 /// `None` means the session is no longer a top-level terminal-hosted `claude`
-/// this pass can see at all — which is not eligibility either.
+/// this pass can see at all — which is not eligibility either — or that the
+/// looping-agent registry did not answer, so the verdict's `kind` cannot be
+/// trusted (both arms fail closed on `None`).
 pub async fn recheck(
     app: &tauri::AppHandle,
     grace: Duration,
@@ -306,6 +317,9 @@ pub async fn recheck(
     terminal_id: &str,
 ) -> Option<WindDownView> {
     let fresh = fresh_pass(app, grace).await;
+    if !fresh.observed.looping_registry_resolved {
+        return None;
+    }
     // The pane must still host this session: a terminal id that has been
     // rebound to another session since the tick's first pass is not the pane
     // whose verdict we are re-checking.
@@ -499,9 +513,10 @@ pub fn observe_terminals(
         .collect()
 }
 
-/// Terminal ids the looping-agent registry currently attributes to an agent.
-/// An unresolvable registry is an empty set (see [`session_kind_for`]).
-pub fn looping_terminal_ids(app: &tauri::AppHandle) -> HashSet<String> {
+/// Terminal ids the looping-agent registry currently attributes to an agent,
+/// or `None` when the registry is not reachable this pass (see
+/// [`ObservedInputs::looping_registry_resolved`] for what each arm does then).
+pub fn looping_terminal_ids(app: &tauri::AppHandle) -> Option<HashSet<String>> {
     use tauri::Manager;
 
     app.try_state::<Arc<qontinui_runner_lib::looping_agent::registry::LoopingAgentRegistry>>()
@@ -512,7 +527,6 @@ pub fn looping_terminal_ids(app: &tauri::AppHandle) -> HashSet<String> {
                 .filter_map(|rec| rec.runtime.terminal_id)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
