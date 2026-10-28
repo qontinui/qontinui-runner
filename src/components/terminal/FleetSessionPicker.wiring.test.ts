@@ -541,8 +541,12 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
   });
 
   it("leaves `limit` out of the scope fingerprint itself", () => {
-    expect(DISCOVERY).toContain(
-      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+    // `sessionStatus` joined the fingerprint with coord's Phase 4 filter (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`); `limit` still
+    // stays out.
+    const fingerprint = /return JSON\.stringify\(\[([^\]]*)\]\);/.exec(codeOf(DISCOVERY))?.[1];
+    expect(fingerprint?.replace(/\s+/g, " ").trim()).toBe(
+      "scope.deviceId, scope.state, scope.includeClosed, scope.tenantId, scope.sessionStatus ?? null,",
     );
   });
 });
@@ -687,13 +691,31 @@ describe("the merged view shows every tenant's rows and every tenant's failure",
   });
 
   it("groups a merged read by device AND tenant", () => {
-    expect(SOURCE).toContain("groupByDevice(visible, { byTenant: merged })");
+    expect(SOURCE.replace(/\s+/g, " ")).toContain(
+      "groupByDevice( visible.filter((s) => !endedHere.has(s.sessionId)), { byTenant: merged }, )",
+    );
   });
 
   it("reads a row's degraded flags off its OWN tenant's envelope", () => {
-    expect(SOURCE).toContain(
-      "envelopes.get(s.servedTenantId ?? null)?.deviceIdentityColumnsPresent",
+    // Both the attach button and the end button read the row's OWN walk's flag.
+    expect(SOURCE.replace(/\s+/g, " ")).toContain(
+      "envelopes.get( s.servedTenantId ?? null, )?.deviceIdentityColumnsPresent;",
     );
+    expect(SOURCE).toContain("endButtonState(s, rowColumnsPresent)");
+  });
+
+  it("ends a row, and bulk-ends, under the tenant the ROW was listed under", () => {
+    // coord resolves the session within the presented principal's tenant only:
+    // an end minted under the selection or the default slot is a 404 in a
+    // merged view. The finished read is also one walk per walked tenant.
+    // Anchored to each call: the string also appears in the attach call, so a
+    // bare `toContain` would pass with the End button's target missing it.
+    const src = SOURCE.replace(/\s+/g, " ");
+    expect(src).toMatch(/setEndTarget\(\{[^}]*tenant: s\.mintTenantId \?\? null,[^}]*\}\)/);
+    expect(src).toMatch(
+      /items: candidates\.map\(\(s\) => \(\{[^}]*tenant: s\.mintTenantId \?\? null,/,
+    );
+    expect(SOURCE).toContain("useFinishedFleetSessions(walkTenants)");
   });
 
   it("offers the empty state's create PER answered tenant in a merged read, never an unchosen default", () => {

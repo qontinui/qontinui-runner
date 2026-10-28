@@ -89,6 +89,13 @@ export interface FleetScope {
    * worst; a tenant switch must restart the walk like any other scope change.
    */
   tenantId: string | null;
+  /**
+   * The WORK-axis filter (`?session_status=`, plan
+   * `2026-09-30-close-remote-sessions-from-the-local-runner` Phase 4). Optional
+   * so the picker's own walk, which never sets it, is unchanged; coord puts it
+   * in the cursor fingerprint, so it is part of the scope here too.
+   */
+  sessionStatus?: string | null;
 }
 
 /**
@@ -96,7 +103,13 @@ export interface FleetScope {
  * under the other; unequal keys mean the walk must restart with no cursor.
  */
 export function fleetScopeKey(scope: FleetScope): string {
-  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);
+  return JSON.stringify([
+    scope.deviceId,
+    scope.state,
+    scope.includeClosed,
+    scope.tenantId,
+    scope.sessionStatus ?? null,
+  ]);
 }
 
 /** True when two scopes would accept each other's cursors. */
@@ -435,6 +448,9 @@ const FLEET_ERROR_CODES = [
   "cursor_version_unsupported",
   "limit_not_positive",
   "unknown_state",
+  "unknown_session_status",
+  "work_axis_columns_absent",
+  "work_axis_columns_unknown",
 ] as const;
 
 export type FleetErrorCode = (typeof FLEET_ERROR_CODES)[number];
@@ -506,6 +522,20 @@ export function fleetErrorMessage(code: FleetErrorCode | null, raw: unknown): st
       return (
         "coord does not recognise the selected state filter — the lists of session states " +
         "in play disagree. Clear the state filter to list every state."
+      );
+    case "unknown_session_status":
+      return (
+        "coord does not recognise the requested session-status filter — this runner and " +
+        "coord disagree about the work-axis vocabulary."
+      );
+    case "work_axis_columns_absent":
+    case "work_axis_columns_unknown":
+      // A 503, not an empty list: coord cannot read (absent) or could not probe
+      // (unknown) the work-axis columns, so which sessions are finished is
+      // UNKNOWN. Never rendered as "0 finished".
+      return (
+        "The finished filter is unavailable — coord cannot read session status right now, so " +
+        "which sessions are finished is unknown."
       );
     default:
       return `Failed to load fleet sessions: ${raw}`;
@@ -810,6 +840,8 @@ export interface FleetServerFilter {
   state: string | null;
   includeClosed: boolean;
   limit: number;
+  /** Work-axis filter; see [`FleetScope`]. Absent/null = no filter. */
+  sessionStatus?: string | null;
 }
 
 export const DEFAULT_FLEET_SERVER_FILTER: FleetServerFilter = {
@@ -830,6 +862,7 @@ export function fleetScopeOf(server: FleetServerFilter, tenantId: string | null)
     state: server.state,
     includeClosed: server.includeClosed,
     tenantId,
+    sessionStatus: server.sessionStatus ?? null,
   };
 }
 

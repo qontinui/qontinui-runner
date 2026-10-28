@@ -446,7 +446,7 @@ fn newest_copy_among(config_dirs: &[PathBuf], session_id: &str) -> Option<PathBu
 ///
 /// Newest rather than "the exact path in `config_dir`": a migrated session's
 /// frozen copy sits at the SAME encoded path in its old config dir
-/// (`account_migration::copy_transcript` keeps the project dir), so callers
+/// (`session_carry::copy_transcript` keeps the project dir), so callers
 /// that loop over config dirs would otherwise read the frozen copy whenever its
 /// dir came first. The exact path in each config dir is checked first (a few
 /// `stat`s); the full `projects/*` sweep runs only when none exists.
