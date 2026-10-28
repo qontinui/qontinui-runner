@@ -4777,9 +4777,12 @@ fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>)
 /// Monotonic: `NotYetRun → Withheld → Ran`, or `NotYetRun → Ran`. Once the
 /// restore has run, normal orphan handling resumes for good; a later drain does
 /// not re-arm the hold. The restore runs per PAGE (the active one first), so
-/// records of pages not yet restored are then judged exactly as on an undrained
-/// boot — parity, not a full guarantee; that gap is the plan's recorded
-/// follow-up ("Non-active pages at an UNDRAINED boot").
+/// this latch alone cannot keep the rows of a page not yet opened. That gap
+/// (the plan's recorded follow-up "Non-active pages at an UNDRAINED boot") is
+/// closed by the boot-census arm of [`withheld_boot_restore_candidate`]: a row
+/// in the boot-latched restorable set is held in every phase (plan
+/// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+/// Phase 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRestorePhase {
     /// The restore path has not been asked yet (the frontend has not mounted)
@@ -4902,17 +4905,35 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   (drained, or drain state unknown). This covers a poll tick that lands
 ///   before the frontend's first ask; when the gate allows, today's handling
 ///   applies (the restore is about to run, or there is no consumer for it).
+/// - `awaiting_boot_restore` ⇒ hold in EVERY phase, `Ran` included (plan
+///   `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+///   Phase 4). The caller passes
+///   [`crate::session::restore_census::BootCensus::awaits_restore`]: the row is
+///   in the boot-latched restorable set and is not finished. Restore is lazy
+///   per PAGE, so after `Ran` a row on a page not opened yet still matches no
+///   terminal by design, and closing it `no-terminal` after
+///   `NO_TERMINAL_ORPHAN_TICKS` strands it for good. Its own restore makes the
+///   hold moot: the restore re-asserts the row (`record_open`) or re-points its
+///   terminal (a rebind), so the poll matches it by id and judges it on that
+///   live terminal, which the hold never overrides, and its first touch moves
+///   it past the boot line. A close or a finish by the operator ends the hold,
+///   and so does the `OPEN_STALE_MS` prune. A row outside the latched set is a
+///   genuine orphan and closes as before.
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
     phase: BootRestorePhase,
     drain_defers_boot_resume: bool,
+    awaiting_boot_restore: bool,
 ) -> bool {
     let Some(boot_at) = boot_at_ms else {
         return false;
     };
     if last_seen_at >= boot_at {
         return false;
+    }
+    if awaiting_boot_restore {
+        return true;
     }
     match phase {
         BootRestorePhase::Ran => false,
@@ -11590,6 +11611,26 @@ mod tests {
         phase: BootRestorePhase,
         drain_defers_boot_resume: bool,
     ) {
+        simulate_no_terminal_poll_ticks_with_census(
+            store,
+            ticks,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            None,
+        );
+    }
+
+    /// [`simulate_no_terminal_poll_ticks`] with the boot census latched, as
+    /// `main.rs` reads it each tick ([`crate::session::restore_census::latched`]).
+    fn simulate_no_terminal_poll_ticks_with_census(
+        store: &SessionLifecycleStore,
+        ticks: u32,
+        boot_at_ms: Option<i64>,
+        phase: BootRestorePhase,
+        drain_defers_boot_resume: bool,
+        census: Option<&crate::session::restore_census::BootCensus>,
+    ) {
         let mut consecutive_no_match: HashMap<String, u32> = HashMap::new();
         for _ in 0..ticks {
             for rec in store.open_records() {
@@ -11602,6 +11643,7 @@ mod tests {
                     boot_at_ms,
                     phase,
                     drain_defers_boot_resume,
+                    census.is_some_and(|c| c.awaits_restore(&rec)),
                 );
                 let action = hold_for_withheld_boot_restore(
                     classify(
@@ -11848,20 +11890,121 @@ mod tests {
     fn withheld_boot_restore_candidate_truth_table() {
         let boot = Some(1_000);
         use BootRestorePhase::*;
-        // Prior-boot record.
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, false));
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, true));
-        assert!(withheld_boot_restore_candidate(999, boot, NotYetRun, true));
-        assert!(!withheld_boot_restore_candidate(
-            999, boot, NotYetRun, false
+        // Prior-boot record outside the boot-latched restorable set.
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, false, false
         ));
-        assert!(!withheld_boot_restore_candidate(999, boot, Ran, true));
-        // This-boot record: never held.
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, true, false
+        ));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, true, false
+        ));
         assert!(!withheld_boot_restore_candidate(
-            1_000, boot, Withheld, true
+            999, boot, NotYetRun, false, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, Ran, true, false
+        ));
+        // Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+        // restore-set, Phase 4: a prior-boot row still awaiting the boot
+        // restore that latched it is held in EVERY phase. The `Ran` row is the
+        // unopened page: the restore ran for the page on screen, not for this
+        // row's.
+        assert!(withheld_boot_restore_candidate(999, boot, Ran, false, true));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, false, true
+        ));
+        // This-boot record: never held, awaiting or not.
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Withheld, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Ran, false, true
         ));
         // No boot instant: nothing is provably prior-boot.
-        assert!(!withheld_boot_restore_candidate(999, None, Withheld, true));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Withheld, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Ran, false, true
+        ));
+    }
+
+    /// Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+    /// restore-set, Phase 4: the boot restore has RUN (for the page on
+    /// screen), and the boot-latched cohort sits on a page never opened, so it
+    /// matches no terminal. The poll must hold it `open` past the orphan
+    /// debounce, while the ghost the latch left out (a genuine orphan) still
+    /// closes `no-terminal`. Finishing a held row releases the hold.
+    #[test]
+    fn a_latched_row_on_an_unopened_page_is_not_swept_as_an_orphan() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        store.set_boot_ms_for_test(boot);
+        // The census latches the restorable set, exactly as main.rs does at
+        // boot (a crash boot: the crashed process's marker never anchors).
+        #[derive(Debug)]
+        struct NoTranscripts;
+        impl TranscriptProbe for NoTranscripts {
+            fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
+                false
+            }
+        }
+        let census = crate::session::restore_census::BootCensus {
+            boot_at_ms: boot,
+            expected: crate::session::restore_census::expected_rows(
+                store.restorable_records(None, false),
+                &NoTranscripts,
+            ),
+        };
+        let latched: Vec<&str> = census
+            .expected
+            .iter()
+            .map(|e| e.claude_session_id.as_str())
+            .collect();
+        assert_eq!(
+            latched,
+            vec!["victim-a", "victim-b"],
+            "the ghost is not latched"
+        );
+
+        simulate_no_terminal_poll_ticks_with_census(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            Some(&census),
+        );
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+        assert_eq!(store.get("victim-b").unwrap().state, "open");
+        let ghost = store.get("ghost").unwrap();
+        assert_eq!(ghost.state, "closed", "a genuine orphan still closes");
+        assert_eq!(ghost.close_reason.as_deref(), Some("no-terminal"));
+        assert_eq!(
+            sorted_restorable(&store, Some(boot)),
+            vec!["victim-a".to_string(), "victim-b".to_string()],
+            "the held cohort is still restorable when its page opens"
+        );
+
+        // The operator finishes one: it no longer awaits a restore, so the
+        // ordinary orphan handling retires it.
+        store
+            .set_finished("victim-b", true, None)
+            .expect("a known session");
+        simulate_no_terminal_poll_ticks_with_census(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            Some(&census),
+        );
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+        assert_eq!(store.get("victim-b").unwrap().state, "closed");
     }
 
     #[test]
