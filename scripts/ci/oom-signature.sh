@@ -15,6 +15,15 @@
 # to emit that title when — and only when — the log proves an OOM. Plan
 # 2026-10-27-coord-routes-ci-jobs-by-runner-capability, D4 and Phase 1.
 #
+# DESIGN RISK (accepted, same class as a build timeout). A PR that
+# DETERMINISTICALLY runs the compiler out of memory (a pathological generic or
+# macro expansion) gets the build-killed title on every attempt. On main coord
+# write-skips that as `build_killed`, so such a commit would sit write-skipped
+# — neither green nor a code red — indefinitely, exactly as a build that
+# deterministically times out does. Coord cannot tell the two apart there (see
+# qontinui-coord `main_baseline_no_verdict.rs`); the bound on it is coord's,
+# not this script's.
+#
 # OUTPUT. On a match, exactly one line on stdout:
 #   ::error title=<step> OUT OF MEMORY (not a verdict on this PR)::<signature>: <evidence>
 # With --build-phase (the step only compiles, so NO test ran) the title also
@@ -34,25 +43,48 @@
 #   1. `rustc-LLVM ERROR: out of memory`        at line start (rustc/LLVM).
 #      The one signal Phase 0 confirmed on hosted runners: the incident plus
 #      3 further hits.
-#   2. `memory allocation of N bytes failed`     at line start (Rust's abort).
+#   2. `memory allocation of N bytes failed`     at line start (Rust's abort),
+#      or after libtest's `test <name> ... ` on the same line (a single-
+#      threaded test binary prints the abort where the result would go). Only
+#      when N is no more than the machine's total RAM: a request larger than
+#      the whole machine is a size bug (an overflowed capacity), not capacity.
+#      Total RAM is --mem-total-bytes when given, else MemTotal from
+#      /proc/meminfo (Linux; Git Bash on Windows emulates it), else a fixed
+#      64 GiB cap — larger than any hosted runner, so the cap only ever
+#      SILENCES an absurd request and never invents a match.
 #   3. cargo's `process didn't exit successfully: … (exit code: 0xc0000017[,
 #      STATUS_NO_MEMORY])` ending the line (a Windows process out of memory).
 #   4. `(os error 1455)` at line end             (Windows commit limit).
 #   5. `LINK : fatal error LNK1102: …`, optionally after cargo's `= note: `
 #      (MSVC linker out of memory).
-#   6. `(signal: 9, SIGKILL: kill)` at line end — ONLY together with a cgroup
-#      `oom_kill` count > 0 read from --memory-events. A SIGKILL alone is not
-#      evidence: job 111779867816's rustc was SIGKILLed because the runner
-#      received a shutdown signal, and a timeout or a cancel delivers one too.
+#   6. `(signal: 9, SIGKILL: kill)` at line end (cargo reporting a killed
+#      rustc or test binary), and
+#   7. bash's own `<script>: line N: <pid> Killed  <cmd>` — the run phase
+#      execs each test binary from the step's bash script, not through cargo,
+#      so an OOM-killed test binary is reported this way (the step exits 137).
+#   6 and 7 count ONLY together with cgroup evidence: the `oom_kill` count in
+#   --memory-events must EXCEED --oom-kill-baseline, the count the workflow
+#   recorded before the step ran. `oom_kill` is cumulative over the cgroup's
+#   lifetime (on a hosted runner, the runner service's), so a non-zero count
+#   alone may be an earlier step's or an earlier job's. A missing, unreadable
+#   or non-integer baseline or count is NO evidence. A SIGKILL alone is not
+#   evidence either: job 111779867816's rustc was SIGKILLed because the runner
+#   received a shutdown signal, and a timeout or a cancel delivers one too.
 #
 # NOT a signature: the Windows pagefile peak. Phase 0 measured hosted Windows
 # at 32767 of 32768 MB in 8 of 21 readings, 5 of them jobs that failed in
 # TESTS, and a GREEN job at 32551 — saturation is normal there, not OOM.
 #
 # A CODE VERDICT IN THE SAME LOG WINS. When the log also carries a verdict on
-# the code — a rustc diagnostic with an error code (`error[E0425]: …`) or a
-# failed test (`test <name> ... FAILED`) — nothing is emitted, whatever memory
-# evidence sits beside it. On main a build-phase OOM title is WRITE-SKIPPED
+# the code — any rustc error diagnostic, with or without a code
+# (`error[E0425]: …`, a deny-lint `error: unused variable: …`, a syntax
+# `error: expected …`), or a failed test (`test <name> ... FAILED`) — nothing
+# is emitted, whatever memory evidence sits beside it. The ONLY `error: ` lines
+# that are not a verdict are cargo's wrappers around a failure reported
+# elsewhere: `could not compile`, `linking with`, `failed to spawn`,
+# `build failed`, `test failed`, `failed to run custom build command` and
+# `process didn't exit successfully` — each names WHICH process failed, never
+# why, and every OOM log carries one of them. On main a build-phase OOM title is WRITE-SKIPPED
 # (the prior verdict stands), so annotating a run that also failed on its
 # merits would hide a real red; a pagefile that peaked during a genuine compile
 # error is not why that compile failed.
@@ -62,8 +94,9 @@
 #   * GitHub's echo of a step's own script (`##[group]Run …` to
 #     `##[endgroup]`) in a log downloaded through the jobs-logs API — this
 #     script's source and the workflow text that calls it name every signature;
-#   * rustc source snippets (`188 | …`, `    | …`) — a warning that points at a
-#     source line mentioning `os error 1455` must not read as an OOM; and
+#   * rustc source snippets (`188 | …`, `    | …`) — a WARNING (which is not a
+#     verdict, so the guard above lets it through) that points at a source
+#     line ending in `(os error 1455)` must not read as an OOM; and
 #   * libtest's captured output of a failing test (from `---- <name> stdout ----`
 #     to the `failures:` / `test result:` line that ends it), where a test's own
 #     assertion text about these errors is printed.
@@ -74,15 +107,17 @@
 # matches the same way the in-job file does.
 #
 # Usage:
-#   oom-signature.sh --step <step name> --log <file>
-#                    [--build-phase] [--memory-events <file>]
+#   oom-signature.sh --step <step name> --log <file> [--build-phase]
+#                    [--memory-events <file> --oom-kill-baseline <count>]
+#                    [--mem-total-bytes <bytes>]
 #
 # Tested by scripts/tests/test_oom_signature.sh (fixtures, no network).
 
 set -uo pipefail
 
 usage() {
-  echo "usage: $0 --step <name> --log <file> [--build-phase] [--memory-events <file>]" >&2
+  echo "usage: $0 --step <name> --log <file> [--build-phase]" \
+    "[--memory-events <file> --oom-kill-baseline <count>] [--mem-total-bytes <bytes>]" >&2
   exit 2
 }
 
@@ -90,12 +125,16 @@ step=""
 log=""
 build_phase=0
 memory_events=""
+oom_kill_baseline=""
+mem_total_bytes=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --step) [ $# -ge 2 ] || usage; step="$2"; shift 2 ;;
     --log) [ $# -ge 2 ] || usage; log="$2"; shift 2 ;;
     --build-phase) build_phase=1; shift ;;
     --memory-events) [ $# -ge 2 ] || usage; memory_events="$2"; shift 2 ;;
+    --oom-kill-baseline) [ $# -ge 2 ] || usage; oom_kill_baseline="$2"; shift 2 ;;
+    --mem-total-bytes) [ $# -ge 2 ] || usage; mem_total_bytes="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -136,9 +175,26 @@ first_line() {
   grep -m1 "$1" -- "$2" "$evidence" || true
 }
 
-# A verdict on the code in the same log: stay silent (see the header).
-if grep -qE '^error\[E[0-9]+\]|^test .* \.\.\. FAILED$' "$evidence"; then
+# A verdict on the code in the same log: stay silent (see the header). Every
+# rustc `error: ` / `error[E…]: ` line is a verdict except cargo's wrappers.
+CARGO_WRAPPER='^error: (could not compile|linking with|failed to spawn|build failed|test failed|failed to run custom build command|process didn.t exit successfully)'
+# One awk, not `grep | grep -q`: under pipefail an early-exiting `grep -q`
+# SIGPIPEs the first grep and the pipeline would read as "no verdict".
+if awk -v w="$CARGO_WRAPPER" '/^error(\[E[0-9]+\])?: / && $0 !~ w { found = 1 } END { exit !found }' \
+     "$evidence"; then
   exit 0
+fi
+if grep -qE '^test .* \.\.\. FAILED$' "$evidence"; then
+  exit 0
+fi
+
+# The machine's total RAM in bytes (see signature 2 in the header).
+is_uint() { case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+MEM_TOTAL_CAP=68719476736 # 64 GiB
+if ! is_uint "$mem_total_bytes"; then
+  mem_total_bytes="$(awk '$1 == "MemTotal:" && $2 ~ /^[0-9]+$/ { printf "%.0f", $2 * 1024; exit }' \
+    "${OOM_SIGNATURE_MEMINFO:-/proc/meminfo}" 2>/dev/null)"
+  is_uint "$mem_total_bytes" || mem_total_bytes=$MEM_TOTAL_CAP
 fi
 
 signature=""
@@ -156,24 +212,30 @@ match() {
 }
 
 match "rustc-LLVM ERROR: out of memory" -E '^rustc-LLVM ERROR: out of memory'
-match "memory allocation failed" -E '^memory allocation of [0-9]+ bytes failed'
+# 2. Rust's allocation abort, bounded by the machine's RAM.
+alloc_hit="$(first_line -E '^(test .* \.\.\. )?memory allocation of [0-9]+ bytes failed')"
+if [ -n "$alloc_hit" ]; then
+  alloc_bytes="$(printf '%s' "$alloc_hit" | sed -n 's/.*memory allocation of \([0-9]*\) bytes failed.*/\1/p')"
+  # awk compares as doubles, so a 25-digit N still compares correctly.
+  if awk -v n="$alloc_bytes" -v t="$mem_total_bytes" 'BEGIN { exit !(n != "" && n + 0 <= t + 0) }'; then
+    match "memory allocation failed" -E '^(test .* \.\.\. )?memory allocation of [0-9]+ bytes failed'
+  fi
+fi
 match "STATUS_NO_MEMORY (0xc0000017)" -iE \
   "^[[:space:]]*process didn't exit successfully: .*\\(exit code: 0xc0000017(, STATUS_NO_MEMORY)?\\)$"
 match "commit limit (os error 1455)" -E '\(os error 1455\)$'
 match "LNK1102 linker out of memory" -E '^[[:space:]]*(= note: )?LINK : fatal error LNK1102'
 
-# 6. SIGKILL with the cgroup's own record of an OOM kill.
-if [ -z "$signature" ] && [ -n "$memory_events" ] && [ -r "$memory_events" ]; then
+# 6/7. A kill, with the cgroup's own record of an OOM kill DURING the step:
+# the count must have risen above the baseline recorded before it.
+if [ -z "$signature" ] && [ -n "$memory_events" ] && [ -r "$memory_events" ] \
+   && is_uint "$oom_kill_baseline"; then
   oom_kills="$(awk '$1 == "oom_kill" { print $2; exit }' "$memory_events" 2>/dev/null)"
-  case "$oom_kills" in
-    '' | *[!0-9]*) oom_kills=0 ;;
-  esac
-  if [ "$oom_kills" -gt 0 ]; then
-    hit="$(first_line -E '\(signal: 9, SIGKILL: kill\)$')"
-    if [ -n "$hit" ]; then
-      signature="SIGKILL with cgroup oom_kill=$oom_kills"
-      line="$hit"
-    fi
+  if is_uint "$oom_kills" \
+     && awk -v n="$oom_kills" -v b="$oom_kill_baseline" 'BEGIN { exit !(n + 0 > b + 0) }'; then
+    match "SIGKILL with cgroup oom_kill $oom_kill_baseline->$oom_kills" -E '\(signal: 9, SIGKILL: kill\)$'
+    match "Killed with cgroup oom_kill $oom_kill_baseline->$oom_kills" -E \
+      '^[^[:space:]].*: line [0-9]+: +[0-9]+ Killed( .*)?$'
   fi
 fi
 
