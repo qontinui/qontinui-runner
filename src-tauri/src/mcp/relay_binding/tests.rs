@@ -2557,7 +2557,9 @@ async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
 /// names its command, settles THAT command at once instead of being dropped
 /// while the agent sits out the relay timeout. It is not the app's own
 /// failure — what the app reported is unknown — so nothing lands in the
-/// app-code slot, the origin is `transport` and retryability is `null`.
+/// app-code slot, the origin is `unknown` (the app answered; what it did could
+/// not be read — never `transport`, which means "never delivered") and
+/// retryability is `null`.
 #[tokio::test]
 async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_failure() {
     let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
@@ -2579,7 +2581,7 @@ async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_
         None,
         "nothing lands in the app-code slot: {body}"
     );
-    assert_eq!(body["hint"]["failure_origin"], "transport", "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "unknown", "{body}");
     assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
     assert!(
         body["error"]
