@@ -151,7 +151,7 @@ interface SkippedPayload {
   reason?: string;
 }
 
-/** `session-account-migration-stalled` — `followup.rs` `report_stall`. */
+/** `session-account-migration-stalled` — `followup.rs` `report_stalled`. */
 export interface StalledPayload {
   claudeSessionId?: string;
   terminalId?: string;
@@ -216,7 +216,8 @@ export function migratedToast(p: MigratedPayload): { message: string; type: Toas
 
 /** The toast for one `session-account-migration-stalled` event. */
 export function stalledToast(p: StalledPayload): { message: string; type: ToastType } {
-  const esc = p.escSent ? " (one Esc was sent and the retry gave up)" : "";
+  // The reason says how the retry ended; this only says an Esc preceded it.
+  const esc = p.escSent ? " (one Esc was sent before the retry)" : "";
   const screen = p.screenLine ? ` Screen: "${p.screenLine}"` : "";
   return {
     message: `Session ${(p.claudeSessionId ?? "").slice(0, 8)} was resumed on ${accountLabel(

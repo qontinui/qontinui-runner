@@ -176,11 +176,17 @@ pub(crate) fn is_prompt_row(row: &str) -> bool {
         .starts_with('❯')
 }
 
-/// Whether `row` is a `❯` input row holding an unsent draft, by the same rule
-/// [`input_prompt_ready`] refuses on. For screen rules that read rendered
-/// text without a cursor (the migration follow-up's limit-wait gate).
-pub(crate) fn row_holds_unsent_draft(row: &str) -> bool {
-    prompt_row(row).is_some_and(|line| is_unsent_draft(&line.input))
+/// Whether `row`, the cursor's row with the cursor at `cursor_col`, is an
+/// EMPTY `❯` input line by the rules [`input_prompt_ready`] applies: the
+/// marker opens the row, the cursor sits at the input start, and nothing but
+/// the placeholder follows the marker. The cursor is what tells the
+/// placeholder from a typed draft that begins `Try "`, which leaves the
+/// cursor after its text. For the migration follow-up's limit-wait gate.
+pub(crate) fn row_is_idle_input_at(row: &str, cursor_col: u16) -> bool {
+    is_prompt_row(row)
+        && prompt_row(row).is_some_and(|line| {
+            usize::from(cursor_col) == input_start(&line) && !is_unsent_draft(&line.input)
+        })
 }
 
 /// The column typed input starts at: the marker, one separator, then input.

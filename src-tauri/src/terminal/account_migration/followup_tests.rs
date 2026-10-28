@@ -3,9 +3,31 @@
 
 use super::*;
 
+/// Where a fixture puts the CLI's cursor; [`scr`] strips it.
+const CURSOR: char = '▮';
+
+/// `text` as the pane's screen, the cursor at the [`CURSOR`] mark (row,
+/// character column) or, with no mark, at the start of the last row.
+fn scr(text: &str) -> ScreenText {
+    let mut lines = Vec::new();
+    let mut cursor = None;
+    for (row, line) in text.lines().enumerate() {
+        if let Some(col) = line.chars().position(|c| c == CURSOR) {
+            cursor = Some((row, col));
+        }
+        lines.push(line.replace(CURSOR, ""));
+    }
+    let (row, col) = cursor.unwrap_or((lines.len().saturating_sub(1), 0));
+    ScreenText {
+        lines,
+        cursor_row: u16::try_from(row).unwrap(),
+        cursor_col: u16::try_from(col).unwrap(),
+    }
+}
+
 /// The resumed pane as the 2026-10-22 hypothesis has it: the CLI's own
-/// limit-wait banner, re-entered on `--resume`.
-const LIMIT_WAIT: &str = "● Working on phase 3…\n\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n\n────────\n❯ \n────────\n";
+/// limit-wait banner, re-entered on `--resume`, the cursor in the idle box.
+const LIMIT_WAIT: &str = "● Working on phase 3…\n\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n\n────────\n❯ ▮\n────────\n";
 
 /// An ordinary CLI dialog: `Esc to cancel`, but no limit.
 const PLAIN_DIALOG: &str =
@@ -16,16 +38,16 @@ const BLANK_RESUME: &str = "$ claude --permission-mode bypassPermissions --resum
 
 #[test]
 fn the_limit_wait_banner_is_recognised_and_a_plain_dialog_is_not() {
-    assert!(screen_shows_limit_wait(LIMIT_WAIT));
-    assert!(screen_shows_limit_wait(
-        "5-hour limit reached ∙ resets 3am · esc to cancel\n────────\n❯ \n────────\n"
-    ));
+    assert!(screen_shows_limit_wait(&scr(LIMIT_WAIT)));
+    assert!(screen_shows_limit_wait(&scr(
+        "5-hour limit reached ∙ resets 3am · esc to cancel\n────────\n❯ ▮\n────────\n"
+    )));
     assert!(
-        !screen_shows_limit_wait("5-hour limit reached ∙ resets 3am · esc to cancel"),
+        !screen_shows_limit_wait(&scr("5-hour limit reached ∙ resets 3am · esc to cancel▮")),
         "no input box seen: a stall, never an Esc (round-17 review)"
     );
-    assert!(!screen_shows_limit_wait(PLAIN_DIALOG));
-    assert!(!screen_shows_limit_wait(BLANK_RESUME));
+    assert!(!screen_shows_limit_wait(&scr(PLAIN_DIALOG)));
+    assert!(!screen_shows_limit_wait(&scr(BLANK_RESUME)));
 }
 
 /// Mutation check per arm: swapping the `NotExhausted` and `Exhausted` arms
@@ -33,7 +55,7 @@ fn the_limit_wait_banner_is_recognised_and_a_plain_dialog_is_not() {
 #[test]
 fn banner_on_a_not_exhausted_account_is_one_esc_and_one_retry() {
     assert_eq!(
-        decide_stall(Some(LIMIT_WAIT), Exhaustion::NotExhausted, false),
+        decide_stall(Some(&scr(LIMIT_WAIT)), Exhaustion::NotExhausted, false),
         StallAction::EscThenRetry
     );
 }
@@ -41,7 +63,7 @@ fn banner_on_a_not_exhausted_account_is_one_esc_and_one_retry() {
 #[test]
 fn banner_on_an_exhausted_account_sends_no_esc() {
     assert_eq!(
-        decide_stall(Some(LIMIT_WAIT), Exhaustion::Exhausted, false),
+        decide_stall(Some(&scr(LIMIT_WAIT)), Exhaustion::Exhausted, false),
         StallAction::Stalled(StallReason::LimitWaitOnExhaustedAccount)
     );
 }
@@ -49,7 +71,7 @@ fn banner_on_an_exhausted_account_sends_no_esc() {
 #[test]
 fn banner_with_an_unknown_probe_sends_no_esc() {
     assert_eq!(
-        decide_stall(Some(LIMIT_WAIT), Exhaustion::Unknown, false),
+        decide_stall(Some(&scr(LIMIT_WAIT)), Exhaustion::Unknown, false),
         StallAction::Stalled(StallReason::LimitWaitExhaustionUnknown)
     );
 }
@@ -58,7 +80,7 @@ fn banner_with_an_unknown_probe_sends_no_esc() {
 fn any_other_screen_is_a_stall() {
     for screen in [PLAIN_DIALOG, BLANK_RESUME] {
         assert_eq!(
-            decide_stall(Some(screen), Exhaustion::NotExhausted, false),
+            decide_stall(Some(&scr(screen)), Exhaustion::NotExhausted, false),
             StallAction::Stalled(StallReason::UnrecognisedScreen),
             "{screen:?}"
         );
@@ -74,7 +96,7 @@ fn any_other_screen_is_a_stall() {
 #[test]
 fn a_second_give_up_is_a_stall_never_a_second_esc() {
     assert_eq!(
-        decide_stall(Some(LIMIT_WAIT), Exhaustion::NotExhausted, true),
+        decide_stall(Some(&scr(LIMIT_WAIT)), Exhaustion::NotExhausted, true),
         StallAction::Stalled(StallReason::RetryGaveUp)
     );
 }
@@ -223,11 +245,11 @@ fn a_banner_above_a_bottom_dialog_is_not_the_limit_wait() {
         screen.push_str(&format!("● later output {i}\n"));
     }
     let with_dialog = format!("{screen}{PLAIN_DIALOG}");
-    assert!(!screen_shows_limit_wait(&with_dialog));
-    let with_draft = format!("{screen}────────\n❯ half-typed operator draft\n────────\n");
-    assert!(!screen_shows_limit_wait(&with_draft));
+    assert!(!screen_shows_limit_wait(&scr(&with_dialog)));
+    let with_draft = format!("{screen}────────\n❯ half-typed operator draft▮\n────────\n");
+    assert!(!screen_shows_limit_wait(&scr(&with_draft)));
     assert_eq!(
-        decide_stall(Some(&with_dialog), Exhaustion::NotExhausted, false),
+        decide_stall(Some(&scr(&with_dialog)), Exhaustion::NotExhausted, false),
         StallAction::Stalled(StallReason::UnrecognisedScreen)
     );
 }
@@ -244,84 +266,108 @@ fn a_banner_above_a_bottom_dialog_is_not_the_limit_wait() {
 #[test]
 fn a_limit_line_above_a_short_dialog_is_not_the_limit_wait() {
     let banner_over_dialog = format!("5-hour limit reached ∙ resets 3am\n{PLAIN_DIALOG}");
-    assert!(!screen_shows_limit_wait(&banner_over_dialog));
+    assert!(!screen_shows_limit_wait(&scr(&banner_over_dialog)));
     assert_eq!(
-        decide_stall(Some(&banner_over_dialog), Exhaustion::NotExhausted, false),
+        decide_stall(
+            Some(&scr(&banner_over_dialog)),
+            Exhaustion::NotExhausted,
+            false
+        ),
         StallAction::Stalled(StallReason::UnrecognisedScreen)
     );
     let wait_beside_dialog = format!(
         "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n{PLAIN_DIALOG}"
     );
-    assert!(!screen_shows_limit_wait(&wait_beside_dialog));
+    assert!(!screen_shows_limit_wait(&scr(&wait_beside_dialog)));
     let wait_beside_choice =
         "  ⎿  5-hour limit reached ∙ resets 3am · esc to cancel\n❯ 1. Yes\n  2. No\n";
-    assert!(!screen_shows_limit_wait(wait_beside_choice));
+    assert!(!screen_shows_limit_wait(&scr(wait_beside_choice)));
     assert!(
-        screen_shows_limit_wait(LIMIT_WAIT),
+        screen_shows_limit_wait(&scr(LIMIT_WAIT)),
         "the real banner over the idle input box still is"
     );
 }
 
 /// Round-12 S6: the real banner directly over an input box holding an
 /// unsent draft is not the limit wait, so no `Esc` (it could wipe the
-/// draft); the placeholder is not a draft.
+/// draft); the placeholder is not a draft. Round-18 W2: a typed draft that
+/// BEGINS like the placeholder is told apart by the cursor, which a typed
+/// draft leaves after its text.
 ///
-/// Mutation check: dropping the draft term fails the first assertion.
+/// Every draft fixture but `draft_cursor_home` leaves the cursor after the
+/// text, so the cursor column refuses those before the draft term is read.
+/// Mutation checks: dropping the draft term fails the `draft_cursor_home`
+/// assertion; dropping the cursor-column term fails the `try_draft` one.
 #[test]
 fn a_banner_over_an_unsent_draft_sends_no_esc() {
-    let with_draft = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n";
-    assert!(!screen_shows_limit_wait(with_draft));
-    assert!(!esc_still_warranted(Some(with_draft)));
+    let with_draft = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(with_draft)));
+    assert!(!esc_still_warranted(Some(&scr(with_draft))));
     assert_eq!(
-        decide_stall(Some(with_draft), Exhaustion::NotExhausted, false),
+        decide_stall(Some(&scr(with_draft)), Exhaustion::NotExhausted, false),
         StallAction::Stalled(StallReason::UnrecognisedScreen)
     );
-    let placeholder = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ Try \"fix the tests\"\n────────\n";
-    assert!(screen_shows_limit_wait(placeholder));
+    let placeholder = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮Try \"fix the tests\"\n────────\n";
+    assert!(screen_shows_limit_wait(&scr(placeholder)));
+    let try_draft = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ Try \"cargo test\" first, then push▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(try_draft)));
+    // The operator pressed Home: the cursor is at the input start, so only
+    // the draft term tells this from the empty box.
+    let draft_cursor_home = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮half-typed operator draft\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(draft_cursor_home)));
 }
 
-/// Round-13 S4: the draft rule reads only rows BELOW the banner. A prior
-/// prompt echoed above it, or a `❯ npm test` quoted in output, is history —
-/// the wait is still recognised; the real draft in the input box still
-/// blocks.
+/// Round-13 S4: a prior prompt echoed above the banner, or a `❯ npm test`
+/// quoted in output, is history — the wait is still recognised; the real
+/// draft in the input box still blocks.
 ///
-/// Mutation check: applying the draft rule to every bottom row (round 12)
-/// fails the first two assertions.
+/// Since round 18 only the cursor's row is read, so a `❯` row elsewhere
+/// cannot decide; the first two assertions pin that a quoted or echoed `❯`
+/// does not hide the wait.
 #[test]
 fn a_prompt_echoed_in_the_history_is_not_a_draft() {
-    let echoed = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯\u{a0}\n────────\n";
-    assert!(screen_shows_limit_wait(echoed));
-    let quoted = "  Run it with:\n    ❯ npm test\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n────────\n";
-    assert!(screen_shows_limit_wait(quoted));
-    let drafted = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n";
-    assert!(!screen_shows_limit_wait(drafted));
+    let echoed = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯\u{a0}▮\n────────\n";
+    assert!(screen_shows_limit_wait(&scr(echoed)));
+    let quoted = "  Run it with:\n    ❯ npm test\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮\n────────\n";
+    assert!(screen_shows_limit_wait(&scr(quoted)));
+    let drafted = "❯ run the tests and push\n  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(drafted)));
 }
 
-/// Round-14 W1: the draft below the banner blocks with NO box rules around
-/// it (an unfamiliar rule glyph, or a single rule): the `Esc` could wipe it.
+/// Round-14 W1: a draft with NO box rules around it (an unfamiliar rule
+/// glyph, or a single rule) blocks. Since round 18 an EMPTY `❯` row with no
+/// rules, or one, blocks too: the box is not seen, so the gate fails closed.
 ///
-/// Mutation check: reading the draft only inside a two-rule box (round 13)
-/// fails both assertions.
+/// The draft fixtures are also refused by the cursor column, and `idle_bare`
+/// by having no row under the cursor. Mutation check: dropping the two-rule
+/// term fails the `idle_one_rule` and `idle_no_rules` assertions.
 #[test]
-fn a_draft_below_the_banner_blocks_without_box_rules() {
-    let bare = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n❯ half-typed operator draft\n";
-    assert!(!screen_shows_limit_wait(bare));
-    let one_rule = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n════════\n❯ half-typed operator draft\n";
-    assert!(!screen_shows_limit_wait(one_rule));
+fn a_box_without_both_rules_is_not_a_wait() {
+    let bare = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n❯ half-typed operator draft▮\n";
+    assert!(!screen_shows_limit_wait(&scr(bare)));
+    let one_rule = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n════════\n❯ half-typed operator draft▮\n";
+    assert!(!screen_shows_limit_wait(&scr(one_rule)));
+    let idle_bare =
+        "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n❯ ▮\n";
+    assert!(!screen_shows_limit_wait(&scr(idle_bare)));
+    let idle_one_rule = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮\n  ? for shortcuts\n";
+    assert!(!screen_shows_limit_wait(&scr(idle_one_rule)));
+    let idle_no_rules = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n  some output\n❯ ▮\n  ? for shortcuts\n";
+    assert!(!screen_shows_limit_wait(&scr(idle_no_rules)));
 }
 
 /// Round-16 W1: the banner drawn UNDER the input box (a status line) still
-/// has the box's draft seen — the lowest `❯` row decides, wherever the
-/// banner is; an empty box there is still the wait.
+/// has the box's draft seen, wherever the banner is; an empty box there is
+/// still the wait.
 ///
-/// Mutation check: reading the draft only on rows below the banner (round
-/// 14) fails the first assertion.
+/// Since round 18 the box is read at the cursor, so the banner's position
+/// cannot decide; these pin that it does not, either way.
 #[test]
 fn a_draft_above_a_status_line_banner_blocks() {
-    let drafted = "────────\n❯ half-typed operator draft\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
-    assert!(!screen_shows_limit_wait(drafted));
-    let idle = "────────\n❯ \n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
-    assert!(screen_shows_limit_wait(idle));
+    let drafted = "────────\n❯ half-typed operator draft▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(!screen_shows_limit_wait(&scr(drafted)));
+    let idle = "────────\n❯ ▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(screen_shows_limit_wait(&scr(idle)));
 }
 
 /// Round-17 W1 and S3: the idle input box must be SEEN. A long draft under
@@ -329,46 +375,104 @@ fn a_draft_above_a_status_line_banner_blocks() {
 /// whose first line is empty but which continues below, and an input mode
 /// drawn with another marker all leave no idle box: no `Esc`.
 ///
-/// Mutation checks: treating a missing input row as idle fails the first and
-/// last assertions; dropping the continuation term fails the second.
+/// The cursor is where the CLI leaves it: after the wrapped draft, and on
+/// the bash-mode row; on the continued draft it is parked back on the `❯`
+/// row, the worst case.
+///
+/// Each is refused by, among others, a different term: `wrapped` by the rule above the
+/// cursor row (draft text sits there), `continued` by the rule below it
+/// (mutation check: dropping that term fails the second assertion), and
+/// `bash_mode` by `prompt_row` finding no `❯` on the cursor row.
 #[test]
 fn a_draft_the_gate_cannot_see_whole_is_not_a_wait() {
     let wrapped = format!(
-        "────────\n❯ please refactor the module\n{}────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n",
+        "────────\n❯ please refactor the module\n{}  and the end of it▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n",
         "  and keep going with more of the instruction\n".repeat(6)
     );
-    assert!(!screen_shows_limit_wait(&wrapped));
-    let continued = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n  second line of a draft\n────────\n";
-    assert!(!screen_shows_limit_wait(continued));
-    let bash_mode = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n! git status\n────────\n";
-    assert!(!screen_shows_limit_wait(bash_mode));
+    assert!(!screen_shows_limit_wait(&scr(&wrapped)));
+    let continued = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮\n  second line of a draft\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(continued)));
+    let bash_mode = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n! git status▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(bash_mode)));
 }
 
 /// Round-17 W2: a status line under the box that ENDS in `❯` (a
 /// starship-style prompt) is not the input row, so the draft above it is
-/// still read.
+/// still read; the idle box above it is still the wait. Nor is such a row
+/// the input when the cursor sits on it between two rules.
 ///
-/// Mutation check: counting any row containing `❯` as a prompt row fails it.
+/// Mutation check: dropping the `is_prompt_row` term from
+/// `row_is_idle_input_at` fails the last assertion.
 #[test]
 fn a_status_line_ending_in_the_marker_does_not_hide_the_draft() {
-    let screen = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft\n────────\n~/proj on main ❯\n";
-    assert!(!screen_shows_limit_wait(screen));
-    let idle = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ \n────────\n~/proj on main ❯\n";
-    assert!(screen_shows_limit_wait(idle));
+    let screen = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ half-typed operator draft▮\n────────\n~/proj on main ❯\n";
+    assert!(!screen_shows_limit_wait(&scr(screen)));
+    let idle = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ ▮\n────────\n~/proj on main ❯\n";
+    assert!(screen_shows_limit_wait(&scr(idle)));
+    let shell_in_box = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n~/proj on main ❯ ▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(shell_in_box)));
+}
+
+/// Round-18 W1: a `❯` row that is NOT the input box — quoted in output above
+/// a bash-mode draft (bare, or reading like the placeholder), or a draft's
+/// own last line — never stands in for it. The cursor is where the CLI
+/// leaves it: after the bash-mode text, and on the draft's last line.
+///
+/// Several terms refuse these at once: the first two have no `❯` on the
+/// cursor row, and a gate reading the lowest `❯` row instead would still be
+/// refused by the cursor column there. Mutation check: dropping the two-rule
+/// term fails the third.
+#[test]
+fn a_marker_row_that_is_not_the_input_box_is_not_a_wait() {
+    let quoted_over_bash = "  Run it in a shell:\n    ❯\n────────\n! git push --force▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(!screen_shows_limit_wait(&scr(quoted_over_bash)));
+    let placeholder_over_bash = "  ❯ Try \"fix lint\"\n────────\n! rm -rf build▮\n────────\n  Usage limit reached · continuing automatically at 6pm · esc to cancel\n";
+    assert!(!screen_shows_limit_wait(&scr(placeholder_over_bash)));
+    let bare_last_line = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n────────\n❯ paste of my shell:\n  ❯ ▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(bare_last_line)));
+}
+
+/// Round-18 S3: any other bottom row with an `esc to …` hint is a view the
+/// `Esc` would close, not the wait.
+///
+/// Mutation check: dropping the `esc to ` term fails it.
+#[test]
+fn an_esc_bound_hint_beside_the_banner_is_not_a_wait() {
+    let view = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n  Search sessions\n────────\n❯ ▮\n────────\n  esc to go back\n";
+    assert!(!screen_shows_limit_wait(&scr(view)));
+}
+
+/// Round-19 W1: a narrow pane wraps the turn's hint across two rows, and
+/// rows are right-trimmed, so no single row holds `esc to `. The hint is
+/// read across the row break as well.
+///
+/// The grid wraps at the column, so a break can fall inside a word too.
+///
+/// Mutation checks: dropping the joined-rows check fails all three
+/// assertions; dropping only its whitespace-free arm fails the last.
+#[test]
+fn a_hint_wrapped_across_two_rows_is_not_a_wait() {
+    let wrapped_after_to = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Germinating… (12s · esc to\ninterrupt)\n────────\n❯ ▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(wrapped_after_to)));
+    let wrapped_after_esc = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Germinating… (12s · esc\nto interrupt)\n────────\n❯ ▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(wrapped_after_esc)));
+    let wrapped_mid_word = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Germinating… (12s · es\nc to interrupt)\n────────\n❯ ▮\n────────\n";
+    assert!(!screen_shows_limit_wait(&scr(wrapped_mid_word)));
 }
 
 /// Fix 2: the `Esc` needs the banner STILL in the bottom rows on the re-read,
 /// and no turn under way; an unreadable re-read never authorizes it.
 ///
-/// Mutation checks: dropping the `screen_shows_turn` term fails the
-/// turn-started case; returning `true` for `None` fails the last.
+/// The turn-started case is refused by the per-row `esc to ` term and the
+/// joined-rows check alike. Mutation check: returning
+/// `true` for `None` fails the last assertion.
 #[test]
 fn the_esc_is_sent_only_while_the_re_read_still_shows_the_banner() {
-    assert!(esc_still_warranted(Some(LIMIT_WAIT)));
-    let turn_started = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Working… (esc to interrupt)\n────────\n❯ \n────────\n";
-    assert!(!esc_still_warranted(Some(turn_started)));
-    assert!(!esc_still_warranted(Some(PLAIN_DIALOG)));
-    assert!(!esc_still_warranted(Some(BLANK_RESUME)));
+    assert!(esc_still_warranted(Some(&scr(LIMIT_WAIT))));
+    let turn_started = "  ⎿  Usage limit reached · continuing automatically at 6pm · esc to cancel\n✻ Working… (esc to interrupt)\n────────\n❯ ▮\n────────\n";
+    assert!(!esc_still_warranted(Some(&scr(turn_started))));
+    assert!(!esc_still_warranted(Some(&scr(PLAIN_DIALOG))));
+    assert!(!esc_still_warranted(Some(&scr(BLANK_RESUME))));
     assert!(!esc_still_warranted(None));
 }
 

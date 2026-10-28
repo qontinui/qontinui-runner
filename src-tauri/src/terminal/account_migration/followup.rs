@@ -57,6 +57,7 @@ use tauri::Emitter;
 use tracing::{info, warn};
 
 use super::{prompt_when_idle, IdlePromptOutcome, IdleWait, SyncGate};
+use crate::terminal::graceful_exit::ScreenText;
 use crate::terminal::output_scan::normalize;
 use crate::terminal::session_carry::{self, tail::TailRescue, DeltaSyncOutcome, TranscriptCopy};
 
@@ -378,29 +379,36 @@ pub(crate) enum StallAction {
 /// a dialog is showing beside the banner and the `Esc` would cancel it: not a
 /// limit wait.
 ///
-/// Nor is it one unless the IDLE input box is seen: an `Esc` could wipe an
-/// unsent draft (round-12 review S6), so every way of not seeing the box ends
-/// in a reported stall, never a stray `Esc`. The input row is the LOWEST row
-/// the `❯` marker opens ([`is_prompt_row`](crate::terminal::graceful_exit::is_prompt_row)):
-/// a `❯` higher up is a prompt echoed in the history or quoted in output
-/// (round-13 review S4), and a status line that merely ENDS in `❯` (a
-/// starship-style prompt) is not one (round-17 review W2). It must exist — a
-/// long draft that scrolled its `❯` out of the bottom rows, or an input mode
-/// drawn with another marker, leaves none (round-17 W1, S3). It must hold no
-/// draft by the rule `input_prompt_ready` refuses on, and no row may sit
-/// between it and the box's bottom rule or the banner: that is a draft's
-/// continuation (round-17 W1). Where the banner sits does not matter, above
-/// the box or under it as a status line, which is unmeasured (round-16 W1);
-/// a box rule is not required (round-14 W1), though a row of an unfamiliar
-/// rule glyph under the `❯` reads as continuation. (A banner the CLI wrapped
-/// onto two rows therefore reads as not-a-wait — a reported stall, never a
-/// stray `Esc`.)
-pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
+/// Nor is it one while any other bottom row carries an `esc to …` hint: a
+/// view that `Esc` would close (`esc to go back`), or a turn under way
+/// (`esc to interrupt`) — round-18 review S3 — including a hint a narrow
+/// pane wrapped across two rows (round-19 review W1).
+///
+/// Nor is it one unless the IDLE input box is seen, read where the CLI's
+/// cursor is ([`row_is_idle_input_at`](crate::terminal::graceful_exit::row_is_idle_input_at)):
+/// the cursor row is a `❯` input row, the cursor sits at its input start,
+/// nothing but the placeholder follows the marker, and the rows directly
+/// above and below it are the box's two rules. An `Esc` could wipe an unsent
+/// draft (round-12 review S6), and every way of not seeing that box ends in a
+/// reported stall, never a stray `Esc`. The cursor row and the two rules tie
+/// the `❯` to the box the operator types in: a `❯` quoted in output, a
+/// draft's own last line that is a bare `❯`, or a bash-mode draft under a
+/// quoted `❯` all put a `❯` row on screen that is not the input (round-18
+/// W1). A typed draft that begins `Try "` reads as the placeholder unless the
+/// cursor column is checked (round-18 W2). One residual is accepted: such a
+/// draft with the cursor moved back to its start (Home) is indistinguishable
+/// from the placeholder on screen — `input_prompt_ready` shares it (round-19
+/// review W2). The single row between two rules
+/// rules out a draft's continuation rows (round-17 W1), and a box drawn with no rules or
+/// one now reads as not-a-wait too (round 14 admitted those; failing closed
+/// costs a reported stall). Where the banner sits does not matter, above the
+/// box or under it as a status line, which is unmeasured (round-16 W1). (A
+/// banner the CLI wrapped onto two rows reads as not-a-wait as well.)
+pub(crate) fn screen_shows_limit_wait(screen: &ScreenText) -> bool {
     use crate::terminal::graceful_exit::{
-        is_box_edge, is_numbered_option, is_prompt_row, row_holds_unsent_draft,
-        DIALOG_CHROME_MARKERS,
+        is_box_edge, is_numbered_option, row_is_idle_input_at, DIALOG_CHROME_MARKERS,
     };
-    let bottom = crate::terminal::usage_limit::bottom_rows_text(screen);
+    let bottom = crate::terminal::usage_limit::bottom_rows_text(&screen_text(screen));
     let rows: Vec<&str> = bottom.lines().collect();
     let Some(banner) = rows.iter().rposition(|row| is_limit_wait_banner(row)) else {
         return false;
@@ -408,23 +416,44 @@ pub(crate) fn screen_shows_limit_wait(screen: &str) -> bool {
     let dialog = rows.iter().enumerate().any(|(i, row)| {
         i != banner && {
             let n = normalize(row);
-            is_numbered_option(row) || DIALOG_CHROME_MARKERS.iter().any(|m| n.contains(m))
+            is_numbered_option(row)
+                || n.contains("esc to ")
+                || DIALOG_CHROME_MARKERS.iter().any(|m| n.contains(m))
         }
     });
     if dialog {
         return false;
     }
-    let Some(input) = (0..rows.len())
-        .rev()
-        .find(|&i| i != banner && is_prompt_row(rows[i]))
+    // The same hints read across row breaks: rows are right-trimmed, so a
+    // narrow pane that wraps `· esc to` / `interrupt)` leaves no single row
+    // holding `esc to `, while `normalize` turns the joined break into a
+    // space. The grid wraps at the column, not a word, so a break inside a
+    // word (`es` / `c to`) is read with all whitespace removed as well. A
+    // false match only costs a reported stall. (The turn's `esc to interrupt`
+    // is one of these hints, so no separate turn check is needed.)
+    let others: Vec<&str> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| (i != banner).then_some(*row))
+        .collect();
+    let joined = normalize(&others.join("\n"));
+    let squeezed: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+    if joined.contains("esc to ") || squeezed.contains("escto") {
+        return false;
+    }
+    let row = usize::from(screen.cursor_row);
+    let line = |i: usize| screen.lines.get(i).map(String::as_str);
+    let (Some(above), Some(input), Some(below)) =
+        (row.checked_sub(1).and_then(line), line(row), line(row + 1))
     else {
         return false;
     };
-    let continued = (input + 1..rows.len())
-        .take_while(|&i| i != banner && !is_box_edge(rows[i]))
-        .next()
-        .is_some();
-    !row_holds_unsent_draft(rows[input]) && !continued
+    is_box_edge(above) && is_box_edge(below) && row_is_idle_input_at(input, screen.cursor_col)
+}
+
+/// The screen's rows joined with `\n`, as the text rules read it.
+pub(crate) fn screen_text(screen: &ScreenText) -> String {
+    screen.lines.join("\n")
 }
 
 /// Pure: whether one row is the CLI's limit-wait banner
@@ -439,15 +468,14 @@ fn is_limit_wait_banner(row: &str) -> bool {
 }
 
 /// Pure: whether the one `Esc` may be sent on `screen`, re-read IMMEDIATELY
-/// before it: the banner must still be in the bottom rows and no turn may
-/// have started (2026-10-23 review fix 2). Between the give-up's read and the
-/// `Esc` the probe ran for seconds; the CLI's own wait may have ended and a
-/// turn begun, which the `Esc` would interrupt. `None` (unreadable) never
-/// authorizes it.
-pub(crate) fn esc_still_warranted(screen: Option<&str>) -> bool {
-    screen.is_some_and(|s| {
-        screen_shows_limit_wait(s) && !crate::terminal::usage_limit::screen_shows_turn(s)
-    })
+/// before it: the limit wait must still be showing over the idle box
+/// (2026-10-23 review fix 2). Between the give-up's read and the `Esc` the
+/// probe ran for seconds; the CLI's own wait may have ended and a turn begun,
+/// which the `Esc` would interrupt — the turn's `esc to interrupt` hint is
+/// one of the rows [`screen_shows_limit_wait`] refuses on. `None`
+/// (unreadable) never authorizes it.
+pub(crate) fn esc_still_warranted(screen: Option<&ScreenText>) -> bool {
+    screen.is_some_and(screen_shows_limit_wait)
 }
 
 /// What one nudge attempt's outcome leads to.
@@ -477,7 +505,7 @@ pub(crate) fn nudge_step(outcome: IdlePromptOutcome) -> NudgeStep {
 /// `retried` is whether this give-up is the retry's. At most one `Esc` and one
 /// retry per migration: a retry's give-up is always a stall.
 pub(crate) fn decide_stall(
-    screen: Option<&str>,
+    screen: Option<&ScreenText>,
     exhaustion: Exhaustion,
     retried: bool,
 ) -> StallAction {
@@ -621,16 +649,14 @@ pub(crate) fn stall_finding_body(
     })
 }
 
-/// The pane's rendered screen — the same `text_snapshot` read the usage-limit
-/// watcher scans. `None` when the app or the terminal is gone.
-fn pane_screen_text(terminal_id: &str) -> Option<String> {
+/// The pane's rendered screen with its cursor — the same `text_snapshot`
+/// read the usage-limit watcher scans. `None` when the app or the terminal is
+/// gone.
+fn pane_screen(terminal_id: &str) -> Option<ScreenText> {
     use tauri::Manager;
     let app = crate::tauri_app_handle::current()?;
     let tm = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?;
-    let session = tm.get(terminal_id)?;
-    let grid = session.grid();
-    let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-    Some(guard.text_snapshot().text)
+    Some(tm.get(terminal_id)?.grid_screen())
 }
 
 /// One `Esc` to the pane.
@@ -677,35 +703,35 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
         let last_refusal = match nudge_step(outcome) {
             NudgeStep::Done => return,
             NudgeStep::Stalled(reason) => {
-                let screen = pane_screen_text(&p.new_terminal_id);
-                report_stalled(p, reason, screen.as_deref(), esc_sent).await;
+                let screen = pane_screen(&p.new_terminal_id);
+                report_stalled(p, reason, screen.as_ref(), esc_sent).await;
                 return;
             }
             NudgeStep::GaveUp { last_refusal } => last_refusal,
         };
-        let screen = pane_screen_text(&p.new_terminal_id);
+        let screen = pane_screen(&p.new_terminal_id);
         warn!(
             terminal_id = %p.new_terminal_id,
             session = %p.claude_session_id,
             label,
             last_refusal = %last_refusal,
-            screen = %screen.as_deref().map_or_else(|| "<unreadable>".to_string(), screen_excerpt),
+            screen = %screen.as_ref().map_or_else(|| "<unreadable>".to_string(), |s| screen_excerpt(&screen_text(s))),
             "continue nudge gave up — what the resumed pane shows"
         );
         // Probe only when the decision depends on it.
-        let exhaustion = if !retried && screen.as_deref().is_some_and(screen_shows_limit_wait) {
+        let exhaustion = if !retried && screen.as_ref().is_some_and(screen_shows_limit_wait) {
             probe_exhaustion(&p.dst_config_dir).await
         } else {
             Exhaustion::Unknown
         };
-        match decide_stall(screen.as_deref(), exhaustion, retried) {
+        match decide_stall(screen.as_ref(), exhaustion, retried) {
             StallAction::EscThenRetry => {
                 // The probe took seconds: re-read right before the Esc.
-                let fresh = pane_screen_text(&p.new_terminal_id);
-                if esc_still_warranted(fresh.as_deref()) {
+                let fresh = pane_screen(&p.new_terminal_id);
+                if esc_still_warranted(fresh.as_ref()) {
                     if let Err(e) = send_esc(&p.new_terminal_id) {
                         warn!(terminal_id = %p.new_terminal_id, error = %e, "continue nudge: the one Esc could not be written");
-                        report_stalled(p, StallReason::EscNotDelivered, fresh.as_deref(), false)
+                        report_stalled(p, StallReason::EscNotDelivered, fresh.as_ref(), false)
                             .await;
                         return;
                     }
@@ -726,7 +752,7 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
                 retried = true;
             }
             StallAction::Stalled(reason) => {
-                report_stalled(p, reason, screen.as_deref(), esc_sent).await;
+                report_stalled(p, reason, screen.as_ref(), esc_sent).await;
                 return;
             }
         }
@@ -738,10 +764,13 @@ async fn nudge_with_stall_recovery(p: &PostMigration, nudge: &str) {
 async fn report_stalled(
     p: &PostMigration,
     reason: StallReason,
-    screen: Option<&str>,
+    screen: Option<&ScreenText>,
     esc_sent: bool,
 ) {
-    let line = screen.map_or_else(|| "<screen unreadable>".to_string(), evidence_line);
+    let line = screen.map_or_else(
+        || "<screen unreadable>".to_string(),
+        |s| evidence_line(&screen_text(s)),
+    );
     warn!(
         terminal_id = %p.new_terminal_id,
         session = %p.claude_session_id,
