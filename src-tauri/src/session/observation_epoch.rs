@@ -384,7 +384,7 @@ mod tests {
         let touch = main_rs
             .find("poll_lifecycle_store.touch(&rec.claude_session_id)")
             .expect("the poll's KeepAlive touch");
-        let header = main_rs[..touch]
+        let header = sub(&main_rs, 0, touch)
             .rfind("for rec in &open {")
             .expect("the classify loop that hosts the touch");
         let loop_end = closing_brace(&main_rs, header + "for rec in &open ".len());
@@ -392,9 +392,11 @@ mod tests {
         // The lexer below does not model every token; a mis-parse that ends
         // the loop early would also land off the loop's own closing line.
         let line_of = |at: usize| {
-            let start = main_rs[..at].rfind('\n').map_or(0, |n| n + 1);
-            let end = main_rs[at..].find('\n').map_or(main_rs.len(), |n| at + n);
-            &main_rs[start..end]
+            let start = sub(&main_rs, 0, at).rfind('\n').map_or(0, |n| n + 1);
+            let end = sub(&main_rs, at, main_rs.len())
+                .find('\n')
+                .map_or(main_rs.len(), |n| at + n);
+            sub(&main_rs, start, end)
         };
         let indent = line_of(header).len() - line_of(header).trim_start().len();
         assert_eq!(
@@ -409,7 +411,8 @@ mod tests {
             calls[0] > loop_end && calls[0] < held_log,
             "record_tick must run once per tick, after the per-record classify loop"
         );
-        let call = &main_rs[calls[0]..calls[0] + main_rs[calls[0]..].find(';').unwrap()];
+        let semi = calls[0] + sub(&main_rs, calls[0], main_rs.len()).find(';').unwrap();
+        let call = sub(&main_rs, calls[0], semi);
         assert!(
             call.contains("&held_unjudged"),
             "the tick carries the rows it held unjudged: {call}"
@@ -438,7 +441,7 @@ mod tests {
             "exactly one poll call of match_live_terminal"
         );
         let open = calls[0] + "match_live_terminal".len();
-        let args = &main_rs[open..closing_paren(&main_rs, open)];
+        let args = sub(&main_rs, open, closing_paren(&main_rs, open));
         assert!(
             args.trim_end()
                 .trim_end_matches(',')
@@ -453,7 +456,7 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(pushes.len(), 1, "exactly one push into held_unjudged");
-        let branch = main_rs[..pushes[0]]
+        let branch = sub(&main_rs, 0, pushes[0])
             .rfind("if held && action == PollAction::Skip {")
             .expect("the held-and-skipped branch");
         let branch_end = closing_brace(
@@ -461,12 +464,21 @@ mod tests {
             branch + "if held && action == PollAction::Skip ".len(),
         );
         assert!(pushes[0] < branch_end, "the push sits inside that branch");
-        let guard = main_rs[branch..pushes[0]]
+        let guard = sub(&main_rs, branch, pushes[0])
             .rfind("if carries_boot_restore_hold(")
             .map(|i| branch + i)
             .expect("the push is guarded by carries_boot_restore_hold");
-        let guard_end = closing_brace(&main_rs, guard + main_rs[guard..].find('{').unwrap());
+        let guard_end = closing_brace(
+            &main_rs,
+            guard + sub(&main_rs, guard, main_rs.len()).find('{').unwrap(),
+        );
         assert!(pushes[0] < guard_end, "the push sits inside that guard");
+    }
+
+    /// `src[from..to]`, without the panicking index the `clippy::string_slice`
+    /// lint forbids; every offset here comes from a `find` on ASCII text.
+    fn sub(src: &str, from: usize, to: usize) -> &str {
+        src.get(from..to).expect("offsets on char boundaries")
     }
 
     /// Byte offset of the `)` matching the `(` at `open` (no string or comment
