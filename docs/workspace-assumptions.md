@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 107 | 108 | 105 | 2 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (107 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -331,6 +331,7 @@ _No hits._
 | `src/process_capture/process_tree.rs` | `parse_command_lines_json` | `cfg(windows)-only fn 'parse_command_lines_json' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_powershell_snapshot` | `cfg(windows)-only fn 'parse_powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_wmi_creation_date` | `cfg(windows)-only fn 'parse_wmi_creation_date' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `process_creation_filetime` | `cfg(windows)-only fn 'process_creation_filetime' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — GetProcessTimes overlay for claude pids, called only from the cfg(windows) snapshot_process_table. The cfg(unix) snapshot_process_table in the same file fills creation_times from /proc instead; creation_filetimes stays empty off Windows by design, and the registry's Linux branch compares creation_times. |
 | `src/process_helpers.rs` | `ChildTreeGuard::attach_raw` | `cfg(windows)-only fn 'attach_raw' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_helpers.rs` | `cmd_no_window` | `no_window("cmd.exe")` | 1 | unreviewed |
 | `src/process_helpers.rs` | `tokio_cmd_no_window` | `tokio_no_window("cmd.exe")` | 1 | unreviewed |
@@ -346,6 +347,7 @@ _No hits._
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `"powershell"` | 1 | unreviewed |
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/terminal/claude_resume_sniff.rs` | `is_claude_program` | `matches!(base, "claude" \| "claude.exe" \| "claude.cmd" \| "claude.ps1")` | 1 | unreviewed |
+| `src/terminal/migration_identity.rs` | `key` | `cfg(windows)-only fn 'key' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows path-normalisation helper nested inside same_config_path's cfg(windows) block; the cfg(not(windows)) block directly below it compares the paths with Path equality (case-sensitive, as on Linux); two spellings that differ there leave two valid rows and the identity reads unknown, the safe outcome. |
 | `src/terminal/session.rs` | `TerminalSession::assign_to_job_object` | `cfg(windows)-only fn 'assign_to_job_object' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/ui_thread_probe.rs` | `resolve_own_main_window` | `cfg(windows)-only fn 'resolve_own_main_window' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `attach_process_failed` | `cfg(windows)-only fn 'attach_process_failed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

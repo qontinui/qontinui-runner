@@ -592,3 +592,28 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+# os_bound_tooling: a `cfg(windows)`-only fn whose non-Windows path lives in a
+# platform twin of its CALLER (or in the enclosing fn's own `cfg(not(windows))`
+# arm), so the file-level "no sibling" heuristic flags it although the
+# non-Windows platform has its own path.
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "process_creation_filetime"
+disposition = "fallback_correct"
+note = "GetProcessTimes overlay for claude pids, called only from the cfg(windows) snapshot_process_table. The cfg(unix) snapshot_process_table in the same file fills creation_times from /proc instead; creation_filetimes stays empty off Windows by design, and the registry's Linux branch compares creation_times."
+reviewed = [
+    "cfg(windows)-only fn `process_creation_filetime` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/terminal/migration_identity.rs"
+symbol = "key"
+disposition = "fallback_correct"
+note = "Windows path-normalisation helper nested inside same_config_path's cfg(windows) block; the cfg(not(windows)) block directly below it compares the paths with Path equality (case-sensitive, as on Linux); two spellings that differ there leave two valid rows and the identity reads unknown, the safe outcome."
+reviewed = [
+    "cfg(windows)-only fn `key` has no cfg(not(windows)) sibling in this file",
+]
