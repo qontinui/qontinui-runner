@@ -217,9 +217,9 @@ impl StopHookRegistration {
     /// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]), so it gets
     /// the `Stop` hook unless the flag is explicitly `off`. Every other spawn
     /// keeps [`Self::from_env`]'s dark default. Measured 2026-10-28 on the
-    /// operator box: all 89 null-status sessions ran with the `-nostop`
-    /// carrier, so the turn-end check could never run for the continuations
-    /// that idled holding a slot.
+    /// operator box (coord finding 4eef6693): all 89 null-status sessions ran
+    /// with the `-nostop` carrier, so the turn-end check could never run for
+    /// the continuations that idled holding a slot.
     pub fn for_spawn(
         reading: crate::mcp::continuation_verdict::FlagReading,
         gate_continuation: bool,

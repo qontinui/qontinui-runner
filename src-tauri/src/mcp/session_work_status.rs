@@ -609,7 +609,12 @@ fn one_status_from_body(body: &WireResponse, csid: &str) -> OneStatus {
 /// Read ONE harness session's work axis over the same door, credential and
 /// timeouts as [`fetch`]. Never errors — see [`OneStatus`].
 pub async fn fetch_one(csid: &str) -> OneStatus {
-    match fetch_wire(&[csid.to_string()]).await {
+    // The id is interpolated into a CSV query parameter: only a UUID goes on
+    // the wire, so a `,` or `&` in a payload can never reshape the request.
+    if uuid::Uuid::parse_str(csid.trim()).is_err() {
+        return OneStatus::Unresolved(format!("`{csid}` is not a harness session UUID"));
+    }
+    match fetch_wire(&[csid.trim().to_string()]).await {
         Ok((body, _)) => one_status_from_body(&body, csid),
         Err(note) => OneStatus::Unresolved(note),
     }

@@ -3153,20 +3153,6 @@ pub(crate) fn live_gate_continuations() -> Vec<(String, uuid::Uuid)> {
         .collect()
 }
 
-/// Test seam for modules outside this one: insert a live entry.
-#[cfg(test)]
-pub(crate) fn test_register_live_continuation(terminal_id: &str, gate_id: Option<uuid::Uuid>) {
-    register_continuation_session(terminal_id.to_string(), None, gate_id);
-}
-
-/// Test seam for modules outside this one: remove a live entry.
-#[cfg(test)]
-pub(crate) fn test_deregister_continuation(terminal_id: &str) {
-    lock_recover(continuation_sessions(), "continuation_sessions")
-        .live
-        .remove(terminal_id);
-}
-
 /// The configured continuation-session cap (env override, else the default).
 /// A non-numeric / empty env value falls back to the default.
 fn continuation_session_cap() -> usize {
@@ -4193,7 +4179,7 @@ async fn post_work_unreported_fallback(
 /// `work_completed` is always the bare marker (the fixed string is what lets
 /// coord's transition guard compare it exactly), while `work_abandoned` carries
 /// `": <first line, ≤200 chars>"` whenever a detail was sent.
-fn is_session_work_outcome(recorded: &str) -> bool {
+pub(crate) fn is_session_work_outcome(recorded: &str) -> bool {
     recorded == "work_completed" || marker_matches("work_abandoned", recorded)
 }
 
@@ -15392,6 +15378,27 @@ mod tests {
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
     /// prefix followed by the same thread-pressure stamp continuations use.
+    /// The two read-only registry doors the Stop-hook verdict and the finish
+    /// relay use: only a LIVE entry carrying a gate is a gate continuation; a
+    /// gate-less entry (a work-unit dispatch) and an unknown terminal are not.
+    #[test]
+    fn live_gate_continuation_lookups_name_only_gated_live_entries() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::new_v4();
+        register_continuation_session("t-gate".to_string(), None, Some(gate));
+        register_continuation_session("t-unit".to_string(), Some("unit:x:p".to_string()), None);
+
+        assert_eq!(live_gate_continuation_gate_id("t-gate"), Some(gate));
+        assert_eq!(live_gate_continuation_gate_id("t-unit"), None);
+        assert_eq!(live_gate_continuation_gate_id("t-nope"), None);
+        assert_eq!(
+            live_gate_continuations(),
+            vec![("t-gate".to_string(), gate)]
+        );
+        clear_continuation_registry();
+    }
+
     #[test]
     fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
         let _env_lock = env_lock();

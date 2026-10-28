@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use qontinui_runner_lib::wind_down::{self, GridIdle};
+use qontinui_runner_lib::wind_down::{self, GridIdle, Sideband, SidebandState};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -108,16 +108,31 @@ pub enum RelayDecision {
     Hold(String),
 }
 
-/// The relayable token a raw outcome carries, or `None`. A detail-bearing
-/// outcome is stored as `<token>: <detail>`, so the token is the text before
-/// the first `:`.
+/// The relayable token a raw outcome carries, or `None`.
+///
+/// Delegates to [`crate::agent_runtime::is_session_work_outcome`], the ONE
+/// predicate for "an outcome only the session itself can write", shaped to
+/// what coord persists: `work_completed` bare, `work_abandoned` bare or as
+/// `work_abandoned: <detail>`. A second, looser copy here would drift from it.
 pub fn relayable_token(raw: &str) -> Option<&'static str> {
-    let token = raw.split(':').next().unwrap_or("").trim();
-    match token {
-        "work_completed" => Some("work_completed"),
-        "work_abandoned" => Some("work_abandoned"),
-        _ => None,
+    if !crate::agent_runtime::is_session_work_outcome(raw) {
+        return None;
     }
+    Some(if raw == "work_completed" {
+        "work_completed"
+    } else {
+        "work_abandoned"
+    })
+}
+
+/// Re-read a gate that held (no outcome yet, or a non-relayable one) at most
+/// this often, so a box full of idle continuations that said nothing costs one
+/// coord read per gate per window, not per tick.
+pub const RE_READ_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Whether a gate last read at `last` is due for another read at `now`.
+pub fn due_for_read(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= RE_READ_AFTER)
 }
 
 /// Whether `grid` has been idle continuously for at least `grace` at `now_ms`.
@@ -130,16 +145,33 @@ pub fn idle_past_grace(grid: GridIdle, now_ms: i64, grace: Duration) -> bool {
     }
 }
 
-/// The whole rule, pure. `gate` is consulted only once the pane is idle past
-/// grace — the async loop does not even read it otherwise.
+/// Whether the pane is quiet enough to relay: idle past grace on the grid,
+/// and not self-reporting `working` on its OSC 9999 sideband (a pane can look
+/// idle while the session says it is mid-work).
+pub fn pane_quiet(grid: GridIdle, sideband: Sideband, now_ms: i64, grace: Duration) -> bool {
+    let working = matches!(
+        sideband,
+        Sideband::Reported {
+            state: SidebandState::Working,
+            ..
+        }
+    );
+    !working && idle_past_grace(grid, now_ms, grace)
+}
+
+/// The whole rule, pure. `gate` is consulted only once the pane is quiet —
+/// the async loop does not even read it otherwise.
 pub fn decide(
     grid: GridIdle,
+    sideband: Sideband,
     now_ms: i64,
     grace: Duration,
     gate: &GateOutcomeRead,
 ) -> RelayDecision {
-    if !idle_past_grace(grid, now_ms, grace) {
-        return RelayDecision::Hold(format!("pane not idle past grace ({grid:?})"));
+    if !pane_quiet(grid, sideband, now_ms, grace) {
+        return RelayDecision::Hold(format!(
+            "pane not quiet past grace (grid {grid:?}, sideband {sideband:?})"
+        ));
     }
     match gate {
         GateOutcomeRead::Unreadable(why) => RelayDecision::Hold(format!("gate unreadable: {why}")),
@@ -181,8 +213,15 @@ pub fn gate_outcome_from_body(body: &Value, gate_id: uuid::Uuid) -> GateOutcomeR
 // I/O
 // ===========================================================================
 
-/// Read one gate's outcome over the device-authed list door. Never errors.
-async fn fetch_gate_outcome(gate_id: uuid::Uuid) -> GateOutcomeRead {
+/// The coord base, device JWT and client one tick's reads share — resolved
+/// once per tick (the credential may reach the OS keychain), never per gate.
+struct CoordReader {
+    base: String,
+    jwt: String,
+    client: reqwest::Client,
+}
+
+async fn coord_reader() -> Result<CoordReader, String> {
     let parts = tokio::time::timeout(
         CREDENTIAL_TIMEOUT,
         tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
@@ -190,19 +229,20 @@ async fn fetch_gate_outcome(gate_id: uuid::Uuid) -> GateOutcomeRead {
     .await;
     let (base, jwt) = match parts {
         Ok(Ok(Ok(p))) => p,
-        Ok(Ok(Err(e))) => return GateOutcomeRead::Unreadable(format!("no credential ({e})")),
-        Ok(Err(e)) => return GateOutcomeRead::Unreadable(format!("credential task failed ({e})")),
-        Err(_) => {
-            return GateOutcomeRead::Unreadable("credential resolution timed out".to_string())
-        }
+        Ok(Ok(Err(e))) => return Err(format!("no credential ({e})")),
+        Ok(Err(e)) => return Err(format!("credential task failed ({e})")),
+        Err(_) => return Err("credential resolution timed out".to_string()),
     };
-    let client = match crate::mcp::continuation_verdict::http_client() {
-        Ok(c) => c,
-        Err(e) => return GateOutcomeRead::Unreadable(e),
-    };
+    let client = crate::mcp::continuation_verdict::http_client()?;
+    Ok(CoordReader { base, jwt, client })
+}
+
+/// Read one gate's outcome over the device-authed list door. Never errors.
+async fn fetch_gate_outcome(reader: &CoordReader, gate_id: uuid::Uuid) -> GateOutcomeRead {
+    let CoordReader { base, jwt, client } = reader;
     // `include_archived`: a gate the retention worker archived still answers.
     let url = format!("{base}/coord/agent-gates?gate_id={gate_id}&include_archived=true");
-    let resp = match client.get(&url).bearer_auth(&jwt).send().await {
+    let resp = match client.get(&url).bearer_auth(jwt).send().await {
         Ok(r) => r,
         Err(e) => return GateOutcomeRead::Unreadable(format!("request failed ({e})")),
     };
@@ -234,20 +274,53 @@ pub fn start() {
     info!("continuation_finish_relay: started");
 }
 
+/// What survives between ticks: when each gate was last read and held.
+#[derive(Debug, Default)]
+struct RelayState {
+    last_read: HashMap<uuid::Uuid, std::time::Instant>,
+}
+
 async fn run_loop() {
     tokio::time::sleep(BOOT_SETTLE_DELAY).await;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut state = RelayState::default();
     loop {
         ticker.tick().await;
-        tick_once().await;
+        tick_once(&mut state).await;
     }
 }
 
-async fn tick_once() {
+/// `terminal_id` -> the harness session id of its NEWEST open, unfinished
+/// record, from `(terminal_id, claude_session_id, opened_at, finished)` rows. A terminal can hold more than one open record (a stale one from an
+/// earlier session id in the same pane); the newest is the live session.
+fn unfinished_by_terminal(
+    rows: impl IntoIterator<Item = (String, String, i64, bool)>,
+) -> HashMap<String, String> {
+    // (terminal_id, claude_session_id, opened_at, finished)
+    let mut best: HashMap<String, (i64, String)> = HashMap::new();
+    for (tid, sid, opened_at, finished) in rows {
+        if finished {
+            continue;
+        }
+        match best.get(&tid) {
+            Some((kept, _)) if *kept >= opened_at => {
+                debug!(terminal_id = %tid, "continuation_finish_relay: a terminal holds more than one open record — keeping the newest");
+            }
+            _ => {
+                best.insert(tid, (opened_at, sid));
+            }
+        }
+    }
+    best.into_iter().map(|(tid, (_, sid))| (tid, sid)).collect()
+}
+
+async fn tick_once(state: &mut RelayState) {
     use tauri::Manager;
 
     let continuations = crate::agent_runtime::live_gate_continuations();
+    let live_gates: HashSet<uuid::Uuid> = continuations.iter().map(|(_, g)| *g).collect();
+    state.last_read.retain(|g, _| live_gates.contains(g));
     if continuations.is_empty() {
         return;
     }
@@ -261,12 +334,14 @@ async fn tick_once() {
         return;
     };
     // terminal_id -> its open, not-yet-finished record's harness session id.
-    let unfinished: HashMap<String, String> = store
-        .open_records()
-        .into_iter()
-        .filter(|r| r.finished_at.is_none())
-        .map(|r| (r.terminal_id, r.claude_session_id))
-        .collect();
+    let unfinished = unfinished_by_terminal(store.open_records().into_iter().map(|r| {
+        (
+            r.terminal_id,
+            r.claude_session_id,
+            r.opened_at,
+            r.finished_at.is_some(),
+        )
+    }));
     let candidates: Vec<(String, uuid::Uuid, String)> = continuations
         .into_iter()
         .filter_map(|(tid, gate)| unfinished.get(&tid).map(|sid| (tid, gate, sid.clone())))
@@ -283,17 +358,36 @@ async fn tick_once() {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let grace = wind_down::grace_from_env();
 
+    let mut reader: Option<Result<CoordReader, String>> = None;
     for (terminal_id, gate_id, claude_session_id) in candidates {
-        let grid = observations
+        let observation = observations
             .get(&terminal_id)
-            .map_or(GridIdle::Unknown, |o| o.grid);
-        // Only an idle-past-grace pane costs a coord read.
-        let gate = if idle_past_grace(grid, now_ms, grace) {
-            fetch_gate_outcome(gate_id).await
+            .copied()
+            .unwrap_or(wind_down_observer::TerminalObservation::UNOBSERVABLE);
+        let (grid, sideband) = (observation.grid, observation.sideband);
+        // Only a quiet pane whose gate is due costs a coord read; the
+        // credential is resolved once per tick, on the first read.
+        let now = std::time::Instant::now();
+        let gate = if !pane_quiet(grid, sideband, now_ms, grace) {
+            GateOutcomeRead::Unreadable("not read — pane not quiet past grace".to_string())
+        } else if !due_for_read(state.last_read.get(&gate_id).copied(), now) {
+            continue;
         } else {
-            GateOutcomeRead::Unreadable("not read — pane not idle past grace".to_string())
+            if reader.is_none() {
+                reader = Some(coord_reader().await);
+            }
+            let r = match &reader {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => {
+                    debug!(error = %e, "continuation_finish_relay: no coord reader this tick");
+                    return;
+                }
+                None => return,
+            };
+            state.last_read.insert(gate_id, now);
+            fetch_gate_outcome(r, gate_id).await
         };
-        match decide(grid, now_ms, grace, &gate) {
+        match decide(grid, sideband, now_ms, grace, &gate) {
             RelayDecision::Hold(why) => {
                 debug!(terminal_id = %terminal_id, gate_id = %gate_id, reason = %why, "continuation_finish_relay: hold");
             }
@@ -353,6 +447,8 @@ mod tests {
         GridIdle::Idle { since_ms: NOW - ms }
     }
 
+    const NR: Sideband = Sideband::NeverReported;
+
     fn outcome(s: Option<&str>) -> GateOutcomeRead {
         GateOutcomeRead::Outcome(s.map(String::from))
     }
@@ -361,11 +457,17 @@ mod tests {
     fn relays_work_completed_and_work_abandoned_once_idle_past_grace() {
         let grid = idle_for(600_000);
         assert_eq!(
-            decide(grid, NOW, GRACE, &outcome(Some("work_completed"))),
+            decide(grid, NR, NOW, GRACE, &outcome(Some("work_completed"))),
             RelayDecision::Relay("work_completed")
         );
         assert_eq!(
-            decide(grid, NOW, GRACE, &outcome(Some("work_abandoned: gave up"))),
+            decide(
+                grid,
+                NR,
+                NOW,
+                GRACE,
+                &outcome(Some("work_abandoned: gave up"))
+            ),
             RelayDecision::Relay("work_abandoned")
         );
     }
@@ -382,7 +484,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decide(grid, NOW, GRACE, &outcome(raw)),
+                    decide(grid, NR, NOW, GRACE, &outcome(raw)),
                     RelayDecision::Hold(_)
                 ),
                 "{raw:?} must not be relayed"
@@ -391,6 +493,7 @@ mod tests {
         assert!(matches!(
             decide(
                 grid,
+                NR,
                 NOW,
                 GRACE,
                 &GateOutcomeRead::Unreadable("HTTP 401".into())
@@ -403,15 +506,15 @@ mod tests {
     fn holds_until_the_pane_has_been_idle_for_the_whole_grace() {
         let done = outcome(Some("work_completed"));
         assert!(matches!(
-            decide(idle_for(599_999), NOW, GRACE, &done),
+            decide(idle_for(599_999), NR, NOW, GRACE, &done),
             RelayDecision::Hold(_)
         ));
         assert!(matches!(
-            decide(GridIdle::Busy, NOW, GRACE, &done),
+            decide(GridIdle::Busy, NR, NOW, GRACE, &done),
             RelayDecision::Hold(_)
         ));
         assert!(matches!(
-            decide(GridIdle::Unknown, NOW, GRACE, &done),
+            decide(GridIdle::Unknown, NR, NOW, GRACE, &done),
             RelayDecision::Hold(_)
         ));
     }
@@ -442,13 +545,71 @@ mod tests {
     }
 
     #[test]
-    fn relayable_token_is_exact_on_the_token_not_a_prefix_match() {
+    fn relayable_token_matches_what_coord_persists_and_nothing_looser() {
         assert_eq!(relayable_token("work_completed"), Some("work_completed"));
-        assert_eq!(
-            relayable_token(" work_abandoned: x"),
-            Some("work_abandoned")
-        );
+        assert_eq!(relayable_token("work_abandoned"), Some("work_abandoned"));
+        assert_eq!(relayable_token("work_abandoned: x"), Some("work_abandoned"));
+        // coord stores `work_completed` bare; a detail on it is not its shape.
+        assert_eq!(relayable_token("work_completed: x"), None);
+        assert_eq!(relayable_token("work_abandoned:x"), None);
         assert_eq!(relayable_token("work_completed_maybe"), None);
         assert_eq!(relayable_token("work_unreported"), None);
+    }
+
+    #[test]
+    fn a_pane_whose_sideband_says_working_is_not_quiet() {
+        let working = Sideband::Reported {
+            state: SidebandState::Working,
+            set_at_ms: NOW,
+        };
+        let not_working = Sideband::Reported {
+            state: SidebandState::NotWorking,
+            set_at_ms: NOW,
+        };
+        let done = outcome(Some("work_completed"));
+        let grid = idle_for(3_600_000);
+        assert!(matches!(
+            decide(grid, working, NOW, GRACE, &done),
+            RelayDecision::Hold(_)
+        ));
+        assert_eq!(
+            decide(grid, not_working, NOW, GRACE, &done),
+            RelayDecision::Relay("work_completed")
+        );
+    }
+
+    #[test]
+    fn a_held_gate_is_re_read_only_after_the_backoff() {
+        let t0 = std::time::Instant::now();
+        assert!(due_for_read(None, t0));
+        assert!(!due_for_read(
+            Some(t0),
+            t0 + RE_READ_AFTER - Duration::from_secs(1)
+        ));
+        assert!(due_for_read(Some(t0), t0 + RE_READ_AFTER));
+    }
+
+    fn row(tid: &str, sid: &str, opened_at: i64, finished: bool) -> (String, String, i64, bool) {
+        (tid.to_string(), sid.to_string(), opened_at, finished)
+    }
+
+    #[test]
+    fn a_terminal_with_two_open_records_maps_to_the_newest() {
+        let m = unfinished_by_terminal(vec![
+            row("t1", "old", 100, false),
+            row("t1", "new", 200, false),
+            row("t2", "done", 300, true),
+        ]);
+        assert_eq!(m.get("t1").map(String::as_str), Some("new"));
+        assert!(
+            !m.contains_key("t2"),
+            "a finished record is never a candidate"
+        );
+        // Order-independent.
+        let m = unfinished_by_terminal(vec![
+            row("t1", "new", 200, false),
+            row("t1", "old", 100, false),
+        ]);
+        assert_eq!(m.get("t1").map(String::as_str), Some("new"));
     }
 }
