@@ -1282,6 +1282,8 @@ async fn start_steward(
         crate::terminal::TrustArm::AccountChosenLater,
         // A steward session runs under the machine default tenant.
         None,
+        // `Steward` from the HTTP door, `OperatorTerminal` from the runner UI.
+        origin,
     ) {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);

@@ -714,6 +714,7 @@ async fn resume_one(
                     // reports it if `record_pinned_session_open` adopts the
                     // reopen under D3.
                     gate_identity: None,
+                    origin: crate::coord_drain_state::SpawnOrigin::BootResume,
                 },
             )
         })
