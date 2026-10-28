@@ -5921,9 +5921,12 @@ async fn run_gate_continuation_inner(
             // gets back-pressured a band earlier than a human's own terminal.
             warn!(
                 "agent_runtime: gate-continuation deferred under machine load: {} \
-                 — re-delivered when threads free up (anchor_key={:?})",
+                 — re-delivered when threads free up (anchor_key={:?} session_name={:?} gate_id={:?} ledger_live={})",
                 observation.clause(severity),
-                payload.anchor_key
+                payload.anchor_key,
+                payload.session_name,
+                payload.gate_id,
+                crate::terminal::spawn_ledger::counts().0
             );
             // The stamp reason names the REAL numbers, in the same
             // `<class>:<detail>` shape as `at_cap:` / `duplicate_anchor:` so
@@ -6957,10 +6960,27 @@ async fn run_continuation_terminal(
                         .is_some_and(|s| s.is_alive());
                 // The session is intentionally left on `main` (docked, visible) — no
                 // pop-out window was opened, so there is nothing to reassign it to.
+                // Forensics (plan 2026-10-28-runner-spawn-forensics-...): name the
+                // gate, skill, anchor and session so a burst is attributable.
+                let fx_skill = crate::terminal::spawn_ledger::skill_from_prompt(&payload.initial_prompt);
+                let fx_name = payload.session_name.clone().unwrap_or_else(|| "unknown".into());
+                let fx_gate = payload.gate_id.map(|g| g.to_string()).unwrap_or_else(|| "none".into());
+                let fx_anchor = payload.anchor_key.clone().unwrap_or_else(|| "none".into());
+                crate::terminal::spawn_ledger::annotate_origin(
+                    &terminal_id.to_string(),
+                    crate::terminal::spawn_ledger::Origin::GateContinuation {
+                        skill: fx_skill.clone(),
+                        gate_id: fx_gate.clone(),
+                        dispatch_id: payload.dispatch_id.map(|d| d.to_string()).unwrap_or_else(|| "none".into()),
+                        anchor_key: fx_anchor.clone(),
+                        session_name: fx_name.clone(),
+                    },
+                );
                 info!(
                     "agent_runtime: gate-continuation terminal session started \
                  terminal_id={terminal_id} coord_session={coord_session_id:?} \
-                 agent_id={agent_id} attempt={attempt}"
+                 agent_id={agent_id} attempt={attempt} session_name={fx_name} gate_id={fx_gate} \
+                 skill={fx_skill} anchor_key={fx_anchor} claude_session={pinned_session_id}"
                 );
                 // Surface the freshly-created continuation to the operator: emit a
                 // `terminal-focus-request` so the frontend (a) switches the main view

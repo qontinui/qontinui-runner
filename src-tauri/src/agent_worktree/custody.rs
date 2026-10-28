@@ -571,6 +571,23 @@ pub(crate) fn write_session_name(session_id: &str, name: &str) -> std::io::Resul
     Ok(path)
 }
 
+/// Read the name recorded for `session_id` (the reader twin of
+/// [`write_session_name`]); `None` when the id is not a plain filename
+/// component, the file is absent/unreadable, or the name is empty.
+pub(crate) fn read_session_name(session_id: &str) -> Option<String> {
+    let id = session_id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let raw = std::fs::read_to_string(session_names_dir().join(id.to_ascii_lowercase())).ok()?;
+    let name = raw.lines().next().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn session_names_dir() -> PathBuf {
     if let Ok(over) = std::env::var("QONTINUI_SESSION_NAMES_DIR") {
         if !over.trim().is_empty() {

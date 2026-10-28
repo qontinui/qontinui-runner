@@ -1946,8 +1946,13 @@ impl TerminalSession {
             terminal_id = %id,
             pid = ?child_pid,
             cwd = %cwd,
+            claude_session = %pinned_session_id,
+            runner_pid = std::process::id(),
             "Terminal session spawned"
         );
+        // Forensics: held until the session is fully built (registered just
+        // before `Ok(Self {`), so a failed spawn leaves no ghost ledger entry.
+        let ledger_pinned = pinned_session_id.clone();
 
         // Assign to Windows Job Object for crash safety — the pid the pane
         // allows, which is `None` for a PTY-holder pane (its child must outlive
@@ -2500,6 +2505,9 @@ impl TerminalSession {
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
+        // Forensics: remember who this pid is (parent, image, claude session) so
+        // a burst or a shutdown can be attributed from the log alone.
+        super::spawn_ledger::register(&id.to_string(), child_pid, &ledger_pinned);
         Ok(Self {
             id,
             title: Arc::new(Mutex::new(title)),
@@ -4885,6 +4893,7 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
+        super::spawn_ledger::deregister(&self.id.to_string());
         // SeqCst, and BEFORE the kill: the waiter classifies the exit the kill
         // causes as runner-initiated by seeing this store (see
         // `mark_exited_was_runner_initiated`).
@@ -5060,6 +5069,8 @@ impl TerminalSession {
     pub fn close_kill_only(&self) {
         warn!(
             terminal_id = %self.id,
+            pid = ?self.child_pid,
+            claude_session = %self.pinned_session_id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
         );
         // SeqCst, before the kill — see `mark_exited_was_runner_initiated`.
@@ -5202,6 +5213,7 @@ impl Drop for TerminalSession {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
         }
+        super::spawn_ledger::deregister(&self.id.to_string());
     }
 }
 

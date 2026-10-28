@@ -6788,6 +6788,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          close request — exiting process",
                         force_exit_at.as_secs()
                     );
+                    // Forensics: which terminals were still open when we gave up.
+                    // try_lock + no process-table walk: must never delay the exit.
+                    terminal::spawn_ledger::log_roster("force-exit-watchdog", Some(256), false);
                     // D3: name WHICH of the two force-exit routes fired. A
                     // `warn!` alone cannot be told apart from the other one in
                     // a truncated log, and this thread never reaches the
@@ -6929,6 +6932,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          finishing — exiting process",
                         shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
                     );
+                    terminal::spawn_ledger::log_roster("force-exit-watchdog-2", Some(256), false);
                     // D3: the OTHER force-exit route. Same reason as the
                     // watchdog above — this thread terminates the process
                     // directly and never reaches the post-`app.run()`

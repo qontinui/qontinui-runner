@@ -1091,6 +1091,9 @@ impl TerminalManager {
     /// leak processes), while the thread joins and the shim-dir sweep are
     /// skipped. The imminent `process::exit` reclaims the rest.
     pub fn close_all(&self, deadline: std::time::Instant) {
+        // The ledger outlives the drain below, so this names every terminal
+        // that was open when the shutdown began.
+        super::spawn_ledger::log_roster("close_all", Some(256), false);
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),

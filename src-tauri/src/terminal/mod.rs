@@ -33,6 +33,7 @@ pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod spawn_ledger; // forensic spawn bookkeeping + burst warning + roster (plan 2026-10-28-runner-spawn-forensics-logs-name-the-session-pid-and-gate)
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]

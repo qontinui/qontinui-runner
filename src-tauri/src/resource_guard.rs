@@ -2525,6 +2525,9 @@ pub(crate) fn admit_spawn(
                 observed = observation.observed,
                 limit = observation.limit,
                 what = %what,
+                ledger_live = crate::terminal::spawn_ledger::counts().0,
+                ledger_recent_60s = crate::terminal::spawn_ledger::counts().1,
+                why = "warn_arm_proceeds: the warn band never refuses an operator spawn",
                 "resource_guard: spawning past the session warn limit"
             );
             emit_notice(app, "warn", &observation, &message);
