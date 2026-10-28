@@ -418,6 +418,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
 const LEDGER_CALLS: &[&str] = &[
     "record_control_result(",
     "record_sdk_result(",
+    "record_sdk_navigation_result(",
     "record_action(",
     "record_diff(",
     "record_diff_result(",

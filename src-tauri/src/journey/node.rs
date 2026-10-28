@@ -13,9 +13,18 @@
 //! Nothing a row can carry is read from user input:
 //! - `pageLabel` comes from [`resolve_declared_page_label`] (tabId → activeTab →
 //!   slugged `pageContext.name`), or on a `SemanticSnapshot` from the slugged
-//!   `page.pageName` — never from `page.pathname`, raw or slugged;
-//! - `pathnameTemplate` is only ever the framework's route PATTERN
-//!   (`page.route.pattern` / `page.routePattern`), never derived;
+//!   `page.pageName` — never from `page.pathname`, raw or slugged. A NAME that
+//!   mirrors the pathname (`usePageContext({ name: pathname })`) is refused too
+//!   ([`name_mirrors_pathname`], a defence-in-depth tripwire);
+//! - `pathnameTemplate` is only ever a route PATTERN the app ASSERTS came from
+//!   its router: `page.route.pattern` is kept only when `page.route` also
+//!   carries `patternSource: "router"`, and is never derived. A string cannot
+//!   prove it is a pattern (`/login` and `/search/<secret>` look alike), so an
+//!   unasserted pattern is dropped to `null` — FAIL CLOSED — and counted as
+//!   `templateUntrusted` in `/journey/health`. The SemanticSnapshot's
+//!   `page.routePattern` is not read at all: no SDK producer ever asserts it.
+//!   Plan `2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern`
+//!   D1;
 //! - an affordance is a structural fingerprint (a hash), an ARIA role and a
 //!   declared effect — never an element's label, text or value.
 //!
@@ -31,7 +40,9 @@ use qontinui_types::journey::JourneyNode;
 use qontinui_types::spec_check::{ClassificationStatus, SpecCheckResult};
 
 use crate::spec_api::slug::pathname_to_spec_id;
-use crate::state_discovery::capture::{resolve_declared_page_label, resolve_page_label};
+use crate::state_discovery::capture::{
+    name_mirrors_pathname, resolve_declared_page_label, resolve_page_label,
+};
 use crate::state_discovery::fingerprint::{extract_role, stable_element_fingerprint};
 
 /// The classification a state must carry to count as PRESENT in a node.
@@ -52,9 +63,18 @@ pub(crate) struct PageIdentity {
     pub spec_lookup_label: Option<String>,
     /// The app-declared page label that may be stored in a node.
     pub page_label: Option<String>,
-    /// The framework route pattern, when the snapshot carries one.
+    /// The framework route pattern, when the snapshot carries one AND the
+    /// app asserted it came from its router (D1). Never derived.
     pub pathname_template: Option<String>,
+    /// The snapshot carried a route pattern WITHOUT the router assertion, so
+    /// it was dropped. The caller counts it into `/journey/health`.
+    pub template_untrusted: bool,
 }
+
+/// The only `page.route.patternSource` value under which a route pattern is
+/// stored (D1). Anything else — absent, misspelt, another source — is
+/// untrusted.
+pub(crate) const ROUTER_PATTERN_SOURCE: &str = "router";
 
 fn non_blank(v: Option<&serde_json::Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
@@ -63,30 +83,38 @@ fn non_blank(v: Option<&serde_json::Value>) -> Option<&str> {
 /// Read a snapshot's page identity.
 ///
 /// Two snapshot shapes reach the producer: the UI Bridge CONTROL snapshot
-/// (`/control/snapshot` — `page.pageContext`, `page.route.pattern`,
-/// `activeTab`) and the SDK's `SemanticSnapshot` (the `beforeSnapshot` /
-/// `afterSnapshot` of an execute-with-diff — `page.pageName`,
-/// `page.routePattern`). Both spellings of the same two facts are read;
-/// neither shape carries the other's.
+/// (`/control/snapshot` — `page.pageContext`, `page.route`, `activeTab`) and
+/// the SDK's `SemanticSnapshot` (the `beforeSnapshot` / `afterSnapshot` of an
+/// execute-with-diff — `page.pageName`). Both spellings of the page label are
+/// read. The route TEMPLATE is read only from `page.route`, and only when the
+/// app asserts `patternSource: "router"` (D1): the SemanticSnapshot's partial
+/// route pattern has no producer that asserts it, so it is never read.
 pub(crate) fn page_identity(snapshot: &serde_json::Value) -> PageIdentity {
     let page = snapshot.get("page");
-    let semantic_page_name =
-        non_blank(page.and_then(|p| p.get("pageName"))).map(pathname_to_spec_id);
+    let semantic_page_name = non_blank(page.and_then(|p| p.get("pageName")))
+        .filter(|name| !name_mirrors_pathname(snapshot, name))
+        .map(pathname_to_spec_id);
 
     let page_label = resolve_declared_page_label(snapshot).or(semantic_page_name);
     let spec_lookup_label = page_label.clone().or_else(|| resolve_page_label(snapshot));
 
-    let pathname_template = non_blank(
-        page.and_then(|p| p.get("route"))
-            .and_then(|r| r.get("pattern")),
-    )
-    .or_else(|| non_blank(page.and_then(|p| p.get("routePattern"))))
-    .map(|s| s.trim().to_string());
+    let route = page.and_then(|p| p.get("route"));
+    let pattern = non_blank(route.and_then(|r| r.get("pattern")));
+    let router_asserted = route
+        .and_then(|r| r.get("patternSource"))
+        .and_then(|v| v.as_str())
+        == Some(ROUTER_PATTERN_SOURCE);
+    let (pathname_template, template_untrusted) = match pattern {
+        Some(p) if router_asserted => (Some(p.trim().to_string()), false),
+        Some(_) => (None, true),
+        None => (None, false),
+    };
 
     PageIdentity {
         spec_lookup_label,
         page_label,
         pathname_template,
+        template_untrusted,
     }
 }
 
@@ -496,6 +524,7 @@ mod tests {
             spec_lookup_label: label.map(String::from),
             page_label: label.map(String::from),
             pathname_template: template.map(String::from),
+            template_untrusted: false,
         }
     }
 
@@ -587,23 +616,80 @@ mod tests {
             "activeTab": "config-log-sources",
             "page": {
                 "pathname": "/x/42",
-                "route": { "pattern": "/x/[id]" },
+                "route": { "pattern": "/x/[id]", "patternSource": "router" },
                 "pageContext": { "name": "Import / Export" }
             }
         }));
         assert_eq!(id.page_label.as_deref(), Some("config-log-sources"));
         assert_eq!(id.pathname_template.as_deref(), Some("/x/[id]"));
+        assert!(!id.template_untrusted);
+    }
+
+    /// D1: the live 2026-10-09 leak. An app reported its CONCRETE path as the
+    /// route pattern; without the router assertion it is dropped (fail
+    /// closed) and counted, never stored.
+    #[test]
+    fn a_concrete_pattern_without_pattern_source_is_dropped_and_counted() {
+        const SENTINEL: &str = "JP2SENTINELw4r8mv";
+        for route in [
+            json!({ "pattern": format!("/search/{SENTINEL}") }),
+            json!({ "pattern": format!("/search/{SENTINEL}"), "patternSource": "app" }),
+            json!({ "pattern": format!("/search/{SENTINEL}"), "patternSource": "Router" }),
+            json!({ "pattern": format!("/search/{SENTINEL}"), "patternSource": true }),
+        ] {
+            let id = page_identity(&json!({
+                "page": { "pathname": format!("/search/{SENTINEL}"), "route": route }
+            }));
+            assert_eq!(id.pathname_template, None, "{route}");
+            assert!(id.template_untrusted, "{route}");
+            let node = build_node(&id, &SpecLookup::NoSpec);
+            assert!(!node.key().contains(SENTINEL), "{}", node.key());
+            assert!(!serde_json::to_string(&node).unwrap().contains(SENTINEL));
+        }
     }
 
     #[test]
-    fn page_identity_reads_the_semantic_snapshot_shape() {
+    fn no_pattern_is_neither_stored_nor_untrusted() {
+        let id = page_identity(&json!({ "page": { "route": { "patternSource": "router" } } }));
+        assert_eq!(id.pathname_template, None);
+        assert!(!id.template_untrusted, "nothing was dropped");
+        let id = page_identity(&json!({
+            "page": { "route": { "pattern": null, "patternSource": "router" } }
+        }));
+        assert_eq!(id.pathname_template, None);
+        assert!(!id.template_untrusted);
+    }
+
+    #[test]
+    fn page_identity_reads_the_semantic_snapshot_label_but_never_its_pattern() {
         let id = page_identity(&json!({
             "snapshotId": "s1",
-            "page": { "pathname": "/x/42", "pageName": "Import / Export", "routePattern": "/x/:id" }
+            "page": { "pathname": "/x/42", "pageName": "Import / Export", "routePattern": "/x/42" }
         }));
         assert_eq!(id.page_label.as_deref(), Some("import-export"));
         assert!(!id.page_label.unwrap().contains('/'));
-        assert_eq!(id.pathname_template.as_deref(), Some("/x/:id"));
+        assert_eq!(
+            id.pathname_template, None,
+            "the SemanticSnapshot pattern has no asserting producer (D1)"
+        );
+        assert!(!id.template_untrusted, "the arm is not read at all");
+    }
+
+    #[test]
+    fn page_identity_refuses_a_page_name_that_mirrors_the_pathname() {
+        // `usePageContext({ name: pathname })` on both snapshot shapes: the
+        // runner slugs the name, so it would store `search-<secret>`.
+        for snap in [
+            json!({ "page": { "pathname": "/search/JP2SENTINEL",
+                              "pageContext": { "name": "/search/JP2SENTINEL" } } }),
+            json!({ "page": { "pathname": "/search/JP2SENTINEL",
+                              "pageName": "/search/JP2SENTINEL" } }),
+        ] {
+            let id = page_identity(&snap);
+            assert_eq!(id.page_label, None, "{snap}");
+            let node = build_node(&id, &SpecLookup::NoSpec);
+            assert!(!node.key().to_lowercase().contains("jp2sentinel"));
+        }
     }
 
     #[test]

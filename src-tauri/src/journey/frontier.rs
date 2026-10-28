@@ -327,7 +327,10 @@ mod tests {
         let sql = EDGE_WRITE_SQL;
         assert!(sql.contains("$12 IN ('changed', 'no_change', 'settle_timeout')"));
         assert!(sql.contains("WHERE $12 = 'error'"));
-        assert!(sql.contains("SET reason = 'activation_failed'"));
+        assert!(sql.contains("reason = 'activation_failed'"));
+        // ...and refreshes the stored node, so a pre-D1 body cannot outlive
+        // the template scrub by being bumped past its cutoff.
+        assert!(sql.contains("SET node = EXCLUDED.node,"));
         assert!(
             !sql.contains("to_node_unobserved"),
             "unobserved touches no frontier row"
