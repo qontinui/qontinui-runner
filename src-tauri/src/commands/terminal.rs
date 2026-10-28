@@ -2339,6 +2339,35 @@ pub(crate) struct SessionCaptureHint {
 /// `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
 pub(crate) const GATE_ID_ENV: &str = "QONTINUI_GATE_ID";
 
+/// The env a GATE continuation's PTY carries beyond the base child env: the
+/// gate it reports to ([`GATE_ID_ENV`] / [`GATE_DEVICE_ID_ENV`]) and the
+/// Stop-hook mode it runs under.
+///
+/// The mode is forwarded because `claude_stop_hook.sh` short-circuits on
+/// `QONTINUI_STOP_HOOK_CONTINUATION` before asking the runner, and the base
+/// child env sets that variable to the RUNNER's mode — `off` when unset. A gate
+/// continuation reads an unset flag as armed
+/// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]); without this
+/// override its Stop hook would be registered and then exit before ever
+/// reaching the verdict. Applied through `extra_env`, which runs after the base
+/// env, so it wins. Pure over its inputs (the unit-test surface).
+pub(crate) fn gate_identity_env(
+    gate: GateIdentity,
+    reading: crate::mcp::continuation_verdict::FlagReading,
+) -> Vec<(String, String)> {
+    vec![
+        (GATE_ID_ENV.to_string(), gate.gate_id.to_string()),
+        (
+            GATE_DEVICE_ID_ENV.to_string(),
+            gate.consuming_device_id.to_string(),
+        ),
+        (
+            crate::mcp::continuation_verdict::FLAG_ENV.to_string(),
+            reading.mode_for(true).as_str().to_string(),
+        ),
+    ]
+}
+
 /// Env var carrying the CONSUMING device id for [`GATE_ID_ENV`]'s gate.
 ///
 /// coord's outcome UPDATE carries `AND continuation_consumed_by = $3`, so a
@@ -2566,10 +2595,9 @@ pub(crate) fn create_terminal_session_backend(
     // to report to" — the correct signal, and the reason this is not a
     // sentinel value.
     if let Some(gate) = capture_hint.as_ref().and_then(|h| h.gate_identity) {
-        env_pairs.push((GATE_ID_ENV.to_string(), gate.gate_id.to_string()));
-        env_pairs.push((
-            GATE_DEVICE_ID_ENV.to_string(),
-            gate.consuming_device_id.to_string(),
+        env_pairs.extend(gate_identity_env(
+            gate,
+            crate::mcp::continuation_verdict::FlagReading::from_env(),
         ));
     }
     // The spawn-time policy delivery marker pair — set, or BLANKED, on every
@@ -3134,6 +3162,32 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// A gate continuation's PTY carries the gate pair AND an armed Stop-hook
+    /// mode when the flag is unset — the script short-circuits on that
+    /// variable, so without it the registered hook never reaches the verdict.
+    /// An explicit `off` is forwarded as `off`.
+    #[test]
+    fn gate_identity_env_arms_the_stop_hook_unless_the_flag_is_off() {
+        use crate::mcp::continuation_verdict::{FlagReading, Mode, FLAG_ENV};
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::new_v4(),
+            consuming_device_id: uuid::Uuid::new_v4(),
+        };
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let env = gate_identity_env(gate, FlagReading::Unset);
+        assert_eq!(get(&env, GATE_ID_ENV), Some(gate.gate_id.to_string()));
+        assert_eq!(
+            get(&env, GATE_DEVICE_ID_ENV),
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("on"));
+
+        let env = gate_identity_env(gate, FlagReading::Explicit(Mode::Off));
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("off"));
+    }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.

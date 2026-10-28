@@ -1436,7 +1436,11 @@ async fn continuation_verdict(
     let hook_input: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let key = resolve_session_key(&state, &id, &hook_input);
-    Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input).await)
+    // The mode is scoped by the PATH id (the runner terminal id) against the
+    // runner's own continuation registry: a gate continuation is armed by
+    // default, everything else keeps the flag's dark default.
+    let mode = crate::mcp::continuation_verdict::mode_for_terminal(&id);
+    Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input, mode).await)
 }
 
 // =============================================================================

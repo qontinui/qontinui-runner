@@ -568,12 +568,97 @@ pub async fn resolve_coord_row(csid: &str) -> RowResolution {
 }
 
 // ---------------------------------------------------------------------------
+// One session's raw work axis (the Stop-hook verdict's read)
+// ---------------------------------------------------------------------------
+
+/// What coord said about ONE harness session's work axis, with the raw status
+/// word kept (the verdict decides on the word, not on [`SessionWorkStatus`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneStatus {
+    /// coord has a row; `None` = its work axis is unset.
+    Row(Option<String>),
+    /// coord named the id in `unknown` — reachable, and no row.
+    NoRow,
+    /// coord could not be asked, or did not settle the id (degraded read,
+    /// bridge column absent, an `invalid` id, named in no bucket).
+    Unresolved(String),
+}
+
+/// Pure: settle `csid`'s raw work axis against a decoded body.
+fn one_status_from_body(body: &WireResponse, csid: &str) -> OneStatus {
+    if !body.session_bridge_column_present {
+        return OneStatus::Unresolved(
+            "coord reported sessionBridgeColumnPresent: false".to_string(),
+        );
+    }
+    if let Some(row) = body.statuses.get(csid) {
+        return OneStatus::Row(
+            row.session_status
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if body.unknown.iter().any(|u| u == csid) {
+        return OneStatus::NoRow;
+    }
+    OneStatus::Unresolved("coord named the id in neither `statuses` nor `unknown`".to_string())
+}
+
+/// Read ONE harness session's work axis over the same door, credential and
+/// timeouts as [`fetch`]. Never errors — see [`OneStatus`].
+pub async fn fetch_one(csid: &str) -> OneStatus {
+    match fetch_wire(&[csid.to_string()]).await {
+        Ok((body, _)) => one_status_from_body(&body, csid),
+        Err(note) => OneStatus::Unresolved(note),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_status_keeps_the_raw_word_and_separates_no_row_from_unresolved() {
+        let b = body(serde_json::json!({
+            "statuses": {
+                "a": {"session_status": "Working "},
+                "b": {"session_status": null},
+                "c": {"session_status": "  "}
+            },
+            "unknown": ["u"], "invalid": ["bad"], "accepted": 3,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            one_status_from_body(&b, "a"),
+            OneStatus::Row(Some("Working".into()))
+        );
+        assert_eq!(one_status_from_body(&b, "b"), OneStatus::Row(None));
+        assert_eq!(one_status_from_body(&b, "c"), OneStatus::Row(None));
+        assert_eq!(one_status_from_body(&b, "u"), OneStatus::NoRow);
+        assert!(matches!(
+            one_status_from_body(&b, "bad"),
+            OneStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            one_status_from_body(&b, "zzz"),
+            OneStatus::Unresolved(_)
+        ));
+
+        let no_bridge = body(serde_json::json!({
+            "statuses": {"a": {"session_status": "working"}}, "unknown": [],
+            "sessionBridgeColumnPresent": false
+        }));
+        assert!(matches!(
+            one_status_from_body(&no_bridge, "a"),
+            OneStatus::Unresolved(_)
+        ));
+    }
 
     fn body(json: serde_json::Value) -> WireResponse {
         serde_json::from_value(json).expect("decode")

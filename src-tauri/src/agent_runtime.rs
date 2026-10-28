@@ -3127,6 +3127,46 @@ fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
 }
 
+/// The `coord.gates` row the LIVE continuation in `terminal_id` reports to, or
+/// `None` when the registry holds no entry for that terminal or holds one with
+/// no gate (a work-unit dispatch).
+///
+/// Read-only. It is how the Stop-hook verdict scopes its default-on arm to gate
+/// continuations ([`crate::mcp::continuation_verdict::mode_for_terminal`]) —
+/// by the runner's own record, never by a title or by the session's
+/// environment, which the runner cannot read.
+pub(crate) fn live_gate_continuation_gate_id(terminal_id: &str) -> Option<uuid::Uuid> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .and_then(|s| s.gate_id)
+}
+
+/// `(terminal_id, gate_id)` for every LIVE continuation that has a gate row —
+/// a snapshot taken under the registry lock and returned with it released.
+/// The finish relay ([`crate::session::continuation_finish_relay`]) walks it.
+pub(crate) fn live_gate_continuations() -> Vec<(String, uuid::Uuid)> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .iter()
+        .filter_map(|(tid, s)| s.gate_id.map(|g| (tid.clone(), g)))
+        .collect()
+}
+
+/// Test seam for modules outside this one: insert a live entry.
+#[cfg(test)]
+pub(crate) fn test_register_live_continuation(terminal_id: &str, gate_id: Option<uuid::Uuid>) {
+    register_continuation_session(terminal_id.to_string(), None, gate_id);
+}
+
+/// Test seam for modules outside this one: remove a live entry.
+#[cfg(test)]
+pub(crate) fn test_deregister_continuation(terminal_id: &str) {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .remove(terminal_id);
+}
+
 /// The configured continuation-session cap (env override, else the default).
 /// A non-numeric / empty env value falls back to the default.
 fn continuation_session_cap() -> usize {
@@ -6796,8 +6836,11 @@ async fn run_continuation_terminal(
             prompt_carrier,
             // Direct exec — no identity shim in the chain to append `--settings`,
             // so the hook carrier has to be spelled out here or this session runs
-            // with no SessionStart/PreCompact/Stop hook at all.
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // with no SessionStart/PreCompact/Stop hook at all. A GATE
+            // continuation gets the Stop-armed carrier unless the flag is
+            // explicitly `off`: it is the unattended population whose turn end
+            // must be checked (plan 2026-10-28-finished-gate-continuations-…).
+            crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
         );
         // ...unless an operator template put a replacement prompt in the final
