@@ -3484,13 +3484,21 @@ impl SessionLifecycleStore {
             .get()
             .map(|e| e.observed())
             .unwrap_or_default();
+        let prior_held: HashSet<&str> = self
+            .observation_epoch
+            .get()
+            .map(|e| e.prior_held_unjudged().iter().map(String::as_str).collect())
+            .unwrap_or_default();
         let marker_teardown_complete = self.prior_teardown_complete.get().copied();
         let boot_ms = self.boot_ms.load(Ordering::Relaxed);
         match self.map.lock() {
             Ok(m) => {
                 let now_ms = Utc::now().timestamp_millis();
+                let held = |r: &TerminalSessionRecord| {
+                    awaiting_prior_boot_restore(r, &prior_held, boot_ms, now_ms)
+                };
                 let anchors = restore_anchors(
-                    m.values(),
+                    m.values().filter(|r| !held(r)),
                     prior_marker_at,
                     boot_was_clean,
                     marker_teardown_complete,
@@ -3501,7 +3509,7 @@ impl SessionLifecycleStore {
                 );
                 let (finished, unfinished): (Vec<_>, Vec<_>) = m
                     .values()
-                    .filter(|r| restore_admissible(r, &anchors, now_ms))
+                    .filter(|r| held(r) || restore_admissible(r, &anchors, now_ms))
                     .cloned()
                     .partition(|r| r.finished_at.is_some());
                 (dedupe_open_by_terminal(unfinished), finished)
@@ -4405,6 +4413,30 @@ fn awaiting_account_hold(r: &TerminalSessionRecord, now_ms: i64) -> bool {
             .is_some_and(|since| now_ms - since <= OPEN_STALE_MS)
 }
 
+/// Was `r` held UNJUDGED by the prior process's liveness poll — a row of that
+/// process's boot-latched restorable set still waiting for its page's restore
+/// on the poll's last successful tick
+/// ([`crate::session::observation_epoch::ObservationEpoch::prior_held_unjudged`])?
+/// Such a row is admitted by that hold, like [`awaiting_account_hold`]: the
+/// prior process admitted it at its boot and never looked at it again, so its
+/// observation epoch is no evidence against it (plan
+/// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+/// Phase 4). It feeds no anchor, and the hold lasts while the row stays open,
+/// unfinished and untouched since before this boot, up to the open-row prune
+/// age ([`OPEN_STALE_MS`]) after its own stamp.
+fn awaiting_prior_boot_restore(
+    r: &TerminalSessionRecord,
+    prior_held: &HashSet<&str>,
+    boot_ms: i64,
+    now_ms: i64,
+) -> bool {
+    r.state == "open"
+        && r.finished_at.is_none()
+        && r.last_seen_at < boot_ms
+        && now_ms - r.last_seen_at <= OPEN_STALE_MS
+        && prior_held.contains(r.claude_session_id.as_str())
+}
+
 /// Will the frontend's boot restore leave `r` `needs-account` because no
 /// account can be named from evidence? Mirrors `classifyRestoreAction`'s gates
 /// (`useTerminalInitialization.ts`) and the evidence half of
@@ -4481,6 +4513,8 @@ fn boot_restore_needs_account(r: &TerminalSessionRecord, probe: &dyn TranscriptP
 /// the hold expires — at most the open-row prune age ([`OPEN_STALE_MS`]) after
 /// its stamp. The exemption from the recency arms lasts only that long: an
 /// expired stamp falls through to the recency arm like any other open row.
+/// The prior poll's unjudged holds ([`awaiting_prior_boot_restore`]) are
+/// admitted the same way, by the caller, before this predicate runs.
 fn restore_admissible(r: &TerminalSessionRecord, anchors: &RestoreAnchors, now_ms: i64) -> bool {
     if awaiting_account_hold(r, now_ms) {
         return true;
@@ -4783,9 +4817,11 @@ fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>)
 /// life of THIS process: a row in the boot-latched restorable set is held in
 /// every phase (plan
 /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
-/// Phase 4). It does not survive a second restart: a held row is never touched,
-/// so the next boot measures it against this process's observation epoch and
-/// drops it — a recorded follow-up of that plan.
+/// Phase 4). A held row is never touched, so across a further restart it is
+/// carried by the observation epoch instead: each successful tick records the
+/// ids it held unjudged, and the next boot admits those rows by that hold
+/// ([`awaiting_prior_boot_restore`]) rather than measuring them against an
+/// epoch that never looked at them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRestorePhase {
     /// The restore path has not been asked yet (the frontend has not mounted)
@@ -4923,8 +4959,8 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   hold never overrides; its first touch moves it past the boot line. A
 ///   close or a finish by the operator ends the hold, and so does the
 ///   `OPEN_STALE_MS` prune. A row outside the latched set is a genuine orphan
-///   and closes as before. The hold lasts for THIS process only (see
-///   [`BootRestorePhase`]).
+///   and closes as before. The poll records the rows this arm held so the
+///   hold survives a further restart (see [`BootRestorePhase`]).
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
@@ -10506,7 +10542,7 @@ mod tests {
     ) -> Arc<ObservationEpoch> {
         let path = dir.join(crate::session::observation_epoch::EPOCH_FILE_NAME);
         if let Some(at) = prior_observed_at {
-            assert!(ObservationEpoch::open(&path, at - 3_600_000).record_tick(true, at));
+            assert!(ObservationEpoch::open(&path, at - 3_600_000).record_tick(true, at, &[]));
         }
         let epoch = Arc::new(ObservationEpoch::open(&path, i64::MAX - 1));
         store.attach_observation_epoch(epoch.clone());
@@ -10715,9 +10751,9 @@ mod tests {
             .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
         // First boot: a failed tick, then a successful one at T, then failures.
         let first = ObservationEpoch::open(&epoch_path, t - 3_600_000);
-        assert!(!first.record_tick(false, t - 45_000));
-        assert!(first.record_tick(true, t));
-        assert!(!first.record_tick(false, t + 45_000));
+        assert!(!first.record_tick(false, t - 45_000, &[]));
+        assert!(first.record_tick(true, t, &[]));
+        assert!(!first.record_tick(false, t + 45_000, &[]));
         drop(first);
 
         write_fixture(&path, starved_cohort_fixture(t));
@@ -12144,6 +12180,50 @@ mod tests {
         );
         assert_eq!(store.get("victim-a").unwrap().state, "open");
         assert_eq!(store.get("victim-b").unwrap().state, "closed");
+    }
+
+    /// Same plan, Phase 4: the hold survives a SECOND restart before the page
+    /// opens. Process A held `held` unjudged on its last successful tick and
+    /// served another session that died at A's end, so A's epoch and every
+    /// anchor sit hours past `held`'s stamp. Boot B admits `held` by the
+    /// carried hold, while an open row A did not hold, with the same old
+    /// stamp, stays excluded. (Stamps are relative to now: the hold expires at
+    /// the open-row prune age, measured against wall-clock now.)
+    #[test]
+    fn a_held_row_survives_a_second_restart_before_its_page_opens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let hour = 3_600_000_i64;
+        let now = Utc::now().timestamp_millis();
+        let (stamp, boot_a, a_end, boot_b) =
+            (now - 10 * hour, now - 9 * hour, now - 2 * hour, now - hour);
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("held", "open", stamp, None, None),
+                fixture_rec("not-held", "open", stamp, None, None),
+                fixture_rec("served", "closed", a_end, Some(a_end), Some("poll-dead")),
+            ],
+        );
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        assert!(ObservationEpoch::open(&epoch_path, boot_a).record_tick(
+            true,
+            a_end,
+            &["held".to_string()]
+        ));
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot_b);
+        store.attach_prior_teardown_complete(false);
+        store.attach_observation_epoch(Arc::new(ObservationEpoch::open(&epoch_path, boot_b)));
+
+        assert_eq!(
+            restorable_ids(&store, None, false),
+            vec!["held".to_string(), "served".to_string()],
+            "the carried hold admits `held`; the unheld row of the same age stays out"
+        );
     }
 
     #[test]
