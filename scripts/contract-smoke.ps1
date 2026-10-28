@@ -1064,7 +1064,11 @@ try {
             # returns a structured JSON error envelope (success:false / any
             # non-empty JSON error) is route-matched-but-resource-not-found --
             # the route IS registered, so PASS. A genuinely unregistered route
-            # falls through to axum's empty-body default 404 -> keep FAIL.
+            # is answered by the runner's router fallback (not_found_handler),
+            # which ALSO returns a structured envelope, so the body's presence
+            # proves nothing: its code == NOT_FOUND with an error starting
+            # "No route for" marks it unregistered -> keep FAIL. (An empty
+            # body is unregistered too.) See CONTRACT.md "404 discriminator".
             $hasParam = $r.Path -match ":[A-Za-z]+"
             $isStructuredErr = $false
             $rawBody = $res[1]
@@ -1072,9 +1076,12 @@ try {
                 try {
                     $parsed = $rawBody | ConvertFrom-Json
                     if ($null -ne $parsed) {
-                        $hasSuccessFalse = ($parsed.PSObject.Properties.Name -contains 'success') -and (-not $parsed.success)
-                        $hasErrorField = ($parsed.PSObject.Properties.Name -contains 'error') -and ($null -ne $parsed.error)
-                        if ($hasSuccessFalse -or $hasErrorField) { $isStructuredErr = $true }
+                        $names = $parsed.PSObject.Properties.Name
+                        $hasSuccessFalse = ($names -contains 'success') -and (-not $parsed.success)
+                        $hasErrorField = ($names -contains 'error') -and ($null -ne $parsed.error)
+                        $isRouteFallback = ($names -contains 'code') -and ($parsed.code -eq 'NOT_FOUND') -and
+                            $hasErrorField -and ([string]$parsed.error).StartsWith('No route for')
+                        if (($hasSuccessFalse -or $hasErrorField) -and -not $isRouteFallback) { $isStructuredErr = $true }
                     }
                 } catch {
                     $isStructuredErr = $false

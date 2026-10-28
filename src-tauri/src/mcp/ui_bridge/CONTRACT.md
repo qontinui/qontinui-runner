@@ -523,16 +523,30 @@ API router is built: the panic is logged and the HTTP API never comes up, but
 the runner process itself keeps running. `tmp_vision_cache/` is only ever written by runner builds that
 predate this.
 
-### 404 discriminator: empty body vs structured envelope
-A 404 from a route with a `:param`/`{name}` segment is ambiguous on its own, so
-the runner makes it discriminable by body: a **route-matched, resource-not-found**
-404 carries a **structured JSON error envelope** (`{success:false, error, …}` —
-e.g. `ELEMENT_NOT_FOUND`, "Component not found"), whereas a **genuinely
-unregistered** route falls through to **axum's default 404 with an empty body**.
+### 404 discriminator: route fallback vs resource not found
+Both kinds of 404 carry a structured JSON envelope, so the body's presence
+discriminates nothing; its `code` and `error` do.
+
+- A **genuinely unregistered** route is answered by the router fallback
+  (`mcp_api::not_found_handler`) with
+  `{success:false, code:"NOT_FOUND", error:"No route for <METHOD> <path>…"}`.
+  For a `/ui-bridge/*` path the message appends a discovery hint
+  (`GET /ui-bridge/_routes`, `GET /ui-bridge/commands`). For a route the UI
+  Bridge deliberately deleted (`mcp/ui_bridge/removed_routes.rs`,
+  `REMOVED_UI_BRIDGE_ROUTES` — the old screenshot / element-image /
+  stuck-screen / `/ai/media/*` family), the message first says the route was
+  removed and names the replacement, `POST /ui-bridge/vision/capture` (bytes at
+  `GET /ui-bridge/vision/cache/{sha256}`). Status stays 404 and code stays
+  `NOT_FOUND` either way.
+- A **route-matched, resource-not-found** 404 from a `:param`/`{name}` route
+  comes from the handler itself and never begins its `error` with
+  `No route for` (e.g. `ELEMENT_NOT_FOUND`, "Component not found").
+
 Consumers (and `scripts/contract-smoke.ps1`'s walk classifier) treat
-"`:param` route + structured envelope = route reachable" and "empty body =
-unregistered". New not-found handlers should always return a structured envelope
-so this stays a reliable signal.
+"`code == NOT_FOUND` and `error` starts with `No route for`" as unregistered,
+and any other structured envelope on a `:param` route as route reachable. New
+not-found handlers must return a structured envelope and must not phrase their
+`error` as `No route for …`, so this stays a reliable signal.
 
 ## Element-id discovery
 
