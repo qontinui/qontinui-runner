@@ -1006,6 +1006,8 @@ pub(crate) async fn open_remote_tab(
             spawn_app,
             io,
             pinned,
+            // An operator attaching to (or creating) a remote session.
+            crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
     .await
