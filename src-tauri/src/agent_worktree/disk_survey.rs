@@ -2107,6 +2107,7 @@ mod tests {
                 drive_letter: Some("D".to_string()),
                 total_bytes: 4_000,
                 free_bytes: 93,
+                removable: false,
             }],
             taken_at: chrono::Utc::now(),
         };
