@@ -10261,6 +10261,78 @@ mod tests {
         );
     }
 
+    /// The incident's measured shape (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`):
+    /// the liveness poll's process snapshots failed for the last stretch of
+    /// the prior process's life, so no row was TOUCHED after T, while sessions
+    /// kept being spawned up to T+39m. The clean marker was stamped at T+77m.
+    /// Boot at T+3h.
+    const STARVED_COHORT: [&str; 5] = [
+        "starved-0000",
+        "starved-0010",
+        "starved-0020",
+        "starved-0030",
+        "starved-0039",
+    ];
+
+    /// Five open rows spread from `t` to `t + 39m` (ids name their minute
+    /// offset) plus one ghost last seen 72h before `t`.
+    fn starved_cohort_fixture(t: i64) -> Vec<TerminalSessionRecord> {
+        let minute = 60_000_i64;
+        let mut recs: Vec<TerminalSessionRecord> = [0_i64, 10, 20, 30, 39]
+            .iter()
+            .zip(STARVED_COHORT)
+            .map(|(m, id)| fixture_rec(id, "open", t + m * minute, None, None))
+            .collect();
+        recs.push(fixture_rec("ghost-72h", "open", t - 72 * 3_600_000, None, None));
+        recs
+    }
+
+    #[test]
+    fn restorable_records_snapshot_starved_cohort_survives_early_clean_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let marker_at = t + 77 * 60_000;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+
+        assert_eq!(
+            restorable_ids(&store, Some(marker_at), true),
+            STARVED_COHORT.map(str::to_string).to_vec(),
+            "every session on screen when the snapshots starved is restored; the 72h ghost is not"
+        );
+    }
+
+    /// The in-process arm of the same strand: THIS process booted before the
+    /// cohort was spawned, its snapshots then failed, so nothing it wrote was
+    /// ever touched. The ledger roster (what the poll captures every tick) must
+    /// still hold every row, not only those within 10 minutes of the newest
+    /// spawn.
+    #[test]
+    fn live_roster_keeps_a_starved_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let boot = t - 60_000;
+        let recs: Vec<TerminalSessionRecord> = starved_cohort_fixture(t)
+            .into_iter()
+            .filter(|r| r.claude_session_id != "ghost-72h")
+            .collect();
+        write_fixture(&path, recs);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+
+        let mut roster: Vec<String> = store
+            .roster_records(Some(boot - 60_000), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        roster.sort();
+        assert_eq!(roster, STARVED_COHORT.map(str::to_string).to_vec());
+    }
+
     /// A genuinely-newer band advances the anchor and a crash band more than
     /// `grace` OLDER is EXCLUDED from the (full-restore) set — it is stale
     /// relative to the last moment of life, exactly as an old lone ghost is.
