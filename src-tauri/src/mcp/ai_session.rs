@@ -1835,34 +1835,36 @@ pub async fn stop_ai_analysis(
         pids_copy
     };
 
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut killed_count = 0;
     for pid in &pids_to_kill {
         info!("MCP API: Killing AI process PID {}", pid);
-        // Use taskkill with /T to kill the entire process tree (cmd.exe spawns node.exe for claude)
-        // /F forces termination, /T terminates child processes
-        let result = crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("MCP API: Successfully killed process tree for PID {}", pid);
-                    killed_count += 1;
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!(
-                        "MCP API: taskkill for PID {} returned error: {}",
-                        pid, stderr
-                    );
-                    // Process may have already exited, which is fine
-                    killed_count += 1;
-                }
+        // The entire process tree (cmd.exe spawns node.exe for claude), ended
+        // in-process: no `taskkill` is spawned to do it.
+        #[cfg(windows)]
+        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(report) => {
+                info!(
+                    "MCP API: Successfully killed process tree for PID {} ({:?})",
+                    pid, report.killed
+                );
+                killed_count += 1;
             }
             Err(e) => {
-                error!("MCP API: Failed to execute taskkill for PID {}: {}", pid, e);
+                // Most often the process had already exited, which is fine.
+                warn!("MCP API: tree kill for PID {} returned error: {}", pid, e);
+                killed_count += 1;
             }
         }
+        // Unchanged off Windows: this path never killed anything there (it
+        // spawned `taskkill`, which does not exist). A separate defect.
+        #[cfg(not(windows))]
+        error!(
+            "MCP API: no process-tree kill on this platform; AI process PID {} was not signalled",
+            pid
+        );
     }
 
     if !pids_to_kill.is_empty() {
@@ -2831,7 +2833,7 @@ A workflow configuration has been auto-loaded:
 **Runner MCP API (port 9876):**
 - GET /status - Check runner and config status
 - POST /run-workflow - Run a workflow by name
-  Example: `Invoke-RestMethod -Uri "http://localhost:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
+  Example: `Invoke-RestMethod -Uri "http://127.0.0.1:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
 - GET /monitors - List available monitors
 
 If your task requires running visual automation, use the Runner API to execute workflows.
@@ -4164,13 +4166,12 @@ pub mod emergency_quit {
                 );
                 break;
             }
-            // `/T` is CORRECT here and must stay: it kills a CHILD AGENT'S OWN
-            // process tree (the `claude` CLI and whatever it spawned), which is
-            // the semantics of quitting the app. Categorically different from
-            // `/T` on the RUNNER's own PID, which would take every live Claude
-            // Code session on the box down with it and is forbidden.
-            let mut cmd = crate::process_helpers::no_window("taskkill");
-            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+            // The whole tree is CORRECT here and must stay: it kills a CHILD
+            // AGENT'S OWN process tree (the `claude` CLI and whatever it
+            // spawned), which is the semantics of quitting the app.
+            // Categorically different from a tree kill of the RUNNER's own
+            // PID, which would take every live Claude Code session on the box
+            // down with it and is forbidden. In-process: no `taskkill` spawn.
             let per_kill = std::cmp::max(
                 std::cmp::min(
                     shutdown_budget::TASKKILL_TIMEOUT,
@@ -4180,19 +4181,22 @@ pub mod emergency_quit {
                 // the runner.
                 shutdown_budget::TASKKILL_FLOOR,
             );
-            match crate::drain::output_with_timeout(cmd, per_kill) {
-                Ok(Some(output)) => {
-                    if output.status.success() {
-                        info!("Shutdown: killed AI process tree for PID {pid}");
-                    } else {
-                        info!("Shutdown: AI process PID {pid} already exited");
-                    }
-                }
-                Ok(None) => warn!(
-                    "Shutdown: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \
-                     abandoned"
+            #[cfg(windows)]
+            match crate::tree_kill::kill_tree_by_pid(*pid, per_kill) {
+                Ok(report) if report.budget_spent => warn!(
+                    "Shutdown: tree kill for PID {pid} exceeded its {per_kill:?} budget — \
+                     killed {:?}",
+                    report.killed
                 ),
-                Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),
+                Ok(_) => info!("Shutdown: killed AI process tree for PID {pid}"),
+                // Most often the process had already exited.
+                Err(e) => info!("Shutdown: AI process PID {pid} not killed: {e}"),
+            }
+            // Unchanged off Windows (never killed anything there).
+            #[cfg(not(windows))]
+            {
+                let _ = per_kill;
+                error!("Shutdown: no process-tree kill on this platform; PID {pid} not signalled");
             }
         }
     }

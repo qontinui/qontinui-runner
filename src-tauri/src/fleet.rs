@@ -6559,7 +6559,10 @@ async fn runner_has_active_tasks() -> bool {
     let port = crate::mcp::types::get_mcp_api_port();
     let probe = async move {
         let resp = reqwest::Client::new()
-            .get(format!("http://localhost:{port}/task-runs/running"))
+            .get(format!(
+                "{}/task-runs/running",
+                crate::mcp::types::runner_loopback_base(port)
+            ))
             .send()
             .await
             .ok()?;

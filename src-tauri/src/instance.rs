@@ -107,7 +107,7 @@ fn runner_kind_from(
 ///
 /// Returns `None` — the unscoped, primary-owned path — ONLY for a runner that
 /// presents no secondary signal at all.
-fn resolve_data_subdir(
+pub(crate) fn resolve_data_subdir(
     name: Option<&str>,
     instance_root: Option<&Path>,
     primary_port: Option<u16>,
@@ -202,7 +202,7 @@ pub fn scope_path(base: &Path) -> PathBuf {
 
 /// Env-free core of [`scope_path`]; `subdir` is consulted only when the base
 /// is not already inside `instance_root`.
-fn scope_path_for(
+pub(crate) fn scope_path_for(
     base: &Path,
     instance_root: Option<&Path>,
     subdir: impl FnOnce() -> Option<String>,
@@ -248,27 +248,17 @@ pub fn api_ports_to_try(port: u16) -> Vec<u16> {
 }
 
 /// Test support: turn an [`crate::test_env::IsolatedAmbient`] into a NAMELESS
-/// subject launch — a root at `<fixture>/subject`, the fixture's own
-/// out-of-root dir keys and any instance name cleared, then the real lib
-/// startup contract (`apply_instance_root_env`, CLI form) applied, exactly as a
-/// binary's `main` would. Returns the root and a restore guard for the one
-/// default the fixture does not capture (`WEBVIEW2_USER_DATA_FOLDER`).
+/// subject launch — a root at `<fixture>/subject` and the fixture's own
+/// out-of-root dir keys cleared (the fixture has already removed the instance
+/// identity and every other root-confined key, and restores them all), then
+/// the real lib startup contract (`apply_instance_root_env`, CLI form) applied,
+/// exactly as a binary's `main` would. Returns the root.
 #[cfg(test)]
-pub(crate) fn enter_rooted_subject_for_test(
-    amb: &crate::test_env::IsolatedAmbient,
-) -> (PathBuf, crate::test_env::EnvVarRestore) {
-    let restore = crate::test_env::EnvVarRestore::capture(&[
-        "WEBVIEW2_USER_DATA_FOLDER",
-        // A D5 default with no runner reader, so not an ambient key.
-        "QONTINUI_TOUCH_LEDGER_DIR",
-    ]);
-    std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
-    std::env::remove_var("QONTINUI_TOUCH_LEDGER_DIR");
+pub(crate) fn enter_rooted_subject_for_test(amb: &crate::test_env::IsolatedAmbient) -> PathBuf {
     for key in [
         "QONTINUI_HOME",
         "QONTINUI_CONFIG_DIR",
         "QONTINUI_SECURE_STORAGE_DIR",
-        "QONTINUI_INSTANCE_NAME",
     ] {
         std::env::remove_var(key);
     }
@@ -277,7 +267,7 @@ pub(crate) fn enter_rooted_subject_for_test(
     let applied = qontinui_runner_lib::instance_env::apply_instance_root_env(false)
         .expect("the fixture's subject launch must satisfy the contract");
     assert_eq!(applied.as_deref(), Some(root.as_path()));
-    (root, restore)
+    root
 }
 
 /// Env-free core of [`api_ports_to_try`].
@@ -803,8 +793,6 @@ mod tests {
     fn a_root_in_the_env_makes_the_live_predicates_read_secondary() {
         let amb = crate::test_env::isolated_ambient();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
-        std::env::remove_var("QONTINUI_PRIMARY_PORT");
         std::env::remove_var("QONTINUI_PORT");
         assert!(owns_shared_root_state(), "fixture baseline: the primary");
         assert!(!is_secondary());
