@@ -315,7 +315,11 @@ impl PaceCursor {
     }
 
     /// Decide against the cursor and, on a release, claim the slot at `now`.
-    fn step(&self, now: Instant, decide_with: impl FnOnce(Option<Instant>) -> GateStep) -> GateStep {
+    fn step(
+        &self,
+        now: Instant,
+        decide_with: impl FnOnce(Option<Instant>) -> GateStep,
+    ) -> GateStep {
         let mut last = match self.0.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -474,8 +478,8 @@ pub(crate) async fn admit_with(
         let step = cursor.step(now, |last| decide(now, last, &pressure, held_since, cfg));
         match step {
             GateStep::Release(why) => {
-                let held_ms = u64::try_from(now.duration_since(started).as_millis())
-                    .unwrap_or(u64::MAX);
+                let held_ms =
+                    u64::try_from(now.duration_since(started).as_millis()).unwrap_or(u64::MAX);
                 count_release(why, guard.is_some());
                 if guard.is_some() {
                     info!(
@@ -852,11 +856,26 @@ mod tests {
         }
         let cursor = PaceCursor::new();
         let t0 = Instant::now();
-        let got = admit_with(SpawnOrigin::Unknown, "terminal", "k", &c, &cursor, warn_reading).await;
+        let got = admit_with(
+            SpawnOrigin::Unknown,
+            "terminal",
+            "k",
+            &c,
+            &cursor,
+            warn_reading,
+        )
+        .await;
         assert_eq!(got.why, Some(ReleaseWhy::HoldDeadline));
         assert_eq!(ms(Instant::now() - t0), 600_000);
-        assert!(check_request_with(SpawnOrigin::Unknown, "terminal", "k", &c, &cursor, warn_reading)
-            .is_err());
+        assert!(check_request_with(
+            SpawnOrigin::Unknown,
+            "terminal",
+            "k",
+            &c,
+            &cursor,
+            warn_reading
+        )
+        .is_err());
         // Every autonomous origin is gated; exactly the two operator ones are not.
         let ungated: Vec<_> = SpawnOrigin::ALL
             .into_iter()
@@ -939,7 +958,9 @@ mod tests {
         // A clear reading admits and claims the slot; one second later the
         // next request is refused for pace with the 2 s that remain.
         assert_eq!(
-            check_request_with(SpawnOrigin::Unknown, "t", "k", &c, &cursor, || Pressure::Clear),
+            check_request_with(SpawnOrigin::Unknown, "t", "k", &c, &cursor, || {
+                Pressure::Clear
+            }),
             Ok(())
         );
         tokio::time::advance(Duration::from_millis(1_000)).await;

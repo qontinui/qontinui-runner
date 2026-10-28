@@ -635,9 +635,7 @@ fn parse_sites(text: &str) -> Rows {
         let spawn = cells.get(4).map(|k| k.to_string());
         if cells[2] == "autonomous" {
             assert!(
-                spawn
-                    .as_deref()
-                    .is_some_and(|k| SPAWN_KINDS.contains(&k)),
+                spawn.as_deref().is_some_and(|k| SPAWN_KINDS.contains(&k)),
                 "runner_spawn_sites.txt:{}: an autonomous row needs a fifth column, one of \
                  {SPAWN_KINDS:?}, got {spawn:?}",
                 n + 1
@@ -1114,7 +1112,10 @@ fn a_discarded_unattended_verdict_or_a_missing_spawn_column_fails() {
     );
 
     let parsed = parse_sites("a.rs | f | autonomous | f | pty\nb.rs | g | operator | -\n");
-    assert_eq!(parsed[&("a.rs".into(), "f".into())].spawn.as_deref(), Some("pty"));
+    assert_eq!(
+        parsed[&("a.rs".into(), "f".into())].spawn.as_deref(),
+        Some("pty")
+    );
     assert_eq!(parsed[&("b.rs".into(), "g".into())].spawn, None);
     for bad in [
         "a.rs | f | autonomous | f\n",
