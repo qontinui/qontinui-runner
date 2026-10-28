@@ -421,7 +421,7 @@ mod tests {
     /// widened `hold` (pre-PR review of plan
     /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`).
     #[test]
-    fn the_poll_matches_on_id_match_only() {
+    fn the_poll_wires_the_boot_restore_hold() {
         let main_rs = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
@@ -445,6 +445,28 @@ mod tests {
                 .ends_with("boot_hold.id_match_only"),
             "match_live_terminal's last argument must be boot_hold.id_match_only: {args}"
         );
+
+        // ...and the carried set is fed only from inside the held-and-skipped
+        // branch, through `carries_boot_restore_hold`.
+        let pushes: Vec<usize> = main_rs
+            .match_indices("held_unjudged.push(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pushes.len(), 1, "exactly one push into held_unjudged");
+        let branch = main_rs[..pushes[0]]
+            .rfind("if held && action == PollAction::Skip {")
+            .expect("the held-and-skipped branch");
+        let branch_end = closing_brace(
+            &main_rs,
+            branch + "if held && action == PollAction::Skip ".len(),
+        );
+        assert!(pushes[0] < branch_end, "the push sits inside that branch");
+        let guard = main_rs[branch..pushes[0]]
+            .rfind("if carries_boot_restore_hold(")
+            .map(|i| branch + i)
+            .expect("the push is guarded by carries_boot_restore_hold");
+        let guard_end = closing_brace(&main_rs, guard + main_rs[guard..].find('{').unwrap());
+        assert!(pushes[0] < guard_end, "the push sits inside that guard");
     }
 
     /// Byte offset of the `)` matching the `(` at `open` (no string or comment

@@ -5007,6 +5007,26 @@ pub struct BootRestoreHold {
     pub hold: bool,
 }
 
+/// Should the poll carry `rec`, which it holds this tick, into the observation
+/// epoch's `held_unjudged` set, so that the next boot admits it by that hold
+/// ([`awaiting_prior_boot_restore`])? Only a boot-census row
+/// (`awaiting_boot_restore`) whose restore has NOT been attempted in this
+/// process. A `restore_pending_at` at or after this boot means the restore
+/// already ran for it here. Such a row is waiting on the restore-pending retry,
+/// not on its page, and carrying it would re-offer a resume that failed on
+/// every restart (for example, after the operator closed the failed tab).
+pub fn carries_boot_restore_hold(
+    rec: &TerminalSessionRecord,
+    boot_at_ms: Option<i64>,
+    awaiting_boot_restore: bool,
+) -> bool {
+    awaiting_boot_restore
+        && !rec
+            .restore_pending_at
+            .zip(boot_at_ms)
+            .is_some_and(|(pending_at, boot_at)| pending_at >= boot_at)
+}
+
 /// See [`BootRestoreHold`].
 pub fn boot_restore_hold(
     last_seen_at: i64,
@@ -12223,6 +12243,85 @@ mod tests {
             restorable_ids(&store, None, false),
             vec!["held".to_string(), "served".to_string()],
             "the carried hold admits `held`; the unheld row of the same age stays out"
+        );
+    }
+
+    /// Same plan, Phase 4: each release condition of the carried hold, alone.
+    #[test]
+    fn awaiting_prior_boot_restore_truth_table() {
+        let hour = 3_600_000_i64;
+        let (boot, now) = (100 * hour, 101 * hour);
+        let held: HashSet<&str> = HashSet::from(["r"]);
+        let row =
+            |state: &str, last_seen_at: i64| fixture_rec("r", state, last_seen_at, None, None);
+
+        assert!(awaiting_prior_boot_restore(
+            &row("open", boot - hour),
+            &held,
+            boot,
+            now
+        ));
+        // Not in the carried set.
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", boot - hour),
+            &HashSet::new(),
+            boot,
+            now
+        ));
+        // Re-stamped at or after this boot (a restore re-asserted it): judged
+        // by recency again.
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", boot),
+            &held,
+            boot,
+            now
+        ));
+        // Past the open-row prune age.
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", now - OPEN_STALE_MS - 1),
+            &held,
+            boot,
+            now
+        ));
+        // Closed or finished rows are never held.
+        assert!(!awaiting_prior_boot_restore(
+            &row("closed", boot - hour),
+            &held,
+            boot,
+            now
+        ));
+        let mut finished = row("open", boot - hour);
+        finished.finished_at = Some(boot - hour);
+        assert!(!awaiting_prior_boot_restore(&finished, &held, boot, now));
+    }
+
+    /// Same plan, Phase 4 (pre-PR review round 3): the poll carries a held
+    /// census row only while its restore has not been attempted in this
+    /// process. One whose restore already ran here (a `restore_pending_at` at
+    /// or after the boot, e.g. a failed resume whose tab the operator closed)
+    /// is not re-offered on every restart.
+    #[test]
+    fn carries_boot_restore_hold_only_before_this_boots_restore_attempt() {
+        let boot = Some(1_000);
+        let mut r = fixture_rec("r", "open", 999, None, None);
+        assert!(carries_boot_restore_hold(&r, boot, true));
+        assert!(
+            !carries_boot_restore_hold(&r, boot, false),
+            "not a census row"
+        );
+        r.restore_pending_at = Some(500);
+        assert!(
+            carries_boot_restore_hold(&r, boot, true),
+            "a pending marker left by an earlier process still awaits THIS boot's restore"
+        );
+        r.restore_pending_at = Some(1_000);
+        assert!(
+            !carries_boot_restore_hold(&r, boot, true),
+            "restore attempted this boot"
+        );
+        assert!(
+            carries_boot_restore_hold(&r, None, true),
+            "no boot instant: no attempt is provably this boot's"
         );
     }
 

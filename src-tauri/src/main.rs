@@ -4610,7 +4610,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::time::Duration;
 
                     use session::session_lifecycle_store::{
-                        boot_restore_hold, boot_restore_phase, classify,
+                        boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
                         close_reason_for_dead_shell, hold_for_withheld_boot_restore,
                         match_live_terminal, PollAction, WorkerPlane,
                     };
@@ -5069,7 +5069,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
-                                if awaiting_boot_restore {
+                                if carries_boot_restore_hold(
+                                    rec,
+                                    tick_boot_at_ms,
+                                    awaiting_boot_restore,
+                                ) {
                                     held_unjudged.push(rec.claude_session_id.clone());
                                 }
                                 // A held record is waiting, not missing: any
