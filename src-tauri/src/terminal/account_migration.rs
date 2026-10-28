@@ -2748,6 +2748,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("observed".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(5),
             handle: None,
             account_label: None,

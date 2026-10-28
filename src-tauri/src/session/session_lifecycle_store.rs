@@ -885,6 +885,7 @@ impl TerminalSessionRecord {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(origin.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at,
             handle: None,
             account_label: None,

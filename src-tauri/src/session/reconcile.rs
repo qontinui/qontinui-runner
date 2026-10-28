@@ -722,13 +722,32 @@ impl TranscriptIndex for DiskTranscriptIndex {
     }
 
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
+        !self
+            .transcript_config_dirs(session_id, working_dir)
+            .is_empty()
+    }
+}
+
+impl DiskTranscriptIndex {
+    /// Every config dir whose transcript for `session_id` exists. Empty for a
+    /// missing `working_dir` — the same bare answer `transcript_exists` gives,
+    /// which the store's guarded entry points map to UNKNOWN.
+    pub fn transcript_config_dirs(
+        &self,
+        session_id: &str,
+        working_dir: Option<&str>,
+    ) -> Vec<PathBuf> {
         let Some(working_dir) = working_dir else {
-            return false;
+            return Vec::new();
         };
-        self.config_dirs.iter().any(|dir| {
-            crate::terminal::transcript::session_transcript_path(dir, working_dir, session_id)
-                .exists()
-        })
+        self.config_dirs
+            .iter()
+            .filter(|dir| {
+                crate::terminal::transcript::session_transcript_path(dir, working_dir, session_id)
+                    .exists()
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -925,6 +944,18 @@ impl TranscriptIndex for PrescannedTranscriptIndex {
 impl crate::session::snapshot_history::TranscriptProbe for DiskTranscriptIndex {
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
         TranscriptIndex::transcript_exists(self, session_id, working_dir)
+    }
+
+    fn transcript_config_dirs(
+        &self,
+        session_id: &str,
+        working_dir: Option<&str>,
+    ) -> Option<Vec<PathBuf>> {
+        Some(DiskTranscriptIndex::transcript_config_dirs(
+            self,
+            session_id,
+            working_dir,
+        ))
     }
 }
 
@@ -1446,8 +1477,10 @@ pub async fn run_at_boot(
     // pass is spawned with a delay and can run AFTER the frontend's on-mount
     // restore read, so the read itself is made collision-immune independently by
     // the one-live-session-per-terminal dedupe inside
-    // `SessionLifecycleStore::restorable_records` (both use `open_authority_key`,
-    // so they agree on which row to keep). Idempotent — a healthy registry closes
+    // `SessionLifecycleStore::restorable_records` (both rank the same contenders
+    // — open rows bound to a terminal — by `open_authority_key`, so they agree on
+    // which row to keep; a row held for an account choice is unbound, so it is a
+    // contender in neither). Idempotent — a healthy registry closes
     // nothing. Runs before the nothing-to-do fast path so a registry that holds
     // ONLY stale collided rows (no live PTYs) is still repaired.
     let repaired = store.repair_terminal_id_collisions();
@@ -1817,6 +1850,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(1),
             handle: None,
             account_label: None,
@@ -2274,6 +2308,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -2442,6 +2477,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -2530,6 +2566,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
