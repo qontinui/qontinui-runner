@@ -4844,6 +4844,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .allows();
                         let mut held_for_restore: usize = 0;
+                        // The boot-census rows this tick held without judging
+                        // them; carried to the next boot with the epoch.
+                        let mut held_unjudged: Vec<String> = Vec::new();
 
                         // Review F1 (plan 2026-09-12 Phase 5): a pane a
                         // restarted runner ADOPTED from its PTY holder runs a
@@ -4897,12 +4900,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // `match_live_terminal`); a waiting one keeps the
                             // triple fallback and is only kept from the orphan
                             // close (see `BootRestoreHold`).
+                            let awaiting_boot_restore =
+                                tick_boot_census.is_some_and(|c| c.awaits_restore(rec));
                             let boot_hold = boot_restore_hold(
                                 rec.last_seen_at,
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
-                                tick_boot_census.is_some_and(|c| c.awaits_restore(rec)),
+                                awaiting_boot_restore,
                             );
                             let held = boot_hold.hold;
 
@@ -5063,6 +5068,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
+                                if awaiting_boot_restore {
+                                    held_unjudged.push(rec.claude_session_id.clone());
+                                }
                                 // A held record is waiting, not missing: any
                                 // no-match streak it built before the hold is
                                 // void, so the orphan debounce restarts from
@@ -5172,9 +5180,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // The classify loop has run to completion, so every
                         // live row this snapshot saw has been touched: only
                         // NOW may the observation epoch advance (never on a
-                        // failed snapshot — it observed nothing).
+                        // failed snapshot — it observed nothing). The rows the
+                        // boot-census hold kept unjudged ride along, so the
+                        // next boot does not read this epoch as evidence
+                        // against them.
                         if let Some(epoch) = poll_lifecycle_store.observation_epoch() {
-                            epoch.record_tick(tick_snapshot_ok, snap_captured_at_ms);
+                            epoch.record_tick(tick_snapshot_ok, snap_captured_at_ms, &held_unjudged);
                         }
 
                         if held_for_restore > 0 {

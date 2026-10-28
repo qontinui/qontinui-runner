@@ -39,9 +39,22 @@
 //!   tick, in memory. It anchors rows this process wrote: if this process never
 //!   observed successfully, nothing it wrote is stale.
 //!
+//! ## Rows a tick held without judging them
+//!
+//! A successful tick is evidence about the rows it could judge, not about the
+//! rows it deliberately did not. The boot-census hold
+//! (`session_lifecycle_store::boot_restore_hold`) keeps a latched restorable
+//! row open while its page has not been restored, and such a row has no
+//! terminal to observe by construction. So each write also records those ids
+//! ([`EpochRecord::held_unjudged`]); the next boot reads them as
+//! [`ObservationEpoch::prior_held_unjudged`] and admits those rows by that
+//! hold, exactly as an account-held row is admitted, instead of measuring them
+//! against an epoch that never looked at them. Without it the hold would last
+//! one process: the next restart before the page is opened would drop them.
+//!
 //! ## Storage
 //!
-//! `observation-epoch.json` (`{observedOkAt, bootMs}`) beside the shutdown
+//! `observation-epoch.json` (`{observedOkAt, bootMs, heldUnjudged?}`) beside the shutdown
 //! marker, INSTANCE-scoped through [`crate::instance::scope_path`] exactly as
 //! [`crate::session::shutdown_marker::marker_path`] is, so a temp runner never
 //! reads the primary's epoch. Atomic temp-file + rename. Absent or corrupt
@@ -61,7 +74,7 @@ pub const EPOCH_FILE_NAME: &str = "observation-epoch.json";
 pub const NO_EPOCH_NOTICE: &str = "restore admission: no observation epoch — anchoring open rows to the prior process's stamps (plus the clean marker when its teardown finished)";
 
 /// The persisted epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EpochRecord {
     /// Unix millis — the capture instant of the last fully-classified poll
@@ -69,6 +82,12 @@ pub struct EpochRecord {
     pub observed_ok_at: i64,
     /// Unix millis at which the process that wrote it booted (provenance).
     pub boot_ms: i64,
+    /// The `claude_session_id`s that tick held open WITHOUT judging them: rows
+    /// of the boot-latched restorable set still waiting for their page's
+    /// restore (see the module doc). `observed_ok_at` says nothing about them.
+    /// Absent in an epoch written before the field existed, which reads empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_unjudged: Vec<String>,
 }
 
 /// The two values restore admission reads (see
@@ -110,12 +129,13 @@ impl ObservationEpoch {
             prior: read_epoch(path),
             current: Mutex::new(None),
         };
-        match epoch.prior {
+        match &epoch.prior {
             None => info!(path = %path.display(), "{NO_EPOCH_NOTICE}"),
             Some(prior) => info!(
                 path = %path.display(),
                 observed_ok_at = prior.observed_ok_at,
                 writer_boot_ms = prior.boot_ms,
+                held_unjudged = prior.held_unjudged.len(),
                 "restore admission: latched the prior observation epoch"
             ),
         }
@@ -129,7 +149,16 @@ impl ObservationEpoch {
 
     /// The PRIOR process's last observation instant (never this process's).
     pub fn prior_observed(&self) -> Option<i64> {
-        self.prior.map(|p| p.observed_ok_at)
+        self.prior.as_ref().map(|p| p.observed_ok_at)
+    }
+
+    /// The rows the PRIOR process's last successful tick held without judging
+    /// them ([`EpochRecord::held_unjudged`]); empty when there is no prior
+    /// epoch or it predates the field.
+    pub fn prior_held_unjudged(&self) -> &[String] {
+        self.prior
+            .as_ref()
+            .map_or(&[], |p| p.held_unjudged.as_slice())
     }
 
     /// THIS process's last successful, fully-classified tick.
@@ -153,19 +182,31 @@ impl ObservationEpoch {
     /// `captured_at_ms` iff that snapshot succeeded. A failed snapshot makes
     /// classify `Skip` every matched row, so nothing was touched and nothing
     /// was observed — the epoch must not move. Returns whether it advanced.
-    pub fn record_tick(&self, snapshot_ok: bool, captured_at_ms: i64) -> bool {
+    /// `held_unjudged` is the ids that tick held without judging them (the
+    /// boot-census hold), carried to the next boot with the epoch.
+    pub fn record_tick(
+        &self,
+        snapshot_ok: bool,
+        captured_at_ms: i64,
+        held_unjudged: &[String],
+    ) -> bool {
         if !snapshot_ok {
             return false;
         }
-        self.record_ok(captured_at_ms);
+        self.record(captured_at_ms, held_unjudged);
         true
+    }
+
+    /// Record a successful observation at `at` that held nothing unjudged.
+    pub fn record_ok(&self, at: i64) {
+        self.record(at, &[]);
     }
 
     /// Record a successful observation at `at` — in memory for this process,
     /// and on disk for the next one. A write failure is logged and leaves the
     /// prior file in place (the next boot then anchors to an older epoch,
     /// which only admits more).
-    pub fn record_ok(&self, at: i64) {
+    fn record(&self, at: i64, held_unjudged: &[String]) {
         match self.current.lock() {
             Ok(mut c) => *c = Some(at),
             Err(e) => *e.into_inner() = Some(at),
@@ -173,6 +214,7 @@ impl ObservationEpoch {
         let rec = EpochRecord {
             observed_ok_at: at,
             boot_ms: self.boot_ms,
+            held_unjudged: held_unjudged.to_vec(),
         };
         if let Err(e) = write_atomic(&self.path, &rec) {
             warn!(
@@ -241,8 +283,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(EPOCH_FILE_NAME);
         let first = ObservationEpoch::open(&path, T);
-        assert!(first.record_tick(true, T + 60_000));
-        assert!(first.record_tick(true, T + 105_000));
+        assert!(first.record_tick(true, T + 60_000, &[]));
+        assert!(first.record_tick(true, T + 105_000, &[]));
 
         let second = ObservationEpoch::open(&path, T + 3_600_000);
         assert_eq!(second.prior_observed(), Some(T + 105_000));
@@ -253,9 +295,34 @@ mod tests {
             on_disk,
             EpochRecord {
                 observed_ok_at: T + 105_000,
-                boot_ms: T
+                boot_ms: T,
+                held_unjudged: Vec::new(),
             }
         );
+    }
+
+    /// The rows a tick held without judging them reach the next boot with the
+    /// epoch; the latest successful tick's set replaces the earlier one, a
+    /// failed tick keeps it, and an epoch written before the field existed
+    /// reads as holding nothing.
+    #[test]
+    fn held_unjudged_rows_reach_the_next_boot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(EPOCH_FILE_NAME);
+        let first = ObservationEpoch::open(&path, T);
+        let held = vec!["held-a".to_string(), "held-b".to_string()];
+        assert!(first.record_tick(true, T + 45_000, &held[..1]));
+        assert!(first.record_tick(true, T + 90_000, &held));
+        assert!(!first.record_tick(false, T + 135_000, &[]));
+
+        let second = ObservationEpoch::open(&path, T + 3_600_000);
+        assert_eq!(second.prior_observed(), Some(T + 90_000));
+        assert_eq!(second.prior_held_unjudged(), held.as_slice());
+
+        std::fs::write(&path, br#"{"observedOkAt": 5, "bootMs": 1}"#).unwrap();
+        let pre_field = ObservationEpoch::open(&path, T);
+        assert_eq!(pre_field.prior_observed(), Some(5));
+        assert!(pre_field.prior_held_unjudged().is_empty());
     }
 
     /// This process's own ticks move `current_observed` only: the prior value
@@ -279,8 +346,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(EPOCH_FILE_NAME);
         let e = ObservationEpoch::open(&path, T);
-        assert!(e.record_tick(true, T + 45_000));
-        assert!(!e.record_tick(false, T + 90_000));
+        assert!(e.record_tick(true, T + 45_000, &[]));
+        assert!(!e.record_tick(false, T + 90_000, &[]));
         assert_eq!(e.current_observed(), Some(T + 45_000));
         assert_eq!(
             ObservationEpoch::open(&path, T + 1).prior_observed(),
@@ -322,6 +389,19 @@ mod tests {
             .expect("the classify loop that hosts the touch");
         let loop_end = closing_brace(&main_rs, header + "for rec in &open ".len());
         assert!(touch < loop_end, "the touch sits inside the classify loop");
+        // The lexer below does not model every token; a mis-parse that ends
+        // the loop early would also land off the loop's own closing line.
+        let line_of = |at: usize| {
+            let start = main_rs[..at].rfind('\n').map_or(0, |n| n + 1);
+            let end = main_rs[at..].find('\n').map_or(main_rs.len(), |n| at + n);
+            &main_rs[start..end]
+        };
+        let indent = line_of(header).len() - line_of(header).trim_start().len();
+        assert_eq!(
+            line_of(loop_end),
+            format!("{}}}", " ".repeat(indent)),
+            "the matched brace is the line that closes `for rec in &open`"
+        );
         let held_log = main_rs
             .find("if held_for_restore > 0 {")
             .expect("the tick's held-records log after the loop");
@@ -329,10 +409,67 @@ mod tests {
             calls[0] > loop_end && calls[0] < held_log,
             "record_tick must run once per tick, after the per-record classify loop"
         );
+        let call = &main_rs[calls[0]..calls[0] + main_rs[calls[0]..].find(';').unwrap()];
+        assert!(
+            call.contains("&held_unjudged"),
+            "the tick carries the rows it held unjudged: {call}"
+        );
+    }
+
+    /// The poll wires the two halves of `BootRestoreHold` to their own
+    /// consumers: the live-terminal MATCH takes `id_match_only`, never the
+    /// widened `hold` (pre-PR review of plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`).
+    #[test]
+    fn the_poll_matches_on_id_match_only() {
+        let main_rs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .unwrap();
+        let calls: Vec<usize> = main_rs
+            .match_indices("match_live_terminal(\n")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one poll call of match_live_terminal"
+        );
+        let open = calls[0] + "match_live_terminal".len();
+        let args = &main_rs[open..closing_paren(&main_rs, open)];
+        assert!(
+            args.trim_end()
+                .trim_end_matches(',')
+                .ends_with("boot_hold.id_match_only"),
+            "match_live_terminal's last argument must be boot_hold.id_match_only: {args}"
+        );
+    }
+
+    /// Byte offset of the `)` matching the `(` at `open` (no string or comment
+    /// in the argument list it is used on).
+    fn closing_paren(src: &str, open: usize) -> usize {
+        let mut depth = 0_i32;
+        for (i, b) in src.bytes().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses after offset {open}");
     }
 
     /// Byte offset of the `}` matching the `{` at `open`, skipping braces in
-    /// string literals and `//` comments.
+    /// string literals and `//` comments. It does NOT model char literals
+    /// (`'{'`, `'"'`), raw strings or `/* */` comments; the caller's
+    /// closing-line assertion catches a mis-parse that ends the span early.
     fn closing_brace(src: &str, open: usize) -> usize {
         let bytes = src.as_bytes();
         assert_eq!(
