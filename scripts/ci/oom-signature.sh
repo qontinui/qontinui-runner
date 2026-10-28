@@ -78,13 +78,16 @@
 # A CODE VERDICT IN THE SAME LOG WINS. When the log also carries a verdict on
 # the code — any rustc error diagnostic, with or without a code
 # (`error[E0425]: …`, a deny-lint `error: unused variable: …`, a syntax
-# `error: expected …`), or a failed test (`test <name> ... FAILED`) — nothing
+# `error: expected …`), or a failed test (`... FAILED` ending a line, or a
+# bare `FAILED` line) — nothing
 # is emitted, whatever memory evidence sits beside it. The ONLY `error: ` lines
 # that are not a verdict are cargo's wrappers around a failure reported
 # elsewhere: `could not compile`, `linking with`, `failed to spawn`,
 # `build failed`, `test failed`, `failed to run custom build command` and
 # `process didn't exit successfully` — each names WHICH process failed, never
-# why, and every OOM log carries one of them. On main a build-phase OOM title is WRITE-SKIPPED
+# why, and every OOM log carries one of them. An `error: ` line that itself
+# ends in `(os error 1455)` is not a verdict either: it is rustc's own report
+# of the commit limit (signature 4). On main a build-phase OOM title is WRITE-SKIPPED
 # (the prior verdict stands), so annotating a run that also failed on its
 # merits would hide a real red; a pagefile that peaked during a genuine compile
 # error is not why that compile failed.
@@ -98,8 +101,8 @@
 #     verdict, so the guard above lets it through) that points at a source
 #     line ending in `(os error 1455)` must not read as an OOM; and
 #   * libtest's captured output of a failing test (from `---- <name> stdout ----`
-#     to the `failures:` / `test result:` line that ends it), where a test's own
-#     assertion text about these errors is printed.
+#     to the `failures:` / `test result:` / next binary's `Running` line that
+#     ends it), where a test's own assertion text about these errors is printed.
 #
 # INPUT is the tee'd step output (`cargo-test-build.log`,
 # `cargo-test-output.log`). ANSI colour escapes, CRs and a leading GitHub log
@@ -180,11 +183,16 @@ first_line() {
 CARGO_WRAPPER='^error: (could not compile|linking with|failed to spawn|build failed|test failed|failed to run custom build command|process didn.t exit successfully)'
 # One awk, not `grep | grep -q`: under pipefail an early-exiting `grep -q`
 # SIGPIPEs the first grep and the pipeline would read as "no verdict".
-if awk -v w="$CARGO_WRAPPER" '/^error(\[E[0-9]+\])?: / && $0 !~ w { found = 1 } END { exit !found }' \
-     "$evidence"; then
+# An `error: ` line that itself ENDS in `(os error 1455)` is rustc reporting
+# the commit limit (`could not exec the linker …`, `failed to write …rlib`), so
+# it is signature 4, not a verdict — but any OTHER verdict line still wins.
+if awk -v w="$CARGO_WRAPPER" '/^error(\[E[0-9]+\])?: / && $0 !~ w && $0 !~ /\(os error 1455\)$/ { found = 1 }
+                             END { exit !found }' "$evidence"; then
   exit 0
 fi
-if grep -qE '^test .* \.\.\. FAILED$' "$evidence"; then
+# A failed test: libtest's `… ... FAILED` (anywhere on the line — a test's own
+# output can share the line with the result) or a bare `FAILED`.
+if grep -qE '\.\.\. FAILED$|^FAILED$' "$evidence"; then
   exit 0
 fi
 
