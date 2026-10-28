@@ -248,18 +248,15 @@ pub fn api_ports_to_try(port: u16) -> Vec<u16> {
 }
 
 /// Test support: turn an [`crate::test_env::IsolatedAmbient`] into a NAMELESS
-/// subject launch — a root at `<fixture>/subject` and the fixture's own
-/// out-of-root dir keys cleared (the fixture has already removed the instance
-/// identity and every other root-confined key, and restores them all), then
-/// the real lib startup contract (`apply_instance_root_env`, CLI form) applied,
-/// exactly as a binary's `main` would. Returns the root.
+/// subject launch — a root at `<fixture>/subject` and the root-confined keys
+/// the fixture points at its own dir cleared (`root_confined_keys_set_to_dir`;
+/// the fixture has already removed the instance identity and every other
+/// root-confined key, and restores them all), then the real lib startup contract
+/// (`apply_instance_root_env`, CLI form) applied, exactly as a binary's `main`
+/// would. Returns the root.
 #[cfg(test)]
 pub(crate) fn enter_rooted_subject_for_test(amb: &crate::test_env::IsolatedAmbient) -> PathBuf {
-    for key in [
-        "QONTINUI_HOME",
-        "QONTINUI_CONFIG_DIR",
-        "QONTINUI_SECURE_STORAGE_DIR",
-    ] {
+    for key in crate::test_env::root_confined_keys_set_to_dir() {
         std::env::remove_var(key);
     }
     let root = amb.dir().join("subject");
