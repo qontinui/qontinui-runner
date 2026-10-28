@@ -1968,7 +1968,7 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Machine-load backstop (plan
         // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
         // Phase 1c): the SAME memory + thread guard the gate-continuation path
-        // applies (`probe_for_spawn`, deferring on any tripped lane), so a flood of
+        // applies (`AdmissionReading::live` — the lanes `probe_for_spawn` composes —, deferring on any tripped lane), so a flood of
         // coord launches cannot start more unattended sessions than the box can
         // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
         // path rewrite, account resolution and worktree materialization all
@@ -1984,7 +1984,7 @@ fn spawn_run_task(payload: LaunchPayload) {
         // the work is offered again on a later pass rather than latched failed.
         if let Err(reason) = admit_launch(
             &live_terminal_predicate(),
-            &crate::resource_guard::probe_for_spawn,
+            &crate::resource_guard::AdmissionReading::live,
         ) {
             info!(
                 "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
@@ -2854,8 +2854,10 @@ struct ContinuationRegistry {
     /// [`Self::take_live_reserving_anchor`] (the migration lift) — and removed
     /// only by that entry's owner: its drop on every non-spawn
     /// exit, or [`AnchorReservation::handed_to_registry`] when the live entry
-    /// replaces it. A reservation is not a running session and costs the machine
-    /// nothing the load lanes could read.
+    /// replaces it. A reservation is not a running session, so it costs the
+    /// machine nothing the load lanes can READ yet — which is exactly why a
+    /// dispatch's permit is also charged as projected cost
+    /// ([`Self::reserved_spawns`]).
     ///
     /// **The account-migration hop holds its anchor here for the whole
     /// respawn.** The hop lifts a continuation off its terminal
@@ -2883,6 +2885,31 @@ struct ContinuationRegistry {
     /// the other route. Carrying the token makes every removal a no-op unless
     /// the remover holds the entry it names.
     pending_anchors: std::collections::HashMap<String, AnchorReservationToken>,
+    /// How many continuations have passed [`evaluate_continuation_guard`] with
+    /// `Proceed` and are not yet registered (or given up): each is charged
+    /// against the resource lanes as a PROJECTED cost
+    /// ([`crate::resource_guard::AdmissionReading::projected`]) until its
+    /// [`AnchorReservation`] settles — [`AnchorReservation::handed_to_registry`]
+    /// (terminal), [`AnchorReservation::release`] (headless), or its drop on any
+    /// other exit.
+    ///
+    /// **Why it exists.** Neither lane can see a continuation whose `claude`
+    /// has not started, and the stretch from the guard to the PTY crosses the
+    /// coord consume claim, the worktree acquire and the trust warm-up. A replay
+    /// of N pending rows used to read the same pre-burst headroom N times and
+    /// admit all N (2026-10-27 on spaceship: 20 passed the guard at once). The
+    /// count is read and incremented under THIS lock in the same critical
+    /// section, so concurrent guard passes are serialized: headroom for K admits
+    /// at most K. It is a PROJECTION over the box's readings, never a fixed cap
+    /// (the count cap stays retired; plan
+    /// `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`
+    /// D2).
+    ///
+    /// Counted for anchor-less continuations too (their permit holds no anchor
+    /// but is still counted), which a count of `pending_anchors` could not do.
+    /// The account-migration hop's permit is NOT counted: that session's
+    /// `claude` is already running and already in the readings.
+    reserved_spawns: usize,
 }
 
 impl ContinuationRegistry {
@@ -3309,7 +3336,12 @@ enum ContinuationGuard {
 ///
 /// The ANCHOR half of a check-to-register permit does exist ([`AnchorReservation`],
 /// taken inside this guard's critical section), so a same-anchor twin cannot
-/// pass within one burst.
+/// pass within one burst. So does the COST half: a `Proceed` charges one
+/// projected session ([`ContinuationRegistry::reserved_spawns`]) against the
+/// readings until the permit settles, decided and recorded under one lock, so
+/// a burst of N rows with headroom for K admits at most K. That is a
+/// projection over the box's readings, not a count: with calm readings it
+/// admits everything, as the operator direction requires.
 ///
 /// ## Any non-`Proceed` verdict defers — deliberately more eager than `admit_spawn`
 ///
@@ -3333,7 +3365,7 @@ enum ContinuationGuard {
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
-    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> (ContinuationGuard, AnchorReservation) {
     warn_if_retired_cap_env_set();
     // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3
@@ -3416,22 +3448,49 @@ fn evaluate_continuation_guard(
     // unreadable sensor produces `Proceed` inside `resource_guard` — UNKNOWN ⇒
     // spawn, the fail-open doctrine this subsystem is built on — so a missing
     // reading can never wedge the queue shut.
-    let verdict = match load_pressure().tripped() {
-        Some((severity, observation)) => ContinuationGuard::LoadPressure {
-            severity,
-            observation: observation.clone(),
-        },
-        None => ContinuationGuard::Proceed,
+    let reading = load_reading();
+    // PROJECTED COST, decided and recorded in ONE critical section. The reading
+    // above cannot see a continuation that passed this guard and has not yet
+    // started its `claude`, so every such admission is charged against it
+    // ([`ContinuationRegistry::reserved_spawns`]). Reading the count and
+    // incrementing it under the same lock is what serializes CONCURRENT guard
+    // passes: of N tasks evaluating one pre-burst reading at once, only as many
+    // as the projected headroom allows read `Proceed`. The projection is pure
+    // arithmetic over the reading taken above — no OS read under the lock.
+    let (verdict, pending) = {
+        let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+        let pending = registry.reserved_spawns;
+        let verdict = match reading.projected(pending).tripped() {
+            Some((severity, observation)) => ContinuationGuard::LoadPressure {
+                severity,
+                observation: observation.clone(),
+            },
+            None => ContinuationGuard::Proceed,
+        };
+        if verdict == ContinuationGuard::Proceed {
+            registry.reserved_spawns += 1;
+        }
+        (verdict, pending)
     };
     // A load deferral leaves the row pending for re-delivery; the re-delivery
     // must find the anchor free, not reserved by this refused evaluation. Only
     // a `Proceed` leaves the reservation behind, for the caller to carry.
     if verdict != ContinuationGuard::Proceed {
+        if pending > 0 {
+            info!(
+                "agent_runtime: continuation admission charged {pending} admitted, \
+                 not-yet-registered spawn(s) as projected cost before deferring"
+            );
+        }
         // RAII rather than a release call: dropping the permit this evaluation
         // minted gives that anchor back, and it can give back nothing else.
+        // Dropped OUTSIDE the lock — its drop takes the same mutex.
         drop(reservation);
         return (verdict, AnchorReservation::none());
     }
+    // The count was taken above; the permit now owns giving it back.
+    let mut reservation = reservation;
+    reservation.counted = true;
     (verdict, reservation)
 }
 
@@ -3480,19 +3539,29 @@ fn launch_deferral_reason(verdict: &crate::resource_guard::SpawnGate) -> Option<
 /// report.
 fn admit_launch(
     is_live: &dyn Fn(&str) -> bool,
-    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> Result<(), String> {
     warn_if_retired_cap_env_set();
     prune_dead_continuations(is_live);
-    match launch_deferral_reason(&load_pressure()) {
+    let reading = load_reading();
+    // Charged with the continuations admitted and not yet running, exactly as
+    // the continuation guard charges them, so a continuation burst in flight
+    // also bounds launches. A launch takes no projected-cost unit itself: its
+    // run task spans the whole agent run, so a unit held there would charge a
+    // RUNNING session twice (once in the readings, once here). Residual,
+    // stated: a burst of LAUNCHES alone is bounded only by the readings.
+    let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
+    match launch_deferral_reason(&reading.projected(pending)) {
         Some(reason) => Err(reason),
         None => Ok(()),
     }
 }
 
-/// [`evaluate_continuation_guard`] with the load verdict taken LIVE from
-/// [`crate::resource_guard::probe_for_spawn`] — the spawn seam's own composed
-/// memory + thread verdict.
+/// [`evaluate_continuation_guard`] with the load reading taken LIVE through
+/// [`crate::resource_guard::AdmissionReading::live`] — both lanes' readings
+/// from [`crate::resource_guard::lane_verdicts`] (the same read the spawn
+/// seam's [`crate::resource_guard::probe_for_spawn`] composes) plus the
+/// projected per-session cost.
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
@@ -3500,20 +3569,23 @@ fn admit_launch(
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
-/// The function itself is passed, NOT called: `&crate::resource_guard::probe_for_spawn`
-/// coerces the `fn` item to the guard's `&dyn Fn() -> SpawnGate` parameter, so
-/// the reading happens inside the guard, after the dedup arm — the whole point
-/// of the lazy parameter. Writing `&probe_for_spawn()` here would restore the
-/// eager evaluation and nothing would fail to compile.
+/// The function itself is passed, NOT called: `&AdmissionReading::live`
+/// coerces the `fn` item to the guard's `&dyn Fn() -> AdmissionReading`
+/// parameter, so the reading happens inside the guard, after the dedup arm —
+/// the whole point of the lazy parameter.
 ///
-/// `probe_for_spawn()` short-circuits on a disabled session guard before touching
+/// `lane_verdicts()` short-circuits on a disabled session guard before touching
 /// either sensor, and the thread reading behind it is memoized for
 /// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
-    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::probe_for_spawn)
+    evaluate_continuation_guard(
+        anchor_key,
+        is_live,
+        &crate::resource_guard::AdmissionReading::live,
+    )
 }
 
 /// The `/health` `spawnAdmission` block: what unattended admission would decide
@@ -3527,10 +3599,15 @@ fn evaluate_continuation_guard_live(
 /// polled route costs nothing beyond the (memoized) readings.
 pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
     let lanes = crate::resource_guard::lane_verdicts();
-    let live = lock_recover(continuation_sessions(), "continuation_sessions")
-        .live
-        .len();
-    spawn_admission_json(lanes.as_ref(), live)
+    let (live, reserved) = {
+        let registry = lock_recover(continuation_sessions(), "continuation_sessions");
+        (registry.live.len(), registry.reserved_spawns)
+    };
+    let mut json = spawn_admission_json(lanes.as_ref(), live);
+    // Admitted, not-yet-registered continuations: each is charged against the
+    // readings as projected cost by the next admission.
+    json["reservedSpawns"] = serde_json::json!(reserved);
+    json
 }
 
 /// The severity word of a lane verdict, `"proceed"` when nothing tripped.
@@ -3696,12 +3773,20 @@ pub(crate) struct AnchorReservation {
     /// ownership. `None` holds nothing: an anchor-less continuation, or an
     /// evaluation that took no permit.
     held: Option<(String, AnchorReservationToken)>,
+    /// Whether this permit holds one [`ContinuationRegistry::reserved_spawns`]
+    /// unit, given back exactly once when the permit settles. Set only by
+    /// [`evaluate_continuation_guard`] on `Proceed`, in the critical section
+    /// that increments the count.
+    counted: bool,
 }
 
 impl AnchorReservation {
     /// A permit over nothing — holds no anchor, releases nothing on drop.
     fn none() -> Self {
-        Self { held: None }
+        Self {
+            held: None,
+            counted: false,
+        }
     }
 
     /// Take custody of the `pending_anchors` entry the caller just inserted
@@ -3712,6 +3797,7 @@ impl AnchorReservation {
     fn owning(anchor_key: String, token: AnchorReservationToken) -> Self {
         Self {
             held: Some((anchor_key, token)),
+            counted: false,
         }
     }
 
@@ -3730,6 +3816,7 @@ impl AnchorReservation {
         // Taken out of `self` so this fn settles the entry and the drop below
         // is a no-op: one removal, not two.
         let held = self.held.take();
+        let counted = std::mem::take(&mut self.counted);
         let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         registry.insert_live(terminal_id, anchor_key, gate_id);
@@ -3739,11 +3826,26 @@ impl AnchorReservation {
             // this path cannot drift away from the drop path.
             registry.release_owned(&anchor, token);
         }
+        // The projected cost becomes a live row in the SAME acquisition, so the
+        // session is never charged twice nor zero times by a concurrent guard.
+        if counted {
+            registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
+        }
     }
 }
 
 impl Drop for AnchorReservation {
     fn drop(&mut self) {
+        if std::mem::take(&mut self.counted) {
+            // One acquisition for both halves; `release_anchor_reservation`
+            // would lock a second time, so the anchor is settled here directly.
+            let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+            registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
+            if let Some((anchor, token)) = self.held.as_ref() {
+                registry.release_owned(anchor, *token);
+            }
+            return;
+        }
         release_anchor_reservation(
             self.held
                 .as_ref()
@@ -14976,7 +15078,7 @@ mod tests {
         // Delivery 1: dispatcher claims the id, guard defers under memory load.
         assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
         assert!(matches!(
-            guard_verdict(Some("new-anchor"), &live_all, &|| commit_verdict(
+            guard_verdict(Some("new-anchor"), &live_all, &|| commit_reading(
                 WARN_BAND_FREE
             )),
             ContinuationGuard::LoadPressure { .. }
@@ -14991,7 +15093,7 @@ mod tests {
             "re-delivery after the release claims the id again"
         );
         assert_eq!(
-            guard_verdict(Some("new-anchor"), &live_all, &calm),
+            guard_verdict(Some("new-anchor"), &live_all, &calm_reading),
             ContinuationGuard::Proceed,
             "pressure cleared → the deferred continuation finally dispatches"
         );
@@ -15220,7 +15322,7 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let reason = match admit_launch(&live_all, &|| thread_verdict(Some(300))) {
+        let reason = match admit_launch(&live_all, &|| thread_reading(Some(300))) {
             Err(reason) => reason,
             other => panic!("300 threads must defer a launch, got {other:?}"),
         };
@@ -15246,18 +15348,18 @@ mod tests {
         let live_all = |_id: &str| true;
 
         assert_eq!(
-            admit_launch(&live_all, &|| thread_verdict(Some(540))).err(),
+            admit_launch(&live_all, &|| thread_reading(Some(540))).err(),
             Some("deferred_load:thread_pressure:critical:540_over_400".to_string())
         );
         let warn_floor = crate::settings::SessionGuardSettings::default().warn_free_commit_bytes;
         assert_eq!(
-            admit_launch(&live_all, &|| commit_verdict(WARN_BAND_FREE)).err(),
+            admit_launch(&live_all, &|| commit_reading(WARN_BAND_FREE)).err(),
             Some(format!(
                 "deferred_load:commit_pressure:warn:{WARN_BAND_FREE}_under_{warn_floor}"
             )),
             "a memory-starved machine defers a launch, naming the lane, reading and floor"
         );
-        assert_eq!(admit_launch(&live_all, &calm), Ok(()));
+        assert_eq!(admit_launch(&live_all, &calm_reading), Ok(()));
     }
 
     /// The deferral report retries only undelivered attempts, boundedly.
@@ -15298,12 +15400,12 @@ mod tests {
             register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
         }
         assert_eq!(
-            guard_verdict(Some("a-new"), &live_all, &calm),
+            guard_verdict(Some("a-new"), &live_all, &calm_reading),
             ContinuationGuard::Proceed,
             "500 live continuations on a calm machine must not defer on count"
         );
         assert_eq!(
-            admit_launch(&live_all, &calm),
+            admit_launch(&live_all, &calm_reading),
             Ok(()),
             "nor may a coord launch"
         );
@@ -15496,9 +15598,9 @@ mod tests {
     fn guard_verdict(
         anchor_key: Option<&str>,
         is_live: &dyn Fn(&str) -> bool,
-        load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+        load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, load_pressure).0
+        evaluate_continuation_guard(anchor_key, is_live, load_reading).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -15544,6 +15646,63 @@ mod tests {
         )
     }
 
+    /// A fixed projected per-session cost for the guard tests, so they never
+    /// depend on the process-global measured threads-per-session.
+    const TEST_SPAWN_COST: crate::resource_guard::ProjectedSpawnCost =
+        crate::resource_guard::ProjectedSpawnCost {
+            commit_bytes: crate::resource_guard::PER_SESSION_RSS_BYTES,
+            threads: 10,
+        };
+
+    /// An [`crate::resource_guard::AdmissionReading`] over injected readings,
+    /// each lane's verdict folded through the REAL evaluators against the
+    /// SHIPPED floors / ceilings (the same pair [`thread_verdict`] and
+    /// [`commit_verdict`] use). `None` is an UNKNOWN reading.
+    fn reading_with(
+        free_commit_bytes: Option<u64>,
+        graded_threads: Option<usize>,
+    ) -> crate::resource_guard::AdmissionReading {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let ceilings = crate::resource_guard::ThreadCeilings::SHIPPED;
+        crate::resource_guard::AdmissionReading {
+            lanes: Some(crate::resource_guard::LaneVerdicts {
+                memory_lane: "host",
+                free_commit_bytes,
+                free_phys_bytes: None,
+                warn_free_commit_bytes: floors.warn_free_commit_bytes,
+                critical_free_commit_bytes: floors.critical_free_commit_bytes,
+                memory: crate::resource_guard::evaluate("host", free_commit_bytes, &floors),
+                threads: crate::resource_guard::ThreadLane {
+                    graded: graded_threads,
+                    warn_ceiling: ceilings.warn,
+                    critical_ceiling: ceilings.critical,
+                    verdict: crate::resource_guard::evaluate_threads(
+                        graded_threads,
+                        true,
+                        ceilings,
+                    ),
+                },
+            }),
+            cost: TEST_SPAWN_COST,
+        }
+    }
+
+    /// Both sensors UNKNOWN: no opinion, and no projection can give one — the
+    /// reading every dedup-lane test passes (the old `calm` verdict).
+    fn calm_reading() -> crate::resource_guard::AdmissionReading {
+        reading_with(None, None)
+    }
+
+    /// A thread-lane reading only (memory UNKNOWN).
+    fn thread_reading(graded: Option<usize>) -> crate::resource_guard::AdmissionReading {
+        reading_with(None, graded)
+    }
+
+    /// A memory-lane reading only (threads UNKNOWN).
+    fn commit_reading(free_commit_bytes: u64) -> crate::resource_guard::AdmissionReading {
+        reading_with(Some(free_commit_bytes), None)
+    }
+
     /// REGRESSION (P3 must not regress #450): a SAME gate_id delivered twice is
     /// still short-circuited by the `dispatched_gate_ids` set — the anchor_key
     /// layer is additive, not a replacement. (Mirrors
@@ -15573,7 +15732,7 @@ mod tests {
         // No session yet → proceed, then register it as live.
         let live_all = |_id: &str| true;
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
         register_continuation_session(
@@ -15584,12 +15743,12 @@ mod tests {
 
         // Same anchor, still live → DuplicateAnchor (carries the existing tid).
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-tid-1".to_string()))
         );
         // A different anchor is unaffected.
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:2"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:2"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
@@ -15597,7 +15756,7 @@ mod tests {
         // free to spawn again (the legitimate re-run after completion).
         let dead_first = |id: &str| id != "term-tid-1";
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &dead_first, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &dead_first, &calm_reading),
             ContinuationGuard::Proceed
         );
         // The registry no longer holds the dead session.
@@ -15651,7 +15810,7 @@ mod tests {
         let live_all = |_id: &str| true;
 
         let (verdict, _held) =
-            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm);
+            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved("unit:u1:phase-2"),
@@ -15659,13 +15818,13 @@ mod tests {
         );
         // The twin, evaluated before the first has registered anything.
         assert_eq!(
-            guard_verdict(Some("unit:u1:phase-2"), &live_all, &calm),
+            guard_verdict(Some("unit:u1:phase-2"), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "the second evaluation for a reserved anchor must dedup, not proceed"
         );
         // A different anchor is unaffected by the reservation.
         assert_eq!(
-            guard_verdict(Some("unit:u1:phase-3"), &live_all, &calm),
+            guard_verdict(Some("unit:u1:phase-3"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
@@ -15693,14 +15852,14 @@ mod tests {
 
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
             "a Proceed hands back a permit that holds the anchor"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
         );
         drop(reservation);
@@ -15710,7 +15869,7 @@ mod tests {
         );
 
         // 2. The third evaluation — a re-delivery — proceeds again.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -15725,7 +15884,7 @@ mod tests {
             "the hand-over must give back the reservation it replaces"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-x1".to_string())),
             "after the hand-over the holder is the live session, not a reservation"
         );
@@ -15736,7 +15895,7 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm);
+        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -15772,7 +15931,7 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
 
         // A continuation is live on the anchor — the session about to migrate.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate));
 
@@ -15790,7 +15949,7 @@ mod tests {
         // (LoadPressure verdicts are refusals too and would prove nothing
         // about the anchor).
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "a same-anchor dispatch inside the migration window must be deferred, not admitted"
         );
@@ -15894,7 +16053,7 @@ mod tests {
         //    refusals too and would satisfy a weaker assertion while proving
         //    nothing about the anchor.
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "a same-anchor dispatch inside the migration window must be deferred"
         );
@@ -15913,7 +16072,7 @@ mod tests {
         );
         // …and the anchor now reads as held by the LIVE session, not free.
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-new".to_string()))
         );
 
@@ -15942,7 +16101,7 @@ mod tests {
             "the anchor is held across the attempt, whether or not the respawn succeeds"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
         );
 
@@ -16046,7 +16205,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -16068,7 +16227,7 @@ mod tests {
             "a stale reservation must not remove an entry it does not own"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "the foreign holder still owns the anchor"
         );
@@ -16087,9 +16246,9 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let thread_loaded = || thread_verdict(Some(540));
-        let memory_loaded = || commit_verdict(WARN_BAND_FREE);
-        let lanes: [(&str, &dyn Fn() -> crate::resource_guard::SpawnGate); 2] =
+        let thread_loaded = || thread_reading(Some(540));
+        let memory_loaded = || commit_reading(WARN_BAND_FREE);
+        let lanes: [(&str, &dyn Fn() -> crate::resource_guard::AdmissionReading); 2] =
             [("a-threads", &thread_loaded), ("a-memory", &memory_loaded)];
         for (anchor, loaded) in lanes {
             for _ in 0..2 {
@@ -16131,7 +16290,7 @@ mod tests {
         // Another anchor-less dispatch must NOT be deduped against the existing
         // anchor-less session (we can't correlate them).
         assert_eq!(
-            guard_verdict(None, &live_all, &calm),
+            guard_verdict(None, &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
@@ -16164,7 +16323,7 @@ mod tests {
         // A live idle runner (151 threads) is BELOW the 256 warn ceiling →
         // nothing to say, spawn.
         assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &|| thread_verdict(Some(151))),
+            guard_verdict(Some("a1"), &live_all, &|| thread_reading(Some(151))),
             ContinuationGuard::Proceed,
             "an idle machine must not defer — a guard that fires at rest is a \
              permanently-closed queue, not a guard"
@@ -16172,13 +16331,13 @@ mod tests {
         // Exactly ON the warn ceiling is AT it, not over it (the lane's
         // boundaries are strictly-above).
         assert_eq!(
-            guard_verdict(Some("a2"), &live_all, &|| thread_verdict(Some(256))),
+            guard_verdict(Some("a2"), &live_all, &|| thread_reading(Some(256))),
             ContinuationGuard::Proceed,
             "256 is the ceiling, not a crossing of it"
         );
 
         // WARN band (257..=400): defer, naming the warn ceiling.
-        match guard_verdict(Some("a3"), &live_all, &|| thread_verdict(Some(300))) {
+        match guard_verdict(Some("a3"), &live_all, &|| thread_reading(Some(300))) {
             ContinuationGuard::LoadPressure {
                 severity,
                 observation,
@@ -16196,7 +16355,7 @@ mod tests {
         // CRITICAL band (>400): still a deferral, now naming the critical
         // ceiling. The guard does not escalate past deferral — there is nothing
         // heavier for a queued row than leaving it queued.
-        match guard_verdict(Some("a4"), &live_all, &|| thread_verdict(Some(540))) {
+        match guard_verdict(Some("a4"), &live_all, &|| thread_reading(Some(540))) {
             ContinuationGuard::LoadPressure {
                 severity,
                 observation,
@@ -16234,7 +16393,7 @@ mod tests {
         let live_all = |_id: &str| true;
 
         let loaded = guard_verdict(Some("wedge-anchor"), &live_all, &|| {
-            thread_verdict(Some(540))
+            thread_reading(Some(540))
         });
         assert!(
             matches!(loaded, ContinuationGuard::LoadPressure { .. }),
@@ -16249,7 +16408,7 @@ mod tests {
         // Sessions exit, threads go back to the pool, the same anchor is
         // re-delivered by the backstop poll → it dispatches.
         assert_eq!(
-            guard_verdict(Some("wedge-anchor"), &live_all, &|| thread_verdict(Some(
+            guard_verdict(Some("wedge-anchor"), &live_all, &|| thread_reading(Some(
                 151
             ))),
             ContinuationGuard::Proceed,
@@ -16274,7 +16433,7 @@ mod tests {
 
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
         assert_eq!(
-            guard_verdict(Some("anchor-dup"), &live_all, &|| thread_verdict(Some(540))),
+            guard_verdict(Some("anchor-dup"), &live_all, &|| thread_reading(Some(540))),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t-live".to_string())),
             "a live duplicate is a dedup, not a load deferral"
         );
@@ -16313,7 +16472,7 @@ mod tests {
             readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // A verdict that WOULD defer, so the test cannot pass merely because
             // the reading happened to be calm.
-            thread_verdict(Some(540))
+            thread_reading(Some(540))
         };
 
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
@@ -16367,11 +16526,192 @@ mod tests {
             "an unreadable sensor has no opinion"
         );
         assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &|| thread_verdict(None)),
+            guard_verdict(Some("a1"), &live_all, &|| thread_reading(None)),
             ContinuationGuard::Proceed,
             "UNKNOWN must never defer — fail open"
         );
 
+        clear_continuation_registry();
+    }
+
+    // =========================================================================
+    // Projected cost: admitted, not-yet-registered continuations count against
+    // the resource lanes (plan 2026-10-28-finished-gate-continuations-… Phase 4,
+    // the insight of plan 2026-10-28-gate-continuation-cap-is-a-real-permit)
+    // =========================================================================
+
+    /// Free commit leaving room for exactly `k` admissions at
+    /// [`TEST_SPAWN_COST`]: the k-th admission (k-1 already pending) still
+    /// projects above the warn floor; the (k+1)-th projects under it.
+    fn free_with_headroom_for(k: u64) -> u64 {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let cost = TEST_SPAWN_COST.commit_bytes;
+        floors.warn_free_commit_bytes + (k - 1) * cost + cost / 2
+    }
+
+    fn reserved_spawns_now() -> usize {
+        continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reserved_spawns
+    }
+
+    /// SEQUENTIAL burst, every permit held (the replay's shape): 20 distinct
+    /// anchors against ONE calm-at-the-start reading with headroom for 3 admit
+    /// exactly 3; the other 17 defer on the memory lane, naming the projected
+    /// reading — never an `at_cap:` count.
+    #[test]
+    fn burst_of_pending_rows_admits_only_the_projected_headroom() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || commit_reading(free_with_headroom_for(3));
+        assert_eq!(
+            reading().projected(0),
+            crate::resource_guard::SpawnGate::Proceed,
+            "the reading alone is calm — only the projection can bound the burst"
+        );
+
+        let mut held = Vec::new();
+        let mut deferred = 0;
+        for i in 0..20 {
+            let anchor = format!("burst-{i}");
+            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), &live_all, &reading);
+            match verdict {
+                ContinuationGuard::Proceed => held.push(permit),
+                ContinuationGuard::LoadPressure { observation, .. } => {
+                    assert_eq!(observation.metric, crate::resource_guard::LaneMetric::FreeCommitBytes);
+                    deferred += 1;
+                }
+                other => panic!("unexpected verdict {other:?}"),
+            }
+        }
+        assert_eq!(held.len(), 3, "headroom for 3 admits exactly 3");
+        assert_eq!(deferred, 17);
+        assert_eq!(reserved_spawns_now(), 3, "each admitted permit holds one unit");
+        drop(held);
+        assert_eq!(reserved_spawns_now(), 0, "dropping the permits gives every unit back");
+        clear_continuation_registry();
+    }
+
+    /// The same burst with ANCHOR-LESS continuations — the population a count of
+    /// `pending_anchors` could never see.
+    #[test]
+    fn anchorless_burst_is_bounded_by_the_projection_too() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || thread_reading(Some(200));
+        // 200 graded threads, 256 warn ceiling, 10 threads per projected
+        // session: pending 0..=5 project <= 250; pending 6 projects 260 > 256.
+        let held: Vec<_> = (0..20)
+            .map(|_| evaluate_continuation_guard(None, &live_all, &reading))
+            .filter(|(v, _)| *v == ContinuationGuard::Proceed)
+            .map(|(_, permit)| permit)
+            .collect();
+        assert_eq!(held.len(), 6);
+        assert_eq!(reserved_spawns_now(), 6);
+        drop(held);
+        assert_eq!(reserved_spawns_now(), 0);
+        clear_continuation_registry();
+    }
+
+    /// CONCURRENT guard passes — the 2026-10-27 incident shape (cap 9, 20
+    /// passed the guard at once): 20 threads released together through a
+    /// barrier, every one reading the SAME pre-burst headroom for 3, admit at
+    /// most 3 (exactly 3, since the count serializes them).
+    #[test]
+    fn concurrent_guard_passes_admit_at_most_the_projected_headroom() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        const N: usize = 20;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let live_all = |_id: &str| true;
+                    let reading = || commit_reading(free_with_headroom_for(3));
+                    barrier.wait();
+                    let anchor = format!("concurrent-{i}");
+                    evaluate_continuation_guard(Some(&anchor), &live_all, &reading)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("guard thread")).collect();
+        let admitted = results
+            .iter()
+            .filter(|(v, _)| *v == ContinuationGuard::Proceed)
+            .count();
+        assert_eq!(admitted, 3, "20 concurrent passes with headroom for 3 admit exactly 3");
+        assert_eq!(reserved_spawns_now(), 3);
+        drop(results);
+        assert_eq!(reserved_spawns_now(), 0);
+        clear_continuation_registry();
+    }
+
+    /// A held permit's unit settles exactly once on every exit: hand-over moves
+    /// it into the live registry (reserved −1, live +1 in one acquisition), drop
+    /// and the headless `release` give it back, and a REFUSED evaluation never
+    /// takes one.
+    #[test]
+    fn projected_units_settle_on_handover_release_and_drop() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+
+        let (v1, terminal) = evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
+        let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
+        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
+        assert_eq!((v1, v2, v3), (ContinuationGuard::Proceed, ContinuationGuard::Proceed, ContinuationGuard::Proceed));
+        assert_eq!(reserved_spawns_now(), 3);
+
+        terminal.handed_to_registry("t-settle-a".into(), None);
+        assert_eq!(reserved_spawns_now(), 2, "hand-over gives the unit back");
+        assert_eq!(
+            continuation_sessions().lock().unwrap_or_else(|p| p.into_inner()).live.len(),
+            1,
+            "…because the session is now a live row the readings will see"
+        );
+        headless.release();
+        assert_eq!(reserved_spawns_now(), 1, "the headless release gives the unit back");
+        drop(dropped);
+        assert_eq!(reserved_spawns_now(), 0, "a give-up drop gives the unit back");
+
+        let (refused, permit) =
+            evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
+        assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
+        assert_eq!(reserved_spawns_now(), 0, "a refused evaluation takes no unit");
+        drop(permit);
+        assert_eq!(reserved_spawns_now(), 0, "and its empty permit gives none back");
+        clear_continuation_registry();
+    }
+
+    /// Launch admission is charged with the continuations admitted and not yet
+    /// running: with the headroom used up by held permits, a launch on the same
+    /// reading defers with a `deferred_load:` reason; once they settle it admits.
+    #[test]
+    fn launch_admission_counts_reserved_continuations() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || commit_reading(free_with_headroom_for(2));
+
+        assert_eq!(admit_launch(&live_all, &reading), Ok(()), "nothing pending: admitted");
+        let held: Vec<_> = (0..2)
+            .map(|i| evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1)
+            .collect();
+        assert_eq!(reserved_spawns_now(), 2);
+        let reason = admit_launch(&live_all, &reading).expect_err("headroom spent by pending continuations");
+        assert!(reason.starts_with("deferred_load:commit_pressure:"), "{reason}");
+        assert_eq!(reserved_spawns_now(), 2, "a launch takes no unit of its own");
+        drop(held);
+        assert_eq!(admit_launch(&live_all, &reading), Ok(()));
         clear_continuation_registry();
     }
 
@@ -17389,8 +17729,10 @@ mod tests {
         );
     }
 
-    /// The two LIVE unattended pre-checks read the composed memory + thread probe
-    /// (`resource_guard::probe_for_spawn`), never the thread lane alone. The unit
+    /// The two LIVE unattended pre-checks read both lanes through
+    /// `resource_guard::AdmissionReading::live` (the `lane_verdicts` read
+    /// `probe_for_spawn` composes, plus the projected per-session cost), never
+    /// the thread lane alone. The unit
     /// tests above inject the verdict, so they cannot see which function the
     /// production wiring passes; this pins that wiring. Before 2026-10-03 both
     /// sites passed `thread_pressure`, so memory pressure reached no pre-check: a
@@ -17416,8 +17758,8 @@ mod tests {
             ("spawn_run_task", body_of("fn spawn_run_task(")),
         ] {
             assert!(
-                body.contains("crate::resource_guard::probe_for_spawn"),
-                "{site} must pass the composed memory + thread probe"
+                body.contains("crate::resource_guard::AdmissionReading::live"),
+                "{site} must pass the live two-lane admission reading (with its projected cost)"
             );
             assert!(
                 !body.contains("crate::resource_guard::thread_pressure"),
@@ -17513,7 +17855,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let floors = crate::settings::SessionGuardSettings::default();
 
-        match guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(WARN_BAND_FREE)) {
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(WARN_BAND_FREE)) {
             ContinuationGuard::LoadPressure {
                 severity,
                 observation,
@@ -17533,7 +17875,7 @@ mod tests {
         }
         // CRITICAL band (under 1.5 GiB): still a deferral, naming the critical
         // floor — the reading that used to die `spawn_failed` after the claim.
-        match guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(GIB)) {
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(GIB)) {
             ContinuationGuard::LoadPressure {
                 severity,
                 observation,
@@ -17545,7 +17887,7 @@ mod tests {
         }
         // Plenty of memory: proceeds.
         assert_eq!(
-            guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(64 * GIB)),
+            guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(64 * GIB)),
             ContinuationGuard::Proceed
         );
         clear_continuation_registry();

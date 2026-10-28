@@ -1160,19 +1160,12 @@ pub(crate) fn evaluate(
         // Unreadable sensor ⇒ no opinion ⇒ proceed. Fail open.
         return SpawnGate::Proceed;
     };
-    let observation = |limit: u64| GateObservation {
-        lane: lane.to_string(),
-        metric: LaneMetric::FreeCommitBytes,
-        observed: free,
-        limit,
-    };
-    if free < guard.critical_free_commit_bytes {
-        return SpawnGate::Critical(observation(guard.critical_free_commit_bytes));
-    }
-    if free < guard.warn_free_commit_bytes {
-        return SpawnGate::Warn(observation(guard.warn_free_commit_bytes));
-    }
-    SpawnGate::Proceed
+    evaluate_floors(
+        lane,
+        free,
+        guard.warn_free_commit_bytes,
+        guard.critical_free_commit_bytes,
+    )
 }
 
 /// Pure verdict over an injected thread count and the machine owner's ceilings.
@@ -2428,6 +2421,147 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
 /// shadowed-lane log [`probe_for_spawn`] writes. For a report, not a gate.
 pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
     compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone()).0
+}
+
+// =============================================================================
+// Projected cost of admitted-but-not-yet-running unattended spawns
+// =============================================================================
+
+/// What ONE admitted, not-yet-registered unattended spawn is projected to cost
+/// each resource lane once its `claude` is running.
+///
+/// ## Why admission needs a projection at all
+///
+/// Both lanes read the box AS IT IS. A continuation that has passed the guard
+/// but has not yet registered — it is still posting coord's consume claim,
+/// acquiring a worktree, warming the trust dial, creating its PTY — has no
+/// process yet, so neither reading can see it. A replay of N pending rows
+/// (`poll_pending_continuations` spawns one task per row, unbounded) therefore
+/// reads the SAME pre-burst headroom N times and admits all N. That is the
+/// 2026-10-27 spaceship incident's shape (20 continuations passed the guard at
+/// once), and it is the insight of plan
+/// `2026-10-28-gate-continuation-cap-is-a-real-permit`, carried here into the
+/// resource-lane admission instead of into a fixed count (plan
+/// `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`
+/// D2; the count stays retired by operator direction 2026-10-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectedSpawnCost {
+    /// Free commit (`MemAvailable` off Windows) one session is projected to
+    /// take — [`PER_SESSION_RSS_BYTES`], the same per-session figure the thread
+    /// ceilings are scaled by.
+    pub(crate) commit_bytes: u64,
+    /// Runner threads one session is projected to add — the measured
+    /// threads-per-session when a fresh tick measured one, else
+    /// [`PER_SESSION_THREADS_FALLBACK`].
+    pub(crate) threads: usize,
+}
+
+impl ProjectedSpawnCost {
+    /// The live projection.
+    pub(crate) fn live() -> Self {
+        Self {
+            commit_bytes: PER_SESSION_RSS_BYTES,
+            threads: measured_per_session_threads().unwrap_or(PER_SESSION_THREADS_FALLBACK),
+        }
+    }
+}
+
+/// One admission reading: both lanes' readings (or `None` for a disabled
+/// session guard, which takes no reading at all) and the projected cost of
+/// each admitted-but-not-yet-running spawn.
+///
+/// The reading is taken ONCE, outside any lock (it is a synchronous OS read);
+/// [`Self::projected`] is pure and cheap, so the caller can fold in its count
+/// of pending admissions under the lock that also records the new one. That
+/// split is what makes the bound hold across CONCURRENT guard passes.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionReading {
+    pub(crate) lanes: Option<LaneVerdicts>,
+    pub(crate) cost: ProjectedSpawnCost,
+}
+
+impl AdmissionReading {
+    /// The live reading: [`lane_verdicts`] (the ONE place the live readings are
+    /// taken, shared with `/health` `spawnAdmission`) plus
+    /// [`ProjectedSpawnCost::live`].
+    pub(crate) fn live() -> Self {
+        Self {
+            lanes: lane_verdicts(),
+            cost: ProjectedSpawnCost::live(),
+        }
+    }
+
+    /// The composed verdict once `pending` admitted-but-not-yet-running spawns
+    /// are charged against the readings. See [`projected_verdict`].
+    pub(crate) fn projected(&self, pending: usize) -> SpawnGate {
+        projected_verdict(self.lanes.as_ref(), pending, self.cost)
+    }
+}
+
+/// PURE: the composed (heavier-lane) verdict once `pending` admitted spawns
+/// that are not yet running are charged at `cost` each.
+///
+/// - `lanes: None` is a disabled guard ⇒ [`SpawnGate::Proceed`], as
+///   [`probe_for_spawn`] answers.
+/// - `pending == 0` is EXACTLY [`composed_verdict`] — the projection never
+///   changes an answer the readings alone give.
+/// - An UNREADABLE lane (`None` reading) stays unreadable: it has no opinion
+///   and projects to none, the fail-open doctrine this module is built on. So
+///   a box whose sensors cannot be read is not bounded by this projection
+///   either — it never was by the readings.
+/// - Free commit saturates at 0; the thread count saturates at `usize::MAX`.
+pub(crate) fn projected_verdict(
+    lanes: Option<&LaneVerdicts>,
+    pending: usize,
+    cost: ProjectedSpawnCost,
+) -> SpawnGate {
+    let Some(lanes) = lanes else {
+        return SpawnGate::Proceed;
+    };
+    if pending == 0 {
+        return composed_verdict(lanes);
+    }
+    let pending_bytes = cost.commit_bytes.saturating_mul(pending as u64);
+    let memory = match lanes.free_commit_bytes {
+        Some(free) => evaluate_floors(
+            lanes.memory_lane,
+            free.saturating_sub(pending_bytes),
+            lanes.warn_free_commit_bytes,
+            lanes.critical_free_commit_bytes,
+        ),
+        None => lanes.memory.clone(),
+    };
+    let threads = match lanes.threads.graded {
+        Some(graded) => evaluate_threads(
+            Some(graded.saturating_add(cost.threads.saturating_mul(pending))),
+            true,
+            ThreadCeilings {
+                warn: lanes.threads.warn_ceiling,
+                critical: lanes.threads.critical_ceiling,
+            },
+        ),
+        None => lanes.threads.verdict.clone(),
+    };
+    compose_lanes(memory, threads).0
+}
+
+/// [`evaluate`]'s comparison over explicit floors, for a caller that holds the
+/// already-folded floors ([`LaneVerdicts`]) rather than a settings struct. Same
+/// strictly-below boundaries, same critical-first order.
+fn evaluate_floors(lane: &str, free: u64, warn: u64, critical: u64) -> SpawnGate {
+    let observation = |limit: u64| GateObservation {
+        lane: lane.to_string(),
+        metric: LaneMetric::FreeCommitBytes,
+        observed: free,
+        limit,
+    };
+    if free < critical {
+        return SpawnGate::Critical(observation(critical));
+    }
+    if free < warn {
+        return SpawnGate::Warn(observation(warn));
+    }
+    SpawnGate::Proceed
 }
 
 /// The shadowed (lane, severity) [`probe_for_spawn`] last logged, so its line is
@@ -5672,5 +5806,94 @@ mod tests {
             }
         });
         assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    // ── projected_verdict ────────────────────────────────────────────────
+
+    const PROJ_COST: ProjectedSpawnCost = ProjectedSpawnCost {
+        commit_bytes: 100,
+        threads: 10,
+    };
+
+    fn proj_lanes(free: Option<u64>, graded: Option<usize>) -> LaneVerdicts {
+        let ceilings = ThreadCeilings { warn: 100, critical: 200 };
+        let floors = SessionGuardSettings {
+            warn_free_commit_bytes: 1_000,
+            critical_free_commit_bytes: 500,
+            ..SessionGuardSettings::default()
+        };
+        LaneVerdicts {
+            memory_lane: "host",
+            free_commit_bytes: free,
+            free_phys_bytes: None,
+            warn_free_commit_bytes: floors.warn_free_commit_bytes,
+            critical_free_commit_bytes: floors.critical_free_commit_bytes,
+            memory: evaluate("host", free, &floors),
+            threads: ThreadLane {
+                graded,
+                warn_ceiling: ceilings.warn,
+                critical_ceiling: ceilings.critical,
+                verdict: evaluate_threads(graded, true, ceilings),
+            },
+        }
+    }
+
+    /// Nothing pending: the projection is EXACTLY the composed verdict, so it
+    /// never changes an answer the readings alone give.
+    #[test]
+    fn projection_with_nothing_pending_is_the_composed_verdict() {
+        for lanes in [
+            proj_lanes(Some(1_500), Some(50)),
+            proj_lanes(Some(900), Some(50)),
+            proj_lanes(Some(1_500), Some(150)),
+            proj_lanes(None, None),
+        ] {
+            assert_eq!(projected_verdict(Some(&lanes), 0, PROJ_COST), composed_verdict(&lanes));
+        }
+        assert_eq!(projected_verdict(None, 99, PROJ_COST), SpawnGate::Proceed, "disabled guard");
+    }
+
+    /// Each pending admission is charged against BOTH lanes: free commit falls by
+    /// `commit_bytes` and the thread reading rises by `threads`, and the verdict
+    /// names the projected reading.
+    #[test]
+    fn projection_charges_each_pending_spawn_against_both_lanes() {
+        // 1_250 free, warn floor 1_000, 100 per spawn: 0..=2 pending proceed,
+        // 3 pending projects 950 -> Warn, 8 pending projects 450 -> Critical.
+        let mem = proj_lanes(Some(1_250), None);
+        assert_eq!(projected_verdict(Some(&mem), 2, PROJ_COST), SpawnGate::Proceed);
+        match projected_verdict(Some(&mem), 3, PROJ_COST) {
+            SpawnGate::Warn(obs) => assert_eq!((obs.observed, obs.limit), (950, 1_000)),
+            other => panic!("expected memory Warn, got {other:?}"),
+        }
+        assert!(matches!(projected_verdict(Some(&mem), 8, PROJ_COST), SpawnGate::Critical(_)));
+
+        // 75 graded threads, warn ceiling 100, 10 per spawn: 2 pending -> 95,
+        // 3 pending -> 105 > 100.
+        let thr = proj_lanes(None, Some(75));
+        assert_eq!(projected_verdict(Some(&thr), 2, PROJ_COST), SpawnGate::Proceed);
+        match projected_verdict(Some(&thr), 3, PROJ_COST) {
+            SpawnGate::Warn(obs) => {
+                assert_eq!(obs.metric, LaneMetric::ThreadCount);
+                assert_eq!((obs.observed, obs.limit), (105, 100));
+            }
+            other => panic!("expected thread Warn, got {other:?}"),
+        }
+    }
+
+    /// FAIL OPEN: an unreadable lane has no opinion and projects to none, and
+    /// the arithmetic saturates rather than wrapping.
+    #[test]
+    fn projection_leaves_unknown_readings_unknown_and_saturates() {
+        let unknown = proj_lanes(None, None);
+        assert_eq!(projected_verdict(Some(&unknown), 1_000, PROJ_COST), SpawnGate::Proceed);
+        let huge = ProjectedSpawnCost {
+            commit_bytes: u64::MAX,
+            threads: usize::MAX,
+        };
+        match projected_verdict(Some(&proj_lanes(Some(1_500), Some(1))), 2, huge) {
+            SpawnGate::Critical(obs) => assert_eq!(obs.observed, 0, "free commit saturates at 0"),
+            other => panic!("expected Critical, got {other:?}"),
+        }
     }
 }
