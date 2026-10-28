@@ -136,6 +136,13 @@ describe("stalledToast", () => {
     expect(toast.message).toContain("Claude usage limit reached");
   });
 
+  it("does not say the retry gave up when the reason says otherwise", () => {
+    const toast = stalledToast({ reason: "submit-failed", escSent: true });
+    expect(toast.message).toContain("submit-failed");
+    expect(toast.message).toContain("one Esc was sent");
+    expect(toast.message).not.toContain("gave up");
+  });
+
   it("says the reason is unknown rather than inventing one", () => {
     const toast = stalledToast({});
     expect(toast.type).toBe("error");
