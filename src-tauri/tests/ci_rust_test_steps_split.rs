@@ -741,6 +741,17 @@ fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
         "`{EMITTER}`'s `if:` must include `failure()`, got `{cond}` — a default \
          `success()` never runs on the one state it exists to explain"
     );
+    // ...and on EITHER Rust half failing: an `if:` that names only one half
+    // never annotates the other half's OOM.
+    for half in [
+        "steps.build_rust_tests.outcome == 'failure'",
+        "steps.run_rust_tests.outcome == 'failure'",
+    ] {
+        assert!(
+            cond.contains(half),
+            "`{EMITTER}`'s `if:` must include `{half}`, got `{cond}`"
+        );
+    }
     assert_eq!(
         emitter.get("continue-on-error").and_then(|v| v.as_bool()),
         Some(true),
