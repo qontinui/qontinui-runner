@@ -2923,10 +2923,6 @@ async fn vision_assert_handler(
             .collect()
     };
 
-    // Evaluated on the blocking pool for the same reason as the analyze
-    // handler: the L1 image assertions read the frame and hash, cluster and
-    // filter image crops. Everything the evaluation borrows moves in owned;
-    // the frame and snapshot come back out for the response.
     // `timelineRef`: the timeline stored on that journey edge row (plan
     // 2026-09-20 Phase 4). Unresolved, the timeline assertions stay unknown.
     // Read before the blocking hop, which only evaluates.
@@ -2944,6 +2940,10 @@ async fn vision_assert_handler(
         }
     };
 
+    // Evaluated on the blocking pool for the same reason as the analyze
+    // handler: the L1 image assertions read the frame and hash, cluster and
+    // filter image crops. Everything the evaluation borrows moves in owned;
+    // the frame and snapshot come back out for the response.
     let AssertRequest {
         assertions,
         snapshot,
