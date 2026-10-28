@@ -1262,6 +1262,7 @@ pub(crate) mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            awaiting_account_since: None,
             spawn: None,
             run: RunAccounting::default(),
         }
@@ -2009,8 +2010,8 @@ pub(crate) mod tests {
         let (store, outbox, _d) = previous_process_store(Some(
             SpawnFacts::new(SpawnOrigin::GateContinuation).gate_id(Some("g".into())),
         ));
-        store.mark_restore_pending(SID);
-        store.mark_restore_pending(SID); // a retry this boot is idempotent
+        store.mark_restore_pending(SID, true);
+        store.mark_restore_pending(SID, true); // a retry this boot is idempotent
         assert_eq!(
             events(&outbox),
             vec![("end".to_string(), 1)],
