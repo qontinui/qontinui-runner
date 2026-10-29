@@ -1142,6 +1142,71 @@ struct ReceiverRespawn<'a> {
     source_session_id: Uuid,
 }
 
+/// One respawn attempt's PTY create, on the blocking pool. `spawn_resumed_pane`
+/// is a SYNCHRONOUS create that can block for seconds to minutes, so it must not
+/// hold an async worker for its duration (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+/// D2), the same as boot resume does. Everything the create reads is cloned
+/// into the task, because a blocking task must own its inputs.
+async fn spawn_receiver_pane_off_worker(
+    effects: &ReceiverRespawn<'_>,
+    claude_bin: String,
+    policy_tenant: Option<Uuid>,
+) -> Result<String, String> {
+    let app = effects.app.clone();
+    let terminal_manager = Arc::clone(&effects.terminal_manager);
+    let session_registry = Arc::clone(&effects.session_registry);
+    let claude_session_id = effects.claude_session_id.to_string();
+    let working_dir = effects.working_dir.to_string();
+    let config_dir = effects.config_dir.to_string();
+    let model = effects.model.clone();
+    let title = effects.title.clone();
+    let page_id = effects.page_id.clone();
+    let zone_index = effects.zone_index;
+    let work_unit_slug = effects.work_unit_slug.clone();
+    let correlation_topic = effects.correlation_topic.clone();
+    let intent_repo = effects.intent_repo.clone();
+    let source_session_id = effects.source_session_id;
+    crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+        crate::terminal::account_migration::spawn_resumed_pane(
+            &app,
+            &terminal_manager,
+            &session_registry,
+            crate::terminal::account_migration::ResumeSpawn {
+                claude_bin,
+                claude_session_id: &claude_session_id,
+                working_dir: &working_dir,
+                model,
+                config_dir: &config_dir,
+                title,
+                page_id,
+                zone_index,
+                work_unit_slug,
+                correlation_topic,
+                intent_repo,
+                coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
+                    parent_session_id: Some(source_session_id),
+                    claude_code_session_id: Some(claude_session_id.clone()),
+                }),
+                // NOT the migration's `true`. A respawn genuinely CREATES
+                // something (its source is already closed and gone), so it must
+                // respect the spawn-time resource floor like every other new
+                // autonomous spawn.
+                resource_override: false,
+                // A cross-machine respawn's source session ran on ANOTHER
+                // device, so its continuation registration — and the consuming
+                // device id coord keys the outcome write on — are not this
+                // box's to carry.
+                gate_identity: None,
+                origin: crate::coord_drain_state::SpawnOrigin::Respawn,
+                policy_tenant,
+            },
+        )
+        .map(|(terminal_id, _coord_id)| terminal_id)
+    })
+    .await
+}
+
 impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
     fn claude_session_id(&self) -> &str {
         self.claude_session_id
@@ -1168,41 +1233,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
             std::path::Path::new(self.working_dir),
         )
         .await;
-        crate::terminal::account_migration::spawn_resumed_pane(
-            &self.app,
-            &self.terminal_manager,
-            &self.session_registry,
-            crate::terminal::account_migration::ResumeSpawn {
-                claude_bin,
-                claude_session_id: self.claude_session_id,
-                working_dir: self.working_dir,
-                model: self.model.clone(),
-                config_dir: self.config_dir,
-                title: self.title.clone(),
-                page_id: self.page_id.clone(),
-                zone_index: self.zone_index,
-                work_unit_slug: self.work_unit_slug.clone(),
-                correlation_topic: self.correlation_topic.clone(),
-                intent_repo: self.intent_repo.clone(),
-                coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
-                    parent_session_id: Some(self.source_session_id),
-                    claude_code_session_id: Some(self.claude_session_id.to_string()),
-                }),
-                // NOT the migration's `true`. A respawn genuinely CREATES
-                // something (its source is already closed and gone), so it must
-                // respect the spawn-time resource floor like every other new
-                // autonomous spawn.
-                resource_override: false,
-                // A cross-machine respawn's source session ran on ANOTHER
-                // device, so its continuation registration — and the consuming
-                // device id coord keys the outcome write on — are not this
-                // box's to carry.
-                gate_identity: None,
-                origin: crate::coord_drain_state::SpawnOrigin::Respawn,
-                policy_tenant,
-            },
-        )
-        .map(|(terminal_id, _coord_id)| terminal_id)
+        spawn_receiver_pane_off_worker(self, claude_bin, policy_tenant).await
     }
 
     async fn await_liveness(
