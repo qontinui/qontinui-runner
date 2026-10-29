@@ -2270,19 +2270,22 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 }
 
 /// A reqwest transport failure rendered with its FULL source chain
-/// ([`crate::util::error_chain::error_chain`]) and a leading `[timeout]` /
-/// `[connect]` tag, so a log line and `/health` `sessionOutbox.lastFailure`
-/// say WHICH transport fault it was instead of reqwest's generic
-/// "error sending request for url (…)".
+/// ([`crate::util::error_chain::error_chain`]) and a leading `[<kind>]` tag —
+/// `timeout` | `connect` | `dns` | `tls` | `body` | `other` — so a log line and
+/// `/health` `sessionOutbox.lastFailure` say WHICH transport fault it was
+/// instead of reqwest's generic "error sending request for url (…)".
+///
+/// The kind is the ONE runner classifier,
+/// `qontinui_runner_lib::outbound_net::failure_kind` (plan
+/// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+/// Phase 0 item 4, which absorbed the `[timeout]` / `[connect]` split that
+/// used to live here).
 fn transport_error(e: &reqwest::Error) -> String {
     let chain = crate::util::error_chain::error_chain(e);
-    if e.is_timeout() {
-        format!("[timeout] {chain}")
-    } else if e.is_connect() {
-        format!("[connect] {chain}")
-    } else {
-        chain
-    }
+    format!(
+        "[{}] {chain}",
+        qontinui_runner_lib::outbound_net::failure_kind(e)
+    )
 }
 
 /// Resolve which tenant binding OWNS an outbox record's session — the slot

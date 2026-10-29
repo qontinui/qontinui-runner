@@ -100,10 +100,20 @@ use crate::coord_ws::CoordWs;
 use crate::profiles::NetworkProfile;
 pub use crate::profiles::TrustMode;
 
+/// Name an outbound failure by its mechanism (`kind=`) and the runtime it was
+/// observed on (`rt=`). Plan
+/// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+/// Phase 0 item 4.
+pub mod failure_kind;
 /// The OS DNS resolver for reqwest clients, off tokio's blocking pool.
 pub mod os_dns;
 /// Corporate CA trust: the per-stack census and its measurements (Phase 5).
 pub mod tls_trust;
+pub use failure_kind::{chain_kind, current_runtime_label, failure_kind};
+
+/// D4's mechanism test: which runtime drives a pooled HTTP connection.
+#[cfg(test)]
+mod connection_driver_runtime_tests;
 
 /// Upper bound on the proxy's CONNECT response (status line plus headers).
 /// A proxy that answers with more than this is not speaking HTTP/1.1 CONNECT

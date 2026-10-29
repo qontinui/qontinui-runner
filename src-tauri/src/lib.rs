@@ -279,6 +279,12 @@ pub mod native_executable;
 // LIB crate so both crates' `spawn_blocking` sites share ONE counter.
 pub mod wedge_diagnostics;
 
+// Runtime scheduling-lag probe (plan
+// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+// Phase 0). In the LIB crate so `/health` (bin) and the heartbeats read ONE
+// registry, and so its tests run under `--lib`.
+pub mod runtime_lag;
+
 // Panic supervisor for the long-lived background loops (plan
 // `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor` Phase
 // 4). In the LIB crate because both crates start loops — `fleet`/`terminal`

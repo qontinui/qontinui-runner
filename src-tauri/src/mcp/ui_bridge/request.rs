@@ -610,15 +610,19 @@ pub(super) async fn gather_ui_error_signals(
     // stays fresh right through a hang. Computed from the same observation of
     // the pong atomic the caller already made, so the diagnostics verdict and
     // the status verdict cannot drift.
-    let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
-        probe_wedged: crate::ui_error::native_ui_probe_verdict(),
-        window_getter_unresponsive: false,
-        last_pong,
-        pong_age_ms: last_pong_age_ms,
-        last_event_pong: crate::ui_error::last_event_pong(),
-        event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
-        ping: crate::ui_error::ping_ask_now(),
-    });
+    let app_runtime_starved = crate::ui_error::app_runtime_starved_now();
+    let native_ui = crate::ui_error::apply_app_runtime_starvation(
+        crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: crate::ui_error::native_ui_probe_verdict(),
+            window_getter_unresponsive: false,
+            last_pong,
+            pong_age_ms: last_pong_age_ms,
+            last_event_pong: crate::ui_error::last_event_pong(),
+            event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+            ping: crate::ui_error::ping_ask_now(),
+        }),
+        app_runtime_starved,
+    );
     let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error.is_some(),
@@ -628,6 +632,7 @@ pub(super) async fn gather_ui_error_signals(
         embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
         pg_reachable,
         pg_schema_ok,
+        app_runtime_starved,
         ..Default::default()
     });
     let json = match &ui_error {

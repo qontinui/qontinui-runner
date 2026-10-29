@@ -1394,8 +1394,56 @@ pub struct NativeUiLiveness {
     /// but pings were not sent and left unanswered for the whole window — the
     /// input the `events_undelivered` reading depends on was never measured,
     /// so the verdict is UNKNOWN, not wedged. A Win32 probe that answered
-    /// outranks it (`"pumping"`).
+    /// outranks it (`"pumping"`). `"app_runtime_starved"` (additive,
+    /// 2026-10-30) means the same staleness was read while the runtime-lag
+    /// probe reported `app-rt` starved — see [`apply_app_runtime_starvation`].
     pub reason: &'static str,
+}
+
+/// Correct a [`classify_native_ui`] verdict for a starved APP runtime.
+///
+/// While `app-rt` is starved (`runtime_lag::app_runtime_starved()`), an event
+/// pong that could only have arrived over the Tauri-event fallback — a JS
+/// `emit`, which is an async Tauri command served on `app-rt` — cannot land.
+/// Its staleness is then a fact about the RUNTIME, not about the native loop,
+/// so `events_undelivered` is an input that was not measured and must not fire
+/// the wedge [policy: an-unknown-input-must-not-fire-a-detector]. Plan
+/// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+/// Phase 3.
+///
+/// Pure. Only the `events_undelivered` rung is withdrawn: a Win32 probe that
+/// timed out, or the caller's own unresponsive getter, measured the loop
+/// directly and still fires. When nothing else fired, `wedged` is the probe's
+/// answer, as in [`classify_native_ui`] — `Some(false)` with reason
+/// `"pumping"` when it came back, otherwise `None` with reason
+/// `"app_runtime_starved"`. A starved runtime triggers NO recovery: recreating
+/// a webview cannot fix it, and the recovery gate reads `wedged`, which this
+/// never raises. `starved` of `None` (UNKNOWN) or `Some(false)` changes
+/// nothing.
+pub fn apply_app_runtime_starvation(
+    mut v: NativeUiLiveness,
+    app_runtime_starved: Option<bool>,
+) -> NativeUiLiveness {
+    if app_runtime_starved != Some(true) || !v.events_undelivered {
+        return v;
+    }
+    v.events_undelivered = false;
+    let measured_fire = v.probe_wedged == Some(true) || v.window_getter_unresponsive;
+    if !measured_fire {
+        v.wedged = v.probe_wedged;
+        v.reason = if v.probe_wedged == Some(false) {
+            "pumping"
+        } else {
+            "app_runtime_starved"
+        };
+    }
+    v
+}
+
+/// Is `app-rt` starved right now, per the runtime-lag probe? `None` = not
+/// registered or never ticked (UNKNOWN).
+pub fn app_runtime_starved_now() -> Option<bool> {
+    qontinui_runner_lib::runtime_lag::app_runtime_starved()
 }
 
 /// Classify the native message loop. Pure — no clock, no atomics, no runtime.
@@ -1507,15 +1555,18 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
     let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
     let last_event_pong = last_event_pong();
     let ping = ping_ask_at(now_ms);
-    classify_native_ui(NativeUiInputs {
-        probe_wedged: native_ui_probe_verdict(),
-        window_getter_unresponsive: false,
-        last_pong,
-        pong_age_ms: now_ms.saturating_sub(last_pong),
-        last_event_pong,
-        event_pong_age_ms: now_ms.saturating_sub(last_event_pong),
-        ping,
-    })
+    apply_app_runtime_starvation(
+        classify_native_ui(NativeUiInputs {
+            probe_wedged: native_ui_probe_verdict(),
+            window_getter_unresponsive: false,
+            last_pong,
+            pong_age_ms: now_ms.saturating_sub(last_pong),
+            last_event_pong,
+            event_pong_age_ms: now_ms.saturating_sub(last_event_pong),
+            ping,
+        }),
+        app_runtime_starved_now(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1708,15 @@ pub struct HealthInputs {
     /// runner whose every spawned session has no coord access, which is the
     /// defect the coord-credential posture exists to make visible.
     pub coord_credential_can_answer: Option<bool>,
+    /// The runtime-lag probe reports `app-rt` starved
+    /// (`runtime_lag::app_runtime_starved()`). `Some(true)` contributes
+    /// `degraded`, never `errored`: recreating a webview cannot fix a starved
+    /// runtime, so this signal triggers no recovery. `None` is UNKNOWN (not
+    /// registered, never ticked, or a sink that does not read it) and never
+    /// degrades. Plan
+    /// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+    /// Phase 3.
+    pub app_runtime_starved: Option<bool>,
 }
 
 pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
@@ -1671,6 +1731,7 @@ pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
         || matches!(i.pg_schema_ok, Some(false))
         || matches!(i.relay_connected, Some(false))
         || matches!(i.coord_credential_can_answer, Some(false))
+        || matches!(i.app_runtime_starved, Some(true))
     {
         "degraded"
     } else {
@@ -1737,6 +1798,98 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── app-rt starvation (plan 2026-10-19-runner-ui-wedge-signal-…, Phase 3) ──
+
+    fn fired_by_events(probe_wedged: Option<bool>) -> NativeUiLiveness {
+        NativeUiLiveness {
+            probe_wedged,
+            window_getter_unresponsive: false,
+            events_undelivered: true,
+            event_pong_age_ms: Some(UI_EVENT_DEAD_AFTER_MS + 1),
+            wedged: Some(true),
+            reason: "events_undelivered",
+        }
+    }
+
+    #[test]
+    fn a_starved_app_runtime_withdraws_the_events_undelivered_wedge() {
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(true));
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, None, "UNKNOWN, never wedged and never `false`");
+        assert_eq!(v.reason, "app_runtime_starved");
+    }
+
+    #[test]
+    fn under_starvation_a_probe_that_answered_still_reads_pumping() {
+        let v = apply_app_runtime_starvation(fired_by_events(Some(false)), Some(true));
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, Some(false));
+        assert_eq!(v.reason, "pumping");
+    }
+
+    #[test]
+    fn under_starvation_a_measured_wedge_still_fires() {
+        let mut probe = fired_by_events(Some(true));
+        probe.reason = "native_probe_wedged";
+        let v = apply_app_runtime_starvation(probe, Some(true));
+        assert_eq!(
+            v.wedged,
+            Some(true),
+            "the Win32 probe measured the loop directly"
+        );
+        assert_eq!(v.reason, "native_probe_wedged");
+        assert!(
+            !v.events_undelivered,
+            "the unmeasured rung is still withdrawn"
+        );
+
+        let mut getter = fired_by_events(None);
+        getter.window_getter_unresponsive = true;
+        getter.reason = "window_getter_unresponsive";
+        let v = apply_app_runtime_starvation(getter, Some(true));
+        assert_eq!(v.wedged, Some(true));
+        assert_eq!(v.reason, "window_getter_unresponsive");
+    }
+
+    #[test]
+    fn starvation_unknown_or_false_changes_nothing() {
+        for starved in [None, Some(false)] {
+            assert_eq!(
+                apply_app_runtime_starvation(fired_by_events(None), starved),
+                fired_by_events(None),
+                "starved={starved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_starved_app_runtime_degrades_and_never_errors() {
+        let starved = HealthInputs {
+            app_runtime_starved: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(compute_derived_status(&starved), "degraded");
+        for unknown in [None, Some(false)] {
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    app_runtime_starved: unknown,
+                    ..Default::default()
+                }),
+                "healthy",
+                "starved={unknown:?} must not degrade"
+            );
+        }
+        // A real error still outranks it.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                app_runtime_starved: Some(true),
+                native_ui_wedged: Some(true),
+                ..Default::default()
+            }),
+            "errored"
+        );
+    }
 
     #[tokio::test]
     async fn first_report_sets_count_and_timestamps() {

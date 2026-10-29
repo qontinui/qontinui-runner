@@ -1587,6 +1587,9 @@ fn install_app_runtime() {
         .worker_threads(workers)
         .enable_all()
         .thread_name("app-rt")
+        // Names this runtime's SCHEDULER workers for the runtime-lag probe's
+        // attribution tally (tokio fires `on_thread_park` from workers only).
+        .on_thread_park(qontinui_runner_lib::runtime_lag::note_worker_thread)
         .build()
     {
         Ok(rt) => rt,
@@ -1601,12 +1604,27 @@ fn install_app_runtime() {
     };
 
     let handle = rt.handle().clone();
+    let lag_handle = rt.handle().clone();
     let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         tauri::async_runtime::set(handle);
     }))
     .is_ok();
 
     if installed {
+        // Plan 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-
+        // is-starved-by-process-spawns, Phase 0: measure whether `app-rt` is
+        // being scheduled, from an OS thread it cannot starve. The attribution
+        // rig is built now, at boot, so a starvation capture never has to
+        // spawn its worker thread during the incident.
+        qontinui_runner_lib::runtime_lag::install_attribution(crate::paths::get_dev_logs_dir());
+        qontinui_runner_lib::runtime_lag::register_runtime(
+            qontinui_runner_lib::runtime_lag::APP_RUNTIME_NAME,
+            &lag_handle,
+            workers,
+        );
+        // Debug builds only: `QONTINUI_DEBUG_BLOCK_APP_WORKERS_SECS=<n>` parks
+        // every `app-rt` worker once, for the Phase 0 / Phase 3 arming checks.
+        qontinui_runner_lib::runtime_lag::debug_block_workers_from_env(&lag_handle, workers);
         // Held for the life of the process; `set` took only a Handle, so
         // DROPPING this runtime would shut down the one Tauri just published.
         // `install_app_runtime` runs exactly once, so the cell is empty here —
@@ -2027,6 +2045,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .thread_name("fleet-hb-rt")
+                .on_thread_park(qontinui_runner_lib::runtime_lag::note_worker_thread)
                 .build()
             {
                 Ok(rt) => rt,
@@ -2039,6 +2058,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             rt.block_on(async {
+                qontinui_runner_lib::runtime_lag::register_runtime(
+                    "fleet-hb-rt",
+                    &tokio::runtime::Handle::current(),
+                    1,
+                );
                 // Plan `2026-09-13-drained-runner-never-reaches-idle` D2: read
                 // this device's coord drain once at boot, before any restore or
                 // resume decides against the not-yet-read (Unknown) state. The
@@ -2073,6 +2097,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 .worker_threads(1)
                 .enable_all()
                 .thread_name("fleet-pub-rt")
+                .on_thread_park(qontinui_runner_lib::runtime_lag::note_worker_thread)
                 .build()
             {
                 Ok(rt) => rt,
@@ -2086,6 +2111,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             rt.block_on(async {
+                qontinui_runner_lib::runtime_lag::register_runtime(
+                    "fleet-pub-rt",
+                    &tokio::runtime::Handle::current(),
+                    1,
+                );
                 // STARTUP-RESILIENCE (§8): the one-shot DeviceBudget publish,
                 // moved OFF the boot critical path (see the `publishers_thread_pg`
                 // comment up by the PG bootstrap). It's `await`-ed here on the

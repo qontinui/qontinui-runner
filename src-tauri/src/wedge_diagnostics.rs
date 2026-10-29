@@ -753,6 +753,14 @@ pub struct WedgeDiagnosticRecord {
     pub tracked_blocking_bodies: TrackedBlockingBodies,
     pub threads: Captured<ThreadCensus>,
     pub children: Captured<ChildCensus>,
+    /// `<collapsed thread name>[ [worker]]` × wait reason, written only by the
+    /// runtime-lag probe's `runtime_starved` capture (plan
+    /// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+    /// Phase 0 item 2): "`app-rt [worker]`: 16 in `WrPushLock`" names a
+    /// convoy without WPR. Absent from every other record, and absent (not
+    /// empty) when the per-thread walk could not be made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_by_name_and_wait: Option<BTreeMap<String, BTreeMap<String, usize>>>,
 }
 
 /// Serialize one record as a single JSONL line (trailing `\n` included).
@@ -1119,6 +1127,91 @@ fn is_session_thread(name: &str) -> bool {
         .any(|family| name.starts_with(family))
 }
 
+/// One thread of THIS process: OS thread id, its name, and its kernel wait
+/// reason (Windows `KWAIT_REASON` name, Linux `/proc` state long form). The
+/// input of [`tally_by_name_and_wait`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRow {
+    pub tid: u64,
+    pub name: String,
+    pub wait: &'static str,
+}
+
+/// Every thread of this process with its name and wait reason. `None` = could
+/// not enumerate (UNKNOWN), never an empty list.
+#[cfg(target_os = "windows")]
+pub fn capture_thread_rows() -> Option<Vec<ThreadRow>> {
+    windows_thread_census::rows().filter(|rows| !rows.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+pub fn capture_thread_rows() -> Option<Vec<ThreadRow>> {
+    let entries = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let name = std::fs::read_to_string(entry.path().join("comm"))
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .unwrap_or_default();
+        let wait = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|s| parse_proc_stat_state(&s))
+            .map(linux_state_name)
+            .unwrap_or("UnknownState");
+        rows.push(ThreadRow { tid, name, wait });
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn capture_thread_rows() -> Option<Vec<ThreadRow>> {
+    None
+}
+
+/// Tally `rows` by `<collapsed name>[ [worker]]` × wait reason. A thread whose
+/// id is in `worker_tids` is a tokio SCHEDULER worker (tokio fires
+/// `on_thread_park` only from workers); every other thread sharing the name is
+/// that runtime's blocking pool or an unrelated thread. Pure. Capped at
+/// [`MAX_THREAD_NAME_ROWS`] names, keeping the largest.
+pub fn tally_by_name_and_wait(
+    rows: &[ThreadRow],
+    worker_tids: &std::collections::HashSet<u64>,
+) -> BTreeMap<String, BTreeMap<String, usize>> {
+    let mut out: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for r in rows {
+        let base = collapse_thread_name(&r.name);
+        let key = if worker_tids.contains(&r.tid) {
+            format!("{base} [worker]")
+        } else {
+            base
+        };
+        *out.entry(key)
+            .or_default()
+            .entry(r.wait.to_string())
+            .or_insert(0) += 1;
+    }
+    if out.len() > MAX_THREAD_NAME_ROWS {
+        let mut by_size: Vec<(String, usize)> = out
+            .iter()
+            .map(|(k, v)| (k.clone(), v.values().sum()))
+            .collect();
+        by_size.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let keep: std::collections::HashSet<String> = by_size
+            .into_iter()
+            .take(MAX_THREAD_NAME_ROWS)
+            .map(|(k, _)| k)
+            .collect();
+        out.retain(|k, _| keep.contains(k));
+    }
+    out
+}
+
 /// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
 /// PURE.
 ///
@@ -1290,7 +1383,7 @@ pub fn capture_child_census() -> Option<ChildCensus> {
 #[cfg(target_os = "windows")]
 #[allow(dead_code, non_snake_case)]
 mod windows_thread_census {
-    use super::{wait_reason_name, ThreadCensus};
+    use super::{wait_reason_name, ThreadCensus, ThreadRow};
     use std::collections::BTreeMap;
 
     const SYSTEM_PROCESS_INFORMATION: u32 = 5;
@@ -1480,6 +1573,25 @@ mod windows_thread_census {
             threads
                 .iter()
                 .map(|t| thread_description(t.client_id.unique_thread as usize as u32))
+                .collect()
+        })
+    }
+
+    /// Every thread's id, description and wait reason —
+    /// [`super::capture_thread_rows`]'s arm, the join of [`census`] and
+    /// [`names`] on thread id.
+    pub(super) fn rows() -> Option<Vec<ThreadRow>> {
+        ProcessTable::read()?.with_own_threads(|threads| {
+            threads
+                .iter()
+                .map(|t| {
+                    let tid = t.client_id.unique_thread as usize as u32;
+                    ThreadRow {
+                        tid: u64::from(tid),
+                        name: thread_description(tid),
+                        wait: wait_reason_name(t.wait_reason),
+                    }
+                })
                 .collect()
         })
     }
@@ -1769,6 +1881,7 @@ impl WedgeDiagnostics {
             tracked_blocking_bodies,
             threads,
             children,
+            threads_by_name_and_wait: None,
         }
     }
 
@@ -1822,6 +1935,30 @@ impl WedgeDiagnostics {
         let record = self.sample(event, consecutive_failures, unresponsive_for);
         // The UTC day comes from the record's own timestamp, so the line and
         // the file it lands in can never disagree about which day it is.
+        let day = record.ts.get(..10).unwrap_or("unknown").to_string();
+        let line = render_record(&record);
+        self.append(&day, &line);
+    }
+
+    /// The runtime-lag probe's capture: the ordinary record plus the joint
+    /// name × wait-reason tally, with `worker_tids` (the OS ids
+    /// `runtime_lag::note_worker_thread` recorded) marking scheduler workers.
+    ///
+    /// The per-thread walk runs INLINE on the caller — the `runtime-lag-watch`
+    /// OS thread, at most once per `runtime_lag::CAPTURE_MIN_INTERVAL` — not
+    /// through the bounded capturer, whose step protocol carries the two fixed
+    /// censuses only. It is the same `NtQuerySystemInformation` read plus one
+    /// `GetThreadDescription` per thread that `capture_thread_name_census`
+    /// already pays on `/health`.
+    pub fn capture_and_append_with_tally(
+        &mut self,
+        event: &'static str,
+        unresponsive_for: Duration,
+        worker_tids: &std::collections::HashSet<u64>,
+    ) {
+        let mut record = self.sample(event, 0, unresponsive_for);
+        record.threads_by_name_and_wait =
+            capture_thread_rows().map(|rows| tally_by_name_and_wait(&rows, worker_tids));
         let day = record.ts.get(..10).unwrap_or("unknown").to_string();
         let line = render_record(&record);
         self.append(&day, &line);
@@ -2605,7 +2742,41 @@ mod tests {
                     cpu_percent: 0.0,
                 }],
             }),
+            threads_by_name_and_wait: None,
         }
+    }
+
+    #[test]
+    fn the_joint_tally_separates_workers_from_the_blocking_pool_of_one_name() {
+        let row = |tid: u64, name: &str, wait: &'static str| ThreadRow {
+            tid,
+            name: name.to_string(),
+            wait,
+        };
+        let rows = vec![
+            row(1, "app-rt", "WrPushLock"),
+            row(2, "app-rt", "WrPushLock"),
+            row(3, "app-rt", "WrQueue"),
+            row(4, "mcp-api-rt", "UserRequest"),
+        ];
+        let workers = std::collections::HashSet::from([1u64, 2]);
+        let t = tally_by_name_and_wait(&rows, &workers);
+        assert_eq!(t["app-rt [worker]"]["WrPushLock"], 2);
+        assert_eq!(
+            t["app-rt"]["WrQueue"], 1,
+            "a non-worker app-rt thread is the blocking pool"
+        );
+        assert_eq!(t["mcp-api-rt"]["UserRequest"], 1);
+        assert!(!t.contains_key("mcp-api-rt [worker]"));
+    }
+
+    #[test]
+    fn the_joint_tally_is_absent_from_every_ordinary_record() {
+        let line = render_record(&fixture_record());
+        assert!(
+            !line.contains("threads_by_name_and_wait"),
+            "the tally is written only by the runtime_starved capture: {line}"
+        );
     }
 
     #[test]

@@ -2172,18 +2172,24 @@ async fn health(
     let fd_pressure = crate::ui_error::classify_fd_pressure(fd_inputs, ping_now_ms);
     let false_death_suppressed = crate::ui_error::false_death_suppressed_count();
     let fd_starved_suppressed = crate::ui_error::fd_starved_suppressed_count();
-    let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
-        probe_wedged: crate::ui_error::native_ui_probe_verdict(),
-        window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
-        last_pong,
-        pong_age_ms,
-        last_event_pong: crate::ui_error::last_event_pong(),
-        event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
-        // From the SAME snapshot (`last_ping_emit_ok`) and clock reading the
-        // `pingDelivery` verdict beside it was classified with, so the verdict
-        // and the published `lastPingEmitOk` come from one read.
-        ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
-    });
+    // Plan 2026-10-19-runner-ui-wedge-signal-…-process-spawns, Phase 3: read
+    // ONCE, so the native verdict and `derived_status` agree on it.
+    let app_runtime_starved = crate::ui_error::app_runtime_starved_now();
+    let native_ui = crate::ui_error::apply_app_runtime_starvation(
+        crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: crate::ui_error::native_ui_probe_verdict(),
+            window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
+            last_pong,
+            pong_age_ms,
+            last_event_pong: crate::ui_error::last_event_pong(),
+            event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+            // From the SAME snapshot (`last_ping_emit_ok`) and clock reading the
+            // `pingDelivery` verdict beside it was classified with, so the verdict
+            // and the published `lastPingEmitOk` come from one read.
+            ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
+        }),
+        app_runtime_starved,
+    );
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
         has_recent_crash: recent_crash_snapshot.is_some(),
@@ -2197,6 +2203,8 @@ async fn health(
         // no refresher pass has concluded — UNKNOWN, never health.
         coord_credential_can_answer: crate::mcp::device_jwt_refresher::coord_credential_posture()
             .map(|s| s.posture.can_answer()),
+        // A starved `app-rt` is DEGRADED, never errored (no recovery).
+        app_runtime_starved,
     });
 
     // `frontendReady` is DERIVED, not latched (2026-08-05).
@@ -2564,6 +2572,14 @@ async fn health(
         // inside 250 ms), which is the log line Evidence 5 of that plan was
         // missing. `lastCohortWake: null` means none observed since boot.
         "transcriptWatcher": crate::terminal::transcript_watcher::health_snapshot(),
+        // Plan 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-
+        // starved-by-process-spawns, Phase 0: is each tokio runtime actually
+        // being scheduled? One row per registered runtime (`app-rt`,
+        // `mcp-api-rt`, `fleet-hb-rt`, `fleet-pub-rt`), measured by an OS
+        // thread, so a starved `app-rt` reads `starved: true` here while this
+        // handler runs on `mcp-api-rt`. `lastTickAgeMs` / `starved` are `null`
+        // for a runtime that has never ticked (UNKNOWN, never 0 / false).
+        "runtimes": qontinui_runner_lib::runtime_lag::runtime_lag_report(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -14135,6 +14151,7 @@ async fn serve_on_dedicated_runtime(
         .worker_threads(API_RUNTIME_WORKER_THREADS)
         .enable_all()
         .thread_name("mcp-api-rt")
+        .on_thread_park(qontinui_runner_lib::runtime_lag::note_worker_thread)
         .build()
     {
         Ok(rt) => rt,
@@ -14154,6 +14171,14 @@ async fn serve_on_dedicated_runtime(
             return axum::serve(listener, router).await.map_err(Into::into);
         }
     };
+
+    // Plan 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-
+    // starved-by-process-spawns, Phase 0: the API runtime's own lag row.
+    qontinui_runner_lib::runtime_lag::register_runtime(
+        "mcp-api-rt",
+        rt.handle(),
+        API_RUNTIME_WORKER_THREADS,
+    );
 
     // `Runtime::spawn` schedules onto `rt`'s workers from this (app-runtime)
     // thread, so no raw thread handoff is needed and there is no window in
@@ -20822,6 +20847,12 @@ mod coord_provision_session_gate_tests {
             region.contains(
                 "\"threadCeilings\": crate::resource_guard::thread_ceilings_health_json()"
             ),
+            "{region}"
+        );
+        // Plan 2026-10-19-runner-ui-wedge-signal-…-process-spawns, Phase 0:
+        // `/health.runtimes` is the lag probe's only loopback reading.
+        assert!(
+            region.contains("\"runtimes\": qontinui_runner_lib::runtime_lag::runtime_lag_report()"),
             "{region}"
         );
     }
