@@ -143,6 +143,41 @@ cargo_build_jobs = 1
 # result as RUST_TEST_THREADS and NEXTEST_TEST_THREADS, so `cargo test` no
 # longer defaults to nproc on a 32-vCPU box.
 
+# ---------------------------------------------------------------------------
+# REQUIREMENTS — declared resource FLOORS for this repo's CI checks, read by
+# coord's fit verdict (crates/coord/src/ci_fit.rs, plan
+# 2026-10-27-coord-routes-ci-jobs-by-runner-capability Phase 5). The schema is
+# CiRequirement in src-tauri/src/ci_node/manifest.rs; this lane parses it and
+# never acts on it. Coord takes max(measured, declared) per quantity, so a
+# floor only RAISES what the job's own resource reports measure, and only a
+# LOWER bound that a measurement supports belongs here. A floor above what
+# the check's runner class holds makes coord read that class INCAPABLE, and
+# once admission and routing consume the fit (plan Phases 6-7) an Incapable
+# class is refused — so a guessed number here would stall the train.
+# ---------------------------------------------------------------------------
+
+[[requirements]]
+check = "test (windows-latest)"
+os = "windows"
+# 18630 MiB = the HIGHEST Windows pagefile PeakUsage (the MEMPEAK step's
+# `peak_mb`, D:\pagefile.sys, AllocatedBaseSize 32768) over the five green
+# `test (windows-latest)` jobs of main push runs at CARGO_BUILD_JOBS=1 after
+# a29c7fb30 (2026-10-28/29: runs 40714423999, 40740392041, 40763457966,
+# 40782525943, 40795747148 read 18441, 18630, 18534, 18472, 16467). Every page
+# in the pagefile is committed memory, so the job's commit charge is AT LEAST
+# that — a strict lower bound, not an estimate (the resident half on top of it
+# is unmeasured on this configuration). It sits far under the hosted class's
+# commit limit (16378 RAM + the 32768 pagefile `Configure pagefile` sets =
+# 49146 MiB), so on its own it never reads that class Marginal: the measured
+# reports decide that. At CARGO_BUILD_JOBS=2 the same job saturated the
+# pagefile (PeakUsage 32767 in run 40698874691, 2026-10-28, build=failure, and
+# in the 2026-10-27 incident run 40449994591) — that configuration needs MORE
+# than 49146 and is not what this floor describes.
+# No min_phys_mem_mb / min_vcpu / min_disk_gb: nothing measures them for this
+# job at this configuration.
+min_commit_mb = 18630
+reason = "commit >= the 18630 MiB Windows pagefile PeakUsage measured on green CARGO_BUILD_JOBS=1 main runs 2026-10-28/29 (max of 5)"
+
 # ===========================================================================
 # STEP PARITY WITH ci.yml's `test` JOB — every gate step of that job is
 # either mirrored below, in ci.yml's order, or listed here as a DECLARED
