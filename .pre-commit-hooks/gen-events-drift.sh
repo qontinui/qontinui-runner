@@ -407,10 +407,17 @@ if [ -f "$SHARED_TARGET_LIB" ]; then
     # NOT run unguarded: a peer's stale units would make the drift verdict about
     # another tree. rc 10 (no library on this machine) builds as before.
     GUARD_RC=0
-    guard_shared_target "$RUNNER_DIR" "[gen-events-drift]" || GUARD_RC=$?
+    guard_shared_target "$RUNNER_DIR" "[gen-events-drift]" "$RUNNER_DIR/src-tauri" || GUARD_RC=$?
     case "$GUARD_RC" in
         0|10) ;;
-        *) cannot_evaluate                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}"                "retry once the peer build holding the tree lock finishes, or push from a checkout with its own CARGO_TARGET_DIR" ;;
+        1|3)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "retry once the peer build holding the tree lock finishes (raise QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT to wait longer)" ;;
+        *)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "fix the cause named above, then push again" ;;
     esac
 else
     log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"

@@ -44,6 +44,9 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT \
     QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
     CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF
+# The guard's "taking the tree lock" notice goes to /dev/tty; keep it off the
+# developer's terminal.
+export QONTINUI_PREPUSH_NO_TTY=1
 
 PASS=0
 FAIL=0
@@ -287,6 +290,34 @@ else
     fail_note "gen-events-drift.sh does not decline when the guard cannot be taken"
 fi
 
+echo "  -- the guard asks cargo which target it builds into --"
+
+# cargo's JSON escapes each backslash in target_directory. Where `cygpath`
+# exists (Git Bash) it would repair a doubled one by itself and hide a broken
+# un-escape, so this arm runs only where it does not, and says so otherwise.
+if command -v cygpath >/dev/null 2>&1; then
+    printf '  SKIP JSON un-escape arm: cygpath is on PATH and would mask a broken un-escape\n'
+    SKIP=$((SKIP + 1))
+else
+    # Every backslash is made by `printf '\134'` (octal 134 = one backslash),
+    # never typed, so no quoting layer can double- or half-count it: the JSON
+    # carries exactly TWO (an escaped one) and the answer must carry ONE.
+    BS="$(printf '\134')"
+    got="$(BS="$BS" bash -c '
+        . "$1"
+        cargo() { printf "{\"packages\":[],\"target_directory\":\"/t/a%s%sb\",\"version\":1}" "$BS" "$BS"; }
+        _shared_target_dir_of . && printf "%s" "$_SHARED_TARGET_DIR"
+    ' _ "$LIB")"
+    check "a JSON-escaped backslash in target_directory is un-escaped once" "/t/a${BS}b" "$got"
+fi
+got="$(bash -c '
+    . "$1"
+    cargo() { echo "error: could not find Cargo.toml" >&2; return 101; }
+    _shared_target_dir_of . ; printf "rc=%s err=%s" "$?" "$_SHARED_TARGET_META_ERR"
+' _ "$LIB")"
+check "a cargo metadata failure returns 1 and keeps cargo's own first error line" \
+    "rc=1 err=error: could not find Cargo.toml" "$got"
+
 echo "  -- the REAL tree-lock library: W2 after W1 re-judges W2's tree --"
 
 # The stub-library arms in push-range-test.sh pin the hook's WIRING. This one
@@ -314,7 +345,10 @@ else
     wt_fixture
     W1="$WT"
     W2="$(dirname "$WT")/wt2"
-    git -C "$PRIMARY" worktree add --quiet -b wt2-branch "$W2" >/dev/null 2>&1
+    if ! git -C "$PRIMARY" worktree add --quiet -b wt2-branch "$W2" >/dev/null 2>&1 || [ ! -f "$W2/lib.rs" ]; then
+        printf '  FATAL could not create the second worktree %s for the real-library arm\n' "$W2" >&2
+        exit 1
+    fi
     REAL_SHIM="$(dirname "$WT")/real-bin"
     mkdir -p "$REAL_SHIM"
     cat > "$REAL_SHIM/cargo" <<'SHIM'
