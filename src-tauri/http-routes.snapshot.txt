@@ -733,7 +733,6 @@ GET /ui-bridge/sdk/control/components handle_components
 GET /ui-bridge/sdk/control/console-errors handle_console_errors
 GET /ui-bridge/sdk/control/element/{id} handle_element
 GET /ui-bridge/sdk/control/element/{id}/history handle_element_history
-GET /ui-bridge/sdk/control/element/{id}/images handle_element_images
 GET /ui-bridge/sdk/control/element/{id}/state handle_element_state
 GET /ui-bridge/sdk/control/element/{id}/state-generic handle_element_state_generic
 GET /ui-bridge/sdk/control/elements handle_elements
@@ -1563,14 +1562,6 @@ POST /ui-bridge/sdk/ai/intents/execute handle_execute_intent
 POST /ui-bridge/sdk/ai/intents/execute-from-query handle_execute_intent_from_query
 POST /ui-bridge/sdk/ai/intents/find handle_find_intent
 POST /ui-bridge/sdk/ai/intents/register handle_register_intent
-POST /ui-bridge/sdk/ai/media/analyze handle_media_analyze
-POST /ui-bridge/sdk/ai/media/analyze/batch handle_media_analyze_batch
-POST /ui-bridge/sdk/ai/media/analyze/page handle_media_analyze_page
-POST /ui-bridge/sdk/ai/media/audit/accessibility handle_media_audit_accessibility
-POST /ui-bridge/sdk/ai/media/audit/performance handle_media_audit_performance
-POST /ui-bridge/sdk/ai/media/compare handle_media_compare
-POST /ui-bridge/sdk/ai/media/find handle_media_find
-POST /ui-bridge/sdk/ai/media/snapshot handle_media_snapshot
 POST /ui-bridge/sdk/ai/recovery/attempt handle_recovery_attempt
 POST /ui-bridge/sdk/ai/scoped-diff handle_ct_scoped_diff
 POST /ui-bridge/sdk/ai/search handle_ai_search
