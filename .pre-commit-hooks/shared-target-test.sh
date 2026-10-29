@@ -43,7 +43,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 # instead of the fixture.
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT \
     QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
-    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF
+    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF \
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
 # The guard's "taking the tree lock" notice goes to /dev/tty; keep it off the
 # developer's terminal.
 export QONTINUI_PREPUSH_NO_TTY=1
@@ -312,7 +313,7 @@ else
 fi
 got="$(bash -c '
     . "$1"
-    cargo() { echo "error: could not find Cargo.toml" >&2; return 101; }
+    cargo() { echo "warning: unused manifest key: x" >&2; echo "error: could not find Cargo.toml" >&2; return 101; }
     _shared_target_dir_of . ; printf "rc=%s err=%s" "$?" "$_SHARED_TARGET_META_ERR"
 ' _ "$LIB")"
 check "a cargo metadata failure returns 1 and keeps cargo's own first error line" \
