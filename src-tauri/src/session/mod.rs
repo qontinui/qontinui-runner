@@ -1506,6 +1506,13 @@ impl SessionRegistry {
                     session = %persisted_id,
                     "session: persisted coord session gone (404) — registering fresh"
                 );
+                // The pane abandons the old id for good. Rows still queued
+                // for it must not re-create it from its recorded create body
+                // (a zombie row nothing closes, or a
+                // `harness_session_already_bound` race that sends the fresh
+                // `started` into the conflict handler) — marked before the
+                // fresh row exists, so no drain tick can get there first.
+                self.coord_sync.note_superseded(persisted_id);
                 self.register_external(intent)
             }
             ResumeProbe::Unreachable => {

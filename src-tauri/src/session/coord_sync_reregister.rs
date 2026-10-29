@@ -25,16 +25,39 @@
 //! a second outbox: it holds create bodies, not events, and nothing drains it.
 //!
 //! - **One writer**: [`Reregister`]. Lines are `{"op":"created",…}` (first
-//!   sight; a later sighting of the same session appends nothing) and
-//!   `{"op":"closed",…}` (coord ACKed the session's `closed` row).
+//!   sight; a later sighting of the same session appends nothing),
+//!   `{"op":"closed",…}` (coord ACKed the session's `closed` row) and
+//!   `{"op":"superseded",…}` (a resume replaced the id with a fresh one).
 //! - **Bound**: an entry is pruned [`PRUNE_AFTER_CLOSE`] (7 days) after its
-//!   session's `closed` ACK, and the file holds at most [`MAX_SESSIONS`]
-//!   entries (oldest closed first, then oldest recorded, are evicted past it).
-//!   Pruning is lazy: on load, and whenever the append-only file has grown past
-//!   twice its live entry count, at which point it is rewritten compacted
-//!   (temp file + rename).
+//!   session's `closed` ACK (a superseded mark 7 days after it was made), and
+//!   the file holds at most [`MAX_SESSIONS`] entries. Past it the store is
+//!   evicted down to [`LOW_WATER`] (oldest closed first, then oldest recorded),
+//!   not to the cap itself — evicting only the overflow would make every new
+//!   session at the cap pay a sort and a full fsynced rewrite, on the drain
+//!   task, under the store lock. Pruning is lazy: on load, and whenever the
+//!   append-only file has grown past twice its live entry count, at which
+//!   point it is rewritten compacted (temp file + rename).
 //! - A session registered before this file existed has no entry. That is
 //!   [`ReregisterOutcome::NoBody`] by design — a body is never invented.
+//!
+//! ## Rows that must NOT be re-created
+//!
+//! A 404 for a session the runner itself has retired is not a lost row to
+//! restore — re-creating it would RESURRECT the session:
+//!
+//! - **Closed**: coord ACKed its `closed` row, then GC'd the row. A late
+//!   `finished` (the retry door, or `coord_register`'s late delivery) would
+//!   re-create it LIVE, and no `closed` ever follows.
+//! - **Superseded**: `SessionRegistry::resume_external` met a 404 for the
+//!   persisted id and registered a FRESH id. Re-creating the old id from the
+//!   rows still queued for it leaves a zombie row nothing closes — or, when the
+//!   old body carries the same harness session, wins the
+//!   `harness_session_already_bound` race and sends the fresh `started` into
+//!   the acquire-path conflict handler.
+//!
+//! [`Reregister::attempt`] answers both with [`Attempt::Retired`] and POSTs
+//! nothing; the drain drops the row (`not_found_closed` /
+//! `not_found_superseded`).
 //!
 //! ## The re-register (D1)
 //!
@@ -49,7 +72,10 @@
 //!
 //! At most one POST per session per [`REREGISTER_WINDOW`] (10 minutes),
 //! whatever its outcome — a coord that keeps refusing is asked again on that
-//! budget, not on every drain retry.
+//! budget, not on every drain retry. A DETERMINISTIC answer (409, another 4xx,
+//! no recorded body) is remembered for the window, so the session's next row
+//! gets the same answer without a POST: the drain drops each such row rather
+//! than holding every row after the first behind a spent budget.
 //!
 //! ## Counters (`GET /health` `sessionOutbox`)
 //!
@@ -86,6 +112,11 @@ pub(crate) const PRUNE_AFTER_CLOSE: Duration = Duration::from_secs(7 * 24 * 60 *
 /// bounds the file at a few MiB even if no session ever closes.
 pub(crate) const MAX_SESSIONS: usize = 10_000;
 
+/// What the store is evicted down to once it passes [`MAX_SESSIONS`] (90% of
+/// it), so the sort + compaction that eviction costs is paid once per
+/// `MAX_SESSIONS - LOW_WATER` new sessions instead of once per session.
+pub(crate) const LOW_WATER: usize = MAX_SESSIONS / 10 * 9;
+
 /// `<outbox>.created.jsonl` — the create-body sidecar beside the outbox.
 pub(crate) fn created_path(outbox_path: &Path) -> PathBuf {
     let name = outbox_path
@@ -114,10 +145,37 @@ pub(crate) enum ReregisterOutcome {
     Transport(String),
 }
 
-/// [`Reregister::attempt`]'s answer: the budget refused the POST, or one ran.
+impl ReregisterOutcome {
+    /// Whether every retry would get the same answer: a 409, another 4xx, or
+    /// no recorded body. Such an outcome ends the row (the drain drops it) and
+    /// is remembered for the budget window; `Created` and `Transport` are not.
+    pub(crate) fn is_deterministic(&self) -> bool {
+        matches!(
+            self,
+            Self::Collision(_) | Self::Refused { .. } | Self::NoBody
+        )
+    }
+}
+
+/// Why a session's row must not be re-created at all (see the module doc,
+/// "Rows that must NOT be re-created").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retired {
+    /// Coord ACKed the session's `closed` row.
+    Closed,
+    /// A resume replaced the id with a fresh one.
+    Superseded,
+}
+
+/// [`Reregister::attempt`]'s answer: the session is retired, the budget
+/// refused the POST, or one ran (or its deterministic answer was remembered).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Attempt {
-    /// A re-register for this session already ran inside the window.
+    /// The session is closed or superseded: nothing was sent, and nothing may
+    /// re-create it.
+    Retired(Retired),
+    /// A re-register for this session already ran inside the window and its
+    /// answer was not deterministic (it created the row, or got no answer).
     BudgetSpent,
     Done(ReregisterOutcome),
 }
@@ -239,6 +297,10 @@ enum Line {
         session_id: Uuid,
         closed_at: DateTime<Utc>,
     },
+    Superseded {
+        session_id: Uuid,
+        superseded_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -253,8 +315,15 @@ struct Entry {
 struct Store {
     path: PathBuf,
     entries: HashMap<Uuid, Entry>,
+    /// Ids a resume replaced, and when. Kept apart from `entries` because the
+    /// superseded id may have no recorded body (registered before this file
+    /// existed) and must still never be re-created.
+    superseded: HashMap<Uuid, DateTime<Utc>>,
     /// Lines in the file, so the append-only growth can trigger a compaction.
     lines: usize,
+    /// How many times the file has been rewritten — what a test reads to see
+    /// that eviction at the cap is amortised rather than paid per session.
+    compactions: u64,
 }
 
 impl Store {
@@ -262,7 +331,9 @@ impl Store {
         let mut store = Store {
             path,
             entries: HashMap::new(),
+            superseded: HashMap::new(),
             lines: 0,
+            compactions: 0,
         };
         let text = match std::fs::read_to_string(&store.path) {
             Ok(t) => t,
@@ -324,18 +395,28 @@ impl Store {
                     e.closed_at.get_or_insert(closed_at);
                 }
             }
+            Line::Superseded {
+                session_id,
+                superseded_at,
+            } => {
+                self.superseded.entry(session_id).or_insert(superseded_at);
+            }
         }
     }
 
-    /// Drop entries closed more than [`PRUNE_AFTER_CLOSE`] ago, then evict
-    /// past [`MAX_SESSIONS`]. Returns how many were removed.
+    /// Drop entries closed (and superseded marks made) more than
+    /// [`PRUNE_AFTER_CLOSE`] ago, then — only once either map is past
+    /// [`MAX_SESSIONS`] — evict it down to [`LOW_WATER`]. Returns how many
+    /// were removed.
     fn prune(&mut self, now: DateTime<Utc>) -> usize {
-        let before = self.entries.len();
+        let before = self.entries.len() + self.superseded.len();
         let horizon = chrono::Duration::seconds(PRUNE_AFTER_CLOSE.as_secs() as i64);
         self.entries.retain(|_, e| {
             e.closed_at
                 .is_none_or(|c| now.signed_duration_since(c) <= horizon)
         });
+        self.superseded
+            .retain(|_, at| now.signed_duration_since(*at) <= horizon);
         if self.entries.len() > MAX_SESSIONS {
             // Closed sessions go first (oldest close first), then the oldest
             // recorded open ones.
@@ -351,16 +432,25 @@ impl Store {
                 })
                 .collect();
             order.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-            let excess = self.entries.len() - MAX_SESSIONS;
+            let excess = self.entries.len() - LOW_WATER;
             for (id, _, _) in order.into_iter().take(excess) {
                 self.entries.remove(&id);
             }
         }
-        before - self.entries.len()
+        if self.superseded.len() > MAX_SESSIONS {
+            let mut order: Vec<(Uuid, DateTime<Utc>)> =
+                self.superseded.iter().map(|(id, at)| (*id, *at)).collect();
+            order.sort_by_key(|(_, at)| *at);
+            let excess = self.superseded.len() - LOW_WATER;
+            for (id, _) in order.into_iter().take(excess) {
+                self.superseded.remove(&id);
+            }
+        }
+        before - self.entries.len() - self.superseded.len()
     }
 
     fn needs_compaction(&self) -> bool {
-        self.lines > 2 * self.entries.len() + 64
+        self.lines > 2 * (self.entries.len() + self.superseded.len()) + 64
     }
 
     fn append(&mut self, line: &Line) -> std::io::Result<()> {
@@ -400,6 +490,15 @@ impl Store {
                 lines += 1;
             }
         }
+        for (id, at) in &self.superseded {
+            let superseded = Line::Superseded {
+                session_id: *id,
+                superseded_at: *at,
+            };
+            buf.push_str(&serde_json::to_string(&superseded).map_err(std::io::Error::other)?);
+            buf.push('\n');
+            lines += 1;
+        }
         let tmp = self.path.with_extension("jsonl.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
@@ -408,6 +507,7 @@ impl Store {
         }
         std::fs::rename(&tmp, &self.path)?;
         self.lines = lines;
+        self.compactions += 1;
         Ok(())
     }
 
@@ -422,7 +522,9 @@ impl Store {
         }
     }
 
-    /// Append, then compact lazily once the file has outgrown its entries.
+    /// Append, then compact lazily once the file has outgrown its entries. At
+    /// the cap, `prune` evicts down to [`LOW_WATER`], so the next eviction is
+    /// `MAX_SESSIONS - LOW_WATER` sessions away rather than one.
     fn append_logged(&mut self, line: &Line, now: DateTime<Utc>) {
         if let Err(e) = self.append(line) {
             tracing::warn!(
@@ -433,7 +535,10 @@ impl Store {
             );
             return;
         }
-        if self.entries.len() > MAX_SESSIONS || self.needs_compaction() {
+        if self.entries.len() > MAX_SESSIONS
+            || self.superseded.len() > MAX_SESSIONS
+            || self.needs_compaction()
+        {
             self.prune(now);
             self.compact_logged();
         }
@@ -449,10 +554,11 @@ impl Store {
 #[derive(Debug)]
 pub(crate) struct Reregister {
     store: Mutex<Store>,
-    /// When each session's last re-register POST went out. Pruned to the
-    /// window on every budget check, so bounded by the sessions re-registered
-    /// in the last [`REREGISTER_WINDOW`].
-    last_attempt: Mutex<HashMap<Uuid, Instant>>,
+    /// When each session's last re-register POST went out, and its answer when
+    /// that answer was deterministic ([`ReregisterOutcome::is_deterministic`]).
+    /// Pruned to the window on every budget check, so bounded by the sessions
+    /// re-registered in the last [`REREGISTER_WINDOW`].
+    last_attempt: Mutex<HashMap<Uuid, (Instant, Option<ReregisterOutcome>)>>,
     /// The budget window in milliseconds ([`REREGISTER_WINDOW`] unless a test
     /// overrides it).
     window_ms: AtomicU64,
@@ -487,18 +593,26 @@ impl Reregister {
         Duration::from_millis(self.window_ms.load(Ordering::Relaxed))
     }
 
-    /// Whether a create body is already recorded for `session_id`.
+    /// Whether a create body is already recorded for `session_id`. A poisoned
+    /// lock answers `false`, so the caller goes on to [`Self::record_body`],
+    /// which logs the poisoned store instead of the recording stopping
+    /// silently.
     pub(crate) fn has_body(&self, session_id: Uuid) -> bool {
         self.store
             .lock()
             .map(|s| s.entries.contains_key(&session_id))
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Record `body` for `session_id` on first sight; a session already
     /// recorded is left untouched (no duplicate line).
     pub(crate) fn record_body(&self, session_id: Uuid, body: JsonValue, tenant_id: Option<Uuid>) {
         let Ok(mut store) = self.store.lock() else {
+            tracing::warn!(
+                session = %session_id,
+                "coord_sync: create-body sidecar lock poisoned — this session's body is NOT \
+                 recorded, so a 404 for it cannot be re-created"
+            );
             return;
         };
         if store.entries.contains_key(&session_id) {
@@ -542,6 +656,47 @@ impl Reregister {
         );
     }
 
+    /// A resume replaced `session_id` with a fresh id
+    /// (`SessionRegistry::resume_external`'s 404 fallback): never re-create it.
+    /// Persisted, so rows for the old id still queued after a restart are
+    /// refused too.
+    pub(crate) fn note_superseded(&self, session_id: Uuid) {
+        let Ok(mut store) = self.store.lock() else {
+            tracing::warn!(
+                session = %session_id,
+                "coord_sync: create-body sidecar lock poisoned — the superseded mark is NOT \
+                 recorded"
+            );
+            return;
+        };
+        if store.superseded.contains_key(&session_id) {
+            return;
+        }
+        let now = Utc::now();
+        store.superseded.insert(session_id, now);
+        store.append_logged(
+            &Line::Superseded {
+                session_id,
+                superseded_at: now,
+            },
+            now,
+        );
+    }
+
+    /// Whether `session_id` is retired — superseded, or closed (its `closed`
+    /// row ACKed) — so a 404 for it must not re-create the row.
+    pub(crate) fn retired(&self, session_id: Uuid) -> Option<Retired> {
+        let store = self.store.lock().ok()?;
+        if store.superseded.contains_key(&session_id) {
+            return Some(Retired::Superseded);
+        }
+        store
+            .entries
+            .get(&session_id)
+            .and_then(|e| e.closed_at)
+            .map(|_| Retired::Closed)
+    }
+
     /// The recorded create body for `session_id`, if any.
     pub(crate) fn recorded(&self, session_id: Uuid) -> Option<RecordedBody> {
         let store = self.store.lock().ok()?;
@@ -551,26 +706,43 @@ impl Reregister {
         })
     }
 
-    /// Take the session's re-register budget: `true` (and the clock starts)
-    /// unless a POST for it already went out inside the window.
-    fn take_budget(&self, session_id: Uuid) -> bool {
+    /// Take the session's re-register budget: `Ok(())` (and the clock starts)
+    /// unless a POST for it already went out inside the window, in which case
+    /// `Err` carries that POST's answer when it was deterministic.
+    fn take_budget(&self, session_id: Uuid) -> Result<(), Option<ReregisterOutcome>> {
         let window = self.window();
         let now = Instant::now();
         let Ok(mut last) = self.last_attempt.lock() else {
-            return false;
+            return Err(None);
         };
-        last.retain(|_, at| now.saturating_duration_since(*at) < window);
-        if last.contains_key(&session_id) {
-            return false;
+        last.retain(|_, (at, _)| now.saturating_duration_since(*at) < window);
+        if let Some((_, settled)) = last.get(&session_id) {
+            return Err(settled.clone());
         }
-        last.insert(session_id, now);
-        true
+        last.insert(session_id, (now, None));
+        Ok(())
     }
 
-    /// One budgeted re-register of `session_id`: the budget check, the POST
-    /// ([`reregister`]), and the counters. A [`ReregisterOutcome::NoBody`]
-    /// spends the budget too, so a session with no body is counted at most
-    /// once per window rather than on every drain retry.
+    /// Remember a deterministic answer for the rest of the session's window.
+    fn settle(&self, session_id: Uuid, outcome: &ReregisterOutcome) {
+        if !outcome.is_deterministic() {
+            return;
+        }
+        if let Ok(mut last) = self.last_attempt.lock() {
+            if let Some((_, settled)) = last.get_mut(&session_id) {
+                *settled = Some(outcome.clone());
+            }
+        }
+    }
+
+    /// One budgeted re-register of `session_id`: the retired check, the
+    /// budget check, the POST ([`reregister`]), and the counters. A retired
+    /// session is answered [`Attempt::Retired`] with no POST and no budget
+    /// spent. A [`ReregisterOutcome::NoBody`] spends the budget too, so a
+    /// session with no body is counted at most once per window rather than on
+    /// every drain retry; inside the window a deterministic answer is returned
+    /// again from memory (no POST, no recount), so each of the session's rows
+    /// meets the same answer.
     pub(crate) async fn attempt(
         &self,
         http: &reqwest::Client,
@@ -578,11 +750,23 @@ impl Reregister {
         session_id: Uuid,
         fallback_scope: TenantScope,
     ) -> Attempt {
-        if !self.take_budget(session_id) {
-            return Attempt::BudgetSpent;
+        if let Some(retired) = self.retired(session_id) {
+            tracing::warn!(
+                session = %session_id,
+                retired = ?retired,
+                "coord_sync: coord has no row for a session this runner already retired \
+                 (closed, or superseded by a fresh id) — NOT re-creating it; the row is dropped"
+            );
+            return Attempt::Retired(retired);
+        }
+        match self.take_budget(session_id) {
+            Ok(()) => {}
+            Err(Some(settled)) => return Attempt::Done(settled),
+            Err(None) => return Attempt::BudgetSpent,
         }
         let recorded = self.recorded(session_id);
         let outcome = reregister(http, base, session_id, recorded, fallback_scope).await;
+        self.settle(session_id, &outcome);
         match &outcome {
             ReregisterOutcome::Created => {
                 self.created.fetch_add(1, Ordering::Relaxed);
@@ -598,8 +782,8 @@ impl Reregister {
                     session = %session_id,
                     code = %code,
                     "coord_sync: re-register POST /sessions answered 409 — the id is held \
-                     elsewhere; the session is ORPHANED and its lifecycle rows are held, not \
-                     dropped (no conflict modal: this is not an acquire)"
+                     elsewhere; the session is ORPHANED and its rows are dropped \
+                     (orphaned_id_collision; no conflict modal: this is not an acquire)"
                 );
             }
             ReregisterOutcome::Refused { status } => {
@@ -607,8 +791,9 @@ impl Reregister {
                 tracing::warn!(
                     session = %session_id,
                     status,
-                    "coord_sync: coord refused to re-create the session row — its lifecycle \
-                     rows are held and re-tried on the re-register budget"
+                    "coord_sync: coord refused to re-create the session row — it would refuse \
+                     the same body again, so the session's rows are dropped \
+                     (orphaned_reregister_refused)"
                 );
             }
             ReregisterOutcome::NoBody => {
@@ -617,7 +802,8 @@ impl Reregister {
                     session = %session_id,
                     "coord_sync: coord has no row for this session and no create body is \
                      recorded for it (registered before the sidecar existed, or never seen \
-                     pending) — its lifecycle rows are held, never posted with an invented body"
+                     pending) — its rows are dropped (orphaned_no_body), never posted with an \
+                     invented body"
                 );
             }
             ReregisterOutcome::Transport(e) => tracing::warn!(
@@ -717,45 +903,100 @@ mod tests {
         assert!(reloaded.has_body(recent) && reloaded.has_body(open));
     }
 
+    fn empty_store(path: PathBuf) -> Store {
+        Store {
+            path,
+            entries: HashMap::new(),
+            superseded: HashMap::new(),
+            lines: 0,
+            compactions: 0,
+        }
+    }
+
+    fn open_entry(recorded_at: DateTime<Utc>) -> Entry {
+        Entry {
+            body: json!({}),
+            tenant_id: None,
+            recorded_at,
+            closed_at: None,
+        }
+    }
+
     #[test]
     fn the_store_is_capped_evicting_closed_sessions_first() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store {
-            path: dir.path().join("c.jsonl"),
-            entries: HashMap::new(),
-            lines: 0,
-        };
+        let mut store = empty_store(dir.path().join("c.jsonl"));
         let closed = Uuid::new_v4();
         let base = now() - chrono::Duration::days(1);
         store.entries.insert(
             closed,
             Entry {
-                body: json!({}),
-                tenant_id: None,
-                recorded_at: base,
                 closed_at: Some(now()),
+                ..open_entry(base)
             },
         );
-        let mut oldest_open = None;
+        let mut opens = Vec::with_capacity(MAX_SESSIONS);
         for i in 0..MAX_SESSIONS {
             let id = Uuid::new_v4();
-            if i == 0 {
-                oldest_open = Some(id);
-            }
+            opens.push(id);
+            store
+                .entries
+                .insert(id, open_entry(base + chrono::Duration::seconds(i as i64)));
+        }
+        assert_eq!(store.prune(now()), MAX_SESSIONS + 1 - LOW_WATER);
+        assert_eq!(
+            store.entries.len(),
+            LOW_WATER,
+            "evicted to the low-water mark"
+        );
+        assert!(!store.entries.contains_key(&closed), "closed goes first");
+        let evicted_opens = MAX_SESSIONS - LOW_WATER;
+        assert!(
+            opens[..evicted_opens]
+                .iter()
+                .all(|id| !store.entries.contains_key(id)),
+            "then the oldest recorded open ones"
+        );
+        assert!(opens[evicted_opens..]
+            .iter()
+            .all(|id| store.entries.contains_key(id)));
+    }
+
+    /// At the cap, eviction (a sort plus a full fsynced rewrite under the
+    /// store lock, on the drain task) is paid once per
+    /// `MAX_SESSIONS - LOW_WATER` new sessions — not once per new session, as
+    /// evicting only the overflow would.
+    #[test]
+    fn eviction_at_the_cap_is_amortised() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = empty_store(dir.path().join("c.jsonl"));
+        let base = now() - chrono::Duration::days(1);
+        for i in 0..MAX_SESSIONS {
             store.entries.insert(
-                id,
-                Entry {
-                    body: json!({}),
-                    tenant_id: None,
-                    recorded_at: base + chrono::Duration::seconds(i as i64),
-                    closed_at: None,
-                },
+                Uuid::new_v4(),
+                open_entry(base + chrono::Duration::seconds(i as i64)),
             );
         }
-        assert_eq!(store.prune(now()), 1);
-        assert_eq!(store.entries.len(), MAX_SESSIONS);
-        assert!(!store.entries.contains_key(&closed), "closed goes first");
-        assert!(store.entries.contains_key(&oldest_open.unwrap()));
+        store.lines = MAX_SESSIONS; // the file matches the entries
+        for _ in 0..100 {
+            let id = Uuid::new_v4();
+            let t = now();
+            store.entries.insert(id, open_entry(t));
+            store.append_logged(
+                &Line::Created {
+                    session_id: id,
+                    body: json!({}),
+                    tenant_id: None,
+                    recorded_at: t,
+                },
+                t,
+            );
+        }
+        assert_eq!(
+            store.compactions, 1,
+            "one eviction to the low-water mark, then 99 plain appends"
+        );
+        assert_eq!(store.entries.len(), LOW_WATER + 99);
     }
 
     #[test]
@@ -763,11 +1004,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = Reregister::open(&dir.path().join("outbox.jsonl"));
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        assert!(r.take_budget(a));
-        assert!(!r.take_budget(a), "inside the window");
-        assert!(r.take_budget(b), "per session");
+        assert_eq!(r.take_budget(a), Ok(()));
+        assert_eq!(r.take_budget(a), Err(None), "inside the window");
+        assert_eq!(r.take_budget(b), Ok(()), "per session");
         r.set_window(Duration::from_millis(0));
-        assert!(r.take_budget(a), "a spent window re-grants it");
+        assert_eq!(r.take_budget(a), Ok(()), "a spent window re-grants it");
+    }
+
+    /// A deterministic answer is remembered for the window (the next row gets
+    /// it without a POST); a `Created` or `Transport` one is not.
+    #[test]
+    fn a_deterministic_answer_is_remembered_for_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Reregister::open(&dir.path().join("outbox.jsonl"));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(r.take_budget(a), Ok(()));
+        r.settle(a, &ReregisterOutcome::NoBody);
+        assert_eq!(r.take_budget(a), Err(Some(ReregisterOutcome::NoBody)));
+        assert_eq!(r.take_budget(b), Ok(()));
+        r.settle(b, &ReregisterOutcome::Created);
+        assert_eq!(r.take_budget(b), Err(None));
+    }
+
+    /// A closed session (its `closed` ACKed) and a superseded id are retired;
+    /// the superseded mark needs no recorded body and survives a reload.
+    #[test]
+    fn closed_and_superseded_sessions_are_retired_across_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join("outbox.jsonl");
+        let r = Reregister::open(&outbox);
+        let (open, closed, superseded) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        r.record_body(open, json!({"id": open}), None);
+        r.record_body(closed, json!({"id": closed}), None);
+        r.note_closed(closed);
+        r.note_superseded(superseded); // no body recorded for it
+        r.note_superseded(superseded); // idempotent
+        assert_eq!(r.retired(open), None);
+        assert_eq!(r.retired(closed), Some(Retired::Closed));
+        assert_eq!(r.retired(superseded), Some(Retired::Superseded));
+
+        let again = Reregister::open(&outbox);
+        assert_eq!(again.retired(open), None);
+        assert_eq!(again.retired(closed), Some(Retired::Closed));
+        assert_eq!(again.retired(superseded), Some(Retired::Superseded));
+        let text = std::fs::read_to_string(created_path(&outbox)).unwrap();
+        assert_eq!(
+            text.matches("\"op\":\"superseded\"").count(),
+            1,
+            "one line per mark: {text}"
+        );
+    }
+
+    /// A poisoned store answers `has_body` false, so the caller reaches
+    /// `record_body` (which logs) rather than recording stopping silently.
+    #[test]
+    fn a_poisoned_store_reports_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Reregister::open(&dir.path().join("outbox.jsonl"));
+        let s = Uuid::new_v4();
+        r.record_body(s, json!({"id": s}), None);
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _g = r.store.lock().unwrap();
+                    panic!("poison the store");
+                })
+                .join()
+        });
+        assert!(r.store.is_poisoned());
+        assert!(!r.has_body(s), "poisoned is not 'already recorded'");
     }
 
     #[test]

@@ -807,7 +807,10 @@ pub struct FinishSessionRequest {
 ///   `"pending"` (an unACKed `Finished` row for this mark is in the session
 ///   outbox) > `"dropped:<reason>"` (the drain dropped the mark's row without
 ///   coord taking it: `refused_4xx`, `not_found`, `quarantine_cap`,
-///   `quarantined` or `outbox_trim`, and nothing has re-queued it since; the
+///   `quarantined`, `outbox_trim`, or — coord had no row and it was not
+///   re-created — `not_found_closed`, `not_found_superseded`,
+///   `orphaned_no_body`, `orphaned_id_collision` or
+///   `orphaned_reregister_refused`; and nothing has re-queued it since; the
 ///   record carries it as `session.finishDelivery`) > `"unknown"`. `unknown`
 ///   covers an outbox that could not be read AND one that was read with no
 ///   row for this mark and no drop recorded; it is never read as delivered.
@@ -816,7 +819,10 @@ pub struct FinishSessionRequest {
 ///   unsynced one, so on a call that re-queued it `delivery` reads `pending`
 ///   and `coord.requeuedAfterDrop` (`{state, reason, at}`, else `null`)
 ///   carries the drop it superseded. `dropped:<reason>` is therefore what a
-///   call answers when it could NOT re-queue (`coord.queued: false`).
+///   call answers when it could NOT re-queue (`coord.queued: false`). While
+///   a row for the mark is still pending the retry door queues nothing more
+///   (`coord.queued: false`, `coord.reason: "already_pending"`, `delivery:
+///   "pending"`), so polling the read-back never grows the outbox.
 ///
 /// Honest local-only cases: a session whose harness id changed inside the
 /// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
@@ -839,9 +845,27 @@ async fn finish_session(
         .ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             "session lifecycle store unavailable".to_string(),
-        ))?;
+        ))?
+        .inner()
+        .clone();
 
-    apply_finish(store.inner(), &id, req).map(Json)
+    // Off the async worker: `apply_finish` persists the lifecycle record, and
+    // the `coord.delivery` probe reads the outbox file from its cursor while
+    // holding the outbox's write lock — blocking I/O that must not stall a
+    // runtime thread (or every other append waiting on that lock behind it).
+    let target = id.clone();
+    spawn_blocking_tracked(move || apply_finish(&store, &target, req))
+        .await
+        .map_err(|join_err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "finish for session `{id}` did not complete ({join_err}) — whether the \
+                     marker was written is unknown"
+                ),
+            )
+        })?
+        .map(Json)
 }
 
 /// The finish route's body, minus axum — pure over the store so the response
@@ -1900,6 +1924,57 @@ mod tests {
         assert!(read["session"]["finishDelivery"].is_null());
     }
 
+    /// A caller polling the reason-less read-back while the finish's row is
+    /// still queued (coord cannot take it yet) gets `pending` on every poll
+    /// and adds NO row: the retry door re-offers the write only when no row
+    /// for this mark is pending. Before, each poll appended another
+    /// `finished` row behind the stuck head.
+    #[test]
+    fn polling_the_read_back_while_the_finish_is_pending_queues_no_second_row() {
+        let coord_id = uuid::Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg =
+            AiCoordRegistrar::with_tenant_resolver(outbox.clone(), uuid::Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_id));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+            let probe = outbox.clone();
+            store.attach_finish_pending_probe(move |rec| {
+                probe.has_pending_finished(&rec.claude_session_id, rec.finished_at)
+            });
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+        let finished_rows = || {
+            outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .filter(|r| r.event_kind == "finished")
+                .count()
+        };
+
+        let first = apply_finish(&store, "s", finish_req(Some("done"))).unwrap();
+        assert_eq!(first["coord"]["queued"], true);
+        assert_eq!(finished_rows(), 1);
+
+        for _ in 0..5 {
+            let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+            assert_eq!(read["changed"], "none");
+            assert_eq!(read["coord"]["queued"], false, "{read}");
+            assert_eq!(read["coord"]["reason"], "already_pending", "{read}");
+            assert_eq!(read["coord"]["delivery"], "pending", "{read}");
+        }
+        assert_eq!(finished_rows(), 1, "five polls, still one finished row");
+    }
+
     #[test]
     fn re_finishing_is_200_changed_none_not_404() {
         let (store, _reg, _dir) = finish_fixture(None);
@@ -2021,12 +2096,15 @@ mod tests {
         assert_eq!(again["coord"]["coordSessionId"], coord_id.to_string());
         assert_eq!(again["session"]["finishSynced"], false);
 
-        // The read-back (no reason): reads, re-offers the owed write, and does
-        // NOT restamp — so it can observe the new mark's ACK.
+        // The read-back (no reason): reads, and does NOT restamp — so it can
+        // observe the new mark's ACK. The restamp's row is still pending, so
+        // it queues no second one.
         let read = apply_finish(&store, "s", finish_req(None)).unwrap();
         assert_eq!(read["changed"], "none");
         assert_eq!(read["session"]["finishedAt"], again_at);
-        assert_eq!(read["coord"]["queued"], true);
+        assert_eq!(read["coord"]["queued"], false);
+        assert_eq!(read["coord"]["reason"], "already_pending");
+        assert_eq!(read["coord"]["delivery"], "pending");
         store.mark_finish_synced("s", Some(first_at)); // the OLD row's late ACK
         assert_eq!(
             apply_finish(&store, "s", finish_req(None)).unwrap()["session"]["finishSynced"],

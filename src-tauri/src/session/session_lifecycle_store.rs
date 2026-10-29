@@ -524,7 +524,10 @@ impl SessionIdentityUpdate {
 pub struct FinishDelivery {
     pub state: FinishDeliveryState,
     /// Why the drain dropped the row — `refused_4xx`, `not_found`,
-    /// `quarantine_cap`, `quarantined` or `outbox_trim`.
+    /// `quarantine_cap`, `quarantined`, `outbox_trim`, or one of the
+    /// missing-row reasons (`not_found_closed`, `not_found_superseded`,
+    /// `orphaned_no_body`, `orphaned_id_collision`,
+    /// `orphaned_reregister_refused`; see `coord_sync_drops`).
     pub reason: String,
     /// When the drop was observed, unix epoch millis.
     pub at: i64,
@@ -1221,6 +1224,12 @@ pub enum LocalOnlyReason {
     /// owed and none was queued: a no-op re-run on a synced mark, or a no-op
     /// unmark.
     NotRequeued,
+    /// The retry door found an unACKed `Finished` row for this very mark
+    /// already in the outbox, so it queued no second one: the write is owed
+    /// and on its way (`coord.delivery` reads `pending`). Without this a caller
+    /// polling the reason-less read-back appended one more row per poll behind
+    /// a row that could not land yet.
+    AlreadyPending,
 }
 
 impl LocalOnlyReason {
@@ -1231,6 +1240,7 @@ impl LocalOnlyReason {
             Self::OutboxWriteFailed => "outbox_write_failed",
             Self::NoForwarder => "no_forwarder",
             Self::NotRequeued => "not_requeued",
+            Self::AlreadyPending => "already_pending",
         }
     }
 }
@@ -2722,12 +2732,13 @@ impl SessionLifecycleStore {
     /// be pushed again by a reason-less re-run. A duplicate enqueue is harmless
     /// (idempotent path-addressed PATCH).
     ///
-    /// Each re-run while the mark stays unsynced appends one more `Finished`
-    /// row, including while an earlier one is still pending: the outbox has
-    /// no side-effect-free "is a row for this session pending" probe (its
-    /// `pending()` is the drain loop's cursor-bearing scan), so the count is
-    /// bounded by operator re-runs rather than deduplicated, and each row is
-    /// the same idempotent PATCH.
+    /// The retry door appends a `Finished` row only when none for this mark
+    /// is already pending: it asks the read-only outbox probe
+    /// (`finish_pending_probe`) first, and on `Some(true)` queues nothing
+    /// ([`LocalOnlyReason::AlreadyPending`]). Otherwise a caller polling the
+    /// read-back while the row could not land grew the outbox by one row per
+    /// poll. An unreadable outbox (`None`) or no probe re-offers as before —
+    /// a duplicate is the same idempotent PATCH, and a lost write is worse.
     ///
     /// Calls are serialized end to end (`finish_forward`), so the retry's
     /// snapshot cannot be overtaken by a concurrent unmark: the order coord's
@@ -2772,7 +2783,11 @@ impl SessionLifecycleStore {
             // this snapshot and its enqueue.
             drop(m);
             let coord = if current.finished_at.is_some() && !current.finish_synced {
-                self.forward_finish_change(&current)
+                if self.finish_pending(&current) == Some(true) {
+                    FinishSync::LocalOnly(LocalOnlyReason::AlreadyPending)
+                } else {
+                    self.forward_finish_change(&current)
+                }
             } else {
                 FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
             };
@@ -2861,11 +2876,18 @@ impl SessionLifecycleStore {
     /// lock released: the probe takes the outbox's lock.
     fn delivery_verdict(&self, rec: &TerminalSessionRecord) -> FinishDeliveryVerdict {
         let pending = if rec.finished_at.is_some() && !rec.finish_synced {
-            self.finish_pending_probe.get().and_then(|p| (p.0)(rec))
+            self.finish_pending(rec)
         } else {
             None
         };
         FinishDeliveryVerdict::decide(rec, pending)
+    }
+
+    /// The outbox probe's answer for `rec`'s mark: `None` when no probe is
+    /// attached or the outbox could not be read. MUST be called with the map
+    /// lock released.
+    fn finish_pending(&self, rec: &TerminalSessionRecord) -> Option<bool> {
+        self.finish_pending_probe.get().and_then(|p| (p.0)(rec))
     }
 
     /// Record that the coord drain DROPPED the `Finished` row of this

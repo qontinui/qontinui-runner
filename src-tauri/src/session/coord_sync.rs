@@ -121,13 +121,19 @@
 //! re-creates the row with `POST /sessions` from the create body recorded at
 //! the drain's first sight of the session's `started` row
 //! (`<outbox>.created.jsonl`), then retries the row once in seq order — at
-//! most one re-register per session per 10 minutes. When the row cannot be
-//! re-created (a 409 id collision — never routed through [`handle_conflict`] —
-//! a 4xx refusal, no recorded body, or the budget is spent) a LIFECYCLE row is
-//! HELD on the session's backoff and never dropped (counted
-//! `orphanedSessions`, and a deliberate hold never counts toward quarantine),
-//! while a heartbeat is ACK-dropped as before — the next one supersedes it.
-//! See [`super::coord_sync_reregister`].
+//! most one re-register per session per 10 minutes. A session the runner
+//! already RETIRED is never re-created — its `closed` row was ACKed, or a
+//! resume replaced its id with a fresh one — and its row is dropped
+//! (`not_found_closed` / `not_found_superseded`). When the row cannot be
+//! re-created and no retry would change that (a 409 id collision — never
+//! routed through [`handle_conflict`] — another 4xx refusal, or no recorded
+//! body) the row is dropped too (`orphaned_id_collision` /
+//! `orphaned_reregister_refused` / `orphaned_no_body`, also counted
+//! `orphanedSessions`). Only while the answer could still change (the budget
+//! is spent, or the re-created row went missing again) is a LIFECYCLE row
+//! HELD on the session's backoff — a deliberate hold never counts toward
+//! quarantine — while a heartbeat is ACK-dropped as before, the next one
+//! superseding it. See [`super::coord_sync_reregister`].
 //!
 //! ## Conflict-on-acquire
 //!
@@ -157,7 +163,9 @@ use crate::auth::TenantScope;
 
 use super::closeout_spool::{classify_coord_write_status, CoordWriteClass};
 use super::coord_sync_drops::{LifecycleDropCounter, LifecycleDropReason, LifecycleDrops};
-use super::coord_sync_reregister::{Attempt, Reregister, ReregisterCounts, ReregisterOutcome};
+use super::coord_sync_reregister::{
+    Attempt, Reregister, ReregisterCounts, ReregisterOutcome, Retired,
+};
 use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
@@ -234,13 +242,16 @@ struct CoordSyncInner {
     /// Phase 4): invoked with the payload's `claude_session_id`, its
     /// `finished_at` and the drop's wire reason whenever a `finished` row
     /// leaves the outbox WITHOUT coord taking it — the `PermanentFailure`
-    /// ACK-drop (`refused_4xx` / `not_found`), the quarantine sidecar
-    /// (`quarantined`, or `quarantine_cap` when the sidecar is full) and the
-    /// outbox's own cap trim (`outbox_trim`, collected from the writer each
-    /// tick). main.rs attaches `SessionLifecycleStore::mark_finish_dropped`,
-    /// which is what lets the finish route answer `coord.delivery:
-    /// "dropped:<reason>"`. A HELD row (`RowMissing`) is not a drop and does
-    /// not fire. Unattached (tests, pre-wiring) → drops are counted only.
+    /// ACK-drop (`refused_4xx` / `not_found`), an unrecoverable missing row
+    /// (`not_found_closed`, `not_found_superseded`, `orphaned_no_body`,
+    /// `orphaned_id_collision`, `orphaned_reregister_refused`), the
+    /// quarantine sidecar (`quarantined`, or `quarantine_cap` when the sidecar
+    /// is full) and the outbox's own cap trim (`outbox_trim`, collected from
+    /// the writer each tick). main.rs attaches
+    /// `SessionLifecycleStore::mark_finish_dropped`, which is what lets the
+    /// finish route answer `coord.delivery: "dropped:<reason>"`. A HELD row
+    /// (`RowMissing`) is not a drop and does not fire. Unattached (tests,
+    /// pre-wiring) → drops are counted only.
     finished_drop_observer: OnceLock<FinishedDropObserver>,
     /// The outside observer of coord's OWN liveness (plan
     /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
@@ -527,6 +538,17 @@ impl CoordSync {
         }
     }
 
+    /// `session_id` has been replaced by a fresh id (the resume 404 fallback,
+    /// [`SessionRegistry::resume_external`]): rows still queued for it must
+    /// never re-create its coord row, so a 404 on one drops it
+    /// (`not_found_superseded`) instead. Persisted in the create-body sidecar,
+    /// so the refusal outlives a restart. Call it BEFORE the fresh id's
+    /// `started` row is written, so no drain tick can re-create the old id
+    /// first and win the harness-session binding the fresh row needs.
+    pub fn note_superseded(&self, session_id: Uuid) {
+        self.inner.reregister.note_superseded(session_id);
+    }
+
     /// Push ONE session's `started` row to coord now and wait — at most
     /// `timeout` — for coord's answer, instead of leaving it to the drain loop.
     ///
@@ -581,7 +603,9 @@ impl CoordSync {
                     detail: snippet(&msg),
                 }
             }
-            Ok(PushOutcome::PermanentFailure(msg)) | Ok(PushOutcome::RowMissing(msg)) => {
+            Ok(PushOutcome::PermanentFailure(msg))
+            | Ok(PushOutcome::RowMissing(msg))
+            | Ok(PushOutcome::RowUnrecoverable { message: msg, .. }) => {
                 let (kind, status) = classify_push_failure(&msg, true);
                 CoordRegistrationFailure {
                     kind,
@@ -1337,9 +1361,12 @@ struct ChainOutcome {
     /// the session is blocked on its head row and goes on its own backoff.
     blocked_on: Option<String>,
     /// `blocked_on` is a DELIBERATE hold — a lifecycle row whose coord row is
-    /// missing and could not be re-created (`PushOutcome::RowMissing`). It
-    /// backs off like any failure but never counts toward quarantine: coord
-    /// is not refusing the row, it has nowhere to put it yet.
+    /// missing and not re-created YET (`PushOutcome::RowMissing`: the
+    /// re-register budget is spent, or the re-created row went missing
+    /// again). It backs off like any failure but never counts toward
+    /// quarantine: coord is not refusing the row, it has nowhere to put it
+    /// yet. A row that can never be re-created is dropped instead
+    /// (`PushOutcome::RowUnrecoverable`), so no hold outlives its cause.
     deliberate_hold: bool,
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
@@ -1494,15 +1521,38 @@ async fn push_chain(
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
             }
+            PushOutcome::RowUnrecoverable {
+                reason: drop_reason,
+                message,
+            } => {
+                // Coord has no row for the session and it must not (closed /
+                // superseded) or cannot (409, another 4xx, no recorded body)
+                // be re-created — every retry would meet the same answer, so
+                // the row is ACK-dropped under its own counted reason rather
+                // than held. `attempt` already logged the cause at `warn!`.
+                let (fail_kind, fail_status) = classify_push_failure(&message, true);
+                note_outbox_failure(fail_kind, fail_status);
+                inner.lifecycle_drops.record(&rec.event_kind, drop_reason);
+                notify_finished_drop(&inner, &rec, drop_reason.as_str());
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    kind = %rec.event_kind,
+                    reason = drop_reason.as_str(),
+                    "coord_sync: coord has no row for this session and it will not be \
+                     re-created — ACK-dropping the row"
+                );
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+            }
             PushOutcome::RowMissing(reason) => {
                 // Only a LIFECYCLE row reaches here: `recover_row_missing`
                 // turned a heartbeat it could not deliver into a
                 // `PermanentFailure` (dropped above). Coord has no row for the
-                // session and it could not be re-created (409, refusal, no
-                // recorded body, or the re-register budget is spent) — HOLD
-                // the row: never ACK it, stop the chain to keep seq order, and
-                // retry on the session's backoff. `attempt` already logged the
-                // cause at `warn!` once per budget window.
+                // session and the answer may still change (the re-register
+                // budget is spent, or the re-created row went missing again)
+                // — HOLD the row: never ACK it, stop the chain to keep seq
+                // order, and retry on the session's backoff.
                 let (fail_kind, fail_status) = classify_push_failure(&reason, true);
                 note_outbox_failure(fail_kind, fail_status);
                 tracing::debug!(
@@ -1977,8 +2027,20 @@ enum PushOutcome {
     /// Coord answered its parsed `404 {"error":"session_not_found"}` to a
     /// path-addressed PATCH ([`row_missing_eligible`]): it has no row for the
     /// session. `push_chain` hands it to [`recover_row_missing`]; one that
-    /// survives recovery is a held lifecycle row, never an ACK.
+    /// survives recovery is a held lifecycle row, never an ACK — and only
+    /// while the recovery's answer could still change (no answer, or the
+    /// re-register budget is spent).
     RowMissing(String),
+    /// [`recover_row_missing`]'s verdict that the missing row must not, or
+    /// cannot, be re-created: the session is retired (closed / superseded),
+    /// or the re-register got a deterministic answer (409, another 4xx, no
+    /// recorded body). Holding the row would keep `coord.delivery` at
+    /// `pending` for a write that can never land, so it is ACK-dropped under
+    /// `reason` — counted, and reported to the finished-drop observer.
+    RowUnrecoverable {
+        reason: LifecycleDropReason,
+        message: String,
+    },
 }
 
 async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOutcome {
@@ -2541,12 +2603,19 @@ fn record_create_body(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) {
 /// | re-register            | lifecycle row             | heartbeat            |
 /// |------------------------|---------------------------|----------------------|
 /// | `Created`              | the retry's own outcome   | the retry's outcome  |
-/// | `Collision` / `Refused` / `NoBody` / budget spent | `RowMissing` → HELD | `PermanentFailure` → ACK-dropped |
+/// | retired: closed / superseded | DROPPED `not_found_closed` / `not_found_superseded` | dropped |
+/// | `NoBody` / `Collision` / `Refused` | DROPPED `orphaned_no_body` / `orphaned_id_collision` / `orphaned_reregister_refused` | dropped |
+/// | budget spent           | `RowMissing` → HELD       | `PermanentFailure` → ACK-dropped |
 /// | `Transport`            | `Transport` (backoff)     | `Transport`          |
 ///
+/// Only an answer that could still change is held: a retired session must
+/// never be re-created (that resurrects it), and a deterministic re-register
+/// answer is the same on every retry, so holding either would only pin
+/// `coord.delivery` at `pending` and the outbox's oldest row for nothing.
+///
 /// A 409 here is NOT the acquire-path conflict: it never reaches
-/// [`handle_conflict`]. A retry that 404s again is treated like a failed
-/// re-register (held / dropped), never re-registered twice in one chain.
+/// [`handle_conflict`]. A retry that 404s again is treated like a spent
+/// budget (held / dropped), never re-registered twice in one chain.
 async fn recover_row_missing(
     inner: &Arc<CoordSyncInner>,
     rec: &OutboxRecord,
@@ -2560,6 +2629,10 @@ async fn recover_row_missing(
             PushOutcome::PermanentFailure(reason)
         }
     };
+    let unrecoverable = |why: LifecycleDropReason| PushOutcome::RowUnrecoverable {
+        reason: why,
+        message: reason.clone(),
+    };
     let base = inner.coord_url.trim_end_matches('/');
     let fallback_scope = record_session_tenant(inner, rec);
     match inner
@@ -2572,12 +2645,20 @@ async fn recover_row_missing(
             other => other,
         },
         Attempt::Done(ReregisterOutcome::Transport(e)) => PushOutcome::Transport(e),
-        Attempt::BudgetSpent
-        | Attempt::Done(
-            ReregisterOutcome::Collision(_)
-            | ReregisterOutcome::Refused { .. }
-            | ReregisterOutcome::NoBody,
-        ) => unresolved(reason),
+        Attempt::Retired(Retired::Closed) => unrecoverable(LifecycleDropReason::NotFoundClosed),
+        Attempt::Retired(Retired::Superseded) => {
+            unrecoverable(LifecycleDropReason::NotFoundSuperseded)
+        }
+        Attempt::Done(ReregisterOutcome::NoBody) => {
+            unrecoverable(LifecycleDropReason::OrphanedNoBody)
+        }
+        Attempt::Done(ReregisterOutcome::Collision(_)) => {
+            unrecoverable(LifecycleDropReason::OrphanedIdCollision)
+        }
+        Attempt::Done(ReregisterOutcome::Refused { .. }) => {
+            unrecoverable(LifecycleDropReason::OrphanedReregisterRefused)
+        }
+        Attempt::BudgetSpent => unresolved(reason),
     }
 }
 
@@ -6743,12 +6824,17 @@ mod tests {
         lifecycle_drops_snapshot(&coord.inner)
     }
 
-    /// (a) A `finished` PATCH that coord answers with its real 404
-    /// `session_not_found` is no longer a drop (Phase 2): with no recorded
-    /// create body the row is HELD, counted `orphanedSessions.no_body`, no
-    /// `POST /sessions` is sent, and `lifecycleDrops` counts nothing.
+    /// (a) A lifecycle PATCH that coord answers with its real 404
+    /// `session_not_found`, for a session with NO recorded create body, can
+    /// never be re-created — every retry meets the same answer. So it is not
+    /// held (holding it pinned `coord.delivery` at `pending` and the outbox's
+    /// oldest row for good): it is dropped as `orphaned_no_body`, counted
+    /// once in `orphanedSessions.no_body`, reported to the finished-drop
+    /// observer, and nothing is POSTed. The session's NEXT row meets the same
+    /// remembered answer inside the window — dropped too, not held behind a
+    /// spent budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_session_not_found_404_on_finished_with_no_body_is_held_not_dropped() {
+    async fn a_session_not_found_404_with_no_body_is_dropped_as_orphaned_no_body() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -6760,48 +6846,61 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
         );
-        let s = Uuid::new_v4();
+        let dropped = attach_drop_log(&coord);
+        // One machine for both rows: seqs are allocated per (machine,
+        // session), and the drain ACKs by (session, seq).
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
         outbox
             .record(
-                Uuid::new_v4(),
+                m,
+                s,
+                SessionEventKind::StateChange,
+                json!({ "id": s, "state": "idle" }),
+            )
+            .unwrap();
+        outbox
+            .record(
+                m,
                 s,
                 SessionEventKind::Finished,
-                json!({ "id": s, "claude_session_id": "c" }),
+                json!({ "id": s, "claude_session_id": "c", "finished_at": 4 }),
             )
             .unwrap();
         let mut state = DrainState::default();
         drain_tick(&coord.inner, &mut state).await;
 
-        let pending = outbox.pending().unwrap();
-        assert_eq!(pending.len(), 1, "the finished row is held, not dropped");
-        assert_eq!(pending[0].event_kind, "finished");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "neither row is held: no retry can create the row"
+        );
         let g = rec.lock().await;
-        assert_eq!(g.patches.len(), 1, "the PATCH was pushed once");
+        assert_eq!(g.patches.len(), 2, "each PATCH was pushed once");
         assert_eq!(g.post_count, 0, "no body recorded — nothing is POSTed");
         drop(g);
-        assert_eq!(coord.inner.reregister.counts().no_body, 1);
+        assert_eq!(
+            coord.inner.reregister.counts().no_body,
+            1,
+            "once per window"
+        );
         let drops = lifecycle_drops_snapshot(&coord.inner);
-        assert_eq!(drops, LifecycleDrops::default(), "nothing was dropped");
-        assert!(
-            state.retry.contains_key(&s),
-            "the held session backs off like any blocked chain"
+        assert_eq!(
+            drops.get("state_change", LifecycleDropReason::OrphanedNoBody),
+            1
         );
-
-        // Held again on the next attempts (inside the budget window): still
-        // pending, still never POSTed, `no_body` counted once per window, and
-        // the deliberate hold never earns a quarantine.
-        for _ in 0..(QUARANTINE_AFTER_SERVING_FAILURES + 2) {
-            state.ack_ticks += 1; // coord "serving" other rows meanwhile
-            state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
-            drain_tick(&coord.inner, &mut state).await;
-        }
-        assert_eq!(outbox.pending().unwrap().len(), 1);
-        assert!(
-            !state.quarantined.contains(&s),
-            "a deliberate hold never quarantines"
+        assert_eq!(
+            drops.get("finished", LifecycleDropReason::OrphanedNoBody),
+            1
         );
-        assert_eq!(rec.lock().await.post_count, 0);
-        assert_eq!(coord.inner.reregister.counts().no_body, 1);
+        assert_eq!(drops.get("finished", LifecycleDropReason::NotFound), 0);
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            vec![("c".to_string(), Some(4), "orphaned_no_body".to_string())]
+        );
+        assert!(
+            !state.retry.contains_key(&s),
+            "nothing is left to back off on"
+        );
+        assert!(!state.quarantined.contains(&s));
     }
 
     /// (b) Any other 4xx on a lifecycle row — a 422, or a 404 whose body is
@@ -7041,13 +7140,14 @@ mod tests {
     }
 
     /// A 409 on the re-register (`session_id_collision`: another device or
-    /// tenant holds the id) HOLDS the lifecycle row: nothing is ACKed, the
-    /// session is counted `orphanedSessions.id_collision`, `handle_conflict`
-    /// is never reached (the local session is not flipped to
-    /// `PendingResolution`), and a later attempt inside the window sends no
-    /// second POST.
+    /// tenant holds the id) is the same on every retry, so the lifecycle row
+    /// is DROPPED as `orphaned_id_collision` (and reported to the finished-drop
+    /// observer), the session is counted `orphanedSessions.id_collision`,
+    /// `handle_conflict` is never reached (the local session is not flipped to
+    /// `PendingResolution`), and the session's next row inside the window is
+    /// dropped on the remembered answer with no second POST.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_re_register_409_holds_the_row_and_never_opens_a_conflict() {
+    async fn a_re_register_409_drops_the_row_and_never_opens_a_conflict() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -7058,6 +7158,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
         );
+        let dropped = attach_drop_log(&coord);
         let registry = build_registry(coord.clone());
         let handle = registry.start(make_test_intent()).unwrap();
         let s = handle.id();
@@ -7076,15 +7177,16 @@ mod tests {
                 Uuid::new_v4(),
                 s,
                 SessionEventKind::Finished,
-                json!({ "id": s, "claude_session_id": "c" }),
+                json!({ "id": s, "claude_session_id": "c", "finished_at": 2 }),
             )
             .unwrap();
         let mut state = DrainState::default();
         drain_tick(&coord.inner, &mut state).await;
 
-        let pending = outbox.pending().unwrap();
-        assert_eq!(pending.len(), 1, "held, not ACKed");
-        assert_eq!(pending[0].event_kind, "finished");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "dropped: a 409 is the same answer on every retry"
+        );
         assert_eq!(rec.lock().await.post_count, posts_before + 1);
         assert_eq!(coord.inner.reregister.counts().id_collision, 1);
         assert_ne!(
@@ -7092,27 +7194,54 @@ mod tests {
             SessionState::PendingResolution,
             "a re-register 409 must not run the acquire-path conflict handler"
         );
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            vec![(
+                "c".to_string(),
+                Some(2),
+                "orphaned_id_collision".to_string()
+            )]
+        );
+        assert!(!state.retry.contains_key(&s), "no hold to back off on");
 
-        // Retry inside the window: the PATCH 404s again, the budget is spent.
-        state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
+        // The session's next row inside the window: dropped on the remembered
+        // answer, with no second POST and no recount.
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
         drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(outbox.pending().unwrap().len(), 1, "still held");
+        assert!(outbox.pending().unwrap().is_empty());
         assert_eq!(
             rec.lock().await.post_count,
             posts_before + 1,
             "no second POST inside the window"
         );
         assert_eq!(coord.inner.reregister.counts().id_collision, 1);
+        let drops = lifecycle_drops_snapshot(&coord.inner);
         assert_eq!(
-            lifecycle_drops_snapshot(&coord.inner),
-            LifecycleDrops::default()
+            drops.get("finished", LifecycleDropReason::OrphanedIdCollision),
+            1
+        );
+        assert_eq!(
+            drops.get("closed", LifecycleDropReason::OrphanedIdCollision),
+            1
+        );
+        assert_ne!(
+            registry.describe_by_id(s).unwrap().state,
+            SessionState::PendingResolution
         );
     }
 
-    /// A 400 / 403 refusal of the re-register HOLDS the lifecycle row and
-    /// counts `orphanedSessions.reregister_refused`.
+    /// A 400 / 403 refusal of the re-register is the same on every retry: the
+    /// lifecycle row is DROPPED as `orphaned_reregister_refused` and counted
+    /// `orphanedSessions.reregister_refused`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_re_register_refusal_holds_the_row() {
+    async fn a_re_register_refusal_drops_the_row() {
         let _amb = crate::test_env::isolated_ambient();
         for (code, error) in [
             (400, "invalid_intent"),
@@ -7134,12 +7263,206 @@ mod tests {
                 )
                 .unwrap();
             drain_tick(&coord.inner, &mut DrainState::default()).await;
-            assert_eq!(outbox.pending().unwrap().len(), 1, "{code}: held");
+            assert!(outbox.pending().unwrap().is_empty(), "{code}: dropped");
             let counts = coord.inner.reregister.counts();
             assert_eq!(counts.reregister_refused, 1, "{code}");
             assert_eq!((counts.created, counts.id_collision), (0, 0), "{code}");
             assert_eq!(rec.lock().await.post_count, 2, "{code}: one re-register");
+            assert_eq!(
+                lifecycle_drops_snapshot(&coord.inner)
+                    .get("closed", LifecycleDropReason::OrphanedReregisterRefused),
+                1,
+                "{code}"
+            );
         }
+    }
+
+    /// Review finding (A): `resume_external` met a 404 for the persisted id
+    /// and registered a FRESH one. Rows still queued for the OLD id must not
+    /// re-create it from its recorded create body — that leaves a zombie row
+    /// nothing closes (or races the fresh `started` into a
+    /// `harness_session_already_bound` conflict). They are dropped as
+    /// `not_found_superseded`, and the refusal survives a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rows_for_an_id_a_resume_superseded_never_re_create_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (outbox, coord, rec, old) = session_coord_lost(dir.path()).await;
+        let dropped = attach_drop_log(&coord);
+        let registry = build_registry(coord.clone());
+        let fresh = registry
+            .resume_external(old, make_test_intent())
+            .await
+            .unwrap();
+        assert_ne!(fresh, old, "the 404 fallback minted a fresh id");
+
+        // One machine for every later row: seqs are allocated per (machine,
+        // session), and the drain ACKs by (session, seq).
+        let m = Uuid::new_v4();
+        for (kind, payload) in [
+            (SessionEventKind::Closed, json!({ "id": old })),
+            (
+                SessionEventKind::Finished,
+                json!({ "id": old, "claude_session_id": "old", "finished_at": 9 }),
+            ),
+        ] {
+            outbox.record(m, old, kind, payload).unwrap();
+        }
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+
+        assert!(outbox.pending().unwrap().is_empty());
+        let g = rec.lock().await;
+        let old_creates = g.posts.iter().filter(|p| p["id"] == json!(old)).count();
+        assert_eq!(
+            old_creates, 1,
+            "only the original create — never re-created"
+        );
+        assert!(
+            !g.created_ids.contains(&old),
+            "coord holds no row for the superseded id"
+        );
+        assert!(g.created_ids.contains(&fresh), "the fresh row was created");
+        drop(g);
+        assert_eq!(coord.inner.reregister.counts().created, 0);
+        let drops = lifecycle_drops_snapshot(&coord.inner);
+        assert_eq!(
+            drops.get("closed", LifecycleDropReason::NotFoundSuperseded),
+            1
+        );
+        assert_eq!(
+            drops.get("finished", LifecycleDropReason::NotFoundSuperseded),
+            1
+        );
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            vec![(
+                "old".to_string(),
+                Some(9),
+                "not_found_superseded".to_string()
+            )]
+        );
+
+        // After a restart, a row still queued for the old id is refused too.
+        let base = coord.inner.coord_url.clone();
+        let restarted = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        outbox
+            .record(
+                m,
+                old,
+                SessionEventKind::StateChange,
+                json!({ "id": old, "state": "idle" }),
+            )
+            .unwrap();
+        drain_tick(&restarted.inner, &mut DrainState::default()).await;
+        assert!(outbox.pending().unwrap().is_empty());
+        let g = rec.lock().await;
+        assert_eq!(
+            g.posts.iter().filter(|p| p["id"] == json!(old)).count(),
+            1,
+            "still never re-created after a restart"
+        );
+    }
+
+    /// Review finding (B): coord ACKed a session's `closed` row and then
+    /// GC'd it. A late `finished` (the retry door, or a late delivery) must
+    /// not re-create the row LIVE with no `closed` ever following: it is
+    /// dropped as `not_found_closed`, and the finish route reads
+    /// `dropped:not_found_closed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_finished_for_a_closed_gcd_session_never_re_creates_it() {
+        use crate::session::session_lifecycle_store::{
+            self as lifecycle, FinishDeliveryVerdict, SessionLifecycleStore,
+        };
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let st = Arc::downgrade(&store);
+            coord.attach_finished_drop_observer(move |csid, at, reason| {
+                if let Some(s) = st.upgrade() {
+                    s.mark_finish_dropped(csid, at, reason);
+                }
+            });
+        }
+        store.record_open(lifecycle::test_open_record("late"));
+        let finished_at = store
+            .set_finished("late", true, Some("done".into()))
+            .unwrap()
+            .record
+            .finished_at;
+
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Started,
+                json!({ "id": s, "kind": "terminal_claude", "intent": { "purpose": "x" } }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+        assert!(outbox.pending().unwrap().is_empty(), "created, then closed");
+        {
+            let mut g = rec.lock().await;
+            assert_eq!(g.post_count, 1);
+            g.created_ids.clear(); // coord GC'd the closed row
+            g.patch_returns_404 = true;
+        }
+
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Finished,
+                json!({ "id": s, "claude_session_id": "late", "finished_at": finished_at }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+
+        assert!(outbox.pending().unwrap().is_empty(), "dropped, not held");
+        assert_eq!(
+            rec.lock().await.post_count,
+            1,
+            "a closed session is never re-created"
+        );
+        assert_eq!(
+            lifecycle_drops_snapshot(&coord.inner)
+                .get("finished", LifecycleDropReason::NotFoundClosed),
+            1
+        );
+        let after = store.get("late").unwrap();
+        assert_eq!(
+            FinishDeliveryVerdict::decide(
+                &after,
+                outbox.has_pending_finished("late", after.finished_at)
+            )
+            .as_wire(),
+            "dropped:not_found_closed"
+        );
     }
 
     /// A second 404 for the same session inside the 10-minute window sends no

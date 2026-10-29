@@ -335,6 +335,11 @@ pub struct OutboxWriter {
     /// Phase 4). Bounded at [`TRIMMED_FINISHED_MAX`]: with no drain collecting
     /// it, the oldest entries go first (the per-kind counter above still
     /// counts every one).
+    ///
+    /// MEMORY-ONLY: a crash (or exit) between the trim and the drain's next
+    /// tick loses the notice, and with the row already gone from the file the
+    /// finish then reads `coord.delivery: "unknown"`. So `unknown` there does
+    /// NOT mean "never trimmed" — only that no drop was recorded.
     trimmed_finished: Mutex<Vec<(String, Option<i64>)>>,
     /// Group-commit state. Lock order is always `write_lock` → `commit`.
     commit: Mutex<CommitState>,
