@@ -2396,6 +2396,12 @@ mod tests {
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
         ),
         (
+            "claude_cli_update.rs",
+            1,
+            "Claude Code's own `~/.claude/settings.json`, read only for the user's \
+             `autoUpdatesChannel` — not runner state",
+        ),
+        (
             "claude_session/trust_gate.rs",
             1,
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",

@@ -1063,7 +1063,7 @@ pub(crate) fn claude_bin_path() -> String {
 /// such a file would trade that for an `EACCES` on every attempt. On
 /// Windows, and for anything that is not an absolute path, `resolved` is
 /// returned as is.
-fn launchable_or_bare(resolved: String) -> String {
+pub(crate) fn launchable_or_bare(resolved: String) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4234,12 +4234,14 @@ pub(crate) struct CarriedContinuation {
 /// exit between the lift and the re-pin* — is a **reviewer obligation, not a
 /// compiler-checked one**. `#[must_use]` does not cover it: the permit IS used
 /// (it is bound at the lift), so inserting a `?` or a `return Err(..)` between
-/// the lift and `match spawned` drops it on the way out, releases the anchor,
+/// the lift and the `carried_continuation.settle` call (the migration wraps
+/// the permit in `respawn_liveness::OwedSettle`, which turns such an exit into a
+/// `warn!` and a re-pin onto the old terminal) drops it on the way out, releases the anchor,
 /// and silently reopens this window with **no compiler warning, no clippy
-/// lint, and no failing test** — none of the tests calls `migrate_session`.
+/// lint, and no failing test** — none of the tests calls `confirm_migration`.
 /// A `let (carried, _) = …` or `let Some((c, _permit)) = …` is the same silent
 /// drop. Both ends of the window in
-/// [`crate::terminal::account_migration::migrate_session`] carry a `GUARD:`
+/// `crate::terminal::account_migration::confirm_migration` carry a `GUARD:`
 /// marker comment so the span is greppable; keep them there.
 pub(crate) fn take_continuation_registration(
     terminal_id: &str,
@@ -9873,6 +9875,11 @@ pub(crate) fn finalize_headless_child_env(
     // this function was extracted: a posture nothing asserts is a posture that
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
+
+    // `DISABLE_AUTOUPDATER=1` when the runner owns CLI updates on this box.
+    crate::claude_cli_update::apply_child_env(|k, v| {
+        cmd.env(k, v);
+    });
 
     crate::terminal::scrub_credential_env_tokio(cmd);
 }

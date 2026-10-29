@@ -2218,12 +2218,19 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
+    // Resolves only once the resumed CLI is proven alive; a respawn that died
+    // (rolled back) or never painted is an error naming which. A pane that
+    // never painted is rolled back onto the old pane while that pane still runs
+    // (the new pane closed), unless the old pane is read to host no CLI — then
+    // the new pane keeps the session.
     let outcome =
         crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
             .await
             .map_err(|e| {
-                // The session never reached `dst`: it must not count as a handoff.
-                crate::ai_provider::unrecord_handoff(&dst);
+                // A session that never reached `dst` must not count as a handoff.
+                if !e.reached_destination() {
+                    crate::ai_provider::unrecord_handoff(&dst);
+                }
                 // A refusal (already migrating / already moved / closed /
                 // gone) reads as its own sentence, exactly as before the typed
                 // error.
@@ -3192,6 +3199,10 @@ mod tests {
             CloseOutcome::TerminalSuperseded {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
+            },
+            CloseOutcome::HeldInFlight {
+                requested: "s".to_string(),
+                terminal_id: "t-new".to_string(),
             },
         ] {
             assert!(

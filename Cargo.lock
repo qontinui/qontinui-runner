@@ -6754,6 +6754,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.1",
  "scopeguard",
+ "semver",
  "sentry",
  "serde",
  "serde_jcs",

@@ -73,6 +73,10 @@
 //!    fresh PTY, pinned via `capture_hint.config_dir` (which threads
 //!    `CLAUDE_CONFIG_DIR` into the PTY **and** keeps the durable restore record
 //!    consistent).
+//!    The resumed CLI is then PROVEN alive (running and painting,
+//!    [`crate::terminal::respawn_liveness`]); a pane that dies is retried, and
+//!    when every attempt dies the respawn fails here — before step 7 — so a
+//!    dead respawn never re-acquires claims under this device.
 //! 7. **Claims re-acquired** under this device and **`parent_session_id`
 //!    stamped**, exactly as [`super::handoff`] does, so the respawn is one link
 //!    in the lineage chain rather than an orphan.
@@ -186,6 +190,24 @@ pub enum RespawnError {
     Transcript(String),
     #[error("respawn spawn failed: {0}")]
     Spawn(String),
+    /// Every resumed pane exited before painting (`respawn-died: exit <code>
+    /// after <n> attempts`). Nothing is left running and no claim was
+    /// re-acquired. The request is NOT replayed by catch-up: every attempt
+    /// registered a coord child stamped with the source as its
+    /// `parent_session_id`, and coord's materialized-child filter counts a
+    /// dead child like a live one, so the operator re-issues the respawn.
+    #[error(
+        "{0} — not retried: coord counts the dead attempts as materialized; re-issue the respawn"
+    )]
+    Died(String),
+    /// The user closed the resumed pane before it painted. Not retried: a
+    /// respawn behind the user's own close would reopen what they closed.
+    #[error("the user closed the resumed pane before it painted — not retried")]
+    ClosedByUser,
+    /// Another mover (an account migration, the resume door) holds this
+    /// Claude session right now.
+    #[error("{0} is already moving this Claude session — left for retry")]
+    InFlight(&'static str),
     #[error("the Tauri app handle is not available — cannot spawn a PTY")]
     NoAppHandle,
     /// Coord's device drain deferred this respawn. Not a failure: the durable
@@ -283,15 +305,9 @@ pub(super) async fn run_catchup(
 ) {
     match fetch_pending(http, coord_url, device_id).await {
         Ok(pending) => {
-            if !pending.is_empty() {
-                tracing::info!(
-                    count = pending.len(),
-                    "session respawn: on-connect catch-up replaying pending respawns"
-                );
-            }
-            for respawn in pending {
-                materialize_logged(registry, lifecycle_store, http, coord_url, &respawn).await;
-            }
+            replay_pending_with(running_respawns(), respawn_permits(), pending, |r| {
+                materialize_task(registry, lifecycle_store, http, coord_url, r)
+            });
         }
         Err(HandoffError::Status(401 | 403, _)) => {
             tracing::warn!(
@@ -315,6 +331,29 @@ pub(super) async fn handle_push_frame(
     device_id: Uuid,
     text: &str,
 ) {
+    handle_push_frame_with(
+        running_respawns(),
+        respawn_permits(),
+        device_id,
+        text,
+        |r| materialize_task(registry, lifecycle_store, http, coord_url, r),
+    );
+}
+
+/// [`handle_push_frame`] with the materializer injected — the delivery wiring
+/// itself, testable without a registry. The materialize runs on its own task
+/// ([`spawn_tracked`]); this returns at once, so the `/ws` read loop that calls
+/// it is never held for a liveness proof.
+pub(super) fn handle_push_frame_with<M, F>(
+    running: &Arc<RunningRespawns>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    device_id: Uuid,
+    text: &str,
+    materialize: M,
+) where
+    M: FnOnce(PendingRespawn) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let Some(respawn) = parse_respawn_push(text, device_id) else {
         return;
     };
@@ -322,11 +361,139 @@ pub(super) async fn handle_push_frame(
         source = %respawn.source_session_id,
         "session respawn: push received; materializing"
     );
-    materialize_logged(registry, lifecycle_store, http, coord_url, &respawn).await;
+    let source = respawn.source_session_id;
+    spawn_tracked(running, permits, source, materialize(respawn));
 }
 
-/// Materialize a respawn and log (but swallow) any error. The durable coord
-/// row is left intact on failure so the next push/catch-up retries.
+/// The catch-up's half of [`handle_push_frame_with`]: every pending respawn
+/// on its own task; returns once they are started.
+pub(super) fn replay_pending_with<M, F>(
+    running: &Arc<RunningRespawns>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    pending: Vec<PendingRespawn>,
+    mut materialize: M,
+) where
+    M: FnMut(PendingRespawn) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if !pending.is_empty() {
+        tracing::info!(
+            count = pending.len(),
+            "session respawn: catch-up replaying pending respawns"
+        );
+    }
+    for respawn in pending {
+        let source = respawn.source_session_id;
+        spawn_tracked(running, permits, source, materialize(respawn));
+    }
+}
+
+/// Respawns this process may materialize at once. Each one can take minutes
+/// (the 180 s liveness proof per attempt, a 120 s CLI-install wait, retries),
+/// so a catch-up replaying many pending rows must not open every PTY at once.
+const MAX_CONCURRENT_RESPAWNS: usize = 4;
+
+/// The sources whose materialize task is running in this process right now.
+/// A push and a catch-up (or two ticks) that deliver the same source while its
+/// first materialize is still proving the pane alive are dropped here, quietly,
+/// instead of reaching the in-flight claim and logging a refusal per tick.
+#[derive(Default)]
+pub(super) struct RunningRespawns(std::sync::Mutex<std::collections::HashSet<Uuid>>);
+
+/// Held by one materialize task; releases its source on drop (completion,
+/// panic, or abort).
+pub(super) struct RunningRespawn {
+    set: Arc<RunningRespawns>,
+    source: Uuid,
+}
+
+impl RunningRespawns {
+    pub(super) fn try_claim(self: &Arc<Self>, source: Uuid) -> Option<RunningRespawn> {
+        let mut g = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.insert(source).then(|| RunningRespawn {
+            set: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+impl Drop for RunningRespawn {
+    fn drop(&mut self) {
+        self.set
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.source);
+    }
+}
+
+/// Run `task` for `source` on its own tokio task, bounded by `permits`, unless
+/// a task for `source` is already running. Returns at once — the coord `/ws`
+/// read loop that delivers pushes (and answers Pings) and the serial catch-up
+/// must never wait out a respawn's liveness proof. `false` when the source was
+/// already running.
+pub(super) fn spawn_tracked<F>(
+    running: &Arc<RunningRespawns>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    source: Uuid,
+    task: F,
+) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some(claim) = running.try_claim(source) else {
+        tracing::debug!(
+            source = %source,
+            "session respawn: a materialize for this source is already running — not starting a second"
+        );
+        return false;
+    };
+    let permits = Arc::clone(permits);
+    tokio::spawn(async move {
+        let _claim = claim;
+        let Ok(_permit) = permits.acquire_owned().await else {
+            return;
+        };
+        task.await;
+    });
+    true
+}
+
+fn running_respawns() -> &'static Arc<RunningRespawns> {
+    static RUNNING: std::sync::LazyLock<Arc<RunningRespawns>> =
+        std::sync::LazyLock::new(Default::default);
+    &RUNNING
+}
+
+fn respawn_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPAWNS)));
+    &PERMITS
+}
+
+/// [`materialize_logged`] as an owned, `'static` future for [`spawn_tracked`].
+fn materialize_task(
+    registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
+    http: &reqwest::Client,
+    coord_url: &str,
+    respawn: PendingRespawn,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let registry = Arc::clone(registry);
+    let lifecycle_store = Arc::clone(lifecycle_store);
+    let http = http.clone();
+    let coord_url = coord_url.to_string();
+    async move {
+        materialize_logged(&registry, &lifecycle_store, &http, &coord_url, &respawn).await;
+    }
+}
+
+/// Materialize a respawn and log (but swallow) any error. A refusal before
+/// any pane spawned leaves the durable coord row pending, so the next
+/// push/catch-up retries it; a [`RespawnError::Died`] does not (see there).
 ///
 /// Every failure is a WARN naming the reason. A refused account pin in
 /// particular must be VISIBLE: the whole point of failing loud is that the
@@ -345,6 +512,16 @@ async fn materialize_logged(
                 source = %respawn.source_session_id,
                 terminal = %terminal_id,
                 "session respawn: resumed session is live"
+            );
+        }
+        Err(e @ RespawnError::Died(_)) => {
+            tracing::warn!(
+                source = %respawn.source_session_id,
+                account = ?respawn.account,
+                error = %e,
+                "session respawn DIED — every resumed pane exited before painting and was \
+                 closed; coord will NOT replay this request (its dead children count as \
+                 materialized), so the respawn must be re-issued"
             );
         }
         Err(e) => {
@@ -693,6 +870,12 @@ async fn materialize(
         .ok_or(RespawnError::NoClaudeSession(respawn.source_session_id))?
         .to_string();
 
+    // 1b. One mover per Claude session (the shared in-flight registry), held
+    //     through spawn, proof and claim re-acquire.
+    let _in_flight =
+        super::in_flight::SessionInFlight::claim(&claude_session_id, "respawn-receiver")
+            .map_err(RespawnError::InFlight)?;
+
     // 2. 🔒 The pin. Fails loud; never degrades to rotation.
     let config_dir = resolve_target_config_dir(respawn.account.as_deref())?;
 
@@ -763,6 +946,15 @@ async fn materialize(
     //    lineage chain rather than an orphan. That stamp is also what lets
     //    coord's materialized-child filter drop this request from the next
     //    catch-up, so a push + catch-up double-delivery does not respawn twice.
+    //    It is stamped at SPAWN, on every attempt: coord creates the session
+    //    row from the spawn's `started` outbox write (`INSERT … ON CONFLICT
+    //    DO NOTHING` in `create_session`), and its respawn catch-up predicate
+    //    (`RESPAWN_PENDING_SQL`) does not read the child's state — so once any
+    //    attempt has spawned, a respawn whose attempts ALL die is not replayed
+    //    by catch-up either. That is reported in `RespawnError::Died`. Whether
+    //    coord offers any door to set a parent later is UNVERIFIED; making a
+    //    dead attempt not count is a coord-side change (the predicate
+    //    filtering on the child's fate).
     let app = crate::tauri_app_handle::current().ok_or(RespawnError::NoAppHandle)?;
     let (terminal_manager, session_registry) = managed_handles(&app)?;
     let title = format!(
@@ -775,42 +967,43 @@ async fn materialize(
         &working_dir,
         &claude_session_id,
     );
-    let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
-        &app,
-        &terminal_manager,
-        &session_registry,
-        crate::terminal::account_migration::ResumeSpawn {
-            claude_session_id: &claude_session_id,
-            working_dir: &working_dir,
-            model_transcript,
-            config_dir: &config_dir,
-            title,
-            // Land back on the tile the session used to occupy when this box
-            // still remembers it; otherwise the default page, zone 0 (a wrong
-            // tile beats a lost session).
-            page_id: local
-                .as_ref()
-                .map(|r| r.page_id.clone())
-                .unwrap_or_else(|| "default".to_string()),
-            zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
-            work_unit_slug: child_intent.work_unit_slug.clone(),
-            correlation_topic: child_intent.correlation_topic.clone(),
-            intent_repo: child_intent.repo.clone(),
-            coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
-                parent_session_id: Some(respawn.source_session_id),
-                claude_code_session_id: Some(claude_session_id.clone()),
-            }),
-            // NOT the migration's `true`. A respawn genuinely CREATES something
-            // (its source is already closed and gone), so it must respect the
-            // spawn-time resource floor like every other new autonomous spawn.
-            resource_override: false,
-            // A cross-machine respawn's source session ran on ANOTHER device,
-            // so its continuation registration — and the consuming device id
-            // coord keys the outcome write on — are not this box's to carry.
-            gate_identity: None,
-        },
+    let mut effects = ReceiverRespawn {
+        app,
+        terminal_manager,
+        session_registry,
+        claude_session_id: &claude_session_id,
+        working_dir: &working_dir,
+        config_dir: &config_dir,
+        model_transcript,
+        title,
+        // Land back on the tile the session used to occupy when this box
+        // still remembers it; otherwise the default page, zone 0 (a wrong
+        // tile beats a lost session).
+        page_id: local
+            .as_ref()
+            .map(|r| r.page_id.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
+        work_unit_slug: child_intent.work_unit_slug.clone(),
+        correlation_topic: child_intent.correlation_topic.clone(),
+        intent_repo: child_intent.repo.clone(),
+        source_session_id: respawn.source_session_id,
+    };
+    // 6b. PROVE the resumed CLI alive before anything below treats the respawn
+    //     as done — in particular before step 7 re-acquires claims under this
+    //     device. There is no old pane to keep (the source ran elsewhere), so a
+    //     death is retried and, when every attempt dies, the dead pane is
+    //     closed and the respawn reported failed through the receiver's error
+    //     path. The coord row does NOT stay pending: see step 6 and
+    //     `RespawnError::Died`.
+    let outcome = crate::terminal::respawn_liveness::confirm_respawn(
+        &mut effects,
+        lifecycle_store,
+        None,
+        crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
-    .map_err(RespawnError::Spawn)?;
+    .await;
+    let terminal_id = proven_terminal(respawn.source_session_id, outcome)?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -857,6 +1050,132 @@ async fn materialize(
     // 9. NO `close_source`. The source is already closed — see the fn docstring.
 
     Ok(terminal_id)
+}
+
+/// Pure: the terminal a respawn may go on with (claims, prompt), or the error
+/// the receiver reports. A death is [`RespawnError::Died`] — never success —
+/// so step 7 never re-acquires claims for a dead respawn.
+fn proven_terminal(
+    source: Uuid,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, RespawnError> {
+    use crate::terminal::respawn_liveness::RespawnOutcome;
+    match outcome {
+        RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
+        // Running but unpainted: UNKNOWN, and a process DOES hold the session —
+        // reporting failure would let the catch-up spawn a second one beside
+        // it. Kept, and said so.
+        RespawnOutcome::Unconfirmed { terminal_id } => {
+            tracing::warn!(
+                source = %source,
+                terminal = %terminal_id,
+                "session respawn: the resumed CLI is running but never painted its prompt — kept as UNCONFIRMED"
+            );
+            Ok(terminal_id)
+        }
+        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
+        // An old-pane close is a migration's only (no old pane here).
+        RespawnOutcome::ClosedByUser { .. } | RespawnOutcome::OldPaneClosed { .. } => {
+            Err(RespawnError::ClosedByUser)
+        }
+        // Only a migration (which has an old pane) rolls back; never here.
+        RespawnOutcome::UnconfirmedRolledBack { terminal_id } => Err(RespawnError::Spawn(format!(
+            "{terminal_id} never painted and was rolled back"
+        ))),
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            ..
+        } => Err(RespawnError::Died(RespawnOutcome::died_reason(
+            exit_code, attempts,
+        ))),
+    }
+}
+
+/// The receiver's side of
+/// [`crate::terminal::respawn_liveness::RespawnEffects`]: one resumed pane,
+/// pinned to the target account, per call.
+struct ReceiverRespawn<'a> {
+    app: tauri::AppHandle,
+    terminal_manager: Arc<crate::terminal::TerminalManager>,
+    session_registry: Arc<SessionRegistry>,
+    claude_session_id: &'a str,
+    working_dir: &'a str,
+    config_dir: &'a str,
+    model_transcript: std::path::PathBuf,
+    title: String,
+    page_id: String,
+    zone_index: i32,
+    work_unit_slug: Option<String>,
+    correlation_topic: Option<String>,
+    intent_repo: Option<String>,
+    source_session_id: Uuid,
+}
+
+impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
+    fn claude_session_id(&self) -> &str {
+        self.claude_session_id
+    }
+
+    async fn spawn_next(&mut self) -> Result<String, String> {
+        // The async pre-step: the ABSOLUTE binary, retried, never bare.
+        let claude_bin = crate::terminal::resume_bin::resolve_resume_bin().await?;
+        crate::terminal::account_migration::spawn_resumed_pane(
+            &self.app,
+            &self.terminal_manager,
+            &self.session_registry,
+            crate::terminal::account_migration::ResumeSpawn {
+                claude_bin,
+                claude_session_id: self.claude_session_id,
+                working_dir: self.working_dir,
+                model_transcript: self.model_transcript.clone(),
+                config_dir: self.config_dir,
+                title: self.title.clone(),
+                page_id: self.page_id.clone(),
+                zone_index: self.zone_index,
+                work_unit_slug: self.work_unit_slug.clone(),
+                correlation_topic: self.correlation_topic.clone(),
+                intent_repo: self.intent_repo.clone(),
+                coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
+                    parent_session_id: Some(self.source_session_id),
+                    claude_code_session_id: Some(self.claude_session_id.to_string()),
+                }),
+                // NOT the migration's `true`. A respawn genuinely CREATES
+                // something (its source is already closed and gone), so it must
+                // respect the spawn-time resource floor like every other new
+                // autonomous spawn.
+                resource_override: false,
+                // A cross-machine respawn's source session ran on ANOTHER
+                // device, so its continuation registration — and the consuming
+                // device id coord keys the outcome write on — are not this
+                // box's to carry.
+                gate_identity: None,
+            },
+        )
+        .map(|(terminal_id, _coord_id)| terminal_id)
+    }
+
+    async fn await_liveness(
+        &mut self,
+        terminal_id: &str,
+    ) -> crate::terminal::respawn_liveness::LivenessVerdict {
+        crate::terminal::respawn_liveness::await_resumed_cli(
+            &self.terminal_manager,
+            terminal_id,
+            crate::terminal::respawn_liveness::RESUME_LIVENESS_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pause_before_retry(&mut self, retry: usize) {
+        tokio::time::sleep(crate::terminal::respawn_liveness::retry_delay(retry)).await;
+    }
+
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.terminal_manager),
+        ))
+    }
 }
 
 /// The two Tauri-managed handles the resume seam needs.
@@ -1333,6 +1652,48 @@ mod tests {
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
 
+    /// The receiver reports a respawn whose every attempt died as a failure —
+    /// never success — and says it is not retried (review finding 2: coord's
+    /// materialized-child filter counts the dead attempts).
+    #[test]
+    fn the_receiver_reports_failure_on_died() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let err = proven_terminal(
+            Uuid::nil(),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, RespawnError::Died(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("respawn-died: exit 127 after 3 attempts"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("not retried") && msg.contains("re-issue"),
+            "a died respawn must not claim it stays pending: {msg}"
+        );
+        assert!(matches!(
+            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
+            Err(RespawnError::Spawn(_))
+        ));
+        assert_eq!(
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::Alive {
+                    terminal_id: "t".into(),
+                    attempts: 1
+                }
+            )
+            .unwrap(),
+            "t"
+        );
+    }
+
     #[test]
     fn transcript_bytes_concatenates_chunks_in_order() {
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
@@ -1617,5 +1978,142 @@ mod tests {
             resolve_working_dir(Some(&stored), None).as_deref(),
             Some("D:/local-checkout")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Review finding 3: materialize runs off the /ws read loop
+    // -----------------------------------------------------------------------
+
+    /// `spawn_tracked` returns before the (minutes-long) materialize finishes,
+    /// refuses a second task for the same source while the first runs, and
+    /// frees the source when it ends.
+    #[tokio::test]
+    async fn a_respawn_materialize_runs_on_its_own_task_and_never_twice_at_once() {
+        let running = Arc::new(RunningRespawns::default());
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPAWNS));
+        let source = Uuid::from_u128(7);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = Arc::clone(&finished);
+        let started = spawn_tracked(&running, &permits, source, async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(started);
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the caller (the /ws read loop) is not made to wait for the materialize"
+        );
+        assert!(
+            !spawn_tracked(&running, &permits, source, async {}),
+            "a push + catch-up double delivery starts no second task"
+        );
+        for _ in 0..100 {
+            if running.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            running.0.lock().unwrap().is_empty(),
+            "the source is released"
+        );
+        assert!(spawn_tracked(&running, &permits, source, async {}));
+    }
+
+    #[tokio::test]
+    async fn concurrent_respawn_materializes_are_bounded() {
+        let running = Arc::new(RunningRespawns::default());
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..6u128 {
+            let (a, p) = (Arc::clone(&active), Arc::clone(&peak));
+            assert!(spawn_tracked(
+                &running,
+                &permits,
+                Uuid::from_u128(100 + i),
+                async move {
+                    let now = a.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    p.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    a.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            ));
+        }
+        for _ in 0..200 {
+            if running.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(running.0.lock().unwrap().is_empty());
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Round 2, finding 4b: the push and catch-up WIRING hand the materialize
+    /// to its own task — both return while it is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_and_catch_up_delivery_never_wait_for_the_materialize() {
+        let device = Uuid::from_u128(0xd1);
+        let pending = |n: u128| -> PendingRespawn {
+            serde_json::from_value(json!({
+                "source_session_id": Uuid::from_u128(n),
+                "target_device_id": device,
+            }))
+            .unwrap()
+        };
+        let slow = |done: Arc<std::sync::atomic::AtomicUsize>| {
+            move |_r: PendingRespawn| {
+                let done = Arc::clone(&done);
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        };
+        let running = Arc::new(RunningRespawns::default());
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPAWNS));
+
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frame = json!({
+            "channel": format!("qontinui.sessions.t.{device}.respawn_request"),
+            "payload": serde_json::to_string(&json!({
+                "source_session_id": Uuid::from_u128(1),
+                "target_device_id": device,
+            })).unwrap(),
+        })
+        .to_string();
+        handle_push_frame_with(&running, &permits, device, &frame, slow(Arc::clone(&done)));
+        assert_eq!(
+            running.0.lock().unwrap().len(),
+            1,
+            "the push started a task"
+        );
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the push wiring returned before the materialize finished"
+        );
+
+        replay_pending_with(
+            &running,
+            &permits,
+            vec![pending(2), pending(3)],
+            slow(Arc::clone(&done)),
+        );
+        assert_eq!(running.0.lock().unwrap().len(), 3);
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the catch-up wiring returned before any materialize finished"
+        );
+        for _ in 0..100 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }
