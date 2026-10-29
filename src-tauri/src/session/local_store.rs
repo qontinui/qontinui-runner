@@ -318,6 +318,11 @@ pub struct OutboxWriter {
     /// `max_bytes`. Non-zero means real event loss — surfaced via
     /// [`OutboxWriter::dropped_unacked`] and a `warn!` per trim.
     dropped_unacked: AtomicU64,
+    /// [`Self::dropped_unacked`] broken down by `event_kind`, so `GET /health`
+    /// can say WHICH rows the trim lost (a dropped `finished` row is a session
+    /// coord never hears end). Surfaced via
+    /// [`OutboxWriter::dropped_unacked_by_kind`].
+    dropped_unacked_by_kind: Mutex<HashMap<String, u64>>,
     /// Group-commit state. Lock order is always `write_lock` → `commit`.
     commit: Mutex<CommitState>,
     commit_cv: Condvar,
@@ -363,6 +368,7 @@ impl OutboxWriter {
             write_lock: Mutex::new(()),
             max_bytes,
             dropped_unacked: AtomicU64::new(0),
+            dropped_unacked_by_kind: Mutex::new(HashMap::new()),
             commit: Mutex::new(CommitState {
                 written: 0,
                 durable: 0,
@@ -407,6 +413,15 @@ impl OutboxWriter {
     /// cap. `0` on a healthy (drained) outbox.
     pub fn dropped_unacked(&self) -> u64 {
         self.dropped_unacked.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::dropped_unacked`] per `event_kind`, as `(kind, count)` pairs.
+    /// Empty on an outbox the cap has never trimmed.
+    pub fn dropped_unacked_by_kind(&self) -> Vec<(String, u64)> {
+        self.dropped_unacked_by_kind
+            .lock()
+            .map(|m| m.iter().map(|(k, n)| (k.clone(), *n)).collect())
+            .unwrap_or_default()
     }
 
     /// fsyncs the group committer has issued since open. One per commit
@@ -667,6 +682,7 @@ impl OutboxWriter {
             .last();
         let mut drop_flags = vec![false; kept.len()];
         let mut dropped_unacked = 0usize;
+        let mut dropped_by_kind: HashMap<&str, u64> = HashMap::new();
         for (i, rec) in kept.iter().enumerate() {
             if live <= target {
                 break;
@@ -677,9 +693,15 @@ impl OutboxWriter {
             drop_flags[i] = true;
             live -= sizes[i];
             dropped_unacked += 1;
+            *dropped_by_kind.entry(rec.event_kind.as_str()).or_insert(0) += 1;
         }
 
         if dropped_unacked > 0 {
+            if let Ok(mut by_kind) = self.dropped_unacked_by_kind.lock() {
+                for (kind, n) in &dropped_by_kind {
+                    *by_kind.entry((*kind).to_string()).or_insert(0) += n;
+                }
+            }
             let total = self
                 .dropped_unacked
                 .fetch_add(dropped_unacked as u64, Ordering::Relaxed)
@@ -1462,6 +1484,47 @@ mod tests {
         assert!(!pending.is_empty());
         assert_eq!(pending.last().unwrap().seq, 400);
         assert!(pending.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    /// The trim's loss is counted by `event_kind`, so `GET /health` can say a
+    /// `finished` row was trimmed rather than only that SOMETHING was (plan
+    /// 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered,
+    /// Phase 1). The oldest row is a lifecycle row; the trim takes it first.
+    #[test]
+    fn cap_trim_counts_dropped_rows_by_kind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let cap = 16 * 1024;
+        let outbox = OutboxWriter::open_with_max_bytes(&path, cap).unwrap();
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        assert!(outbox.dropped_unacked_by_kind().is_empty());
+
+        outbox
+            .record(m, s, SessionEventKind::Finished, json!({ "pad": "f" }))
+            .unwrap();
+        for _ in 0..400 {
+            outbox
+                .record(
+                    m,
+                    s,
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+
+        let by_kind: HashMap<String, u64> = outbox.dropped_unacked_by_kind().into_iter().collect();
+        assert_eq!(
+            by_kind.get("finished").copied(),
+            Some(1),
+            "the trimmed finished row is counted under its own kind: {by_kind:?}"
+        );
+        assert_eq!(
+            by_kind.values().sum::<u64>(),
+            outbox.dropped_unacked(),
+            "the per-kind counts partition the total"
+        );
     }
 
     /// A trim must exhaust ACKED rows before it destroys a single unacked

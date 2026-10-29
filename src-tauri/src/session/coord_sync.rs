@@ -138,6 +138,7 @@ use uuid::Uuid;
 use crate::auth::TenantScope;
 
 use super::closeout_spool::{classify_coord_write_status, CoordWriteClass};
+use super::coord_sync_drops::{LifecycleDropCounter, LifecycleDropReason, LifecycleDrops};
 use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
@@ -228,6 +229,9 @@ struct CoordSyncInner {
     /// session to `PendingResolution`. Entries live only as long as a
     /// [`DrainHold`] guard.
     held: Mutex<HashSet<Uuid>>,
+    /// Lifecycle rows this drain dropped, by kind and reason — `GET /health`
+    /// `sessionOutbox.lifecycleDrops` (see [`super::coord_sync_drops`]).
+    lifecycle_drops: LifecycleDropCounter,
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
@@ -290,6 +294,7 @@ impl CoordSync {
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
                 held: Mutex::new(HashSet::new()),
+                lifecycle_drops: LifecycleDropCounter::default(),
             }),
         }
     }
@@ -325,6 +330,7 @@ impl CoordSync {
                 // probe the REAL upstream from a unit test.
                 outside_observer: None,
                 held: Mutex::new(HashSet::new()),
+                lifecycle_drops: LifecycleDropCounter::default(),
             }),
         }
     }
@@ -828,6 +834,9 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// Lifecycle rows dropped since boot, by kind and reason, as of
+    /// `observed_at` (drain counts plus the outbox's own cap trim).
+    pub lifecycle_drops: LifecycleDrops,
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -853,6 +862,16 @@ fn note_outbox_failure(kind: &'static str, status: Option<u16>) {
             at: Utc::now(),
         })
     });
+}
+
+/// The drain's lifecycle-drop counts merged with the outbox's own per-kind cap
+/// trim total — the one place the four drop reasons come together.
+fn lifecycle_drops_snapshot(inner: &CoordSyncInner) -> LifecycleDrops {
+    let mut drops = inner.lifecycle_drops.snapshot();
+    for (kind, n) in inner.outbox.dropped_unacked_by_kind() {
+        drops.add(&kind, LifecycleDropReason::OutboxTrim, n);
+    }
+    drops
 }
 
 /// `GET /health` `sessionOutbox`, rendered from the live process state.
@@ -881,6 +900,8 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        // `{<kind>: {<reason>: count}}` over the lifecycle kinds, dense.
+        "lifecycleDrops": if observed { h.lifecycle_drops.to_json() } else { JsonValue::Null },
         "observedAt": h.observed_at,
     })
 }
@@ -1284,6 +1305,15 @@ async fn push_chain(
         }
         match push_record(&inner, &rec).await {
             PushOutcome::Acked => {
+                if rec.event_kind == SessionEventKind::Started.as_str() {
+                    // A created coord row is no longer silent: without this
+                    // line "was `started` lost or refused?" had no answer.
+                    tracing::info!(
+                        coord_session = %rec.session_id,
+                        seq = rec.seq,
+                        "coord_sync: coord ACKed the started row — coord session row created"
+                    );
+                }
                 out.acked_by_coord = true;
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
@@ -1363,6 +1393,10 @@ async fn push_chain(
                 // `started` row is a session coord will never know about.
                 let (fail_kind, fail_status) = classify_push_failure(&reason, true);
                 note_outbox_failure(fail_kind, fail_status);
+                inner.lifecycle_drops.record(
+                    &rec.event_kind,
+                    LifecycleDropReason::for_permanent_failure(fail_status, &reason),
+                );
                 tracing::error!(
                     session = %rec.session_id,
                     seq = rec.seq,
@@ -1465,6 +1499,11 @@ fn quarantine_rows(
             path = %path.display(),
             "coord_sync: quarantine sidecar is at its cap — dropping quarantined rows"
         );
+        for r in &fresh {
+            inner
+                .lifecycle_drops
+                .record(&r.event_kind, LifecycleDropReason::QuarantineCap);
+        }
         done.extend(fresh.iter().map(|r| (r.session_id, r.seq)));
         return done;
     }
@@ -1509,12 +1548,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     state.retry.retain(|sid, _| pending_sessions.contains(sid));
     if pending.is_empty() {
         let quarantined = state.quarantined.len() as u64;
+        let lifecycle_drops = lifecycle_drops_snapshot(inner);
         with_outbox_health(|h| {
             h.observed_at = Some(Utc::now());
             h.pending = 0;
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
+            h.lifecycle_drops = lifecycle_drops;
         });
         return TickResult::idle();
     }
@@ -1680,12 +1721,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .collect();
     let retrying = state.retry.len() as u64;
     let quarantined = state.quarantined.len() as u64;
+    let lifecycle_drops = lifecycle_drops_snapshot(inner);
     with_outbox_health(|h| {
         h.observed_at = Some(Utc::now());
         h.pending = remaining.len() as u64;
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
+        h.lifecycle_drops = lifecycle_drops;
     });
 
     TickResult {
@@ -3796,6 +3839,7 @@ async fn fetch_session_coordination_flag(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::coord_sync_drops::LIFECYCLE_DROP_KINDS;
     use crate::session::transport::{DynTransport, Transport, TransportError, TransportHandle};
 
     /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
@@ -4032,6 +4076,10 @@ mod tests {
         /// When set (and `patch_returns_404` is not), every PATCH answers
         /// this status instead of 200 — drives the resume-probe refusal arm.
         patch_status: Option<u16>,
+        /// The body a `patch_status` answer carries; `None` keeps the default
+        /// `{"error":"refused"}`. Lets a test send coord's real
+        /// `{"error":"session_not_found"}` 404.
+        patch_status_body: Option<JsonValue>,
         /// The `tenant_id` field of a 2xx PATCH answer: `None` omits it (the
         /// field-absent arm), `Some(v)` sends `v` verbatim (a non-UUID string
         /// drives the unparseable arm).
@@ -4201,10 +4249,11 @@ mod tests {
                                 .into_response();
                         }
                         if let Some(code) = g.patch_status {
-                            return (
-                                AxumStatus::from_u16(code).unwrap(),
-                                Json(json!({"error": "refused"})),
-                            )
+                            let body = g
+                                .patch_status_body
+                                .clone()
+                                .unwrap_or_else(|| json!({"error": "refused"}));
+                            return (AxumStatus::from_u16(code).unwrap(), Json(body))
                                 .into_response();
                         }
                         let mut answer = json!({"id": id});
@@ -6260,6 +6309,229 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // lifecycleDrops (plan 2026-10-29-session-outbox-drops-the-finish-of-a-
+    // session-coord-never-registered, Phase 1)
+    // -----------------------------------------------------------------
+
+    /// Drain one `kind` row for a fresh session against a fake coord whose
+    /// every PATCH answers `status` with `body`; return the drop snapshot.
+    async fn drain_one_refused_patch(
+        kind: SessionEventKind,
+        status: u16,
+        body: JsonValue,
+    ) -> LifecycleDrops {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.patch_status = Some(status);
+            g.patch_status_body = Some(body);
+        }
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                kind,
+                json!({ "id": s, "claude_session_id": "c" }),
+            )
+            .unwrap();
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a 4xx'd row is ACK-dropped today — the drop this block counts"
+        );
+        assert_eq!(rec.lock().await.patches.len(), 1, "the row was pushed once");
+        lifecycle_drops_snapshot(&coord.inner)
+    }
+
+    /// (a) A `finished` PATCH that coord answers with its real 404
+    /// `session_not_found` is counted as `lifecycleDrops.finished.not_found`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_not_found_404_on_finished_counts_as_not_found() {
+        let _amb = crate::test_env::isolated_ambient();
+        let drops = drain_one_refused_patch(
+            SessionEventKind::Finished,
+            404,
+            json!({"error": "session_not_found"}),
+        )
+        .await;
+        assert_eq!(drops.get("finished", LifecycleDropReason::NotFound), 1);
+        assert_eq!(drops.get("finished", LifecycleDropReason::Refused4xx), 0);
+        assert_eq!(drops.to_json()["finished"]["not_found"], 1);
+    }
+
+    /// (b) Any other 4xx on a lifecycle row — a 422, or a 404 whose body is
+    /// not coord's `session_not_found` — is `refused_4xx`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_session_not_found_4xx_on_a_lifecycle_row_counts_as_refused() {
+        let _amb = crate::test_env::isolated_ambient();
+        let drops = drain_one_refused_patch(
+            SessionEventKind::StateChange,
+            422,
+            json!({"error": "invalid_state"}),
+        )
+        .await;
+        assert_eq!(
+            drops.get("state_change", LifecycleDropReason::Refused4xx),
+            1
+        );
+        assert_eq!(drops.get("state_change", LifecycleDropReason::NotFound), 0);
+
+        let drops = drain_one_refused_patch(
+            SessionEventKind::Closed,
+            404,
+            json!({"error": "route_not_found"}),
+        )
+        .await;
+        assert_eq!(drops.get("closed", LifecycleDropReason::Refused4xx), 1);
+        assert_eq!(drops.get("closed", LifecycleDropReason::NotFound), 0);
+
+        // A heartbeat 404 is not a lifecycle drop (the sibling plan counts it).
+        let drops = drain_one_refused_patch(
+            SessionEventKind::Heartbeat,
+            404,
+            json!({"error": "session_not_found"}),
+        )
+        .await;
+        assert_eq!(drops, LifecycleDrops::default());
+    }
+
+    /// (c) Rows dropped because the quarantine sidecar is at its cap are
+    /// counted as `quarantine_cap` under their own kind; a non-lifecycle row
+    /// dropped beside them is not.
+    #[test]
+    fn a_quarantine_cap_drop_counts_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        // A sparse sidecar already at the cap.
+        std::fs::File::create(quarantine_path(&outbox))
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let rows: Vec<OutboxRecord> = [
+            SessionEventKind::Finished,
+            SessionEventKind::Finished,
+            SessionEventKind::Closed,
+            SessionEventKind::OutputChunk,
+        ]
+        .into_iter()
+        .map(|k| outbox.record(m, s, k, json!({})).unwrap())
+        .collect();
+        let mut state = DrainState::default();
+        let done = quarantine_rows(&coord.inner, &mut state, rows);
+        assert_eq!(done.len(), 4, "at the cap every row is dropped (today)");
+
+        let drops = lifecycle_drops_snapshot(&coord.inner);
+        assert_eq!(drops.get("finished", LifecycleDropReason::QuarantineCap), 2);
+        assert_eq!(drops.get("closed", LifecycleDropReason::QuarantineCap), 1);
+        assert!(drops.to_json().get("output_chunk").is_none());
+    }
+
+    /// (e) Before the first drain tick `lifecycleDrops` is `null` (UNKNOWN,
+    /// not zero), like the neighbouring counters; once observed it is the
+    /// dense `{kind: {reason: n}}` block, and the outbox's own cap trim is
+    /// merged in as `outbox_trim`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_drops_is_null_until_observed_then_dense() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert!(
+            render_session_outbox_health(&SessionOutboxHealth::default())["lifecycleDrops"]
+                .is_null(),
+            "an unobserved drain renders lifecycleDrops: null"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            OutboxWriter::open_with_max_bytes(dir.path().join("outbox.jsonl"), 16 * 1024).unwrap(),
+        );
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
+        outbox
+            .record(m, s, SessionEventKind::Started, json!({}))
+            .unwrap();
+        for _ in 0..200 {
+            outbox
+                .record(
+                    m,
+                    s,
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        let drops = lifecycle_drops_snapshot(&coord.inner);
+        assert_eq!(drops.get("started", LifecycleDropReason::OutboxTrim), 1);
+
+        let observed = render_session_outbox_health(&SessionOutboxHealth {
+            observed_at: Some(Utc::now()),
+            lifecycle_drops: drops,
+            ..SessionOutboxHealth::default()
+        });
+        let block = &observed["lifecycleDrops"];
+        assert_eq!(block["started"]["outbox_trim"], 1);
+        assert_eq!(
+            block["finished"]["not_found"], 0,
+            "zeros are rendered, not omitted"
+        );
+        for kind in LIFECYCLE_DROP_KINDS {
+            for reason in LifecycleDropReason::ALL {
+                assert!(
+                    block[kind.as_str()][reason.as_str()].is_u64(),
+                    "lifecycleDrops.{}.{} must be present",
+                    kind.as_str(),
+                    reason.as_str()
+                );
+            }
+        }
+    }
+
+    /// The counted kinds are exactly the ones `is_lifecycle_kind` accepts.
+    #[test]
+    fn lifecycle_drop_kinds_match_is_lifecycle_kind() {
+        for kind in LIFECYCLE_DROP_KINDS {
+            assert!(is_lifecycle_kind(kind.as_str()), "{}", kind.as_str());
+        }
+        for kind in [
+            SessionEventKind::Heartbeat,
+            SessionEventKind::ClaimStolen,
+            SessionEventKind::OutputChunk,
+            SessionEventKind::CommitReport,
+            SessionEventKind::Progress,
+            SessionEventKind::HelperTaskCreated,
+            SessionEventKind::RestoreRecord,
+            SessionEventKind::GateRegistration,
+            SessionEventKind::FindingPosted,
+            SessionEventKind::CoordTransportRung,
+            SessionEventKind::AgentNotification,
+            SessionEventKind::OperatorTouch,
+        ] {
+            assert!(!is_lifecycle_kind(kind.as_str()), "{}", kind.as_str());
+            assert!(!LIFECYCLE_DROP_KINDS.contains(&kind));
+        }
+    }
+
     /// Failures while NOTHING reaches coord are an outage: they back off but
     /// never count toward quarantine, so an outage cannot quarantine the fleet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6427,6 +6699,7 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            lifecycle_drops: LifecycleDrops::default(),
         });
         for key in [
             "pending",
