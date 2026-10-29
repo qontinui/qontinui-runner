@@ -17,6 +17,13 @@
 //! | `quarantine_cap` | `quarantine_rows`' cap branch (the sidecar is full)         |
 //! | `outbox_trim`    | `OutboxWriter::enforce_cap_locked` (read from the writer)   |
 //!
+//! Since Phase 2 a `session_not_found` 404 on a path-addressed PATCH is not
+//! dropped at all: it re-creates the coord row and retries, or HOLDS the
+//! lifecycle row (`super::coord_sync_reregister`, counted under
+//! `orphanedSessions`). So `not_found` should read `0`; a non-zero value means
+//! a lifecycle 404 reached the drop arm some other way, which is itself the
+//! finding.
+//!
 //! Heartbeats are deliberately absent: a sibling plan
 //! (`2026-10-29-session-outbox-heartbeat-drops-are-uncounted-by-cause`) owns
 //! their counters.

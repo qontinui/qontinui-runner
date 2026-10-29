@@ -63,6 +63,7 @@ pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
 pub(crate) mod coord_sync_drops; // Per-kind, per-reason counts of dropped session-outbox LIFECYCLE rows — /health sessionOutbox.lifecycleDrops (plan 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered, Phase 1)
+pub(crate) mod coord_sync_reregister; // A 404 session_not_found re-creates the coord row from a recorded create body (<outbox>.created.jsonl) and retries, instead of dropping the finish (plan 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered, Phase 2)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
