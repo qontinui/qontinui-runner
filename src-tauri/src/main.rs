@@ -4016,11 +4016,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Gate-continuation outcome outbox (plan
                 // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
-                // Phase 2) — `agent_runtime::post_continuation_outcome` queues a
-                // consume outcome whose direct post failed in transport here, and
-                // the `CoordSync` drain retries it until coord answers. Same
+                // Phase 2) — `agent_runtime::post_continuation_outcome` writes a
+                // consume outcome here before its direct post, and the
+                // `CoordSync` drain retries whatever coord did not confirm. Same
                 // `registrar_outbox` Arc as the closeout spool, for the same
-                // collision reason.
+                // collision reason. `agent_runtime::spawn_runtime` starts long
+                // before this point; an outcome posted in that window is held
+                // in the module's bounded pre-install buffer and written to the
+                // outbox by this install, not lost.
                 if !session::continuation_outcome_outbox::install(
                     registrar_outbox.clone(),
                     machine_id,

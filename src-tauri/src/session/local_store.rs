@@ -33,7 +33,9 @@
 //!   documented disk-full history. [`OutboxWriter::record`] therefore enforces
 //!   [`DEFAULT_MAX_BYTES`] itself, dropping acked rows first and then the
 //!   OLDEST-unacked rows, counted in [`OutboxWriter::dropped_unacked`] and
-//!   warned — never silently. A durability buffer whose only bound is
+//!   warned — never silently. A gate continuation's consume outcome
+//!   (`gate_continuation_outcome`) is never dropped by the trim
+//!   (`is_trim_exempt_kind`). A durability buffer whose only bound is
 //!   "someone else drains me" has no bound at all.
 //!
 //! ## Group commit (plan `2026-07-28-runner-many-sessions-performance` §7a/B6)
@@ -128,6 +130,20 @@ const COMPACT_MIN_DEAD_BYTES: u64 = 4096;
 /// is a full read + rewrite).
 fn trim_target(max_bytes: u64) -> u64 {
     max_bytes / 5 * 4
+}
+
+/// Unacked kinds the cap trim never drops.
+///
+/// Only `gate_continuation_outcome` (plan
+/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+/// Phase 2). On the claim-error spawn path such a row is the ONLY record that
+/// a continuation was consumed, and the trim drops the OLDEST unacked rows
+/// first, so during a long outage these rows would be the first to go. Each
+/// row is a few hundred bytes and there is at most one per gate outcome, so
+/// exempting them cannot defeat the cap the way an exempt transcript kind
+/// would.
+fn is_trim_exempt_kind(kind: &str) -> bool {
+    kind == super::SessionEventKind::GateContinuationOutcome.as_str()
 }
 
 /// A single outbox record. Persisted as one JSON line.
@@ -650,6 +666,8 @@ impl OutboxWriter {
         // Phase 2 — still over? Drop the OLDEST UNACKED rows until under the
         // target. Acked rows surviving phase 1 are seq-floor tombstones and are
         // skipped here: dropping one would reset the next-seq scan on reopen.
+        // An `is_trim_exempt_kind` row is skipped too: it is the only record
+        // of a consume, and it is small.
         let sizes: Vec<u64> = kept.iter().map(serialized_len).collect();
         let mut live: u64 = sizes.iter().sum();
         let target = trim_target(self.max_bytes);
@@ -671,7 +689,10 @@ impl OutboxWriter {
             if live <= target {
                 break;
             }
-            if rec.acked_at.is_some() || protect_from.is_some_and(|p| i >= p) {
+            if rec.acked_at.is_some()
+                || protect_from.is_some_and(|p| i >= p)
+                || is_trim_exempt_kind(&rec.event_kind)
+            {
                 continue;
             }
             drop_flags[i] = true;
