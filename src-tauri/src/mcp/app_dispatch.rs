@@ -454,9 +454,9 @@ impl AppDispatcher {
     /// (no active browser tab), the call short-circuits with
     /// `DispatchError::NotResponsive` instead of waiting for a 10s HTTP retry.
     /// That is NOT a licence to fall back to the runner's own UI: an app WAS
-    /// the target, so the action handlers refuse the IPC fallback for it —
+    /// the target, so every handler with an IPC fallback (actions and reads) refuses it —
     /// only `NotConnected` may fall back (`sdk_client::ipc_fallback_refusal`).
-    /// Read-only handlers without that gate still fall back on any error.
+    /// (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D5).
     /// WebSocket-transport apps skip
     /// the cache entirely — their liveness is already tracked by the relay
     /// heartbeat in `WsConnectionManager`.
