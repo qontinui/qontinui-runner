@@ -1878,10 +1878,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             //
             // `session_status = "finished"` is terminal on coord's work axis and
             // gates prompting; no coord production writer moves a row off it.
+            //
+            // The body also carries the mark's own time as `last_progress_at`
+            // (see `finished_body`), so coord stamps the finish at the instant
+            // the runner DECLARED it, not whenever this outbox row drained.
             let url = format!("{base}/sessions/{}", rec.session_id);
-            let body = json!({
-                "progress": { "session_status": "finished" },
-            });
+            let body = finished_body(&rec.payload);
             crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
@@ -2935,6 +2937,41 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     JsonValue::Object(body)
 }
 
+/// The `PATCH /sessions/:id` body for a `finished` outbox row.
+///
+/// `{progress:{session_status:"finished", last_progress_at:<RFC 3339>}}`,
+/// where `last_progress_at` is the payload's `finished_at` (unix millis — the
+/// runner's own mark, `SessionLifecycleStore::set_finished`) rendered with
+/// millisecond precision in UTC. coord's `ProgressUpdate::last_progress_at` is
+/// a `DateTime<Utc>`, and coord uses an explicit one as the write instant of
+/// the whole report, so WHENEVER this report moves coord's transition clock
+/// (`state_started_at`, served back as `since`) it moves it to this instant
+/// (plan
+/// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
+/// Phase 3 (b)). That is on a real status change on any coord, and on every
+/// finish — finished → finished included — only on a coord carrying that
+/// plan's Phase 2. Without it a late drain post-dates the finish, which is the
+/// unsafe direction for a reader deciding whether a prompt came after it.
+///
+/// A payload with no usable `finished_at` (a row queued by an older build, a
+/// `null`, or a value chrono cannot represent) omits the field, and coord
+/// stamps `now()` exactly as before. Pure.
+fn finished_body(payload: &JsonValue) -> JsonValue {
+    let mut progress = serde_json::Map::new();
+    progress.insert("session_status".into(), json!("finished"));
+    if let Some(at) = payload
+        .get("finished_at")
+        .and_then(JsonValue::as_i64)
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+    {
+        progress.insert(
+            "last_progress_at".into(),
+            json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        );
+    }
+    json!({ "progress": JsonValue::Object(progress) })
+}
+
 /// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
 /// outbox payload. The registrar records the work-progress fields flat in the
 /// payload (`session_status`, optional `last_progress_at` / `progress_detail`);
@@ -3842,9 +3879,16 @@ mod tests {
             body.contains(".patch(&url)"),
             "the finished write must be a PATCH, matching the progress arm: {body}"
         );
+        // The body is built by `finished_body` (which also carries the mark's
+        // time — pinned by `finished_body_carries_the_marks_own_time_as_last_progress_at`).
         assert!(
-            body.contains("\"session_status\": \"finished\""),
-            "the body must set coord's WORK axis to finished: {body}"
+            body.contains("finished_body(&rec.payload)"),
+            "the finished arm must send the finished body: {body}"
+        );
+        assert_eq!(
+            finished_body(&json!({}))["progress"]["session_status"],
+            "finished",
+            "the body must set coord's WORK axis to finished"
         );
     }
     use crate::session::{Intent, RowTenant, SessionKind, SessionRegistry, SessionTransports};
@@ -5274,7 +5318,10 @@ mod tests {
             assert_eq!(g.patches.len(), 3, "{:?}", g.patches);
             assert_eq!(
                 g.patches[2].1,
-                json!({ "progress": { "session_status": "finished" } }),
+                json!({ "progress": {
+                    "session_status": "finished",
+                    "last_progress_at": "1970-01-01T00:00:00.001Z",
+                } }),
                 "the finished row was DELIVERED on retry"
             );
         }
@@ -5583,7 +5630,93 @@ mod tests {
         assert_eq!(g.patches[0].0, s);
         assert_eq!(
             g.patches[0].1,
-            json!({ "progress": { "session_status": "finished" } })
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "1970-01-01T00:00:00.001Z",
+            } })
+        );
+    }
+
+    /// End to end (review round 1): a RESTAMPED mark drains with the NEW time.
+    /// The lifecycle store's restamp → its finish observer → the registrar's
+    /// `finished` outbox row → `push_record` → the PATCH coord receives, whose
+    /// `last_progress_at` is the SECOND finish's stamp, not the first's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restamped_finish_drains_with_the_new_last_progress_at() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let coord_row = Uuid::new_v4();
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_row));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |r| reg.forward_finish_change(r));
+        }
+        store.record_open(test_open_record("s"));
+
+        let first = store
+            .set_finished("s", true, Some("first".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        store.mark_finish_synced("s", Some(first));
+        // Revived, then finished again: a reason-carrying re-finish restamps.
+        let again = store
+            .set_finished("s", true, Some("again".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert_ne!(again, first);
+
+        let rows: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the first finish and the re-sent one: {rows:?}"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.payload["finished_at"], again,
+            "the re-sent row carries the NEW stamp"
+        );
+        let outcome = push_record(&coord.inner, last).await;
+        assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
+
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(again)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let g = rec.lock().await;
+        let (id, body) = g.patches.last().expect("the re-sent finish was PATCHed");
+        assert_eq!(
+            *id, coord_row,
+            "addressed to the session's coord row by PATH"
+        );
+        assert_eq!(body["progress"]["session_status"], "finished");
+        assert_eq!(
+            body["progress"]["last_progress_at"],
+            expected.as_str(),
+            "coord is told the SECOND finish's time: {body}"
         );
     }
 
@@ -6949,12 +7082,21 @@ mod tests {
         })
         .await;
         let g = rec.lock().await;
-        assert!(
-            g.patches
-                .iter()
-                .any(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished"),
-            "the marker must reach coord as PATCH /sessions/:id: {:?}",
-            g.patches
+        let patch = g
+            .patches
+            .iter()
+            .find(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the marker must reach coord as PATCH /sessions/:id: {:?}",
+                    g.patches
+                )
+            });
+        assert_eq!(
+            patch.1["progress"]["last_progress_at"], "1970-01-01T00:00:00.042Z",
+            "the PATCH carries the mark's own time, so coord dates the finish at \
+             the declaration rather than at the drain: {:?}",
+            patch.1
         );
     }
 
@@ -7251,6 +7393,45 @@ mod tests {
         assert!(body.get("repo").is_none());
         assert!(body.get("branch").is_none());
         assert!(body.get("intent_updates").is_none());
+    }
+
+    /// A `finished` row's PATCH carries the mark's own `finished_at` as an
+    /// RFC 3339 `last_progress_at`, and omits it when the payload has no usable
+    /// time.
+    #[test]
+    fn finished_body_carries_the_marks_own_time_as_last_progress_at() {
+        // 2026-09-13T10:00:00.123Z — the mark's `finished_at`, unix millis.
+        let body = finished_body(&json!({
+            "id": Uuid::new_v4(),
+            "claude_session_id": "csid",
+            "finished_at": 1_789_293_600_123_i64,
+        }));
+        assert_eq!(
+            body,
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "2026-09-13T10:00:00.123Z",
+            } }),
+            "coord deserializes `last_progress_at` as a DateTime<Utc> and uses it \
+             as the write instant, so `since` is the declared finish time"
+        );
+        // Only the two progress fields: routing keys are not forwarded.
+        assert!(body["progress"].get("claude_session_id").is_none());
+        assert!(body["progress"].get("finished_at").is_none());
+
+        // No usable time (an older row, a null, a non-integer): omitted, so
+        // coord stamps now() exactly as before.
+        for payload in [
+            json!({ "claude_session_id": "csid" }),
+            json!({ "claude_session_id": "csid", "finished_at": null }),
+            json!({ "claude_session_id": "csid", "finished_at": "yesterday" }),
+        ] {
+            assert_eq!(
+                finished_body(&payload),
+                json!({ "progress": { "session_status": "finished" } }),
+                "{payload}"
+            );
+        }
     }
 
     /// `progress` body nests the flat work-progress fields under `progress`

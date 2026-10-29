@@ -1459,7 +1459,7 @@ pub enum ProbeOutcome {
 /// nothing derived from a token or a URL.
 ///
 /// Use [`run_probe_quiet`] where a non-zero exit is an EXPECTED, routine answer
-/// (`lsof` on an unowned port, `taskkill` on an already-dead pid) — WARNing on
+/// (`lsof` on an unowned port, `netstat | findstr` on a closed one) — WARNing on
 /// those buries the timeout WARN that actually matters.
 pub fn run_probe(
     cmd: std::process::Command,
@@ -1474,9 +1474,8 @@ pub fn run_probe(
 ///
 /// For probes whose negative answer is ordinary and frequent: `lsof -t -i:<port>`
 /// exits 1 whenever nothing owns the port, `ss -ltnp` is simply absent on macOS
-/// and on minimal images, `netstat | findstr` exits 1 when not listening, and
-/// `taskkill /F /T /PID` exits 128 for a pid that already went away. All four
-/// leave the caller's verdict unchanged, and all four fire on a per-process
+/// and on minimal images, and `netstat | findstr` exits 1 when not listening.
+/// All three leave the caller's verdict unchanged, and all three fire on a per-process
 /// timer — so WARNing on them is pure log volume that hides the one line this
 /// PR exists to add.
 ///
