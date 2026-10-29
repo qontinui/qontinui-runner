@@ -674,12 +674,13 @@ async fn run(app: &mut SimApp, req: &ExploreRequest) -> LoopOutcome {
     explore(app, req).await.expect("no runner-side abort")
 }
 
-/// What an earned exhaustion's measures read: confirmed, nothing open, and
-/// no other flag.
+/// What an earned exhaustion's measures read: confirmed, nothing open, the
+/// closing look completed, and no other flag.
 fn earned() -> Unsettled {
     Unsettled {
         exhaustion_unconfirmed: Some(false),
         open_at_confirmation: Some(0),
+        closing_look_failed: Some(false),
         ..Default::default()
     }
 }
@@ -1458,11 +1459,15 @@ fn every_mirrored_check_exists_in_the_vendored_embedded_schema() {
     // LIMIT: this compares against the runner's vendored embedded schema, not
     // the qontinui-web migration text — that file lives in another repo and
     // is not reachable from a unit test offline. The vendored block was
-    // produced by applying `journey_02_explorations`'s DDL (web 56f88b78)
-    // and `journey_03_explorations_stop_unsettled`'s (the seventh word and
-    // the `stop_detail` column) and dumping the table, so it is the
-    // migrations' text as Postgres renders it; a later web change to the
-    // table must be re-vendored for this test to see it.
+    // produced by applying `journey_02_explorations`'s DDL (web 56f88b78),
+    // `journey_03_explorations_stop_unsettled`'s (the seventh word and the
+    // `stop_detail` column) and `journey_04_explorations_stop_detail_any_stop`'s
+    // (`stop_detail` on any stop; its CHECK line re-vendored from
+    // `pg_get_constraintdef`, read from an ephemeral PostgreSQL 16.15
+    // database — `ephemeral-db.sh start pgvector`, 2026-10-29 — after alembic
+    // applied journey_04 to it) and dumping the table, so it is the migrations' text as Postgres renders
+    // it; a later web change to the table must be re-vendored for this test
+    // to see it.
     let schema = include_str!("../../schema.pg.sql.generated");
     assert!(schema.contains("CREATE TABLE project.journey_explorations ("));
     let table = schema
@@ -1501,6 +1506,20 @@ fn every_mirrored_check_exists_in_the_vendored_embedded_schema() {
     let words: BTreeSet<&str> = check.split('\'').skip(1).step_by(2).collect();
     let want: BTreeSet<&str> = StopReason::ALL.iter().map(|r| r.as_str()).collect();
     assert_eq!(words, want, "{check}");
+    // A fresh embedded database is at journey_04: no CHECK ties stop_detail
+    // to frontier_unsettled, so the probe reads it AnyStop.
+    let detail_check = table
+        .lines()
+        .find(|l| l.contains("CONSTRAINT ck_journey_explorations_stop_detail CHECK"))
+        .expect("the stop_detail CHECK");
+    assert!(!check_restricts_stop_detail(detail_check), "{detail_check}");
+    assert!(
+        !table
+            .lines()
+            .filter(|l| l.contains("CHECK"))
+            .any(check_restricts_stop_detail),
+        "no CHECK on the vendored table restricts stop_detail"
+    );
 }
 
 #[test]
@@ -1574,22 +1593,27 @@ async fn an_action_inside_an_explorer_run_is_attributed_to_it() {
 #[test]
 fn the_runner_app_is_refused_with_a_422_naming_why() {
     let runner = crate::spec_api::storage::RUNNER_APP_ID;
-    // However the path spells it: a decoded `%20`, other case, padding.
-    for spelled in [
-        runner.to_string(),
-        format!("{runner} "),
-        format!(" {runner}\t"),
-        runner.to_ascii_uppercase(),
-    ] {
+    // In any case: refused by name.
+    for spelled in [runner.to_string(), runner.to_ascii_uppercase()] {
         let Refusal(status, why) = explore_app_id(&spelled)
             .expect_err("the runner's own webview is not D4-safe to explore");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{spelled:?}");
         assert!(why.contains("no declared effect"), "{spelled:?}: {why}");
     }
+    // Padded (a decoded `%20`): not an identifier, refused — never trimmed
+    // into an id the path did not give (as the observe route checks it).
+    for padded in [
+        format!("{runner} "),
+        format!(" {runner}\t"),
+        " qontinui-web ".to_string(),
+    ] {
+        let Refusal(status, why) = explore_app_id(&padded).expect_err("padded");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{padded:?}");
+        assert!(why.contains("identifier"), "{padded:?}: {why}");
+    }
     assert_eq!(
-        explore_app_id(" qontinui-web ").map_err(|r| r.1),
-        Ok("qontinui-web".to_string()),
-        "the trimmed id is the one every action names"
+        explore_app_id("qontinui-web").map_err(|r| r.1),
+        Ok("qontinui-web".to_string())
     );
     for bad in ["", "a b", "../etc", "qontinui-web/x"] {
         let Refusal(status, why) = explore_app_id(bad).expect_err(bad);
@@ -1774,6 +1798,11 @@ async fn the_work_after_a_stop_is_bounded() {
     let o = run(&mut app, &request(home(), 2, 5, 60)).await;
     assert_eq!(o.stopped_because, StopReason::BudgetActions);
     assert!(started.elapsed() <= POST_STOP_GRACE + Duration::from_millis(1));
+    assert_eq!(
+        o.unsettled.closing_look_failed,
+        Some(true),
+        "the grace ran out: recorded, not dropped"
+    );
 
     // An exhaustion it could not confirm is not claimed.
     let mut full = SimApp::site();
@@ -1862,7 +1891,19 @@ async fn edges_added_counts_what_the_queue_took_and_drops_are_reported() {
         o,
     );
     assert_eq!(r.edges_added, 0);
-    assert!(r.edge_events_dropped > 0);
+    assert!(r.unsettled.edge_events_dropped > 0);
+    // Reported ONCE, in the block the row keeps — not again at the top level.
+    let wire = serde_json::to_value(&r).unwrap();
+    assert!(wire.get("edgeEventsDropped").is_none(), "{wire}");
+    assert_eq!(
+        wire["unsettled"]["edgeEventsDropped"],
+        json!(r.unsettled.edge_events_dropped)
+    );
+    assert_eq!(
+        stop_detail_column(&r).unwrap()["edgeEventsDropped"],
+        json!(r.unsettled.edge_events_dropped),
+        "and the stored row keeps it"
+    );
     assert!(r.affordances_activated > 0, "the app still acted");
     assert_eq!(
         r.affordances_activated + r.frontier_remaining_by_reason.values().sum::<u32>(),
@@ -2373,6 +2414,7 @@ fn the_stored_row_says_why_a_run_was_unsettled() {
     assert_eq!(detail["undrivable"], 2);
     assert_eq!(detail["activationFailedOpen"], 1);
     check_record(&r).unwrap();
+    // Any other stop whose block records nothing: SQL NULL.
     for reason in StopReason::ALL {
         if reason != StopReason::FrontierUnsettled {
             assert_eq!(
@@ -2674,7 +2716,7 @@ fn the_insert_binds_each_column_its_own_value_in_order() {
     // Distinct integers, so any two swapped binds differ.
     r.spent.actions = 7;
     r.edges_added = 5;
-    let params = exploration_insert_params(&r);
+    let params = exploration_insert_params(&r, StopDetailScope::AnyStop);
     let names: Vec<&str> = params.iter().map(|(c, _)| *c).collect();
     assert_eq!(names, cols, "one bind per column, in the SQL's order");
     assert_eq!(params.len(), EXPLORATION_INSERT_BINDS);
@@ -2721,23 +2763,19 @@ async fn a_node_start_check_never_closes_the_previous_runs_pending_edge() {
     let first = run(&mut app, &request(home(), 60, 5, 60)).await;
     assert_eq!(first.stopped_because, StopReason::FrontierUnsettled);
     assert!(app.pending.is_some(), "run one left an edge pending");
-    let edges_before = app.edges.len();
-    // Run two starts from a NODE: its check snapshots the app first. The
-    // check forgets the cursor before that snapshot, so the snapshot cannot
-    // close run one's edge with where the app is now.
+    // Run two starts from a NODE: its check snapshots the app first. The run
+    // forgets the cursor ONCE, before that check, so the check's snapshot
+    // cannot close run one's edge with where the app is now.
     app.snapshot_refused_from = None;
+    app.forgets = 0;
     let here = app.pages[app.current.as_ref().unwrap()].node.key();
-    check_node_start(&mut app, &here)
-        .await
-        .expect("the app is at the start node");
+    let _ = run(&mut app, &request(ExploreStart::Node(here), 60, 5, 60)).await;
+    assert_eq!(app.forgets, 1, "a node start forgets exactly once");
+    // The forget found run one's edge still pending — so the check's
+    // snapshot, taken after it, closed nothing of run one's.
     assert_eq!(
         app.unobserved_closes, 1,
         "closed as unobserved by the forget"
-    );
-    assert_eq!(
-        app.edges.len(),
-        edges_before,
-        "no edge was written with the check's location as its destination"
     );
 }
 
@@ -2746,12 +2784,78 @@ async fn a_node_start_check_takes_no_action_when_the_producer_cannot_forget() {
     let mut app = SimApp::site();
     app.current = Some("home".into());
     app.forget_fails = true;
-    let Refusal(status, msg) = check_node_start(&mut app, &page_node("home").key())
-        .await
-        .expect_err("no snapshot is taken from a stale position");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(msg.contains("unknown position"), "{msg}");
+    let no_row = explore(
+        &mut app,
+        &request(ExploreStart::Node(page_node("home").key()), 60, 5, 60),
+    )
+    .await
+    .expect_err("no snapshot is taken from a stale position");
+    assert_eq!(no_row.kind, NoRowKind::Internal);
+    assert!(
+        no_row.detail.contains("unknown position"),
+        "{}",
+        no_row.detail
+    );
     assert_eq!(app.snapshots, 0, "nothing was asked of the app");
+    assert_eq!(app.forgets, 1);
+}
+
+#[tokio::test]
+async fn a_node_start_is_checked_inside_the_run_after_its_one_forget() {
+    // A start node the app has never been observed at: the run refuses it
+    // (no row, a 422) before any action — the check runs inside `explore`,
+    // so no caller can reach the loop with an unchecked node start.
+    let mut app = SimApp::site();
+    app.current = Some("home".into());
+    let no_row = explore(
+        &mut app,
+        &request(ExploreStart::Node(page_node("nowhere").key()), 60, 5, 60),
+    )
+    .await
+    .expect_err("an unobserved start node is not a reachable start");
+    assert_eq!(
+        no_row.kind,
+        NoRowKind::StartCheck(StatusCode::UNPROCESSABLE_ENTITY)
+    );
+    assert!(
+        no_row.detail.contains("never been observed"),
+        "{}",
+        no_row.detail
+    );
+    assert!(
+        app.activations.is_empty() && app.navigations == 0,
+        "nothing acted on"
+    );
+    assert_eq!(no_row.spent_actions, 0);
+    assert_eq!(
+        app.forgets, 1,
+        "forgotten once, before the check's snapshot"
+    );
+
+    // An auth wall at the check is a 422 naming it; an unreadable answer a 502.
+    let mut app = SimApp::site();
+    app.current = Some("home".into());
+    app.snapshot_auth_wall = true;
+    let no_row = explore(
+        &mut app,
+        &request(ExploreStart::Node(page_node("home").key()), 60, 5, 60),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        no_row.kind,
+        NoRowKind::StartCheck(StatusCode::UNPROCESSABLE_ENTITY)
+    );
+    assert!(
+        no_row.detail.contains("authentication wall"),
+        "{}",
+        no_row.detail
+    );
+
+    // A URL start still forgets (once), and takes no check.
+    let mut app = SimApp::site();
+    let _ = run(&mut app, &request(home(), 60, 5, 60)).await;
+    assert_eq!(app.forgets, 1);
 }
 
 #[test]
@@ -2860,4 +2964,243 @@ async fn a_failed_action_whose_event_was_dropped_is_never_budget_exhausted() {
     let by = by_reason(&o);
     assert_eq!(by["budget_exhausted"], 0, "{by:?}");
     assert_eq!(by["not_yet_activated"], 1, "{by:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups to #2438: budget-stop unknowns, the stored row, runner origins
+// ---------------------------------------------------------------------------
+
+/// `journey_03`'s `ck_journey_explorations_stop_detail`, as PostgreSQL renders
+/// it: `pg_get_constraintdef`, read from an ephemeral PostgreSQL 16.15 database
+/// (`ephemeral-db.sh start pgvector`, 2026-10-29) after alembic applied
+/// journey_03 to it.
+const JOURNEY_03_STOP_DETAIL_CHECK: &str = "CHECK (((stop_detail IS NULL) OR ((stopped_because = \
+     'frontier_unsettled'::text) AND (jsonb_typeof(stop_detail) = 'object'::text))))";
+/// `journey_04`'s, read the same way from the same database after alembic
+/// applied journey_04.
+const JOURNEY_04_STOP_DETAIL_CHECK: &str =
+    "CHECK (((stop_detail IS NULL) OR (jsonb_typeof(stop_detail) = 'object'::text)))";
+
+#[tokio::test]
+async fn a_budget_stops_failed_closing_look_is_kept_in_the_answer_and_the_row() {
+    // The same budget run, clean: its block records nothing, so no detail.
+    let mut clean = SimApp::site();
+    let o = run(&mut clean, &request(home(), 2, 5, 60)).await;
+    assert_eq!(o.stopped_because, StopReason::BudgetActions);
+    assert!(!o.unsettled.any(), "{:?}", o.unsettled);
+    assert_eq!(o.unsettled.closing_look_failed, Some(false));
+    // Now the closing look's snapshot never reaches the producer (a stale
+    // barrier: the runner cannot tie it to a node). Mid-run that is a 503
+    // with no row; after an exhausted frontier it unconfirms the
+    // exhaustion; after a BUDGET stop it used to vanish. It is kept.
+    let mut app = SimApp::site();
+    app.drop_snapshot_events_from = Some(clean.snapshots - 1);
+    let o = run(&mut app, &request(home(), 2, 5, 60)).await;
+    assert_eq!(
+        o.stopped_because,
+        StopReason::BudgetActions,
+        "a budget stop stays one"
+    );
+    assert!(
+        o.unsettled.any(),
+        "the unknown is recorded: {:?}",
+        o.unsettled
+    );
+    assert_eq!(o.unsettled.closing_look_failed, Some(true));
+    assert_eq!(
+        o.unsettled.exhaustion_unconfirmed, None,
+        "no exhaustion was confirmed"
+    );
+    assert!(
+        o.stop_explanation.contains("closing look"),
+        "{}",
+        o.stop_explanation
+    );
+    let r = assemble(
+        "run".into(),
+        "app".into(),
+        &request(home(), 2, 5, 60),
+        chrono::Utc::now(),
+        Duration::from_millis(5),
+        o,
+    );
+    check_record(&r).expect("a budget row may carry its unknowns (journey_04)");
+    let detail = stop_detail_column(&r).expect("the stored row keeps the unknown");
+    assert_eq!(detail["closingLookFailed"], true, "{detail}");
+    let wire = serde_json::to_value(&r).unwrap();
+    assert_eq!(wire["unsettled"]["closingLookFailed"], true, "{wire}");
+}
+
+#[test]
+fn stop_detail_is_written_on_any_stop_that_records_an_unknown_and_withheld_on_journey_03() {
+    let mut budget = record(StopReason::BudgetTime);
+    assert_eq!(stop_detail_column(&budget), None, "nothing recorded: NULL");
+    budget.unsettled.edge_events_dropped = 2;
+    budget.unsettled.ledger_write_failures = 1;
+    let detail = stop_detail_column(&budget).expect("a budget stop with unknowns");
+    assert_eq!(detail, serde_json::to_value(budget.unsettled).unwrap());
+    assert_eq!(detail["edgeEventsDropped"], 2);
+    check_record(&budget).unwrap();
+    // A passed or untaken confirmation records nothing on its own.
+    let mut confirmed = record(StopReason::FrontierExhausted);
+    confirmed.unsettled = earned();
+    confirmed.unsettled.closing_look_failed = Some(false);
+    assert_eq!(stop_detail_column(&confirmed), None);
+
+    // journey_04 (AnyStop): bound as is.
+    assert_eq!(
+        stop_detail_bind(&budget, StopDetailScope::AnyStop),
+        (Some(detail.clone()), false)
+    );
+    // journey_03 (UnsettledOnly): withheld from a budget row — never sent
+    // where the CHECK would refuse the insert — and said so.
+    assert_eq!(
+        stop_detail_bind(&budget, StopDetailScope::UnsettledOnly),
+        (None, true)
+    );
+    let bound = |r: &ExplorationResult, scope| {
+        let params = exploration_insert_params(r, scope);
+        let (_, v) = params.iter().find(|(c, _)| *c == "stop_detail").unwrap();
+        format!("{v:?}")
+    };
+    assert_eq!(
+        bound(&budget, StopDetailScope::UnsettledOnly),
+        format!("{:?}", None::<Value>)
+    );
+    assert_eq!(
+        bound(&budget, StopDetailScope::AnyStop),
+        format!("{:?}", Some(&detail))
+    );
+    // A frontier_unsettled row carries it under either shape.
+    let unsettled = record(StopReason::FrontierUnsettled);
+    for scope in [StopDetailScope::AnyStop, StopDetailScope::UnsettledOnly] {
+        let (v, withheld) = stop_detail_bind(&unsettled, scope);
+        assert!(v.is_some() && !withheld, "{scope:?}");
+    }
+    // A row with nothing to withhold is not reported withheld.
+    assert_eq!(
+        stop_detail_bind(
+            &record(StopReason::BudgetActions),
+            StopDetailScope::UnsettledOnly
+        ),
+        (None, false)
+    );
+}
+
+#[test]
+fn the_schema_probe_tells_journey_03_from_journey_04() {
+    // The SQL's second column is `check_restricts_stop_detail` over every
+    // CHECK on the table, evaluated by Postgres.
+    for pattern in [
+        "pg_get_constraintdef(c.oid) LIKE '%stop_detail%'",
+        "pg_get_constraintdef(c.oid) LIKE '%frontier_unsettled%'",
+        "c.conrelid = to_regclass('project.journey_explorations')",
+        "c.contype = 'c'",
+    ] {
+        assert!(EXPLORATION_SCHEMA_PROBE_SQL.contains(pattern), "{pattern}");
+    }
+    assert!(check_restricts_stop_detail(JOURNEY_03_STOP_DETAIL_CHECK));
+    assert!(!check_restricts_stop_detail(JOURNEY_04_STOP_DETAIL_CHECK));
+    // The stopped_because CHECK names frontier_unsettled but not stop_detail.
+    assert!(!check_restricts_stop_detail(
+        "CHECK ((stopped_because = ANY (ARRAY['frontier_unsettled'::text])))"
+    ));
+}
+
+#[test]
+fn a_runner_rejection_is_a_runner_failure_never_app_unreachable() {
+    let rejected = json!({
+        "success": false,
+        "error": "page/navigate: not navigable",
+        "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
+    });
+    assert!(matches!(
+        classify_answer(rejected.clone()),
+        Err(DriveFailure::Runner(_))
+    ));
+    // A runner rejection is the runner's, WHATEVER the status: page/navigate
+    // sends its rejection with a 200 and `success: false`. Both readers
+    // agree, and neither reads it as the app's answer.
+    for status in [
+        StatusCode::OK,
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        assert!(
+            matches!(
+                classify_snapshot(status, rejected.clone()),
+                Err(DriveFailure::Runner(_))
+            ),
+            "{status}"
+        );
+    }
+    // Checked before the auth reading, too: the runner refused before any UI
+    // could have answered with an authentication code.
+    let mut with_code = rejected.clone();
+    with_code["code"] = json!("UNAUTHORIZED");
+    assert!(matches!(
+        classify_answer(with_code.clone()),
+        Err(DriveFailure::Runner(_))
+    ));
+    assert!(matches!(
+        classify_snapshot(StatusCode::OK, with_code),
+        Err(DriveFailure::Runner(_))
+    ));
+    // An untagged 2xx success:false is still the app answering.
+    assert!(matches!(
+        classify_snapshot(StatusCode::OK, json!({ "success": false, "error": "x" })),
+        Err(DriveFailure::AppAnswered(_))
+    ));
+    // Only `transport` reads as unreachable.
+    let never = json!({ "success": false, "error": "x", "failure_origin": "transport" });
+    assert!(matches!(
+        classify_snapshot(StatusCode::BAD_GATEWAY, never),
+        Err(DriveFailure::Unreachable(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_runner_rejected_action_ends_the_run_without_a_row_never_app_unreachable() {
+    struct RejectingRunner(SimApp);
+    #[async_trait::async_trait]
+    impl ExploreDriver for RejectingRunner {
+        async fn snapshot(&mut self) -> Result<Value, DriveFailure> {
+            self.0.snapshot().await
+        }
+        async fn activate(&mut self, _e: &str, _a: &str) -> Result<ActResult, DriveFailure> {
+            classify_answer(json!({
+                "success": false,
+                "error": "rejected before any UI",
+                "failure_origin": "runner",
+            }))
+        }
+        async fn navigate(&mut self, url: &str) -> Result<ActResult, DriveFailure> {
+            self.0.navigate(url).await
+        }
+        async fn current_node(&mut self, d: Duration) -> Result<NodeReading, BarrierMiss> {
+            self.0.current_node(d).await
+        }
+        async fn ledger_rows(&mut self) -> Result<LedgerRows, String> {
+            self.0.ledger_rows().await
+        }
+        async fn forget_position(&mut self) -> Result<(), BarrierMiss> {
+            self.0.forget_position().await
+        }
+        fn edge_events(&self) -> EdgeEvents {
+            self.0.edge_events()
+        }
+        fn ledger_write_failures(&self) -> u64 {
+            self.0.ledger_write_failures()
+        }
+        fn elapsed(&self) -> Duration {
+            self.0.elapsed()
+        }
+    }
+    let mut d = RejectingRunner(SimApp::site());
+    let no_row = explore(&mut d, &request(home(), 60, 5, 60))
+        .await
+        .expect_err("a runner rejection says nothing about the app");
+    assert_eq!(no_row.kind, NoRowKind::Internal);
+    assert!(no_row.detail.contains("rejected"), "{}", no_row.detail);
 }

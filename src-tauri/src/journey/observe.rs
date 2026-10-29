@@ -107,34 +107,44 @@ pub(crate) fn is_identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '+' | '-'))
 }
 
+/// A refused body: the status and a fixed phrase.
+pub(crate) type BodyRefusal = (StatusCode, &'static str);
+
 /// Why a body was refused — a fixed phrase, never the body or serde's
-/// message (which can quote a value).
-fn refusal_reason(e: &serde_json::Error) -> &'static str {
+/// message (which can quote a value) — and with which status: the split
+/// axum's `Json` extractor makes on the runner's other JSON routes, and the
+/// explore route makes too. A body that is not JSON at all (a syntax error,
+/// a truncated body) is a 400; JSON of the wrong shape is a 422.
+fn refusal_reason(e: &serde_json::Error) -> BodyRefusal {
     match e.classify() {
         serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            "body is not JSON"
+            (StatusCode::BAD_REQUEST, "body is not JSON")
         }
-        serde_json::error::Category::Data => {
+        serde_json::error::Category::Data => (
+            StatusCode::UNPROCESSABLE_ENTITY,
             "body is not the closed observe shape (an unknown field such as a value, or an \
-             unknown action type)"
-        }
-        serde_json::error::Category::Io => "body could not be read",
+             unknown action type)",
+        ),
+        // Unreachable over a buffered body (axum maps it to its syntax
+        // rejection, a 400, for the same reason).
+        serde_json::error::Category::Io => (StatusCode::BAD_REQUEST, "body could not be read"),
     }
 }
 
 /// Parse and validate a relayed interaction into the action it records.
 pub(crate) fn parse_interaction(
     body: &[u8],
-) -> Result<(PassiveInteraction, ActionSpec), &'static str> {
+) -> Result<(PassiveInteraction, ActionSpec), BodyRefusal> {
+    let unprocessable = |why| (StatusCode::UNPROCESSABLE_ENTITY, why);
     let i: PassiveInteraction = serde_json::from_slice(body).map_err(|e| refusal_reason(&e))?;
     for stored in [&i.session_id, &i.app_version, &i.tab_id]
         .into_iter()
         .flatten()
     {
         if !is_identifier(stored) {
-            return Err(
+            return Err(unprocessable(
                 "sessionId / appVersion / tabId must be an identifier ([A-Za-z0-9._:+-], ≤128)",
-            );
+            ));
         }
     }
     let target = i
@@ -147,7 +157,11 @@ pub(crate) fn parse_interaction(
             ActionSpec::navigation("navigate", NavigationTriggerKind::Push)
         }
         (t, Some(id)) => ActionSpec::element(id, t.as_str(), ChokePoint::ElementAction),
-        (_, None) => return Err("targetElementId is required for every action but navigate"),
+        (_, None) => {
+            return Err(unprocessable(
+                "targetElementId is required for every action but navigate",
+            ))
+        }
     };
     Ok((i, action))
 }
@@ -300,8 +314,11 @@ fn refuse(status: StatusCode, app_id: Option<&str>, reason: &'static str) -> Res
 /// `POST /apps/{app_id}/journey/observe`.
 ///
 /// - 202: recorded;
+/// - 400: the body is not JSON at all (as `POST …/journey/explore`, and as
+///   axum's `Json` extractor answers on the runner's other JSON routes);
 /// - 422: the app id is not an identifier or names the runner's own app
-///   ([`observe_app_id`]), or the body is not the closed shape;
+///   ([`observe_app_id`]) — checked exactly as given, untrimmed, as the
+///   explore route checks it —, or the JSON body is not the closed shape;
 /// - 429: no room — the journey queue is down to the slots passive capture
 ///   leaves to agents and the explorer (`capture::PASSIVE_QUEUE_RESERVE`), or
 ///   the per-app counter map is full (`health::MAX_PASSIVE_APPS`);
@@ -326,7 +343,7 @@ pub async fn post_observe(
     // so a stream of junk ids cannot fill that map and lock real apps out.
     let (interaction, action) = match parse_interaction(&body) {
         Ok(p) => p,
-        Err(reason) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, Some(&app_id), reason),
+        Err((status, reason)) => return refuse(status, Some(&app_id), reason),
     };
     // The app's counter slot is CLAIMED here, under one lock, before the
     // event is queued: another app cannot take the last slot between this
@@ -386,9 +403,10 @@ mod tests {
                 key: SENTINEL,
             });
             let err = parse_interaction(body.to_string().as_bytes()).expect_err(key);
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "{key}");
             assert!(
-                !err.contains(SENTINEL),
-                "the refusal must never quote the body: {err}"
+                !err.1.contains(SENTINEL),
+                "the refusal must never quote the body: {err:?}"
             );
         }
     }
@@ -416,7 +434,7 @@ mod tests {
     fn an_unknown_action_type_is_refused_without_quoting_it() {
         let body = json!({ "actionType": SENTINEL, "targetElementId": "x" });
         let err = parse_interaction(body.to_string().as_bytes()).unwrap_err();
-        assert!(!err.contains(SENTINEL), "{err}");
+        assert!(!err.1.contains(SENTINEL), "{err:?}");
     }
 
     #[test]
@@ -588,6 +606,37 @@ mod tests {
         let body = json!({ "actionType": "click", "targetElementId": "x", "tabId": "a b/c" });
         assert!(parse_interaction(body.to_string().as_bytes()).is_err());
         assert!(!is_identifier("../etc"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_a_400_as_on_the_explore_route() {
+        // The explore route's split, which is axum's `Json` extractor's on the
+        // runner's other JSON routes: not JSON → 400, the wrong shape → 422.
+        for not_json in [&b"{not json"[..], b"", b"{\"actionType\": \"click\""] {
+            let (status, why) = parse_interaction(not_json).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{not_json:?}: {why}");
+            let explore = crate::journey::explorer::parse_explore_request(not_json).unwrap_err();
+            assert_eq!(explore.0, status, "the two routes agree on {not_json:?}");
+        }
+        let (status, _) = parse_interaction(br#"{"actionType": "click", "x": 1}"#).unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let explore = crate::journey::explorer::parse_explore_request(b"[1]").unwrap_err();
+        assert_eq!(explore.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn a_padded_app_id_is_refused_by_both_routes_never_trimmed() {
+        for padded in [" qontinui-web", "qontinui-web ", "\tqontinui-web"] {
+            assert!(observe_app_id(padded).is_err(), "{padded:?}");
+            let refusal = crate::journey::explorer::explore_app_id(padded)
+                .expect_err("the explore route checks the id as given, too");
+            assert_eq!(refusal.0, StatusCode::UNPROCESSABLE_ENTITY, "{padded:?}");
+        }
+        assert_eq!(observe_app_id("qontinui-web"), Ok("qontinui-web"));
+        assert_eq!(
+            crate::journey::explorer::explore_app_id("qontinui-web").map_err(|r| r.1),
+            Ok("qontinui-web".to_string())
+        );
     }
 
     #[test]
