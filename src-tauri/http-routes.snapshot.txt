@@ -105,7 +105,14 @@ GET /api/v1/streaming/screenshot get_screenshot
 GET /api/v1/streaming/status get_streaming_status
 GET /apps handle_list_apps
 GET /apps/{app_id} handle_get_app
+GET /apps/{app_id}/journey/dead-ends get_journey_dead_ends
+GET /apps/{app_id}/journey/edge-timing get_journey_edge_timing
+GET /apps/{app_id}/journey/frontier get_journey_frontier
+GET /apps/{app_id}/journey/graph get_journey_graph
 GET /apps/{app_id}/journey/health get_journey_health
+GET /apps/{app_id}/journey/prior-knowledge get_journey_prior_knowledge
+GET /apps/{app_id}/journey/reachable get_journey_reachable
+GET /apps/{app_id}/journey/steps get_journey_steps
 GET /apps/{app_id}/spec/diff get_diff
 GET /apps/{app_id}/spec/get get_file
 GET /apps/{app_id}/spec/graph get_graph
@@ -1042,6 +1049,8 @@ POST /api-surface/snapshot handle_save_snapshot
 POST /api/v1/streaming/focus post_focus
 POST /api/v1/streaming/pair post_pair
 POST /apps handle_register_app
+POST /apps/{app_id}/journey/explore post_explore
+POST /apps/{app_id}/journey/observe post_observe
 POST /apps/{app_id}/spec/author post_author
 POST /apps/{app_id}/spec/derive post_derive
 POST /apps/{app_id}/spec/proposals/scan post_scan

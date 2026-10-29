@@ -1198,10 +1198,11 @@ async fn dispatch_to_app_inner(
 ///   structured failure frame, or an HTTP app's `{success:false, code}` —
 ///   so a caller can branch on `NO_HANDLER` instead of parsing prose. Nothing
 ///   else ever lands in it.
-/// - `hint.failure_origin` is `"app"` when the app itself reported the
-///   failure and `"transport"` for everything else: a timeout, a disconnect,
-///   a displacement, an unreachable HTTP app, and a response frame the relay
-///   could not read, whose outcome is unknown.
+/// - `hint.failure_origin` is `sdk_client::dispatch_failure_origin`'s:
+///   `"app"` when the app itself reported the failure, `"unknown"` when it
+///   may have been reached but its answer could not be read (a timeout, a
+///   displacement, a response frame the relay could not read, a non-2xx or
+///   non-JSON reply), `"transport"` when the request was never delivered.
 /// - `hint.retryable` is the wrapper's own retry verdict when it sent one,
 ///   else `null`: UNKNOWN, never `false`.
 ///
@@ -1215,14 +1216,15 @@ async fn dispatch_to_app_inner(
 /// there.
 fn app_failure_response(err: &DispatchError) -> ApiResponse<serde_json::Value> {
     use crate::mcp::command_relay::CommandRelayError;
-    let (origin, code, retryable) = match err {
+    let origin = crate::mcp::sdk_client::dispatch_failure_origin(err);
+    let (code, retryable) = match err {
         DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
-            ("app", failure.code.clone(), failure.retryable)
+            (failure.code.clone(), failure.retryable)
         }
         DispatchError::AppAnswered {
             code, retryable, ..
-        } => ("app", code.clone(), *retryable),
-        _ => ("transport", None, None),
+        } => (code.clone(), *retryable),
+        _ => (None, None),
     };
     let mut body = match code {
         Some(code) => ApiResponse::error_with_code(err.to_user_message(), code),
@@ -1707,7 +1709,7 @@ mod tests {
     /// the wrapper's own `code` and retry verdict (coord finding `fb3fb468`);
     /// a bare-string refusal keeps the message alone, with retryability
     /// `null`; and a response frame the relay could not read is NOT the
-    /// app's failure — no app code, `failure_origin: "transport"`.
+    /// app's failure — no app code, `failure_origin: "unknown"`.
     #[tokio::test]
     async fn dispatch_to_app_inner_hands_on_the_wrappers_failure_code() {
         use crate::mcp::app_dispatch::AppDispatcher;
@@ -1741,7 +1743,7 @@ mod tests {
             (
                 Answer::Unreadable("invalid type: string \"no\", expected a boolean"),
                 None,
-                serde_json::json!({ "failure_origin": "transport", "retryable": null }),
+                serde_json::json!({ "failure_origin": "unknown", "retryable": null }),
                 "could not be read",
             ),
         ] {
