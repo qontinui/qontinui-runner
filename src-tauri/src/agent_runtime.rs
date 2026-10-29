@@ -1972,8 +1972,8 @@ fn spawn_run_task(payload: LaunchPayload) {
         // composes, charged with the continuations admitted and not yet
         // running), deferring on any tripped lane. A launch takes no
         // projected-cost unit of its own (see `admit_launch`), so a burst of
-        // LAUNCHES alone is bounded by the readings only. Evaluated BEFORE `run_agent_subprocess`, which is where the
-        // path rewrite, account resolution and worktree materialization all
+        // LAUNCHES alone is bounded by the readings only. Evaluated BEFORE
+        // `run_agent_subprocess`, which is where the path rewrite, account resolution and worktree materialization all
         // happen — so a refused launch leaves no worktree, no daemon and no
         // proxy nonce behind; only the stop-token entry exists, released when
         // its guard drops.
@@ -3470,11 +3470,13 @@ fn evaluate_continuation_guard(
     // incrementing it under the same lock is what serializes CONCURRENT guard
     // passes: of N tasks evaluating one pre-burst reading at once, only as many
     // as the projected headroom allows read `Proceed`. The projection is pure
-    // arithmetic over the reading taken above — no OS read under the lock.
-    let (verdict, pending) = {
+    // arithmetic over the reading taken above — no OS read and no log write
+    // under the lock (the shadowed-lane line is written after it is released).
+    let (verdict, pending, shadowed) = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         let pending = registry.reserved_spawns;
-        let verdict = match reading.projected(pending).tripped() {
+        let (projected, shadowed) = reading.projected(pending);
+        let verdict = match projected.tripped() {
             Some((severity, observation)) => ContinuationGuard::LoadPressure {
                 severity,
                 observation: observation.clone(),
@@ -3484,8 +3486,9 @@ fn evaluate_continuation_guard(
         if verdict == ContinuationGuard::Proceed {
             registry.reserved_spawns += 1;
         }
-        (verdict, pending)
+        (verdict, pending, shadowed)
     };
+    crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
     // A load deferral leaves the row pending for re-delivery; the re-delivery
     // must find the anchor free, not reserved by this refused evaluation. Only
     // a `Proceed` leaves the reservation behind, for the caller to carry.
@@ -3565,7 +3568,9 @@ fn admit_launch(
     // RUNNING session twice (once in the readings, once here). Residual,
     // stated: a burst of LAUNCHES alone is bounded only by the readings.
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
-    match launch_deferral_reason(&reading.projected(pending)) {
+    let (projected, shadowed) = reading.projected(pending);
+    crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
         None => Ok(()),
     }
@@ -16607,7 +16612,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let reading = || commit_reading(free_with_headroom_for(3));
         assert_eq!(
-            reading().projected(0),
+            reading().projected(0).0,
             crate::resource_guard::SpawnGate::Proceed,
             "the reading alone is calm — only the projection can bound the burst"
         );
