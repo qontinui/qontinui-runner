@@ -44,12 +44,14 @@
 # ---------------------------------------------------------------------------
 # test (windows-latest) — the Windows leg of ci.yml's `test` matrix.
 #
-# min_commit_mb = 18630 MiB: the HIGHEST Windows pagefile PeakUsage (the
+# min_commit_mb = 18831 MiB: the HIGHEST Windows pagefile PeakUsage (the
 # MEMPEAK step's `peak_mb` on D:\pagefile.sys, AllocatedBaseSize 32768) across
-# the five green `test (windows-latest)` jobs of main push runs at
-# CARGO_BUILD_JOBS=1 after a29c7fb30 (2026-10-28/29: runs 40714423999,
-# 40740392041, 40763457966, 40782525943 and 40795747148 read 18441, 18630,
-# 18534, 18472 and 16467).
+# every green `test (windows-latest)` job of a main push run at
+# CARGO_BUILD_JOBS=1 after a29c7fb30 that had completed by 2026-10-29T07:38Z:
+# runs 40714423999, 40740392041, 40763457966, 40782525943, 40795747148,
+# 40803319595, 40813789424 and 40820893930 read 18441, 18630, 18534, 18472,
+# 16467, 18831, 18510 and 18547. Later runs may read higher; re-derive over
+# the full set when this floor is revisited.
 #
 # Every page in the pagefile is committed memory, so the commit charge was AT
 # LEAST that much. It is a LOWER BOUND on the JOB VM's commit charge — the
@@ -72,5 +74,5 @@
 [[requirements]]
 check = "test (windows-latest)"
 os = "windows"
-min_commit_mb = 18630
-reason = "commit >= 18630 MiB, the highest Windows pagefile PeakUsage over five green CARGO_BUILD_JOBS=1 main runs after a29c7fb30 (2026-10-28/29); a lower bound on the job VM's machine-wide commit charge"
+min_commit_mb = 18831
+reason = "commit >= 18831 MiB, the highest Windows pagefile PeakUsage over the eight green CARGO_BUILD_JOBS=1 main runs after a29c7fb30 completed by 2026-10-29T07:38Z; a lower bound on the job VM's machine-wide commit charge"
