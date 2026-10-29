@@ -996,6 +996,21 @@ async fn materialize(
             "deferred by the coord device drain: {reason}"
         )));
     }
+    // The unattended spawn gate's load-only pre-check (plan 2026-10-28-runner-spawn-
+    // bursts-overwhelm-the-box, D1): on a loaded machine the gate below would only
+    // defer, so defer now — before the coord fetch, claiming no slot. The session
+    // kind is not known until that fetch, so this applies to every handoff; the
+    // pending handoff replays on the next catch-up.
+    if let Err(loaded) = crate::unattended_spawn_gate::load_precheck(
+        crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+        "handoff session",
+        &format!("handoff:{}", handoff.source_session_id),
+    ) {
+        return Err(HandoffError::Session(format!(
+            "deferred by the unattended spawn gate: {}",
+            loaded.reason
+        )));
+    }
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
 
     let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE)?;
@@ -1004,10 +1019,54 @@ async fn materialize(
     // and the claims re-acquired below belong to that same tenant.
     let tenant = TenantScope::for_session(intent.tenant_id);
 
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1): a terminal handoff opens a PTY (`start_with_parent` -> the PTY / claude_cli
+    // transport -> `TerminalManager::create`). This runs INLINE on the `/ws` read
+    // loop, so it never HOLDS: it waits inline at most one pace slot and otherwise
+    // defers, as the drain arm above does — the pending handoff replays on the next
+    // catch-up tick, and the key keeps its place in the gate's queue for that
+    // retry. Nothing has been started or marked. Only the two PTY kinds pass it; a
+    // workflow or agentic child opens no PTY here.
+    //
+    // The drain is NOT read again after the gate: a handoff carries a lineage
+    // coord already admitted (the source session's), and such work runs through
+    // coord's drain (round-3 review B1). The drain arm at the top is this door's
+    // dispatch filter, and the gate waits at most one pace slot.
+    let released = if matches!(
+        intent.kind,
+        SessionKind::TerminalShell | SessionKind::TerminalClaude
+    ) {
+        match crate::unattended_spawn_gate::admit_or_defer(
+            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+            "handoff session",
+            &format!("handoff:{}", handoff.source_session_id),
+            crate::unattended_spawn_gate::UNATTENDED_SPAWN_SPACING,
+        )
+        .await
+        {
+            Ok(released) => Some(released),
+            Err(loaded) => {
+                return Err(HandoffError::Session(format!(
+                    "deferred by the unattended spawn gate: {}",
+                    loaded.reason
+                )))
+            }
+        }
+    } else {
+        None
+    };
+
     // Start the child session locally with lineage back to the source.
     let child = registry
         .start_with_parent(intent, handoff.source_session_id)
-        .map_err(|e| HandoffError::Session(e.to_string()))?;
+        .map_err(|e| {
+            // No PTY opened (the seam's CRITICAL refusal after a `hold_deadline`
+            // release among the causes): give the gate's slot back.
+            if let Some(released) = released {
+                released.refund();
+            }
+            HandoffError::Session(e.to_string())
+        })?;
     let child_id = child.id();
     // Marked the moment the child EXISTS — before the close below, whose
     // failure is exactly what makes this source get sighted again.

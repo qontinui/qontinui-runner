@@ -9,6 +9,15 @@
 //! path is therefore red until it declares how the drain applies to it — the
 //! mechanism coord's `spawn_admission_sites.txt` applies to coord's publish seam.
 //!
+//! Every `autonomous` row also declares its SPAWN KIND (`pty` / `headless` /
+//! `n/a`, plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+//! Phase 2). A `pty` site must call one of the unattended spawn gate's entry
+//! points in its own body, before its first PTY primitive — the pacer-and-hold an
+//! unattended PTY spawn passes immediately before the PTY opens — and a site whose
+//! body reaches a PTY primitive must be classed `pty`, so the column cannot be
+//! used to step around the gate. The rules are listed at
+//! `autonomous_terminal_sites_bypassing_the_unattended_gate`.
+//!
 //! Test-only: the whole module is `#[cfg(test)]` in `main.rs`.
 //!
 //! ## Known limits (a source scan, not a type check)
@@ -54,6 +63,9 @@ const SITES_REL: &str = "src/runner_spawn_sites.txt";
 const SELF_FILE: &str = "runner_spawn_sites.rs";
 const CLASSES: &[&str] = &["autonomous", "operator", "helper", "exempt"];
 
+/// The fifth column of an `autonomous` row: what the site launches.
+const SPAWN_KINDS: &[&str] = &["pty", "headless", "n/a"];
+
 /// Calls that pass the drain gate. `authorize_spawn` and the fan-out variants
 /// run [`crate::coord_drain_state::drain_gate`] first for a `DrainAdmission::Origin`.
 const GATE_CALLS: &[&str] = &[
@@ -83,6 +95,9 @@ const GATE_DEFEATERS: &[&str] = &[
 struct Row {
     class: String,
     detail: String,
+    /// The spawn kind (`pty` / `headless` / `n/a`) — `Some` exactly on
+    /// `autonomous` rows.
+    kind: Option<String>,
 }
 
 type Sources = BTreeMap<String, String>;
@@ -363,18 +378,28 @@ fn resolve_hop<'a>(hop: &'a str, site_file: &'a str) -> (&'a str, &'a str) {
     }
 }
 
-/// The gate calls in `body` whose result is DISCARDED: the statement is
-/// nothing but the (path-qualified) call, optionally `.await`-ed, ending in
-/// `;` — or `let _ = …;`. Returns the offending call tokens.
+/// The drain-gate calls in `body` whose result is DISCARDED (see [`bare_calls`]).
+fn bare_gate_calls(body: &str) -> Vec<&'static str> {
+    let verdicts: Vec<&'static str> = GATE_CALLS
+        .iter()
+        .filter(|c| !HOLD_CALLS.contains(c))
+        .copied()
+        .collect();
+    bare_calls(body, &verdicts)
+}
+
+/// The `calls` in `body` whose result is DISCARDED: the statement is nothing but
+/// the (path-qualified) call, optionally `.await`-ed, ending in `;` — or
+/// `let _ = …;`. Returns the offending call tokens.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn bare_gate_calls(body: &str) -> Vec<&'static str> {
+fn bare_calls(body: &str, calls: &[&'static str]) -> Vec<&'static str> {
     let path_only =
         Regex::new(r"^(?:let\s+_\s*=\s*)?(?:[A-Za-z_][A-Za-z0-9_]*::)*$").expect("path-only regex");
     let mut bare = Vec::new();
-    for call in GATE_CALLS.iter().filter(|c| !HOLD_CALLS.contains(c)) {
+    for call in calls {
         for m in token_re(call).find_iter(body) {
             // Statement start: the last `;`, `{` or `}` that ends its line.
             let before = &body[..m.start()];
@@ -483,6 +508,238 @@ fn autonomous_sites_bypassing_the_gate(sources: &Sources, rows: &Rows) -> Vec<St
     out
 }
 
+/// The unattended gate's entry points a `pty` site may call, path-qualified as
+/// `unattended_spawn_gate::<name>(`. `admit` HOLDS and never refuses: it returns
+/// a `Released` handle a site may simply drop (dropping keeps the slot), so a
+/// bare `.await;` of it is allowed; the other two answer a verdict that must be
+/// consumed ([`UNATTENDED_VERDICT_CALLS`]).
+const UNATTENDED_GATE_CALLS: &[&str] = &["admit(", "admit_or_defer(", "check_request("];
+
+/// The [`UNATTENDED_GATE_CALLS`] whose result must not be discarded.
+const UNATTENDED_VERDICT_CALLS: &[&str] = &["admit_or_defer(", "check_request("];
+
+/// Reads of coord's device drain: the drain gate itself, and the spawn
+/// authorization that consults it first.
+///
+/// The "no drain read after the gate" rule built on this is textual, over the
+/// site's own body, and has two known gaps: a raw
+/// `coord_drain_state::current()` read (a state read rather than a gate call)
+/// is not matched, and neither is a drain read inside a helper the site calls
+/// after its gate. Both would need the reviewer, not this guard, to catch them.
+fn drain_read_re() -> Regex {
+    Regex::new(r"\b(?:drain_gate|drain_gate_for_work|authorize_spawn|authorize_fanout_spawn)\s*\(")
+        .expect("drain read regex")
+}
+
+/// Origin literals that would make the unattended gate a no-op if passed to it.
+const OPERATOR_ORIGINS: &[&str] = &["SpawnOrigin::OperatorTerminal", "SpawnOrigin::OperatorChat"];
+
+/// A call to one of the [`UNATTENDED_GATE_CALLS`]. Any other function in the
+/// module (`health_json`, `load_precheck`) is not a gate, and a
+/// `use crate::unattended_spawn_gate::…` line is not a call.
+fn unattended_gate_call_re() -> Regex {
+    let names: Vec<&str> = UNATTENDED_GATE_CALLS
+        .iter()
+        .map(|c| c.trim_end_matches('('))
+        .collect();
+    Regex::new(&format!(
+        r"\bunattended_spawn_gate::(?:{})\s*\(",
+        names.join("|")
+    ))
+    .expect("unattended gate regex")
+}
+
+/// `body` without the bodies of fns nested inside it: a gate call made by an
+/// inner `fn` is not a call the site makes.
+fn strip_nested_fns(body: &str) -> String {
+    let decl = fn_decl_re();
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(first) = lines.first() else {
+        return String::new();
+    };
+    let outer = first.len() - first.trim_start().len();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let nested = i > 0 && decl.captures(lines[i]).is_some_and(|c| c[1].len() > outer);
+        if !nested {
+            kept.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut opened = false;
+        while i < lines.len() {
+            let line = lines[i];
+            i += 1;
+            let opens = line.matches('{').count();
+            depth += opens;
+            depth = depth.saturating_sub(line.matches('}').count());
+            opened |= opens > 0;
+            // A body-less declaration (`fn f();`) ends at its `;`.
+            if (opened && depth == 0) || (!opened && line.trim_end().ends_with(';')) {
+                break;
+            }
+        }
+    }
+    kept.join("\n")
+}
+
+/// `let <name> = [match] …unattended_spawn_gate::check_request(` — the binding
+/// whose `.commit().await` keeps a request door's slot.
+fn check_request_binding_re() -> Regex {
+    Regex::new(
+        r"let\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=\s*(?:match\s+)?(?:crate::)?unattended_spawn_gate::check_request\s*\(",
+    )
+    .expect("check_request binding regex")
+}
+
+/// The text of a call's argument list, from the `(` at `open` to its matching
+/// `)` inclusive.
+fn call_args(body: &str, open: usize) -> Option<&str> {
+    let tail = body.get(open..)?;
+    let mut depth = 0usize;
+    for (i, c) in tail.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return tail.get(..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The primitives that open a PTY: the `TerminalManager::create` receiver
+/// family, the terminal-session backends, the resumed-pane seam, and the
+/// `SessionRegistry` starts whose PTY / claude_cli transports create a terminal.
+fn pty_primitive_res() -> Vec<Regex> {
+    let mut res: Vec<Regex> = primitive_families()
+        .into_iter()
+        .filter(|(name, _)| {
+            *name == "TerminalManager::create" || *name == "create_tracked_terminal_session_backend"
+        })
+        .flat_map(|(_, res)| res)
+        .collect();
+    for p in [
+        r"\bcreate_terminal_session_backend\s*\(",
+        r"\bspawn_resumed_pane\s*\(",
+        r"\.start_with_parent\s*\(",
+        r"\.start_inner\s*\(",
+        // `SessionRegistry::start` / a transport's `start`, whatever the argument
+        // is called: both reach a PTY for the terminal session kinds.
+        r"\btransport\s*\.\s*start\s*\(",
+        r"\.start\s*\(\s*&?\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
+    ] {
+        res.push(Regex::new(p).expect("pty primitive regex"));
+    }
+    res
+}
+
+/// Autonomous rows that break the spawn-kind contract. PURE over the sources,
+/// reading each site's own body with nested fns stripped. A `pty` row must:
+/// call one of the [`UNATTENDED_GATE_CALLS`]; consume the verdict of the ones
+/// that answer one; pass it no operator origin literal; not read coord's drain
+/// in its own body after it (round-3 review B1: nothing waits in the gate for a
+/// drain, and work coord already dispatched runs through one that arms later;
+/// see [`drain_read_re`] for what the textual check cannot see);
+/// call it BEFORE the first PTY primitive; and, for `check_request`,
+/// `.commit().await` the slot
+/// before that primitive too — an un-awaited commit is a future that never runs.
+/// A row classed anything but `pty` must reach no PTY primitive.
+fn autonomous_terminal_sites_bypassing_the_unattended_gate(
+    sources: &Sources,
+    rows: &Rows,
+) -> Vec<String> {
+    let gate = unattended_gate_call_re();
+    let pty = pty_primitive_res();
+    let mut out = Vec::new();
+    for ((file, func), row) in rows.iter().filter(|(_, r)| r.class == "autonomous") {
+        let Some(raw) = sources.get(file).and_then(|s| fn_body(s, func)) else {
+            out.push(format!("{file}:{func} (site fn not found)"));
+            continue;
+        };
+        let body = strip_nested_fns(&raw);
+        let first_pty = pty
+            .iter()
+            .filter_map(|re| re.find(&body).map(|m| m.start()))
+            .min();
+        let site = format!("{file}:{func}");
+        match row.kind.as_deref() {
+            Some("pty") => {
+                let calls: Vec<regex::Match<'_>> = gate.find_iter(&body).collect();
+                let Some(first_call) = calls.first() else {
+                    out.push(format!("{site} {NO_GATE_CALL}"));
+                    continue;
+                };
+                if let Some(call) = bare_calls(&body, UNATTENDED_VERDICT_CALLS).first() {
+                    out.push(format!(
+                        "{site} (discards the result of unattended_spawn_gate::{call})"
+                    ));
+                    continue;
+                }
+                let operator = calls.iter().find_map(|m| {
+                    call_args(&body, m.end() - 1)
+                        .and_then(|args| OPERATOR_ORIGINS.iter().find(|o| args.contains(**o)))
+                });
+                if let Some(origin) = operator {
+                    out.push(format!("{site} (passes {origin} to the unattended gate)"));
+                    continue;
+                }
+                if drain_read_re()
+                    .find_iter(&body)
+                    .any(|m| m.start() > first_call.start())
+                {
+                    out.push(format!(
+                        "{site} (reads coord's drain after the unattended gate)"
+                    ));
+                    continue;
+                }
+                if first_pty.is_some_and(|p| p < first_call.start()) {
+                    out.push(format!("{site} (opens its PTY before the unattended gate)"));
+                    continue;
+                }
+                let requests = calls.iter().any(|m| m.as_str().contains("check_request"));
+                // The slot's OWN `.commit().await`: the binding `check_request`
+                // returned into, not any `.commit()` (a DB transaction) in the
+                // body, and awaited — `commit` is async, so an un-awaited call
+                // neither keeps the slot nor paces the PTY.
+                let committed = check_request_binding_re()
+                    .captures(&body)
+                    .and_then(|c| c.get(1))
+                    .and_then(|name| {
+                        Regex::new(&format!(
+                            r"\b{}\s*\.\s*commit\s*\(\s*\)\s*\.\s*await\b",
+                            regex::escape(name.as_str())
+                        ))
+                        .ok()
+                    })
+                    .and_then(|re| re.find(&body).map(|m| m.start()))
+                    .is_some_and(|c| first_pty.is_none_or(|p| c < p));
+                if requests && !committed {
+                    out.push(format!(
+                        "{site} (never commits its check_request slot before the PTY)"
+                    ));
+                }
+            }
+            Some(kind) => {
+                if first_pty.is_some() {
+                    out.push(format!("{site} (opens a PTY but is classed {kind})"));
+                }
+            }
+            None => out.push(format!("{site} (autonomous row with no spawn kind)")),
+        }
+    }
+    out
+}
+
+/// The violation text for a `pty` site with no gate call.
+const NO_GATE_CALL: &str = "(a pty site whose own body calls no unattended_spawn_gate entry point)";
+
 /// Operator rows that are not a `#[tauri::command]`.
 fn operator_sites_not_tauri_commands(sources: &Sources, rows: &Rows) -> Vec<String> {
     let decl = fn_decl_re();
@@ -555,7 +812,7 @@ fn parse_sites(text: &str) -> Rows {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let cells: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
+        let mut cells: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
         assert_eq!(
             cells.len(),
             4,
@@ -568,6 +825,27 @@ fn parse_sites(text: &str) -> Rows {
             n + 1,
             cells[2]
         );
+        // An autonomous row carries a fifth column, the spawn kind; no other row
+        // does (their detail may contain a `|`, so it is not split for them).
+        let kind = if cells[2] == "autonomous" {
+            let (detail, kind) = cells[3].rsplit_once('|').unwrap_or_else(|| {
+                panic!(
+                    "runner_spawn_sites.txt:{}: an autonomous row needs a fifth column, the \
+                     spawn kind ({SPAWN_KINDS:?}): `file | fn | autonomous | chain | kind`",
+                    n + 1
+                )
+            });
+            let kind = kind.trim();
+            assert!(
+                SPAWN_KINDS.contains(&kind),
+                "runner_spawn_sites.txt:{}: spawn kind {kind:?} is not one of {SPAWN_KINDS:?}",
+                n + 1
+            );
+            cells[3] = detail.trim();
+            Some(kind.to_string())
+        } else {
+            None
+        };
         assert!(
             !cells[3].is_empty(),
             "runner_spawn_sites.txt:{}: empty detail",
@@ -592,6 +870,7 @@ fn parse_sites(text: &str) -> Rows {
             Row {
                 class: cells[2].to_string(),
                 detail: cells[3].to_string(),
+                kind,
             },
         );
         assert!(
@@ -663,6 +942,259 @@ fn every_autonomous_site_passes_the_drain_gate() {
 }
 
 #[test]
+fn every_autonomous_terminal_site_passes_the_unattended_spawn_gate() {
+    let rows = load_rows();
+    let pty_rows: Vec<_> = rows
+        .iter()
+        .filter(|(_, r)| r.class == "autonomous" && r.kind.as_deref() == Some("pty"))
+        .map(|((file, func), _)| format!("{file}:{func}"))
+        .collect();
+    assert!(
+        pty_rows.len() >= 10,
+        "only {} autonomous pty rows — the guard would be vacuous: {pty_rows:#?}",
+        pty_rows.len()
+    );
+    let violations =
+        autonomous_terminal_sites_bypassing_the_unattended_gate(&load_sources(), &rows);
+    assert!(
+        violations.is_empty(),
+        "autonomous PTY spawn sites that bypass the unattended spawn gate (call \
+         `unattended_spawn_gate::admit` or `admit_or_defer` immediately before the PTY \
+         create, or `check_request` at a request door and `.commit().await` its slot before \
+         the PTY, with the drain read before the gate), or rows whose spawn kind is wrong: \
+         {violations:#?}"
+    );
+}
+
+/// Mutation twin: take the gate call out of the continuation terminal path and
+/// the guard must go red on exactly that row.
+#[test]
+fn removing_the_unattended_gate_from_run_continuation_terminal_fails_the_guard() {
+    let mut sources = load_sources();
+    let rows = load_rows();
+    let file = "agent_runtime.rs".to_string();
+    let src = sources.get(&file).expect("agent_runtime.rs").clone();
+    let fn_at = src
+        .find("async fn run_continuation_terminal(")
+        .expect("run_continuation_terminal exists");
+    let (head, tail) = (
+        src.get(..fn_at).expect("head"),
+        src.get(fn_at..).expect("tail"),
+    );
+    assert!(
+        tail.contains("unattended_spawn_gate::admit("),
+        "fixture: run_continuation_terminal must call the gate"
+    );
+    let mutated = format!(
+        "{head}{}",
+        tail.replacen("unattended_spawn_gate::admit(", "removed_gate::admit(", 1)
+    );
+    sources.insert(file, mutated);
+    assert_eq!(
+        autonomous_terminal_sites_bypassing_the_unattended_gate(&sources, &rows),
+        vec![format!(
+            "agent_runtime.rs:run_continuation_terminal {NO_GATE_CALL}"
+        )],
+        "exactly the mutated site must be reported"
+    );
+}
+
+#[test]
+fn an_ungated_pty_site_and_a_pty_site_classed_headless_fail_the_unattended_guard() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "x.rs".to_string(),
+        "async fn gated(tm: &T) {\n    crate::unattended_spawn_gate::admit(o, w, k).await;\n    tm.create(a);\n}\n\
+         async fn ungated(tm: &T) {\n    tm.create(a);\n}\n\
+         async fn imported_only(tm: &T) {\n    use crate::unattended_spawn_gate::admit;\n    tm.create(a);\n}\n\
+         async fn mislabelled() {\n    spawn_resumed_pane(&app, &tm, &r, spec);\n}\n\
+         async fn honest_headless() {\n    spawn_claude_child(a, b);\n}\n"
+            .to_string(),
+    );
+    let row = |kind: &str| Row {
+        class: "autonomous".into(),
+        detail: "-".into(),
+        kind: Some(kind.into()),
+    };
+    let mut rows = BTreeMap::new();
+    rows.insert(("x.rs".into(), "gated".into()), row("pty"));
+    rows.insert(("x.rs".into(), "ungated".into()), row("pty"));
+    rows.insert(("x.rs".into(), "imported_only".into()), row("pty"));
+    rows.insert(("x.rs".into(), "mislabelled".into()), row("headless"));
+    rows.insert(("x.rs".into(), "honest_headless".into()), row("headless"));
+    assert_eq!(
+        autonomous_terminal_sites_bypassing_the_unattended_gate(&sources, &rows),
+        vec![
+            format!("x.rs:imported_only {NO_GATE_CALL}"),
+            "x.rs:mislabelled (opens a PTY but is classed headless)".to_string(),
+            format!("x.rs:ungated {NO_GATE_CALL}"),
+        ]
+    );
+}
+
+/// Mutation fixtures for the stricter rules: each site below fools a check that
+/// only asks "does the body name `unattended_spawn_gate::`?", and each must be
+/// reported for its own reason; the two honest sites must pass.
+#[test]
+fn a_gate_call_that_is_wrong_discarded_late_nested_operator_or_uncommitted_fails_the_guard() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "x.rs".to_string(),
+        [
+            "async fn honest_admit(tm: &T) {",
+            "    crate::unattended_spawn_gate::admit(o, w, k).await;",
+            "    tm.create(a);",
+            "}",
+            "async fn honest_request(tm: &T) {",
+            "    let slot = match crate::unattended_spawn_gate::check_request(o, w, k) {",
+            "        Ok(slot) => slot,",
+            "        Err(_) => return,",
+            "    };",
+            "    slot.commit().await;",
+            "    tm.create(a);",
+            "}",
+            "async fn wrong_fn(tm: &T) {",
+            "    let _ = crate::unattended_spawn_gate::health_json();",
+            "    tm.create(a);",
+            "}",
+            "async fn discarded(tm: &T) {",
+            "    let _ = crate::unattended_spawn_gate::check_request(o, w, k);",
+            "    tm.create(a);",
+            "}",
+            "async fn bare_defer(tm: &T) {",
+            "    crate::unattended_spawn_gate::admit_or_defer(o, w, k, d).await;",
+            "    tm.create(a);",
+            "}",
+            "async fn operator(tm: &T) {",
+            "    crate::unattended_spawn_gate::admit(SpawnOrigin::OperatorTerminal, w, k).await;",
+            "    tm.create(a);",
+            "}",
+            "async fn late(tm: &T) {",
+            "    tm.create(a);",
+            "    crate::unattended_spawn_gate::admit(o, w, k).await;",
+            "}",
+            "async fn nested(tm: &T) {",
+            "    fn inner() {",
+            "        crate::unattended_spawn_gate::admit(o, w, k);",
+            "    }",
+            "    tm.create(a);",
+            "}",
+            "async fn uncommitted(tm: &T) {",
+            "    let slot = match crate::unattended_spawn_gate::check_request(o, w, k) {",
+            "        Ok(slot) => slot,",
+            "        Err(_) => return,",
+            "    };",
+            "    db.commit();",
+            "    tm.create(a);",
+            "}",
+            "async fn unawaited_commit(tm: &T) {",
+            "    let slot = match crate::unattended_spawn_gate::check_request(o, w, k) {",
+            "        Ok(slot) => slot,",
+            "        Err(_) => return,",
+            "    };",
+            "    let _pending = slot.commit();",
+            "    tm.create(a);",
+            "}",
+            "async fn drain_first(tm: &T) {",
+            "    if !drain_gate_for_work(o, k).allows() {",
+            "        return;",
+            "    }",
+            "    crate::unattended_spawn_gate::admit(o, w, k).await;",
+            "    tm.create(a);",
+            "}",
+            "async fn drain_after(tm: &T) {",
+            "    crate::unattended_spawn_gate::admit(o, w, k).await;",
+            "    if !drain_gate_for_work(o, k).allows() {",
+            "        return;",
+            "    }",
+            "    tm.create(a);",
+            "}",
+            "async fn headless_transport(transport: &P) {",
+            "    let h = transport.start(&spec)?;",
+            "}",
+            "async fn na_registry(registry: &R) {",
+            "    let child = registry.start(spec)?;",
+            "}",
+            "",
+        ]
+        .join("\n"),
+    );
+    let row = |kind: &str| Row {
+        class: "autonomous".into(),
+        detail: "-".into(),
+        kind: Some(kind.into()),
+    };
+    let mut rows = BTreeMap::new();
+    for f in [
+        "honest_admit",
+        "honest_request",
+        "wrong_fn",
+        "discarded",
+        "bare_defer",
+        "operator",
+        "late",
+        "nested",
+        "uncommitted",
+        "unawaited_commit",
+        "drain_first",
+        "drain_after",
+    ] {
+        rows.insert(("x.rs".to_string(), f.to_string()), row("pty"));
+    }
+    rows.insert(
+        ("x.rs".into(), "headless_transport".into()),
+        row("headless"),
+    );
+    rows.insert(("x.rs".into(), "na_registry".into()), row("n/a"));
+    assert_eq!(
+        autonomous_terminal_sites_bypassing_the_unattended_gate(&sources, &rows),
+        vec![
+            "x.rs:bare_defer (discards the result of unattended_spawn_gate::admit_or_defer()"
+                .to_string(),
+            "x.rs:discarded (discards the result of unattended_spawn_gate::check_request()"
+                .to_string(),
+            "x.rs:drain_after (reads coord's drain after the unattended gate)".to_string(),
+            "x.rs:headless_transport (opens a PTY but is classed headless)".to_string(),
+            "x.rs:late (opens its PTY before the unattended gate)".to_string(),
+            "x.rs:na_registry (opens a PTY but is classed n/a)".to_string(),
+            format!("x.rs:nested {NO_GATE_CALL}"),
+            "x.rs:operator (passes SpawnOrigin::OperatorTerminal to the unattended gate)"
+                .to_string(),
+            "x.rs:unawaited_commit (never commits its check_request slot before the PTY)"
+                .to_string(),
+            "x.rs:uncommitted (never commits its check_request slot before the PTY)".to_string(),
+            format!("x.rs:wrong_fn {NO_GATE_CALL}"),
+        ]
+    );
+}
+
+#[test]
+fn an_autonomous_row_needs_a_known_spawn_kind_and_other_rows_take_none() {
+    let rows = parse_sites(
+        "a.rs | f | autonomous | f | pty\n\
+         b.rs | g | exempt | why | with a bar\n",
+    );
+    let key = |file: &str, func: &str| (file.to_string(), func.to_string());
+    assert_eq!(rows[&key("a.rs", "f")].kind.as_deref(), Some("pty"));
+    assert_eq!(rows[&key("a.rs", "f")].detail, "f");
+    let exempt = &rows[&key("b.rs", "g")];
+    assert_eq!(exempt.kind, None);
+    assert_eq!(
+        exempt.detail, "why | with a bar",
+        "a non-autonomous detail is not split"
+    );
+    for bad in [
+        "a.rs | f | autonomous | f\n",
+        "a.rs | f | autonomous | f | gpu\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_sites(bad)).is_err(),
+            "must be refused: {bad:?}"
+        );
+    }
+}
+
+#[test]
 fn every_operator_site_is_a_tauri_command() {
     let rows = load_rows();
     let violations = operator_sites_not_tauri_commands(&load_sources(), &rows);
@@ -707,6 +1239,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            kind: None,
         },
     );
     assert_eq!(
@@ -731,6 +1264,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            kind: None,
         },
     );
     assert!(operator_sites_reachable_by_an_automation(&clean).is_empty());
@@ -779,6 +1313,7 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
         Row {
             class: "helper".into(),
             detail: "recipe(".into(),
+            kind: None,
         },
     );
     let found: Vec<_> = scan_sites(&sources, &rows).into_iter().collect();
@@ -808,6 +1343,7 @@ fn a_broken_chain_an_exempt_admission_or_an_operator_origin_fails_the_guard() {
     let row = |detail: &str| Row {
         class: "autonomous".into(),
         detail: detail.into(),
+        kind: None,
     };
     let mut rows = BTreeMap::new();
     rows.insert(
@@ -844,6 +1380,7 @@ fn an_operator_row_must_be_a_tauri_command() {
             Row {
                 class: "operator".into(),
                 detail: "-".into(),
+                kind: None,
             },
         );
     }
@@ -880,6 +1417,7 @@ fn a_bare_gate_call_whose_result_is_discarded_fails_the_guard() {
             Row {
                 class: "autonomous".into(),
                 detail: f.into(),
+                kind: None,
             },
         );
     }

@@ -6862,7 +6862,34 @@ async fn run_continuation_terminal(
         // from the one async context on this path, so that decision is made on the
         // tenant's dial rather than on a cold cache (which would withhold the mint
         // and leave an unattended, interactive `claude` facing the trust dialog).
+        // BEFORE the gate below: a cold warm can take seconds, and nothing slow may
+        // sit between the gate's release and the PTY. A snapshot that ages past its
+        // TTL during a hold is still the tenant's answer (`Stale`), not a cold one.
         crate::claude_session::trust_gate::warm_dial().await;
+
+        // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+        // D1): pace this PTY spawn and hold it while the machine reads WARN or
+        // CRITICAL — here, after the claim, the worktree and every slow await, so the
+        // reading it releases on is the one the PTY opens under. A hold keeps the
+        // claimed work; the seam below still refuses at CRITICAL once the load
+        // episode's deadline has passed. This continuation holds its coord claim,
+        // so it runs through coord's device drain (round-3 review B1): the drain is
+        // a dispatch filter, and a drain that arms during the hold is logged, never
+        // waited for. Every start attempt is paced, retries included.
+        let unattended_slot = crate::unattended_spawn_gate::admit(
+            if payload.dispatch_id.is_some() {
+                crate::coord_drain_state::SpawnOrigin::UnitContinuation
+            } else {
+                crate::coord_drain_state::SpawnOrigin::GateContinuation
+            },
+            "gate-continuation terminal",
+            &payload
+                .dispatch_id
+                .map(|d| format!("dispatch:{d}"))
+                .or_else(|| payload.gate_id.map(|g| format!("gate:{g}")))
+                .unwrap_or_else(|| pinned_session_id.clone()),
+        )
+        .await;
 
         let result = crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,
@@ -6901,6 +6928,10 @@ async fn run_continuation_terminal(
                 // (it names the failing conjuncts) rather than wrapped as a create
                 // failure.
                 let (reason, phase) = classify_pty_spawn_error(&e);
+                // No PTY opened (the seam's CRITICAL refusal after a
+                // `hold_deadline` release among the causes): give the gate's slot
+                // back, so the next unattended spawn is not paced behind it.
+                unattended_slot.refund();
                 report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
                 return Err(anyhow::anyhow!(e));
             }
@@ -7516,6 +7547,64 @@ async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: S
     }
 }
 
+/// What a condition check does with an authorization verdict that refused its
+/// spawn, reporting through `report` (in production
+/// [`report_condition_run_failed`]).
+///
+/// A DRAIN deferral is reported terminal. Coord inserted this run's
+/// `coord.condition_runs` row as `running` before it published the frame
+/// (`conditions::dispatch::dispatch_group_run` step 3), nothing ages that row
+/// out, and the group runs again only at its next `next_run_at` — a manual run
+/// never — so an unreported deferral would strand the row `running` for good.
+/// The status is `error`: coord's vocabulary here is `running`/`pass`/`fail`/
+/// `error` with no skipped or cancelled status, and coord itself records a run
+/// it could not place because every capable runner is drained as `error`
+/// (`device_or_miss_summary`). The summary names the drain, so the row reads as
+/// a deferral rather than a fault. The single-shot report token is safe to spend:
+/// no session was started that could have wanted it.
+///
+/// A registry VETO is deliberately not reported (see the call site).
+async fn settle_refused_condition_run<'a, F, Fut>(
+    payload: &'a ConditionCheckPayload,
+    authz: &crate::agent_authorization::SpawnDecision,
+    report: F,
+) where
+    F: FnOnce(&'a ConditionCheckPayload, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if let Some(class) = authz.drain_class() {
+        report(
+            payload,
+            format!(
+                "deferred_by_drain: the runner did not start this check — coord's device drain \
+                 reads {} ({}); this run will not execute",
+                class.label(),
+                class.code()
+            ),
+        )
+        .await;
+    }
+}
+
+/// The condition check's pre-claim authorization: wait for the drain's boot
+/// read (`await_boot`), THEN authorize. Until that read lands the drain reads
+/// `Unknown`, which defers every autonomous spawn, and a deferral here is
+/// reported `error` ([`settle_refused_condition_run`]), so a frame delivered at
+/// boot must be judged against the real state (round-5 review nit 2).
+async fn authorize_condition_check<W, WF, A, AF>(
+    await_boot: W,
+    authorize: A,
+) -> crate::agent_authorization::SpawnDecision
+where
+    W: FnOnce() -> WF,
+    WF: std::future::Future<Output = ()>,
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = crate::agent_authorization::SpawnDecision>,
+{
+    await_boot().await;
+    authorize().await
+}
+
 /// Run a condition check as a VISIBLE terminal session.
 ///
 /// Mirrors [`run_continuation_terminal`] — opens a docked, operator-visible
@@ -7542,7 +7631,8 @@ async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: S
 /// - **A registry VETO is not one of those arms and reports nothing**, matching
 ///   both the gate path's step-1b refusal and coord's own pre-flight. See the
 ///   comment at that arm for the evidence and for the coord-side gap it leaves
-///   open.
+///   open. A drain DEFERRAL at that same arm does report
+///   ([`settle_refused_condition_run`]).
 /// - **Host git identity.** No autonomous-agent git author is injected (no
 ///   commits happen), so the PTY keeps the ambient host identity.
 ///
@@ -7581,15 +7671,27 @@ async fn run_condition_check_terminal(
     // an AI terminal that outlives the request that scheduled it — the same
     // auto-dispatch class as a gate continuation, so it takes the same
     // standing per-path opt-in. Coord-dispatched, so autonomous under the
-    // device drain; a deferral takes the same no-report path as a veto, and
-    // coord's condition scheduler dispatches the group again on its next tick.
-    let authz = crate::agent_authorization::authorize_spawn(
-        None,
-        crate::agent_authorization::SpawnPath::StandingContinuation,
-        crate::agent_authorization::DrainAdmission::work(
-            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
-            format!("condition_run:{}", payload.run_id),
-        ),
+    // device drain. A drain deferral is REPORTED terminal: coord recorded this
+    // run `running` before it published the frame and nothing ages that row
+    // out — a scheduled group runs again only at its next `next_run_at`, a
+    // manual run never — so an unreported deferral would strand it (see
+    // `settle_refused_condition_run`). A registry veto is not reported (below).
+    // The drain's boot read comes first (bounded, as the handoff catch-up and the
+    // coord launch path do): until it lands the drain reads `Unknown`, which
+    // defers every autonomous spawn, and reporting that deferral would turn the
+    // group red for a frame that merely arrived at boot.
+    let authz = authorize_condition_check(
+        || crate::coord_drain_state::await_boot_read(Duration::from_secs(15)),
+        || {
+            crate::agent_authorization::authorize_spawn(
+                None,
+                crate::agent_authorization::SpawnPath::StandingContinuation,
+                crate::agent_authorization::DrainAdmission::work(
+                    crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+                    format!("condition_run:{}", payload.run_id),
+                ),
+            )
+        },
     )
     .await;
     if !authz.allows_spawn() {
@@ -7599,8 +7701,10 @@ async fn run_condition_check_terminal(
             authz.label(),
             authz.reason().unwrap_or("no reason recorded")
         );
-        // Deliberately NO report. A registry veto is a standing POLICY state,
-        // not a spawn fault, and both precedents keep it off the RUN record:
+        // A drain deferral drives the run row terminal; a veto returns untouched.
+        settle_refused_condition_run(&payload, &authz, report_condition_run_failed).await;
+        // A VETO gets deliberately NO report. A registry veto is a standing POLICY
+        // state, not a spawn fault, and both precedents keep it off the RUN record:
         //
         //  * the gate path's own step-1b refusal (this file, the
         //    `StandingContinuation` check in `run_gate_continuation_inner`)
@@ -7862,8 +7966,22 @@ async fn run_condition_check_terminal(
     };
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
-    // sync trust gate decides on the tenant's word, not a cold cache.
+    // sync trust gate decides on the tenant's word, not a cold cache — before the
+    // gate, so no slow await sits between its release and the PTY.
     crate::claude_session::trust_gate::warm_dial().await;
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1) — the same pace-and-hold the gate-continuation terminal passes. Coord
+    // recorded this run `running` before it published the frame, and nothing ages
+    // that row out, so a drain that arms while the check waits here does not
+    // defer it: it runs through, as a claimed continuation does (round-3 review
+    // B1, round-4 W1). The drain admission above is this door's drain read.
+    let unattended_slot = crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+        "condition-check terminal",
+        &format!("condition_run:{}", payload.run_id),
+    )
+    .await;
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
@@ -7941,6 +8059,9 @@ async fn run_condition_check_terminal(
             let (reason, _phase) = classify_pty_spawn_error(&e);
             let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
+            // No PTY opened (the seam's CRITICAL refusal after a `hold_deadline`
+            // release among the causes): give the gate's slot back.
+            unattended_slot.refund();
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             Err(anyhow::anyhow!(reason))
         }
@@ -11101,6 +11222,104 @@ mod tests {
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
         }
+    }
+
+    /// Round-4 review W1: a DRAIN deferral at the condition check's pre-claim
+    /// arm drives the run row terminal through the reporter — coord recorded the
+    /// run `running` before publishing the frame and nothing ages it out — while
+    /// a registry veto reports nothing.
+    #[tokio::test]
+    async fn a_drain_deferred_condition_check_reports_its_run_and_a_veto_does_not() {
+        let payload = condition_payload(None, String::new());
+        let mut reports: Vec<(String, String)> = Vec::new();
+        for decision in [
+            crate::agent_authorization::SpawnDecision::DeferredByDrain {
+                reason: "coord has drained this device".to_string(),
+                class: crate::coord_drain_state::DeferClass::Drained,
+            },
+            crate::agent_authorization::SpawnDecision::Deny {
+                reason: "agent disabled".to_string(),
+            },
+        ] {
+            settle_refused_condition_run(&payload, &decision, |p, summary| {
+                reports.push((p.run_id.clone(), summary));
+                async {}
+            })
+            .await;
+        }
+        assert_eq!(
+            reports.len(),
+            1,
+            "only the drain deferral reports: {reports:?}"
+        );
+        let (run_id, summary) = &reports[0];
+        assert_eq!(run_id, &payload.run_id);
+        assert!(summary.starts_with("deferred_by_drain: "), "{summary}");
+        assert!(summary.contains("(device_drained)"), "{summary}");
+    }
+
+    /// Round-5 review nit 2: at boot the drain reads `Unknown` until its first
+    /// read lands. The condition check authorizes only after that read, so a
+    /// frame delivered at boot is judged against the real state and reports
+    /// nothing; judged before it, the same frame would be deferred and its run
+    /// reported `error`.
+    #[tokio::test]
+    async fn a_condition_check_at_boot_is_judged_after_the_drain_boot_read() {
+        use crate::coord_drain_state::{CoordDrainState, SpawnOrigin};
+        let boot = || CoordDrainState::Unknown {
+            since: chrono::Utc::now(),
+            cause: "coord drain state not read yet".to_string(),
+        };
+        let state = std::sync::Mutex::new(boot());
+        let admission = crate::agent_authorization::DrainAdmission::work(
+            SpawnOrigin::CoordDispatch,
+            "condition_run:018f0000-0000-7000-8000-000000000000",
+        );
+        // The drain half of `authorize_spawn`, over the injected state as it
+        // stands when the authorization runs.
+        let authorize = || {
+            let decision =
+                crate::agent_authorization::decide_drain(&state.lock().expect("state"), &admission)
+                    .unwrap_or(crate::agent_authorization::SpawnDecision::Allow);
+            async move { decision }
+        };
+        let payload = condition_payload(None, String::new());
+        let mut reports: Vec<String> = Vec::new();
+
+        // The boot read lands (the device is not drained) before the authorization.
+        let authz = authorize_condition_check(
+            || {
+                *state.lock().expect("state") = CoordDrainState::Clear;
+                async {}
+            },
+            authorize,
+        )
+        .await;
+        assert!(
+            authz.allows_spawn(),
+            "judged after the boot read: {authz:?}"
+        );
+        settle_refused_condition_run(&payload, &authz, |_, summary| {
+            reports.push(summary);
+            async {}
+        })
+        .await;
+        assert!(reports.is_empty(), "nothing to report: {reports:?}");
+
+        // Judged against the not-yet-read state instead, it would be reported.
+        *state.lock().expect("state") = boot();
+        let early = authorize_condition_check(|| async {}, authorize).await;
+        assert_eq!(
+            early.drain_class(),
+            Some(crate::coord_drain_state::DeferClass::Unknown)
+        );
+        settle_refused_condition_run(&payload, &early, |_, summary| {
+            reports.push(summary);
+            async {}
+        })
+        .await;
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("(drain_unreadable)"), "{reports:?}");
     }
 
     /// The rung that exists today: coord ships the token only inside the

@@ -19,10 +19,33 @@
 # (whose mutation twins
 #     runner_spawn_sites::removing_the_drain_gate_from_start_steward_fails_the_guard and
 #     runner_spawn_sites::a_bare_gate_call_whose_result_is_discarded_fails_the_guard
-# prove it can fail), and
-#     runner_spawn_sites::every_operator_site_is_a_tauri_command
+# prove it can fail),
+#     runner_spawn_sites::every_operator_site_is_a_tauri_command, and
+#     runner_spawn_sites::every_autonomous_terminal_site_passes_the_unattended_spawn_gate
+# (whose mutation twin
+#     runner_spawn_sites::removing_the_unattended_gate_from_run_continuation_terminal_fails_the_guard
+# proves it can fail).
 #
-# Columns:  file (relative to src/) | fn | class | detail
+# Columns:  file (relative to src/) | fn | class | detail [| spawn kind]
+#
+# The fifth column is on `autonomous` rows ONLY, and every autonomous row has it
+# (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+# Phase 2 / D1):
+#   pty         the site opens a PTY terminal — `TerminalManager::create`,
+#               `create_*_terminal_session_backend`, `spawn_resumed_pane`, or a
+#               `SessionRegistry` start whose transport does. Its OWN fn body (nested fns
+#               excluded) must call `unattended_spawn_gate::admit(` (hold + pace),
+#               `::admit_or_defer(` (decide once, defer) or `::check_request(` (a request
+#               door) BEFORE its first PTY primitive, read coord's drain before that call and
+#               never after it, consume the verdict of the last two, pass no operator origin
+#               literal, and `.commit().await` a `check_request` slot before the PTY. A row
+#               whose body reaches a PTY primitive must be `pty` —
+#               the guard checks that too, so the column cannot be used to dodge the gate.
+#   headless    the site launches a `claude` child with no PTY (`spawn_claude_child`,
+#               the stream-json `ClaudeSession::spawn`, the Python spawn script). The
+#               headless seam owns its own admission (open PR #2207).
+#   n/a         the site starts a workflow run, not a session process; the spawns a
+#               workflow makes are gated where they happen.
 #
 # class / detail:
 #   autonomous  a spawn the runner makes without an operator at THIS runner asking for
@@ -40,14 +63,14 @@
 #   exempt      not new work: continues or replaces a session that is already running,
 #               or launches nothing. detail = why (non-empty).
 
-agent_runtime.rs | run_agent_subprocess | autonomous | spawn_run_task > run_agent_subprocess
-agent_runtime.rs | run_condition_check_terminal | autonomous | run_condition_check_terminal
-agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuation_inner > run_continuation_headless
-agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner
+agent_runtime.rs | run_agent_subprocess | autonomous | spawn_run_task > run_agent_subprocess | headless
+agent_runtime.rs | run_condition_check_terminal | autonomous | run_condition_check_terminal | pty
+agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuation_inner > run_continuation_headless | headless
+agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner | pty
 claude_session/runner.rs | run_claude_session_interactive | helper | run_claude_session_interactive(
 claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | run_claude_session_interactive_with_retry(
 commands/ai_session.rs | create_ai_session | operator | -
-commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
+commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions | headless
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
 commands/session.rs | session_start | operator | -
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
@@ -55,43 +78,43 @@ commands/terminal.rs | create_tracked_terminal_session_backend | helper | create
 commands/terminal.rs | terminal_create | operator | -
 commands/terminal.rs | terminal_migrate_session_account | operator | -
 config_report_cmd.rs | seam_reports | exempt | builds the fix-agent command ONLY to report its environment (the seam table); never spawns it
-fixer/trigger.rs | launch_fixer | autonomous | launch_fixer
-follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up
-looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal
-mcp/ai_session.rs | run_prompt | autonomous | run_prompt
-mcp/backend_relay.rs | handle_chat_create | autonomous | handle_chat_create
-mcp/backend_relay.rs | handle_terminal_create | autonomous | handle_terminal_create
-mcp/sessions.rs | spawn_session | autonomous | spawn_session
-mcp/steward.rs | start_steward | autonomous | start_steward
-mcp/task_run_workflow_state.rs | resume_task_run | autonomous | resume_task_run
-mcp/task_runs.rs | create_ai_session | autonomous | create_ai_session
-mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
+fixer/trigger.rs | launch_fixer | autonomous | launch_fixer | n/a
+follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up | n/a
+looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal | pty
+mcp/ai_session.rs | run_prompt | autonomous | run_prompt | headless
+mcp/backend_relay.rs | handle_chat_create | autonomous | handle_chat_create | headless
+mcp/backend_relay.rs | handle_terminal_create | autonomous | handle_terminal_create | pty
+mcp/sessions.rs | spawn_session | autonomous | spawn_session | headless
+mcp/steward.rs | start_steward | autonomous | start_steward | pty
+mcp/task_run_workflow_state.rs | resume_task_run | autonomous | resume_task_run | n/a
+mcp/task_runs.rs | create_ai_session | autonomous | create_ai_session | headless
+mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run | n/a
 # The scheduler's RemoteAgent launch (plan 2026-09-13-nightly-return-to-main-sweep, Phase 5b)
 # reaches spawn_claude_child directly instead of POSTing /prompts/run. All three of the
 # scheduler's entry points gate on the device drain before execute_task (tick's
 # partition_for_drain, reconcile_task's drain_gate_for_work, run_task_now's drain_gate);
 # the chain below names the periodic one.
-scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
-mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
-mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
-mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
-mcp/unified_workflows.rs | generate_unified_workflow_async | autonomous | generate_unified_workflow_async
-mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_workflow
-mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow
-meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal
-orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask
+scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch | headless
+mcp/tauri_proxy.rs | dispatch | autonomous | dispatch | pty
+mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler | pty
+mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow | n/a
+mcp/unified_workflows.rs | generate_unified_workflow_async | autonomous | generate_unified_workflow_async | n/a
+mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_workflow | n/a
+mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow | n/a
+meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal | n/a
+orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask | headless
 orchestration_loop/fix_agent.rs | build_fix_agent_command_with | helper | build_fix_agent_command_with(
 orchestration_loop/fix_agent.rs | build_fix_agent_command | helper | build_fix_agent_command(
 orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an orchestration loop ALREADY running — carries DrainAdmission::Exempt; the loop's own fan-out is the new work the drain defers
-reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
-reflection/trigger.rs | launch_reflection | autonomous | launch_reflection
-reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection
-session/handoff.rs | materialize | autonomous | materialize
+reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection | n/a
+reflection/trigger.rs | launch_reflection | autonomous | launch_reflection | n/a
+reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection | n/a
+session/handoff.rs | materialize | autonomous | materialize | pty
 session/mod.rs | start | helper | .start(intent)
 session/mod.rs | start_inner | helper | .start_inner(
 session/mod.rs | start_with_parent | helper | .start_with_parent(
-session/respawn.rs | materialize | autonomous | materialize
-session/resume_door.rs | resume_one | autonomous | resume_one
+session/respawn.rs | materialize | autonomous | materialize | pty
+session/resume_door.rs | resume_one | autonomous | resume_one | pty
 session/transport/claude_cli.rs | start | helper | transport.start(
 session/transport/pty.rs | start | helper | transport.start(
 step_executor/handlers/mod.rs | execute_with_tools | exempt | a step of a workflow run that is already running; every workflow START is a gated row here
@@ -99,8 +122,8 @@ terminal/account_migration.rs | handle_usage_limit_hint | exempt | moves a live 
 terminal/account_migration.rs | migrate_session | helper | migrate_session(
 terminal/account_migration.rs | migrate_session_off_runtime | helper | migrate_session_off_runtime(
 terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane(
-trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
+trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow | n/a
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here
-unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id
-unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask
-unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows
+unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id | n/a
+unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask | n/a
+unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows | n/a

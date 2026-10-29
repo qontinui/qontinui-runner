@@ -2567,7 +2567,20 @@ async fn health(
         // NOW — the memory and thread lanes' readings, limits and verdicts, and
         // the deferral stamp the pre-check would write. Read through the same
         // `resource_guard::lane_verdicts` the gate uses. There is no count cap.
-        "spawnAdmission": crate::agent_runtime::spawn_admission_health_json(),
+        //
+        // Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+        // continuation-cap, Phase 2 adds `unattendedGate` INTO this same object:
+        // the pacer-and-hold every unattended PTY spawn passes immediately
+        // before the PTY opens — spacing, re-probe interval, hold deadline,
+        // spawns queued right now, remembered deferrals, the current load
+        // episode, release / refusal / deferral / refund totals by `why` since
+        // boot, and how many spawns ran through coord's drain. A build serving no `unattendedGate` has no gate. ONE
+        // `spawnAdmission` key: a second key in this `json!` literal would
+        // silently overwrite the first. #2429 (projected cost) already lives in
+        // this object.
+        "spawnAdmission": crate::unattended_spawn_gate::with_unattended_gate(
+            crate::agent_runtime::spawn_admission_health_json(),
+        ),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was

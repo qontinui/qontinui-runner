@@ -610,6 +610,24 @@ async fn supervise_one(
         }
         Action::Relaunch(reason) => {
             let Some((tid, _)) = &live else { return };
+            // The relaunch closes the live tab BEFORE the spawn: on a loaded
+            // machine that would leave the agent down for as long as the load
+            // lasts. Read the load first (no slot claimed) and keep the running tab
+            // until a later tick finds the machine clear.
+            if let Err(loaded) = crate::unattended_spawn_gate::load_precheck(
+                crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+                "looping-agent terminal",
+                &looping_agent_work_key(&rec.def.id),
+            ) {
+                info!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    ?reason,
+                    "looping_agent_supervisor: relaunch postponed, the running tab is kept — {}",
+                    loaded.reason
+                );
+                return;
+            }
             info!(
                 agent = %rec.def.id,
                 terminal = %tid,
@@ -973,6 +991,19 @@ async fn do_spawn(
                  retrying on the next tick, no backoff"
             );
         }
+        Err(e) if crate::unattended_spawn_gate::is_machine_loaded_refusal(&e) => {
+            // The unattended spawn gate deferred the spawn (the machine reads WARN
+            // or CRITICAL, or other unattended spawns are queued ahead). Same
+            // treatment as the resource-guard refusal above and for the same
+            // reason: a verdict on the machine, retried on the next tick with no
+            // backoff, the agent's queue ticket kept.
+            info!(
+                agent = %def.id,
+                error = %e,
+                "looping_agent_supervisor: spawn deferred by the unattended spawn gate — \
+                 retrying on the next tick, no backoff"
+            );
+        }
         Err(e) if crate::claude_session::trust_gate::is_spawn_blocked_refusal(&e) => {
             // The trust gate refused: workspace trust for the agent's home dir
             // could not be DERIVED for the pinned account and the tenant's
@@ -1041,6 +1072,18 @@ async fn spawn_looping_agent_terminal(
     // box is starved. Retrying every tick is what makes the agent restart the
     // moment there is commit to spare; this is what keeps that retry cheap.
     crate::resource_guard::precheck_spawn("looping-agent session", false)?;
+    // The unattended spawn gate's load-only pre-check, beside the resource
+    // guard's: on a loaded machine the gate below would only defer, so defer
+    // before the home dir, the provisioning, the binary and account resolution,
+    // the served-corpus probe and the dial warm — none of it redone every tick
+    // while the machine stays loaded. Claims no slot; `do_spawn` does not back
+    // off for it.
+    crate::unattended_spawn_gate::load_precheck(
+        crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+        "looping-agent terminal",
+        &looping_agent_work_key(&def.id),
+    )
+    .map_err(|loaded| loaded.refusal_text())?;
 
     let terminal_manager = app
         .try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1185,8 +1228,28 @@ async fn spawn_looping_agent_terminal(
 
     // The PTY seam derives workspace trust for `selected_config_dir` through
     // the trust gate's sync door; warm the dial from this async context so the
-    // first spawn after a runner start is not decided by a cold cache.
+    // first spawn after a runner start is not decided by a cold cache. Before the
+    // gate below, so nothing slow sits between its release and the PTY.
     crate::claude_session::trust_gate::warm_dial().await;
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1), immediately before the PTY opens. DECIDE-ONCE, never a hold: this runs
+    // on the supervisor's serial tick, the only thing renewing slot leases, so a
+    // hold here could let a lease expire and a peer runner take the slot (the
+    // #1025 double spawn). It waits inline at most ONE spacing (3 s, far below
+    // the 120 s lease TTL) — enough for the key's kept ticket to take the next
+    // slot ahead of a draining backlog instead of deferring on every tick until
+    // the backlog is gone. A loaded machine, or a longer queue, is a deferral the
+    // next tick retries with the key's place kept; `do_spawn` does not back off
+    // for it.
+    let unattended_slot = crate::unattended_spawn_gate::admit_or_defer(
+        crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+        "looping-agent terminal",
+        &looping_agent_work_key(&def.id),
+        crate::unattended_spawn_gate::UNATTENDED_SPAWN_SPACING,
+    )
+    .await
+    .map_err(|loaded| loaded.refusal_text())?;
 
     let (terminal_id, _coord_session) =
         crate::commands::terminal::create_tracked_terminal_session_backend(
@@ -1216,7 +1279,10 @@ async fn spawn_looping_agent_terminal(
             // hammer a starved machine with new `claude` processes indefinitely —
             // the exact shape of the 2026-08-06→07 incident.
             false,
-        )?;
+        )
+        // No PTY opened (that CRITICAL refusal among the causes): give the gate's
+        // slot back, so the next unattended spawn is not paced behind it.
+        .inspect_err(|_| unattended_slot.refund())?;
     Ok((terminal_id, pinned_session_id))
 }
 
