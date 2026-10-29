@@ -17,14 +17,22 @@
 //! tabs without stealing the view. Operator origins always surface and do not
 //! consume the window.
 //!
+//! [`SpawnOrigin::Unknown`] — a caller this runner cannot name (an agent's
+//! HTTP `POST /terminals`, a UI-Bridge or relay create) — is coalesced (it is
+//! not surfaced while a window is open) but never OPENS one: only a NAMED
+//! unattended origin sets the last surface. Otherwise an agent's own terminal
+//! create would suppress the next real gate continuation's surface for a
+//! minute.
+//!
 //! One decision per spawn. The tab-selection half rides `terminal-created`,
 //! which the [`TerminalManager`](super::TerminalManager) emits at PTY create;
 //! the main-view half is the later `terminal-focus-request`. The create-time
 //! decision is recorded against the terminal id and the first focus request
 //! for that id TAKES it, so the two halves can never disagree (a create that
 //! surfaced is followed by its view switch; a suppressed create never gets
-//! one). A focus request with no recorded create decision (a duplicate anchor
-//! folded onto a live tab) is decided fresh.
+//! one). A REFOCUS (a duplicate anchor folded onto a live tab) only PEEKS the
+//! recorded decision, so it can never consume the original's and hand that
+//! terminal a fresh decision later; with nothing recorded it is decided fresh.
 //!
 //! A suppression is never silent: it is a `debug!`, a `/health`
 //! `focusCoalescer.suppressedTotal` count, and — once per window that had
@@ -103,6 +111,10 @@ impl Coalescer {
 
     /// Decide one request and update the state. Returns (surfaced, the
     /// closed-window count to log, if any).
+    ///
+    /// A surfaced NAMED unattended origin opens a window; a surfaced
+    /// [`SpawnOrigin::Unknown`] does not (module doc); a suppressed one of
+    /// either is counted.
     fn decide(
         &mut self,
         now: Instant,
@@ -113,15 +125,66 @@ impl Coalescer {
         let closed = self.take_closed_window(now, window);
         let surface = should_surface(now, self.last_surface, origin, window);
         if origin.is_autonomous() {
-            if surface {
-                self.last_surface = Some(now);
-                self.last_surface_at = Some(wall);
-            } else {
+            if !surface {
                 self.suppressed_total += 1;
                 self.suppressed_in_window += 1;
+            } else if opens_window(origin) {
+                self.last_surface = Some(now);
+                self.last_surface_at = Some(wall);
             }
         }
         (surface, closed)
+    }
+
+    /// The create-time decision ([`decide_for_create`]): decide, and record
+    /// it for an unattended origin so the terminal's focus request reuses it.
+    /// An operator create records nothing (it always surfaces).
+    fn decide_for_create(
+        &mut self,
+        now: Instant,
+        wall: chrono::DateTime<chrono::Utc>,
+        origin: SpawnOrigin,
+        terminal_id: &str,
+        window: Duration,
+    ) -> (bool, Option<u64>) {
+        let out = self.decide(now, wall, origin, window);
+        if origin.is_autonomous() {
+            self.record_pending(terminal_id, out.0, now);
+        }
+        out
+    }
+
+    /// The focus-request decision ([`decide_for_focus`]): TAKE the recorded
+    /// create-time decision when there is one, else decide fresh.
+    fn decide_for_focus(
+        &mut self,
+        now: Instant,
+        wall: chrono::DateTime<chrono::Utc>,
+        origin: SpawnOrigin,
+        terminal_id: &str,
+        window: Duration,
+    ) -> (bool, Option<u64>) {
+        match self.take_pending(terminal_id, now) {
+            Some(surface) => (surface, self.take_closed_window(now, window)),
+            None => self.decide(now, wall, origin, window),
+        }
+    }
+
+    /// The refocus decision ([`decide_for_refocus`]): PEEK the recorded
+    /// create-time decision — never consume it, so the original terminal's
+    /// own focus request still finds it — else decide fresh.
+    fn decide_for_refocus(
+        &mut self,
+        now: Instant,
+        wall: chrono::DateTime<chrono::Utc>,
+        origin: SpawnOrigin,
+        terminal_id: &str,
+        window: Duration,
+    ) -> (bool, Option<u64>) {
+        match self.peek_pending(terminal_id, now) {
+            Some(surface) => (surface, self.take_closed_window(now, window)),
+            None => self.decide(now, wall, origin, window),
+        }
     }
 
     /// Record a create-time decision for `terminal_id`.
@@ -130,14 +193,27 @@ impl Coalescer {
         while self.pending.len() >= PENDING_DECISION_CAP {
             self.pending.pop_front();
         }
-        self.pending.push_back((terminal_id.to_string(), surface, now));
+        self.pending
+            .push_back((terminal_id.to_string(), surface, now));
     }
 
     /// Take the create-time decision recorded for `terminal_id`, if any.
     fn take_pending(&mut self, terminal_id: &str, now: Instant) -> Option<bool> {
         self.prune(now);
-        let idx = self.pending.iter().position(|(id, _, _)| id == terminal_id)?;
+        let idx = self
+            .pending
+            .iter()
+            .position(|(id, _, _)| id == terminal_id)?;
         self.pending.remove(idx).map(|(_, surface, _)| surface)
+    }
+
+    /// The create-time decision recorded for `terminal_id`, left in place.
+    fn peek_pending(&mut self, terminal_id: &str, now: Instant) -> Option<bool> {
+        self.prune(now);
+        self.pending
+            .iter()
+            .find(|(id, _, _)| id == terminal_id)
+            .map(|(_, surface, _)| *surface)
     }
 
     fn prune(&mut self, now: Instant) {
@@ -149,6 +225,21 @@ impl Coalescer {
             self.pending.pop_front();
         }
     }
+}
+
+/// Whether a surfaced `origin` opens a coalescing window: every unattended
+/// origin except [`SpawnOrigin::Unknown`] (module doc).
+fn opens_window(origin: SpawnOrigin) -> bool {
+    origin.is_autonomous() && origin != SpawnOrigin::Unknown
+}
+
+/// The `/health` `focusCoalescer` block for `c` (pure).
+fn health_json_of(c: &Coalescer) -> serde_json::Value {
+    serde_json::json!({
+        "windowSecs": FOCUS_COALESCE_WINDOW.as_secs(),
+        "suppressedTotal": c.suppressed_total,
+        "lastSurfaceAt": c.last_surface_at.map(|t| t.to_rfc3339()),
+    })
 }
 
 static COALESCER: Mutex<Option<Coalescer>> = Mutex::new(None);
@@ -167,43 +258,69 @@ fn log_closed_window(count: Option<u64>) {
     }
 }
 
+fn log_suppressed(what: &str, surface: bool, origin: SpawnOrigin, terminal_id: &str) {
+    if !surface {
+        debug!(
+            "focus: suppressed unattended {what} origin={} terminal_id={terminal_id}",
+            origin.as_wire()
+        );
+    }
+}
+
 /// The create-time decision for a terminal `origin` is spawning: `true` when
 /// its tab should be selected (`terminal-created` `surface`). Recorded so the
 /// terminal's later focus request ([`decide_for_focus`]) reuses it.
 pub fn decide_for_create(origin: SpawnOrigin, terminal_id: &str) -> bool {
     let now = Instant::now();
     let (surface, closed) = with_coalescer(|c| {
-        let out = c.decide(now, chrono::Utc::now(), origin, FOCUS_COALESCE_WINDOW);
-        if origin.is_autonomous() {
-            c.record_pending(terminal_id, out.0, now);
-        }
-        out
+        c.decide_for_create(
+            now,
+            chrono::Utc::now(),
+            origin,
+            terminal_id,
+            FOCUS_COALESCE_WINDOW,
+        )
     });
     log_closed_window(closed);
-    if !surface {
-        debug!(
-            "focus: suppressed unattended tab selection origin={} terminal_id={terminal_id}",
-            origin.as_wire()
-        );
-    }
+    log_suppressed("tab selection", surface, origin, terminal_id);
     surface
 }
 
 /// Whether a `terminal-focus-request` for `terminal_id` from `origin` is
-/// emitted: the create-time decision when one is recorded, else a fresh one.
+/// emitted: the create-time decision when one is recorded (taken), else a
+/// fresh one.
 pub fn decide_for_focus(origin: SpawnOrigin, terminal_id: &str) -> bool {
     let now = Instant::now();
-    let (surface, closed) = with_coalescer(|c| match c.take_pending(terminal_id, now) {
-        Some(surface) => (surface, c.take_closed_window(now, FOCUS_COALESCE_WINDOW)),
-        None => c.decide(now, chrono::Utc::now(), origin, FOCUS_COALESCE_WINDOW),
+    let (surface, closed) = with_coalescer(|c| {
+        c.decide_for_focus(
+            now,
+            chrono::Utc::now(),
+            origin,
+            terminal_id,
+            FOCUS_COALESCE_WINDOW,
+        )
     });
     log_closed_window(closed);
-    if !surface {
-        debug!(
-            "focus: suppressed unattended focus request origin={} terminal_id={terminal_id}",
-            origin.as_wire()
-        );
-    }
+    log_suppressed("focus request", surface, origin, terminal_id);
+    surface
+}
+
+/// Whether a REFOCUS of the live `terminal_id` (a duplicate anchor folded
+/// onto it) switches the view: the terminal's recorded create-time decision
+/// while one is still pending (peeked, never taken), else a fresh one.
+pub fn decide_for_refocus(origin: SpawnOrigin, terminal_id: &str) -> bool {
+    let now = Instant::now();
+    let (surface, closed) = with_coalescer(|c| {
+        c.decide_for_refocus(
+            now,
+            chrono::Utc::now(),
+            origin,
+            terminal_id,
+            FOCUS_COALESCE_WINDOW,
+        )
+    });
+    log_closed_window(closed);
+    log_suppressed("refocus", surface, origin, terminal_id);
     surface
 }
 
@@ -211,19 +328,12 @@ pub fn decide_for_focus(origin: SpawnOrigin, terminal_id: &str) -> bool {
 /// request has surfaced since boot.
 pub fn health_json() -> serde_json::Value {
     let now = Instant::now();
-    let (suppressed_total, last_surface_at, closed) = with_coalescer(|c| {
-        (
-            c.suppressed_total,
-            c.last_surface_at.map(|t| t.to_rfc3339()),
-            c.take_closed_window(now, FOCUS_COALESCE_WINDOW),
-        )
+    let (value, closed) = with_coalescer(|c| {
+        let closed = c.take_closed_window(now, FOCUS_COALESCE_WINDOW);
+        (health_json_of(c), closed)
     });
     log_closed_window(closed);
-    serde_json::json!({
-        "windowSecs": FOCUS_COALESCE_WINDOW.as_secs(),
-        "suppressedTotal": suppressed_total,
-        "lastSurfaceAt": last_surface_at,
-    })
+    value
 }
 
 #[cfg(test)]
@@ -234,28 +344,28 @@ mod tests {
     /// 2026-10-27 (`.dev-logs/primary.log` on spaceship, ANSI-stripped), as
     /// milliseconds after the first one, 20:30:24.933Z.
     const BURST_2026_10_27_MS: [u64; 46] = [
-        0,       // 20:30:24.933
-        2_888,   // 20:30:27.821
-        4_333,   // 20:30:29.266
-        4_426,   // 20:30:29.359
-        6_624,   // 20:30:31.557
-        6_686,   // 20:30:31.619
-        6_760,   // 20:30:31.693
-        10_323,  // 20:30:35.256
-        10_359,  // 20:30:35.292
-        10_400,  // 20:30:35.333
-        10_726,  // 20:30:35.659
-        14_735,  // 20:30:39.668
-        14_825,  // 20:30:39.758
-        14_899,  // 20:30:39.832
-        15_750,  // 20:30:40.683
-        15_785,  // 20:30:40.718
-        15_860,  // 20:30:40.793
-        15_973,  // 20:30:40.906
-        16_345,  // 20:30:41.278
-        109_136, // 20:32:14.069
-        987_368, // 20:46:52.301
-        987_516, // 20:46:52.449
+        0,         // 20:30:24.933
+        2_888,     // 20:30:27.821
+        4_333,     // 20:30:29.266
+        4_426,     // 20:30:29.359
+        6_624,     // 20:30:31.557
+        6_686,     // 20:30:31.619
+        6_760,     // 20:30:31.693
+        10_323,    // 20:30:35.256
+        10_359,    // 20:30:35.292
+        10_400,    // 20:30:35.333
+        10_726,    // 20:30:35.659
+        14_735,    // 20:30:39.668
+        14_825,    // 20:30:39.758
+        14_899,    // 20:30:39.832
+        15_750,    // 20:30:40.683
+        15_785,    // 20:30:40.718
+        15_860,    // 20:30:40.793
+        15_973,    // 20:30:40.906
+        16_345,    // 20:30:41.278
+        109_136,   // 20:32:14.069
+        987_368,   // 20:46:52.301
+        987_516,   // 20:46:52.449
         1_018_710, // 20:47:23.643
         1_159_382, // 20:49:44.315
         1_160_564, // 20:49:45.497
@@ -292,7 +402,8 @@ mod tests {
             .copied()
             .filter(|ms| {
                 let now = base + Duration::from_millis(*ms);
-                c.decide(now, chrono::Utc::now(), origin, FOCUS_COALESCE_WINDOW).0
+                c.decide(now, chrono::Utc::now(), origin, FOCUS_COALESCE_WINDOW)
+                    .0
             })
             .collect()
     }
@@ -331,17 +442,17 @@ mod tests {
         let base = Instant::now();
         let mut c = Coalescer::default();
         let w = FOCUS_COALESCE_WINDOW;
-        assert!(c.decide(base, chrono::Utc::now(), SpawnOrigin::GateContinuation, w).0);
+        assert!(
+            c.decide(base, chrono::Utc::now(), SpawnOrigin::GateContinuation, w)
+                .0
+        );
         let t1 = base + Duration::from_secs(1);
-        assert!(c.decide(t1, chrono::Utc::now(), SpawnOrigin::OperatorTerminal, w).0);
+        assert!(
+            c.decide(t1, chrono::Utc::now(), SpawnOrigin::OperatorTerminal, w)
+                .0
+        );
         assert_eq!(c.last_surface, Some(base));
         assert!(!c.decide(t1, chrono::Utc::now(), SpawnOrigin::Steward, w).0);
-    }
-
-    #[test]
-    fn unknown_origin_is_coalesced() {
-        let out = surfaced(&[0, 1_000, 59_999, 60_000], SpawnOrigin::Unknown);
-        assert_eq!(out, vec![0, 60_000]);
     }
 
     #[test]
@@ -350,7 +461,12 @@ mod tests {
         let w = Duration::from_secs(60);
         let o = SpawnOrigin::LoopingAgent;
         assert!(should_surface(base, None, o, w));
-        assert!(!should_surface(base + Duration::from_millis(59_999), Some(base), o, w));
+        assert!(!should_surface(
+            base + Duration::from_millis(59_999),
+            Some(base),
+            o,
+            w
+        ));
         assert!(should_surface(base + w, Some(base), o, w));
     }
 
@@ -400,14 +516,146 @@ mod tests {
         }
         assert_eq!(c.pending.len(), PENDING_DECISION_CAP);
         assert_eq!(c.take_pending("t-0", base), None);
-        assert_eq!(c.take_pending(&format!("t-{}", PENDING_DECISION_CAP + 9), base), Some(false));
+        assert_eq!(
+            c.take_pending(&format!("t-{}", PENDING_DECISION_CAP + 9), base),
+            Some(false)
+        );
     }
 
     #[test]
-    fn health_json_shape() {
+    fn health_json_of_reports_the_fixture_exactly() {
+        let w = FOCUS_COALESCE_WINDOW;
+        assert_eq!(
+            health_json_of(&Coalescer::default()),
+            serde_json::json!({ "windowSecs": 60, "suppressedTotal": 0, "lastSurfaceAt": null })
+        );
+
+        let base = Instant::now();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-27T20:30:24.933Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut c = Coalescer::default();
+        let o = SpawnOrigin::GateContinuation;
+        assert!(c.decide(base, at, o, w).0);
+        for secs in [3, 5, 7] {
+            assert!(
+                !c.decide(base + Duration::from_secs(secs), chrono::Utc::now(), o, w)
+                    .0
+            );
+        }
+        assert_eq!(
+            health_json_of(&c),
+            serde_json::json!({
+                "windowSecs": 60,
+                "suppressedTotal": 3,
+                "lastSurfaceAt": "2026-10-27T20:30:24.933+00:00",
+            })
+        );
+    }
+
+    #[test]
+    fn health_json_wrapper_carries_every_key() {
         let v = health_json();
         assert_eq!(v["windowSecs"], 60);
         assert!(v["suppressedTotal"].is_u64(), "{v}");
         assert!(v.get("lastSurfaceAt").is_some(), "{v}");
+    }
+
+    // ── The create -> focus handoff, at the Coalescer level (injected time) ──
+
+    fn wall() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    #[test]
+    fn handoff_autonomous_create_suppressed_then_focus_is_false() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let o = SpawnOrigin::GateContinuation;
+        let mut c = Coalescer::default();
+        assert!(c.decide_for_create(base, wall(), o, "first", w).0);
+        let t1 = base + Duration::from_secs(5);
+        assert!(!c.decide_for_create(t1, wall(), o, "second", w).0);
+        // The focus request arrives AFTER the window closed: a fresh decision
+        // would surface it; the recorded create-time decision must win.
+        let t2 = base + Duration::from_secs(70);
+        assert!(!c.decide_for_focus(t2, wall(), o, "second", w).0);
+        // Taken, not left behind.
+        assert!(c.pending.iter().all(|(id, _, _)| id != "second"));
+    }
+
+    #[test]
+    fn handoff_autonomous_create_surfaced_then_focus_is_true() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let o = SpawnOrigin::GateContinuation;
+        let mut c = Coalescer::default();
+        assert!(c.decide_for_create(base, wall(), o, "first", w).0);
+        // Inside the window its own create opened: a fresh decision would be
+        // suppressed; the recorded one surfaces it.
+        let t1 = base + Duration::from_secs(5);
+        assert!(c.decide_for_focus(t1, wall(), o, "first", w).0);
+        assert_eq!(c.suppressed_total, 0);
+    }
+
+    #[test]
+    fn handoff_operator_create_records_nothing() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let mut c = Coalescer::default();
+        for o in [SpawnOrigin::OperatorTerminal, SpawnOrigin::OperatorChat] {
+            assert!(c.decide_for_create(base, wall(), o, "op", w).0);
+        }
+        assert!(c.pending.is_empty());
+        assert_eq!(c.last_surface, None);
+    }
+
+    #[test]
+    fn a_duplicate_fold_does_not_steal_the_create_decision() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let o = SpawnOrigin::GateContinuation;
+        let mut c = Coalescer::default();
+        assert!(c.decide_for_create(base, wall(), o, "first", w).0);
+        // `orig` is created inside that window: suppressed.
+        let t1 = base + Duration::from_secs(2);
+        assert!(!c.decide_for_create(t1, wall(), o, "orig", w).0);
+        // A duplicate anchor folds onto `orig` after the window closed; it
+        // must not consume `orig`'s pending decision...
+        let t2 = base + Duration::from_secs(65);
+        assert!(!c.decide_for_refocus(t2, wall(), o, "orig", w).0);
+        // ...so `orig`'s own focus request still finds it and stays
+        // suppressed (a fresh decision here would surface it).
+        let t3 = base + Duration::from_secs(66);
+        assert!(!c.decide_for_focus(t3, wall(), o, "orig", w).0);
+    }
+
+    #[test]
+    fn a_refocus_with_nothing_pending_is_decided_fresh() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let o = SpawnOrigin::GateContinuation;
+        let mut c = Coalescer::default();
+        assert!(c.decide_for_refocus(base, wall(), o, "live", w).0);
+        let t1 = base + Duration::from_secs(1);
+        assert!(!c.decide_for_refocus(t1, wall(), o, "live", w).0);
+    }
+
+    #[test]
+    fn unknown_origin_is_coalesced_but_never_opens_a_window() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let mut c = Coalescer::default();
+        // An agent's HTTP create surfaces (no window is open) but opens none...
+        assert!(c.decide(base, wall(), SpawnOrigin::Unknown, w).0);
+        assert_eq!(c.last_surface, None);
+        // ...so a real gate continuation one second later still surfaces.
+        let t1 = base + Duration::from_secs(1);
+        assert!(c.decide(t1, wall(), SpawnOrigin::GateContinuation, w).0);
+        // Inside THAT window an Unknown create is coalesced and counted.
+        let t2 = base + Duration::from_secs(2);
+        assert!(!c.decide(t2, wall(), SpawnOrigin::Unknown, w).0);
+        assert_eq!(c.suppressed_total, 1);
+        assert_eq!(c.last_surface, Some(t1));
     }
 }
