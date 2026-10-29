@@ -546,8 +546,9 @@ pub struct Unsettled {
     /// `app_unreachable` / `auth_wall` before it. A run whose stop word
     /// became `app_unreachable` / `auth_wall` AT the closing look — an
     /// exhausted frontier whose confirming snapshot found the app gone or
-    /// behind a login — took the look and reads `Some(true)`, beside
-    /// `exhaustionUnconfirmed: true`. Under a BUDGET stop this is the one
+    /// behind a login — took the look and reads `Some(true)`; its stop word
+    /// says what the look found, so `exhaustionUnconfirmed` stays `null`
+    /// there. Under a BUDGET stop this is the one
     /// place such a failure is recorded: the stop word stays the budget, and
     /// the reasons of what was seen were not refreshed after the last action.
     pub closing_look_failed: Option<bool>,
