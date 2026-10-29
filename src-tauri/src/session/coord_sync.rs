@@ -6985,7 +6985,10 @@ mod tests {
             json!({ "state": "active" }),
         )
         .await;
-        assert!(state.quarantined.contains(&failing), "precondition: quarantined");
+        assert!(
+            state.quarantined.contains(&failing),
+            "precondition: quarantined"
+        );
         let patches_before = rec
             .lock()
             .await
@@ -7076,7 +7079,10 @@ mod tests {
             json!({ "state": "active" }),
         )
         .await;
-        assert!(state.quarantined.contains(&failing), "precondition: quarantined");
+        assert!(
+            state.quarantined.contains(&failing),
+            "precondition: quarantined"
+        );
         let patches_before = rec
             .lock()
             .await
@@ -7096,7 +7102,10 @@ mod tests {
             .unwrap();
         hb(&outbox);
         let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(tick.heartbeats_superseded, 2, "both heartbeats were dropped");
+        assert_eq!(
+            tick.heartbeats_superseded, 2,
+            "both heartbeats were dropped"
+        );
         assert!(pending_of(&outbox, failing).is_empty());
 
         // A heartbeat appended in a LATER tick is dropped too.
@@ -7112,7 +7121,10 @@ mod tests {
             .iter()
             .filter(|(id, _)| *id == failing)
             .count();
-        assert_eq!(sent, patches_before, "no heartbeat reached coord after the close");
+        assert_eq!(
+            sent, patches_before,
+            "no heartbeat reached coord after the close"
+        );
         let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
         assert!(
             sidecar.contains("\"closed\""),
@@ -7153,7 +7165,10 @@ mod tests {
             }
             drain_tick(&coord.inner, &mut state).await;
         }
-        assert!(state.quarantined.contains(&stuck), "precondition: quarantined");
+        assert!(
+            state.quarantined.contains(&stuck),
+            "precondition: quarantined"
+        );
 
         outbox
             .record(machine, stuck, SessionEventKind::Heartbeat, json!({}))
@@ -7162,11 +7177,7 @@ mod tests {
         assert_eq!(tick.heartbeats_superseded, 1, "the heartbeat was dropped");
         assert!(pending_of(&outbox, stuck).is_empty());
         assert!(
-            rec.lock()
-                .await
-                .patches
-                .iter()
-                .all(|(id, _)| *id != stuck),
+            rec.lock().await.patches.iter().all(|(id, _)| *id != stuck),
             "no heartbeat PATCH for a session coord never created"
         );
     }
