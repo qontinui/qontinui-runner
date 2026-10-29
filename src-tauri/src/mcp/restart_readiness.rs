@@ -1434,7 +1434,7 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
+    let verdict = build_verdict(
         terminal,
         headless,
         holder,
@@ -1444,7 +1444,11 @@ pub async fn restart_readiness_handler(
         drain,
         census,
         status_source,
-    ))
+    );
+    // Fresher than the 600 s background census: the systemd watchdog gate
+    // reads the newest published verdict (plan 2026-10-19 Phase 2b).
+    crate::sd_notify::publish_readiness_verdict(&verdict, now_ms);
+    Json(verdict)
 }
 
 // ---------------------------------------------------------------------------

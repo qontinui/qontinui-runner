@@ -193,6 +193,8 @@ async fn connect_and_pump_ci(
     let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "ci_node").await?;
     *connected_at = Some(std::time::Instant::now());
     info!("ci_node: WS connected for device_id={device_id}");
+    // systemd `READY=1` waits on this (plan 2026-10-19 Phase 2b).
+    crate::sd_notify::mark_ci_subscription_up();
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(CI_KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);

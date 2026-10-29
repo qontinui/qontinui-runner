@@ -1211,6 +1211,9 @@ async fn run_once(
         );
     }
 
+    // The last-good readiness snapshot the systemd watchdog gate reads from
+    // its own OS thread (plan 2026-10-19 Phase 2b, `crate::sd_notify`).
+    crate::sd_notify::publish_census_report(&report);
     store_latest(report);
 }
 

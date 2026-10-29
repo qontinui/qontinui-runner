@@ -14286,6 +14286,9 @@ pub async fn start_server(
 
                 // Signal that the API is ready for requests
                 api_ready_flag.api_ready.store(true, Ordering::Relaxed);
+                // systemd `READY=1` half (plan 2026-10-19 Phase 2b); no-op
+                // without `NOTIFY_SOCKET`.
+                crate::sd_notify::mark_http_serving();
                 if let Err(e) = emitter.emit("api-ready", try_port) {
                     warn!("Failed to emit api-ready event: {}", e);
                 } else {
