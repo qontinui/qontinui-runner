@@ -18,10 +18,17 @@
 //!   mode), and opens with one `WARN`. A slow or timed-out tick is NOT a stall:
 //!   under `MissedTickBehavior::Skip` the next `tick()` returns the missed
 //!   deadline immediately, so the lateness our own tick caused is excluded.
+//! * **A slow tick.** A tick that succeeds but takes longer than one interval
+//!   (start to end, sinks included) gets its own `WARN`, so a gap between
+//!   ticks wider than 2 × interval always surfaces at once: either as a stall
+//!   (the loop was not run) or as a slow or failed tick (it was, and the tick
+//!   itself took the time). A failed tick is already a `WARN` and is not
+//!   reported twice.
 //! * **Proof of sending.** Every [`SUMMARY_WINDOW`] one `info!` line beginning
 //!   `fleet::heartbeat: summary` reports ticks ok/failed, the widest
 //!   start-to-start gap and the last coord status, then the window counters
-//!   reset. Windows are anchored to the loop start, so they do not drift.
+//!   reset. Emission is anchored to the loop start, so it does not drift;
+//!   `window=` is the span the counters actually cover.
 //!
 //! The timing logic lives in [`HeartbeatLoopStats`] (pure, clock readings
 //! passed in, tested with synthetic instants) and the loop itself in
@@ -138,9 +145,28 @@ impl StallWarning {
     }
 }
 
+/// A tick that succeeded but took longer than one interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlowTick {
+    pub took: Duration,
+    pub interval: Duration,
+}
+
+impl SlowTick {
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "fleet::heartbeat: slow tick: took {:.1}s (interval {}s)",
+            self.took.as_secs_f64(),
+            self.interval.as_secs()
+        )
+    }
+}
+
 /// One summary window's counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Summary {
+    /// The span the counters cover: since the previous summary (or the loop
+    /// start), not since the anchored window opened.
     pub window: Duration,
     pub ticks_ok: u64,
     pub ticks_failed: u64,
@@ -171,6 +197,9 @@ pub(crate) struct HeartbeatLoopStats {
     last_tick_start: Option<Instant>,
     last_tick_end: Option<Instant>,
     window_start: Instant,
+    /// When the window counters were last zeroed (loop start, then each
+    /// summary). `window_start` schedules emission; this measures it.
+    counted_since: Instant,
     ticks_ok: u64,
     ticks_failed: u64,
     max_gap: Duration,
@@ -186,6 +215,7 @@ impl HeartbeatLoopStats {
             last_tick_start: None,
             last_tick_end: None,
             window_start: now,
+            counted_since: now,
             ticks_ok: 0,
             ticks_failed: 0,
             max_gap: Duration::ZERO,
@@ -214,9 +244,16 @@ impl HeartbeatLoopStats {
         })
     }
 
-    /// Record the end of a tick (after its sinks ran).
-    pub(crate) fn on_tick_end(&mut self, now: Instant) {
+    /// Record the end of a tick (after its sinks ran). Returns a warning when
+    /// the tick `succeeded` but took longer than one interval from its start;
+    /// a failed tick already has its own `WARN`.
+    pub(crate) fn on_tick_end(&mut self, now: Instant, succeeded: bool) -> Option<SlowTick> {
         self.last_tick_end = Some(now);
+        let took = now.saturating_duration_since(self.last_tick_start?);
+        (succeeded && took > self.interval).then_some(SlowTick {
+            took,
+            interval: self.interval,
+        })
     }
 
     /// Record a successful tick with coord's status. Returns the length of the
@@ -240,21 +277,24 @@ impl HeartbeatLoopStats {
     /// window's summary and zero the counters. The next window opens at the
     /// last whole multiple of [`SUMMARY_WINDOW`] past the old one — anchored to
     /// the loop start, so a summary emitted at 630s still leaves the next due
-    /// at 1200s, and a long suspend yields one summary, not a burst.
+    /// at 1200s, and a long suspend yields one summary, not a burst. The
+    /// reported `window` is the span since the counters were last zeroed, so
+    /// that 1200s summary says 570s.
     pub(crate) fn maybe_summary(&mut self, now: Instant) -> Option<Summary> {
-        let window = now.saturating_duration_since(self.window_start);
-        if window < SUMMARY_WINDOW {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < SUMMARY_WINDOW {
             return None;
         }
-        let whole = u32::try_from(window.as_nanos() / SUMMARY_WINDOW.as_nanos()).unwrap_or(1);
+        let whole = u32::try_from(elapsed.as_nanos() / SUMMARY_WINDOW.as_nanos()).unwrap_or(1);
         let summary = Summary {
-            window,
+            window: now.saturating_duration_since(self.counted_since),
             ticks_ok: self.ticks_ok,
             ticks_failed: self.ticks_failed,
             max_gap: self.max_gap,
             last_status: self.last_status.clone().unwrap_or_else(|| "none".into()),
         };
         self.window_start += SUMMARY_WINDOW * whole;
+        self.counted_since = now;
         self.ticks_ok = 0;
         self.ticks_failed = 0;
         self.max_gap = Duration::ZERO;
@@ -283,6 +323,7 @@ pub(crate) fn outcome_status(outcome: &HeartbeatOutcome) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoopEvent {
     Stall(StallWarning),
+    SlowTick(SlowTick),
     Failed { failure: TickFailure, streak: u32 },
     Recovered { after: u32 },
     Summary(Summary),
@@ -292,6 +333,7 @@ pub(crate) enum LoopEvent {
 fn log_event(event: &LoopEvent) {
     match event {
         LoopEvent::Stall(stall) => warn!("{}", stall.line()),
+        LoopEvent::SlowTick(slow) => warn!("{}", slow.line()),
         LoopEvent::Failed { failure, streak } => warn!(
             "fleet::heartbeat: {} (consecutive_failures={streak})",
             failure.message
@@ -335,7 +377,7 @@ pub(crate) async fn run_heartbeat_loop<W, WF, OnTick, OnFail, OnOk, OkF, Emit>(
         if let Some(stall) = stats.on_tick_start(Instant::now(), deadline) {
             emit(&LoopEvent::Stall(stall));
         }
-        match run_tick(work(), limit).await {
+        let succeeded = match run_tick(work(), limit).await {
             Err(failure) => {
                 let streak = stats.record_failed(failure.cause);
                 emit(&LoopEvent::Failed {
@@ -343,16 +385,20 @@ pub(crate) async fn run_heartbeat_loop<W, WF, OnTick, OnFail, OnOk, OkF, Emit>(
                     streak,
                 });
                 on_failure(&failure);
+                false
             }
             Ok(outcome) => {
                 if let Some(after) = stats.record_ok(outcome_status(&outcome)) {
                     emit(&LoopEvent::Recovered { after });
                 }
                 on_success(outcome).await;
+                true
             }
-        }
+        };
         let end = Instant::now();
-        stats.on_tick_end(end);
+        if let Some(slow) = stats.on_tick_end(end, succeeded) {
+            emit(&LoopEvent::SlowTick(slow));
+        }
         if let Some(summary) = stats.maybe_summary(end) {
             emit(&LoopEvent::Summary(summary));
         }
@@ -481,7 +527,7 @@ mod tests {
             let t0 = Instant::now();
             let mut stats = HeartbeatLoopStats::new(INTERVAL, t0);
             assert_eq!(stats.on_tick_start(t0, t0), None);
-            stats.on_tick_end(t0 + secs(tick_secs));
+            stats.on_tick_end(t0 + secs(tick_secs), true);
             // Skip: the next tick returns at once with its missed deadline.
             let next = stats.on_tick_start(t0 + secs(tick_secs), t0 + INTERVAL);
             assert_eq!(next, None, "a {tick_secs}s tick is not a stall");
@@ -497,12 +543,12 @@ mod tests {
         let t0 = Instant::now();
         let mut stats = HeartbeatLoopStats::new(INTERVAL, t0);
         stats.on_tick_start(t0, t0);
-        stats.on_tick_end(t0 + secs(1));
+        stats.on_tick_end(t0 + secs(1), true);
 
         let deadline = t0 + INTERVAL;
         let mut quiet = HeartbeatLoopStats::new(INTERVAL, t0);
         quiet.on_tick_start(t0, t0);
-        quiet.on_tick_end(t0 + secs(1));
+        quiet.on_tick_end(t0 + secs(1), true);
         assert_eq!(quiet.on_tick_start(deadline + secs(29), deadline), None);
 
         let warning = stats
@@ -516,7 +562,7 @@ mod tests {
 
         let mut fractional = HeartbeatLoopStats::new(INTERVAL, t0);
         fractional.on_tick_start(t0, t0);
-        fractional.on_tick_end(t0 + secs(1));
+        fractional.on_tick_end(t0 + secs(1), true);
         let w = fractional
             .on_tick_start(deadline + Duration::from_millis(30_400), deadline)
             .expect("30.4s exceeds 30s");
@@ -527,8 +573,9 @@ mod tests {
     }
 
     /// Synthetic instants: no summary before 10 minutes, one at 10 minutes,
-    /// counters reset after it, the last status carries over, and windows stay
-    /// anchored (a summary emitted at 630s leaves the next due at 1200s).
+    /// counters reset after it, the last status carries over, and emission
+    /// stays anchored (a summary emitted at 630s leaves the next due at 1200s)
+    /// while `window=` reports the 570s its counters cover.
     #[test]
     fn the_summary_is_emitted_every_ten_minutes_and_resets_its_counters() {
         let t0 = Instant::now();
@@ -570,11 +617,42 @@ mod tests {
         let next = stats
             .maybe_summary(t0 + secs(1200))
             .expect("second window elapsed");
-        assert_eq!(next.window, secs(600));
+        assert_eq!(next.window, secs(570), "the span since the 630s emission");
         assert_eq!(next.ticks_ok, 0);
         assert_eq!(next.ticks_failed, 0);
         assert_eq!(next.max_gap, Duration::ZERO);
         assert_eq!(next.last_status, "registered/DRAINED");
+    }
+
+    /// Synthetic instants: a tick that SUCCEEDS but runs past one interval
+    /// warns as a slow tick; one inside the interval, and a failed one (which
+    /// already has its own WARN), do not.
+    #[test]
+    fn a_successful_tick_slower_than_the_interval_warns() {
+        let t0 = Instant::now();
+        let mut stats = HeartbeatLoopStats::new(INTERVAL, t0);
+        stats.on_tick_start(t0, t0);
+        let slow = stats
+            .on_tick_end(t0 + Duration::from_millis(85_400), true)
+            .expect("85.4s at a 30s interval");
+        assert_eq!(slow.took, Duration::from_millis(85_400));
+        assert_eq!(
+            slow.line(),
+            "fleet::heartbeat: slow tick: took 85.4s (interval 30s)"
+        );
+
+        stats.on_tick_start(t0 + secs(90), t0 + secs(90));
+        assert_eq!(
+            stats.on_tick_end(t0 + secs(120), true),
+            None,
+            "exactly one interval"
+        );
+        stats.on_tick_start(t0 + secs(120), t0 + secs(120));
+        assert_eq!(
+            stats.on_tick_end(t0 + secs(210), false),
+            None,
+            "a failed tick is reported by its own WARN"
+        );
     }
 
     #[test]
@@ -667,6 +745,44 @@ mod tests {
                     last_status: "registered/clear".into(),
                 }),
             ]
+        );
+    }
+
+    /// Paused tokio clock, the real loop: the second tick succeeds after 85s.
+    /// That is exactly one slow-tick WARN and no stall — the next tick starts
+    /// on its missed deadline, which our own slow tick explains.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_warns_on_a_slow_successful_tick() {
+        let events = Rc::new(RefCell::new(Vec::<LoopEvent>::new()));
+        let sink = events.clone();
+        let calls = Rc::new(RefCell::new(0usize));
+        let loop_fut = run_heartbeat_loop(
+            INTERVAL,
+            move || {
+                let n = {
+                    let mut c = calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                async move {
+                    if n == 2 {
+                        tokio::time::sleep(secs(85)).await;
+                    }
+                    Ok(clear())
+                }
+            },
+            || {},
+            |_f: &TickFailure| {},
+            |_o: HeartbeatOutcome| async {},
+            move |e: &LoopEvent| sink.borrow_mut().push(e.clone()),
+        );
+        assert!(tokio::time::timeout(secs(200), loop_fut).await.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![LoopEvent::SlowTick(SlowTick {
+                took: secs(85),
+                interval: INTERVAL,
+            })]
         );
     }
 
