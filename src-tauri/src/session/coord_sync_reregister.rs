@@ -136,18 +136,21 @@ pub(crate) enum ReregisterOutcome {
     /// (`session_id_collision`) or the harness session is bound elsewhere
     /// (`harness_session_already_bound`). Carries coord's `error` code.
     Collision(String),
-    /// Coord refused the create with another 4xx (400 `invalid_intent` /
-    /// `unknown_device`, 403 `harness_session_id_requires_device_identity`).
+    /// Coord refused the create BODY with a 400, 404 or 422 (`invalid_intent`,
+    /// `unknown_device`) — the same body is refused again on every retry. A
+    /// refusal of the CREDENTIAL (401, 403, 408) is not this: a re-minted token
+    /// can change the answer, so it is [`Self::Transport`].
     Refused { status: u16 },
     /// No create body is recorded for the session; nothing was sent.
     NoBody,
-    /// Network, timeout, 5xx or 429 — coord did not decide.
+    /// Network, timeout, 5xx, 429, or a credential refusal (401 / 403 / 408)
+    /// — coord did not decide on the body.
     Transport(String),
 }
 
 impl ReregisterOutcome {
-    /// Whether every retry would get the same answer: a 409, another 4xx, or
-    /// no recorded body. Such an outcome ends the row (the drain drops it) and
+    /// Whether every retry would get the same answer: a 409, a body refusal
+    /// (400 / 404 / 422), or no recorded body. Such an outcome ends the row (the drain drops it) and
     /// is remembered for the budget window; `Created` and `Transport` are not.
     pub(crate) fn is_deterministic(&self) -> bool {
         matches!(
@@ -259,7 +262,14 @@ pub(crate) async fn reregister(
             .unwrap_or_else(|| "conflict".to_string());
         return ReregisterOutcome::Collision(code);
     }
-    if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+    // Only a refusal of the BODY is final. 401 / 403 / 408 answer the
+    // credential or the clock, and 429 is pacing: an expired device token or a
+    // tenant mismatch must not drop a session's close and finish for good, so
+    // those fall through to `Transport` and the drain's backoff retries them.
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
         let snippet: String = detail.chars().take(600).collect();
         tracing::warn!(
             session = %session_id,

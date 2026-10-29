@@ -1469,6 +1469,12 @@ impl SessionRegistry {
         // the DEFAULT binding, not an anonymous send, so resolving it here is
         // what keeps a non-default tenant's resume off the default tenant's
         // credential.
+        // Held across probe -> supersede mark -> fresh register, so no drain
+        // tick that starts in that span can 404 on the old id's queued rows and
+        // re-create it from its recorded create body while the fresh row is
+        // being made. A re-register already on the wire when the hold is taken
+        // is not stopped by it (see the `NotFound` arm).
+        let _hold = self.coord_sync.hold_drain(persisted_id);
         let probe = self
             .coord_sync
             .probe_resume(persisted_id, intent.tenant_id)
@@ -1510,8 +1516,11 @@ impl SessionRegistry {
                 // for it must not re-create it from its recorded create body
                 // (a zombie row nothing closes, or a
                 // `harness_session_already_bound` race that sends the fresh
-                // `started` into the conflict handler) — marked before the
-                // fresh row exists, so no drain tick can get there first.
+                // `started` into the conflict handler). Marked before the
+                // fresh row exists, under the drain hold taken above, so no
+                // tick that starts from here on can re-create it. The one
+                // window left is a re-register POST a tick already had on the
+                // wire before the hold — about one round trip at startup.
                 self.coord_sync.note_superseded(persisted_id);
                 self.register_external(intent)
             }

@@ -2629,10 +2629,14 @@ async fn recover_row_missing(
             PushOutcome::PermanentFailure(reason)
         }
     };
-    let unrecoverable = |why: LifecycleDropReason| PushOutcome::RowUnrecoverable {
+    // The message names what ended the row, so `/health` `lastFailure` shows
+    // the re-register's answer (a 409, a refusal) rather than the PATCH 404
+    // that started the recovery.
+    let unrecoverable = |why: LifecycleDropReason, cause: String| PushOutcome::RowUnrecoverable {
         reason: why,
-        message: reason.clone(),
+        message: format!("{cause} (after {reason})"),
     };
+    let sid = rec.session_id;
     let base = inner.coord_url.trim_end_matches('/');
     let fallback_scope = record_session_tenant(inner, rec);
     match inner
@@ -2645,19 +2649,26 @@ async fn recover_row_missing(
             other => other,
         },
         Attempt::Done(ReregisterOutcome::Transport(e)) => PushOutcome::Transport(e),
-        Attempt::Retired(Retired::Closed) => unrecoverable(LifecycleDropReason::NotFoundClosed),
-        Attempt::Retired(Retired::Superseded) => {
-            unrecoverable(LifecycleDropReason::NotFoundSuperseded)
-        }
-        Attempt::Done(ReregisterOutcome::NoBody) => {
-            unrecoverable(LifecycleDropReason::OrphanedNoBody)
-        }
-        Attempt::Done(ReregisterOutcome::Collision(_)) => {
-            unrecoverable(LifecycleDropReason::OrphanedIdCollision)
-        }
-        Attempt::Done(ReregisterOutcome::Refused { .. }) => {
-            unrecoverable(LifecycleDropReason::OrphanedReregisterRefused)
-        }
+        Attempt::Retired(Retired::Closed) => unrecoverable(
+            LifecycleDropReason::NotFoundClosed,
+            format!("session {sid} is closed; its coord row is not re-created"),
+        ),
+        Attempt::Retired(Retired::Superseded) => unrecoverable(
+            LifecycleDropReason::NotFoundSuperseded,
+            format!("session {sid} was superseded by a resume; its coord row is not re-created"),
+        ),
+        Attempt::Done(ReregisterOutcome::NoBody) => unrecoverable(
+            LifecycleDropReason::OrphanedNoBody,
+            format!("no recorded create body for session {sid}; nothing re-registered"),
+        ),
+        Attempt::Done(ReregisterOutcome::Collision(code)) => unrecoverable(
+            LifecycleDropReason::OrphanedIdCollision,
+            format!("409 {code}: re-register POST /sessions for {sid}"),
+        ),
+        Attempt::Done(ReregisterOutcome::Refused { status }) => unrecoverable(
+            LifecycleDropReason::OrphanedReregisterRefused,
+            format!("{status}: re-register POST /sessions for {sid} refused"),
+        ),
         Attempt::BudgetSpent => unresolved(reason),
     }
 }
@@ -7237,16 +7248,13 @@ mod tests {
         );
     }
 
-    /// A 400 / 403 refusal of the re-register is the same on every retry: the
-    /// lifecycle row is DROPPED as `orphaned_reregister_refused` and counted
-    /// `orphanedSessions.reregister_refused`.
+    /// A 400 / 422 refusal of the re-register body is the same on every
+    /// retry: the lifecycle row is DROPPED as `orphaned_reregister_refused`
+    /// and counted `orphanedSessions.reregister_refused`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_re_register_refusal_drops_the_row() {
         let _amb = crate::test_env::isolated_ambient();
-        for (code, error) in [
-            (400, "invalid_intent"),
-            (403, "harness_session_id_requires_device_identity"),
-        ] {
+        for (code, error) in [(400, "invalid_intent"), (422, "invalid_intent")] {
             let dir = tempfile::tempdir().unwrap();
             let (outbox, coord, rec, s) = session_coord_lost(dir.path()).await;
             {
@@ -7273,6 +7281,50 @@ mod tests {
                     .get("closed", LifecycleDropReason::OrphanedReregisterRefused),
                 1,
                 "{code}"
+            );
+        }
+    }
+
+    /// A 401 / 403 / 408 on the re-register answers the credential or the
+    /// clock, not the body: a re-minted token can change it. The lifecycle
+    /// row is HELD for the drain's backoff — never dropped, never counted as
+    /// a refusal — so a credential blip cannot lose a session's close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_refusal_of_the_re_register_holds_the_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        for (code, error) in [
+            (401, "unauthorized"),
+            (403, "harness_session_id_requires_device_identity"),
+            (408, "request_timeout"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (outbox, coord, rec, s) = session_coord_lost(dir.path()).await;
+            {
+                let mut g = rec.lock().await;
+                g.post_status = Some(code);
+                g.post_status_body = Some(json!({ "error": error }));
+            }
+            outbox
+                .record(
+                    Uuid::new_v4(),
+                    s,
+                    SessionEventKind::Closed,
+                    json!({ "id": s }),
+                )
+                .unwrap();
+            drain_tick(&coord.inner, &mut DrainState::default()).await;
+            assert_eq!(
+                outbox.pending().unwrap().len(),
+                1,
+                "{code}: the close is held, not dropped"
+            );
+            assert_eq!(rec.lock().await.post_count, 2, "{code}: one re-register");
+            let counts = coord.inner.reregister.counts();
+            assert_eq!(counts.reregister_refused, 0, "{code}");
+            assert_eq!(
+                lifecycle_drops_snapshot(&coord.inner),
+                LifecycleDrops::default(),
+                "{code}: nothing dropped"
             );
         }
     }
