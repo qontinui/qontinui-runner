@@ -1447,7 +1447,7 @@ pub async fn restart_readiness_handler(
     );
     // Fresher than the 600 s background census: the systemd watchdog gate
     // reads the newest published verdict (plan 2026-10-19 Phase 2b).
-    crate::sd_notify::publish_readiness_verdict(&verdict, now_ms);
+    crate::sd_notify::publish_readiness_verdict(&verdict);
     Json(verdict)
 }
 

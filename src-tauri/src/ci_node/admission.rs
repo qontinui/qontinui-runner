@@ -869,7 +869,13 @@ fn start_build(
         "ci_node: starting dispatch {} repo={} sha={} check_name={:?}",
         dispatch_id, payload.repo, payload.head_sha, payload.check_name
     );
+    // Counted for the systemd watchdog gate (plan 2026-10-19 Phase 2b,
+    // `crate::sd_notify`): a wedged runner is never watchdog-killed while a
+    // build runs. Moved into the task, so completion, cancellation, a panic or
+    // the task being dropped all release it.
+    let in_flight = crate::sd_notify::ci_build_in_flight();
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         super::executor::run_dispatch(payload, root, token, host, max_concurrent).await;
         on_build_finished(&dispatch_id);
     });

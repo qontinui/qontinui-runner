@@ -1373,12 +1373,22 @@ struct SdWatchdogFeed {
 
 impl SdWatchdogFeed {
     fn tick(&mut self, dir: &Path, s: WatchdogSample) {
+        self.tick_with(dir, s, crate::sd_notify::watchdog_tick);
+    }
+
+    /// [`Self::tick`] with the decide-and-send step injected — the test seam.
+    /// `decide(backend_wedged, monitor_fresh)` returns `None` when there is no
+    /// service manager to notify.
+    fn tick_with<D>(&mut self, dir: &Path, s: WatchdogSample, decide: D)
+    where
+        D: FnOnce(bool, bool) -> Option<crate::sd_notify::WatchdogDecision>,
+    {
         use crate::sd_notify::WatchdogDecision;
         if self.started_ms == 0 {
             self.started_ms = s.now_ms;
         }
         let fresh = sd_monitor_heartbeat_fresh(s, self.started_ms);
-        let Some(decision) = crate::sd_notify::watchdog_tick(s.backend_wedged, fresh) else {
+        let Some(decision) = decide(s.backend_wedged, fresh) else {
             return;
         };
         if self.last != Some(decision)
@@ -1398,24 +1408,28 @@ fn append_sd_watchdog_line(
     s: WatchdogSample,
     monitor_fresh: bool,
 ) {
+    use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
     use std::io::Write;
     let what = match decision {
-        crate::sd_notify::WatchdogDecision::Withhold => {
-            "WITHHOLDING WATCHDOG=1 (restart-readiness snapshot reads safe) — systemd will              restart this runner when WatchdogSec= expires"
-        }
-        crate::sd_notify::WatchdogDecision::Keepalive(
-            crate::sd_notify::KeepaliveReason::HostingWork,
-        ) => "keeping WATCHDOG=1 despite the wedge: the readiness snapshot counts live work",
-        crate::sd_notify::WatchdogDecision::Keepalive(
-            crate::sd_notify::KeepaliveReason::ReadinessUnknown,
-        ) => "keeping WATCHDOG=1 despite the wedge: the readiness snapshot is UNKNOWN",
-        crate::sd_notify::WatchdogDecision::Keepalive(
-            crate::sd_notify::KeepaliveReason::Healthy,
-        ) => "WATCHDOG=1 (healthy)",
+        WatchdogDecision::Withhold => concat!(
+            "WITHHOLDING WATCHDOG=1 (no CI build in flight, restart-readiness snapshot ",
+            "reads safe) — systemd will restart this runner when WatchdogSec= expires"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::HostingWork) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: a CI build is in flight or the ",
+            "readiness snapshot counts live work"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::ReadinessUnknown) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: the readiness snapshot is UNKNOWN ",
+            "(never ran, contended, or stale)"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::Healthy) => "WATCHDOG=1 (healthy)",
     };
     let line = format!(
-        "{} SD_WATCHDOG {} — pid {}, backend_wedged={}, probe heartbeat fresh={},          consecutive /livez failures {}
-",
+        concat!(
+            "{} SD_WATCHDOG {} — pid {}, backend_wedged={}, probe heartbeat fresh={}, ",
+            "consecutive /livez failures {}\n"
+        ),
         chrono::Utc::now().to_rfc3339(),
         what,
         std::process::id(),
@@ -1493,9 +1507,23 @@ fn start_wedge_watchdog() {
     // Phase 2b), never the tokio-hosted self-probe loop: a stalled probe loop
     // then reads as a stale heartbeat, i.e. a readiness-GATED kill.
     let mut feed = SdWatchdogFeed::default();
+    // A tick longer than half systemd's `WatchdogSec=` would leave no slack
+    // for one late wake, so it is shortened to fit (and said once).
+    let (tick, shortened) = crate::sd_notify::tick_for_watchdog(
+        Duration::from_secs(WATCHDOG_TICK_SECS),
+        crate::sd_notify::watchdog_interval(),
+    );
+    if shortened {
+        warn!(
+            "sd_notify: wedge-watchdog tick {}s exceeds half of WATCHDOG_USEC ({:?}) — ticking every {:?} instead",
+            WATCHDOG_TICK_SECS,
+            crate::sd_notify::watchdog_interval(),
+            tick
+        );
+    }
     start_wedge_watchdog_with_hook(
         dir,
-        Duration::from_secs(WATCHDOG_TICK_SECS),
+        tick,
         WATCHDOG_STOP.clone(),
         live_watchdog_sample,
         move |dir, s| feed.tick(dir, s),
@@ -2805,6 +2833,56 @@ mod tests {
         feed.tick(dir.path(), sample(10_000, 9_000, true));
         assert_eq!(feed.last, None);
         assert!(!wedge_incidents_path(dir.path()).exists());
+    }
+
+    /// The `SD_WATCHDOG` record is written once per transition away from a
+    /// healthy keepalive — not once per tick — and a return to healthy then a
+    /// second withhold writes a second line.
+    #[test]
+    fn sd_feed_records_each_transition_away_from_healthy_once() {
+        use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let mut feed = SdWatchdogFeed::default();
+        let lines = |d: &Path| {
+            std::fs::read_to_string(wedge_incidents_path(d))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("SD_WATCHDOG"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let healthy = || Some(WatchdogDecision::Keepalive(KeepaliveReason::Healthy));
+        let withhold = || Some(WatchdogDecision::Withhold);
+
+        feed.tick_with(dir.path(), sample(10_000, 9_000, false), |_, _| healthy());
+        assert!(lines(dir.path()).is_empty());
+
+        feed.tick_with(dir.path(), sample(20_000, 19_000, true), |w, fresh| {
+            assert!(
+                w && fresh,
+                "the feed hands the sample's wedge flag and freshness through"
+            );
+            withhold()
+        });
+        feed.tick_with(dir.path(), sample(35_000, 34_000, true), |_, _| withhold());
+        let after_two = lines(dir.path());
+        assert_eq!(after_two.len(), 1, "{after_two:?}");
+        assert!(
+            after_two[0].contains("WITHHOLDING WATCHDOG=1"),
+            "{after_two:?}"
+        );
+        assert!(
+            !after_two[0].contains("  "),
+            "no run of spaces: {after_two:?}"
+        );
+
+        feed.tick_with(dir.path(), sample(50_000, 49_000, false), |_, _| healthy());
+        feed.tick_with(dir.path(), sample(65_000, 64_000, true), |_, _| {
+            Some(WatchdogDecision::Keepalive(KeepaliveReason::HostingWork))
+        });
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all[1].contains("a CI build is in flight"), "{all:?}");
     }
 
     /// Independent stamps, for the cases Item 4 introduced.
