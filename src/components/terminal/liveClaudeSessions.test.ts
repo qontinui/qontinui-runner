@@ -191,6 +191,46 @@ describe("extractLiveSessionsStrict (liveness polarity)", () => {
     expect(extractLiveSessionsStrict([])).toEqual([]);
   });
 
+  it("carries the holding pane (terminalId / pageId) through both envelopes", () => {
+    const held = mk({ terminalId: "t-09ce90d9", pageId: "e7810bcf" });
+    for (const got of [
+      extractLiveSessionsStrict({ sessions: [held] }),
+      extractLiveSessionsStrict([held]),
+    ]) {
+      expect(got).toHaveLength(1);
+      expect(got![0].terminalId).toBe("t-09ce90d9");
+      expect(got![0].pageId).toBe("e7810bcf");
+      expect(got![0].sessionId).toBe(held.sessionId);
+    }
+  });
+
+  it("keeps a row with no pane keys as a LIVE row (pane unknown, not dead)", () => {
+    const got = extractLiveSessionsStrict({
+      sessions: [mk({ sessionId: "in-pane", terminalId: "t-a", pageId: "p-1" }), mk({ sessionId: "outside" })],
+    });
+    expect(got).toHaveLength(2);
+    expect(got![1].sessionId).toBe("outside");
+    expect("terminalId" in got![1]).toBe(false);
+    expect("pageId" in got![1]).toBe(false);
+  });
+
+  it("drops a malformed pane key but keeps the row and its other fields", () => {
+    const raw = [
+      { ...mk({ sessionId: "empty" }), terminalId: "", pageId: "p-1" },
+      { ...mk({ sessionId: "nulls" }), terminalId: null, pageId: null },
+      { ...mk({ sessionId: "numbers" }), terminalId: 42, pageId: { id: "p" } },
+    ];
+    const got = extractLiveSessionsStrict({ sessions: raw })!;
+    expect(got.map((s) => s.sessionId)).toEqual(["empty", "nulls", "numbers"]);
+    expect("terminalId" in got[0]).toBe(false);
+    expect(got[0].pageId).toBe("p-1");
+    for (const s of got.slice(1)) {
+      expect("terminalId" in s).toBe(false);
+      expect("pageId" in s).toBe(false);
+      expect(s.pid).toBe(2804);
+    }
+  });
+
   it("maps any other shape to null (indeterminate), never []", () => {
     // A shape surprise flowing through the tolerant extractor becomes [] =
     // "definitively no live sessions" → the restore path forks everything.
@@ -226,6 +266,23 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
     expect(ids).not.toBeNull();
     expect([...ids!].sort()).toEqual(["dup", "solo"]);
+  });
+
+  it("counts a row with no holding pane as LIVE, exactly like one inside a pane", async () => {
+    // A claude outside every runner pane (or one whose pane is unknown) has no
+    // terminalId — it is still a live holder of its id.
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: {
+        sessions: [
+          mk({ sessionId: "in-pane", pid: 10, terminalId: "t-a", pageId: "p-1" }),
+          mk({ sessionId: "outside", pid: 11 }),
+        ],
+      },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect([...ids!].sort()).toEqual(["in-pane", "outside"]);
   });
 
   it("returns an EMPTY set (not null) when no process is live", async () => {

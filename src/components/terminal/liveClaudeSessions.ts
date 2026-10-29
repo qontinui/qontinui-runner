@@ -62,6 +62,35 @@ export interface LiveClaudeSession {
    * carries no cwd — a resume from the wrong dir finds nothing.
    */
   resumeCommand: string | null;
+  /**
+   * The runner pane (terminal id) whose process tree holds this row's `pid`
+   * (`session::live_holders::attribute_holders` on the Rust side).
+   *
+   * **Absent means "held outside a runner pane, or the pane is unknown" —
+   * NEVER "not live".** The row is live by the registry's own pid check; only
+   * the pane is unknown. The runner omits the key for a process outside every
+   * pane, for one under two panes, and for one whose pane root failed the
+   * PID-reuse guard — and a runner binary predating the field omits it always.
+   */
+  terminalId?: string;
+  /** The grid page of {@link terminalId}. Absent on the same terms. */
+  pageId?: string;
+}
+
+/**
+ * Keep `terminalId` / `pageId` only when each is a non-empty string; drop any
+ * other value rather than let a malformed key masquerade as a pane to "go to".
+ * Every other field passes through untouched, and a row with nothing to drop
+ * is returned as-is.
+ */
+function normalizeHolderFields(row: LiveClaudeSession): LiveClaudeSession {
+  if (!row || typeof row !== "object") return row;
+  const bad = (v: unknown) => v !== undefined && (typeof v !== "string" || v.length === 0);
+  if (!bad(row.terminalId) && !bad(row.pageId)) return row;
+  const out: LiveClaudeSession = { ...row };
+  if (bad(out.terminalId)) delete out.terminalId;
+  if (bad(out.pageId)) delete out.pageId;
+  return out;
 }
 
 /**
@@ -74,14 +103,19 @@ export interface LiveClaudeSession {
  * `[]` would read as "definitively no live sessions" and let the restore path
  * respawn — fork — every session. Display callers who want the tolerant
  * degrade use [`extractLiveSessions`].
+ *
+ * Each row carries its holding pane (`terminalId` / `pageId`) when the runner
+ * sent one; a malformed pane key is dropped (pane unknown), the row is kept.
  */
 export function extractLiveSessionsStrict(data: unknown): LiveClaudeSession[] | null {
-  if (Array.isArray(data)) return data as LiveClaudeSession[];
-  if (data && typeof data === "object") {
+  let rows: unknown[] | null = null;
+  if (Array.isArray(data)) rows = data;
+  else if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;
-    if (Array.isArray(inner)) return inner as LiveClaudeSession[];
+    if (Array.isArray(inner)) rows = inner;
   }
-  return null;
+  if (rows === null) return null;
+  return (rows as LiveClaudeSession[]).map(normalizeHolderFields);
 }
 
 /**

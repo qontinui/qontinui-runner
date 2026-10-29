@@ -10,7 +10,7 @@
 import type { ReactNode } from "react";
 import { MessageSquare, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
-import { TabTitle } from "../displayTitle";
+import { TabPaneLabel } from "../PaneLabelView";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { MAXIMIZED_HEADER_HEIGHT_PX } from "./constants";
 
@@ -57,8 +57,8 @@ export function MaximizedHeader({
       style={{ height: `${MAXIMIZED_HEADER_HEIGHT_PX}px` }}
     >
       <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
-      <span className="text-[10px] text-[#a9b1d6]">
-        <TabTitle tab={tab} />
+      <span className="text-[10px] text-[#a9b1d6] min-w-0">
+        <TabPaneLabel tab={tab} />
       </span>
       <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
       {onTogglePrompts && (
