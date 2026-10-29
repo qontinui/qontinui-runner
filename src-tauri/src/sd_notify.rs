@@ -552,8 +552,9 @@ where
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                // Belt and braces beside the send lock: READY may never be
-                // followed by an extension.
+                // Defensive only: the send lock already serializes every
+                // caller, so this cannot fire today. Kept so READY can never
+                // be followed by an extension even if the lock is removed.
                 if latch.ready_sent.load(Ordering::SeqCst) {
                     return ReadyAction::Wait;
                 }
