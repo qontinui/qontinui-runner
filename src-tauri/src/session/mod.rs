@@ -69,6 +69,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
@@ -309,8 +310,9 @@ pub enum SessionEventKind {
     FindingPosted,
     /// Session FINISHED marker (plan
     /// `2026-09-01-session-finished-marker-and-unfinished-resume`, Phase 2).
-    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished"}}`
-    /// — the same door `Progress` uses, so the target is the URL path and the
+    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished",
+    /// last_progress_at}}` (the payload's `finished_at`, so coord dates the
+    /// finish at the mark rather than at the drain) — the same door `Progress` uses, so the target is the URL path and the
     /// peer-clobber trap in `coord_report_status` (which resolves an omitted
     /// `claude_code_session_id` to the device's most-recently-started session)
     /// does not apply to this rung.

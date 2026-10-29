@@ -1767,42 +1767,108 @@ probe_door() {
 # server would actually honour. The value is kept VERBATIM (the `Bearer ` prefix
 # included) precisely so the replay is byte-identical to what the client sends.
 # unstamped-floor-ok: the false-DEAD incidents above are history, not a live floor 2026-09-11
+#
+# ONE PARSE PER FILE (plan 2026-10-19-hook-spawn-rate-and-orphaned-processes,
+# Phase 3). This function used to spend THREE jq runs on the proxy fields (url,
+# key, then a `jq -e` for which header the key came from) and read_stdio_cfg a
+# FOURTH on the same file, plus two `printf | sed | tr` pipelines per arm to
+# split lines -- ~20 processes per .mcp.json on the jq arm, and `call` walks one
+# per directory level. A watcher calling `coord-revive.sh call` every 45 s was
+# a third of all process creation on the operator box (2026-10-19). parse_mcp_cfg now
+# reads every field once; read_stdio_cfg takes the stdio half from the same
+# parse when it is asked about the same file right after (find_own_cfg's
+# order), and parses for itself otherwise.
+#
+# parse_mcp_cfg <file> -> sets _MC_URL, _MC_KEY, _MC_HDR, _MC_CRED, _MC_SHIM and
+# _MC_FILE=<file>. Each field keeps the value rules its own read had: the jq arm
+# evaluates the SAME expressions as the four separate runs did, each under its
+# own `try`, so a malformed entry that broke one of those runs empties that
+# field only; the python arm keeps the python reads' rules. _MC_HDR is the jq
+# arm's `1`/`0` ("Authorization is non-empty"), or the python arm's header
+# NAME, exactly what each arm decided before. A non-string value prints as JSON
+# and a newline inside a value folds to a space, so no value can shift the
+# line layout (such a value was never a usable url or nonce). Output ends in a
+# literal `end` line; without it every field is EMPTY, which is what a failed
+# reader produced before. Config on STDIN for the reason spelled out above.
+parse_mcp_cfg() {
+  local _out _l
+  _MC_URL=""; _MC_KEY=""; _MC_HDR=""; _MC_CRED=""; _MC_SHIM=""; _MC_FILE="$1"
+  if [ "$JSON_READER" = jq ]; then
+    _out=$(jq -r '
+      def one: if type == "string" then (split("\n") | join(" ")) else tojson end;
+      (try (.mcpServers["coord-mcp"].url // "") catch "" | one),
+      (try ((.mcpServers["coord-mcp"].headers // {}) as $h
+            | if (($h.Authorization // "") | tostring) != "" then $h.Authorization
+              else ($h["X-Coord-Mcp-Proxy-Key"] // "") end) catch "" | one),
+      (try (if ((.mcpServers["coord-mcp"].headers.Authorization // "") | tostring) != ""
+            then "1" else "0" end) catch "0"),
+      ((try [ (.mcpServers // {}) as $s
+        | if ($s | type) != "object" then empty else
+          ($s["coord-mcp"] // null) as $c
+          | if ($c | type) != "object" or (($c.command // "") | tostring) == ""
+               or (($c.args // null) | type) != "array" then empty
+            else ($c.args | map(tostring)) as $a
+              | ([range(0; ($a | length) - 1) | select($a[.] == "--credential") | $a[. + 1]][0] // ""),
+                ([$a[] | select(test("coord-mcp-shim\\.py$"))][0] // "")
+            end
+          end ] catch []) as $st
+       | ($st[0] // "" | one), ($st[1] // "" | one)),
+      "end"' < "$1" 2>/dev/null)
+  else
+    _out=$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d=None
+o=["","","","",""]
+try:
+    c=((d.get("mcpServers",{}) or {}).get("coord-mcp",{}) or {})
+    h=(c.get("headers",{}) or {})
+    authz=h.get("Authorization","") or ""
+    legacy=h.get("X-Coord-Mcp-Proxy-Key","") or ""
+    o[0]=c.get("url","") or ""
+    o[1]=authz or legacy
+    o[2]="Authorization" if authz else "X-Coord-Mcp-Proxy-Key"
+except Exception: pass
+try:
+    s=d.get("mcpServers") if isinstance(d,dict) else None
+    c=s.get("coord-mcp") if isinstance(s,dict) else None
+    if isinstance(c,dict) and c.get("command") and isinstance(c.get("args"),list):
+        a=[str(x) for x in c["args"]]
+        o[3]=next((a[i+1] for i in range(len(a)-1) if a[i]=="--credential"),"")
+        o[4]=next((x for x in a if x.endswith("coord-mcp-shim.py")),"")
+except Exception: pass
+for v in o: print(str(v).replace("\n"," "))
+print("end")' < "$1" 2>/dev/null)
+  fi
+  # Split with parameter expansion: no `sed`/`tr` processes. The CR strip is
+  # NOT redundant -- a NATIVE Windows jq/python writes CRLF, `$(...)` strips
+  # only the trailing one, and a CR surviving into a url makes curl exit 3 with
+  # http_code 000, which classify reports as UNREACHABLE: a false DEAD over a
+  # live door, invisible on Linux. Every line is stripped here, once -- in a
+  # plain assignment: inside an array `+=( … )` bash leaves a `$'\r'` in the
+  # `${_l%…}` pattern unexpanded (measured, Git Bash 5.2), and the CR survives.
+  local -a _f=()
+  while [ -n "$_out" ]; do
+    case "$_out" in
+      *$'\n'*) _l="${_out%%$'\n'*}"; _out="${_out#*$'\n'}" ;;
+      *)       _l="$_out"; _out="" ;;
+    esac
+    _l="${_l%$'\r'}"
+    _f+=("$_l")
+  done
+  [ "${#_f[@]}" -ge 6 ] && [ "${_f[5]}" = end ] || return 0
+  _MC_URL="${_f[0]}"; _MC_KEY="${_f[1]}"; _MC_HDR="${_f[2]}"
+  _MC_CRED="${_f[3]}"; _MC_SHIM="${_f[4]}"
+  return 0
+}
+
 read_cfg() {
+  parse_mcp_cfg "$1"
+  CFG_URL="$_MC_URL"; CFG_KEY="$_MC_KEY"
   CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
   if [ "$JSON_READER" = jq ]; then
-    CFG_URL=$(jq -r '.mcpServers["coord-mcp"].url // ""' < "$1" 2>/dev/null)
-    CFG_KEY=$(jq -r '(.mcpServers["coord-mcp"].headers // {}) as $h
-      | if (($h.Authorization // "") | tostring) != "" then $h.Authorization
-        else ($h["X-Coord-Mcp-Proxy-Key"] // "") end' < "$1" 2>/dev/null)
-    if [ -n "$CFG_KEY" ] && jq -e '((.mcpServers["coord-mcp"].headers.Authorization // "") | tostring) != ""' < "$1" >/dev/null 2>&1; then
-      CFG_KEY_HEADER="Authorization"
-    fi
+    [ -n "$CFG_KEY" ] && [ "$_MC_HDR" = 1 ] && CFG_KEY_HEADER="Authorization"
   else
-    local _pair
-    _pair=$("$JSON_READER" -c 'import json,sys
-try: d=json.load(sys.stdin)
-except Exception: print(); print(); print(); sys.exit(0)
-c=((d.get("mcpServers",{}) or {}).get("coord-mcp",{}) or {})
-h=(c.get("headers",{}) or {})
-authz=h.get("Authorization","") or ""
-legacy=h.get("X-Coord-Mcp-Proxy-Key","") or ""
-print(c.get("url","") or "")
-print(authz or legacy)
-print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$1" 2>/dev/null)
-    # `tr -d '\r'` is NOT redundant. The reader here is a NATIVE Windows python
-    # whose text-mode stdout emits CRLF, so $_pair is literally "URL\r\nKEY":
-    # `$(...)` strips only the TRAILING CRLF, leaving a CR at the end of line 1.
-    # MSYS GNU sed happens to strip it, so this reads fine today — but `head -1`,
-    # `IFS= read -r`, `cut` and `mapfile` do NOT, and any of those is a natural
-    # "simplification" of the two lines below. A CR surviving into CFG_URL makes
-    # curl exit 3 with http_code 000, which classify reports as UNREACHABLE —
-    # i.e. VERDICT: DEAD over a live door, the exact false-DEAD this fix exists
-    # to kill, and invisible on Linux where python emits bare LF. Strip it here
-    # rather than depending on which line-tool a future edit reaches for.
-    CFG_URL=$(printf '%s\n' "$_pair" | sed -n '1p' | tr -d '\r')
-    CFG_KEY=$(printf '%s\n' "$_pair" | sed -n '2p' | tr -d '\r')
-    CFG_KEY_HEADER=$(printf '%s\n' "$_pair" | sed -n '3p' | tr -d '\r')
-    [ -n "$CFG_KEY_HEADER" ] || CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
+    [ -n "$_MC_HDR" ] && CFG_KEY_HEADER="$_MC_HDR"
   fi
   case "$CFG_URL" in *"/coord-mcp"*) ;; *) return 1 ;; esac
   [ -n "$CFG_KEY" ] || return 1
@@ -2438,35 +2504,17 @@ find_own_cfg() {
 # only the PATH out of .mcp.json. It never parses the credential itself --
 # stdio_door asks the shim to, so there is one credential grammar, not three.
 # Config on STDIN for the MSYS_NO_PATHCONV reason read_cfg spells out.
+#
+# The two fields come from parse_mcp_cfg (see read_cfg). find_own_cfg asks
+# read_cfg about a file and then, when it is not proxy-shaped, asks this about
+# the SAME file: that second question is answered from the first parse, with
+# no reader run at all. The memo is consumed here, so it can never answer for
+# a later, possibly rewritten, copy of the file; asked cold, this parses.
 read_stdio_cfg() {
-  local _pair
   CFG_CRED_PATH=""; CFG_ENTRY_SHIM=""
-  if [ "$JSON_READER" = jq ]; then
-    _pair=$(jq -r '
-      (.mcpServers // {}) as $s
-      | if ($s | type) != "object" then empty else
-        ($s["coord-mcp"] // null) as $c
-        | if ($c | type) != "object" or (($c.command // "") | tostring) == ""
-             or (($c.args // null) | type) != "array" then empty
-          else ($c.args | map(tostring)) as $a
-            | ([range(0; ($a | length) - 1) | select($a[.] == "--credential") | $a[. + 1]][0] // ""),
-              ([$a[] | select(test("coord-mcp-shim\\.py$"))][0] // "")
-          end
-        end' < "$1" 2>/dev/null)
-  else
-    _pair=$("$JSON_READER" -c 'import json,sys
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(0)
-s=d.get("mcpServers") if isinstance(d,dict) else None
-c=s.get("coord-mcp") if isinstance(s,dict) else None
-if not (isinstance(c,dict) and c.get("command") and isinstance(c.get("args"),list)): sys.exit(0)
-a=[str(x) for x in c["args"]]
-cred=next((a[i+1] for i in range(len(a)-1) if a[i]=="--credential"),"")
-print(cred)
-print(next((x for x in a if x.endswith("coord-mcp-shim.py")),""))' < "$1" 2>/dev/null)
-  fi
-  CFG_CRED_PATH=$(printf '%s\n' "$_pair" | sed -n '1p' | tr -d '\r')
-  CFG_ENTRY_SHIM=$(printf '%s\n' "$_pair" | sed -n '2p' | tr -d '\r')
+  [ "${_MC_FILE:-}" = "$1" ] || parse_mcp_cfg "$1"
+  _MC_FILE=""
+  CFG_CRED_PATH="$_MC_CRED"; CFG_ENTRY_SHIM="$_MC_SHIM"
   if [ -n "$CFG_CRED_PATH" ] && [ -n "$CFG_ENTRY_SHIM" ]; then return 0; fi
   # Rejected: leave NOTHING behind. The proxy path's failure messages read
   # CFG_CRED_PATH to name where the nonce came from, so a half-parsed nearer

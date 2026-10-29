@@ -1643,8 +1643,9 @@ pub fn terminal_session_record_close(
 /// only that: an unreadable (lock-poisoned) registry is an `Err`, never an
 /// unknown id. For a
 /// known id `data` is the same body `POST /sessions/{id}/finish` answers
-/// ([`FinishOutcome::response_json`]): what changed (`"marker"`,
-/// `"reason_only"`, or `"none"` for a no-op that wrote nothing) and whether
+/// ([`FinishOutcome::response_json`]): what changed (`"marker"`, including
+/// a restamp of an already-finished mark, or `"none"` for a no-op that wrote
+/// nothing) and whether
 /// coord was told (`coord.queued` / `coordSessionId` / `reason`), so neither a
 /// no-op nor a local-only mark can read as a coord write.
 ///
