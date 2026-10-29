@@ -2471,13 +2471,21 @@ async fn health(
         // of the drain's last tick (`observedAt`; `pending: null` = no tick
         // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
         // accepted, and `lastFailure {kind, status, at}` — `kind` one of
-        // server_error / rate_limited / unauthorized / rejected / conflict /
-        // network / timeout. `retryingSessions` are on their own backoff;
-        // `quarantinedSessions` had their rows moved to the
-        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
-        // everything else. `heartbeatsSuperseded` counts pending heartbeat
-        // rows dropped unsent because a newer heartbeat was queued right
-        // behind them. A stalled drain used to be invisible from here.
+        // server_error / rate_limited / unauthorized / rejected / not_found /
+        // conflict / http_error / network / timeout. `retryingSessions` are
+        // on their own backoff; `quarantinedSessions` had their rows moved to
+        // the `<outbox>.quarantine.jsonl` sidecar after failing while coord
+        // served everything else. Three counters (process lifetime, `null`
+        // before the first tick) split the heartbeat rows the drain dropped
+        // without coord taking them, by cause: `heartbeatsSuperseded` (a newer
+        // pending heartbeat of the session replaces them), `heartbeatsMuted`
+        // (the session is quarantined and its `started`/`closed` row went to
+        // the sidecar, so none of its heartbeats will be sent), and
+        // `heartbeatsDroppedOnFailure` (the push failed: no answer, a 5xx, a
+        // 4xx other than 409, or another non-2xx answer), with
+        // `heartbeatsDroppedOnFailureByKind` mapping each `lastFailure` kind
+        // to its count (only non-zero kinds; the values sum to the scalar).
+        // A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
