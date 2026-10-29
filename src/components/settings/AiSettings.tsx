@@ -159,6 +159,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
               result.data.claude_cli?.auto_continue_after_migration ?? true,
+            // Carried verbatim: the save sends them back explicitly, so a
+            // value set elsewhere (PUT /settings/ai) survives a form save.
+            selection_min_shortfall: result.data.claude_cli?.selection_min_shortfall ?? null,
+            selection_min_headroom: result.data.claude_cli?.selection_min_headroom ?? null,
+            handoff_load_estimate: result.data.claude_cli?.handoff_load_estimate ?? null,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -284,6 +289,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         accountSelectionPinned: settings.claude_cli.account_selection_pinned,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
+        // EXPLICIT (like configDir): `null` clears the override.
+        selectionMinShortfall: settings.claude_cli.selection_min_shortfall ?? null,
+        selectionMinHeadroom: settings.claude_cli.selection_min_headroom ?? null,
+        handoffLoadEstimate: settings.claude_cli.handoff_load_estimate ?? null,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,

@@ -18,7 +18,16 @@
  * constructed X/Y pair below is the case that tells the two apart.
  */
 import { describe, expect, it } from "vitest";
-import { compareByHighestExpectedUsage, compareByUsageHeadroom, isAccountExhausted } from "./types";
+import {
+  compareByHighestExpectedUsage,
+  compareByUsageHeadroom,
+  compareForAccountSelectionMode,
+  headroomFloorsFromSettings,
+  isAccountExhausted,
+  MIN_FLOOR_SETTING,
+  MIN_HEADROOM,
+  MIN_SHORTFALL,
+} from "./types";
 
 type A = {
   utilization: number;
@@ -51,9 +60,11 @@ describe("compareByUsageHeadroom", () => {
     // (-0.30 vs -0.02), but its window has barely started — its spare
     // capacity is in no danger of expiring. 'expiring' is nearly through its
     // week with spare capacity about to be lost outright, so it wins.
+    // (-0.30 vs -0.05), but its window has barely started. 'expiring' is
+    // under pace past MIN_SHORTFALL, so the window furthest along wins.
     const accounts: A[] = [
       { label: "fresh", utilization: 0.1, expected_utilization: 0.4, usage_delta: -0.3 },
-      { label: "expiring", utilization: 0.79, expected_utilization: 0.8, usage_delta: -0.01 },
+      { label: "expiring", utilization: 0.75, expected_utilization: 0.8, usage_delta: -0.05 },
     ];
     expect(best(accounts)).toBe("expiring");
   });
@@ -183,11 +194,16 @@ describe("compareByUsageHeadroom", () => {
 
   // ── The measured roster ──────────────────────────────────────────────────
 
-  it("orders the measured merytshost roster: paktis first, hotmail fourth", () => {
+  it("orders the measured merytshost roster: iris first, hotmail third", () => {
     // Source: `GET http://127.0.0.1:9876/analytics/account-usage` on
     // merytshost, 2026-09-01 (source `oauth_usage`). Re-measure there if this
     // ever needs updating. The shipped min-delta key picked `.claude-hotmail`
     // — dead last among the under-pace set under the intended rule.
+    //
+    // Since MIN_SHORTFALL (runner `measured_roster_2026_09_01_picks_iris_not_hotmail`):
+    // paktis (-0.0137) and pakqon (-0.0196) are under pace by less than the
+    // floor, so they are demoted to the over-pace tier and ranked on their
+    // ratios (pakqon 0.671, paktis 0.983).
     const roster: A[] = [
       {
         label: ".claude-paktis",
@@ -237,18 +253,115 @@ describe("compareByUsageHeadroom", () => {
     ];
 
     const ordered = order(roster);
-    expect(ordered[0]).toBe(".claude-paktis");
-    expect(ordered[3]).toBe(".claude-hotmail");
+    expect(ordered[0]).toBe(".claude-iris");
+    expect(ordered[2]).toBe(".claude-hotmail");
     expect(ordered).toEqual([
-      ".claude-paktis",
       ".claude-iris",
       ".claude-qontinui",
       ".claude-hotmail",
       ".claude-pakqon",
+      ".claude-paktis",
       ".claude-paktis-gmail",
       ".claude-tiohorst",
       ".claude",
     ]);
+  });
+
+  // ── The headroom floors (runner `under_pace_shortfall`) ──────────────────
+
+  it("the 2026-10-18 incident: pakqon is never under pace, and MIN_SHORTFALL is why", () => {
+    // Runner `incident_2026_10_18_pakqon_is_never_under_pace_and_min_shortfall_is_why`.
+    // pakqon beside an account with a real margin and an earlier window: under
+    // the displaced `delta < 0` rule pakqon (the later window) won the
+    // under-pace rows; with the floor the margin account wins every row.
+    const rows: [string, number, number][] = [
+      ["20:41", 0.81, 0.8136],
+      ["21:34", 0.82, 0.8189],
+      ["22:03", 0.82, 0.8217],
+      ["22:29:56", 0.82, 0.8243],
+      ["23:31", 0.84, 0.8305],
+    ];
+    const margin: A = {
+      label: "margin",
+      utilization: 0.4,
+      expected_utilization: 0.5,
+      usage_delta: -0.1,
+    };
+    const noShortfallFloor = { min_shortfall: Number.MIN_VALUE, min_headroom: MIN_HEADROOM };
+    for (const [at, utilization, expected] of rows) {
+      const pakqon: A = {
+        label: `pakqon@${at}`,
+        utilization,
+        expected_utilization: expected,
+        usage_delta: utilization - expected,
+      };
+      expect(best([pakqon, margin])).toBe("margin");
+      if (utilization - expected < 0) {
+        // With MIN_SHORTFALL relaxed (headroom floor kept) it wins again: the
+        // shortfall floor, not the headroom floor, is what excluded it.
+        const relaxed = [pakqon, margin].sort((a, b) =>
+          compareByUsageHeadroom(a, b, noShortfallFloor),
+        );
+        expect(relaxed[0]?.label).toBe(pakqon.label);
+      }
+    }
+  });
+
+  it("an account under MIN_HEADROOM sorts after every usable account but before an exhausted one", () => {
+    // Runner `cmp_rank_low_headroom_sorts_after_every_usable_tier_but_before_exhausted`.
+    // 'thin' is 6 points under pace with a late window — the best under-pace
+    // key in the roster — but has only 7 points left.
+    const thin: A = {
+      label: "thin",
+      utilization: 0.93,
+      expected_utilization: 0.99,
+      usage_delta: -0.06,
+    };
+    const accounts: A[] = [
+      thin,
+      { label: "over", utilization: 0.5, expected_utilization: 0.1, usage_delta: 0.4 },
+      { label: "unknown", utilization: 0.8 },
+      { label: "dead", utilization: 1.0, expected_utilization: 0.9, usage_delta: 0.1 },
+    ];
+    expect(order(accounts)).toEqual(["unknown", "over", "thin", "dead"]);
+    // Still the pick when it is the only non-exhausted account.
+    expect(best([accounts[3]!, thin])).toBe("thin");
+    expect(1 - thin.utilization).toBeLessThan(MIN_HEADROOM);
+    // The highest-expected comparator agrees.
+    const hexp = [...accounts].sort(compareByHighestExpectedUsage).map((x) => x.label);
+    expect(hexp.indexOf("thin")).toBe(2);
+    expect(hexp[3]).toBe("dead");
+  });
+
+  it("honours the settings overrides, clamped like the runner", () => {
+    expect(headroomFloorsFromSettings({})).toEqual({
+      min_shortfall: MIN_SHORTFALL,
+      min_headroom: MIN_HEADROOM,
+    });
+    expect(
+      headroomFloorsFromSettings({ selection_min_shortfall: 0, selection_min_headroom: 7 }),
+    ).toEqual({ min_shortfall: MIN_FLOOR_SETTING, min_headroom: 1 });
+    expect(
+      headroomFloorsFromSettings({ selection_min_shortfall: null, selection_min_headroom: NaN }),
+    ).toEqual({ min_shortfall: MIN_SHORTFALL, min_headroom: MIN_HEADROOM });
+
+    // A 3-point margin: under pace by default, demoted under a 5-point floor.
+    const close: A = {
+      label: "close",
+      utilization: 0.77,
+      expected_utilization: 0.8,
+      usage_delta: -0.03,
+    };
+    const early: A = {
+      label: "early",
+      utilization: 0.1,
+      expected_utilization: 0.3,
+      usage_delta: -0.2,
+    };
+    expect(best([close, early])).toBe("close");
+    const strict = headroomFloorsFromSettings({ selection_min_shortfall: 0.05 });
+    const cmp = compareForAccountSelectionMode("least_usage", strict);
+    expect([close, early].sort(cmp)[0]?.label).toBe("early");
   });
 
   // ── Level 1 — exhaustion dominates (unchanged) ───────────────────────────

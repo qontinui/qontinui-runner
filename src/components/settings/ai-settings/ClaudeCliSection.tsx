@@ -28,8 +28,60 @@ import {
   accountSelectionModeLabel,
   compareForAccountSelectionMode,
   displayedAccountSelection,
+  HANDOFF_LOAD_ESTIMATE,
   hasDeterministicPick,
+  headroomFloorsFromSettings,
+  MIN_HEADROOM,
+  MIN_SHORTFALL,
 } from "../types";
+import type { ClaudeCliSettings } from "../types";
+
+/** The three account-selection overrides, edited in percentage points and
+ * stored as utilization fractions (`null` = the runner's built-in value). */
+const SELECTION_THRESHOLD_FIELDS: {
+  key: keyof Pick<
+    ClaudeCliSettings,
+    "selection_min_shortfall" | "selection_min_headroom" | "handoff_load_estimate"
+  >;
+  label: string;
+  help: string;
+  defaultValue: number;
+  min: number;
+}[] = [
+  {
+    key: "selection_min_shortfall",
+    label: "Minimum shortfall",
+    help: "How far under its pace an account must be to count as under pace (expected minus used).",
+    defaultValue: MIN_SHORTFALL,
+    min: 1,
+  },
+  {
+    key: "selection_min_headroom",
+    label: "Minimum headroom",
+    help: "Capacity an account must have left before its reset; below it the account is picked last.",
+    defaultValue: MIN_HEADROOM,
+    min: 1,
+  },
+  {
+    key: "handoff_load_estimate",
+    label: "Handoff load charge",
+    help: "Usage each handoff charges its target account, fading out over 3 hours. 0 turns it off.",
+    defaultValue: HANDOFF_LOAD_ESTIMATE,
+    min: 0,
+  },
+];
+
+/** A percentage-point input value as the stored fraction; empty = no override. */
+function thresholdFromInput(raw: string): number | null {
+  if (raw.trim() === "") return null;
+  const points = Number(raw);
+  return Number.isFinite(points) ? points / 100 : null;
+}
+
+/** A stored fraction as the percentage-point input value; no override = "". */
+function thresholdToInput(value: number | null | undefined): string {
+  return value == null ? "" : String(Math.round(value * 10000) / 100);
+}
 
 interface ClaudeCliSectionProps {
   settings: AiSettings;
@@ -72,6 +124,9 @@ export function ClaudeCliSection({
   // mode (`settings.claude_cli.account_selection_mode`).
   const { mode: effectiveSelectionMode, fleetManaged: selectionFleetManaged } =
     displayedAccountSelection(settings);
+  // The floors the runner ranks on, so the "best account" marker agrees with
+  // its pick (the runner also adds handoff charges this page cannot see).
+  const selectionFloors = headroomFloorsFromSettings(settings.claude_cli);
 
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
@@ -270,7 +325,7 @@ export function ClaudeCliSection({
         setAccountUsages(result.data);
         const best = result.data
           .filter((a) => !a.error)
-          .sort(compareForAccountSelectionMode(effectiveSelectionMode))[0];
+          .sort(compareForAccountSelectionMode(effectiveSelectionMode, selectionFloors))[0];
         if (best) {
           onLog(
             "success",
@@ -483,8 +538,9 @@ export function ClaudeCliSection({
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
-                    .sort(compareForAccountSelectionMode(effectiveSelectionMode))[0]?.config_dir ===
-                    dir;
+                    .sort(
+                      compareForAccountSelectionMode(effectiveSelectionMode, selectionFloors),
+                    )[0]?.config_dir === dir;
 
                 return (
                   <div
@@ -854,6 +910,39 @@ export function ClaudeCliSection({
                   </span>
                 </span>
               </label>
+              <div className="space-y-1.5 pt-1" data-testid="selection-thresholds">
+                <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                  Selection Thresholds (% points)
+                </span>
+                {SELECTION_THRESHOLD_FIELDS.map((field) => (
+                  <label key={field.key} className="flex items-start gap-2">
+                    <input
+                      type="number"
+                      min={field.min}
+                      max={100}
+                      step={0.5}
+                      aria-label={field.label}
+                      value={thresholdToInput(settings.claude_cli[field.key])}
+                      placeholder={thresholdToInput(field.defaultValue)}
+                      onChange={(e) => {
+                        const value = thresholdFromInput(e.target.value);
+                        setSettings((prev) => ({
+                          ...prev,
+                          claude_cli: { ...prev.claude_cli, [field.key]: value },
+                        }));
+                      }}
+                      className="w-16 px-2 py-1 text-xs bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
+                    />
+                    <span>
+                      <span className="text-xs font-medium block">{field.label}</span>
+                      <span className="text-[10px] text-muted-foreground block">
+                        {field.help} Leave empty for the default (
+                        {thresholdToInput(field.defaultValue)}).
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
             </div>
           )}
 
