@@ -1968,9 +1968,11 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Machine-load backstop (plan
         // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
         // Phase 1c): the SAME memory + thread guard the gate-continuation path
-        // applies (`AdmissionReading::live` — the lanes `probe_for_spawn` composes —, deferring on any tripped lane), so a flood of
-        // coord launches cannot start more unattended sessions than the box can
-        // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
+        // applies (`AdmissionReading::live`: the lanes `probe_for_spawn`
+        // composes, charged with the continuations admitted and not yet
+        // running), deferring on any tripped lane. A launch takes no
+        // projected-cost unit of its own (see `admit_launch`), so a burst of
+        // LAUNCHES alone is bounded by the readings only. Evaluated BEFORE `run_agent_subprocess`, which is where the
         // path rewrite, account resolution and worktree materialization all
         // happen — so a refused launch leaves no worktree, no daemon and no
         // proxy nonce behind; only the stop-token entry exists, released when
@@ -2897,7 +2899,9 @@ struct ContinuationRegistry {
     /// has not started, and the stretch from the guard to the PTY crosses the
     /// coord consume claim, the worktree acquire and the trust warm-up. A replay
     /// of N pending rows used to read the same pre-burst headroom N times and
-    /// admit all N (2026-10-27 on spaceship: 20 passed the guard at once). The
+    /// admit all N (2026-10-27 on spaceship: 20 passed the guard at once, as
+    /// measured in the Why of plan
+    /// `2026-10-28-gate-continuation-cap-is-a-real-permit`). The
     /// count is read and incremented under THIS lock in the same critical
     /// section, so concurrent guard passes are serialized: headroom for K admits
     /// at most K. It is a PROJECTION over the box's readings, never a fixed cap
@@ -2909,6 +2913,16 @@ struct ContinuationRegistry {
     /// but is still counted), which a count of `pending_anchors` could not do.
     /// The account-migration hop's permit is NOT counted: that session's
     /// `claude` is already running and already in the readings.
+    ///
+    /// **Residual, stated.** The unit settles when the session REGISTERS
+    /// (its transcript exists), not when the readings have caught up with its
+    /// memory and threads: a freshly started `claude` is well under
+    /// [`crate::resource_guard::PER_SESSION_RSS_BYTES`], and the thread reading
+    /// is memoized for [`crate::health_monitor::THREAD_READING_TTL`]. So the
+    /// single-instant burst (one replay pass) is bounded; staggered waves a few
+    /// seconds apart are bounded only partly. In the other direction a
+    /// never-started retry holds its unit across its retries, which only
+    /// over-charges.
     reserved_spawns: usize,
 }
 
@@ -3603,11 +3617,12 @@ pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
         let registry = lock_recover(continuation_sessions(), "continuation_sessions");
         (registry.live.len(), registry.reserved_spawns)
     };
-    let mut json = spawn_admission_json(lanes.as_ref(), live);
-    // Admitted, not-yet-registered continuations: each is charged against the
-    // readings as projected cost by the next admission.
-    json["reservedSpawns"] = serde_json::json!(reserved);
-    json
+    spawn_admission_json(
+        lanes.as_ref(),
+        live,
+        reserved,
+        crate::resource_guard::ProjectedSpawnCost::live(),
+    )
 }
 
 /// The severity word of a lane verdict, `"proceed"` when nothing tripped.
@@ -3624,9 +3639,17 @@ fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
 /// [policy: `unknown-must-not-render-as-a-default`]. An unreadable sensor inside
 /// an enabled guard is `null` on its own field and `proceed` on its verdict,
 /// which is exactly the fail-open verdict the gate applies.
+///
+/// `verdict` / `deferStamp` are the PROJECTED composed verdict — the readings
+/// with `reserved_spawns` admitted, not-yet-running continuations charged at
+/// `cost` — so the route says what the next admission would decide, exactly as
+/// [`evaluate_continuation_guard`] would. The per-lane `verdict`s stay the
+/// raw readings' own.
 fn spawn_admission_json(
     lanes: Option<&crate::resource_guard::LaneVerdicts>,
     live_continuations: usize,
+    reserved_spawns: usize,
+    cost: crate::resource_guard::ProjectedSpawnCost,
 ) -> serde_json::Value {
     let Some(lanes) = lanes else {
         return serde_json::json!({
@@ -3636,10 +3659,11 @@ fn spawn_admission_json(
             "memory": null,
             "threads": null,
             "liveContinuations": live_continuations,
+            "reservedSpawns": reserved_spawns,
             "countCap": "retired",
         });
     };
-    let composed = crate::resource_guard::composed_verdict(lanes);
+    let composed = crate::resource_guard::projected_verdict(Some(lanes), reserved_spawns, cost);
     let defer_stamp = composed
         .tripped()
         .map(|(severity, observation)| load_pressure_stamp_reason(severity, observation));
@@ -3671,6 +3695,9 @@ fn spawn_admission_json(
         // Registered continuation sessions (P3's population) — reported, never
         // an admission input since the count cap was retired.
         "liveContinuations": live_continuations,
+        // Admitted, not-yet-registered continuations, charged against the
+        // readings as projected cost (`verdict` above already includes them).
+        "reservedSpawns": reserved_spawns,
         "countCap": "retired",
     })
 }
@@ -3826,8 +3853,10 @@ impl AnchorReservation {
             // this path cannot drift away from the drop path.
             registry.release_owned(&anchor, token);
         }
-        // The projected cost becomes a live row in the SAME acquisition, so the
-        // session is never charged twice nor zero times by a concurrent guard.
+        // The projected cost becomes a live row in the SAME acquisition, so no
+        // concurrent guard sees the unit and the row both, or neither (what
+        // the readings show of the new session is another matter — see
+        // `ContinuationRegistry::reserved_spawns`'s residual).
         if counted {
             registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
         }
@@ -3839,6 +3868,9 @@ impl Drop for AnchorReservation {
         if std::mem::take(&mut self.counted) {
             // One acquisition for both halves; `release_anchor_reservation`
             // would lock a second time, so the anchor is settled here directly.
+            // Saturating, and deliberately not asserted: a Drop must not panic
+            // on this path, and a registry reset under a live permit (the
+            // tests' `clear_continuation_registry`) is legitimate.
             let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
             registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
             if let Some((anchor, token)) = self.held.as_ref() {
@@ -5936,7 +5968,11 @@ async fn run_gate_continuation_inner(
             // within one interval — plus the capacity-freed exit hook fires the
             // moment a live continuation's PTY exits, which is also the moment
             // its memory and threads go back. So this deferral self-heals on
-            // exactly the event that relieves the pressure.
+            // exactly the event that relieves the pressure. A deferral caused
+            // only by PROJECTED cost (admitted continuations not yet running,
+            // `ContinuationRegistry::reserved_spawns`) has no such event: the
+            // units settle when those sessions register, which triggers no
+            // re-poll, so it waits for the backstop interval.
             //
             // Both the WARN and the CRITICAL verdict land here, unlike
             // `resource_guard::admit_spawn`, which refuses only at CRITICAL —
@@ -5944,7 +5980,7 @@ async fn run_gate_continuation_inner(
             // gets back-pressured a band earlier than a human's own terminal.
             warn!(
                 "agent_runtime: gate-continuation deferred under machine load: {} \
-                 — re-delivered when the resource frees up (anchor_key={:?})",
+                 — re-delivered by the next poll (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
             );
@@ -15852,7 +15888,8 @@ mod tests {
 
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -15869,7 +15906,8 @@ mod tests {
         );
 
         // 2. The third evaluation — a re-delivery — proceeds again.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -15931,7 +15969,8 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
 
         // A continuation is live on the anchor — the session about to migrate.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate));
 
@@ -16581,7 +16620,10 @@ mod tests {
             match verdict {
                 ContinuationGuard::Proceed => held.push(permit),
                 ContinuationGuard::LoadPressure { observation, .. } => {
-                    assert_eq!(observation.metric, crate::resource_guard::LaneMetric::FreeCommitBytes);
+                    assert_eq!(
+                        observation.metric,
+                        crate::resource_guard::LaneMetric::FreeCommitBytes
+                    );
                     deferred += 1;
                 }
                 other => panic!("unexpected verdict {other:?}"),
@@ -16589,9 +16631,17 @@ mod tests {
         }
         assert_eq!(held.len(), 3, "headroom for 3 admits exactly 3");
         assert_eq!(deferred, 17);
-        assert_eq!(reserved_spawns_now(), 3, "each admitted permit holds one unit");
+        assert_eq!(
+            reserved_spawns_now(),
+            3,
+            "each admitted permit holds one unit"
+        );
         drop(held);
-        assert_eq!(reserved_spawns_now(), 0, "dropping the permits gives every unit back");
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "dropping the permits gives every unit back"
+        );
         clear_continuation_registry();
     }
 
@@ -16641,12 +16691,18 @@ mod tests {
                 })
             })
             .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("guard thread")).collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("guard thread"))
+            .collect();
         let admitted = results
             .iter()
             .filter(|(v, _)| *v == ContinuationGuard::Proceed)
             .count();
-        assert_eq!(admitted, 3, "20 concurrent passes with headroom for 3 admit exactly 3");
+        assert_eq!(
+            admitted, 3,
+            "20 concurrent passes with headroom for 3 admit exactly 3"
+        );
         assert_eq!(reserved_spawns_now(), 3);
         drop(results);
         assert_eq!(reserved_spawns_now(), 0);
@@ -16664,30 +16720,58 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let (v1, terminal) = evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
+        let (v1, terminal) =
+            evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
         let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
         let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
-        assert_eq!((v1, v2, v3), (ContinuationGuard::Proceed, ContinuationGuard::Proceed, ContinuationGuard::Proceed));
+        assert_eq!(
+            (v1, v2, v3),
+            (
+                ContinuationGuard::Proceed,
+                ContinuationGuard::Proceed,
+                ContinuationGuard::Proceed
+            )
+        );
         assert_eq!(reserved_spawns_now(), 3);
 
         terminal.handed_to_registry("t-settle-a".into(), None);
         assert_eq!(reserved_spawns_now(), 2, "hand-over gives the unit back");
         assert_eq!(
-            continuation_sessions().lock().unwrap_or_else(|p| p.into_inner()).live.len(),
+            continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .live
+                .len(),
             1,
             "…because the session is now a live row the readings will see"
         );
         headless.release();
-        assert_eq!(reserved_spawns_now(), 1, "the headless release gives the unit back");
+        assert_eq!(
+            reserved_spawns_now(),
+            1,
+            "the headless release gives the unit back"
+        );
         drop(dropped);
-        assert_eq!(reserved_spawns_now(), 0, "a give-up drop gives the unit back");
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "a give-up drop gives the unit back"
+        );
 
         let (refused, permit) =
             evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
         assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
-        assert_eq!(reserved_spawns_now(), 0, "a refused evaluation takes no unit");
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "a refused evaluation takes no unit"
+        );
         drop(permit);
-        assert_eq!(reserved_spawns_now(), 0, "and its empty permit gives none back");
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "and its empty permit gives none back"
+        );
         clear_continuation_registry();
     }
 
@@ -16702,14 +16786,28 @@ mod tests {
         let live_all = |_id: &str| true;
         let reading = || commit_reading(free_with_headroom_for(2));
 
-        assert_eq!(admit_launch(&live_all, &reading), Ok(()), "nothing pending: admitted");
+        assert_eq!(
+            admit_launch(&live_all, &reading),
+            Ok(()),
+            "nothing pending: admitted"
+        );
         let held: Vec<_> = (0..2)
-            .map(|i| evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1)
+            .map(|i| {
+                evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1
+            })
             .collect();
         assert_eq!(reserved_spawns_now(), 2);
-        let reason = admit_launch(&live_all, &reading).expect_err("headroom spent by pending continuations");
-        assert!(reason.starts_with("deferred_load:commit_pressure:"), "{reason}");
-        assert_eq!(reserved_spawns_now(), 2, "a launch takes no unit of its own");
+        let reason =
+            admit_launch(&live_all, &reading).expect_err("headroom spent by pending continuations");
+        assert!(
+            reason.starts_with("deferred_load:commit_pressure:"),
+            "{reason}"
+        );
+        assert_eq!(
+            reserved_spawns_now(),
+            2,
+            "a launch takes no unit of its own"
+        );
         drop(held);
         assert_eq!(admit_launch(&live_all, &reading), Ok(()));
         clear_continuation_registry();
@@ -17792,7 +17890,12 @@ mod tests {
 
         // Memory tripped, threads calm: the composed verdict and the stamp are
         // the memory lane's.
-        let v = spawn_admission_json(Some(&lanes(commit_verdict(WARN_BAND_FREE), 200, calm())), 7);
+        let v = spawn_admission_json(
+            Some(&lanes(commit_verdict(WARN_BAND_FREE), 200, calm())),
+            7,
+            0,
+            TEST_SPAWN_COST,
+        );
         assert_eq!(v["enabled"], true);
         assert_eq!(v["verdict"], "warn");
         assert_eq!(
@@ -17823,6 +17926,8 @@ mod tests {
                 thread_verdict(Some(540)),
             )),
             0,
+            0,
+            TEST_SPAWN_COST,
         );
         assert_eq!(v["verdict"], "critical");
         assert_eq!(v["deferStamp"], "thread_pressure:critical:540_over_400");
@@ -17830,16 +17935,33 @@ mod tests {
         assert_eq!(v["threads"]["gradedThreads"], 540);
 
         // Calm: no stamp.
-        let v = spawn_admission_json(Some(&lanes(calm(), 200, calm())), 0);
+        let v = spawn_admission_json(Some(&lanes(calm(), 200, calm())), 0, 0, TEST_SPAWN_COST);
         assert_eq!(v["verdict"], "proceed");
         assert_eq!(v["deferStamp"], serde_json::Value::Null);
+        assert_eq!(v["reservedSpawns"], 0);
+
+        // Pending admissions are charged: 200 graded threads + 6 reserved × 10
+        // = 260 > 256, so the route reports what the next admission would
+        // decide, while the raw thread lane still reads `proceed`.
+        let threads_only = crate::resource_guard::ProjectedSpawnCost {
+            commit_bytes: 0,
+            threads: 10,
+        };
+        // Memory UNKNOWN here, so only the thread lane can move.
+        let threads_200 = thread_reading(Some(200)).lanes.expect("an enabled reading");
+        let v = spawn_admission_json(Some(&threads_200), 0, 6, threads_only);
+        assert_eq!(v["verdict"], "warn");
+        assert_eq!(v["deferStamp"], "thread_pressure:warn:260_over_256");
+        assert_eq!(v["threads"]["verdict"], "proceed");
+        assert_eq!(v["reservedSpawns"], 6);
 
         // Disabled guard: nothing was read, so nothing is reported as a number.
-        let v = spawn_admission_json(None, 3);
+        let v = spawn_admission_json(None, 3, 2, TEST_SPAWN_COST);
         assert_eq!(v["enabled"], false);
         assert_eq!(v["memory"], serde_json::Value::Null);
         assert_eq!(v["threads"], serde_json::Value::Null);
         assert_eq!(v["liveContinuations"], 3);
+        assert_eq!(v["reservedSpawns"], 2);
     }
 
     /// A continuation offered while free memory is under its WARN floor — or its
