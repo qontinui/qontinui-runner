@@ -12121,7 +12121,7 @@ CREATE TABLE project.journey_explorations (
     CONSTRAINT ck_journey_explorations_spent_non_negative CHECK (((spent_actions >= 0) AND (spent_depth >= 0) AND (spent_wall_clock_ms >= 0))),
     CONSTRAINT ck_journey_explorations_spent_within_budget CHECK (((spent_actions <= budget_max_actions) AND (spent_depth <= budget_max_depth))),
     CONSTRAINT ck_journey_explorations_start_object CHECK ((jsonb_typeof(start) = 'object'::text)),
-    CONSTRAINT ck_journey_explorations_stop_detail CHECK (((stop_detail IS NULL) OR ((stopped_because = 'frontier_unsettled'::text) AND (jsonb_typeof(stop_detail) = 'object'::text)))),
+    CONSTRAINT ck_journey_explorations_stop_detail CHECK (((stop_detail IS NULL) OR (jsonb_typeof(stop_detail) = 'object'::text))),
     CONSTRAINT ck_journey_explorations_stop_node_object CHECK (((stop_node IS NULL) OR (jsonb_typeof(stop_node) = 'object'::text))),
     CONSTRAINT ck_journey_explorations_stopped_because CHECK ((stopped_because = ANY (ARRAY['budget_actions'::text, 'budget_depth'::text, 'budget_time'::text, 'frontier_exhausted'::text, 'frontier_unsettled'::text, 'app_unreachable'::text, 'auth_wall'::text])))
 );

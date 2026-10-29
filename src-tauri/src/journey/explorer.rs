@@ -22,11 +22,13 @@
 //!
 //! It repeats until a budget is spent or no activatable entry is left, and
 //! returns — and persists to `project.journey_explorations` (qontinui-web
-//! migrations `journey_02_explorations` and
-//! `journey_03_explorations_stop_unsettled`) — the run's budget, spend, stop
-//! reason (with the [`Unsettled`] breakdown as `stop_detail` when it is
-//! `frontier_unsettled`) and accounting. `frontier_exhausted` is the only stop reason under which a
-//! later `not_reachable` could be claimed for the explored component.
+//! migrations `journey_02_explorations`,
+//! `journey_03_explorations_stop_unsettled` and
+//! `journey_04_explorations_stop_detail_any_stop`) — the run's budget, spend,
+//! stop reason (with the [`Unsettled`] breakdown as `stop_detail` whenever it
+//! records anything — see [`stop_detail_column`]) and accounting.
+//! `frontier_exhausted` is the only stop reason under which a later
+//! `not_reachable` could be claimed for the explored component.
 //!
 //! ## D4, restated (not `isNavigationElement`)
 //!
@@ -532,6 +534,23 @@ pub struct Unsettled {
     /// reached the ledger). `None` (JSON `null`): the re-run selection did
     /// not run, so this was not measured.
     pub open_at_confirmation: Option<u32>,
+    /// Whether the look taken AFTER the stop — the closing snapshot, the
+    /// barrier tying it to a fresh node, and the ledger re-read — failed to
+    /// complete, whatever stopped the run: `Some(true)` when any part of it
+    /// failed (a runner-side miss — a dropped snapshot event, a barrier
+    /// timeout, the producer gone —, an app that answered it with a failure,
+    /// whose answer could not be read, that could not be reached or was
+    /// behind a login, a ledger re-read that failed, or the post-stop grace
+    /// running out); `Some(false)` when it completed. `None` (JSON `null`):
+    /// no closing look was taken, because the run had ALREADY stopped
+    /// `app_unreachable` / `auth_wall` before it. A run whose stop word
+    /// became `app_unreachable` / `auth_wall` AT the closing look — an
+    /// exhausted frontier whose confirming snapshot found the app gone or
+    /// behind a login — took the look and reads `Some(true)`, beside
+    /// `exhaustionUnconfirmed: true`. Under a BUDGET stop this is the one
+    /// place such a failure is recorded: the stop word stays the budget, and
+    /// the reasons of what was seen were not refreshed after the last action.
+    pub closing_look_failed: Option<bool>,
     /// A ledger read during the run reported the ledger NOT `writing`: what
     /// the run read may lack its own writes.
     pub ledger_not_writing: bool,
@@ -566,6 +585,7 @@ impl Unsettled {
             || self.rows_unreadable > 0
             || self.exhaustion_unconfirmed == Some(true)
             || self.open_at_confirmation.is_some_and(|n| n > 0)
+            || self.closing_look_failed == Some(true)
             || self.edge_events_dropped > 0
             || self.snapshot_refused_by_app
             || self.ledger_not_writing
@@ -819,9 +839,9 @@ pub(crate) fn settle_stop(
              {} unroutable, {} component action(s) not driven, {} failed attempt(s), {} \
              undrivable entr(ies), {} activation_failed row(s) open, ledger read truncated: {}, \
              {} unreadable row(s), exhaustion unconfirmed: {}, entr(ies) open at the \
-             confirming read: {}, {} action event(s) dropped, snapshot refused by the app: {}, \
-             ledger not writing: {}, {} journey write(s) failed, action outcome unknown: {}, \
-             snapshot outcome unknown: {}",
+             confirming read: {}, closing look failed: {}, {} action event(s) dropped, snapshot \
+             refused by the app: {}, ledger not writing: {}, {} journey write(s) failed, action \
+             outcome unknown: {}, snapshot outcome unknown: {}",
             u.unroutable,
             u.component_actions,
             u.attempts_failed,
@@ -831,6 +851,7 @@ pub(crate) fn settle_stop(
             u.rows_unreadable,
             measured(u.exhaustion_unconfirmed),
             measured(u.open_at_confirmation),
+            measured(u.closing_look_failed),
             u.edge_events_dropped,
             u.snapshot_refused_by_app,
             u.ledger_not_writing,
@@ -1086,6 +1107,11 @@ pub(crate) enum NoRowKind {
     /// snapshot, could not be read: it may have acted, and nothing was
     /// explored, so no stop word is true. A 502.
     StartUnknown,
+    /// A node start [`check_node_start`] refused, with its status (a 422 for
+    /// a start that cannot be reached or is behind an auth wall, a 502 / 503
+    /// for an answer it could not read or an app or producer it could not
+    /// ask). Nothing was acted on.
+    StartCheck(StatusCode),
 }
 
 /// A run that ended without a row.
@@ -1473,18 +1499,33 @@ pub(crate) async fn explore<D: ExploreDriver>(
     };
     run.write_failures_at_start = run.d.ledger_write_failures();
     // The explorer's cursor outlives a run: its last node is the previous
-    // run's, and a URL start acts BEFORE any look. Forget it first, so the
-    // start navigation's edge runs from the unknown node, never from where
-    // another run left off.
+    // run's. Forget it first — ONCE, for every start: a URL start acts BEFORE
+    // any look, so its start navigation's edge must run from the unknown
+    // node, never from where another run left off; a node start's check
+    // snapshots the app before anything else, and that snapshot must not
+    // close a previous run's pending edge with where the app is now.
     if run.d.forget_position().await.is_err() {
         return Err(NoRow {
             kind: NoRowKind::Internal,
             detail: "the journey producer could not be told the run starts from an unknown \
-                     position"
+                     position; nothing was acted on"
                 .into(),
             spent_actions: 0,
             edge_events: run.d.edge_events(),
         });
+    }
+    // A node start must be where the app is, or reachable from it, before
+    // any action is taken ([`check_node_start`], which relies on the forget
+    // above and does not forget again).
+    if let ExploreStart::Node(k) = &request.start {
+        if let Err(Refusal(status, detail)) = check_node_start(&mut *run.d, k).await {
+            return Err(NoRow {
+                kind: NoRowKind::StartCheck(status),
+                detail,
+                spent_actions: 0,
+                edge_events: run.d.edge_events(),
+            });
+        }
     }
     let mut not_activated = NotActivated::default();
     let start_url = match &request.start {
@@ -1521,7 +1562,9 @@ pub(crate) async fn explore<D: ExploreDriver>(
     // runner-side failure to tie the snapshot to a node, an app that answered
     // it with a failure, or a ledger that could not be re-read leaves the
     // exhaustion unconfirmed (settled below). A budget stop stays a budget
-    // stop either way.
+    // stop either way — but a closing look that did not complete is recorded
+    // (`closing_look_failed`), never dropped: the unknown is kept in the
+    // answer and, through `stop_detail`, in the row.
     if !matches!(
         stopped_because,
         StopReason::AppUnreachable | StopReason::AuthWall
@@ -1541,6 +1584,23 @@ pub(crate) async fn explore<D: ExploreDriver>(
             (looked, graph)
         })
         .await;
+        let closing_failure = match &confirmed {
+            Ok((Ok(_), Some(_))) => None,
+            Ok((Ok(_), None)) => Some("the ledger could not be re-read after it".to_string()),
+            Ok((Err(Halt::Stop(_, d) | Halt::NoRow(_, d)), _)) => Some(d.clone()),
+            Ok((Err(Halt::DetourRefused), _)) => Some("a refused detour".to_string()),
+            Err(_) => Some(format!(
+                "it did not finish within the post-stop grace ({} s)",
+                POST_STOP_GRACE.as_secs()
+            )),
+        };
+        run.unsettled.closing_look_failed = Some(closing_failure.is_some());
+        if let (Some(why), true) = (&closing_failure, stopped_because.is_budget()) {
+            stop_explanation = format!(
+                "{stop_explanation}; the closing look after the stop did not complete, so where \
+                 the app ended and the last action's edge are unknown: {why}"
+            );
+        }
         match confirmed {
             Ok((Ok(here), Some(graph))) if exhausted => match run.start_key.clone() {
                 Some(start_key) => {
@@ -1818,6 +1878,14 @@ pub struct ExploreSpent {
 #[serde(rename_all = "snake_case")]
 pub enum PersistenceState {
     Written,
+    /// The row was written WITHOUT its `stop_detail`: the run is not
+    /// `frontier_unsettled` and its [`Unsettled`] block records something,
+    /// but this database still has qontinui-web `journey_03`'s CHECK, which
+    /// allows `stop_detail` only on a `frontier_unsettled` row
+    /// (`journey_04_explorations_stop_detail_any_stop` is not applied). The
+    /// insert never fails on it; the block is in this answer only, and the
+    /// `detail` says so.
+    WrittenWithoutStopDetail,
     /// The table does not exist in this database (an embedded database
     /// predating it never receives it — plan Phase 0 decision 4).
     SchemaAbsent,
@@ -1842,8 +1910,8 @@ pub struct ExplorationResult {
     pub spent: ExploreSpent,
     pub stopped_because: StopReason,
     /// Why the run stopped, in prose, for a reader. Not stored: the stored,
-    /// machine-readable breakdown of a `frontier_unsettled` stop is
-    /// [`Self::unsettled`], persisted as the `stop_detail` column.
+    /// machine-readable breakdown is [`Self::unsettled`], persisted as the
+    /// `stop_detail` column ([`stop_detail_column`]).
     pub stop_explanation: String,
     pub stop_node: Option<JourneyNode>,
     /// The run's ACTION EVENTS the journey producer's queue accepted —
@@ -1855,9 +1923,6 @@ pub struct ExplorationResult {
     /// window. It is not "new graph edges": a replay re-observes an existing
     /// edge. Persisted as `edges_added`.
     pub edges_added: u32,
-    /// The run's action events the queue could NOT hold — actions taken whose
-    /// edge will never be written.
-    pub edge_events_dropped: u32,
     /// Distinct frontier entries the run saw at the nodes it stood on.
     pub affordances_seen: u32,
     /// Of those, the ones it activated and the app acted on.
@@ -1873,6 +1938,15 @@ pub struct ExplorationResult {
     /// frontier. All zero / false under `frontier_exhausted`; under
     /// `frontier_unsettled` it says why. Under any other stop it is what was
     /// measured on the way — unknowns the run carried, not why it stopped.
+    /// Persisted as `stop_detail` whenever it records anything
+    /// ([`stop_detail_column`]).
+    ///
+    /// The run's dropped action events are reported HERE, as
+    /// `unsettled.edgeEventsDropped`, and nowhere else in this answer: this
+    /// block is what the row keeps, so the count survives the answer, and
+    /// one field cannot disagree with a copy of itself. (The no-row answer,
+    /// which has no `unsettled` block, carries `edgeEventsDropped` at its
+    /// top level beside `edgesAdded`.)
     pub unsettled: Unsettled,
     pub start: Value,
     pub started_at: String,
@@ -1883,8 +1957,9 @@ pub struct ExplorationResult {
 }
 
 /// The CHECKs of `project.journey_explorations` (qontinui-web migrations
-/// `journey_02_explorations` and `journey_03_explorations_stop_unsettled`)
-/// that a value can violate, checked HERE so a row
+/// `journey_02_explorations`, `journey_03_explorations_stop_unsettled` and
+/// `journey_04_explorations_stop_detail_any_stop`) that a value can violate,
+/// checked HERE so a row
 /// the database would refuse is refused with the constraint named before it
 /// is sent. Three are not re-checked because the types cannot violate them:
 /// `stopped_because` is a [`StopReason`] (its seven words, pinned against the
@@ -1931,12 +2006,12 @@ pub(crate) fn check_record(r: &ExplorationResult) -> Result<(), String> {
         n.validate()
             .map_err(|e| format!("stop_node contract validation: {e}"))?;
     }
+    // journey_04's CHECK: any stop may carry it, as a JSON object. (On a
+    // database still at journey_03, `persist` withholds it from a row that is
+    // not frontier_unsettled instead — see [`stop_detail_bind`].)
     let detail = stop_detail_column(r);
     let unsettled = r.stopped_because == StopReason::FrontierUnsettled;
-    if detail
-        .as_ref()
-        .is_some_and(|d| !unsettled || !d.is_object())
-    {
+    if detail.as_ref().is_some_and(|d| !d.is_object()) {
         return Err("ck_journey_explorations_stop_detail".into());
     }
     if unsettled && !r.unsettled.any() {
@@ -1952,16 +2027,77 @@ pub(crate) fn check_record(r: &ExplorationResult) -> Result<(), String> {
     Ok(())
 }
 
-/// The `stop_detail` column (qontinui-web `journey_03_explorations_stop_unsettled`):
-/// the [`Unsettled`] breakdown — the answer's `unsettled` block, camelCase —
-/// of a run that stopped `frontier_unsettled`, so the stored row says WHY the
-/// frontier was not exhausted. `None` (SQL NULL) for every other stop: the
-/// stop word itself is the whole reason there.
+/// The `stop_detail` column (qontinui-web `journey_03_explorations_stop_unsettled`,
+/// widened to every stop by `journey_04_explorations_stop_detail_any_stop`):
+/// the [`Unsettled`] block — the answer's `unsettled`, camelCase — exactly
+/// when it RECORDS something, i.e. [`Unsettled::any`]: a count above zero, a
+/// flag set, or a confirmation measure that failed (`exhaustionUnconfirmed`
+/// / `closingLookFailed` `true`, `openAtConfirmation` above zero). A
+/// confirmation that passed (`false` / `0`) or was not taken (`null`) records
+/// nothing on its own.
+///
+/// - `frontier_unsettled`: always non-NULL ([`check_record`] refuses one whose
+///   block records nothing) — it says WHY the frontier was not exhausted.
+/// - any other stop: non-NULL when the run carried an unknown or an unsettling
+///   count on the way (dropped action events, failed journey writes, a closing
+///   look that did not complete, …) — so the stored row keeps it; the stop
+///   word stays the reason. NULL when the block records nothing.
 pub(crate) fn stop_detail_column(r: &ExplorationResult) -> Option<Value> {
-    if r.stopped_because != StopReason::FrontierUnsettled {
+    if !r.unsettled.any() {
         return None;
     }
     serde_json::to_value(r.unsettled).ok()
+}
+
+/// What the database's CHECK on `stop_detail` allows, as the probe read it
+/// ([`EXPLORATION_SCHEMA_PROBE_SQL`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopDetailScope {
+    /// qontinui-web `journey_04`: on any stop, as a JSON object.
+    AnyStop,
+    /// qontinui-web `journey_03` (or `journey_04`'s downgrade): only on a
+    /// `frontier_unsettled` row. Also what an unreadable probe column reads
+    /// as — fail-closed, so the insert never fails on it.
+    UnsettledOnly,
+}
+
+/// The `stop_detail` value to bind for `r` under `scope`, and whether a
+/// block that [`stop_detail_column`] would store was WITHHELD (a database at
+/// `journey_03` and a row that is not `frontier_unsettled`).
+pub(crate) fn stop_detail_bind(
+    r: &ExplorationResult,
+    scope: StopDetailScope,
+) -> (Option<Value>, bool) {
+    let detail = stop_detail_column(r);
+    let allowed =
+        scope == StopDetailScope::AnyStop || r.stopped_because == StopReason::FrontierUnsettled;
+    match detail {
+        Some(d) if allowed => (Some(d), false),
+        Some(_) => (None, true),
+        None => (None, false),
+    }
+}
+
+/// Does a CHECK definition (as `pg_get_constraintdef` renders it) tie
+/// `stop_detail` to `frontier_unsettled`? The predicate
+/// [`EXPLORATION_SCHEMA_PROBE_SQL`]'s second column evaluates in SQL, kept
+/// here so a test holds it against both migrations' renderings.
+///
+/// Fail-safe, with a known false positive: ANY CHECK on the table whose
+/// definition names both words reads as restricting — journey_03's, but also
+/// a future one that, say, REQUIRES the detail on an unsettled row without
+/// restricting other stops. While such a CHECK stands, every non-unsettled
+/// row's detail is withheld (`written_without_stop_detail`, said in the
+/// answer), never sent where it might be refused; a migration that adds one
+/// must revisit this predicate, or the withholding never ends.
+///
+/// Run against a real database: the probe SQL was executed on an ephemeral
+/// PostgreSQL 16.15 (`ephemeral-db.sh start pgvector`, 2026-10-29) with the
+/// web alembic chain at `journey_02` (`false, false`), `journey_03`
+/// (`true, true`), `journey_04` (`true, false`) and downgraded back to
+/// `journey_03` (`true, true`). No runner test drives a database.
+pub(crate) fn check_restricts_stop_detail(definition: &str) -> bool {
+    definition.contains("stop_detail") && definition.contains("frontier_unsettled")
 }
 
 /// `INSERT` of one run. `$5` / `$6` cast from the RFC 3339 strings the answer
@@ -1984,8 +2120,12 @@ pub(crate) const EXPLORATION_INSERT_BINDS: usize = 18;
 pub(crate) type InsertParam = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
 
 /// The INSERT's binds as `(column, value)`, in the SQL's column order — one
-/// list, so a test can hold each column to its own value.
-pub(crate) fn exploration_insert_params(r: &ExplorationResult) -> Vec<(&'static str, InsertParam)> {
+/// list, so a test can hold each column to its own value. `stop_detail` is
+/// bound under `scope` ([`stop_detail_bind`]).
+pub(crate) fn exploration_insert_params(
+    r: &ExplorationResult,
+    scope: StopDetailScope,
+) -> Vec<(&'static str, InsertParam)> {
     let to_i32 = |n: u32| n as i32;
     let stop_node = r
         .stop_node
@@ -2017,18 +2157,29 @@ pub(crate) fn exploration_insert_params(r: &ExplorationResult) -> Vec<(&'static 
         ("stop_node", Box::new(stop_node)),
         ("edges_added", Box::new(to_i32(r.edges_added))),
         ("frontier_remaining_by_reason", Box::new(remaining)),
-        ("stop_detail", Box::new(stop_detail_column(r))),
+        ("stop_detail", Box::new(stop_detail_bind(r, scope).0)),
     ]
 }
 
-/// Does the explorations table exist? Schema-qualified, like the ledger probe.
-/// It also requires the `stop_detail` column (web
-/// `journey_03_explorations_stop_unsettled`): a database at `journey_02` has
-/// the table but would refuse every INSERT, so it reads `schema_absent`.
+/// Two columns.
+///
+/// 1. Does the explorations table exist? Schema-qualified, like the ledger
+///    probe. It also requires the `stop_detail` column (web
+///    `journey_03_explorations_stop_unsettled`): a database at `journey_02`
+///    has the table but would refuse every INSERT, so it reads
+///    `schema_absent`.
+/// 2. Does a CHECK on it still tie `stop_detail` to `frontier_unsettled`
+///    (web `journey_03`'s, before `journey_04_explorations_stop_detail_any_stop`
+///    relaxed it)? The SQL form of [`check_restricts_stop_detail`]. `true` →
+///    [`StopDetailScope::UnsettledOnly`].
 pub(crate) const EXPLORATION_SCHEMA_PROBE_SQL: &str =
     "SELECT to_regclass('project.journey_explorations') IS NOT NULL \
      AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' \
-     AND table_name = 'journey_explorations' AND column_name = 'stop_detail')";
+     AND table_name = 'journey_explorations' AND column_name = 'stop_detail'), \
+     EXISTS (SELECT 1 FROM pg_constraint c \
+     WHERE c.conrelid = to_regclass('project.journey_explorations') AND c.contype = 'c' \
+     AND pg_get_constraintdef(c.oid) LIKE '%stop_detail%' \
+     AND pg_get_constraintdef(c.oid) LIKE '%frontier_unsettled%')";
 
 async fn persist(pg: &crate::database::pg::PgDb, r: &ExplorationResult) -> Persistence {
     if let Err(e) = check_record(r) {
@@ -2045,8 +2196,16 @@ async fn persist(pg: &crate::database::pg::PgDb, r: &ExplorationResult) -> Persi
         Ok(c) => c,
         Err(e) => return failed(format!("PG pool error: {e}")),
     };
-    match conn.query_one(EXPLORATION_SCHEMA_PROBE_SQL, &[]).await {
-        Ok(row) if row.try_get::<_, bool>(0).unwrap_or(false) => {}
+    let scope = match conn.query_one(EXPLORATION_SCHEMA_PROBE_SQL, &[]).await {
+        Ok(row) if row.try_get::<_, bool>(0).unwrap_or(false) => {
+            // Unreadable → restricting: withholding a value never fails the
+            // insert, sending one the CHECK refuses would.
+            if row.try_get::<_, bool>(1).unwrap_or(true) {
+                StopDetailScope::UnsettledOnly
+            } else {
+                StopDetailScope::AnyStop
+            }
+        }
         Ok(_) => {
             return Persistence {
                 state: PersistenceState::SchemaAbsent,
@@ -2064,8 +2223,9 @@ async fn persist(pg: &crate::database::pg::PgDb, r: &ExplorationResult) -> Persi
                 &e,
             ))
         }
-    }
-    let owned = exploration_insert_params(r);
+    };
+    let withheld = stop_detail_bind(r, scope).1;
+    let owned = exploration_insert_params(r, scope);
     if owned.len() != EXPLORATION_INSERT_BINDS {
         return failed(format!(
             "{} binds for {EXPLORATION_INSERT_BINDS} INSERT parameters; not sent",
@@ -2077,6 +2237,17 @@ async fn persist(pg: &crate::database::pg::PgDb, r: &ExplorationResult) -> Persi
         .map(|(_, v)| &**v as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
     match conn.execute(EXPLORATION_INSERT_SQL, &params).await {
+        Ok(_) if withheld => Persistence {
+            state: PersistenceState::WrittenWithoutStopDetail,
+            detail: format!(
+                "one row in project.journey_explorations, WITHOUT its stop_detail: this run \
+                 stopped {} and its unsettled block records unknowns, but this database's CHECK \
+                 still allows stop_detail only on a frontier_unsettled row — apply qontinui-web \
+                 migration journey_04_explorations_stop_detail_any_stop. The block is in this \
+                 answer only.",
+                r.stopped_because.as_str()
+            ),
+        },
         Ok(_) => Persistence {
             state: PersistenceState::Written,
             detail: "one row in project.journey_explorations".into(),
@@ -2119,7 +2290,6 @@ pub(crate) fn assemble(
         stop_explanation: outcome.stop_explanation,
         stop_node: outcome.stop_node,
         edges_added: clamp_u32(outcome.edge_events.enqueued),
-        edge_events_dropped: clamp_u32(outcome.edge_events.dropped),
         affordances_seen: outcome.accounting.seen.len() as u32,
         affordances_activated: outcome.accounting.activated_count(),
         frontier_remaining_by_reason: outcome.accounting.remaining_by_reason(
@@ -2145,24 +2315,46 @@ pub(crate) fn assemble(
 // The live driver
 // ---------------------------------------------------------------------------
 
-/// What an SDK action route's answer means for the run, in order: an auth
-/// refusal is an auth wall; `failure_origin: "unknown"` (the request may have
+/// An answer the RUNNER produced by rejecting the request before touching any
+/// UI (`failure_origin: "runner"`, [`capture::RUNNER_REJECTION_ORIGIN`]).
+/// Checked FIRST by both [`classify_answer`] and [`classify_snapshot`],
+/// whatever the HTTP status: `page/navigate`'s rejection, for one, is sent
+/// with a 200 and `success: false`. Nothing about the app was learned, so it
+/// is [`DriveFailure::Runner`] — a runner-side failure with no row (503) —
+/// never `app_unreachable`, never an app's answer.
+fn runner_rejection(body: &Value, what: &str) -> Option<DriveFailure> {
+    (body.get("failure_origin").and_then(|v| v.as_str()) == Some(capture::RUNNER_REJECTION_ORIGIN))
+        .then(|| {
+            DriveFailure::Runner(format!(
+                "the runner rejected the {what} before touching any UI: {}",
+                body.get("error").map(|e| e.to_string()).unwrap_or_default()
+            ))
+        })
+}
+
+/// What an SDK action route's answer means for the run, in order: a RUNNER
+/// rejection ([`runner_rejection`]) is [`DriveFailure::Runner`], whatever
+/// else the answer says; an auth refusal is an auth wall;
+/// `failure_origin: "unknown"` (the request may have
 /// reached the app but its answer could not be read) is
 /// [`DriveFailure::OutcomeUnknown`] — this function maps only that LABEL: an
 /// answer with no boolean `success` reads as unknown because the named-app
 /// routes add the label to it, and one with neither `success` nor a label
-/// falls through to acted; a refusal
-/// that reached no UI (a transport refusal — a named app that could not be
-/// reached, or a refused webview fallback — a runner rejection, or a tab
-/// refusal) is `app_unreachable`; an app-answered `success: false` is a
-/// failed activation; anything else acted.
+/// falls through to acted; a refusal that reached no UI (a transport refusal
+/// — a named app that could not be reached, or a refused webview fallback —
+/// or a tab refusal) is `app_unreachable`; an app-answered `success: false`
+/// is a failed activation; anything else acted.
 pub(crate) fn classify_answer(answer: Value) -> Result<ActResult, DriveFailure> {
+    if let Some(f) = runner_rejection(&answer, "action") {
+        return Err(f);
+    }
     if answer_is_auth_refusal(&answer) {
         return Err(DriveFailure::AuthWall(
             "the action answer carried an authentication refusal".into(),
         ));
     }
-    if answer.get("failure_origin").and_then(|v| v.as_str()) == Some("unknown") {
+    let origin = answer.get("failure_origin").and_then(|v| v.as_str());
+    if origin == Some("unknown") {
         return Err(DriveFailure::OutcomeUnknown(format!(
             "the action's answer could not be read: {}",
             answer
@@ -2191,8 +2383,13 @@ pub(crate) fn classify_answer(answer: Value) -> Result<ActResult, DriveFailure> 
     Ok(ActResult::Acted)
 }
 
-/// What the snapshot route's answer means for the run.
+/// What the snapshot route's answer means for the run, in order.
 ///
+/// - an answer tagged `failure_origin: "runner"` (the runner rejected the
+///   request before touching any UI), WHATEVER its status — a 2xx
+///   `success: false` included → a runner-side failure
+///   ([`DriveFailure::Runner`]: no row), never `app_unreachable` and never the
+///   app's answer ([`runner_rejection`], as [`classify_answer`] reads it);
 /// - an authentication refusal → an auth wall;
 /// - a 2xx answer that is not `success: false` → the snapshot;
 /// - a 2xx `success: false`, or a failure whose `failure_origin` is `"app"`
@@ -2204,6 +2401,9 @@ pub(crate) fn classify_answer(answer: Value) -> Result<ActResult, DriveFailure> 
 /// - only a `failure_origin: "transport"` failure (never delivered) → no UI
 ///   was reached → `app_unreachable`.
 pub(crate) fn classify_snapshot(status: StatusCode, body: Value) -> Result<Value, DriveFailure> {
+    if let Some(f) = runner_rejection(&body, "snapshot") {
+        return Err(f);
+    }
     if answer_is_auth_refusal(&body) {
         return Err(DriveFailure::AuthWall(
             "the snapshot answer carried an authentication refusal".into(),
@@ -2405,9 +2605,10 @@ impl Drop for RunGuard {
 /// A node start must be where the app is, or reachable from it over observed
 /// D4-safe edges; checked before any action is taken.
 ///
-/// - It first has the producer forget the explorer cursor's position, so this
-///   check's snapshot cannot close a previous run's pending edge (503, no
-///   action, when the producer cannot be told).
+/// - It is run by [`explore`] right AFTER the run's one
+///   [`ExploreDriver::forget_position`], and relies on it: the producer has
+///   forgotten the explorer cursor's position, so this check's snapshot
+///   cannot close a previous run's pending edge. It does not forget again.
 /// - The node "where the app is" must be FRESH: the producer's resolved
 ///   snapshot count must have moved past what it was before this check's
 ///   snapshot (the freshness check [`Run`]'s looks use), else a stale node —
@@ -2422,17 +2623,6 @@ pub(crate) async fn check_node_start<D: ExploreDriver>(
 ) -> Result<(), Refusal> {
     let unavailable = |m: String| Refusal(StatusCode::SERVICE_UNAVAILABLE, m);
     let no_producer = || unavailable("the journey producer could not say where the app is".into());
-    // Forget the explorer cursor's position FIRST: a previous run may have
-    // left a pending edge, and this check's snapshot would otherwise close it
-    // with where the app is now, attributed to that run. If the producer
-    // cannot be told, nothing is acted on and no row is written.
-    d.forget_position().await.map_err(|_| {
-        unavailable(
-            "the journey producer could not be told the run starts from an unknown position; \
-             nothing was acted on"
-                .into(),
-        )
-    })?;
     let before = d
         .current_node(BARRIER_TIMEOUT)
         .await
@@ -2494,10 +2684,12 @@ pub(crate) async fn check_node_start<D: ExploreDriver>(
 /// The app id the explorer drives, or why it refuses (a 422 before anything
 /// runs).
 ///
-/// - It must be an identifier ([`super::observe::is_identifier`], the same
-///   alphabet the observe route holds an app id to) once trimmed — so a
-///   `qontinui-runner%20` decodes to a value this check sees through, and
-///   the returned id is the trimmed one every action names.
+/// - It must be an identifier ([`super::observe::is_identifier`]) EXACTLY as
+///   the path gave it — the same check, untrimmed, the observe route holds an
+///   app id to ([`super::observe::observe_app_id`]). A padded id (a decoded
+///   `%20`) is not an identifier and is refused, never silently rewritten:
+///   no journey route normalizes the app id, so a trimmed one would be
+///   written under a spelling the read routes would not find.
 /// - The runner's OWN webview (compared case-insensitively): D4 rule 3
 ///   activates any undeclared `menuitem` / `link` / `tab`, and the runner's
 ///   UI has `role="menuitem"` buttons with no declared effect that act — the
@@ -2505,8 +2697,7 @@ pub(crate) async fn check_node_start<D: ExploreDriver>(
 ///   (`src/components/wrappers/WrapperCard.tsx`, `MenuItem`). If one is in a
 ///   snapshot, D4 would fire it, so exploring the runner is not D4-safe. The
 ///   plan's acceptance target is qontinui-web; this fails closed.
-pub(crate) fn explore_app_id(raw: &str) -> Result<String, Refusal> {
-    let app_id = raw.trim();
+pub(crate) fn explore_app_id(app_id: &str) -> Result<String, Refusal> {
     if !super::observe::is_identifier(app_id) {
         return Err(unprocessable(
             "app id must be an identifier ([A-Za-z0-9._:+-], ≤128)",
@@ -2524,18 +2715,22 @@ pub(crate) fn explore_app_id(raw: &str) -> Result<String, Refusal> {
 
 /// `POST /apps/{app_id}/journey/explore`.
 ///
-/// - 400: not JSON; 422: a missing budget field, an unknown field, a bad
-///   `start`, a node start that cannot be reached, an app id that is not an
-///   identifier or names the runner's own app ([`explore_app_id`]), or a
-///   start the app refused — its start URL, or its first snapshot (no row: no
-///   stop word is true of a run that never began) — or a node start behind
-///   an authentication wall;
-/// - 502: the app's answer to the start URL or first snapshot could not be
-///   read (no row);
+/// - 400: not JSON — a body serde cannot parse as JSON at all (a syntax
+///   error or a truncated body), the same status axum's `Json` extractor
+///   answers on the runner's other JSON routes and the observe route
+///   answers; 422: a JSON body of the wrong shape — a missing budget field,
+///   an unknown field, a bad `start` —, a node start that cannot be reached,
+///   an app id that is not an identifier or names the runner's own app
+///   ([`explore_app_id`]), or a start the app refused — its start URL, or its
+///   first snapshot (no row: no stop word is true of a run that never began)
+///   — or a node start behind an authentication wall;
+/// - 502: the app's answer to the start URL, the first snapshot, or the node
+///   start check's snapshot could not be read (no row);
 /// - 409: a run is already exploring this app;
 /// - 503: the journey ledger is not `writing` (the explorer has no private
-///   write path, so a run would add nothing), or the runner itself failed
-///   mid-run (no row is written: none of the seven stop reasons is true);
+///   write path, so a run would add nothing), the runner itself failed
+///   mid-run (no row is written: none of the seven stop reasons is true), or
+///   the node start check could not reach the app or ask the producer;
 /// - 200: the run's answer, with `persistence` saying whether its row was
 ///   written.
 pub async fn post_explore(
@@ -2581,11 +2776,6 @@ pub async fn post_explore(
         run: ExplorerRun::new(run_id.clone()),
         started: Instant::now(),
     };
-    if let ExploreStart::Node(k) = &request.start {
-        if let Err(r) = check_node_start(&mut driver, k).await {
-            return r.into_response();
-        }
-    }
     let outcome = match explore(&mut driver, &request).await {
         Ok(o) => o,
         Err(no_row) => {
@@ -2601,6 +2791,7 @@ pub async fn post_explore(
                 NoRowKind::StartUnknown => {
                     (StatusCode::BAD_GATEWAY, "the exploration could not start")
                 }
+                NoRowKind::StartCheck(status) => (status, "the node start was refused"),
             };
             return (
                 status,
