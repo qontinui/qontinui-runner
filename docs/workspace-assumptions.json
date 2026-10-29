@@ -821,6 +821,24 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/session/tracking_health.rs",
+      "symbol": "const WORK_CHILD_IMAGES",
+      "excerpt": "\"powershell\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/tracking_health.rs",
+      "symbol": "const WORK_CHILD_IMAGES",
+      "excerpt": "\"pwsh\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/step_executor/handlers/check.rs",
       "symbol": "CheckHandler::execute",
       "excerpt": "let mut c = crate::process_helpers::tokio_no_window(\"powershell\");",

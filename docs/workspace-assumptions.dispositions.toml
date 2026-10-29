@@ -596,3 +596,16 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+# qontinui-runner#2426 (plan 2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap
+# Phase 3, the #1987 re-land): the boot-time MCP-child rule's always-work image list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/tracking_health.rs"
+symbol = "const WORK_CHILD_IMAGES"
+disposition = "fallback_correct"
+note = "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
