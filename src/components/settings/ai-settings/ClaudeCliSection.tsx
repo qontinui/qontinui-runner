@@ -71,11 +71,17 @@ const SELECTION_THRESHOLD_FIELDS: {
   },
 ];
 
-/** A percentage-point input value as the stored fraction; empty = no override. */
-function thresholdFromInput(raw: string): number | null {
+/**
+ * A percentage-point input value as the stored fraction; empty = no override.
+ * Clamped to `[minPoints, 100]` — the same bounds the runner applies
+ * (`HeadroomFloors::from_cli`, `handoff_load_estimate_from`) — so the value the
+ * form shows is the value the runner reads.
+ */
+function thresholdFromInput(raw: string, minPoints: number): number | null {
   if (raw.trim() === "") return null;
   const points = Number(raw);
-  return Number.isFinite(points) ? points / 100 : null;
+  if (!Number.isFinite(points)) return null;
+  return Math.min(100, Math.max(minPoints, points)) / 100;
 }
 
 /** A stored fraction as the percentage-point input value; no override = "". */
@@ -925,7 +931,7 @@ export function ClaudeCliSection({
                       value={thresholdToInput(settings.claude_cli[field.key])}
                       placeholder={thresholdToInput(field.defaultValue)}
                       onChange={(e) => {
-                        const value = thresholdFromInput(e.target.value);
+                        const value = thresholdFromInput(e.target.value, field.min);
                         setSettings((prev) => ({
                           ...prev,
                           claude_cli: { ...prev.claude_cli, [field.key]: value },

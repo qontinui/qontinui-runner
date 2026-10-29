@@ -388,7 +388,11 @@ function ascending(x: number, y: number): number {
  * terminal subset in `useSessionManager`) can use the one comparator.
  * `floors` defaults to the built-in values, so it can be handed straight to
  * `Array.prototype.sort`; pass {@link headroomFloorsFromSettings} to honour
- * the runner's overrides.
+ * the runner's overrides. The terminal-side "best account" pickers
+ * (`TerminalPage` `spawnWithPromptText`, `useTerminalCommands`
+ * `resolveAccountConfigDir`, `LaunchMenu`) hold no `AiSettings` and so rank on
+ * the built-in floors: with an override set they can disagree with the
+ * runner's `pick_best_account` and the Settings page marker.
  */
 export function compareByUsageHeadroom(
   a: RankableAccount,

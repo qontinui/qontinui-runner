@@ -57,9 +57,6 @@ describe("compareByUsageHeadroom", () => {
 
   it("prefers the HIGHEST-expected under-pace account, not the emptiest", () => {
     // 'fresh' has far more absolute room (10% used) and a much better delta
-    // (-0.30 vs -0.02), but its window has barely started — its spare
-    // capacity is in no danger of expiring. 'expiring' is nearly through its
-    // week with spare capacity about to be lost outright, so it wins.
     // (-0.30 vs -0.05), but its window has barely started. 'expiring' is
     // under pace past MIN_SHORTFALL, so the window furthest along wins.
     const accounts: A[] = [
