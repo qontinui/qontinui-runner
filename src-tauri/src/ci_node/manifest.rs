@@ -21,10 +21,6 @@
 //! arbitrary registry and RUN it as a listening server on a user's machine.
 //! So a service is NAMED from a closed registry ([`super::services`]) and its
 //! version PINNED, exactly like a tool.
-//!
-//! Two tables are parsed for coord and never acted on here: `[[ci_readers]]`
-//! ([`CiReader`]) and `[[requirements]]` ([`CiRequirement`], the declared
-//! resource floors coord's CI fit verdict reads).
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -225,67 +221,6 @@ pub(crate) struct CiManifest {
     /// CI-node dispatch on `deny_unknown_fields`; it never acts on it.
     #[serde(default)]
     pub ci_readers: Vec<CiReader>,
-    /// Declared resource FLOORS for this repo's CI checks, read by coord's fit
-    /// verdict (plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability`
-    /// Phase 5, D2). The runner PARSES and VALIDATES the table so a repo can
-    /// declare it without failing every CI-node dispatch on
-    /// `deny_unknown_fields`; it never acts on it.
-    #[serde(default)]
-    pub requirements: Vec<CiRequirement>,
-}
-
-/// The OS a requirement names. The census vocabulary coord's runner classes
-/// carry (`linux` | `windows` | `macos`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum RequirementOs {
-    Linux,
-    Windows,
-    Macos,
-}
-
-/// One declared resource FLOOR for one CI check.
-///
-/// Coord derives a check's requirement from its own job resource reports
-/// (`coord.ci_job_observations`) and takes `max(measured, declared)`
-/// quantity by quantity; this table is the declared half. A floor is a LOWER
-/// bound the author can stand behind — never a guess and never a ceiling — so
-/// each entry carries the `reason` that says what measured it.
-///
-/// # The schema — kept IDENTICAL in coord
-///
-/// Coord's reader is `qontinui-coord` `crates/coord/src/ci_fit.rs`
-/// (`DeclaredRequirement`); the two field sets, their units, their bounds and
-/// their validation must not drift apart:
-///
-/// | key               | unit        | meaning                                                  |
-/// |-------------------|-------------|----------------------------------------------------------|
-/// | `check`           | —           | the check-run name exactly as GitHub shows it (a matrix leg's `test (windows-latest)`) |
-/// | `min_phys_mem_mb` | MiB         | memory the job's anonymous working set needs              |
-/// | `min_commit_mb`   | MiB         | commit charge (RAM + pagefile) the job needs (Windows)    |
-/// | `min_vcpu`        | cores       | CPUs                                                      |
-/// | `min_disk_gb`     | GiB         | free disk                                                 |
-/// | `os`              | —           | `linux` \| `windows` \| `macos`                            |
-/// | `reason`          | —           | what measured each number (required, non-empty)           |
-///
-/// At least one of the five constraint keys must be present, every number is
-/// `1..=`[`MAX_REQUIREMENT_VALUE`], a `check` is declared at most once, and
-/// there are at most [`MAX_REQUIREMENTS`] entries.
-///
-/// # Land order: runner first, declarations after
-///
-/// Same coupling as `[[ci_readers]]`: a `[[requirements]]` block is a hard
-/// parse error on any runner built before this field existed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CiRequirement {
-    pub check: String,
-    pub min_phys_mem_mb: Option<u64>,
-    pub min_commit_mb: Option<u64>,
-    pub min_vcpu: Option<u64>,
-    pub min_disk_gb: Option<u64>,
-    pub os: Option<RequirementOs>,
-    pub reason: String,
 }
 
 /// One declared cross-repo CI reader: "the CI of `repo` may check this repo
@@ -657,7 +592,6 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
     validate_canonical(manifest.canonical.as_ref())?;
     validate_repairs(&manifest.repair)?;
     validate_ci_readers(&manifest.ci_readers)?;
-    validate_requirements(&manifest.requirements)?;
     for (i, step) in manifest.steps.iter().enumerate() {
         let label = if step.name.trim().is_empty() {
             format!("steps[{i}]")
@@ -859,63 +793,6 @@ fn validate_ci_readers(readers: &[CiReader]) -> Result<(), String> {
             ));
         }
         seen.push(key);
-    }
-    Ok(())
-}
-
-/// Upper bound on declared requirements — one per heavy check is the use.
-const MAX_REQUIREMENTS: usize = 32;
-
-/// The largest number a requirement may carry in any unit (16 TiB in MiB).
-/// Keeps every value representable in coord's signed 64-bit arithmetic.
-const MAX_REQUIREMENT_VALUE: u64 = 16 * 1024 * 1024;
-
-fn validate_requirements(reqs: &[CiRequirement]) -> Result<(), String> {
-    if reqs.len() > MAX_REQUIREMENTS {
-        return Err(format!(
-            "ci.toml declares {} [[requirements]] (max {MAX_REQUIREMENTS})",
-            reqs.len()
-        ));
-    }
-    let mut seen: Vec<&str> = Vec::new();
-    for (i, r) in reqs.iter().enumerate() {
-        let label = format!("requirements[{i}]");
-        let check = r.check.trim();
-        if check.is_empty() {
-            return Err(format!("{label}: check must be non-empty"));
-        }
-        if seen.contains(&check) {
-            return Err(format!(
-                "{label}: check {check:?} is declared more than once"
-            ));
-        }
-        seen.push(check);
-        if r.reason.trim().is_empty() {
-            return Err(format!(
-                "{label}: reason must say what measured the floor (non-empty)"
-            ));
-        }
-        let numbers = [
-            ("min_phys_mem_mb", r.min_phys_mem_mb),
-            ("min_commit_mb", r.min_commit_mb),
-            ("min_vcpu", r.min_vcpu),
-            ("min_disk_gb", r.min_disk_gb),
-        ];
-        for (key, v) in numbers {
-            if let Some(v) = v {
-                if v == 0 || v > MAX_REQUIREMENT_VALUE {
-                    return Err(format!(
-                        "{label}: {key} {v} out of range (1..={MAX_REQUIREMENT_VALUE})"
-                    ));
-                }
-            }
-        }
-        if numbers.iter().all(|(_, v)| v.is_none()) && r.os.is_none() {
-            return Err(format!(
-                "{label}: declares no constraint (set at least one of min_phys_mem_mb, \
-                 min_commit_mb, min_vcpu, min_disk_gb, os)"
-            ));
-        }
     }
     Ok(())
 }
@@ -1331,118 +1208,6 @@ repo = "example-org/other-consumer"
         let m = parse_and_validate(&text).expect("opt-in parses");
         assert!(m.ci_readers[0].allow_pull_request_target);
         assert!(!m.ci_readers[1].allow_pull_request_target);
-    }
-
-    const WITH_REQUIREMENTS: &str = r#"
-version = 1
-
-[[steps]]
-name = "test"
-command = ["cargo", "test"]
-
-[[requirements]]
-check = "test (windows-latest)"
-os = "windows"
-min_commit_mb = 18630
-reason = "pagefile PeakUsage on green JOBS=1 runs"
-
-[[requirements]]
-check = "test (ubuntu-22.04)"
-min_phys_mem_mb = 4096
-min_vcpu = 2
-min_disk_gb = 10
-reason = "measured"
-"#;
-
-    /// The `[[requirements]]` table parses field for field (the schema coord's
-    /// `ci_fit::DeclaredRequirement` mirrors) and is never a step.
-    #[test]
-    fn requirements_parse_and_are_never_steps() {
-        let m = parse_and_validate(WITH_REQUIREMENTS).expect("valid");
-        assert_eq!(
-            m.requirements,
-            vec![
-                CiRequirement {
-                    check: "test (windows-latest)".to_string(),
-                    min_phys_mem_mb: None,
-                    min_commit_mb: Some(18630),
-                    min_vcpu: None,
-                    min_disk_gb: None,
-                    os: Some(RequirementOs::Windows),
-                    reason: "pagefile PeakUsage on green JOBS=1 runs".to_string(),
-                },
-                CiRequirement {
-                    check: "test (ubuntu-22.04)".to_string(),
-                    min_phys_mem_mb: Some(4096),
-                    min_commit_mb: None,
-                    min_vcpu: Some(2),
-                    min_disk_gb: Some(10),
-                    os: None,
-                    reason: "measured".to_string(),
-                },
-            ]
-        );
-        assert_eq!(m.steps.len(), 1, "a requirement is not a step");
-        let m = parse_and_validate(VALID).expect("valid");
-        assert!(m.requirements.is_empty(), "the table is optional");
-    }
-
-    #[test]
-    fn requirements_reject_bad_declarations() {
-        let cases = [
-            (
-                WITH_REQUIREMENTS.replace("check = \"test (windows-latest)\"", "check = \" \""),
-                "check must be non-empty",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("(ubuntu-22.04)", "(windows-latest)"),
-                "declared more than once",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("reason = \"measured\"", "reason = \"\""),
-                "reason must say what measured",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("min_commit_mb = 18630", "min_commit_mb = 0"),
-                "min_commit_mb 0 out of range",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("min_vcpu = 2", "min_vcpu = 16777217"),
-                "min_vcpu 16777217 out of range",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("os = \"windows\"\nmin_commit_mb = 18630\n", ""),
-                "declares no constraint",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("os = \"windows\"", "os = \"Windows\""),
-                "unknown variant",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("min_disk_gb = 10", "min_disk_gb = 10\nmax_mem_mb = 1"),
-                "unknown field",
-            ),
-            (
-                WITH_REQUIREMENTS.replace("min_commit_mb = 18630", "min_commit_mb = -1"),
-                "ci.toml parse error",
-            ),
-        ];
-        for (text, needle) in cases {
-            let err = parse_and_validate(&text).expect_err(needle);
-            assert!(err.contains(needle), "{needle}: {err}");
-        }
-    }
-
-    #[test]
-    fn requirements_are_capped() {
-        let mut text = String::from("version = 1\n[[steps]]\nname = \"t\"\ncommand = [\"t\"]\n");
-        for i in 0..=MAX_REQUIREMENTS {
-            text.push_str(&format!(
-                "[[requirements]]\ncheck = \"c{i}\"\nmin_vcpu = 1\nreason = \"r\"\n"
-            ));
-        }
-        let err = parse_and_validate(&text).expect_err("over the cap");
-        assert!(err.contains("[[requirements]] (max 32)"), "{err}");
     }
 
     #[test]
