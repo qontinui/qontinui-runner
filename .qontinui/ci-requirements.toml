@@ -1,0 +1,76 @@
+# ===========================================================================
+# CI REQUIREMENTS — declared resource FLOORS for this repo's CI checks.
+#
+# WHO READS THIS FILE: coord, and nothing else. Coord's fit verdict
+# (qontinui-coord crates/coord/src/ci_fit.rs, plan
+# 2026-10-27-coord-routes-ci-jobs-by-runner-capability Phase 5) reads it from
+# its canonical mirror at the default-branch tip. NO CI node reads it: the
+# runner-as-CI-node lane parses `.qontinui/ci.toml` only, and never opens this
+# file.
+#
+# WHY IT IS NOT A TABLE IN `.qontinui/ci.toml`: every CI-node runner parses
+# ci.toml with a compiled-in `deny_unknown_fields` struct (CiManifest,
+# src-tauri/src/ci_node/manifest.rs), and a running runner is never restarted.
+# A new top-level key there would make every runner binary built before the
+# schema change refuse every dispatch of this repo ("unknown field
+# `requirements`") until the whole fleet was rebuilt. A separate file that no
+# CI node parses can be added or changed with no rebuild anywhere.
+#
+# THE SCHEMA (coord validates it; a file that fails validation reads as an
+# UNKNOWN floor, never as "none declared"):
+#
+#   [[requirements]]       at most 32 entries
+#   check            = "<the check-run name exactly as GitHub shows it>"
+#                      each check declared once (trimmed, case-sensitive)
+#   min_phys_mem_mb  = MiB of memory the job's working set needs
+#   min_commit_mb    = MiB of commit charge (RAM + pagefile) — Windows
+#   min_vcpu         = cores
+#   min_disk_gb      = GiB of free disk
+#   os               = "linux" | "windows" | "macos"
+#   reason           = what measured each number (required, not blank)
+#
+#   Every number is 1..=16777216. Each entry sets at least one of the five
+#   constraint keys. Unknown keys are refused.
+#
+# HOW COORD USES IT: the effective requirement is max(measured, declared) per
+# quantity, where "measured" comes from the check's own job resource reports.
+# So a floor only ever RAISES a requirement, and only a LOWER bound that a
+# measurement supports belongs here. A floor above what the check's runner
+# class holds reads that class INCAPABLE, and once admission and routing
+# consume the fit (plan Phases 6-7) an Incapable class is refused — a guessed
+# number here would stall the merge train.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# test (windows-latest) — the Windows leg of ci.yml's `test` matrix.
+#
+# min_commit_mb = 18630 MiB: the HIGHEST Windows pagefile PeakUsage (the
+# MEMPEAK step's `peak_mb` on D:\pagefile.sys, AllocatedBaseSize 32768) across
+# the five green `test (windows-latest)` jobs of main push runs at
+# CARGO_BUILD_JOBS=1 after a29c7fb30 (2026-10-28/29: runs 40714423999,
+# 40740392041, 40763457966, 40782525943 and 40795747148 read 18441, 18630,
+# 18534, 18472 and 16467).
+#
+# Every page in the pagefile is committed memory, so the commit charge was AT
+# LEAST that much. It is a LOWER BOUND on the JOB VM's commit charge — the
+# whole machine's, the image's own services included, not the job's alone —
+# and not an estimate of it: the resident half on top of the pagefile is not
+# measured in this configuration.
+#
+# It sits far under the hosted class's commit limit (16378 MiB RAM + the
+# 32768 MiB pagefile ci.yml's `Configure pagefile` step sets = 49146 MiB), so
+# on its own it reads that class Fits; the job's measured reports decide
+# whether it is Marginal. At CARGO_BUILD_JOBS=2 the same job saturated the
+# pagefile (PeakUsage 32767 in run 40698874691 on 2026-10-28, build failure,
+# and in the 2026-10-27 incident run 40449994591). That configuration needs
+# more, and this floor does not describe it.
+#
+# os = "windows": the check is the Windows matrix leg by definition.
+# No min_phys_mem_mb, min_vcpu or min_disk_gb: nothing measures them for this
+# job in this configuration.
+# ---------------------------------------------------------------------------
+[[requirements]]
+check = "test (windows-latest)"
+os = "windows"
+min_commit_mb = 18630
+reason = "commit >= 18630 MiB, the highest Windows pagefile PeakUsage over five green CARGO_BUILD_JOBS=1 main runs after a29c7fb30 (2026-10-28/29); a lower bound on the job VM's machine-wide commit charge"
