@@ -6278,6 +6278,56 @@ mod tests {
         (outbox, coord, rec, s)
     }
 
+    /// The arming test for the 404 recovery: it enters only through
+    /// `drain_tick`, the door the drain loop drives, and observes only what
+    /// coord saw. Without the recovery the 404'd close is ACK-dropped and coord
+    /// never sees a second create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_coord_row_is_re_created_through_the_drain_tick() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Started,
+                json!({ "id": s, "kind": "terminal_claude", "intent": { "purpose": "lost" } }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+        {
+            let mut g = rec.lock().await;
+            assert_eq!(g.post_count, 1, "the create reached coord");
+            g.created_ids.clear(); // coord lost the row
+            g.patch_returns_404 = true;
+        }
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+
+        assert!(outbox.pending().unwrap().is_empty());
+        let g = rec.lock().await;
+        assert_eq!(g.post_count, 2, "coord saw the row re-created");
+        assert_eq!(g.posts[1]["id"], json!(s));
+        assert_eq!(g.patches.len(), 2, "the 404'd close, then its retry");
+        assert_eq!(g.patches[1].1["state"], "closed");
+    }
+
     /// A 404 `session_not_found` on the `closed` PATCH re-creates the coord
     /// row from the recorded create body (same id) and retries the close in
     /// the same chain — the close lands instead of being ACK-dropped.
