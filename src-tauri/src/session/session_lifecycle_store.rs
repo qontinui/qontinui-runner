@@ -861,6 +861,14 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Unix millis of the most recent provider SessionStart hook that reported
+    /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
+    /// process last started (or resumed into) its terminal. The durable half of
+    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
+    /// whose operator ran `/resume` still resolves to the resumed session after
+    /// a restart. `None` = no hook seen, or the record predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_start_at: Option<i64>,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -966,12 +974,14 @@ pub struct SessionLifecycleStore {
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
     /// open sessions on this terminal STARTED most recently", which
-    /// [`Self::latest_open_on_terminal`] needs and no persisted field can say:
-    /// `confirmed_at` is monotonic (a typed `claude --resume X` of a session
-    /// confirmed earlier keeps X's OLD stamp) and `last_seen_at` is bumped by
-    /// every liveness touch of every open record. Process-local by design: a
-    /// runner restart re-spawns every PTY, and each restored provider fires its
-    /// hook again. LOCK ORDER — `map` then this, never the reverse.
+    /// [`Self::latest_open_on_terminal`] needs: `confirmed_at` is monotonic (a
+    /// typed `claude --resume X` of a session confirmed earlier keeps X's OLD
+    /// stamp) and `last_seen_at` is bumped by every liveness touch of every
+    /// open record. The durable twin is
+    /// [`TerminalSessionRecord::last_session_start_at`], which carries the
+    /// order across a restart — a holder-adopted pane fires no new hook. This
+    /// counter only breaks that stamp's ties and wall-clock steps.
+    /// LOCK ORDER — `map` then this, never the reverse.
     session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
@@ -1914,7 +1924,7 @@ impl SessionLifecycleStore {
     ///   winner, and report [`CloseOutcome::RedirectedAmbiguous`] naming every
     ///   candidate. A nondeterministic close would be a worse failure than the
     ///   silent no-op it replaces, because it is not reproducible — which is
-    ///   why this must not be a single-match `find_open_by_terminal` call.
+    ///   why this must not be a first-match `.find()` over the map.
     /// * Nothing resolves — [`CloseOutcome::NotFound`], `warn!` with both ids,
     ///   and **no row is mutated and no observer fires**.
     ///
@@ -2284,9 +2294,9 @@ impl SessionLifecycleStore {
     /// `TerminalSession` title, so the durable registry stayed frozen at the
     /// spawn-time title and a restart restored the pane under a stale name.
     /// Keyed by terminal id because the rename call sites hold only that —
-    /// same resolution [`Self::find_open_by_terminal`] performs. No-op (no
-    /// write) if no open record references the terminal, or the title is
-    /// already current.
+    /// the same row [`Self::find_open_by_terminal`] resolves (the session
+    /// running there). No-op (no write) if no open record references the
+    /// terminal, or the title is already current.
     pub fn update_title_by_terminal(&self, terminal_id: &str, title: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -2296,8 +2306,11 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
+            let Some(id) = self.ranked_open_id(&m, terminal_id, |_| true) else {
                 return; // no open record hosts this terminal — nothing to flush
+            };
+            let Some(rec) = m.get_mut(&id) else {
+                return;
             };
             if rec.title.as_deref() == Some(title) {
                 return; // already current — nothing to flush
@@ -2395,8 +2408,11 @@ impl SessionLifecycleStore {
     /// in-memory `TerminalSession.page_id`; without this flush the durable
     /// record stays frozen at the spawn-time page, so a restart would restore
     /// the pane on its original page rather than where the operator moved it.
-    /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
-    /// open record references the terminal, or the page is already current.
+    /// Sibling of [`Self::update_title_by_terminal`], but applied to EVERY
+    /// open record on the terminal: the page is where the pane sits, not a
+    /// property of whichever session runs in it, and a terminal can carry
+    /// several open rows. No-op (no write) if no open record references the
+    /// terminal, or every page is already current.
     pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -2406,23 +2422,27 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
-                return; // no open record hosts this terminal — nothing to flush
-            };
-            if rec.page_id == page_id {
-                return; // already current — nothing to flush
+            let changed: Vec<TerminalSessionRecord> = m
+                .values_mut()
+                .filter(|r| open_on_terminal(r, terminal_id) && r.page_id != page_id)
+                .map(|rec| {
+                    rec.page_id = page_id.to_string();
+                    rec.clone()
+                })
+                .collect();
+            if changed.is_empty() {
+                return; // nothing hosts this terminal, or already current
             }
-            rec.page_id = page_id.to_string();
-            let changed = rec.clone();
-            self.persist(
-                m,
-                &[LifecycleDelta::Upsert {
-                    rec: Box::new(changed.clone()),
-                }],
-            );
+            let deltas: Vec<LifecycleDelta> = changed
+                .iter()
+                .map(|r| LifecycleDelta::Upsert {
+                    rec: Box::new(r.clone()),
+                })
+                .collect();
+            self.persist(m, &deltas);
             changed
         };
-        self.snapshot_change(std::iter::once(changed));
+        self.snapshot_change(changed);
     }
 
     /// Mark a present session as restore-pending (a boot-restore is about to
@@ -3000,12 +3020,14 @@ impl SessionLifecycleStore {
                 return false;
             }
         };
-        // The FIRST open record on the terminal. That is the spawn's record
-        // because a terminal hosts at most ONE live provider session — the
-        // single-tenant-terminal invariant `record_open` enforces by superseding
-        // siblings. If that invariant ever loosened, this pick would become a
-        // guess and must be keyed by session id instead.
-        let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
+        // The open record ranked as the session running on the terminal. A
+        // terminal can carry several open rows (`record_open` supersedes only
+        // unconfirmed siblings), so this is the ranked pick, not a first match;
+        // the `opened_at` gate below still refuses a row older than the spawn.
+        let rec = self
+            .ranked_open_id(&m, terminal_id, |_| true)
+            .and_then(|id| m.get_mut(&id));
+        let Some(rec) = rec else {
             debug!(
                 terminal_id,
                 "session_lifecycle_store: no open record for terminal — spawn default dropped"
@@ -3175,21 +3197,20 @@ impl SessionLifecycleStore {
         );
     }
 
-    /// Clone of the open record currently hosted by `terminal_id`, if any.
-    /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
-    /// reference a given terminal at a time. A blank id resolves to nothing —
-    /// it is how an unbound row (a held one included) is represented.
+    /// Clone of the open record whose session is RUNNING on `terminal_id`, if
+    /// any. A blank id resolves to nothing — it is how an unbound row (a held
+    /// one included) is represented.
+    ///
+    /// A terminal can carry several open rows at once — a pane whose operator
+    /// ran `/resume` (or typed `claude --resume X`) keeps the pane's original
+    /// confirmed row open beside the resumed one, because the hook bind evicts
+    /// only UNCONFIRMED siblings. So this is NOT a first match over the
+    /// `HashMap`: it picks the same row [`Self::latest_open_on_terminal`]
+    /// ranks highest. A first match once made the token-exhaustion migration
+    /// resume a 7-day-stale pane session and close the pane running the real
+    /// one (2026-10-29, terminal `5b27af82`).
     pub fn find_open_by_terminal(&self, terminal_id: &str) -> Option<TerminalSessionRecord> {
-        match self.map.lock() {
-            Ok(m) => m
-                .values()
-                .find(|r| open_on_terminal(r, terminal_id))
-                .cloned(),
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on find_open_by_terminal");
-                None
-            }
-        }
+        self.ranked_open_on_terminal(terminal_id, |_| true)
     }
 
     /// Like [`Self::find_open_by_terminal`], but only returns a CONFIRMED
@@ -3218,24 +3239,49 @@ impl SessionLifecycleStore {
         &self,
         terminal_id: &str,
     ) -> Option<TerminalSessionRecord> {
-        self.find_open_by_terminal(terminal_id)
-            .filter(|r| r.confirmed_at.is_some())
+        self.ranked_open_on_terminal(terminal_id, |r| r.confirmed_at.is_some())
     }
 
     /// Record that a provider's SessionStart hook just reported
     /// `claude_session_id` — the process that hook came from is now the one
-    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`].
+    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`]: the
+    /// process-local order, and the durable
+    /// [`TerminalSessionRecord::last_session_start_at`] stamp that carries the
+    /// answer across a restart. Never creates a record.
     pub fn note_session_start_hook(&self, claude_session_id: &str) {
-        match self.session_start_hooks.lock() {
-            Ok(mut g) => {
-                g.0 += 1;
-                let seq = g.0;
-                g.1.insert(claude_session_id.to_string(), seq);
+        let now = Utc::now().timestamp_millis();
+        match self.map.lock() {
+            Ok(mut m) => {
+                if let Some(rec) = m.get_mut(claude_session_id) {
+                    rec.last_session_start_at = Some(now);
+                    let changed = rec.clone();
+                    // Not snapshotted or mirrored: the stamp is a ranking
+                    // input for terminal lookups, not layout or wire state.
+                    self.persist(
+                        m,
+                        &[LifecycleDelta::Upsert {
+                            rec: Box::new(changed),
+                        }],
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on note_session_start_hook");
             }
         }
+        let mut g = self.hook_order();
+        g.0 += 1;
+        let seq = g.0;
+        g.1.insert(claude_session_id.to_string(), seq);
+    }
+
+    /// The process-local hook order. A poisoned lock is recovered rather than
+    /// refused: the guarded data is a counter and a map with no invariant a
+    /// panic can break, and refusing would blank every terminal lookup.
+    fn hook_order(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<String, u64>)> {
+        self.session_start_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// The MOST RECENT open session on `terminal_id`, other than `exclude` —
@@ -3245,51 +3291,74 @@ impl SessionLifecycleStore {
     /// pinned to P whose operator then typed `claude --resume X`: the hook
     /// bind evicts only UNCONFIRMED siblings, confirming runs no supersede
     /// scan, and liveness keeps both alive while any provider runs in the
-    /// subtree), so [`Self::find_open_by_terminal`]'s first-match over the
-    /// `HashMap` would pick one by iteration order. This ranks instead, greatest
-    /// wins:
+    /// subtree), so a first match over the `HashMap` would pick one by
+    /// iteration order. This ranks instead, greatest wins:
     ///
     /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
-    /// 2. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
-    /// 3. then `last_seen_at`, then `opened_at`;
-    /// 4. then `claude_session_id`, so the choice is deterministic even on a
+    /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
+    ///    the same fact, surviving a restart or a holder handoff, whose adopted
+    ///    panes fire no new hook;
+    /// 3. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 4. then `last_seen_at`, then `opened_at`;
+    /// 5. then `claude_session_id`, so the choice is deterministic even on a
     ///    full tie.
     ///
-    /// The hook order comes first because `confirmed_at` is monotonic: a typed
-    /// resume of a session confirmed BEFORE the pane's own session keeps the
-    /// older stamp and would lose to the pane on `confirmed_at` alone.
+    /// Hook order comes before `confirmed_at` because `confirmed_at` is
+    /// monotonic: a typed resume of a session confirmed BEFORE the pane's own
+    /// session keeps the older stamp and would lose to the pane on
+    /// `confirmed_at` alone. The process-local order leads the durable stamp
+    /// because it cannot be misordered by a wall-clock step.
     pub fn latest_open_on_terminal(
         &self,
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
-        if terminal_id.trim().is_empty() {
-            return None;
-        }
+        self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
+    }
+
+    /// The open row on `terminal_id` that `admit` accepts and that ranks
+    /// highest by [`Self::latest_open_on_terminal`]'s order — the selector
+    /// behind the "which session is running on this terminal" reads and the
+    /// terminal-keyed writes. (Closing by terminal ranks differently, by
+    /// [`open_authority_key`]: it settles which row a dead PTY's exit closes.)
+    fn ranked_open_on_terminal(
+        &self,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<TerminalSessionRecord> {
         let m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on latest_open_on_terminal");
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on ranked_open_on_terminal");
                 return None;
             }
         };
-        let hooks = match self.session_start_hooks.lock() {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: hook-order lock poisoned on latest_open_on_terminal");
-                return None;
-            }
-        };
+        let id = self.ranked_open_id(&m, terminal_id, admit)?;
+        m.get(&id).cloned()
+    }
+
+    /// Id of the row [`Self::ranked_open_on_terminal`] picks, for a caller
+    /// already holding `map`. Takes the hook-order lock, so it keeps the
+    /// store's LOCK ORDER — `map` then hooks.
+    fn ranked_open_id(
+        &self,
+        m: &HashMap<String, TerminalSessionRecord>,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<String> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        let hooks = self.hook_order();
         m.values()
-            .filter(|r| {
-                r.state == "open" && r.terminal_id == terminal_id && r.claude_session_id != exclude
-            })
+            .filter(|r| open_on_terminal(r, terminal_id) && admit(r))
             .max_by(|a, b| {
                 let key = |r: &TerminalSessionRecord| {
                     (
                         hooks.1.get(&r.claude_session_id).copied(),
+                        r.last_session_start_at,
                         r.confirmed_at,
                         r.last_seen_at,
                         r.opened_at,
@@ -3299,7 +3368,7 @@ impl SessionLifecycleStore {
                     .cmp(&key(b))
                     .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
             })
-            .cloned()
+            .map(|r| r.claude_session_id.clone())
     }
 
     /// Clone of the record for `claude_session_id`, open or closed.
@@ -5507,6 +5576,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
     }
 }
 
@@ -5735,6 +5805,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -6127,6 +6198,107 @@ mod tests {
                 .is_none(),
             "an unknown terminal id resolves to None"
         );
+    }
+
+    /// A pane pinned to P whose operator then ran `/resume X` keeps BOTH rows
+    /// open (the hook bind evicts only unconfirmed siblings), and the terminal
+    /// lookups must name X — the session actually running — every time, not
+    /// whichever row the `HashMap` yields first. Incident 2026-10-29: the
+    /// token-exhaustion migration resolved terminal `5b27af82` to its stale
+    /// pane session, resumed that, and closed the pane running the real one.
+    /// Driven through the same calls `POST /control/session-open` makes.
+    #[test]
+    fn terminal_lookups_name_the_resumed_session_not_the_stale_pane_row() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            for id in ["pane-p", "resumed-x"] {
+                store.record_open(auth_on(id, "term-r"));
+                store.confirm_session(id);
+                store.note_session_start_hook(id);
+            }
+            assert_eq!(
+                store.get("pane-p").unwrap().state,
+                "open",
+                "precondition: the stale pane row survives the resume"
+            );
+            // An unconfirmed row bound later must not displace X from the
+            // confirmed lookup.
+            let mut phantom = rec("phantom");
+            phantom.terminal_id = "term-r".to_string();
+            phantom.origin = Some(ORIGIN_OBSERVED.to_string());
+            store.record_open(phantom);
+
+            assert_eq!(
+                store
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+            assert_eq!(
+                store
+                    .find_confirmed_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// The same answer after a restart: the process-local hook order is gone
+    /// (a holder-adopted pane fires no new hook), so the durable
+    /// `last_session_start_at` must carry it. The resumed session is given the
+    /// OLDER `confirmed_at` — it was confirmed in another pane before this one
+    /// — which is exactly the case `confirmed_at` alone gets wrong.
+    #[test]
+    fn resumed_session_still_wins_after_reload() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            {
+                let store = SessionLifecycleStore::open(&path).unwrap();
+                let mut x = auth_on("resumed-x", "term-r");
+                x.confirmed_at = Some(1_000);
+                store.record_open(x);
+                store.record_open(auth_on("pane-p", "term-r"));
+                store.confirm_session("pane-p");
+                store.note_session_start_hook("pane-p");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                store.note_session_start_hook("resumed-x");
+                assert_eq!(store.get("pane-p").unwrap().state, "open");
+            }
+            let reloaded = SessionLifecycleStore::open(&path).unwrap();
+            assert!(reloaded
+                .get("resumed-x")
+                .unwrap()
+                .last_session_start_at
+                .is_some());
+            assert_eq!(
+                reloaded
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// A page move relocates every open row on the pane, so the stale sibling
+    /// cannot be restored on the page the pane left.
+    #[test]
+    fn update_page_by_terminal_moves_every_open_row_on_the_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        for id in ["pane-p", "resumed-x"] {
+            store.record_open(auth_on(id, "term-r"));
+            store.confirm_session(id);
+        }
+        store.record_open(auth_on("elsewhere", "term-other"));
+        store.update_page_by_terminal("term-r", "page-2");
+        assert_eq!(store.get("pane-p").unwrap().page_id, "page-2");
+        assert_eq!(store.get("resumed-x").unwrap().page_id, "page-2");
+        assert_eq!(store.get("elsewhere").unwrap().page_id, "default");
     }
 
     /// `confirm_session` flips provisional→confirmed monotonically, a
@@ -7366,7 +7538,7 @@ mod tests {
     /// with `open_authority_key`, so a CONFIRMED row wins over a newer
     /// unconfirmed one, and every candidate is named.
     ///
-    /// A `find_open_by_terminal`-style single `.find()` over the `HashMap` would
+    /// A first-match `.find()` over the `HashMap` would
     /// close a nondeterministic row here — a worse failure than the silent
     /// no-op it replaces, because it is not reproducible.
     #[test]
@@ -9669,6 +9841,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 

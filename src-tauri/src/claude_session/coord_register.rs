@@ -3824,6 +3824,7 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
             },
         );
         let finished_at = store
@@ -3926,6 +3927,7 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
             },
         );
         let coord_id = reg
