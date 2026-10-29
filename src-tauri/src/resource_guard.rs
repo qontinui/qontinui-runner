@@ -1015,7 +1015,11 @@ pub(crate) struct GateObservation {
     /// [`Lane::as_str`] — `"host"`, `"wsl"` or `"threads"`. Never a literal.
     pub(crate) lane: String,
     pub(crate) metric: LaneMetric,
-    /// What was measured, in the metric's own unit.
+    /// What was measured, in the metric's own unit — or, for an unattended
+    /// admission refused by [`projected_verdict`], the PROJECTED reading: the
+    /// measured value with every admitted, not-yet-running spawn charged at
+    /// [`ProjectedSpawnCost`]. The box never read that number; the deferral log
+    /// line names the pending count beside it.
     pub(crate) observed: u64,
     /// The floor it fell below, or the ceiling it rose above.
     pub(crate) limit: u64,
@@ -2439,8 +2443,9 @@ pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
 /// (`poll_pending_continuations` spawns one task per row, unbounded) therefore
 /// reads the SAME pre-burst headroom N times and admits all N. That is the
 /// 2026-10-27 spaceship incident's shape (20 continuations passed the guard at
-/// once), and it is the insight of plan
-/// `2026-10-28-gate-continuation-cap-is-a-real-permit`, carried here into the
+/// once with `QONTINUI_CONTINUATION_SESSION_CAP=9`, as measured in the Why of
+/// plan `2026-10-28-gate-continuation-cap-is-a-real-permit`), and it is that
+/// plan's insight, carried here into the
 /// resource-lane admission instead of into a fixed count (plan
 /// `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`
 /// D2; the count stays retired by operator direction 2026-10-03).
@@ -2492,9 +2497,13 @@ impl AdmissionReading {
     }
 
     /// The composed verdict once `pending` admitted-but-not-yet-running spawns
-    /// are charged against the readings. See [`projected_verdict`].
+    /// are charged against the readings. See [`projected_verdict`]. Writes the
+    /// same edge-triggered shadowed-lane line [`probe_for_spawn`] writes, so a
+    /// lane that tripped but lost the report still reaches the log.
     pub(crate) fn projected(&self, pending: usize) -> SpawnGate {
-        projected_verdict(self.lanes.as_ref(), pending, self.cost)
+        let (reported, shadowed) = projected_lanes(self.lanes.as_ref(), pending, self.cost);
+        note_shadowed_lane(shadowed.as_ref());
+        reported
     }
 }
 
@@ -2515,11 +2524,21 @@ pub(crate) fn projected_verdict(
     pending: usize,
     cost: ProjectedSpawnCost,
 ) -> SpawnGate {
+    projected_lanes(lanes, pending, cost).0
+}
+
+/// [`projected_verdict`] with the shadowed lane [`compose_lanes`] reports beside
+/// the heavier one. PURE.
+fn projected_lanes(
+    lanes: Option<&LaneVerdicts>,
+    pending: usize,
+    cost: ProjectedSpawnCost,
+) -> (SpawnGate, Option<SpawnGate>) {
     let Some(lanes) = lanes else {
-        return SpawnGate::Proceed;
+        return (SpawnGate::Proceed, None);
     };
     if pending == 0 {
-        return composed_verdict(lanes);
+        return compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone());
     }
     let pending_bytes = cost.commit_bytes.saturating_mul(pending as u64);
     let memory = match lanes.free_commit_bytes {
@@ -2542,7 +2561,7 @@ pub(crate) fn projected_verdict(
         ),
         None => lanes.threads.verdict.clone(),
     };
-    compose_lanes(memory, threads).0
+    compose_lanes(memory, threads)
 }
 
 /// [`evaluate`]'s comparison over explicit floors, for a caller that holds the
@@ -2606,6 +2625,13 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
         return SpawnGate::Proceed;
     };
     let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads.verdict);
+    note_shadowed_lane(shadowed.as_ref());
+    reported
+}
+
+/// The edge-triggered "a second lane also tripped" line, shared by the gate
+/// ([`probe_for_spawn`]) and unattended admission ([`AdmissionReading::projected`]).
+fn note_shadowed_lane(shadowed: Option<&SpawnGate>) {
     // The lane that tripped but lost the report. Logged so the operator's log
     // says both, even though the toast or the refusal can only say one. The
     // severity word comes from the shadowed verdict itself, not from the
@@ -2621,7 +2647,6 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
     // backlog with both lanes tripped. It is written when the shadowed
     // (lane, severity) pair CHANGES, and not again until it does.
     let shadow_key = shadowed
-        .as_ref()
         .and_then(SpawnGate::tripped)
         .map(|(severity, obs)| (obs.metric, severity));
     let shadow_changed = {
@@ -2631,7 +2656,6 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
         changed
     };
     if let Some((severity, obs)) = shadowed
-        .as_ref()
         .and_then(SpawnGate::tripped)
         .filter(|_| shadow_changed)
     {
@@ -2646,7 +2670,6 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
             obs.clause(severity),
         );
     }
-    reported
 }
 
 /// `bytes` as `"1.42 GiB"`. Two decimals because the shipped critical floor is
@@ -5816,7 +5839,10 @@ mod tests {
     };
 
     fn proj_lanes(free: Option<u64>, graded: Option<usize>) -> LaneVerdicts {
-        let ceilings = ThreadCeilings { warn: 100, critical: 200 };
+        let ceilings = ThreadCeilings {
+            warn: 100,
+            critical: 200,
+        };
         let floors = SessionGuardSettings {
             warn_free_commit_bytes: 1_000,
             critical_free_commit_bytes: 500,
@@ -5848,9 +5874,16 @@ mod tests {
             proj_lanes(Some(1_500), Some(150)),
             proj_lanes(None, None),
         ] {
-            assert_eq!(projected_verdict(Some(&lanes), 0, PROJ_COST), composed_verdict(&lanes));
+            assert_eq!(
+                projected_verdict(Some(&lanes), 0, PROJ_COST),
+                composed_verdict(&lanes)
+            );
         }
-        assert_eq!(projected_verdict(None, 99, PROJ_COST), SpawnGate::Proceed, "disabled guard");
+        assert_eq!(
+            projected_verdict(None, 99, PROJ_COST),
+            SpawnGate::Proceed,
+            "disabled guard"
+        );
     }
 
     /// Each pending admission is charged against BOTH lanes: free commit falls by
@@ -5861,17 +5894,26 @@ mod tests {
         // 1_250 free, warn floor 1_000, 100 per spawn: 0..=2 pending proceed,
         // 3 pending projects 950 -> Warn, 8 pending projects 450 -> Critical.
         let mem = proj_lanes(Some(1_250), None);
-        assert_eq!(projected_verdict(Some(&mem), 2, PROJ_COST), SpawnGate::Proceed);
+        assert_eq!(
+            projected_verdict(Some(&mem), 2, PROJ_COST),
+            SpawnGate::Proceed
+        );
         match projected_verdict(Some(&mem), 3, PROJ_COST) {
             SpawnGate::Warn(obs) => assert_eq!((obs.observed, obs.limit), (950, 1_000)),
             other => panic!("expected memory Warn, got {other:?}"),
         }
-        assert!(matches!(projected_verdict(Some(&mem), 8, PROJ_COST), SpawnGate::Critical(_)));
+        assert!(matches!(
+            projected_verdict(Some(&mem), 8, PROJ_COST),
+            SpawnGate::Critical(_)
+        ));
 
         // 75 graded threads, warn ceiling 100, 10 per spawn: 2 pending -> 95,
         // 3 pending -> 105 > 100.
         let thr = proj_lanes(None, Some(75));
-        assert_eq!(projected_verdict(Some(&thr), 2, PROJ_COST), SpawnGate::Proceed);
+        assert_eq!(
+            projected_verdict(Some(&thr), 2, PROJ_COST),
+            SpawnGate::Proceed
+        );
         match projected_verdict(Some(&thr), 3, PROJ_COST) {
             SpawnGate::Warn(obs) => {
                 assert_eq!(obs.metric, LaneMetric::ThreadCount);
@@ -5886,7 +5928,10 @@ mod tests {
     #[test]
     fn projection_leaves_unknown_readings_unknown_and_saturates() {
         let unknown = proj_lanes(None, None);
-        assert_eq!(projected_verdict(Some(&unknown), 1_000, PROJ_COST), SpawnGate::Proceed);
+        assert_eq!(
+            projected_verdict(Some(&unknown), 1_000, PROJ_COST),
+            SpawnGate::Proceed
+        );
         let huge = ProjectedSpawnCost {
             commit_bytes: u64::MAX,
             threads: usize::MAX,
