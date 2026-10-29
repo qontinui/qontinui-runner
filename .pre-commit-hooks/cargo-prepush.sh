@@ -492,7 +492,7 @@ trap 'restore_lock; cleanup_clippy_log; release_shared_target' EXIT
 GUARD_RC=10
 if declare -F guard_shared_target >/dev/null 2>&1; then
   GUARD_RC=0
-  guard_shared_target "$ROOT" "[pre-push]" || GUARD_RC=$?
+  guard_shared_target "$ROOT" "[pre-push]" "$ROOT/src-tauri" || GUARD_RC=$?
 fi
 case "$GUARD_RC" in
   0|10) ;;
@@ -540,11 +540,19 @@ if [[ "$clippy_rc" -ne 0 ]]; then
     # none). Calling it "a lint fired" sent the 2026-10-29 push hunting a lint
     # that did not exist.
     echo "[pre-push] FAIL — a compile error (or deny-tier lint) — see the error[E…] lines above."
+    # Said on EVERY coded error, guarded or not: the tree lock only knows builds
+    # that take it, and cargo-guard.sh (until qontinui-claude-config#1823),
+    # rust-analyzer or a raw cargo can still leave a peer's units in the target
+    # (see lib/shared-target.sh, "WHAT IT DOES NOT COVER").
     if [[ "$GUARD_RC" == "10" ]]; then
-      echo "          This target is UNGUARDED: if the error names code that exists in"
-      echo "          this tree, re-run with a private CARGO_TARGET_DIR before changing"
-      echo "          any code — a peer checkout's stale build may be the cause."
+      echo "          This target is UNGUARDED, so a peer checkout's stale build can"
+      echo "          be the cause."
+    else
+      echo "          The target was guarded, but builds that skip the tree lock can"
+      echo "          still leave a peer checkout's stale units behind."
     fi
+    echo "          If the error names code that EXISTS in this tree, re-run with a"
+    echo "          private CARGO_TARGET_DIR before changing any code."
     echo "          Fix it, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
   elif grep -qE '^error(\[|:)' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
