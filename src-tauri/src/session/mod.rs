@@ -308,8 +308,9 @@ pub enum SessionEventKind {
     FindingPosted,
     /// Session FINISHED marker (plan
     /// `2026-09-01-session-finished-marker-and-unfinished-resume`, Phase 2).
-    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished"}}`
-    /// — the same door `Progress` uses, so the target is the URL path and the
+    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished",
+    /// last_progress_at}}` (the payload's `finished_at`, so coord dates the
+    /// finish at the mark rather than at the drain) — the same door `Progress` uses, so the target is the URL path and the
     /// peer-clobber trap in `coord_report_status` (which resolves an omitted
     /// `claude_code_session_id` to the device's most-recently-started session)
     /// does not apply to this rung.

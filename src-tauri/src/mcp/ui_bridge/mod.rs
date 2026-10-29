@@ -856,7 +856,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/ai/expect"),
             ("POST", "/ui-bridge/ai/fill-form"),
             ("POST", "/ui-bridge/ai/image-diff"),
-            ("POST", "/ui-bridge/ai/media/audit/{}"),
             // page-summary is a runner-only `/ai/*` read extension (not in the
             // SDK contract). It accepts GET as well as POST so verification
             // drivers can read it with GET without tripping the auto-405 →
@@ -989,12 +988,6 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/ai/analyze/data"),
             ("GET", "/ui-bridge/ai/analyze/regions"),
             ("GET", "/ui-bridge/ai/analyze/structured-data"),
-            // Media audit named subpaths — runner exposes the parameterised
-            // /ai/media/audit/{audit_type} form which routes via Path<String>.
-            // SDK declares concrete subpaths; aliasing them would require
-            // wrapper handlers that hardcode the audit-type string.
-            ("POST", "/ui-bridge/ai/media/audit/accessibility"),
-            ("POST", "/ui-bridge/ai/media/audit/performance"),
             // Spawn-headless — deferred (Bucket C7 of the 2026-05-07 plan).
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.

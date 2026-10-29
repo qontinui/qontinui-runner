@@ -3510,7 +3510,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_explorer::start_exploration,
             commands::state_machine::clear_action_log,
             commands::state_machine::get_action_log_view,
-            commands::state_machine::navigate_to_state,
             commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
             commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
             commands::state_machine_configs::sm_create_config,
