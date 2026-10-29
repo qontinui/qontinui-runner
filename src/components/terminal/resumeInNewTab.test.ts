@@ -23,11 +23,14 @@ vi.mock("@/lib/instance-storage", () => ({
 import { recallSessionId } from "./lastKnownSessionIds";
 import {
   describeResumeFailure,
-  pastSessionResumeNotice,
+  forkInNewTab,
+  pastSessionResumeTarget,
   resumeFailureNotice,
   resumeInNewTab,
   resumeProfileSession,
+  resumeThrownNotice,
   retryResumeArgs,
+  runVerifiedFork,
   type ResumeInNewTabDeps,
 } from "./resumeInNewTab";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -123,9 +126,24 @@ describe("resumeInNewTab", () => {
     expect(createTerminal).not.toHaveBeenCalled();
   });
 
-  it("an unreadable live registry does not refuse an operator's explicit resume", async () => {
-    const { d } = deps({ liveSessionIds: async () => null });
-    await expect(resumeInNewTab(d, target)).resolves.toMatchObject({ kind: "verified" });
+  it("an unreadable live registry REFUSES (liveness-unknown) — a click never falls through to a resume that may fork", async () => {
+    const { d, createTerminal } = deps({ liveSessionIds: async () => null });
+    await expect(resumeInNewTab(d, target)).resolves.toEqual({
+      kind: "failed",
+      failure: "liveness-unknown",
+      tabId: null,
+    });
+    expect(createTerminal).not.toHaveBeenCalled();
+  });
+
+  it("allowLive (the dialog's explicit 'Resume anyway') skips the liveness read entirely", async () => {
+    const liveSessionIds = vi.fn(async () => new Set([target.claudeSessionId]));
+    const { d, createTerminal } = deps({ liveSessionIds });
+    await expect(resumeInNewTab(d, target, undefined, { allowLive: true })).resolves.toMatchObject({
+      kind: "verified",
+    });
+    expect(liveSessionIds).not.toHaveBeenCalled();
+    expect(createTerminal).toHaveBeenCalledTimes(1);
   });
 
   it("reports a refused spawn and an unverified resume as distinct failures", async () => {
@@ -379,7 +397,7 @@ describe("retryResumeArgs (the ResumeFailedBanner Retry)", () => {
   });
 });
 
-describe("pastSessionResumeNotice (a Previous Sessions one-click Resume)", () => {
+describe("pastSessionResumeTarget (a Previous Sessions one-click Resume, before the gate)", () => {
   const ps = {
     claudeSessionId: "abc-123",
     resumeName: "amber-otter",
@@ -388,35 +406,146 @@ describe("pastSessionResumeNotice (a Previous Sessions one-click Resume)", () =>
     provider: "claude",
   };
 
-  it("resumes in THE resume dir and says nothing when it came back", async () => {
-    const resume = vi.fn(async () => ({ kind: "verified" as const, tabId: "t" }));
-    await expect(pastSessionResumeNotice(ps, resume)).resolves.toBeNull();
-    expect(resume).toHaveBeenCalledWith({
-      claudeSessionId: "abc-123",
-      displayName: "amber-otter",
-      workingDir: "D:/repo",
-      configDir: "C:/claude/.claude-gmail",
-      provider: "claude",
+  it("resolves the target in THE resume dir, with the conversation's name", () => {
+    expect(pastSessionResumeTarget(ps)).toEqual({
+      kind: "target",
+      target: {
+        claudeSessionId: "abc-123",
+        displayName: "amber-otter",
+        workingDir: "D:/repo",
+        configDir: "C:/claude/.claude-gmail",
+        provider: "claude",
+      },
+      conversationName: "amber-otter",
     });
   });
 
-  it("a REJECTED resume surfaces as a notice, never silence", async () => {
-    const resume = vi.fn(async () => {
-      throw new Error("ipc down");
+  it("an unnamed session keeps the claude <id8> tab name but has no conversation name", () => {
+    const r = pastSessionResumeTarget({ ...ps, resumeName: "" });
+    expect(r).toMatchObject({
+      kind: "target",
+      target: { displayName: "claude abc-123" },
+      conversationName: null,
     });
-    await expect(pastSessionResumeNotice(ps, resume)).resolves.toBe(
+  });
+
+  it("refuses with a reason when the account or the dir is unknown", () => {
+    expect(pastSessionResumeTarget({ ...ps, resumeDir: null })).toMatchObject({
+      kind: "refused",
+      notice: expect.stringMatching(/no working directory/),
+    });
+    expect(
+      pastSessionResumeTarget({ ...ps, resumeAccount: { known: false, configDir: null } }),
+    ).toMatchObject({
+      kind: "refused",
+      notice: expect.stringMatching(/account it ran under is unknown/),
+    });
+  });
+
+  it("a REJECTED resume has its own notice, never silence", () => {
+    expect(resumeThrownNotice(new Error("ipc down"), "amber-otter")).toBe(
       'Could not resume "amber-otter": ipc down',
     );
   });
+});
 
-  it("refuses with a reason when the account or the dir is unknown", async () => {
-    const resume = vi.fn();
-    await expect(pastSessionResumeNotice({ ...ps, resumeDir: null }, resume)).resolves.toMatch(
-      /no working directory/,
+describe("forkInNewTab (the resume-live dialog's 'Fork as a new conversation')", () => {
+  it("opens a tab under the fork title and binds NOTHING to the original id", async () => {
+    const verifyFork = vi.fn(async () => "verified" as const);
+    const liveSessionIds = vi.fn(async () => new Set([target.claudeSessionId]));
+    const { d, createTerminal, updateTab, verify } = deps({ verifyFork, liveSessionIds });
+    await expect(forkInNewTab(d, target, "fork of amber-otter · abc-123")).resolves.toEqual({
+      kind: "verified",
+      tabId: "tab-1",
+    });
+    expect(createTerminal.mock.calls[0][0]).toBe("fork of amber-otter · abc-123");
+    expect(createTerminal.mock.calls[0][1]).toBe("D:/repo");
+    // The original id belongs to the live holder: the fork tab never claims it.
+    for (const [, updates] of updateTab.mock.calls) {
+      expect(updates).not.toHaveProperty("claudeSessionId");
+    }
+    expect(verify).not.toHaveBeenCalled();
+    // A fork writes a new transcript, so it needs no liveness clearance.
+    expect(liveSessionIds).not.toHaveBeenCalled();
+    expect(verifyFork.mock.calls[0][0]).toMatchObject({
+      tabId: "tab-1",
+      claudeSessionId: "abc-123",
+      configDir: "C:/claude/.claude-gmail",
+    });
+  });
+
+  it("reports an un-appendable command and an unverified fork as distinct failures", async () => {
+    const unavailable = deps({ verifyFork: vi.fn(async () => "unavailable" as const) });
+    await expect(forkInNewTab(unavailable.d, target, "f")).resolves.toMatchObject({
+      failure: "fork-unavailable",
+      tabId: "tab-1",
+    });
+    const unverified = deps({ verifyFork: vi.fn(async () => "failed" as const) });
+    await expect(forkInNewTab(unverified.d, target, "f")).resolves.toMatchObject({
+      failure: "fork-not-verified",
+    });
+    expect(describeResumeFailure("fork-unavailable")).toMatch(/--fork-session/);
+  });
+
+  it("refuses an unsafe id and an untypeable account before any tab", async () => {
+    const bad = deps();
+    await expect(
+      forkInNewTab(bad.d, { ...target, claudeSessionId: "abc; rm -rf /" }, "f"),
+    ).resolves.toMatchObject({ failure: "invalid-session-id" });
+    await expect(
+      forkInNewTab(bad.d, { ...target, configDir: "C:/claude/$(evil)" }, "f"),
+    ).resolves.toMatchObject({ failure: "needs-account" });
+    expect(bad.createTerminal).not.toHaveBeenCalled();
+  });
+});
+
+describe("runVerifiedFork", () => {
+  const base = {
+    terminalRefs: new Map(),
+    tabId: "tab-1",
+    claudeSessionId: "abc-123",
+    configDir: "C:/claude/.claude-gmail",
+    defaultConfigHome: async () => HOME,
+  };
+
+  it("types the backend resume with --fork-session appended, and records nothing", async () => {
+    const typeAndVerify = vi.fn(async () => "verified" as const);
+    const updateTab = vi.fn();
+    const buildCommand = vi.fn(
+      async () => "claude --dangerously-skip-permissions --resume abc-123\r",
     );
     await expect(
-      pastSessionResumeNotice({ ...ps, resumeAccount: { known: false, configDir: null } }, resume),
-    ).resolves.toMatch(/account it ran under is unknown/);
-    expect(resume).not.toHaveBeenCalled();
+      runVerifiedFork({ ...base, updateTab, buildCommand, typeAndVerify }),
+    ).resolves.toBe("verified");
+    expect(buildCommand.mock.calls[0][0]).toBe("abc-123");
+    expect(buildCommand.mock.calls[0][1]).toBe("C:/claude/.claude-gmail");
+    expect(typeAndVerify.mock.calls[0][2]).toBe(
+      "claude --dangerously-skip-permissions --resume abc-123 --fork-session\r",
+    );
+    expect(updateTab).toHaveBeenLastCalledWith("tab-1", { isReconnecting: false });
+    // Never parked in `resumeFailed` — a fork tab has no bound id to Retry.
+    for (const [, updates] of updateTab.mock.calls) {
+      expect(updates).not.toHaveProperty("resumeFailed");
+    }
+  });
+
+  it("types nothing when the command does not end in --resume <id>", async () => {
+    const typeAndVerify = vi.fn(async () => "verified" as const);
+    const buildCommand = vi.fn(async () => "my-alias\r");
+    await expect(
+      runVerifiedFork({ ...base, updateTab: vi.fn(), buildCommand, typeAndVerify }),
+    ).resolves.toBe("unavailable");
+    expect(typeAndVerify).not.toHaveBeenCalled();
+  });
+
+  it("types nothing when the backend refuses to render", async () => {
+    const typeAndVerify = vi.fn(async () => "verified" as const);
+    const buildCommand = vi.fn(async () => {
+      throw new Error("gateway unresolved");
+    });
+    await expect(
+      runVerifiedFork({ ...base, updateTab: vi.fn(), buildCommand, typeAndVerify }),
+    ).resolves.toBe("unavailable");
+    expect(typeAndVerify).not.toHaveBeenCalled();
   });
 });

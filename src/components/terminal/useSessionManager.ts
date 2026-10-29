@@ -26,6 +26,13 @@ import {
   tabLiveStatus,
 } from "./sessionManagerLiveRows";
 import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
+import { conversationLabel } from "./paneLabel";
+import {
+  bulkResumeSummary,
+  runBulkResume,
+  type BulkResumeTally,
+  type ResumeOutcome,
+} from "./resumeGate";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -337,7 +344,16 @@ export interface UseSessionManagerParams {
   sessionsLoading: boolean;
   desktopNotify: boolean;
   onRefreshSessions: () => void;
-  onResumeSession: (session: TranscriptSession) => void;
+  /**
+   * THE click-resume funnel (`useShellIntegration().handleResumeSession`):
+   * reads liveness first, and resolves with what the resume came to. Bulk
+   * passes `{ interactive: false }`, which skips a live or unknown id instead
+   * of opening the resume-live dialog.
+   */
+  onResumeSession: (
+    session: TranscriptSession,
+    opts?: { interactive?: boolean },
+  ) => Promise<ResumeOutcome>;
   onSelectSession: (sessionId: string) => void;
   /**
    * Bring a session's open terminal tab into view. Called by `openSession`
@@ -353,6 +369,11 @@ export interface UseSessionManagerParams {
    * row a hidden session could be closed only by showing it first.
    */
   onCloseSessionTab?: (tabId: string) => void;
+  /**
+   * The page's notification — the bulk "resume selected" summary lands here,
+   * so a bulk resume always acknowledges what it did and what it skipped.
+   */
+  onNotify?: (notification: { message: string; type: "success" | "error" }) => void;
 }
 
 export interface UseSessionManagerReturn {
@@ -378,7 +399,8 @@ export interface UseSessionManagerReturn {
 
   // Actions
   refresh: () => void;
-  resumeSession: (session: UnifiedSession) => void;
+  /** Resume through the click gate; `null` for a row that has nothing to resume. */
+  resumeSession: (session: UnifiedSession) => Promise<ResumeOutcome | null>;
   viewTranscript: (session: UnifiedSession) => void;
   /**
    * The card-body click: go to the session's open terminal tab when it has a
@@ -400,7 +422,8 @@ export interface UseSessionManagerReturn {
   toggleSelect: (sessionId: string) => void;
   selectAllFrozen: () => void;
   clearSelection: () => void;
-  bulkResume: () => void;
+  /** Resume the selection, skipping live and unknown ids, then post a summary. */
+  bulkResume: () => Promise<BulkResumeTally>;
 
   // Pinning & labeling
   pinnedIds: Set<string>;
@@ -600,6 +623,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     desktopNotify,
     onRefreshSessions,
     onResumeSession,
+    onNotify,
     onSelectSession,
     onFocusSessionTab,
     onCloseSessionTab,
@@ -1230,9 +1254,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, [onRefreshSessions, fetchDigests]);
 
   const resumeSession = useCallback(
-    (session: UnifiedSession) => {
+    async (session: UnifiedSession): Promise<ResumeOutcome | null> => {
       // A tab-sourced row has no transcript to resume — it IS the live tab.
-      if (session.source !== "transcript") return;
+      if (session.source !== "transcript") return null;
       // F1 inertness: a debug-injected fake has no real transcript on disk —
       // resuming it would spawn a stray `claude --resume <fake-id>` against a
       // session id that doesn't exist. No-op it.
@@ -1240,9 +1264,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         console.warn(
           `[test-fixtures] ignoring resume on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
         );
-        return;
+        return null;
       }
-      onResumeSession(session._transcript);
+      return onResumeSession(session._transcript);
     },
     [onResumeSession],
   );
@@ -1329,13 +1353,19 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       );
     }
     setSelectedIds(new Set());
-    // Resume sequentially with a small delay to let each tab initialize
-    for (const session of toResume) {
-      onResumeSession(session._transcript);
-      // Small delay between resumes to avoid race conditions in terminal creation
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  }, [transcriptRows, selectedIds, onResumeSession]);
+    // Sequentially, through the click gate but NON-interactively: a live or
+    // unknown id is skipped (never forked, never a dialog per row), and each
+    // item's own liveness read is the pre-type re-read the spacing between
+    // spawns needs. The tally is acknowledged as one summary.
+    const tally = await runBulkResume(
+      toResume,
+      (s) => conversationLabel(s.registryName ?? s.resumeName, s.sessionId),
+      (s) => onResumeSession(s._transcript, { interactive: false }),
+    );
+    const summary = bulkResumeSummary(tally);
+    if (summary) onNotify?.(summary);
+    return tally;
+  }, [transcriptRows, selectedIds, onResumeSession, onNotify]);
 
   return {
     sessions,

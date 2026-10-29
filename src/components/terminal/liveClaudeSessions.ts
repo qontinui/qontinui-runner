@@ -98,7 +98,7 @@ function normalizeHolderFields(row: LiveClaudeSession): LiveClaudeSession {
  * object whose `sessions` key is an array — anything else returns `null`
  * ("shape not understood"), never `[]`.
  *
- * The liveness oracle (`fetchLiveClaudeSessionIds`) depends on this polarity:
+ * The liveness oracle (`fetchLiveClaudeSessions`) depends on this polarity:
  * a misshapen payload (e.g. `{}` after a Rust-side rename) that degraded to
  * `[]` would read as "definitively no live sessions" and let the restore path
  * respawn — fork — every session. Display callers who want the tolerant
@@ -220,23 +220,47 @@ export function registryNamesBySessionId(
 }
 
 /**
- * Read the set of session ids that some LIVE Claude Code process is already
- * hosting, via `terminal_claude_session_list_live` (each entry is PID-verified
- * against the live process table on the Rust side —
- * `session::claude_session_registry::read_live_sessions`).
+ * Does this row name a usable session id? The ONE predicate both projections
+ * of the oracle use — the id set below and the click gate's holder filter
+ * (`resumeGate.decideClickResume`) — so a row cannot count as live in one and
+ * not the other.
+ */
+export function hasLiveSessionId(s: unknown): s is LiveClaudeSession {
+  return (
+    !!s &&
+    typeof s === "object" &&
+    typeof (s as { sessionId?: unknown }).sessionId === "string" &&
+    (s as { sessionId: string }).sessionId.length > 0
+  );
+}
+
+/** The deduped set of session ids the live rows name. */
+export function liveSessionIdSet(sessions: readonly unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const s of sessions) {
+    if (hasLiveSessionId(s)) ids.add(s.sessionId);
+  }
+  return ids;
+}
+
+/**
+ * Read every LIVE Claude Code registry row, via
+ * `terminal_claude_session_list_live` (each entry is PID-verified against the
+ * live process table on the Rust side —
+ * `session::claude_session_registry::read_live_sessions` — and carries the
+ * runner pane that holds it when there is one).
  *
- * The restore path consults this BEFORE typing `claude --resume <id>` for a
- * cold-restored record: an id in this set is already alive, and resuming it
- * again forks the session — a second live process on the same transcript
- * (measured 2026-07-23: 22 of 80 live ids had >1 live process).
+ * THE liveness oracle. [`fetchLiveClaudeSessionIds`] is its id projection;
+ * the click-resume gate (`resumeGate.ts`) reads the rows themselves, because
+ * "go to the existing pane" needs the holder's `terminalId` / `pageId`.
  *
  * Returns `null` when the registry could not be read (invoke failed,
- * unsuccessful response, or missing payload). Callers MUST treat `null` as
- * indeterminate and FAIL CLOSED toward not-respawning — never as "nothing
- * alive". A missing tab is recoverable; a duplicate live session corrupts the
+ * unsuccessful response, missing payload, or a payload shape not understood).
+ * Callers MUST treat `null` as indeterminate — never as "nothing alive". A
+ * missing tab is recoverable; a duplicate live session corrupts the
  * transcript.
  */
-export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+export async function fetchLiveClaudeSessions(): Promise<LiveClaudeSession[] | null> {
   let resp: CommandResponse;
   try {
     resp = await invoke<CommandResponse>("terminal_claude_session_list_live");
@@ -258,9 +282,24 @@ export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> |
     );
     return null;
   }
-  const ids = new Set<string>();
-  for (const s of sessions) {
-    if (s && typeof s.sessionId === "string" && s.sessionId) ids.add(s.sessionId);
-  }
-  return ids;
+  return sessions;
+}
+
+/**
+ * Read the set of session ids that some LIVE Claude Code process is already
+ * hosting — the id projection of [`fetchLiveClaudeSessions`], so there is ONE
+ * oracle.
+ *
+ * The restore path consults this BEFORE typing `claude --resume <id>` for a
+ * cold-restored record: an id in this set is already alive, and resuming it
+ * again forks the session — a second live process on the same transcript
+ * (measured 2026-07-23: 22 of 80 live ids had >1 live process).
+ *
+ * Returns `null` exactly when [`fetchLiveClaudeSessions`] does. Callers MUST
+ * treat `null` as indeterminate and FAIL CLOSED toward not-respawning — never
+ * as "nothing alive".
+ */
+export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+  const sessions = await fetchLiveClaudeSessions();
+  return sessions === null ? null : liveSessionIdSet(sessions);
 }

@@ -29,6 +29,12 @@ export interface UseStateTransitionEffectsParams {
 
 export interface UseStateTransitionEffectsReturn {
   flashingTabs: Set<string>;
+  /**
+   * Flash one pane's border once — the `zone-flash` a needs-input transition
+   * shows — so a "take me to it" action visibly lands (the resume-live
+   * dialog's "Go to the existing pane").
+   */
+  flashTab: (tabId: string) => void;
   unseenNeedsInput: Set<string>;
   setUnseenNeedsInput: React.Dispatch<React.SetStateAction<Set<string>>>;
   autoApprovePatterns: string[];
@@ -46,6 +52,9 @@ export interface UseStateTransitionEffectsReturn {
   pendingRestarts: Record<number, number>;
   cancelPendingRestart: (zoneIndex: number) => void;
 }
+
+/** How long a {@link UseStateTransitionEffectsReturn.flashTab} flash lasts. */
+const FOCUS_FLASH_MS = 1600;
 
 export function useStateTransitionEffects(
   params: UseStateTransitionEffectsParams,
@@ -102,6 +111,20 @@ export function useStateTransitionEffects(
 
   const setAutoApprovePatterns = useCallback((patterns: string[]) => {
     setAutoApprovePatternsState(patterns);
+  }, []);
+
+  const flashTab = useCallback((tabId: string) => {
+    setFlashingTabs((old) => (old.has(tabId) ? old : new Set(old).add(tabId)));
+    // Longer than the needs-input flash's 1 s: the pane may be on a page that
+    // is still being switched to, and must still be flashing when it paints.
+    setTimeout(() => {
+      setFlashingTabs((old) => {
+        if (!old.has(tabId)) return old;
+        const next = new Set(old);
+        next.delete(tabId);
+        return next;
+      });
+    }, FOCUS_FLASH_MS);
   }, []);
 
   const cancelPendingRestart = useCallback((zoneIndex: number) => {
@@ -356,6 +379,7 @@ export function useStateTransitionEffects(
 
   return {
     flashingTabs,
+    flashTab,
     unseenNeedsInput,
     setUnseenNeedsInput,
     autoApprovePatterns,

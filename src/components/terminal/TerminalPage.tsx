@@ -8,7 +8,10 @@ import { SessionManagerPanel, type SessionPanelView } from "./SessionManagerPane
 import { SinceRestartProvider } from "./SinceRestartContext";
 import { SinceRestartStrip } from "./SinceRestartStrip";
 import type { PastSession } from "./usePastSessions";
-import { pastSessionResumeNotice, retryResumeArgs } from "./resumeInNewTab";
+import { pastSessionResumeTarget, retryResumeArgs } from "./resumeInNewTab";
+import { runGatedRetry } from "./resumeGate";
+import { fetchLiveClaudeSessions } from "./liveClaudeSessions";
+import { ResumeGateHost } from "./ResumeGateHost";
 import { requestTerminalView } from "./sinceRestart";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
@@ -990,20 +993,24 @@ function TerminalPageInner({
 
   const { workflowGen, sessionManager, shellIntegration } = session;
 
-  // Resume a historical (Previous Sessions) record — THE resume path
-  // (`resumeTarget` → `resumeInNewTab`), shared with the "Since restart" bulk
-  // resume. Under the session's RESOLVED account only: the card disables
-  // Resume when that account is unknown, and this re-checks, because a resume
-  // under the default account fails as "No conversation found".
-  const { resumeTarget } = shellIntegration;
+  // Resume a historical (Previous Sessions) record — through THE click gate
+  // (`resumeClick` → `resumeGate.runClickResume` → `resumeInNewTab`), which
+  // reads liveness first and says when the resume did not come back. Under
+  // the session's RESOLVED account only: the card disables Resume when that
+  // account is unknown, and this re-checks, because a resume under the
+  // default account fails as "No conversation found".
+  const { resumeTarget, resumeClick, askResumeGate } = shellIntegration;
   const { setNotification } = workflowGen;
   const handleResumePastSession = useCallback(
     (ps: PastSession) => {
-      void pastSessionResumeNotice(ps, resumeTarget).then((notice) => {
-        if (notice) setNotification({ message: notice, type: "error" });
-      });
+      const resolved = pastSessionResumeTarget(ps);
+      if (resolved.kind === "refused") {
+        setNotification({ message: resolved.notice, type: "error" });
+        return;
+      }
+      void resumeClick(resolved.target, { conversationName: resolved.conversationName });
     },
-    [resumeTarget, setNotification],
+    [resumeClick, setNotification],
   );
 
   // The session sidebar's view, owned here so the "Since restart" strip's
@@ -1076,16 +1083,29 @@ function TerminalPageInner({
         pageId,
       });
       if (!retry) return;
-      updateTab(tabId, { resumeFailed: false, isReconnecting: true });
-      void runVerifiedResume({
-        terminalRefs: terminalRefs.current,
-        tabId,
-        ...retry,
-        updateTab,
-      });
+      // Gated like every click-resume (`runGatedRetry`): the Retry types into
+      // this tab and would otherwise put a second writer on a conversation a
+      // live process already holds. A live id opens the resume-live dialog, an
+      // unreadable registry its UNKNOWN form; nothing is typed before a choice.
+      void runGatedRetry(
+        {
+          readLive: fetchLiveClaudeSessions,
+          ask: askResumeGate,
+          retry: () => {
+            updateTab(tabId, { resumeFailed: false, isReconnecting: true });
+            return runVerifiedResume({
+              terminalRefs: terminalRefs.current,
+              tabId,
+              ...retry,
+              updateTab,
+            });
+          },
+        },
+        { tabId, claudeSessionId: retry.claudeSessionId, conversationName: tab.title },
+      );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [updateTab, pageId],
+    [updateTab, pageId, askResumeGate],
   );
 
   // Dismiss the informational "fresh conversation" (terminal-only) restore note
@@ -1820,6 +1840,11 @@ function TerminalPageInner({
 
             <TerminalRightPanel />
           </div>
+
+          {/* The resume-live dialog (plan 2026-10-27, Phase 3): opened by the
+            click gate when a Resume names a conversation a live process holds,
+            or when liveness could not be read. */}
+          <ResumeGateHost />
 
           <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
 

@@ -10,7 +10,9 @@ import {
   extractLiveSessions,
   extractLiveSessionsStrict,
   fetchLiveClaudeSessionIds,
+  fetchLiveClaudeSessions,
   isOperatorNamed,
+  liveSessionIdSet,
   registryNamesBySessionId,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
@@ -206,7 +208,10 @@ describe("extractLiveSessionsStrict (liveness polarity)", () => {
 
   it("keeps a row with no pane keys as a LIVE row (pane unknown, not dead)", () => {
     const got = extractLiveSessionsStrict({
-      sessions: [mk({ sessionId: "in-pane", terminalId: "t-a", pageId: "p-1" }), mk({ sessionId: "outside" })],
+      sessions: [
+        mk({ sessionId: "in-pane", terminalId: "t-a", pageId: "p-1" }),
+        mk({ sessionId: "outside" }),
+      ],
     });
     expect(got).toHaveLength(2);
     expect(got![1].sessionId).toBe("outside");
@@ -329,5 +334,38 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     });
     const ids = await fetchLiveClaudeSessionIds();
     expect([...ids!]).toEqual(["ok"]);
+  });
+});
+
+describe("fetchLiveClaudeSessions (the rows the click gate reads)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("returns every row, holding pane included, in registry order", async () => {
+    const rows = [
+      mk({ sessionId: "dup", pid: 10, terminalId: "t-a", pageId: "p-1" }),
+      mk({ sessionId: "dup", pid: 11 }),
+    ];
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: rows } });
+    expect(await fetchLiveClaudeSessions()).toEqual(rows);
+  });
+
+  it("returns [] for a readable empty registry and null for an unreadable one", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: [] } });
+    expect(await fetchLiveClaudeSessions()).toEqual([]);
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchLiveClaudeSessions()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
+    expect(await fetchLiveClaudeSessions()).toBeNull();
+  });
+
+  it("the id set is exactly the ids projection of the rows (one oracle)", async () => {
+    const rows = [mk({ sessionId: "a" }), mk({ sessionId: "b" }), mk({ sessionId: "a" })];
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { sessions: rows } });
+    const fromRows = liveSessionIdSet((await fetchLiveClaudeSessions())!);
+    const ids = await fetchLiveClaudeSessionIds();
+    expect([...ids!].sort()).toEqual([...fromRows].sort());
+    expect([...fromRows].sort()).toEqual(["a", "b"]);
   });
 });
