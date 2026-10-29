@@ -198,6 +198,14 @@ const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 /// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
 
+/// `/finish-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/finish-session.md` (canonical) — edit it
+/// there, then re-vendor. Bundled because the bundled `/unattended` closes every
+/// session with it: a dispatched session on a device with no fleet `.claude`
+/// tree otherwise has no way to record `session_status=finished` (plan
+/// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`).
+const FINISH_SESSION: &str = include_str!("fleet_commands/finish-session.md");
+
 /// `/fix` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -364,6 +372,7 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
     ("find-debt", FIND_DEBT),
+    ("finish-session", FINISH_SESSION),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
@@ -2615,6 +2624,62 @@ mod tests {
              2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run \
              Phase 5) or this guard's content probe went stale. Both are findings; \
              neither is a pass"
+        );
+    }
+
+    /// The bundled `/unattended` closes every session by running
+    /// `/finish-session`, so the bundle must carry `/finish-session` too.
+    ///
+    /// Before plan
+    /// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`
+    /// (Phase 3) it did not: a runner-dispatched session on a device with no
+    /// fleet `.claude` tree was told to run a command its workdir never had, so
+    /// it could not record `session_status=finished` and a rebuilt runner kept
+    /// offering it for resume. Literals are spelled here on purpose — this test
+    /// must fail if the roster line is dropped, not follow it.
+    #[test]
+    fn bundle_carries_finish_session_beside_unattended() {
+        let roster: Vec<&str> = FLEET_COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert!(
+            roster.contains(&"finish-session"),
+            "FLEET_COMMANDS has no \"finish-session\" entry, but the bundled \
+             /unattended ends every session with /finish-session — a dispatched \
+             session on a device without a fleet .claude tree cannot record \
+             finished. Restore (\"finish-session\", FINISH_SESSION) in FLEET_COMMANDS"
+        );
+        let unattended = FLEET_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "unattended")
+            .map(|(_, b)| *b)
+            .expect("the bundle carries \"unattended\"");
+
+        // Every `/finish-session` reference, read as the whole slash-command
+        // token it starts (so `/finish-session-foo` would be read as
+        // `finish-session-foo`, not as a hit on the roster name).
+        // Split on `/` rather than byte-slicing after a match, so no index can
+        // land inside a UTF-8 character (the bodies are full of em dashes).
+        let mut references = 0usize;
+        for after_slash in unattended.split('/').skip(1) {
+            let token: String = after_slash
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !token.starts_with("finish-session") {
+                continue;
+            }
+            assert!(
+                roster.contains(&token.as_str()),
+                "the bundled /unattended references /{token}, which is not a bundled \
+                 command name — the reference dangles on any device whose workdir \
+                 only has the bundle. Bundled names: {roster:?}"
+            );
+            references += 1;
+        }
+        assert!(
+            references > 0,
+            "the bundled /unattended no longer references /finish-session, so this \
+             guard watches an edge that no longer exists. Re-read the plan before \
+             dropping finish-session from the bundle"
         );
     }
 }
