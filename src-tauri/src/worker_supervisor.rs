@@ -901,7 +901,11 @@ mod tests {
         // must contain `spawn_supervised` and no bare `tokio::spawn(` /
         // `tauri::async_runtime::spawn(`.
         const SUPERVISED: &[(&str, &str, &str)] = &[
-            ("fleet.rs", "pub fn spawn_heartbeat()", "fleet.heartbeat"),
+            (
+                "fleet/heartbeat_loop.rs",
+                "pub fn spawn_heartbeat()",
+                "fleet.heartbeat",
+            ),
             (
                 "fleet.rs",
                 "pub fn spawn_budget_republisher(",
