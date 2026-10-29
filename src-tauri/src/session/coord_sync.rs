@@ -132,6 +132,17 @@
 //! gateway 502/504s quarantined 12 sessions on merytshost, diverting their
 //! heartbeats to the sidecar until coord's staleness watcher closed the rows.
 //!
+//! Nor does quarantine divert a session's heartbeats once some OTHER row put it
+//! there. A session quarantined on its `state_change` or `progress` row still
+//! sends its newest pending heartbeat each tick, as a one-row chain (a
+//! heartbeat PATCH carries no state, so pushing it ahead of lifecycle rows
+//! reorders nothing coord reads), and ACK-drops the older ones; only its
+//! non-heartbeat rows go to the sidecar. Otherwise the session's coord row
+//! lapses to `stale` and then `closed` while the session is alive, with no
+//! heartbeat ever arriving to revive it. A quarantined session that closed
+//! locally emits no heartbeats (the heartbeat loop skips `Closed` sessions), so
+//! this never keeps a closed session's row alive.
+//!
 //! ## Conflict-on-acquire
 //!
 //! 409 from coord on `POST /sessions` (the row already exists for this
@@ -1629,6 +1640,19 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .collect();
     let mut superseded: Vec<(Uuid, i64)> = Vec::new();
 
+    // A quarantined session's heartbeats bypass the sidecar: only its newest
+    // pending heartbeat goes out, and every older one is superseded by it —
+    // across lifecycle rows too, since those go to the sidecar, not to coord.
+    let mut newest_quarantined_heartbeat: HashMap<Uuid, i64> = HashMap::new();
+    for rec in &pending {
+        if rec.event_kind == heartbeat_kind && state.quarantined.contains(&rec.session_id) {
+            let newest = newest_quarantined_heartbeat
+                .entry(rec.session_id)
+                .or_insert(rec.seq);
+            *newest = (*newest).max(rec.seq);
+        }
+    }
+
     // Group into per-session chains. `pending()` returns records sorted by
     // (session_id, seq), so each chain is already in seq order.
     let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
@@ -1638,8 +1662,16 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             continue;
         }
         if state.quarantined.contains(&rec.session_id) {
-            to_quarantine.push(rec);
-            continue;
+            if rec.event_kind != heartbeat_kind {
+                to_quarantine.push(rec);
+                continue;
+            }
+            if newest_quarantined_heartbeat.get(&rec.session_id) != Some(&rec.seq) {
+                superseded.push((rec.session_id, rec.seq));
+                continue;
+            }
+            // The newest heartbeat falls through and becomes a one-row chain:
+            // every other row of this session was routed away above.
         }
         if superseded_keys.contains(&(rec.session_id, rec.seq)) {
             superseded.push((rec.session_id, rec.seq));
@@ -6890,6 +6922,98 @@ mod tests {
         assert!(
             state.quarantined.contains(&failing),
             "a state_change head coord keeps refusing must still quarantine"
+        );
+    }
+
+    /// A session quarantined by its `state_change` row still delivers its
+    /// heartbeats: its newest pending heartbeat goes out as a one-row chain,
+    /// the older ones are superseded, and only the lifecycle row goes to the
+    /// sidecar — so the live session's coord row cannot lapse beyond revive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quarantined_session_still_delivers_its_newest_heartbeat() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        // Only state-carrying PATCHes 502, so heartbeats would go through.
+        rec.lock().await.poison_state_patch_ids.push(failing);
+
+        let mut state = drive_502s_while_coord_serves_others(
+            &coord,
+            &outbox,
+            machine,
+            failing,
+            SessionEventKind::StateChange,
+            json!({ "state": "active" }),
+        )
+        .await;
+        assert!(state.quarantined.contains(&failing), "precondition: quarantined");
+        let patches_before = rec
+            .lock()
+            .await
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .count();
+
+        let hb = |outbox: &OutboxWriter| {
+            outbox
+                .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
+                .unwrap()
+        };
+        hb(&outbox);
+        outbox
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap();
+        hb(&outbox);
+        hb(&outbox);
+
+        let superseded_before = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+        drain_tick(&coord.inner, &mut state).await;
+
+        let g = rec.lock().await;
+        let sent: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .skip(patches_before)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(
+            sent,
+            vec![&json!({ "heartbeat": true })],
+            "exactly the newest heartbeat reached coord"
+        );
+        drop(g);
+        assert!(
+            pending_of(&outbox, failing).is_empty(),
+            "the older heartbeats were superseded and the state_change sidecarred"
+        );
+        assert!(
+            HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed) - superseded_before >= 2,
+            "the two older heartbeats are counted as superseded"
+        );
+        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
+        assert!(
+            sidecar.contains("pending_resolution"),
+            "the lifecycle row still went to the sidecar"
+        );
+        assert!(
+            state.quarantined.contains(&failing),
+            "a delivered heartbeat does not lift the quarantine"
         );
     }
 
