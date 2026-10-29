@@ -2693,3 +2693,43 @@ async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_ver
         "{body}"
     );
 }
+
+/// Item 9 of the journey explorer follow-ups: the registration answer says
+/// whether the registrant's origin may relay to the journey observe route, by
+/// the guard's own decision under the CURRENT route policy. Behind the real
+/// guard at the default policy (`enforce-doors`): a Trusted origin is
+/// admitted, a Foreign one is not (the guard would only shadow-admit it and
+/// count a would-be refusal), and the field is on every success answer.
+#[tokio::test]
+async fn the_registration_answer_says_whether_its_origin_may_relay_to_observe() {
+    for policy in [None, Some("enforce"), Some("shadow")] {
+        let s = spawn_with_policy(policy, BindingConfig::default()).await;
+        let cases: [(Caller<'_>, &str, &str, Option<bool>); 3] = [
+            (browser(WEB_DEV), "web-dev", WEB_DEV, Some(true)),
+            (browser(GOOD), "foreign", GOOD, Some(false)),
+            (agent(), "agent", "http://127.0.0.1:4555", Some(true)),
+        ];
+        for (from, app_id, base_url, want) in cases {
+            let mut payload = json!({ "appId": app_id, "appName": "x", "appType": "web",
+                                      "transport": "http", "baseUrl": base_url });
+            if let Some(o) = from.origin {
+                payload["origin"] = json!(o);
+            }
+            let (status, body) = s.post("/ui-bridge/apps/register", from, payload).await;
+            assert_eq!(status, 200, "{policy:?} {app_id}: {body}");
+            let observe = &body["data"]["journeyObserve"];
+            assert!(
+                observe.get("admitted").is_some(),
+                "{policy:?} {app_id}: the field is on every success answer: {body}"
+            );
+            assert_eq!(
+                observe["admitted"].as_bool(),
+                want,
+                "{policy:?} {app_id}: {body}"
+            );
+            // The registry entry's own fields are still at the top level.
+            assert_eq!(body["data"]["appId"], app_id, "{body}");
+            assert!(body["data"].get("principalClass").is_some(), "{body}");
+        }
+    }
+}

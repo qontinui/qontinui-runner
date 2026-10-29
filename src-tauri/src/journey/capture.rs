@@ -844,7 +844,11 @@ fn scoped(event: JourneyEvent) -> JourneyEvent {
 /// Hand one event to the journey worker, spawning it on first use.
 /// Fire-and-forget: never blocks, never fails the caller. Inside
 /// [`as_passive`] it is a passive event: it never takes the queue's reserve,
-/// and a refusal is counted against passive capture for the app.
+/// and a refusal is counted against passive capture for the app — as a
+/// refused CLOSING SNAPSHOT (`closingSnapshotsRefusedTotal`), not a refused
+/// relay: `as_passive` wraps only the snapshot an observe relay takes after
+/// the route ACCEPTED the relay (the relay itself is queued by
+/// [`record_passive`], whose refusal the route counts).
 pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
     let tx = event_tx(pg_db);
     let is_action = matches!(event, JourneyEvent::Action { .. });
@@ -860,12 +864,22 @@ pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
     }
     match sent {
         Ok(()) => {}
-        Err(NotQueued::Reserve) => health::record_passive_refused(
-            app_id.as_deref(),
-            "the journey queue is down to its reserve for agent and explorer events — passive \
-             event not queued"
-                .to_string(),
-        ),
+        Err(NotQueued::Reserve) => match app_id.as_deref() {
+            Some(app) => health::record_passive_snapshot_refused(
+                app,
+                "the journey queue was down to its reserve for agent and explorer events, so \
+                 this closing snapshot was not queued; its relay's edge closes \
+                 to_node_unobserved",
+            ),
+            // DELIBERATELY not `record_passive_refused` with no app: that is
+            // `unattributedRefusals`, relays the ROUTE refused for a bad app
+            // id, and this is no relay. No app-less event reaches
+            // `as_passive` today; should one, it is a dropped journey event,
+            // counted as a write failure (see `PassiveCaptureHealth::unattributed_refusals`).
+            None => health::record_write_failure(
+                "a passive journey event with no app was not queued (reserve)".to_string(),
+            ),
+        },
         Err(NotQueued::Full) => {
             health::record_write_failure("journey event queue full — event dropped".to_string())
         }
@@ -1388,6 +1402,32 @@ async fn write_frontier(
 mod tests {
     use super::*;
     use crate::journey::cursor::resolve_trigger;
+
+    #[test]
+    fn a_passive_event_refused_at_the_reserve_is_a_closing_snapshot_never_a_refused_relay() {
+        // `refusedTotal` counts relays the observe ROUTE refused. A passive
+        // event refused here is the closing snapshot of a relay the route
+        // already ACCEPTED, so it is counted on its own counter.
+        let src = include_str!("capture.rs");
+        let body = src
+            .split("pub(crate) fn enqueue_edge_observation(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("enqueue_edge_observation's body");
+        let reserve = body
+            .split("Err(NotQueued::Reserve)")
+            .nth(1)
+            .and_then(|b| b.split("Err(NotQueued::Full)").next())
+            .expect("the reserve arm");
+        assert!(
+            reserve.contains("health::record_passive_snapshot_refused("),
+            "{reserve}"
+        );
+        assert!(
+            !reserve.contains("record_passive_refused("),
+            "a refused closing snapshot must not count as a refused relay: {reserve}"
+        );
+    }
     use crate::journey::node::{Affordance, ElementAffordance};
     use qontinui_types::ir::IrEffect;
     use qontinui_types::journey::ChokePoint;

@@ -86,6 +86,9 @@ struct Recent {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Unslotted {
     refused: u64,
+    /// Closing snapshots refused at the queue reserve ([`record_passive_snapshot_refused`]).
+    snapshots_refused: u64,
+    last_snapshot_refusal: Option<String>,
     last_refusal: Option<String>,
     /// Receipts that found no slot (only if one was not claimed first).
     received: u64,
@@ -104,7 +107,14 @@ pub(crate) const MAX_UNSLOTTED_APPS: usize = 256;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassiveStats {
     pub received: u64,
+    /// Relays the ROUTE refused ([`record_passive_refused`]) — never a
+    /// closing snapshot (that is [`Self::snapshots_refused`]).
     pub refused: u64,
+    /// Closing snapshots of ACCEPTED relays refused at the queue reserve
+    /// ([`record_passive_snapshot_refused`]).
+    pub snapshots_refused: u64,
+    /// Why (and when) the last closing snapshot was refused.
+    pub last_snapshot_refusal: Option<String>,
     pub last_received_at: Option<String>,
     pub last_refusal: Option<String>,
     /// The counts may be incomplete: this app's counters were (re)created
@@ -243,6 +253,8 @@ fn claim_in(r: &mut Recent, app_id: &str) -> bool {
         PassiveStats {
             received: earlier.received,
             refused: earlier.refused,
+            snapshots_refused: earlier.snapshots_refused,
+            last_snapshot_refusal: earlier.last_snapshot_refusal,
             last_received_at: earlier.last_received_at,
             last_refusal: earlier.last_refusal,
             counts_incomplete: earlier.counts_incomplete,
@@ -343,6 +355,32 @@ fn record_refusal_in(r: &mut Recent, app_id: Option<&str>, reason: String) {
     e.last_refusal = Some(reason);
 }
 
+/// The closing snapshot of an ACCEPTED relay (taken inside
+/// `capture::as_passive`) was refused at the journey queue's reserve, so the
+/// relay's pending edge will close `to_node_unobserved`. Counted apart from
+/// [`record_passive_refused`]: the relay itself was accepted (and counted in
+/// `receivedTotal`), so counting this as a refused relay would make
+/// `refusedTotal` count two different things. `reason` becomes
+/// `lastClosingSnapshotRefusal`, stamped with the time it was recorded, so a
+/// rise in `closingSnapshotsRefusedTotal` says why.
+pub(crate) fn record_passive_snapshot_refused(app_id: &str, reason: &str) {
+    let mut r = recent().lock().unwrap_or_else(|p| p.into_inner());
+    record_snapshot_refusal_in(&mut r, app_id, format!("{} — {reason}", now_iso()));
+}
+
+fn record_snapshot_refusal_in(r: &mut Recent, app_id: &str, reason: String) {
+    if let Some(slot) = r.passive.get_mut(app_id) {
+        slot.snapshots_refused += 1;
+        slot.last_snapshot_refusal = Some(reason);
+        return;
+    }
+    // An accepted relay claimed a slot first, so this is not expected; kept,
+    // never dropped, should it happen.
+    let e = unslotted_entry(r, app_id);
+    e.snapshots_refused += 1;
+    e.last_snapshot_refusal = Some(reason);
+}
+
 /// The passive-capture block for `app_id` from a [`Recent`]: its slot, else
 /// its unslotted entry, else nothing — and then its refusal count is
 /// known (zero) only while no unslotted entry was ever evicted. A slot or
@@ -354,6 +392,8 @@ fn passive_health_in(r: &Recent, app_id: &str) -> PassiveCaptureHealth {
     if let Some(e) = r.passive_unslotted.get(app_id) {
         let stats = PassiveStats {
             refused: e.refused,
+            snapshots_refused: e.snapshots_refused,
+            last_snapshot_refusal: e.last_snapshot_refusal.clone(),
             last_refusal: e.last_refusal.clone(),
             received: e.received,
             last_received_at: e.last_received_at.clone(),
@@ -404,18 +444,36 @@ pub struct PassiveCaptureHealth {
     /// Relays accepted for this app — a LOWER BOUND when
     /// [`Self::counts_complete`] is false.
     pub received_total: u64,
-    /// Relays for this app the route refused (see [`record_passive_refused`]).
+    /// Relays for this app the ROUTE refused (see [`record_passive_refused`]):
+    /// each a relayed interaction that was not recorded at all. It counts
+    /// nothing else — a closing snapshot refused after its relay was accepted
+    /// is [`Self::closing_snapshots_refused_total`].
     /// `None` (JSON `null`) = UNKNOWN: unslotted counters were evicted, and
     /// either this app has no counters, or its counters were created after
     /// an eviction that may have taken its earlier ones — it may have had
     /// refusals this process no longer holds. Never shown as a known count.
     pub refused_total: Option<u64>,
+    /// Closing snapshots of ACCEPTED relays refused at the journey queue's
+    /// reserve (see [`record_passive_snapshot_refused`]): each a relay that
+    /// IS in `receivedTotal` but whose edge closes `to_node_unobserved`.
+    /// `None` (JSON `null`) = UNKNOWN, exactly when `refusedTotal` is.
+    pub closing_snapshots_refused_total: Option<u64>,
     /// `false` when this app's counts may be incomplete (see
     /// [`Self::refused_total`]): `receivedTotal` is then a lower bound.
     pub counts_complete: bool,
+    /// Why the last relay the route refused was refused ([`Self::refused_total`]).
     pub last_refusal: Option<String>,
-    /// Refusals process-wide whose app id was itself refused (so they
-    /// belong to no app).
+    /// When and why the last closing snapshot was refused
+    /// ([`Self::closing_snapshots_refused_total`]); `None` when none was.
+    pub last_closing_snapshot_refusal: Option<String>,
+    /// Relays process-wide the observe route refused because their path app
+    /// id was not an identifier (so they belong to no app) — that, and
+    /// nothing else. A passive journey event refused at the queue reserve
+    /// that names no app (no current path produces one: the only events
+    /// recorded inside `capture::as_passive` are closing snapshots, which
+    /// always carry their app) is not a refused relay, so it is not counted
+    /// here: it is a dropped journey event, counted as a journey write
+    /// failure (`counters.recentWriteFailures` / the ledger state).
     pub unattributed_refusals: u64,
     pub detail: String,
 }
@@ -436,6 +494,8 @@ pub(crate) fn derive_passive_capture(
     let PassiveStats {
         received: received_total,
         refused,
+        snapshots_refused,
+        last_snapshot_refusal,
         last_received_at,
         last_refusal,
         counts_incomplete,
@@ -443,6 +503,7 @@ pub(crate) fn derive_passive_capture(
     let counts_complete = !counts_incomplete;
     let refusals_known = refusals_known && counts_complete;
     let refused_total = refusals_known.then_some(refused);
+    let closing_snapshots_refused_total = refusals_known.then_some(snapshots_refused);
     let caveat = if counts_complete {
         ""
     } else {
@@ -502,8 +563,10 @@ pub(crate) fn derive_passive_capture(
         last_received_at,
         received_total,
         refused_total,
+        closing_snapshots_refused_total,
         counts_complete,
         last_refusal,
+        last_closing_snapshot_refusal: last_snapshot_refusal,
         unattributed_refusals,
         detail,
     }
@@ -990,6 +1053,46 @@ mod tests {
         // An id that is not an identifier is unattributed.
         record_refusal_in(&mut r, None, "bad id".into());
         assert_eq!(r.passive_unattributed_refusals, 1);
+    }
+
+    #[test]
+    fn a_refused_closing_snapshot_is_its_own_count_never_a_refused_relay() {
+        let mut r = Recent::default();
+        assert!(claim_in(&mut r, "relaying-app"));
+        record_received_in(&mut r, "relaying-app", "2026-10-29T10:00:00.000Z".into());
+        record_snapshot_refusal_in(&mut r, "relaying-app", "t0 — reserve".into());
+        let h = passive_health_in(&r, "relaying-app");
+        assert_eq!(h.state, PassiveCaptureState::Receiving);
+        assert_eq!(h.received_total, 1, "the relay itself was accepted");
+        assert_eq!(h.refused_total, Some(0), "no relay was refused");
+        assert_eq!(h.closing_snapshots_refused_total, Some(1));
+        assert_eq!(h.last_refusal, None, "a refused relay is explained apart");
+        let wire = serde_json::to_value(&h).unwrap();
+        assert_eq!(wire["refusedTotal"], 0, "{wire}");
+        assert_eq!(wire["closingSnapshotsRefusedTotal"], 1, "{wire}");
+        assert_eq!(
+            wire["lastClosingSnapshotRefusal"], "t0 — reserve",
+            "a rise in the count says why: {wire}"
+        );
+        // A route refusal moves only refusedTotal.
+        record_refusal_in(&mut r, Some("relaying-app"), "bad body".into());
+        let h = passive_health_in(&r, "relaying-app");
+        assert_eq!(h.refused_total, Some(1));
+        assert_eq!(h.closing_snapshots_refused_total, Some(1));
+        // Unknown is first-class: when the counts may be incomplete, both read
+        // null — never a known 0.
+        let mut r = Recent::default();
+        for i in 0..=MAX_UNSLOTTED_APPS {
+            record_refusal_in(&mut r, Some(&format!("other-{i}")), "bad body".into());
+        }
+        assert!(r.passive_unslotted_evicted > 0);
+        assert!(claim_in(&mut r, "late-app"));
+        record_snapshot_refusal_in(&mut r, "late-app", "t1 — reserve".into());
+        let h = passive_health_in(&r, "late-app");
+        assert_eq!(h.closing_snapshots_refused_total, None, "{}", h.detail);
+        assert_eq!(h.refused_total, None);
+        let wire = serde_json::to_value(&h).unwrap();
+        assert!(wire["closingSnapshotsRefusedTotal"].is_null(), "{wire}");
     }
 
     #[test]
