@@ -936,7 +936,7 @@ pub async fn acquire_for_terminal(
         }
     };
     if let Some(wd) = &out.0 {
-        provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
+        provision_session_cwd_off_worker(wd, out.1.is_some(), spawn_tenant).await;
     }
     out
 }
@@ -1047,8 +1047,31 @@ pub async fn acquire_for_worker(
             format!("allocate for {repo} returned no worktree"),
         )));
     };
-    provision_session_cwd(&wd, true, spawn_tenant);
+    provision_session_cwd_off_worker(&wd, true, spawn_tenant).await;
     Ok((wd, ctx))
+}
+
+/// [`provision_session_cwd`] run on the blocking pool: the door for every
+/// ASYNC caller.
+///
+/// The pass is synchronous. It writes `.mcp.json`, then probes the cwd with
+/// `git ls-files`, which polls its child with `std::thread::sleep` for up to
+/// 5 s. It then fetches the commands and skills registries on a joined OS
+/// thread. Run inline, all of that holds the async worker it runs on (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+/// D2). Fail-soft like the pass itself: a pass that does not complete is
+/// logged by [`crate::spawn_off_worker::run_provisioning_off_worker`] and the
+/// spawn goes on.
+pub(crate) async fn provision_session_cwd_off_worker(
+    wd: &str,
+    allocated_here: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) {
+    let owned = wd.to_string();
+    crate::spawn_off_worker::run_provisioning_off_worker(wd, move || {
+        provision_session_cwd(&owned, allocated_here, spawn_tenant)
+    })
+    .await;
 }
 
 /// Provision the per-session cwd artifacts — the coord-mcp `.mcp.json` and the
