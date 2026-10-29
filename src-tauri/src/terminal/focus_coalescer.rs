@@ -9,20 +9,21 @@
 //! Terminal panel. On 2026-10-27 that was 46 view switches in 20 minutes, 19 of
 //! them inside 17 seconds.
 //!
-//! The rule here: across ALL unattended origins
-//! ([`SpawnOrigin::is_autonomous`]), at most ONE view-switching decision
-//! surfaces per [`FOCUS_COALESCE_WINDOW`]. The first spawn of a burst still
-//! surfaces (the reason the focus request exists — plan
-//! `2026-06-07-gate-continuation-auto-surface-and-focus`); the rest appear as
-//! tabs without stealing the view. Operator origins always surface and do not
-//! consume the window.
+//! The rule here: across all NAMED unattended origins
+//! ([`SpawnOrigin::is_autonomous`], every one except [`SpawnOrigin::Unknown`])
+//! at most ONE view-switching decision surfaces per [`FOCUS_COALESCE_WINDOW`].
+//! The first spawn of a burst still surfaces (the reason the focus request
+//! exists — plan `2026-06-07-gate-continuation-auto-surface-and-focus`); the
+//! rest appear as tabs without stealing the view. Operator origins always
+//! surface and open no window.
 //!
 //! [`SpawnOrigin::Unknown`] — a caller this runner cannot name (an agent's
-//! HTTP `POST /terminals`, a UI-Bridge or relay create) — is coalesced (it is
-//! not surfaced while a window is open) but never OPENS one: only a NAMED
-//! unattended origin sets the last surface. Otherwise an agent's own terminal
-//! create would suppress the next real gate continuation's surface for a
-//! minute.
+//! HTTP `POST /terminals`, a UI-Bridge or relay create) — has a window of its
+//! OWN. An `Unknown` request surfaces only when neither the named window nor
+//! the `Unknown` window is open, and its surface opens only the `Unknown`
+//! window. So an all-`Unknown` burst is still held to one surface per
+//! window, while an agent's own terminal create never suppresses the next
+//! real gate continuation's surface.
 //!
 //! One decision per spawn. The tab-selection half rides `terminal-created`,
 //! which the [`TerminalManager`](super::TerminalManager) emits at PTY create;
@@ -32,7 +33,10 @@
 //! surfaced is followed by its view switch; a suppressed create never gets
 //! one). A REFOCUS (a duplicate anchor folded onto a live tab) only PEEKS the
 //! recorded decision, so it can never consume the original's and hand that
-//! terminal a fresh decision later; with nothing recorded it is decided fresh.
+//! terminal a fresh decision later. A peeked suppression stays suppressed; a
+//! peeked surface is NOT replayed — the refocus is a new request and is
+//! decided against the window as it stands now, as is one with nothing
+//! recorded.
 //!
 //! A suppression is never silent: it is a `debug!`, a `/health`
 //! `focusCoalescer.suppressedTotal` count, and — once per window that had
@@ -84,14 +88,20 @@ pub fn should_surface(
 /// the state machine is tested without a clock.
 #[derive(Debug, Default)]
 struct Coalescer {
-    /// The instant the last UNATTENDED request surfaced.
+    /// The instant the last NAMED unattended request surfaced (the named
+    /// window; [`SpawnOrigin::Unknown`] never sets it).
     last_surface: Option<Instant>,
     /// Wall-clock twin of `last_surface`, for `/health`.
     last_surface_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The instant the last [`SpawnOrigin::Unknown`] request surfaced (the
+    /// `Unknown` window).
+    last_unknown_surface: Option<Instant>,
+    /// Wall-clock twin of `last_unknown_surface`, for `/health`.
+    last_unknown_surface_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Suppressed requests since boot.
     suppressed_total: u64,
-    /// Suppressed requests inside the window opened by `last_surface`, not
-    /// yet reported by the window-close `info!`.
+    /// Suppressed requests while a window was open, not yet reported by the
+    /// window-close `info!`.
     suppressed_in_window: u64,
     /// Create-time decisions awaiting their focus request: (terminal id,
     /// surfaced, decided at).
@@ -99,10 +109,11 @@ struct Coalescer {
 }
 
 impl Coalescer {
-    /// If the window opened by the last surface has closed with suppressions
-    /// in it, return that count and reset it — the caller logs it once.
+    /// If every open window (named and `Unknown`) has closed with
+    /// suppressions in it, return that count and reset it — the caller logs
+    /// it once.
     fn take_closed_window(&mut self, now: Instant, window: Duration) -> Option<u64> {
-        let last = self.last_surface?;
+        let last = self.last_surface.max(self.last_unknown_surface)?;
         if self.suppressed_in_window == 0 || now.saturating_duration_since(last) < window {
             return None;
         }
@@ -112,9 +123,10 @@ impl Coalescer {
     /// Decide one request and update the state. Returns (surfaced, the
     /// closed-window count to log, if any).
     ///
-    /// A surfaced NAMED unattended origin opens a window; a surfaced
-    /// [`SpawnOrigin::Unknown`] does not (module doc); a suppressed one of
-    /// either is counted.
+    /// A NAMED unattended origin is checked against, and opens, the named
+    /// window. [`SpawnOrigin::Unknown`] is checked against both windows and
+    /// opens only its own (module doc). A suppressed request of either kind
+    /// is counted.
     fn decide(
         &mut self,
         now: Instant,
@@ -123,12 +135,17 @@ impl Coalescer {
         window: Duration,
     ) -> (bool, Option<u64>) {
         let closed = self.take_closed_window(now, window);
-        let surface = should_surface(now, self.last_surface, origin, window);
+        let unknown = origin == SpawnOrigin::Unknown;
+        let surface = should_surface(now, self.last_surface, origin, window)
+            && (!unknown || should_surface(now, self.last_unknown_surface, origin, window));
         if origin.is_autonomous() {
             if !surface {
                 self.suppressed_total += 1;
                 self.suppressed_in_window += 1;
-            } else if opens_window(origin) {
+            } else if unknown {
+                self.last_unknown_surface = Some(now);
+                self.last_unknown_surface_at = Some(wall);
+            } else {
                 self.last_surface = Some(now);
                 self.last_surface_at = Some(wall);
             }
@@ -172,7 +189,10 @@ impl Coalescer {
 
     /// The refocus decision ([`decide_for_refocus`]): PEEK the recorded
     /// create-time decision — never consume it, so the original terminal's
-    /// own focus request still finds it — else decide fresh.
+    /// own focus request still finds it. A peeked suppression short-circuits
+    /// to `false`; anything else (a peeked surface, or nothing recorded) is
+    /// decided fresh, so a duplicate re-delivered later cannot replay an old
+    /// surface past the window that is open now.
     fn decide_for_refocus(
         &mut self,
         now: Instant,
@@ -182,8 +202,8 @@ impl Coalescer {
         window: Duration,
     ) -> (bool, Option<u64>) {
         match self.peek_pending(terminal_id, now) {
-            Some(surface) => (surface, self.take_closed_window(now, window)),
-            None => self.decide(now, wall, origin, window),
+            Some(false) => (false, self.take_closed_window(now, window)),
+            _ => self.decide(now, wall, origin, window),
         }
     }
 
@@ -227,18 +247,13 @@ impl Coalescer {
     }
 }
 
-/// Whether a surfaced `origin` opens a coalescing window: every unattended
-/// origin except [`SpawnOrigin::Unknown`] (module doc).
-fn opens_window(origin: SpawnOrigin) -> bool {
-    origin.is_autonomous() && origin != SpawnOrigin::Unknown
-}
-
 /// The `/health` `focusCoalescer` block for `c` (pure).
 fn health_json_of(c: &Coalescer) -> serde_json::Value {
     serde_json::json!({
         "windowSecs": FOCUS_COALESCE_WINDOW.as_secs(),
         "suppressedTotal": c.suppressed_total,
         "lastSurfaceAt": c.last_surface_at.map(|t| t.to_rfc3339()),
+        "lastUnknownSurfaceAt": c.last_unknown_surface_at.map(|t| t.to_rfc3339()),
     })
 }
 
@@ -324,8 +339,9 @@ pub fn decide_for_refocus(origin: SpawnOrigin, terminal_id: &str) -> bool {
     surface
 }
 
-/// `/health` `focusCoalescer`. `lastSurfaceAt: null` means no unattended
-/// request has surfaced since boot.
+/// `/health` `focusCoalescer`. `lastSurfaceAt` is the named window's last
+/// surface and `lastUnknownSurfaceAt` the `Unknown` window's; `null` means no
+/// such request has surfaced since boot.
 pub fn health_json() -> serde_json::Value {
     let now = Instant::now();
     let (value, closed) = with_coalescer(|c| {
@@ -527,28 +543,49 @@ mod tests {
         let w = FOCUS_COALESCE_WINDOW;
         assert_eq!(
             health_json_of(&Coalescer::default()),
-            serde_json::json!({ "windowSecs": 60, "suppressedTotal": 0, "lastSurfaceAt": null })
+            serde_json::json!({
+                "windowSecs": 60,
+                "suppressedTotal": 0,
+                "lastSurfaceAt": null,
+                "lastUnknownSurfaceAt": null,
+            })
         );
 
+        let rfc = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
         let base = Instant::now();
-        let at = chrono::DateTime::parse_from_rfc3339("2026-10-27T20:30:24.933Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
         let mut c = Coalescer::default();
         let o = SpawnOrigin::GateContinuation;
-        assert!(c.decide(base, at, o, w).0);
+        assert!(c.decide(base, rfc("2026-10-27T20:30:24.933Z"), o, w).0);
         for secs in [3, 5, 7] {
             assert!(
                 !c.decide(base + Duration::from_secs(secs), chrono::Utc::now(), o, w)
                     .0
             );
         }
+        // Close the window first, so the since-boot total and the in-window
+        // count diverge (3 vs 0) and the literal below can tell them apart.
+        assert_eq!(
+            c.take_closed_window(base + Duration::from_secs(61), w),
+            Some(3)
+        );
+        assert_eq!(c.suppressed_in_window, 0);
+        // An `Unknown` surface after the named window closed opens its own.
+        let t = base + Duration::from_secs(62);
+        assert!(
+            c.decide(t, rfc("2026-10-27T20:31:26.933Z"), SpawnOrigin::Unknown, w)
+                .0
+        );
         assert_eq!(
             health_json_of(&c),
             serde_json::json!({
                 "windowSecs": 60,
                 "suppressedTotal": 3,
                 "lastSurfaceAt": "2026-10-27T20:30:24.933+00:00",
+                "lastUnknownSurfaceAt": "2026-10-27T20:31:26.933+00:00",
             })
         );
     }
@@ -639,6 +676,72 @@ mod tests {
         assert!(c.decide_for_refocus(base, wall(), o, "live", w).0);
         let t1 = base + Duration::from_secs(1);
         assert!(!c.decide_for_refocus(t1, wall(), o, "live", w).0);
+    }
+
+    #[test]
+    fn a_refocus_of_a_surfaced_pending_terminal_honours_the_open_window() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let mut c = Coalescer::default();
+        // `a` (a migrated pane) surfaces at 0 s; its decision stays pending.
+        assert!(
+            c.decide_for_create(base, wall(), SpawnOrigin::Respawn, "a", w)
+                .0
+        );
+        // `b` surfaces at 70 s and opens a new window.
+        let t1 = base + Duration::from_secs(70);
+        assert!(
+            c.decide_for_create(t1, wall(), SpawnOrigin::GateContinuation, "b", w)
+                .0
+        );
+        // A duplicate folded onto `a` at 75 s must not replay `a`'s old
+        // surface inside `b`'s window.
+        let t2 = base + Duration::from_secs(75);
+        assert!(
+            !c.decide_for_refocus(t2, wall(), SpawnOrigin::GateContinuation, "a", w)
+                .0
+        );
+        // The peek left `a`'s own decision in place.
+        assert_eq!(c.take_pending("a", t2), Some(true));
+    }
+
+    #[test]
+    fn an_all_unknown_burst_surfaces_once_per_window() {
+        let out = surfaced(&[0, 1_000, 59_999, 60_000], SpawnOrigin::Unknown);
+        assert_eq!(out, vec![0, 60_000]);
+    }
+
+    #[test]
+    fn an_unknown_request_is_suppressed_inside_the_named_window() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let mut c = Coalescer::default();
+        assert!(c.decide(base, wall(), SpawnOrigin::GateContinuation, w).0);
+        let t1 = base + Duration::from_secs(30);
+        assert!(!c.decide(t1, wall(), SpawnOrigin::Unknown, w).0);
+        assert_eq!(c.last_unknown_surface, None);
+        assert_eq!(c.suppressed_total, 1);
+    }
+
+    #[test]
+    fn unknown_only_suppressions_are_reported_when_the_unknown_window_closes() {
+        let base = Instant::now();
+        let w = FOCUS_COALESCE_WINDOW;
+        let mut c = Coalescer::default();
+        let u = SpawnOrigin::Unknown;
+        assert_eq!(c.decide(base, wall(), u, w), (true, None));
+        assert_eq!(
+            c.decide(base + Duration::from_secs(10), wall(), u, w),
+            (false, None)
+        );
+        assert_eq!(
+            c.take_closed_window(base + Duration::from_secs(59), w),
+            None
+        );
+        assert_eq!(
+            c.take_closed_window(base + Duration::from_secs(60), w),
+            Some(1)
+        );
     }
 
     #[test]
