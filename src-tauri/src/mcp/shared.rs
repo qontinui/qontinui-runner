@@ -376,8 +376,9 @@ pub fn get_workspace_paths_internal(
 /// hold for this path:
 /// - the only caller runs `qontinui-claude-config/scripts/spawn-independent-claude.py`,
 ///   which starts `claude` as a GRANDCHILD, under a `powershell.exe` it
-///   launches with its OWN `CREATE_NEW_CONSOLE`. The console this flag gave
-///   `python.exe` was never the one `claude` ran in.
+///   launches with a console of its OWN (`CREATE_NO_WINDOW` since
+///   qontinui-claude-config#2111; `CREATE_NEW_CONSOLE` before). The console
+///   this flag gave `python.exe` was never the one `claude` ran in.
 /// - That `claude` runs `--print` with stdin and stdout redirected, the mode
 ///   the runner already launches with no window at all
 ///   (`ai_provider::claude_cli`, `agent_runtime::spawn_claude_child`).
