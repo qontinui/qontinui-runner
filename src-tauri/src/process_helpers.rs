@@ -2821,7 +2821,7 @@ mod timeout_tests {
 //
 // So the rule needs a test rather than a reviewer.
 //
-// Two scans, because there are two ways to ship a console:
+// Two scans, one for each of the two common ways to ship a console:
 // 1. a `Command::new(` that never gets `CREATE_NO_WINDOW`, and
 // 2. a `creation_flags(..)` call that hands a command `CREATE_NEW_CONSOLE`,
 //    wherever the command came from. `creation_flags` REPLACES the flags, so
@@ -2831,6 +2831,12 @@ mod timeout_tests {
 //    `creation_flags` as suppression, so a raw `Command::new` given
 //    `CREATE_NEW_CONSOLE` passed it too.) `mcp/shared.rs`'s
 //    `spawn_python_with_console` was exactly that shape until 2026-10-28.
+// NOT caught by either: a `creation_flags(..)` that drops `CREATE_NO_WINDOW`
+// without naming `CREATE_NEW_CONSOLE` (`no_window("x")` then
+// `.creation_flags(CREATE_NEW_PROCESS_GROUP)` also opens a window, because the
+// call replaces the flags). Scan 1 never sees the `no_window(..)` form, and on
+// a raw `Command::new` it reads a nearby `creation_flags` as suppression; scan 2
+// looks only for the `CREATE_NEW_CONSOLE` bit.
 
 /// Source-scanning helpers shared by the guards below: the `.rs` walk and
 /// the ONE test-code skipper. Every guard in this file reads production text
@@ -2902,18 +2908,31 @@ mod source_scan {
 
     /// The production lines of `src`, as `(1-based line number, line)`.
     ///
-    /// Skips exactly the item each column-0 test-only cfg
-    /// ([`is_test_only_cfg`]) applies to — a `mod` of any visibility, a
-    /// helper fn, a `use` — then keeps scanning, so a test module in the
-    /// middle of a file hides neither the production code before it nor
-    /// after it. The item is the first non-attribute line after the cfg: one
-    /// ending in `;`, or opening and closing its braces on that line, is the
-    /// whole item; otherwise it runs to the next line that is exactly `}` —
-    /// rustfmt closes every top-level item that way, and unlike brace
-    /// counting this is not fooled by braces inside the string literals
-    /// source-scanning tests are full of. A head line with no brace (a
-    /// multi-line `static`, `use a::{..};`) ends at its first `;` line, and a
-    /// multi-line attribute is skipped by bracket depth.
+    /// Skips the item each column-0 test-only cfg ([`is_test_only_cfg`])
+    /// applies to — a `mod` of any visibility, a helper fn, a `use` — then
+    /// keeps scanning, so a test module in the middle of a file does not hide
+    /// the production code before or after it. The item is the first
+    /// non-attribute line after the cfg: one ending in `;`, or opening and
+    /// closing its braces on that line, is the whole item; otherwise it runs
+    /// to the next line that is exactly `}` or `};`, the way rustfmt closes a
+    /// top-level item. A head line with no brace (a multi-line `static`,
+    /// `use a::{..};`) ends at its first `;` line, and a multi-line attribute
+    /// is skipped by bracket depth.
+    ///
+    /// It is a line heuristic, not a parser, and it can miss in both
+    /// directions:
+    /// - EARLY, which is loud: a column-0 `}` inside a multi-line string
+    ///   literal ends the item there, so the rest of that test module is read
+    ///   as production (`fleet.rs`'s test module is one such case).
+    /// - LATE, which is silent and hides production code. For example: a
+    ///   test-only item that closes on `});` instead of `}` / `};`; a
+    ///   braceless head whose body has a line opening `{` (an array of struct
+    ///   literals closing on `];`); a `{` inside a string on the head line; an
+    ///   attribute whose string holds an unbalanced `[`. Each carries the skip
+    ///   past the item's end. None existed at qontinui-runner `ee693ff49`
+    ///   (measured by emulation over every `.rs` file; plan
+    ///   `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+    ///   Phase 6). A `syn`-based skipper would remove both kinds of miss.
     pub(super) fn production_lines(src: &str) -> Vec<(usize, &str)> {
         let mut out = Vec::new();
         let mut lines = src.lines().enumerate();
@@ -3132,8 +3151,12 @@ mod console_window_guard {
 
     /// `CREATE_NEW_CONSOLE` plus every file-local binding whose value names
     /// it, followed through aliases of aliases. File-local and scope-blind on
-    /// purpose: it can only over-report. A flag value imported from another
-    /// module is not followed.
+    /// purpose, so the alias resolution itself only over-reports. The scan as
+    /// a whole can still miss. These are not followed: a flag value imported
+    /// from another module, a plain reassignment (`flags = CREATE_NEW_CONSOLE;`),
+    /// a `pub static`, a value passed in as a parameter, a field target
+    /// (`opts.flags |= ..`) and a `0b`/`0o` literal. A call line whose string
+    /// literal holds `//` is missed too, because the line is cut there.
     fn console_flag_names(lines: &[(usize, &str)]) -> HashSet<String> {
         let bindings: Vec<(&str, &str)> = lines.iter().filter_map(|(_, l)| binding(l)).collect();
         let mut names = HashSet::from(["CREATE_NEW_CONSOLE".to_string()]);
