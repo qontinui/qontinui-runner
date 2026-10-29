@@ -349,6 +349,18 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The `dispatched_at` coord served beside this row in
+    /// `pending-continuations` — the dispatch EPISODE the consume record names
+    /// (plan `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+    /// D1 correction). Stamped by [`poll_pending_continuations`] only, and
+    /// echoed verbatim on the outcome post.
+    ///
+    /// `serde(skip)`, never read off the frame: a WS frame's own keys are not
+    /// the row's `continuation_dispatched_at`, and a mismatched value would make
+    /// coord's episode guard drop a genuine record. `None` (every WS delivery)
+    /// omits the field, which is coord's pre-guard behaviour.
+    #[serde(skip)]
+    pub dispatched_at: Option<String>,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -2038,8 +2050,9 @@ fn spawn_run_task(payload: LaunchPayload) {
 struct PendingContinuation {
     gate_id: uuid::Uuid,
     payload: GateContinuationPayload,
+    /// Threaded onto the payload ([`GateContinuationPayload::dispatched_at`])
+    /// so the outcome post names the episode it consumes.
     #[serde(default)]
-    #[allow(dead_code)]
     dispatched_at: Option<String>,
 }
 
@@ -2164,6 +2177,11 @@ struct ContinuationConsumedBody {
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_code_session_id: Option<String>,
+    /// The dispatch episode ([`GateContinuationPayload::dispatched_at`]),
+    /// echoed verbatim on the OUTCOME shape only; coord records nothing (200,
+    /// null echo) when it names a different episode than the row's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatched_at: Option<String>,
 }
 
 impl ContinuationConsumedBody {
@@ -2174,6 +2192,7 @@ impl ContinuationConsumedBody {
             outcome: None,
             detail: None,
             claude_code_session_id: None,
+            dispatched_at: None,
         }
     }
 
@@ -2195,7 +2214,15 @@ impl ContinuationConsumedBody {
             outcome: Some(outcome.wire()),
             detail,
             claude_code_session_id,
+            dispatched_at: None,
         }
+    }
+
+    /// Name the dispatch episode this outcome consumes (`None` = unknown,
+    /// omitted from the body).
+    fn at_episode(mut self, dispatched_at: Option<String>) -> Self {
+        self.dispatched_at = dispatched_at;
+        self
     }
 }
 
@@ -2237,6 +2264,23 @@ enum SpawnDecision {
     /// Plan `2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs`,
     /// Phase 3.
     SkipRerouted {
+        target_device_id: Option<uuid::Uuid>,
+    },
+    /// Claim refused (HTTP 409 `{"error":"expired","expired_at",
+    /// "expired_reason","target_device_id"}`) → coord already expired this
+    /// row on its TTL, and this device is NOT the row's target, so the claim
+    /// is a late delivery of work coord has given up on. SKIP the spawn and
+    /// post NO outcome: the row is terminal on coord, and a spawn here is
+    /// exactly the unrecorded run the plan exists to stop. Like the cancelled
+    /// skip, the local dispatch claim is KEPT (coord never re-lists an expired
+    /// row). Carries `expired_reason` and the target device for the INFO log.
+    ///
+    /// Before this arm the shape fell into the "any other 409" branch and
+    /// spawned anyway ([`SpawnDecision::SpawnDespiteClaimError`]). Plan
+    /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+    /// coord Phase 3.
+    SkipExpired {
+        expired_reason: Option<String>,
         target_device_id: Option<uuid::Uuid>,
     },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
@@ -2329,6 +2373,10 @@ fn continuation_drain_admission_for(
 ///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
 ///   it parses as a UUID). Without this arm the rerouted refusal fell into the
 ///   "any other 409" spawn-anyway branch below and double-spawned.
+/// - 409 with a JSON body whose `error == "expired"` →
+///   [`SpawnDecision::SkipExpired`] (coord's TTL expiry answered to a
+///   non-target device; reason from `expired_reason`, target from
+///   `target_device_id` when it parses as a UUID).
 /// - any other status (incl. a 409 that is NONE of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
@@ -2367,13 +2415,31 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipRerouted { target_device_id };
             }
+            // The TTL-expired shape, answered to a NON-target device:
+            // `{"error":"expired","expired_at":…,"expired_reason":…,
+            // "target_device_id":<uuid|null>}`. The row is terminal on coord.
+            if v.get("error").and_then(|e| e.as_str()) == Some("expired") {
+                let expired_reason = v
+                    .get("expired_reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+                let target_device_id = v
+                    .get("target_device_id")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipExpired {
+                    expired_reason,
+                    target_device_id,
+                };
+            }
         }
-        // A 409 that is none of the cancelled / superseded / rerouted contracts
-        // (e.g. some other conflict): proceed rather than silently drop the
-        // continuation.
+        // A 409 that is none of the cancelled / superseded / rerouted / expired
+        // contracts (e.g. some other conflict): proceed rather than silently
+        // drop the continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
-                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+                "claim returned 409 without a cancelled, superseded, rerouted or expired \
+                 body: {body}"
             ),
         };
     }
@@ -2612,6 +2678,8 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   the new target: the same availability-over-consistency trade every
 ///   claim-error path already makes, and reachable only through an in-flight
 ///   duplicate or a frame-only offline republish.
+/// * [`SpawnDecision::SkipExpired`] → **false**. coord expired the row on its
+///   TTL, so it is terminal there and never re-listed — the cancelled case.
 ///
 /// The remaining decisions spawn or defer, so none is a skip: `false`.
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
@@ -2771,6 +2839,25 @@ fn settle_claim_decision(
             // rather than incidental). No outcome and no deferred stamp: the
             // row now belongs to the new target, and a deferral from us would
             // write this device's pressure onto a row another device owns.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipExpired {
+            expired_reason,
+            target_device_id,
+        } => {
+            info!(
+                "agent_runtime: continuation already expired by coord and this device is not \
+                 its target — skipping spawn, no outcome posted (gate_id={gate_id} \
+                 expired_reason={} target_device_id={})",
+                expired_reason.as_deref().unwrap_or("(not named)"),
+                target_device_id
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "(none)".to_string())
+            );
+            // Keeps the claim, like the cancelled arm: the row is terminal on
+            // coord and never re-listed (`skip_leaves_row_pending` is false).
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -4097,12 +4184,17 @@ async fn post_work_unreported_fallback(
     // The detail is [`work_unreported_detail`]'s one line — HOW the session
     // ended, which is what lets coord re-deliver a crash and leave a deliberate
     // end alone. Coord persists `work_unreported: <detail>`.
+    // Durable (a real outcome on a consumed row), on the same per-gate lane
+    // as `spawned`, so a queued `spawned` stays ahead of it. Names the episode
+    // the session was claimed under, when the poll told us.
     match post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
         Some(detail),
         None,
+        crate::session::continuation_outcome_outbox::take_episode(gate_id),
+        true,
     )
     .await
     {
@@ -4820,6 +4912,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
+        payload.dispatched_at = row.dispatched_at;
         match dispatch_gate_continuation(payload, device_id).await {
             DispatchOutcome::Dispatched => counts.dispatched_n += 1,
             DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
@@ -5062,6 +5155,8 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
 /// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
 /// - 409 `{"error":"rerouted", target_device_id, …}` → [`SpawnDecision::SkipRerouted`].
+/// - 409 `{"error":"expired", expired_reason, target_device_id, …}` →
+///   [`SpawnDecision::SkipExpired`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -5111,17 +5206,36 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
             let text = resp.text().await.unwrap_or_default();
             decide_spawn(status, &text)
         }
+        // The cause CHAIN with a `[timeout]` / `[connect]` tag: a bare `{e:#}`
+        // on a reqwest error printed only "error sending request for url (…)",
+        // which left the 2026-10-22 incident unable to say which fault it was.
         Err(e) => SpawnDecision::SpawnDespiteClaimError {
-            cause: format!("claim POST failed: {e:#}"),
+            cause: format!(
+                "claim POST failed: {}",
+                crate::session::coord_sync::transport_error(&e)
+            ),
         },
     }
 }
 
-/// POST the consume OUTCOME (`{device_id, outcome, detail?}`) after the spawn
-/// attempt resolves, or after the spawned session's PTY exits without having
-/// reported. Best-effort, 5s timeout — a failure `warn!`s once and is
-/// swallowed (coord already recorded the claim; a missed outcome only leaves
-/// `continuation_consumed_outcome` NULL). NEVER crashes the caller.
+/// POST the consume OUTCOME (`{device_id, outcome, detail?, dispatched_at?}`)
+/// after the spawn attempt resolves, or after the spawned session's PTY exits
+/// without having reported. One direct 5 s attempt — the fast path. NEVER
+/// crashes the caller.
+///
+/// **Durable on a transport failure** (plan
+/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+/// Phase 2). It is NOT safe to assume "coord already recorded the claim": on
+/// the [`SpawnDecision::SpawnDespiteClaimError`] path this post is the ONLY
+/// record of the consume, and the 2026-10-22 brownout lost hundreds of them to
+/// a fire-once post. So when `durable` and the failure is the retryable class
+/// (transport, timeout, 5xx, 429) the record goes to the session outbox kind
+/// `gate_continuation_outcome`, which the `coord_sync` drain retries until
+/// coord answers; a direct 400/404/409 is coord's verdict and is logged, not
+/// queued. A gate with a record already queued posts BEHIND it instead of
+/// directly, so the lane's order holds. All of that lives in
+/// [`crate::session::continuation_outcome_outbox`]; `durable` is that module's
+/// `durable_retry_applies` for this post.
 ///
 /// **Verifies by read.** The route answers 200 for a REFUSED outcome write as
 /// well as an accepted one — the consume ack is recorded either way, and only
@@ -5137,18 +5251,40 @@ async fn post_continuation_outcome(
     outcome: ContinuationOutcome,
     detail: Option<String>,
     claude_code_session_id: Option<String>,
+    dispatched_at: Option<String>,
+    durable: bool,
 ) -> OutcomeAck {
+    use crate::session::continuation_outcome_outbox as outbox;
+    // No coord configured: nothing to post to, and nothing to retry against.
     let Some(base) = connected_coord_base() else {
         return OutcomeAck::NoVerdict;
     };
+    let token = outcome.wire();
+    let record = outbox::ContinuationOutcomeRecord {
+        gate_id,
+        device_id,
+        outcome: token.to_string(),
+        detail: detail.clone(),
+        claude_code_session_id: claude_code_session_id.clone(),
+        dispatched_at: dispatched_at.clone(),
+    };
+    let store = outbox::global();
+    if outbox::queue_behind_pending(store.as_deref(), &record, durable) {
+        return OutcomeAck::NoVerdict;
+    }
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
     let Some(client) = crate::coord_http::coord_client() else {
-        warn!("agent_runtime: continuation-outcome: no shared coord client gate_id={gate_id}");
+        outbox::handle_direct_failure(
+            store.as_deref(),
+            &outbox::DirectFailure::NoClient,
+            &record,
+            durable,
+        );
         return OutcomeAck::NoVerdict;
     };
-    let token = outcome.wire();
     let body =
-        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id);
+        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id)
+            .at_episode(dispatched_at);
     // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..); same device-keyed route — coord resolves the gate row from the path gate_id plus the verified claiming device, and the optional claude_code_session_id is a value it STAMPS onto that row, never a key it scopes or looks up by.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
@@ -5186,18 +5322,25 @@ async fn post_continuation_outcome(
             }
             ack
         }
+        // A non-2xx: coord's own answer is logged by the module, and only the
+        // retryable class (5xx, 429) is queued.
         Ok(resp) => {
-            warn!(
-                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
-                 returned {} (continuing)",
-                resp.status()
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            outbox::handle_direct_failure(
+                store.as_deref(),
+                &outbox::DirectFailure::Status { status, body },
+                &record,
+                durable,
             );
             OutcomeAck::NoVerdict
         }
         Err(e) => {
-            warn!(
-                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
-                 failed (continuing): {e:#}"
+            outbox::handle_direct_failure(
+                store.as_deref(),
+                &outbox::DirectFailure::Transport(crate::session::coord_sync::transport_error(&e)),
+                &record,
+                durable,
             );
             OutcomeAck::NoVerdict
         }
@@ -5274,9 +5417,26 @@ async fn post_spawn_outcome(
     detail: Option<String>,
     // The pinned Claude session uuid — `Some` only on a `Spawned` outcome.
     claude_code_session_id: Option<String>,
+    // The dispatch episode this run was claimed under (`None` = unknown).
+    dispatched_at: Option<String>,
+    // Whether coord CONFIRMED the consume claim (a 200). Decides whether a
+    // failed `spawn_failed` earns a durable retry; `spawned` always does.
+    claim_confirmed: bool,
 ) {
-    if let OutcomeAck::Superseded(standing) =
-        post_continuation_outcome(gate_id, device_id, outcome, detail, claude_code_session_id).await
+    let durable = crate::session::continuation_outcome_outbox::durable_retry_applies(
+        outcome.wire(),
+        claim_confirmed,
+    );
+    if let OutcomeAck::Superseded(standing) = post_continuation_outcome(
+        gate_id,
+        device_id,
+        outcome,
+        detail,
+        claude_code_session_id,
+        dispatched_at,
+        durable,
+    )
+    .await
     {
         warn!(
             "agent_runtime: continuation-outcome gate_id={gate_id} REFUSED — posted {} but \
@@ -6006,6 +6166,11 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
+    //
+    // `claim_confirmed` carries coord's 200 to step 4: a failed `spawn_failed`
+    // is durably retried only on a CONFIRMED claim (see
+    // `continuation_outcome_outbox::durable_retry_applies`).
+    let mut claim_confirmed = false;
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
@@ -6020,8 +6185,16 @@ async fn run_gate_continuation_inner(
         // So the DECISION (log + whether the claim is settled here) stays
         // there and only the await lands at this call site.
         let decision = post_continuation_claim(gate_id, device_id).await;
+        claim_confirmed = decision == SpawnDecision::Spawn;
         match settle_claim_decision(&decision, consume_target, gate_id) {
-            ClaimOutcome::Spawn => {}
+            ClaimOutcome::Spawn => {
+                // The PTY exit fallback knows only the gate id; let it name
+                // the same dispatch episode this run was claimed under.
+                crate::session::continuation_outcome_outbox::remember_episode(
+                    gate_id,
+                    payload.dispatched_at.as_deref(),
+                );
+            }
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
                 defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))
@@ -6105,6 +6278,8 @@ async fn run_gate_continuation_inner(
                         &e.to_string(),
                     ))),
                     None,
+                    payload.dispatched_at.clone(),
+                    claim_confirmed,
                 )
                 .await;
             }
@@ -6202,6 +6377,8 @@ async fn run_gate_continuation_inner(
                 resolution.outcome,
                 resolution.detail,
                 resolution.claude_code_session_id,
+                payload.dispatched_at.clone(),
+                claim_confirmed,
             )
             .await
         }
@@ -14299,6 +14476,7 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            dispatched_at: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -17476,6 +17654,7 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                dispatched_at: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -17606,6 +17785,64 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// 409 with coord Phase 3's TTL-expired contract (answered to a NON-target
+    /// device) → SkipExpired: no spawn, no outcome, local claim KEPT. Before
+    /// this arm the shape fell into "any other 409" and spawned anyway — an
+    /// unrecorded run of work coord had already given up on (plan
+    /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`).
+    #[test]
+    fn decide_spawn_on_409_expired_skips_without_spawning() {
+        let target = uuid::Uuid::now_v7();
+        let body = format!(
+            r#"{{"error":"expired","expired_at":"2026-10-29T10:00:00.123456+00:00","expired_reason":"ttl_7d_elapsed","target_device_id":"{target}"}}"#
+        );
+        let decision = decide_spawn(409, &body);
+        assert_eq!(
+            decision,
+            SpawnDecision::SkipExpired {
+                expired_reason: Some("ttl_7d_elapsed".to_string()),
+                target_device_id: Some(target),
+            }
+        );
+        // A null / absent target and reason still skip: the refusal is
+        // authoritative, the fields are for the log only.
+        for body in [
+            r#"{"error":"expired","target_device_id":null}"#,
+            r#"{"error":"expired"}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipExpired {
+                    expired_reason: None,
+                    target_device_id: None,
+                },
+                "{body}"
+            );
+        }
+        // Terminal on coord: the skip keeps the local claim, and the funnel
+        // returns Skip (no spawn, no deferral, no outcome).
+        assert!(!skip_leaves_row_pending(&decision));
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate));
+        assert_eq!(
+            settle_claim_decision(&decision, ConsumeTarget::Gate(gate, 0), gate),
+            ClaimOutcome::Skip
+        );
+        assert!(
+            !claim_gate_dispatch(gate),
+            "an expired skip keeps the local claim: coord never re-lists the row"
+        );
+        release_gate_dispatch(gate);
+        // The drain never turns a refusal into anything else.
+        assert_eq!(
+            apply_drain_to_claim(
+                decision.clone(),
+                &crate::coord_drain_state::CoordDrainState::Clear
+            ),
+            decision
+        );
     }
 
     /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
