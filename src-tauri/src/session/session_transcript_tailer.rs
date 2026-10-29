@@ -1891,11 +1891,13 @@ mod tests {
         assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
     }
 
-    /// An unbound session has no row to heartbeat — and must not get one.
+    /// An unbound session has no row to heartbeat — and must not get one. Nor
+    /// may its unbound appends spend the throttle window: the first append
+    /// after the key is bound heartbeats at once, not up to 60 s later.
     #[test]
     fn transcript_activity_on_an_unbound_key_heartbeats_nothing() {
         let dir = tempdir().unwrap();
-        let (t, _registrar, outbox) = tailer(dir.path());
+        let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
         let t0 = Instant::now();
         for i in 0..3u64 {
@@ -1906,6 +1908,16 @@ mod tests {
         }
         assert_eq!(t.admit_at(&csid, 8, false, t0), Admit::Withheld);
         assert_eq!(all_heartbeats(&outbox), 0);
+
+        // Bound inside what would have been the throttle window.
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+        t.admit_at(&csid, 8, false, t0 + Duration::from_secs(5));
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "the unbound appends did not claim the throttle slot"
+        );
     }
 
     /// Gate 1 governs transcript CONTENT, not liveness: with consent off a
