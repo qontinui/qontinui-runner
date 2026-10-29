@@ -826,7 +826,7 @@
       "excerpt": "\"powershell\",",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm."
+      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
     },
     {
       "class": "os_bound_tooling",
@@ -835,7 +835,7 @@
       "excerpt": "\"pwsh\",",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm."
+      "note": "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
     },
     {
       "class": "os_bound_tooling",
