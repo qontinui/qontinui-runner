@@ -3803,6 +3803,14 @@ mod tests {
             Some((0, 0)),
             &fb
         )));
+        // So does a non-zero sliver below the shared minimum, off the sentinel.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((10, 10)),
+            Some((160, 28)),
+            &fb
+        )));
         assert!(is_fallback(placement_from_snapshot(
             false,
             false,

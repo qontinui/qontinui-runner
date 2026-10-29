@@ -362,8 +362,7 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
     // match the resume-path reader. Best-effort: a marker write failure only
     // degrades the next boot to "treated as crash", which is the safe
     // direction.
-    let marker_path = crate::session::shutdown_marker::marker_path();
-    crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
+    stamp_drained_marker(&crate::session::shutdown_marker::marker_path());
 
     // Retract the out-of-process port advertisement (plan 2026-07-17 §4): a
     // drain is the supervisor's pre-kill signal, so this runner is about to stop
@@ -383,6 +382,17 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
     );
 
     summary
+}
+
+/// The drain's shutdown-marker stamp: `clean:true` with the teardown NOT
+/// complete. A drain flushes turns, stashes WIP and heartbeats claims, but
+/// closes no terminal, and it stamps even when it timed out, so it can never
+/// attest that the teardown finished. Only `run_teardown` does, after
+/// `TerminalManager::close_all` (plan
+/// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+/// Phase 3).
+pub(crate) fn stamp_drained_marker(marker_path: &std::path::Path) {
+    crate::session::shutdown_marker::mark_clean_shutdown(marker_path);
 }
 
 /// Block (polling) until `session` leaves `Processing` or `deadline` passes.
@@ -895,6 +905,24 @@ mod tests {
         assert_eq!(
             configured_timeout(),
             Duration::from_millis(DEFAULT_DRAIN_TIMEOUT_MS)
+        );
+    }
+
+    /// Plan `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 3: the drain's marker classifies as a planned restart whose
+    /// teardown did NOT finish. A drain closes no terminal, so it must never
+    /// claim one.
+    #[test]
+    fn drain_marker_is_clean_but_never_a_finished_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-shutdown.json");
+        stamp_drained_marker(&path);
+        let boot = crate::session::shutdown_marker::read_classification(&path, 7);
+        assert!(!boot.crash_recovery, "a drain is a planned shutdown");
+        assert!(boot.prior_marker_at.is_some());
+        assert!(
+            !boot.teardown_complete,
+            "a drain must not attest a finished teardown"
         );
     }
 }

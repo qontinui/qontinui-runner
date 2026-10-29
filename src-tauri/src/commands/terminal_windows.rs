@@ -345,7 +345,7 @@ pub fn restore_pop_out_windows(
                 tracing::warn!(
                     window = %label,
                     rejected_geometry = ?g,
-                    "restore_pop_out_windows: saved geometry is not restorable (minimized/zero-size) — using default placement and clearing it"
+                    "restore_pop_out_windows: saved geometry is not restorable (minimized/too small) — using default placement and clearing it"
                 );
                 assignments.clear_geometry(&label);
                 None
