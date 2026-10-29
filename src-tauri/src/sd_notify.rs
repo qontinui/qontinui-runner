@@ -52,6 +52,16 @@
 //! completed, or a snapshot older than [`SNAPSHOT_MAX_AGE`], is UNKNOWN and
 //! keeps alive (fail closed).
 //!
+//! **Known limit — CI builds under a wedge:** a build guard drops only when
+//! its executor task ends, and a starved runtime never ends it. So a guard
+//! protects the runner only while it was started, or a lease was renewed by
+//! an accepted progress POST, within [`CI_BUILD_PROTECTION`] (coord's 15 min
+//! [`CI_DISPATCH_LEASE`] plus sweeper margin). A starved runtime renews
+//! nothing, so its builds age out exactly when coord has re-placed them; a
+//! healthy multi-hour build that keeps reporting stays protected. The renewal
+//! stamp is shared by all dispatches, so one renewing build keeps an
+//! orphaned sibling counted too — the conservative direction.
+//!
 //! **Known limit, stated rather than hidden:** the background census runs
 //! every `tracking_health::CHECK_INTERVAL` (600 s), so a session opened after
 //! the last pass and before a wedge is not in the snapshot unless a
@@ -73,7 +83,7 @@
 //! blocked watchdog thread.
 
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -224,36 +234,139 @@ pub fn tick_for_watchdog(default: Duration, interval: Option<Duration>) -> (Dura
 // In-flight CI builds
 // ---------------------------------------------------------------------------
 
-static CI_BUILDS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// The dispatch lease coord grants a ci_node build: 15 minutes, renewed by
+/// every progress POST coord accepts. Coord owns the number; the runner
+/// carries it only here and in `ci_node::checkout`'s
+/// `production_policy_stays_inside_the_lease` test.
+pub const CI_DISPATCH_LEASE: Duration = Duration::from_secs(15 * 60);
+
+/// A build guard stops keeping a wedged runner alive once neither its start
+/// nor the last accepted progress POST is within this bound: the lease, plus
+/// margin for coord's lease sweeper to run. By then coord has marked the
+/// dispatch lost and re-placed it, so the local build being protected is
+/// orphaned — and the kill is no longer a stop of work anyone is waiting on.
+pub const CI_BUILD_PROTECTION: Duration = Duration::from_secs(20 * 60);
+
+/// How many concurrent builds the table tracks individually. Far above any
+/// `max_concurrent`; a build beyond it lands in `overflow`, which never ages
+/// (fail closed).
+const CI_BUILD_SLOTS: usize = 64;
+
+/// Monotonic ms since a process-local epoch, floored at 1 so `0` can mean
+/// "empty slot" / "never".
+fn mono_ms(epoch: &OnceLock<Instant>) -> u64 {
+    (epoch.get_or_init(Instant::now).elapsed().as_millis() as u64).saturating_add(1)
+}
+
+/// Lock-free table of running ci_node builds. Each slot holds the build's
+/// start stamp (monotonic ms, `0` = free); `renewed_ms` is the last time
+/// coord ACCEPTED a progress POST for any dispatch, i.e. renewed a lease.
+pub struct CiBuildTable {
+    epoch: OnceLock<Instant>,
+    slots: [AtomicU64; CI_BUILD_SLOTS],
+    overflow: AtomicUsize,
+    renewed_ms: AtomicU64,
+}
+
+impl CiBuildTable {
+    const fn new() -> Self {
+        CiBuildTable {
+            epoch: OnceLock::new(),
+            slots: [const { AtomicU64::new(0) }; CI_BUILD_SLOTS],
+            overflow: AtomicUsize::new(0),
+            renewed_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        mono_ms(&self.epoch)
+    }
+
+    fn claim(&'static self) -> CiBuildInFlight {
+        let start = self.now_ms();
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot
+                .compare_exchange(0, start, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return CiBuildInFlight {
+                    table: self,
+                    slot: Some(i),
+                };
+            }
+        }
+        self.overflow.fetch_add(1, Ordering::SeqCst);
+        CiBuildInFlight {
+            table: self,
+            slot: None,
+        }
+    }
+
+    fn note_renewed(&self) {
+        self.renewed_ms.store(self.now_ms(), Ordering::SeqCst);
+    }
+
+    /// Builds that still protect the runner at monotonic `now_ms`: a slot
+    /// counts while `now - max(start, last renewal) <= bound`; overflow always
+    /// counts.
+    fn protecting(&self, now_ms: u64, bound: Duration) -> usize {
+        let renewed = self.renewed_ms.load(Ordering::SeqCst);
+        let bound_ms = bound.as_millis() as u64;
+        let young = self
+            .slots
+            .iter()
+            .map(|s| s.load(Ordering::SeqCst))
+            .filter(|&start| start != 0 && now_ms.saturating_sub(start.max(renewed)) <= bound_ms)
+            .count();
+        young + self.overflow.load(Ordering::SeqCst)
+    }
+}
+
+static CI_BUILDS: CiBuildTable = CiBuildTable::new();
 
 /// RAII marker for one running ci_node dispatch. Created when the build's slot
-/// is taken and moved into the executor task, so the count is released on
+/// is taken and moved into the executor task, so it is released on
 /// completion, cancellation, an early return, a panic, or the task being
 /// dropped — every path out.
-#[derive(Debug)]
-pub struct CiBuildInFlight(&'static AtomicUsize);
+pub struct CiBuildInFlight {
+    table: &'static CiBuildTable,
+    slot: Option<usize>,
+}
 
-impl CiBuildInFlight {
-    fn on(counter: &'static AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        CiBuildInFlight(counter)
+impl std::fmt::Debug for CiBuildInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CiBuildInFlight")
+            .field("slot", &self.slot)
+            .finish()
     }
 }
 
 impl Drop for CiBuildInFlight {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        match self.slot {
+            Some(i) => self.table.slots[i].store(0, Ordering::SeqCst),
+            None => {
+                self.table.overflow.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 }
 
 /// Mark one ci_node dispatch as running until the guard drops.
 pub fn ci_build_in_flight() -> CiBuildInFlight {
-    CiBuildInFlight::on(&CI_BUILDS_IN_FLIGHT)
+    CI_BUILDS.claim()
 }
 
-/// How many ci_node dispatches are running. Lock-free.
+/// Coord accepted a progress POST — a dispatch lease was renewed. Called by
+/// `ci_node::reporting`'s flusher.
+pub fn note_ci_lease_renewed() {
+    CI_BUILDS.note_renewed();
+}
+
+/// How many ci_node dispatches still protect a wedged runner: running, and
+/// started or lease-renewed within [`CI_BUILD_PROTECTION`]. Lock-free.
 pub fn ci_builds_in_flight() -> usize {
-    CI_BUILDS_IN_FLIGHT.load(Ordering::SeqCst)
+    CI_BUILDS.protecting(CI_BUILDS.now_ms(), CI_BUILD_PROTECTION)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,11 +462,15 @@ pub fn ready_action(
     }
 }
 
-/// The READY latch's two once-flags.
+/// The READY latch's two once-flags, plus a send lock that serializes the
+/// decide-and-send so an `EXTEND_TIMEOUT_USEC=` can never follow `READY=1`.
 #[derive(Debug, Default)]
 pub struct ReadyLatch {
     ready_sent: AtomicBool,
     extend_sent: AtomicBool,
+    /// Only ever `try_lock`ed: a caller that finds it held skips this poll
+    /// (the holder is doing the work), so the watchdog thread never blocks.
+    sending: Mutex<()>,
 }
 
 impl ReadyLatch {
@@ -361,6 +478,7 @@ impl ReadyLatch {
         ReadyLatch {
             ready_sent: AtomicBool::new(false),
             extend_sent: AtomicBool::new(false),
+            sending: Mutex::new(()),
         }
     }
 }
@@ -417,6 +535,11 @@ pub fn poll_ready_with<F>(
 where
     F: FnOnce(&str) -> std::io::Result<bool>,
 {
+    let _sending = match latch.sending.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return ReadyAction::Wait,
+    };
     if latch.ready_sent.load(Ordering::SeqCst) {
         return ReadyAction::Wait;
     }
@@ -429,6 +552,11 @@ where
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                // Belt and braces beside the send lock: READY may never be
+                // followed by an extension.
+                if latch.ready_sent.load(Ordering::SeqCst) {
+                    return ReadyAction::Wait;
+                }
                 let msg = format!(
                     "EXTEND_TIMEOUT_USEC={}\nSTATUS=HTTP API serving; waiting up to {}s for the \
                      ci_node device_ci subscription before READY",
@@ -469,8 +597,8 @@ where
 /// One published readiness verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedReadiness {
-    /// Monotonic stamp of the publish — the only clock used for ordering and
-    /// age.
+    /// Monotonic stamp of when the evidence was OBSERVED (the census pass's
+    /// start) — the only clock used for ordering and age.
     pub stamp: Instant,
     pub safe_to_restart: bool,
     pub reason: String,
@@ -564,12 +692,15 @@ pub fn census_verdict(report: &TrackingHealthReport, now_ms: i64) -> RestartRead
 
 /// Publish the verdict over a completed background census pass. Called by
 /// `tracking_health::run_once` on the async side.
-pub fn publish_census_report(report: &TrackingHealthReport) {
+///
+/// `observed_at` is when the census pass began observing the process table —
+/// the snapshot's age and ordering are measured from it, not from publish.
+pub fn publish_census_report(report: &TrackingHealthReport, observed_at: Instant) {
     let v = census_verdict(report, chrono::Utc::now().timestamp_millis());
     publish_into(
         &LAST_READINESS,
         PublishedReadiness {
-            stamp: Instant::now(),
+            stamp: observed_at,
             safe_to_restart: v.safe_to_restart,
             reason: v.reason,
             source: "census",
@@ -578,11 +709,12 @@ pub fn publish_census_report(report: &TrackingHealthReport) {
 }
 
 /// Publish the verdict a `GET /restart-readiness` just served.
-pub fn publish_readiness_verdict(v: &RestartReadiness) {
+/// `observed_at` is when that request's census pass began.
+pub fn publish_readiness_verdict(v: &RestartReadiness, observed_at: Instant) {
     publish_into(
         &LAST_READINESS,
         PublishedReadiness {
-            stamp: Instant::now(),
+            stamp: observed_at,
             safe_to_restart: v.safe_to_restart,
             reason: v.reason.clone(),
             source: "restart-readiness",
@@ -817,21 +949,70 @@ mod tests {
 
     #[test]
     fn ci_build_guard_counts_and_releases_on_every_exit() {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        static TABLE: CiBuildTable = CiBuildTable::new();
+        let count = || TABLE.protecting(TABLE.now_ms(), CI_BUILD_PROTECTION);
         {
-            let _a = CiBuildInFlight::on(&COUNTER);
-            let _b = CiBuildInFlight::on(&COUNTER);
-            assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+            let _a = TABLE.claim();
+            let _b = TABLE.claim();
+            assert_eq!(count(), 2);
         }
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 0);
-        // A panicking build releases its count during unwind.
+        assert_eq!(count(), 0);
+        // A panicking build releases its slot during unwind.
         let r = std::panic::catch_unwind(|| {
-            let _g = CiBuildInFlight::on(&COUNTER);
-            assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+            let _g = TABLE.claim();
+            assert_eq!(count(), 1);
             panic!("build panicked");
         });
         assert!(r.is_err());
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 0);
+        assert_eq!(count(), 0);
+    }
+
+    /// Plan 2026-10-19 Phase 2b re-review: a starved runtime never drops its
+    /// build guards, so a guard ages out of the gate once neither its start
+    /// nor a lease renewal is within `CI_BUILD_PROTECTION` — while a young
+    /// one, or an old one coord keeps renewing, still keeps the runner alive.
+    #[test]
+    fn an_aged_ci_build_guard_stops_keeping_a_wedged_runner_alive() {
+        static TABLE: CiBuildTable = CiBuildTable::new();
+        let bound = CI_BUILD_PROTECTION;
+        let bound_ms = bound.as_millis() as u64;
+        let _g = TABLE.claim();
+        let start = TABLE
+            .slots
+            .iter()
+            .map(|s| s.load(Ordering::SeqCst))
+            .max()
+            .unwrap();
+
+        // Young: protects.
+        assert_eq!(TABLE.protecting(start + bound_ms, bound), 1);
+        let view = ReadinessView::Published(entry(Instant::now(), true));
+        assert_eq!(
+            watchdog_decision(true, true, TABLE.protecting(start + bound_ms, bound), &view),
+            WatchdogDecision::Keepalive(KeepaliveReason::HostingWork)
+        );
+        // Aged with no renewal: no longer protects, so a safe snapshot withholds.
+        let late = start + bound_ms + 1;
+        assert_eq!(TABLE.protecting(late, bound), 0);
+        assert_eq!(
+            watchdog_decision(true, true, TABLE.protecting(late, bound), &view),
+            WatchdogDecision::Withhold
+        );
+        // A lease renewal re-arms it for another bound.
+        TABLE.renewed_ms.store(late, Ordering::SeqCst);
+        assert_eq!(TABLE.protecting(late + bound_ms, bound), 1);
+        assert_eq!(TABLE.protecting(late + bound_ms + 1, bound), 0);
+    }
+
+    #[test]
+    fn ci_build_overflow_never_ages() {
+        static TABLE: CiBuildTable = CiBuildTable::new();
+        let guards: Vec<_> = (0..CI_BUILD_SLOTS + 1).map(|_| TABLE.claim()).collect();
+        assert_eq!(TABLE.overflow.load(Ordering::SeqCst), 1);
+        assert_eq!(TABLE.protecting(u64::MAX / 2, CI_BUILD_PROTECTION), 1);
+        drop(guards);
+        assert_eq!(TABLE.protecting(TABLE.now_ms(), CI_BUILD_PROTECTION), 0);
+        assert_eq!(TABLE.overflow.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1007,6 +1188,32 @@ mod tests {
             ReadyAction::Wait
         );
         assert_eq!(sent.len(), 2, "{sent:?}");
+    }
+
+    #[test]
+    fn no_extension_is_ever_sent_after_ready_and_a_contended_poll_sends_nothing() {
+        let short = Some(Duration::from_secs(1));
+        // READY already sent: a poll that would otherwise extend sends nothing.
+        let latch = ReadyLatch::default();
+        latch.ready_sent.store(true, Ordering::SeqCst);
+        let mut sent = 0;
+        let action = poll_ready_with(&latch, short, CiSubscription::Pending, |_| {
+            sent += 1;
+            Ok(true)
+        });
+        assert_eq!(action, ReadyAction::Wait);
+        assert_eq!(sent, 0);
+
+        // Another caller holds the send lock: this poll skips without sending.
+        let latch = ReadyLatch::default();
+        let _held = latch.sending.lock().unwrap();
+        let action = poll_ready_with(&latch, short, CiSubscription::Up, |_| {
+            sent += 1;
+            Ok(true)
+        });
+        assert_eq!(action, ReadyAction::Wait);
+        assert_eq!(sent, 0);
+        assert!(!latch.ready_sent.load(Ordering::SeqCst));
     }
 
     #[test]
