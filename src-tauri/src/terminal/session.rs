@@ -5112,10 +5112,12 @@ fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
 /// Default per-thread join cap on the interactive close path.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Default cap on the shutdown `taskkill` subprocess.
+/// Default cap on the pane-tree kill. On Windows that is an in-process walk
+/// (`qontinui_runner_win32::process_tree`), not a `taskkill` subprocess; the
+/// constant's name predates that change.
 const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
+/// Floor under the kill cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
 const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);

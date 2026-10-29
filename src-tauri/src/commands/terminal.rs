@@ -1643,8 +1643,9 @@ pub fn terminal_session_record_close(
 /// only that: an unreadable (lock-poisoned) registry is an `Err`, never an
 /// unknown id. For a
 /// known id `data` is the same body `POST /sessions/{id}/finish` answers
-/// ([`FinishOutcome::response_json`]): what changed (`"marker"`,
-/// `"reason_only"`, or `"none"` for a no-op that wrote nothing) and whether
+/// ([`FinishOutcome::response_json`]): what changed (`"marker"`, including
+/// a restamp of an already-finished mark, or `"none"` for a no-op that wrote
+/// nothing) and whether
 /// coord was told (`coord.queued` / `coordSessionId` / `reason`), so neither a
 /// no-op nor a local-only mark can read as a coord write.
 ///
@@ -2217,11 +2218,17 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
-        .inspect_err(|_| {
-            // The session never reached `dst`: it must not count as a handoff.
-            crate::ai_provider::unrecord_handoff(&dst);
-        })?;
+    let outcome =
+        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
+            .await
+            .map_err(|e| {
+                // The session never reached `dst`: it must not count as a handoff.
+                crate::ai_provider::unrecord_handoff(&dst);
+                // A refusal (already migrating / already moved / closed /
+                // gone) reads as its own sentence, exactly as before the typed
+                // error.
+                e.to_string()
+            })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
