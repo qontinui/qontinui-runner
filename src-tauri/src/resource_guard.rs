@@ -2496,15 +2496,28 @@ impl AdmissionReading {
         }
     }
 
-    /// The composed verdict once `pending` admitted-but-not-yet-running spawns
-    /// are charged against the readings. See [`projected_verdict`]. Writes the
-    /// same edge-triggered shadowed-lane line [`probe_for_spawn`] writes, so a
-    /// lane that tripped but lost the report still reaches the log.
-    pub(crate) fn projected(&self, pending: usize) -> SpawnGate {
-        let (reported, shadowed) = projected_lanes(self.lanes.as_ref(), pending, self.cost);
-        note_shadowed_lane(shadowed.as_ref());
-        reported
+    /// PURE: the composed verdict once `pending` admitted-but-not-yet-running
+    /// spawns are charged against the readings, with the lane that tripped but
+    /// lost the report beside it. See [`projected_verdict`]. Safe to call under
+    /// a lock: it reads nothing and logs nothing — hand the second half to
+    /// [`note_admission_shadowed_lane`] once the lock is released.
+    pub(crate) fn projected(&self, pending: usize) -> (SpawnGate, Option<SpawnGate>) {
+        projected_lanes(self.lanes.as_ref(), pending, self.cost)
     }
+}
+
+/// The shadowed (lane, severity) unattended admission last logged — its own
+/// cell, apart from [`LAST_SHADOWED_LANE`], because the admission verdict is
+/// PROJECTED and can shadow a different lane than [`probe_for_spawn`]'s raw one
+/// at the same instant; one shared cell would flip on every interleaving and
+/// defeat the edge trigger.
+static LAST_ADMISSION_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
+
+/// The edge-triggered "a second lane also tripped" line for unattended
+/// admission (the shadowed half of [`AdmissionReading::projected`]). Call it
+/// OUTSIDE any registry lock.
+pub(crate) fn note_admission_shadowed_lane(shadowed: Option<&SpawnGate>) {
+    note_shadowed_lane(shadowed, &LAST_ADMISSION_SHADOWED_LANE);
 }
 
 /// PURE: the composed (heavier-lane) verdict once `pending` admitted spawns
@@ -2625,13 +2638,18 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
         return SpawnGate::Proceed;
     };
     let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads.verdict);
-    note_shadowed_lane(shadowed.as_ref());
+    note_shadowed_lane(shadowed.as_ref(), &LAST_SHADOWED_LANE);
     reported
 }
 
-/// The edge-triggered "a second lane also tripped" line, shared by the gate
-/// ([`probe_for_spawn`]) and unattended admission ([`AdmissionReading::projected`]).
-fn note_shadowed_lane(shadowed: Option<&SpawnGate>) {
+/// The edge-triggered "a second lane also tripped" line, written when the
+/// shadowed (lane, severity) pair differs from the one `last` holds. The gate
+/// ([`probe_for_spawn`]) and unattended admission
+/// ([`note_admission_shadowed_lane`]) each pass their own cell.
+fn note_shadowed_lane(
+    shadowed: Option<&SpawnGate>,
+    last: &Mutex<Option<(LaneMetric, &'static str)>>,
+) {
     // The lane that tripped but lost the report. Logged so the operator's log
     // says both, even though the toast or the refusal can only say one. The
     // severity word comes from the shadowed verdict itself, not from the
@@ -2650,7 +2668,7 @@ fn note_shadowed_lane(shadowed: Option<&SpawnGate>) {
         .and_then(SpawnGate::tripped)
         .map(|(severity, obs)| (obs.metric, severity));
     let shadow_changed = {
-        let mut last = LAST_SHADOWED_LANE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
         let changed = *last != shadow_key;
         *last = shadow_key;
         changed
