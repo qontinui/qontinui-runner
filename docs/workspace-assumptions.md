@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 96 | 97 | 96 | 0 | 0 | 0 |
+| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (96 rows)
+## `os_bound_tooling` (98 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -330,6 +330,8 @@ _No hits._
 | `src/profile_cli.rs` | `read_user_path` | `cfg(windows)-only fn 'read_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `write_user_path` | `cfg(windows)-only fn 'write_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/screen/dpi.rs` | `set_windows_dpi_awareness` | `cfg(windows)-only fn 'set_windows_dpi_awareness' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"powershell",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm. |
+| `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"pwsh",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a child named pwsh/powershell (Claude Code's Bash tool shell on Windows, or pwsh on Linux) counts as WORK. On a box without PowerShell nothing matches and the rule falls to the other names and to the default-is-work arm. |
 | `src/step_executor/handlers/check.rs` | `CheckHandler::execute` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/step_executor/handlers/shell_command.rs` | `ShellCommandHandler::get_shell_type` | `"powershell"` | 1 | unreviewed |
 | `src/step_executor/handlers/shell_command.rs` | `ShellCommandHandler::run_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
