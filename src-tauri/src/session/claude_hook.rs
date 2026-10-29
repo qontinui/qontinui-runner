@@ -211,6 +211,22 @@ impl StopHookRegistration {
         Self::from_mode(crate::mcp::continuation_verdict::Mode::from_env())
     }
 
+    /// The variant for one spawn. Pure — the unit-test surface.
+    ///
+    /// A GATE continuation reads an UNSET flag as armed
+    /// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]), so it gets
+    /// the `Stop` hook unless the flag is explicitly `off`. Every other spawn
+    /// keeps [`Self::from_env`]'s dark default. Measured 2026-10-28 on the
+    /// operator box (coord finding 4eef6693): all 89 null-status sessions ran
+    /// with the `-nostop` carrier, so the turn-end check could never run for
+    /// the continuations that idled holding a slot.
+    pub fn for_spawn(
+        reading: crate::mcp::continuation_verdict::FlagReading,
+        gate_continuation: bool,
+    ) -> Self {
+        Self::from_mode(reading.mode_for(gate_continuation))
+    }
+
     /// The `--settings` file name this variant materializes. Distinct per
     /// variant — see [`HOOK_SETTINGS_NAME_NOSTOP`] for why.
     fn settings_name(self) -> &'static str {
@@ -329,6 +345,22 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
 /// so calling it here and again at the spawn seam costs one cache hit.
 pub fn direct_spawn_settings_args() -> Vec<String> {
     settings_args_from(materialize(&session_restore_dir()))
+}
+
+/// [`direct_spawn_settings_args`] for a spawn that knows whether it is a GATE
+/// continuation: the variant comes from [`StopHookRegistration::for_spawn`]
+/// over the runner's live flag, so a gate continuation is Stop-armed unless the
+/// flag is explicitly `off`. `false` is exactly [`direct_spawn_settings_args`].
+///
+/// The PTY env half — the parsed mode the Stop script's own short-circuit
+/// reads — is forwarded for the same spawns by
+/// `commands::terminal::gate_identity_env`, so the carrier and the script agree.
+pub fn spawn_settings_args(gate_continuation: bool) -> Vec<String> {
+    let reg = StopHookRegistration::for_spawn(
+        crate::mcp::continuation_verdict::FlagReading::from_env(),
+        gate_continuation,
+    );
+    settings_args_from(materialize_with(&session_restore_dir(), reg))
 }
 
 /// [`direct_spawn_settings_args`] over an already-resolved carrier path — the
@@ -1043,6 +1075,44 @@ mod tests {
             "a deleted script forces the settings rewrite too"
         );
         assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
+    }
+
+    /// A gate continuation gets the Stop-registering carrier with the flag
+    /// UNSET, the no-Stop one with the flag explicitly `off`; any other spawn
+    /// is unchanged (dark unless the flag arms it).
+    #[test]
+    fn gate_continuation_spawns_get_the_stop_hook_unless_explicitly_off() {
+        use crate::mcp::continuation_verdict::{FlagReading, Mode};
+        assert_eq!(
+            StopHookRegistration::for_spawn(FlagReading::Unset, true),
+            StopHookRegistration::Registered
+        );
+        assert_eq!(
+            StopHookRegistration::for_spawn(FlagReading::Explicit(Mode::Off), true),
+            StopHookRegistration::Omitted
+        );
+        assert_eq!(
+            StopHookRegistration::for_spawn(FlagReading::Unset, false),
+            StopHookRegistration::Omitted
+        );
+        assert_eq!(
+            StopHookRegistration::for_spawn(FlagReading::Explicit(Mode::On), false),
+            StopHookRegistration::Registered
+        );
+
+        // And the carrier FILE that variant materializes is the armed one.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = materialize_with(
+            tmp.path(),
+            StopHookRegistration::for_spawn(FlagReading::Unset, true),
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            v["hooks"].as_object().unwrap().contains_key("Stop"),
+            "a gate continuation's carrier must register the Stop hook"
+        );
     }
 
     /// The production entry point is the env wrapper, so pin that it picks the

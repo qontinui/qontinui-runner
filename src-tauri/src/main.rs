@@ -5337,6 +5337,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // (it records each outcome there).
                 session::wind_down_executor::start();
 
+                // Continuation finish relay (plan
+                // `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`,
+                // Phase 2): a gate continuation idle past grace whose own gate
+                // reads work_completed/work_abandoned gets session_status
+                // finished recorded. Its OWN ticker — it must run on an
+                // undrained box, where the wind-down executor does nothing.
+                session::continuation_finish_relay::start();
+
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every
                 // 10 min cross-reference the live claude descendants of this

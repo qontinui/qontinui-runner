@@ -3127,6 +3127,32 @@ fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
 }
 
+/// The `coord.gates` row the LIVE continuation in `terminal_id` reports to, or
+/// `None` when the registry holds no entry for that terminal or holds one with
+/// no gate (a work-unit dispatch).
+///
+/// Read-only. It is how the Stop-hook verdict scopes its default-on arm to gate
+/// continuations ([`crate::mcp::continuation_verdict::mode_for_terminal`]) —
+/// by the runner's own record, never by a title or by the session's
+/// environment, which the runner cannot read.
+pub(crate) fn live_gate_continuation_gate_id(terminal_id: &str) -> Option<uuid::Uuid> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .and_then(|s| s.gate_id)
+}
+
+/// `(terminal_id, gate_id)` for every LIVE continuation that has a gate row —
+/// a snapshot taken under the registry lock and returned with it released.
+/// The finish relay ([`crate::session::continuation_finish_relay`]) walks it.
+pub(crate) fn live_gate_continuations() -> Vec<(String, uuid::Uuid)> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .iter()
+        .filter_map(|(tid, s)| s.gate_id.map(|g| (tid.clone(), g)))
+        .collect()
+}
+
 /// The configured continuation-session cap (env override, else the default).
 /// A non-numeric / empty env value falls back to the default.
 fn continuation_session_cap() -> usize {
@@ -4153,7 +4179,7 @@ async fn post_work_unreported_fallback(
 /// `work_completed` is always the bare marker (the fixed string is what lets
 /// coord's transition guard compare it exactly), while `work_abandoned` carries
 /// `": <first line, ≤200 chars>"` whenever a detail was sent.
-fn is_session_work_outcome(recorded: &str) -> bool {
+pub(crate) fn is_session_work_outcome(recorded: &str) -> bool {
     recorded == "work_completed" || marker_matches("work_abandoned", recorded)
 }
 
@@ -6796,8 +6822,11 @@ async fn run_continuation_terminal(
             prompt_carrier,
             // Direct exec — no identity shim in the chain to append `--settings`,
             // so the hook carrier has to be spelled out here or this session runs
-            // with no SessionStart/PreCompact/Stop hook at all.
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // with no SessionStart/PreCompact/Stop hook at all. A GATE
+            // continuation gets the Stop-armed carrier unless the flag is
+            // explicitly `off`: it is the unattended population whose turn end
+            // must be checked (plan 2026-10-28-finished-gate-continuations-…).
+            crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
         );
         // ...unless an operator template put a replacement prompt in the final
@@ -15345,6 +15374,27 @@ mod tests {
     }
 
     const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
+
+    /// The two read-only registry doors the Stop-hook verdict and the finish
+    /// relay use: only a LIVE entry carrying a gate is a gate continuation; a
+    /// gate-less entry (a work-unit dispatch) and an unknown terminal are not.
+    #[test]
+    fn live_gate_continuation_lookups_name_only_gated_live_entries() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::new_v4();
+        register_continuation_session("t-gate".to_string(), None, Some(gate));
+        register_continuation_session("t-unit".to_string(), Some("unit:x:p".to_string()), None);
+
+        assert_eq!(live_gate_continuation_gate_id("t-gate"), Some(gate));
+        assert_eq!(live_gate_continuation_gate_id("t-unit"), None);
+        assert_eq!(live_gate_continuation_gate_id("t-nope"), None);
+        assert_eq!(
+            live_gate_continuations(),
+            vec![("t-gate".to_string(), gate)]
+        );
+        clear_continuation_registry();
+    }
 
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
