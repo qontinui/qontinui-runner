@@ -1444,10 +1444,17 @@ impl PaneExitFacts {
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
     id: TerminalId,
-    /// Display title. Mutated post-spawn by [`Self::set_title`] (Phase 2 of
-    /// the bi-directional title sync — frontend OSC 0 observers in xterm.js
-    /// call back via `terminal_set_title` Tauri command).
+    /// Display title: the spawn-time name. Mutated post-spawn only by
+    /// [`Self::set_title`]. The OSC-0/2 title the child emits does NOT land
+    /// here — it is [`Self::activity_title`] (plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`, D3).
     title: Arc<Mutex<String>>,
+    /// The child's current-activity title: the latest OSC-0/2 string the
+    /// frontend's xterm.js `onTitleChange` relayed through
+    /// `terminal_set_title` (e.g. Claude Code's "Fix Phase 5b round 11").
+    /// `None` until the child emits one. Runtime-only: never persisted into
+    /// the lifecycle record, whose `title` names the conversation (D3).
+    activity_title: Arc<Mutex<Option<String>>>,
     /// Working directory the shell was started in.
     working_dir: String,
     /// Which terminal page this session belongs to. Mutated post-spawn by
@@ -2503,6 +2510,7 @@ impl TerminalSession {
         Ok(Self {
             id,
             title: Arc::new(Mutex::new(title)),
+            activity_title: Arc::new(Mutex::new(None)),
             working_dir: cwd,
             page_id: Arc::new(Mutex::new(page_id)),
             writer,
@@ -4281,13 +4289,11 @@ impl TerminalSession {
         }
     }
 
-    /// Update the session's display title. Phase 2 of bi-directional
-    /// title sync: the frontend's xterm.js `onTitleChange` handler relays
-    /// observed OSC 0/2 titles back to the runner via the
-    /// `terminal_set_title` Tauri command, which routes through
-    /// `TerminalManager::set_title` to here. Subsequent `info()` calls
-    /// (and `GET /terminals`) see the new value; other observers get the
-    /// `terminal-title-changed` event emitted by the manager.
+    /// Update the session's display (spawn-time) title. NOT the OSC relay's
+    /// target since plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+    /// D3: the OSC-0/2 title goes to [`Self::set_activity_title`].
+    #[cfg(test)]
     pub fn set_title(&self, title: String) {
         match self.title.lock() {
             Ok(mut g) => *g = title,
@@ -4508,6 +4514,28 @@ impl TerminalSession {
     /// the terminal was opened against.
     pub fn working_dir(&self) -> &str {
         &self.working_dir
+    }
+
+    /// Record the child's current-activity title (the OSC-0/2 string). Phase 2
+    /// of the bi-directional title sync relays it from xterm.js
+    /// `onTitleChange` via `terminal_set_title` and
+    /// `TerminalManager::set_title`. A blank title clears it.
+    pub fn set_activity_title(&self, title: Option<String>) {
+        let title = title.filter(|t| !t.trim().is_empty());
+        match self.activity_title.lock() {
+            Ok(mut g) => *g = title,
+            // Poisoned: recover and overwrite — pure text, no invariants.
+            Err(e) => *e.into_inner() = title,
+        }
+    }
+
+    /// The child's current-activity title, `None` until one was relayed.
+    /// Poison-tolerant, like [`Self::title`].
+    pub fn activity_title(&self) -> Option<String> {
+        self.activity_title
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     /// Read the session's current display title (see [`Self::set_title`]).
@@ -5660,6 +5688,7 @@ pub(crate) mod tests {
         TerminalSession {
             id: "test".to_string(),
             title: Arc::new(Mutex::new("test".to_string())),
+            activity_title: Arc::new(Mutex::new(None)),
             working_dir: ".".to_string(),
             page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
@@ -8313,6 +8342,28 @@ pub(crate) mod tests {
         let _ = session.submit_prompt("x", PtyWriteCaller::HttpSubmitPrompt);
         let slots = session.last_input();
         assert!(slots.last_write.is_none() && slots.last_submit.is_none());
+    }
+
+    /// D3: the activity title is held apart from the display title, so OSC
+    /// churn never rewrites the name `info()` (and `GET /terminals` `title`)
+    /// reports.
+    #[test]
+    fn set_activity_title_leaves_the_display_title_alone() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf);
+        assert_eq!(session.activity_title(), None);
+        session.set_activity_title(Some("Fix Phase 5b round 11".to_string()));
+        assert_eq!(
+            session.activity_title().as_deref(),
+            Some("Fix Phase 5b round 11")
+        );
+        assert_eq!(
+            session.info().title,
+            "test",
+            "the display title is untouched"
+        );
+        session.set_activity_title(Some("   ".to_string()));
+        assert_eq!(session.activity_title(), None, "a blank title clears it");
     }
 
     #[test]

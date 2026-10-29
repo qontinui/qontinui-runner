@@ -9,7 +9,8 @@ import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
-import { TabTitle, useDisplayTitle } from "../displayTitle";
+import { useDisplayTitle, usePaneLabel } from "../displayTitle";
+import { PaneLabelText, TabPaneLabel } from "../PaneLabelView";
 import { ZONE_HEADER_HOVER_RESERVE_CLASS } from "./headerReserve";
 import { formatTotalOutput } from "./outputSize";
 
@@ -124,6 +125,10 @@ export function ZoneLabel({
   // the session title so `ai/find` by title resolves to this header; the
   // session binding rides as data attributes on the registered node.
   const displayTitle = useDisplayTitle(tab);
+  // Phase 4 (plan 2026-10-27-click-resume-forks-a-live-conversation-and-pane-
+  // titles-hide-its-identity): the visible header leads with the
+  // conversation's `<name> · <id8>`, with the OSC activity title secondary.
+  const paneLabelValue = usePaneLabel(tab);
   const headerSpec = zoneHeaderElementSpec(zoneIndex, displayTitle, tab.claudeSessionId);
   const { ref: headerRef } = useUIElement({
     id: headerSpec.id,
@@ -180,10 +185,13 @@ export function ZoneLabel({
         }`}
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
-      {/* `title` keeps the full name reachable when the header truncates it. */}
-      <span className="text-[10px] text-[#a9b1d6] truncate font-medium" title={displayTitle}>
-        {displayTitle}
-      </span>
+      {/* The name truncates; the `· <id8>` suffix never does. `title` keeps
+          both lines reachable when the header truncates them. */}
+      <PaneLabelText
+        label={paneLabelValue}
+        tabId={tab.id}
+        primaryClassName="text-[10px] text-[#a9b1d6] font-medium"
+      />
       {position && (
         <span
           className="text-[9px] text-[#565f89] font-mono shrink-0"
@@ -316,8 +324,8 @@ export function ZoneLabel({
                         className={`w-1.5 h-1.5 rounded-full shrink-0 ${tabState === "needs-input" ? "animate-pulse" : ""}`}
                         style={{ backgroundColor: STATE_BORDER_COLORS[tabState] }}
                       />
-                      <span className="text-[10px] truncate flex-1">
-                        <TabTitle tab={t} />
+                      <span className="text-[10px] flex-1 min-w-0">
+                        <TabPaneLabel tab={t} />
                       </span>
                       {assignedZone && !isCurrent && (
                         <span className="text-[8px] text-[#565f89]">

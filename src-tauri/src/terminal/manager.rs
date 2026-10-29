@@ -760,36 +760,31 @@ impl TerminalManager {
         }
     }
 
-    /// Update the title of a terminal session and emit a
-    /// `terminal-title-changed` Tauri event so other webview windows
-    /// (and the backend relay's WS subscribers) stay in sync.
+    /// Record a terminal's OSC-0/2 current-activity title and emit a
+    /// `terminal-title-changed` event (`{id, activityTitle}`) so other webview
+    /// windows (and the backend relay's WS subscribers) stay in sync.
     ///
     /// Phase 2 of the bi-directional title sync (plan
     /// `2026-05-11-runner-dispatch-and-terminal-ux-fixes-plan.md`): the
-    /// frontend's xterm.js `onTitleChange` callback now invokes
-    /// `terminal_set_title` so backend `/terminals` titles match what the
-    /// user sees in the UI. Without this, `TerminalSession.title` was
-    /// frozen at spawn time and drifted from the OSC 0 title the child
-    /// emits at runtime.
+    /// frontend's xterm.js `onTitleChange` callback invokes
+    /// `terminal_set_title` with the title the child emits at runtime.
+    ///
+    /// Since plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+    /// D3 that title is the pane's ACTIVITY, not its identity. Current Claude
+    /// Code CLIs emit their current activity (e.g. the description of the last
+    /// subagent launched) as the OSC title, and mirroring it into the lifecycle
+    /// record's `title` — as this method did from plan
+    /// `2026-07-03-runner-session-tracking-drift-and-guardrails` Phase 3 item 4
+    /// until 2026-10-27 — erased the conversation's name. So it is stored only
+    /// as [`TerminalSession::activity_title`] and NEVER written into the
+    /// record, whose `title` only `reconcile::refresh_titles` (the provider's
+    /// name) and operator renames write.
     pub fn set_title(&self, id: &str, title: String, app_handle: &AppHandle) -> Result<(), String> {
         let session = self
             .get(id)
             .ok_or_else(|| format!("Terminal session not found: {}", id))?;
-        session.set_title(title.clone());
-        // Durable-title sync (plan 2026-07-03-runner-session-tracking-drift-
-        // and-guardrails Phase 3 item 4): mirror the rename into the lifecycle
-        // registry so a restart restores the pane under its CURRENT name, not
-        // the spawn-time one. No-ops cleanly when the terminal has no open
-        // record (plain shell never recorded) or the store isn't managed.
-        {
-            use tauri::Manager;
-            if let Some(store) = app_handle
-                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-            {
-                store.update_title_by_terminal(id, &title);
-            }
-        }
-        let payload = serde_json::json!({ "id": id, "title": title });
+        let payload = Self::record_activity_title(&session, id, title);
         if let Err(e) = app_handle.emit("terminal-title-changed", &payload) {
             error!("Failed to emit terminal-title-changed: {}", e);
         }
@@ -802,6 +797,35 @@ impl TerminalManager {
             &payload,
         );
         Ok(())
+    }
+
+    /// The pure half of [`Self::set_title`]: store the activity title on the
+    /// session and build the `terminal-title-changed` payload. Touches no
+    /// lifecycle record — the property D3 rests on, pinned by
+    /// `osc_title_churn_never_changes_the_record_title`.
+    fn record_activity_title(
+        session: &TerminalSession,
+        id: &str,
+        title: String,
+    ) -> serde_json::Value {
+        session.set_activity_title(Some(title));
+        serde_json::json!({ "id": id, "activityTitle": session.activity_title() })
+    }
+
+    /// Every live terminal's current-activity title, keyed by terminal id.
+    /// Terminals whose child has emitted no OSC title are absent.
+    pub fn activity_titles(&self) -> HashMap<String, String> {
+        let sessions = match self.sessions.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Sessions lock poisoned: {}", e);
+                return HashMap::new();
+            }
+        };
+        sessions
+            .iter()
+            .filter_map(|(id, s)| s.activity_title().map(|t| (id.clone(), t)))
+            .collect()
     }
 
     /// Move a terminal session onto a different page and emit a
@@ -1181,6 +1205,121 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    // ── D3 (plan 2026-10-27-click-resume-forks-a-live-conversation-and-
+    //    pane-titles-hide-its-identity, Phase 4): the OSC title is activity ──
+
+    /// The body of `TerminalManager::set_title`, sliced out of this file.
+    fn set_title_body() -> &'static str {
+        const SRC: &str = include_str!("manager.rs");
+        let start = SRC
+            .find("pub fn set_title(&self, id: &str")
+            .expect("set_title is in manager.rs");
+        let rest = &SRC[start..];
+        let end = rest.find("\n    }").expect("set_title has a closing brace");
+        &rest[..end]
+    }
+
+    /// OSC title churn never changes the lifecycle record's `title`.
+    ///
+    /// A provider session emits a new OSC title per activity (e.g. one per
+    /// subagent launched). Each lands on the session's `activity_title` and in
+    /// the event payload; the record keeps the conversation's name. Then the
+    /// provider-name refresh still runs, and it is a no-op because the name
+    /// was never overwritten.
+    #[test]
+    fn osc_title_churn_never_changes_the_record_title() {
+        use crate::session::reconcile::{
+            refresh_titles, LivePty, ProviderSessionIndex, ProviderSessionMeta,
+        };
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        use crate::terminal::session::tests::make_test_session;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let rec: crate::session::session_lifecycle_store::TerminalSessionRecord =
+            serde_json::from_value(serde_json::json!({
+                "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
+                "pageId": "default",
+                "zoneIndex": 0,
+                "title": "maxim",
+                "terminalId": "term-1",
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+            }))
+            .unwrap();
+        store.record_open(rec);
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        for osc in [
+            "✳ Claude Code",
+            "Fix Phase 5b round 11",
+            "Review the diff",
+            r"D:\qontinui-root",
+        ] {
+            let payload = TerminalManager::record_activity_title(&session, "term-1", osc.into());
+            assert_eq!(payload["id"], "term-1");
+            assert_eq!(payload["activityTitle"], osc);
+            assert!(
+                payload.get("title").is_none(),
+                "the event carries no `title`: a listener must not mistake activity for identity"
+            );
+            assert_eq!(session.activity_title().as_deref(), Some(osc));
+        }
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-1")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("maxim"),
+            "OSC churn left the record's conversation name alone"
+        );
+
+        // The provider-name refresh is still the record title's writer.
+        struct Index;
+        impl ProviderSessionIndex for Index {
+            fn meta_for_pid(&self, _pid: u32) -> Option<ProviderSessionMeta> {
+                Some(ProviderSessionMeta {
+                    session_id: "9b40e22d-deec-415c-9379-5f85ae994ad8".into(),
+                    name: Some("maxim".into()),
+                })
+            }
+        }
+        let live = vec![LivePty {
+            terminal_id: "term-1".into(),
+            pid: Some(4241),
+            working_dir: "C:/repo".into(),
+            page_id: "default".into(),
+            title: "maxim".into(),
+            ai_pid: Some(4242),
+            ai_start_unix: None,
+        }];
+        assert!(
+            refresh_titles(&store, &live, &Index).is_empty(),
+            "the name was never overwritten, so there is nothing to re-adopt"
+        );
+    }
+
+    /// The relay must not reach for the lifecycle store at all. Before D3,
+    /// `set_title` mirrored every OSC title into the record via
+    /// `update_title_by_terminal` (plan 2026-07-03 Phase 3 item 4), which is
+    /// how a subagent description replaced the lead session's name on
+    /// 2026-10-27. Pinned on the source because `set_title` needs a live
+    /// `AppHandle`, which no unit test can build.
+    #[test]
+    fn osc_title_relay_never_writes_the_lifecycle_record() {
+        let body = set_title_body();
+        assert!(body.contains("record_activity_title"), "{body}");
+        for forbidden in ["update_title_by_terminal", "SessionLifecycleStore"] {
+            assert!(
+                !body.contains(forbidden),
+                "set_title must not write the record title (found `{forbidden}`)"
+            );
+        }
+    }
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
     /// manager. `bind_coord_session` must fire the observer with the

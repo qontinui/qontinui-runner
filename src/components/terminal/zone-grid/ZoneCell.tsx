@@ -54,6 +54,7 @@ import { writeToTerminalById } from "../writeToTerminalById";
 import { useTabHotSlice } from "../useTerminalHotStore";
 import { CompactZoneCard } from "./CompactZoneCard";
 import { ZoneLabel } from "./ZoneLabel";
+import { TabPaneLabel } from "../PaneLabelView";
 import { ZoneQuickActions } from "./ZoneQuickActions";
 import {
   STATE_BORDER_COLORS,
@@ -803,6 +804,13 @@ function ZoneCellInner({
                   badge={reviewBadge}
                 />
               )}
+              {/* Phase 4 (plan 2026-10-27-click-resume-forks-a-live-
+                  conversation-and-pane-titles-hide-its-identity): the solo
+                  pane names its conversation too, `<name> · <id8>` first and
+                  the OSC activity title secondary. */}
+              <span className="min-w-0 text-[10px] text-[#a9b1d6]">
+                <TabPaneLabel tab={tab} primaryClassName="font-medium" />
+              </span>
             </div>
           )}
           {showFilterBar && (

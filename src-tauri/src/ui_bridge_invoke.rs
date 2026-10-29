@@ -477,7 +477,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "terminal_set_title",
         dispatch: Dispatch::Frontend,
-        description: "Update a terminal session's display title. Mirrors OSC 0/2 titles emitted by the PTY into TerminalSession.title and broadcasts terminal-title-changed to other webviews / WS subscribers. Pair to ZoneGrid's onTitleChange handler.",
+        description: "Record a terminal session's current-activity title (the OSC 0/2 title the PTY child emits) as TerminalSession.activity_title and broadcast terminal-title-changed {id, activityTitle} to other webviews / WS subscribers. Never rewrites the session's display title or the lifecycle record's conversation title. Pair to ZoneGrid's onTitleChange handler.",
         args_schema: r#"{"type":"object","required":["terminalId","title"],"properties":{"terminalId":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}"#,
         response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
         // Required `terminalId` + `title`; empty-args probe would always
