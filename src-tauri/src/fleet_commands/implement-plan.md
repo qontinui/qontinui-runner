@@ -3364,7 +3364,7 @@ deselection that counts is the row you just read.
 **The reviewer's brief carries the arming record, not only the diff.** Run
 Step 4.4b's `declare` and `prove` for this head first (they commit nothing),
 then hand the reviewer — spawned or inline — the output of
-`bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh show`
+`bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh show --root "$WT"`
 beside the diff, and none of your rationale for it. Tell the reviewer what the
 record's own THREAT MODEL says it cannot catch: `prove` is a control against
 honest mistakes, not against a constructed shadow (a `cfg` twin, a module no
@@ -3544,13 +3544,16 @@ because its tests enter through the changed function instead of the entry point
 the population uses. This step records one proposition per changed production
 symbol — *an assertion that enters where the population enters was observed
 GREEN with this change and RED without it* — as a head-keyed artifact,
-`~/.qontinui/arming/<session-id>.json` (schema `arming-arm/1`), the third
+`~/.qontinui/arming/<session-id>/<tree-key>.json` (schema `arming-arm/1`), the third
 member beside the review record and the handoff record.
 
-**The MAIN session performs it, once per PR, before that PR opens.** The record
-holds ONE head at a time — `declare` re-keys it — so for each PR: declare,
-prove, then render that PR's trailers (Step 4.5) into its body file, and only
-then move to the next PR. `show` afterwards reflects the last PR declared; each
+**One record per session AND tree, once per PR, before that PR opens.** Each
+tree (`--root`) has its own record, keyed by git's canonical top level, and it
+holds ONE head at a time — `declare` re-keys only its own tree's record — so two
+agents of one session (subagents inherit the session id) working on two trees no
+longer overwrite each other's record. For each PR: declare, prove, then render
+that PR's trailers (Step 4.5) into its body file. Two PRs cut from ONE tree still
+share that tree's record, so finish one before declaring the next there. Each
 PR's own evidence is the trailer block in its body. It commits nothing, so it
 runs before Step 4.4's reviewer is briefed (the brief carries the record) and
 again for any new head a review round causes — `prove` refuses a record

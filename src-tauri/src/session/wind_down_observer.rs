@@ -231,6 +231,7 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
             sm.inner(),
             boot_ms,
             &status_fetch.by_session_id,
+            &status_fetch.since_by_session_id,
         )
         .await
         {
@@ -515,6 +516,7 @@ mod tests {
             nested_under_claude: false,
             session_id: session_id.map(str::to_string),
             session_status: status.map(str::to_string),
+            session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
         }

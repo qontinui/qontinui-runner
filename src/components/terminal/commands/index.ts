@@ -20,6 +20,7 @@ export {
   ok,
   pluralize,
   renderCommandStatus,
+  statusTtlMs,
   stateEffect,
   statusKindOf,
 } from "./verdict";
