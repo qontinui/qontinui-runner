@@ -156,7 +156,7 @@
 //! Wire payload matches the existing claim-conflict body shape so the
 //! frontend doesn't need a schema update for Phase 3.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -780,6 +780,7 @@ impl Drop for DrainHold {
 ///
 /// `kind` is one of `server_error` (5xx), `rate_limited` (429),
 /// `unauthorized` (401/403 — coord refused the credential, or its absence),
+/// `not_found` (404),
 /// `rejected` (another 4xx), `http_error` (any other non-2xx), `network` (no HTTP answer),
 /// `timeout` (no answer inside the bound), `conflict` (409), or `local` (the
 /// runner failed before reaching coord). `status` is coord's HTTP status where
@@ -818,6 +819,11 @@ fn classify_push_failure(msg: &str, permanent: bool) -> (&'static str, Option<u1
         Some(429) => "rate_limited",
         Some(s) if s >= 500 => "server_error",
         Some(409) => "conflict",
+        // Before the generic 4xx arm: a 404 on a heartbeat PATCH is coord
+        // serving no row for the session to this caller, a different fault from
+        // a malformed row (400/422), and one a heartbeat repeats forever. Every
+        // caller of this classifier (`confirm_started` included) gets the label.
+        Some(404) => "not_found",
         Some(401 | 403) => "unauthorized",
         Some(s) if (400..500).contains(&s) => "rejected",
         Some(_) => "http_error",
@@ -865,6 +871,24 @@ pub(crate) struct SessionOutboxHealth {
     pub quarantined_sessions: u64,
     /// [`HEARTBEATS_SUPERSEDED`] as of this snapshot.
     pub heartbeats_superseded: u64,
+    /// [`HEARTBEATS_MUTED`] as of this snapshot.
+    pub heartbeats_muted: u64,
+    /// [`HEARTBEATS_DROPPED_ON_FAILURE`] as of this snapshot.
+    pub heartbeats_dropped_on_failure: u64,
+    /// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] as of this snapshot: only the
+    /// kinds with a non-zero total, so its values sum to
+    /// `heartbeats_dropped_on_failure`.
+    pub heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+}
+
+/// Copy the three heartbeat-drop totals into a health snapshot. Both snapshot
+/// writes in `drain_tick` go through this, so the block never reports one
+/// counter fresh and another stale.
+fn snapshot_heartbeat_drops(h: &mut SessionOutboxHealth) {
+    h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+    h.heartbeats_muted = HEARTBEATS_MUTED.load(Ordering::Relaxed);
+    h.heartbeats_dropped_on_failure = HEARTBEATS_DROPPED_ON_FAILURE.load(Ordering::Relaxed);
+    h.heartbeats_dropped_on_failure_by_kind = heartbeats_dropped_on_failure_by_kind();
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -918,10 +942,20 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
-        // Pending heartbeat rows dropped unsent: superseded by a newer one, or
-        // of a quarantined session muted by a sidecarred `started`/`closed`
-        // (process lifetime).
+        // Heartbeat rows the drain ACK-dropped without coord taking them, one
+        // counter per cause, all process lifetime: superseded by a newer
+        // pending heartbeat of the same session; muted because the session is
+        // quarantined and its `started`/`closed` row went to the sidecar; and
+        // dropped after a push that failed (no answer, a 5xx, a 4xx other
+        // than 409, or another non-2xx answer), broken down by failure kind.
         "heartbeatsSuperseded": counted(h.heartbeats_superseded),
+        "heartbeatsMuted": counted(h.heartbeats_muted),
+        "heartbeatsDroppedOnFailure": counted(h.heartbeats_dropped_on_failure),
+        "heartbeatsDroppedOnFailureByKind": if observed {
+            json!(h.heartbeats_dropped_on_failure_by_kind)
+        } else {
+            JsonValue::Null
+        },
         "observedAt": h.observed_at,
     })
 }
@@ -1120,13 +1154,83 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
     }
 }
 
-/// Pending heartbeat rows the drain ACK-dropped unsent: superseded by a newer
-/// pending heartbeat of the same session, or belonging to a quarantined
-/// session whose `started` or `closed` row went to the sidecar (module header,
-/// "One session's failure is that session's problem"). Process-lifetime
-/// total, bumped only once the ACK has landed;
+/// Pending heartbeat rows the drain ACK-dropped unsent because a newer pending
+/// heartbeat of the same session replaces them: the next pending row is also a
+/// heartbeat, or the session is quarantined and has a newer pending heartbeat.
+/// A muted session's heartbeats are NOT counted here ([`HEARTBEATS_MUTED`]).
+/// Process-lifetime total, bumped only once the ACK has landed;
 /// `GET /health` `sessionOutbox.heartbeatsSuperseded`.
 pub(crate) static HEARTBEATS_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Pending heartbeat rows the drain ACK-dropped unsent because their session is
+/// quarantined and its `started` or `closed` row went to the sidecar (module
+/// header, "One session's failure is that session's problem"): coord holds no
+/// row to keep alive, or the session has ended, so no heartbeat of it will
+/// ever be sent. Same lifetime and ACK-landed rule as
+/// [`HEARTBEATS_SUPERSEDED`]; `GET /health` `sessionOutbox.heartbeatsMuted`.
+pub(crate) static HEARTBEATS_MUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Heartbeat rows the drain ACK-dropped after a push that did not deliver
+/// them: a transport failure (no HTTP answer, a 5xx, or another non-2xx
+/// answer) or a 4xx other than 409 (a 429, a 403, a 404 when coord serves no
+/// row for the session to this caller, ...). A heartbeat is never retried,
+/// so before this counter such a drop left no trace beyond `lastFailure`,
+/// which the next failure of any kind overwrites. Same lifetime and
+/// ACK-landed rule as [`HEARTBEATS_SUPERSEDED`]; equals the sum of
+/// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] as of each drain snapshot (the
+/// per-kind slots are bumped first);
+/// `GET /health` `sessionOutbox.heartbeatsDroppedOnFailure`.
+pub(crate) static HEARTBEATS_DROPPED_ON_FAILURE: AtomicU64 = AtomicU64::new(0);
+
+/// The failure kinds [`classify_push_failure`] can return, in the order
+/// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] is indexed. The whole vocabulary,
+/// so every heartbeat drop lands on its own kind (`conflict` stays 0 in
+/// practice: a 409 on a heartbeat PATCH is `Acked`, not a drop).
+const HEARTBEAT_DROP_KINDS: [&str; 9] = [
+    "network",
+    "timeout",
+    "server_error",
+    "rate_limited",
+    "conflict",
+    "unauthorized",
+    "rejected",
+    "not_found",
+    "http_error",
+];
+
+/// [`HEARTBEATS_DROPPED_ON_FAILURE`] split by [`classify_push_failure`] kind,
+/// indexed like [`HEARTBEAT_DROP_KINDS`];
+/// `GET /health` `sessionOutbox.heartbeatsDroppedOnFailureByKind`.
+pub(crate) static HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND: [AtomicU64; HEARTBEAT_DROP_KINDS.len()] =
+    [const { AtomicU64::new(0) }; HEARTBEAT_DROP_KINDS.len()];
+
+/// The per-kind slot for a failure kind. `classify_push_failure` only returns
+/// members of [`HEARTBEAT_DROP_KINDS`]; a kind added there without this list
+/// is logged at error level and lands on `http_error` (the "some other HTTP
+/// answer" kind) rather than going uncounted. It never panics: this runs in
+/// the drain loop, after the ACK landed.
+fn heartbeat_drop_kind_slot(kind: &str) -> usize {
+    match HEARTBEAT_DROP_KINDS.iter().position(|k| *k == kind) {
+        Some(slot) => slot,
+        None => {
+            tracing::error!(
+                kind,
+                "coord_sync: failure kind missing from HEARTBEAT_DROP_KINDS; counted as http_error"
+            );
+            HEARTBEAT_DROP_KINDS.len() - 1
+        }
+    }
+}
+
+/// The non-zero per-kind heartbeat failure-drop totals.
+fn heartbeats_dropped_on_failure_by_kind() -> BTreeMap<&'static str, u64> {
+    HEARTBEAT_DROP_KINDS
+        .iter()
+        .zip(HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND.iter())
+        .map(|(k, n)| (*k, n.load(Ordering::Relaxed)))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
 
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
@@ -1294,6 +1398,10 @@ struct ChainOutcome {
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
+    /// The [`classify_push_failure`] kind of every heartbeat this chain
+    /// ACK-dropped after a failed push (one entry per row, also in
+    /// `succeeded`). Counted by the tick once the ACK lands.
+    heartbeat_failure_drops: Vec<&'static str>,
 }
 
 /// Push one session's records in seq order.
@@ -1322,6 +1430,7 @@ async fn push_chain(
         had_transport_error: false,
         blocked_on: None,
         aborted: false,
+        heartbeat_failure_drops: Vec::new(),
     };
 
     for rec in records {
@@ -1419,6 +1528,7 @@ async fn push_chain(
                     );
                     out.succeeded.push((rec.session_id, rec.seq));
                     out.cleared.push((rec.session_id, rec.seq));
+                    out.heartbeat_failure_drops.push(fail_kind);
                     if unreachable {
                         out.had_transport_error = true;
                         if trip_abort {
@@ -1466,6 +1576,9 @@ async fn push_chain(
                 );
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
+                if rec.event_kind == SessionEventKind::Heartbeat.as_str() {
+                    out.heartbeat_failure_drops.push(fail_kind);
+                }
             }
         }
     }
@@ -1519,9 +1632,17 @@ struct TickResult {
     /// sat out its own backoff did nothing, and must not reset the loop's
     /// outage backoff.
     ran_any: bool,
-    /// Heartbeat rows this tick ACK-dropped unsent, counted only once the ACK
-    /// landed — this tick's share of [`HEARTBEATS_SUPERSEDED`].
+    /// Heartbeat rows this tick ACK-dropped unsent because a newer heartbeat
+    /// replaces them, counted only once the ACK landed — this tick's share of
+    /// [`HEARTBEATS_SUPERSEDED`].
     heartbeats_superseded: u64,
+    /// This tick's share of [`HEARTBEATS_MUTED`], same ACK-landed rule.
+    heartbeats_muted: u64,
+    /// This tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE`], same rule.
+    heartbeats_dropped_on_failure: u64,
+    /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
+    /// only) — this tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`].
+    heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
 }
 
 impl TickResult {
@@ -1531,6 +1652,9 @@ impl TickResult {
             idle: true,
             ran_any: false,
             heartbeats_superseded: 0,
+            heartbeats_muted: 0,
+            heartbeats_dropped_on_failure: 0,
+            heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
         }
     }
 }
@@ -1617,7 +1741,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
-            h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+            snapshot_heartbeat_drops(h);
         });
         return TickResult::idle();
     }
@@ -1654,6 +1778,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|w| (w[0].session_id, w[0].seq))
         .collect();
     let mut superseded: Vec<(Uuid, i64)> = Vec::new();
+    // Heartbeats of a muted quarantined session (below): dropped like the
+    // superseded ones, but counted apart, because no newer heartbeat of the
+    // session will ever be sent.
+    let mut muted: Vec<(Uuid, i64)> = Vec::new();
 
     // A quarantined session's heartbeats bypass the sidecar: only its newest
     // pending heartbeat goes out, and every older one is superseded by it —
@@ -1692,9 +1820,12 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 to_quarantine.push(rec);
                 continue;
             }
-            if state.heartbeats_muted.contains(&rec.session_id)
-                || newest_quarantined_heartbeat.get(&rec.session_id) != Some(&rec.seq)
-            {
+            // Muted wins: a muted session's newest heartbeat is dropped too.
+            if state.heartbeats_muted.contains(&rec.session_id) {
+                muted.push((rec.session_id, rec.seq));
+                continue;
+            }
+            if newest_quarantined_heartbeat.get(&rec.session_id) != Some(&rec.seq) {
                 superseded.push((rec.session_id, rec.seq));
                 continue;
             }
@@ -1713,10 +1844,13 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
-    // Counted only once the ACK lands (below), so a failed ACK — which leaves
-    // the rows pending for the next tick — is never counted twice.
+    // Counted only once the ACK lands (below): a failed ACK counts nothing, so
+    // no row is counted twice. (`ack` marks the keys before its scan and
+    // compaction, so a failure in either can still drop rows uncounted.)
     let superseded_count = superseded.len() as u64;
+    let muted_count = muted.len() as u64;
     succeeded.extend(superseded);
+    succeeded.extend(muted);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1755,8 +1889,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut had_transport_error = false;
     let mut delivered = false;
     let mut blocked: Vec<(Uuid, String)> = Vec::new();
+    let mut heartbeat_failure_drops: Vec<&'static str> = Vec::new();
     for outcome in outcomes {
         delivered |= outcome.acked_by_coord;
+        heartbeat_failure_drops.extend(outcome.heartbeat_failure_drops);
         succeeded.extend(outcome.succeeded);
         had_transport_error |= outcome.had_transport_error;
         for (key, attempts) in outcome.attempts {
@@ -1823,6 +1959,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     }
 
     let mut heartbeats_superseded = 0;
+    let mut heartbeats_muted = 0;
+    let mut heartbeats_dropped_on_failure = 0;
+    let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
     if !succeeded.is_empty() {
         match inner.outbox.ack(&succeeded) {
             Ok(()) => {
@@ -1837,7 +1976,36 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     tracing::debug!(
                         rows = superseded_count,
                         total,
-                        "coord_sync: dropped heartbeat rows unsent (superseded by a newer one, or their quarantined session is muted)"
+                        "coord_sync: dropped heartbeat rows unsent (superseded by a newer one)"
+                    );
+                }
+                heartbeats_muted = muted_count;
+                if muted_count > 0 {
+                    let total =
+                        HEARTBEATS_MUTED.fetch_add(muted_count, Ordering::Relaxed) + muted_count;
+                    tracing::debug!(
+                        rows = muted_count,
+                        total,
+                        "coord_sync: dropped heartbeat rows unsent (their quarantined session is muted)"
+                    );
+                }
+                heartbeats_dropped_on_failure = heartbeat_failure_drops.len() as u64;
+                for kind in &heartbeat_failure_drops {
+                    let slot = heartbeat_drop_kind_slot(kind);
+                    HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND[slot].fetch_add(1, Ordering::Relaxed);
+                    *heartbeats_dropped_on_failure_by_kind
+                        .entry(HEARTBEAT_DROP_KINDS[slot])
+                        .or_insert(0) += 1;
+                }
+                if heartbeats_dropped_on_failure > 0 {
+                    let total = HEARTBEATS_DROPPED_ON_FAILURE
+                        .fetch_add(heartbeats_dropped_on_failure, Ordering::Relaxed)
+                        + heartbeats_dropped_on_failure;
+                    tracing::debug!(
+                        rows = heartbeats_dropped_on_failure,
+                        total,
+                        by_kind = ?heartbeats_dropped_on_failure_by_kind,
+                        "coord_sync: dropped heartbeat rows after a failed push"
                     );
                 }
             }
@@ -1864,7 +2032,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
-        h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+        snapshot_heartbeat_drops(h);
     });
 
     TickResult {
@@ -1877,6 +2045,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         idle: false,
         ran_any,
         heartbeats_superseded,
+        heartbeats_muted,
+        heartbeats_dropped_on_failure,
+        heartbeats_dropped_on_failure_by_kind,
     }
 }
 
@@ -6653,6 +6824,217 @@ mod tests {
         assert!(outbox.pending().unwrap().is_empty(), "all three dropped");
         assert!(state.last_ack.is_none(), "coord took nothing");
         assert!(state.retry.is_empty());
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure, 3,
+            "each 5xx-dropped heartbeat is counted as a failure drop"
+        );
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("server_error", 3)])
+        );
+        assert_eq!(tick.heartbeats_superseded, 0);
+        assert_eq!(tick.heartbeats_muted, 0);
+        // The tick's counts reached the process totals `/health` serves.
+        assert_static_floor(
+            &HEARTBEATS_DROPPED_ON_FAILURE,
+            3,
+            "heartbeatsDroppedOnFailure",
+        );
+        assert_static_floor(
+            &HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND[heartbeat_drop_kind_slot("server_error")],
+            3,
+            "heartbeatsDroppedOnFailureByKind.server_error",
+        );
+        // The `/health` cell the drain writes carries them. A floor read is
+        // parallel-safe: only `snapshot_heartbeat_drops` writes these fields,
+        // under the cell's mutex, from statics that never decrease, so a later
+        // writer can only raise them.
+        let served = session_outbox_health_json();
+        assert!(served["heartbeatsDroppedOnFailure"]
+            .as_u64()
+            .is_some_and(|n| n >= 3));
+        assert!(served["heartbeatsDroppedOnFailureByKind"]["server_error"]
+            .as_u64()
+            .is_some_and(|n| n >= 3));
+        // Only non-zero kinds are served (so zero drops render `{}`); the
+        // `conflict` slot is always 0, so dropping the filter fails here.
+        let mut h = SessionOutboxHealth::default();
+        snapshot_heartbeat_drops(&mut h);
+        assert!(h
+            .heartbeats_dropped_on_failure_by_kind
+            .values()
+            .all(|n| *n > 0));
+    }
+
+    /// Every kind [`classify_push_failure`] returns for today's status classes
+    /// has its own slot in [`HEARTBEAT_DROP_KINDS`], so no heartbeat drop is
+    /// folded into another kind's count. One sample per status class, plus the
+    /// two no-status arms; a new classifier arm needs a new sample here.
+    #[test]
+    fn every_push_failure_kind_has_a_heartbeat_drop_slot() {
+        let samples: [(&str, bool); 11] = [
+            ("[timeout] no answer", false),
+            ("connection refused", false),
+            ("no status", true),
+            ("503 Service Unavailable: x", false),
+            ("429 Too Many Requests: x", true),
+            ("409 Conflict: x", true),
+            ("404 Not Found: x", true),
+            ("401 Unauthorized: x", true),
+            ("403 Forbidden: x", true),
+            ("422 Unprocessable Entity: x", true),
+            ("302 Found: x", false),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (msg, permanent) in samples {
+            let (kind, _) = classify_push_failure(msg, permanent);
+            assert!(
+                HEARTBEAT_DROP_KINDS.contains(&kind),
+                "{msg:?} classified as {kind:?}, which has no slot"
+            );
+            assert_eq!(HEARTBEAT_DROP_KINDS[heartbeat_drop_kind_slot(kind)], kind);
+            seen.insert(kind);
+        }
+        // The samples reach the whole vocabulary, so a kind dropped from the
+        // list (or one the classifier stops producing) fails here too.
+        assert_eq!(seen.len(), HEARTBEAT_DROP_KINDS.len());
+    }
+
+    /// Reads a process-global heartbeat drop counter as a FLOOR, never as an
+    /// exact value or a delta: tests run in parallel and other drain ticks add
+    /// to the same static, but nothing ever subtracts. So after a tick that
+    /// dropped `n` rows, the static is at least `n` if that tick's ACK block
+    /// incremented it -- and a static nothing increments stays 0 for the whole
+    /// process, whatever ran beside this test, so deleting an increment site
+    /// fails the floor deterministically.
+    fn assert_static_floor(static_value: &AtomicU64, n: u64, what: &str) {
+        let seen = static_value.load(Ordering::Relaxed);
+        assert!(seen >= n, "{what}: process total {seen} < this tick's {n}");
+    }
+
+    /// One heartbeat per session, pushed by one drain tick against `base`;
+    /// returns the tick and the drain state after it. Helper for the
+    /// failure-drop counter tests.
+    async fn drain_one_heartbeat_each(base: String, sessions: usize) -> (TickResult, DrainState) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        for _ in 0..sessions {
+            outbox
+                .record(m, Uuid::new_v4(), SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+        }
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "every failed heartbeat is ACK-dropped"
+        );
+        (tick, state)
+    }
+
+    /// A heartbeat that got no HTTP answer at all is counted as a failure drop
+    /// of kind `network` — the `Transport` arm's unreachable case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_dropped_unreachable_is_counted_network() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, _accepted) = spawn_dropping_coord().await;
+        let (tick, _) = drain_one_heartbeat_each(base, 1).await;
+        assert!(tick.outage, "precondition: an unreachable coord");
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("network", 1)])
+        );
+        assert_eq!(tick.heartbeats_superseded, 0);
+        assert_eq!(tick.heartbeats_muted, 0);
+    }
+
+    /// A heartbeat answered 403 is ACK-dropped by the `PermanentFailure` arm
+    /// and counted as a failure drop of kind `unauthorized`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_403_is_counted_unauthorized() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_forbidden = true;
+        let (tick, _) = drain_one_heartbeat_each(base, 2).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 2);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("unauthorized", 2)])
+        );
+    }
+
+    /// A heartbeat PATCH coord answers 404 (no row for the session served to
+    /// this caller) is counted as `not_found`, apart from a malformed row's
+    /// `rejected`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_404_is_counted_not_found() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let (tick, _) = drain_one_heartbeat_each(base, 1).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("not_found", 1)])
+        );
+    }
+
+    /// A heartbeat 429 is not retried (`heartbeat` is not a lifecycle kind), so
+    /// it lands in `PermanentFailure` and is counted as `rate_limited`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_429_is_counted_rate_limited() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 1;
+        let (tick, state) = drain_one_heartbeat_each(base, 1).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("rate_limited", 1)])
+        );
+        assert!(state.retry.is_empty(), "a heartbeat 429 is never retried");
+        assert_eq!(rec.lock().await.next_patch_429, 0, "the 429 was served");
+    }
+
+    /// Only HEARTBEAT failure drops are counted: a `state_change` coord refuses
+    /// with a 4xx is ACK-dropped by the same arm and moves no heartbeat counter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_heartbeat_4xx_drop_is_not_a_heartbeat_drop() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_status = Some(422);
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
+            .unwrap();
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "precondition: the 422 row was ACK-dropped"
+        );
+        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
+        assert!(tick.heartbeats_dropped_on_failure_by_kind.is_empty());
     }
 
     /// The `(seq, kind)` of every pending row of `session`, in seq order.
@@ -6715,6 +7097,14 @@ mod tests {
         assert_eq!(
             tick.heartbeats_superseded, 5,
             "the five superseded rows are counted once their ACK landed"
+        );
+        assert_eq!(
+            tick.heartbeats_muted, 0,
+            "an unquarantined session is never muted"
+        );
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure, 0,
+            "nothing was pushed, so nothing failed"
         );
 
         state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
@@ -7038,6 +7428,11 @@ mod tests {
             tick.heartbeats_superseded, 2,
             "the two older heartbeats are counted as superseded"
         );
+        assert_eq!(
+            tick.heartbeats_muted, 0,
+            "a quarantined session with no sidecarred started/closed is not muted"
+        );
+        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
         let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
         assert!(
             sidecar.contains("pending_resolution"),
@@ -7103,15 +7498,28 @@ mod tests {
         hb(&outbox);
         let tick = drain_tick(&coord.inner, &mut state).await;
         assert_eq!(
-            tick.heartbeats_superseded, 2,
-            "both heartbeats were dropped"
+            tick.heartbeats_muted, 2,
+            "both heartbeats were dropped as MUTED"
         );
+        assert_eq!(
+            tick.heartbeats_superseded, 0,
+            "a muted drop is not counted as superseded"
+        );
+        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
         assert!(pending_of(&outbox, failing).is_empty());
+        assert_static_floor(&HEARTBEATS_MUTED, 2, "heartbeatsMuted");
+        assert!(
+            session_outbox_health_json()["heartbeatsMuted"]
+                .as_u64()
+                .is_some_and(|n| n >= 2),
+            "the /health cell carries the muted total"
+        );
 
         // A heartbeat appended in a LATER tick is dropped too.
         hb(&outbox);
         let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(tick.heartbeats_superseded, 1);
+        assert_eq!(tick.heartbeats_muted, 1);
+        assert_eq!(tick.heartbeats_superseded, 0);
         assert!(pending_of(&outbox, failing).is_empty());
 
         let sent = rec
@@ -7174,7 +7582,14 @@ mod tests {
             .record(machine, stuck, SessionEventKind::Heartbeat, json!({}))
             .unwrap();
         let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(tick.heartbeats_superseded, 1, "the heartbeat was dropped");
+        assert_eq!(
+            tick.heartbeats_muted, 1,
+            "the heartbeat was dropped as MUTED"
+        );
+        assert_eq!(
+            tick.heartbeats_superseded, 0,
+            "a muted drop is not counted as superseded"
+        );
         assert!(pending_of(&outbox, stuck).is_empty());
         assert!(
             rec.lock().await.patches.iter().all(|(id, _)| *id != stuck),
@@ -7420,6 +7835,10 @@ mod tests {
             ("rejected", Some(422))
         );
         assert_eq!(
+            classify_push_failure("404 Not Found: {\"error\":\"session not found\"}", true),
+            ("not_found", Some(404))
+        );
+        assert_eq!(
             classify_push_failure("error sending request for url (https://x/sessions)", false),
             ("network", None)
         );
@@ -7460,6 +7879,17 @@ mod tests {
             "no tick yet is UNKNOWN, not zero"
         );
         assert!(unobserved["lastFailure"].is_null());
+        for key in [
+            "heartbeatsSuperseded",
+            "heartbeatsMuted",
+            "heartbeatsDroppedOnFailure",
+            "heartbeatsDroppedOnFailureByKind",
+        ] {
+            assert!(
+                unobserved[key].is_null(),
+                "sessionOutbox.{key} before the first tick is UNKNOWN, not zero"
+            );
+        }
 
         let at = Utc::now();
         let observed = render_session_outbox_health(&SessionOutboxHealth {
@@ -7475,6 +7905,12 @@ mod tests {
             retrying_sessions: 1,
             quarantined_sessions: 0,
             heartbeats_superseded: 2,
+            heartbeats_muted: 4,
+            heartbeats_dropped_on_failure: 3,
+            heartbeats_dropped_on_failure_by_kind: BTreeMap::from([
+                ("server_error", 2),
+                ("not_found", 1),
+            ]),
         });
         for key in [
             "pending",
@@ -7484,6 +7920,9 @@ mod tests {
             "retryingSessions",
             "quarantinedSessions",
             "heartbeatsSuperseded",
+            "heartbeatsMuted",
+            "heartbeatsDroppedOnFailure",
+            "heartbeatsDroppedOnFailureByKind",
             "observedAt",
         ] {
             assert!(
@@ -7492,6 +7931,20 @@ mod tests {
             );
         }
         assert_eq!(observed["pending"], 3);
+        assert_eq!(observed["heartbeatsSuperseded"], 2);
+        assert_eq!(observed["heartbeatsMuted"], 4);
+        assert_eq!(observed["heartbeatsDroppedOnFailure"], 3);
+        assert_eq!(
+            observed["heartbeatsDroppedOnFailureByKind"],
+            json!({ "server_error": 2, "not_found": 1 })
+        );
+        // Observed with nothing dropped on failure: an empty object, not null.
+        let quiet = render_session_outbox_health(&SessionOutboxHealth {
+            observed_at: Some(at),
+            ..SessionOutboxHealth::default()
+        });
+        assert_eq!(quiet["heartbeatsDroppedOnFailure"], 0);
+        assert_eq!(quiet["heartbeatsDroppedOnFailureByKind"], json!({}));
         assert_eq!(observed["lastFailure"]["kind"], "server_error");
         assert_eq!(observed["lastFailure"]["status"], 503);
         assert!(observed["lastFailure"]["at"].is_string());
