@@ -1973,8 +1973,9 @@ fn spawn_run_task(payload: LaunchPayload) {
         // running), deferring on any tripped lane. A launch takes no
         // projected-cost unit of its own (see `admit_launch`), so a burst of
         // LAUNCHES alone is bounded by the readings only. Evaluated BEFORE
-        // `run_agent_subprocess`, which is where the path rewrite, account resolution and worktree materialization all
-        // happen — so a refused launch leaves no worktree, no daemon and no
+        // `run_agent_subprocess`, which is where the path rewrite, account
+        // resolution and worktree materialization all happen — so a refused
+        // launch leaves no worktree, no daemon and no
         // proxy nonce behind; only the stop-token entry exists, released when
         // its guard drops.
         //
