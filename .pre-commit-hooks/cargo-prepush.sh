@@ -478,10 +478,44 @@ echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier 
 # a cause it cannot support.
 CLIPPY_LOG="$(mktemp)"
 cleanup_clippy_log() { rm -f "$CLIPPY_LOG"; }
-trap 'restore_lock; cleanup_clippy_log' EXIT
+# A missing lib/shared-target.sh (noted above) defines no release; the trap
+# must still run the other two.
+declare -F release_shared_target >/dev/null 2>&1 || release_shared_target() { :; }
+trap 'restore_lock; cleanup_clippy_log; release_shared_target' EXIT
+
+# Build under the shared target's TREE LOCK and freshness ledger, or not at all.
+# Without them cargo replays a PEER worktree's units from a shared target as
+# Fresh, and clippy reports that peer's errors as this tree's: on 2026-10-29 a
+# false `error[E0432]` for a module that existed in the pushed tree (coord
+# finding 7b603cde; see lib/shared-target.sh). Taken AFTER the skip exit, so a
+# fmt-only push takes no lock, and after every scope-sensitive git call above.
+GUARD_RC=10
+if declare -F guard_shared_target >/dev/null 2>&1; then
+  GUARD_RC=0
+  guard_shared_target "$ROOT" "[pre-push]" || GUARD_RC=$?
+fi
+case "$GUARD_RC" in
+  0|10) ;;
+  *)
+    echo >&2
+    echo "[pre-push] CANNOT RUN CLIPPY GUARDED — ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}." >&2
+    echo "[pre-push]   A clippy run without the tree lock can replay a PEER worktree's build as" >&2
+    echo "[pre-push]   Fresh and report errors that are not in this tree, so it is not run." >&2
+    echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'clippy-windows'); fmt above" >&2
+    echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
+    if [[ "$STRICT" == "1" ]]; then
+      echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
+      exit 1
+    fi
+    echo "[pre-push]   Not blocking the push. Set QONTINUI_PREPUSH_STRICT=1 to block instead." >&2
+    exit 0
+    ;;
+esac
 
 clippy_rc=0
-cargo clippy 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+# `9>&-`: the tree lock's descriptor (flock arm) must not leak into cargo or a
+# daemon it spawns, which could otherwise hold the lock past this hook's exit.
+cargo clippy 9>&- 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
 if [[ "$clippy_rc" -ne 0 ]]; then
   rc="$clippy_rc"
   echo
@@ -501,6 +535,17 @@ if [[ "$clippy_rc" -ne 0 ]]; then
   elif [[ "$rc" -eq 127 ]] || grep -qiE 'command not found|could not execute|no such file or directory' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — clippy could not run at all (exit $rc). This is NOT a lint failure."
     echo "          Check the toolchain: rustup component add clippy."
+  elif grep -qE '^error\[E[0-9]{4}\]' "$CLIPPY_LOG"; then
+    # A rustc error CODE is a compile error, not a clippy lint (lints carry
+    # none). Calling it "a lint fired" sent the 2026-10-29 push hunting a lint
+    # that did not exist.
+    echo "[pre-push] FAIL — a compile error (or deny-tier lint) — see the error[E…] lines above."
+    if [[ "$GUARD_RC" == "10" ]]; then
+      echo "          This target is UNGUARDED: if the error names code that exists in"
+      echo "          this tree, re-run with a private CARGO_TARGET_DIR before changing"
+      echo "          any code — a peer checkout's stale build may be the cause."
+    fi
+    echo "          Fix it, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
   elif grep -qE '^error(\[|:)' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
     echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
