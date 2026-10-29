@@ -1011,17 +1011,23 @@ pub struct TitleRefresh {
 /// routing through the EXISTING rename sink
 /// ([`SessionLifecycleStore::update_title_by_terminal`]) rather than adding a
 /// parallel title writer — so an in-Claude `/rename` converges on the registry
-/// within one reconcile tick, exactly like an OSC-0 rename does immediately.
+/// within one reconcile tick.
 ///
 /// Only terminals with a bound open record are considered: the title belongs to
 /// a record, and an unbound PTY has none to update.
 ///
-/// Precedence note: the other writer into the same sink is `terminal_set_title`
-/// (xterm.js's OSC-0 `onTitleChange`). These do not fight in practice — the very
-/// symptom this fixes is that a provider session emits no OSC-0 title, so the
-/// registry title sits frozen at its spawn-time value. Were a PTY to emit OSC-0
-/// titles continuously, the two would alternate at one write per tick; the
-/// `info!` below makes that visible rather than silent.
+/// Precedence note: this is the record title's ONLY automatic writer; the other
+/// is an operator rename. The OSC-0/2 title (xterm.js `onTitleChange` →
+/// `terminal_set_title` → `TerminalManager::set_title`) does NOT write here.
+/// An earlier note assumed a provider session "emits no OSC-0 title", so the
+/// two writers would not fight. That premise is false: current Claude Code CLIs
+/// emit their current activity (e.g. the description of the last subagent
+/// launched, "Fix Phase 5b round 11") as the OSC title, and mirroring it into
+/// the record erased the conversation's name. Since plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+/// D3 the OSC title lives on `TerminalSession::activity_title` and is never
+/// persisted, so the record's `title` names the conversation and this refresh
+/// is the authority on it.
 pub fn refresh_titles<N: ProviderSessionIndex>(
     store: &SessionLifecycleStore,
     live: &[LivePty],

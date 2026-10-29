@@ -63,9 +63,8 @@ use std::time::Duration;
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use crate::process_capture::process_tree::{
-    claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
-};
+use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
+use crate::session::live_holders::{pane_claude_pids, root_is_recycled};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use crate::terminal::TerminalManager;
 
@@ -843,20 +842,18 @@ pub fn evaluate(
     // The fifth source (D9): each holder pane's tree, over the same snapshot.
     // Its `claude` joins the live universe even when it is no descendant of
     // the runner — the case the holder exists for.
+    //
+    // The walk is `live_holders::pane_claude_pids` — the same one the
+    // click-resume liveness rows are attributed with — so this census and that
+    // attribution cannot disagree about which `claude` a pane holds.
     let mut holder_panes: Vec<HolderPane> = holders.panes.clone();
     let mut holder_claimed: HashSet<u32> = HashSet::new();
     for pane in &mut holder_panes {
-        let mut pids: Vec<u32> = Vec::new();
-        for root in [pane.holder_pid, pane.child_pid].into_iter().flatten() {
-            if root <= 1 || root == runner_pid {
-                continue;
-            }
-            for pid in claude_pids_in_inclusive_subtree(root, snapshot) {
-                if !pids.contains(&pid) {
-                    pids.push(pid);
-                }
-            }
-        }
+        let pids = pane_claude_pids(
+            [pane.holder_pid, pane.child_pid].into_iter().flatten(),
+            runner_pid,
+            snapshot,
+        );
         for &pid in &pids {
             holder_claimed.insert(pid);
             if live_set.insert(pid) {
@@ -897,15 +894,22 @@ pub fn evaluate(
     for rec in open_records {
         let alive = match terminal_pids.get(&rec.terminal_id) {
             Some(&pid) => {
-                let present = claude_present_in_inclusive_subtree(
-                    pid,
-                    snapshot,
-                    pid_reuse_reference(
+                // One walk serves both the presence verdict and the claims:
+                // present = the PID-reuse guard admits the root AND its
+                // inclusive subtree holds a claude — exactly
+                // `claude_present_in_inclusive_subtree`, via the shared guard
+                // (`live_holders::root_is_recycled`).
+                let subtree_claude = claude_pids_in_inclusive_subtree(pid, snapshot);
+                let present = !subtree_claude.is_empty()
+                    && !root_is_recycled(
                         pid,
-                        &holders.verified_terminal_pids,
-                        primary_boot_unix_millis,
-                    ),
-                );
+                        snapshot,
+                        pid_reuse_reference(
+                            pid,
+                            &holders.verified_terminal_pids,
+                            primary_boot_unix_millis,
+                        ),
+                    );
                 // ⚠ The CLAIM is registered whether or not the record is
                 // `present`, while `terminal_claimed` (the classification set)
                 // stays gated on `present` exactly as before.
@@ -919,7 +923,7 @@ pub fn evaluate(
                 // different session would be silently discounted. Registering
                 // the claim unconditionally makes the pid AMBIGUOUS instead,
                 // which blocks. Fail-closed beats tidy.
-                for claimed in claude_pids_in_inclusive_subtree(pid, snapshot) {
+                for claimed in subtree_claude {
                     if present {
                         terminal_claimed.insert(claimed);
                     }
@@ -1169,16 +1173,13 @@ pub async fn compute(
     // The holder panes' `claude` too (the same roots `evaluate` walks), so a
     // holder-hosted process outside the runner's subtree reports its cwd.
     for pane in &holders.panes {
-        for root in [pane.holder_pid, pane.child_pid].into_iter().flatten() {
-            if root <= 1 || root == runner_pid {
-                continue;
-            }
-            for pid in
-                crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(root, &snap)
-            {
-                if !live_pids.contains(&pid) {
-                    live_pids.push(pid);
-                }
+        for pid in pane_claude_pids(
+            [pane.holder_pid, pane.child_pid].into_iter().flatten(),
+            runner_pid,
+            &snap,
+        ) {
+            if !live_pids.contains(&pid) {
+                live_pids.push(pid);
             }
         }
     }
@@ -1316,6 +1317,7 @@ pub async fn run_periodic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_capture::process_tree::claude_present_in_inclusive_subtree;
 
     fn snap_with(
         parent_map: &[(u32, &[u32])],

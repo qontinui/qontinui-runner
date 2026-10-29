@@ -14,12 +14,14 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tauri::Manager;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::terminal::types::TerminalInfo;
 use crate::terminal::{strip_ansi, TerminalManager};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -128,12 +130,130 @@ pub struct MoveTerminalRequest {
 // ============================================================================
 
 /// One terminal's membership entry within a page group.
-#[derive(Debug, Serialize)]
+///
+/// `title` is the session's display (spawn-time) title. The conversation's
+/// identity rides beside it (plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
+/// Phase 4 / D3): `conversationLabel` is the pane's primary label
+/// (`<name> · <id8>`, `(unnamed) · <id8>`, or `no conversation bound` for a
+/// pane with no bound conversation), composed by
+/// [`crate::session::pane_label::conversation_label`]. `activityTitle` is the
+/// child's OSC-0/2 current-activity title, a secondary line that never
+/// replaces the identity.
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPageEntry {
     pub id: String,
     pub title: String,
     pub is_alive: bool,
+    /// The conversation id bound to this pane's open lifecycle record.
+    /// Omitted when no conversation is bound (a plain shell).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
+    /// The conversation's name (the record's live-registry name, else its
+    /// title). Omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_name: Option<String>,
+    /// The pane's primary label. Always present.
+    pub conversation_label: String,
+    /// The child's current-activity (OSC-0/2) title. Omitted until one is
+    /// emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_title: Option<String>,
+}
+
+impl TerminalPageEntry {
+    /// Build one entry from a live terminal, its open lifecycle record (if
+    /// any) and its activity title (if any).
+    pub fn from_parts(
+        info: &TerminalInfo,
+        record: Option<&TerminalSessionRecord>,
+        activity_title: Option<&str>,
+    ) -> Self {
+        let identity = crate::session::pane_label::identity_of_record(record);
+        Self {
+            id: info.id.clone(),
+            title: info.title.clone(),
+            is_alive: info.is_alive,
+            claude_session_id: identity.claude_session_id,
+            conversation_name: identity.conversation_name,
+            conversation_label: identity.conversation_label,
+            activity_title: crate::session::pane_label::clean_activity_title(activity_title),
+        }
+    }
+}
+
+/// Pure: group live terminals into pages, each entry carrying its
+/// conversation identity and activity title. `records_by_terminal` holds the
+/// OPEN lifecycle records keyed by terminal id; `activity_by_terminal` holds
+/// [`TerminalManager::activity_titles`].
+pub fn group_terminal_pages(
+    terminals: Vec<TerminalInfo>,
+    records_by_terminal: &HashMap<String, TerminalSessionRecord>,
+    activity_by_terminal: &HashMap<String, String>,
+) -> TerminalPagesResponse {
+    let mut grouped: BTreeMap<String, Vec<TerminalPageEntry>> = BTreeMap::new();
+    for info in terminals {
+        let entry = TerminalPageEntry::from_parts(
+            &info,
+            records_by_terminal.get(&info.id),
+            activity_by_terminal.get(&info.id).map(String::as_str),
+        );
+        grouped.entry(info.page_id.clone()).or_default().push(entry);
+    }
+    let pages = grouped
+        .into_iter()
+        .map(|(page_id, terminals)| TerminalPageGroup {
+            page_id,
+            terminal_count: terminals.len(),
+            terminals,
+        })
+        .collect();
+    TerminalPagesResponse { pages }
+}
+
+/// Pure: the `GET /terminals` rows — each [`TerminalInfo`] as serialized,
+/// plus `activityTitle` beside `title` when the child has emitted one (plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
+/// Phase 4). `TerminalInfo` is a shared-schema type, so the field rides on
+/// the wire object rather than on the struct.
+pub fn terminals_with_activity(
+    terminals: Vec<TerminalInfo>,
+    activity_by_terminal: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    terminals
+        .into_iter()
+        .map(|info| {
+            let activity = activity_by_terminal
+                .get(&info.id)
+                .and_then(|t| crate::session::pane_label::clean_activity_title(Some(t)));
+            let mut value = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
+            if let (Some(obj), Some(activity)) = (value.as_object_mut(), activity) {
+                obj.insert(
+                    "activityTitle".to_string(),
+                    serde_json::Value::String(activity),
+                );
+            }
+            value
+        })
+        .collect()
+}
+
+/// The OPEN lifecycle records keyed by terminal id, or an empty map when the
+/// store is not managed (no record is then bound, and every entry's label is
+/// `no conversation bound`).
+fn open_records_by_terminal(state: &ApiState) -> HashMap<String, TerminalSessionRecord> {
+    state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|store| {
+            store
+                .open_records()
+                .into_iter()
+                .map(|r| (r.terminal_id.clone(), r))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A page and the live terminals parked on it.
@@ -220,7 +340,8 @@ pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_manager.list();
+    let terminals =
+        terminals_with_activity(terminal_manager.list(), &terminal_manager.activity_titles());
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
@@ -742,32 +863,13 @@ pub async fn list_terminal_pages_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_manager.list();
+    let response = group_terminal_pages(
+        terminal_manager.list(),
+        &open_records_by_terminal(&state),
+        &terminal_manager.activity_titles(),
+    );
 
-    let mut grouped: BTreeMap<String, Vec<TerminalPageEntry>> = BTreeMap::new();
-    for info in terminals {
-        grouped
-            .entry(info.page_id.clone())
-            .or_default()
-            .push(TerminalPageEntry {
-                id: info.id,
-                title: info.title,
-                is_alive: info.is_alive,
-            });
-    }
-
-    let pages: Vec<TerminalPageGroup> = grouped
-        .into_iter()
-        .map(|(page_id, terminals)| TerminalPageGroup {
-            page_id,
-            terminal_count: terminals.len(),
-            terminals,
-        })
-        .collect();
-
-    Ok(Json(ApiResponse::success(serde_json::json!(
-        TerminalPagesResponse { pages }
-    ))))
+    Ok(Json(ApiResponse::success(serde_json::json!(response))))
 }
 
 /// Close a terminal session.
@@ -1179,6 +1281,118 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 4 (plan 2026-10-27-click-resume-forks-a-live-conversation-
+    //    and-pane-titles-hide-its-identity): the conversation label ──────
+
+    fn info(id: &str, page: &str, title: &str) -> TerminalInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": title,
+            "pid": null,
+            "cols": 80,
+            "rows": 24,
+            "workingDir": "C:/repo",
+            "isAlive": true,
+            "exitCode": null,
+            "createdAt": 0,
+            "totalBytesProduced": 0,
+            "pageId": page,
+        }))
+        .expect("a TerminalInfo deserializes")
+    }
+
+    fn open_record(id: &str, terminal: &str, title: Option<&str>) -> TerminalSessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "claudeSessionId": id,
+            "pageId": "p1",
+            "zoneIndex": 0,
+            "title": title,
+            "terminalId": terminal,
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+        }))
+        .expect("a minimal record deserializes")
+    }
+
+    #[test]
+    fn terminal_pages_entries_lead_with_the_conversation_label() {
+        let records: HashMap<String, TerminalSessionRecord> = [(
+            "t-lead".to_string(),
+            open_record(
+                "9b40e22d-deec-415c-9379-5f85ae994ad8",
+                "t-lead",
+                Some("maxim"),
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let activity: HashMap<String, String> =
+            [("t-lead".to_string(), "Fix Phase 5b round 11".to_string())]
+                .into_iter()
+                .collect();
+        let resp = group_terminal_pages(
+            vec![
+                info("t-lead", "p1", "claude 9b40e22d"),
+                info("t-shell", "p1", "Terminal 2"),
+            ],
+            &records,
+            &activity,
+        );
+        let wire = serde_json::to_value(&resp).unwrap();
+        let rows = wire["pages"][0]["terminals"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let lead = &rows[0];
+        assert_eq!(lead["id"], "t-lead");
+        assert_eq!(
+            lead["claudeSessionId"],
+            "9b40e22d-deec-415c-9379-5f85ae994ad8"
+        );
+        assert_eq!(lead["conversationName"], "maxim");
+        assert_eq!(lead["conversationLabel"], "maxim · 9b40e22d");
+        assert_eq!(lead["activityTitle"], "Fix Phase 5b round 11");
+        assert_eq!(
+            lead["title"], "claude 9b40e22d",
+            "the display title is unchanged"
+        );
+
+        let shell = &rows[1];
+        assert_eq!(shell["conversationLabel"], "no conversation bound");
+        for absent in ["claudeSessionId", "conversationName", "activityTitle"] {
+            assert!(
+                shell.get(absent).is_none(),
+                "{absent} is omitted for a plain shell"
+            );
+        }
+    }
+
+    #[test]
+    fn get_terminals_rows_carry_activity_title_beside_title() {
+        let activity: HashMap<String, String> = [
+            ("t-1".to_string(), "Review the diff".to_string()),
+            ("t-blank".to_string(), "   ".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rows = terminals_with_activity(
+            vec![
+                info("t-1", "p", "maxim"),
+                info("t-blank", "p", "x"),
+                info("t-2", "p", "y"),
+            ],
+            &activity,
+        );
+        assert_eq!(rows[0]["title"], "maxim");
+        assert_eq!(rows[0]["activityTitle"], "Review the diff");
+        assert!(
+            rows[1].get("activityTitle").is_none(),
+            "a blank activity is not a title"
+        );
+        assert!(rows[2].get("activityTitle").is_none());
+        assert_eq!(rows[2]["id"], "t-2", "the TerminalInfo fields are kept");
+    }
 
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —

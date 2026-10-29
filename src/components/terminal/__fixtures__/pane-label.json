@@ -1,0 +1,53 @@
+{
+  "_comment": "Shared table for the pane conversation label (plan 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity, Phase 4 / D3). Read by BOTH src-tauri/src/session/pane_label.rs (conversation_label) and src/components/terminal/paneLabel.test.ts (conversationLabel), so the Rust and TypeScript twins cannot drift.",
+  "cases": [
+    {
+      "case": "name and id",
+      "name": "maxim",
+      "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
+      "label": "maxim · 9b40e22d"
+    },
+    {
+      "case": "name is trimmed",
+      "name": "  maxim  ",
+      "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
+      "label": "maxim · 9b40e22d"
+    },
+    {
+      "case": "no name",
+      "name": null,
+      "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
+      "label": "(unnamed) · 9b40e22d"
+    },
+    {
+      "case": "blank name",
+      "name": "   ",
+      "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
+      "label": "(unnamed) · 9b40e22d"
+    },
+    {
+      "case": "no id",
+      "name": "maxim",
+      "claudeSessionId": null,
+      "label": "no conversation bound"
+    },
+    {
+      "case": "blank id",
+      "name": null,
+      "claudeSessionId": "  ",
+      "label": "no conversation bound"
+    },
+    {
+      "case": "id shorter than eight characters",
+      "name": "probe",
+      "claudeSessionId": "abc",
+      "label": "probe · abc"
+    },
+    {
+      "case": "long name keeps the id suffix",
+      "name": "Fix Phase 5b round 11 of the account-migration plan while the merge train is red and the reviewer is waiting",
+      "claudeSessionId": "3da13dea-0000-4000-8000-000000000000",
+      "label": "Fix Phase 5b round 11 of the account-migration plan while the merge train is red and the reviewer is waiting · 3da13dea"
+    }
+  ]
+}

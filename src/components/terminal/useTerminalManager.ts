@@ -78,6 +78,14 @@ export interface TerminalTab {
    * goes through `resolveDisplayTitle` (`displayTitle.tsx`).
    */
   spawnName?: string;
+  /**
+   * The child's current-activity title: the latest OSC 0/2 string its xterm
+   * reported (`ZoneGrid.onTitleChange`), e.g. Claude Code's "Fix Phase 5b
+   * round 11". The secondary line of the pane label, never its identity
+   * (plan `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
+   * D3). For a plain shell (no `claudeSessionId`) it is the shell's title.
+   */
+  activityTitle?: string;
   pid: number | null;
   isAlive: boolean;
   exitCode: number | null;
@@ -1620,6 +1628,7 @@ export function useTerminalManager(
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"
+          | "activityTitle"
         >
       >,
     ) => {

@@ -77,7 +77,7 @@ vi.mock("./contexts", () => {
       terminalRefs,
       pageId: "zone-grid-tmux-test",
       markReconnected: noop,
-      renameTab: noop,
+      updateTab: noop,
       closeTerminal: noop,
       sessionStates: {},
       staleTabs: new Set<string>(),

@@ -1,5 +1,4 @@
 import { memo, useCallback, useMemo, useReducer, useRef, useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { useDisplayTitleResolver } from "./displayTitle";
@@ -28,6 +27,7 @@ import {
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
+import { relayActivityTitle } from "./activityTitleRelay";
 
 export type ViewMode = "auto" | "full" | "compact";
 
@@ -162,7 +162,7 @@ function ZoneGridInner({
     terminalRefs: terminalRefsRef,
     pageId,
     markReconnected,
-    renameTab,
+    updateTab,
     closeTerminal,
   } = session;
   // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
@@ -188,9 +188,19 @@ function ZoneGridInner({
   const onReconnected = markReconnected;
   /**
    * Layer 4 polish (OSC 0/2 title): plumb the latest title from the Rust
-   * grid up to the tab title via `renameTab`. The title field is already
-   * surfaced in `GridSnapshot` (parsed by `vte::Perform::osc_dispatch` in
+   * grid up to the tab. The title field is already surfaced in `GridSnapshot`
+   * (parsed by `vte::Perform::osc_dispatch` in
    * `src-tauri/src/terminal/grid.rs`); this is the wire-up.
+   *
+   * The OSC title is the pane's ACTIVITY, not its identity (plan
+   * `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
+   * D3). Current Claude Code CLIs emit their current activity, e.g. the
+   * description of the last subagent launched. This relay used to call
+   * `renameTab`, which overwrote `tab.title`, so a live lead pane read "Fix
+   * Phase 5b round 11" with nothing naming its conversation. It now sets
+   * `tab.activityTitle` only. The pane label (`paneLabel.ts`) leads with
+   * `<name> · <id8>` and shows the activity as a secondary line. A plain shell
+   * with no conversation still titles from it (`resolveDisplayTitle`).
    *
    * Skip empty / whitespace-only titles defensively. The TerminalInstance
    * de-dupes against its last-reported value, so this fires at most once
@@ -201,26 +211,11 @@ function ZoneGridInner({
    * `WorkerSessionCell`, never `TerminalInstance` — and `onTitleChange` is
    * passed to `TerminalInstance` alone. A worker emits no OSC 0/2 at all
    * (it is an in-process stream-json session, not a pty), so the `Worker N`
-   * pin is enforced by the mount split, not by a test in this callback. The
-   * `taskRunId` test that used to stand here was kept after its subject was
-   * deleted; it could no longer fire, and the only tab it could have fired
-   * for would have been a PTY tab that is not a worker.
+   * pin is enforced by the mount split, not by a test in this callback.
    */
   const onTitleChange = useCallback(
-    (tabId: string, title: string) => {
-      const trimmed = title.trim();
-      if (!trimmed) return;
-      renameTab(tabId, trimmed);
-      // Phase 2: bi-directional title sync. The local React rename above
-      // updates UI immediately; fire-and-forget the backend write so other
-      // observers (`GET /terminals`, multi-window setups) see the same
-      // value. Failures are non-fatal — at worst the backend keeps the
-      // spawn-time title; we still rendered the new one locally.
-      invoke("terminal_set_title", { terminalId: tabId, title: trimmed }).catch((e) => {
-        console.warn(`[ZoneGrid] terminal_set_title failed for ${tabId}:`, e);
-      });
-    },
-    [renameTab],
+    (tabId: string, title: string) => relayActivityTitle(updateTab, tabId, title),
+    [updateTab],
   );
   const { labelsAndTags, incrementMetric: _incrementMetric } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;

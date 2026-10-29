@@ -238,6 +238,17 @@ pub struct SessionEntry {
     pub terminal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The pane's conversation label, `<name> · <id8>` (plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
+    /// Phase 4), composed by `session::pane_label`. Terminal plane only; `None`
+    /// on the AI plane, which shares this struct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_label: Option<String>,
+    /// The pane's OSC-0/2 current-activity title, when its child emitted one.
+    /// Never the identity: that is `id` / `conversation_label`. Terminal plane
+    /// only; `None` on the AI plane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_title: Option<String>,
 }
 
 /// The terminal-hosted agent-session plane — the population in the incident.
@@ -587,9 +598,13 @@ fn oldest_process(procs: &[LiveClaudeProcess]) -> Option<i64> {
 /// called them terminal-hosted. The total is emitted separately by
 /// [`live_claude_totals_from`]; the verdict reads that, so the change is
 /// labelling only.
+///
+/// `activity_by_terminal` is `TerminalManager::activity_titles` (terminal id →
+/// OSC activity title); it only labels entries and never changes a count.
 pub fn terminal_plane_from(
     report: &TrackingHealthReport,
     open_records: &[TerminalSessionRecord],
+    activity_by_terminal: &HashMap<String, String>,
     now_ms: i64,
 ) -> TerminalPlane {
     let dead: std::collections::HashSet<&str> = report
@@ -607,6 +622,12 @@ pub fn terminal_plane_from(
             state: r.state.clone(),
             terminal_id: Some(r.terminal_id.clone()),
             title: r.title.clone(),
+            conversation_label: Some(
+                crate::session::pane_label::identity_of_record(Some(r)).conversation_label,
+            ),
+            activity_title: crate::session::pane_label::clean_activity_title(
+                activity_by_terminal.get(&r.terminal_id).map(String::as_str),
+            ),
         })
         .collect();
 
@@ -895,6 +916,8 @@ pub fn ai_plane_from(
             state: e.state.clone(),
             terminal_id: None,
             title: None,
+            conversation_label: None,
+            activity_title: None,
         })
         .collect();
 
@@ -1389,9 +1412,18 @@ pub async fn restart_readiness_handler(
         None => ActivityEvidence::default(),
     };
 
+    // Activity titles label the terminal-plane entries (Phase 4 of plan
+    // 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-
+    // its-identity). `TerminalInfo` from `list()` carries no activity title, so
+    // the manager's own map is read. An unresolved manager labels nothing and
+    // changes no count.
+    let activity_by_terminal: HashMap<String, String> = app
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|tm| tm.activity_titles())
+        .unwrap_or_default();
     let terminal = pass
         .as_ref()
-        .map(|p| terminal_plane_from(&p.report, &p.open_records, now_ms));
+        .map(|p| terminal_plane_from(&p.report, &p.open_records, &activity_by_terminal, now_ms));
     let headless = pass.as_ref().map(|p| headless_plane_from(&p.report));
     let holder = pass.as_ref().map(|p| holder_plane_from(&p.report));
     let totals = pass
@@ -1557,6 +1589,90 @@ mod tests {
         assert_eq!(json["coordDrain"]["reason"], "rebuild");
     }
 
+    /// Phase 4 (plan 2026-10-27-click-resume-forks-a-live-conversation-and-
+    /// pane-titles-hide-its-identity): each terminal-plane entry carries the
+    /// pane's conversation label and, when its child emitted one, the OSC
+    /// activity title — and the activity never replaces the identity.
+    #[test]
+    fn restart_readiness_terminal_entries_carry_the_conversation_label() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut lead = record(
+            "9b40e22d-deec-415c-9379-5f85ae994ad8",
+            "t-lead",
+            now_ms - 1_000,
+        );
+        lead.title = Some("maxim".to_string());
+        let mut unnamed = record(
+            "3da13dea-0000-4000-8000-000000000000",
+            "t-other",
+            now_ms - 1_000,
+        );
+        unnamed.title = None;
+        let activity: HashMap<String, String> = [
+            ("t-lead".to_string(), "Fix Phase 5b round 11".to_string()),
+            ("t-other".to_string(), "   ".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let t = terminal_plane_from(&empty_report(now_ms), &[lead, unnamed], &activity, now_ms);
+        let lead = &t.sessions[0];
+        assert_eq!(lead.id, "9b40e22d-deec-415c-9379-5f85ae994ad8");
+        assert_eq!(lead.conversation_label.as_deref(), Some("maxim · 9b40e22d"));
+        assert_eq!(
+            lead.activity_title.as_deref(),
+            Some("Fix Phase 5b round 11")
+        );
+        assert_eq!(
+            lead.title.as_deref(),
+            Some("maxim"),
+            "the record title is the name"
+        );
+
+        let other = &t.sessions[1];
+        assert_eq!(
+            other.conversation_label.as_deref(),
+            Some("(unnamed) · 3da13dea")
+        );
+        assert_eq!(
+            other.activity_title, None,
+            "a blank activity is not a title"
+        );
+
+        let wire = serde_json::to_value(&t).unwrap();
+        assert_eq!(
+            wire["sessions"][0]["conversation_label"],
+            "maxim · 9b40e22d"
+        );
+        assert_eq!(
+            wire["sessions"][0]["activity_title"],
+            "Fix Phase 5b round 11"
+        );
+        assert!(wire["sessions"][1].get("activity_title").is_none());
+    }
+
+    /// The AI plane shares `SessionEntry` but has no pane: both new fields are
+    /// `None` and absent from the wire.
+    #[test]
+    fn restart_readiness_ai_plane_entries_carry_no_pane_label() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ai = ai_plane_from(
+            &[AiSessionInput {
+                id: "run-1".to_string(),
+                state: "processing".to_string(),
+                has_worktree: false,
+                created_at_ms: None,
+            }],
+            &[],
+            now_ms,
+        );
+        assert_eq!(ai.sessions[0].conversation_label, None);
+        assert_eq!(ai.sessions[0].activity_title, None);
+        let wire = serde_json::to_value(&ai.sessions[0]).unwrap();
+        assert!(wire.get("conversation_label").is_none());
+        assert!(wire.get("activity_title").is_none());
+    }
+
     /// A census pass with every class empty — an idle box.
     fn empty_report(now_ms: i64) -> TrackingHealthReport {
         TrackingHealthReport {
@@ -1591,7 +1707,12 @@ mod tests {
         now_ms: i64,
     ) -> RestartReadiness {
         build_verdict(
-            Some(terminal_plane_from(report, open_records, now_ms)),
+            Some(terminal_plane_from(
+                report,
+                open_records,
+                &HashMap::new(),
+                now_ms,
+            )),
             Some(headless_plane_from(report)),
             Some(holder_plane_from(report)),
             ai,
@@ -2011,7 +2132,7 @@ mod tests {
             now_ms,
             &crate::session::tracking_health::HolderCensus::default(),
         );
-        let t = terminal_plane_from(&report, &records, now_ms);
+        let t = terminal_plane_from(&report, &records, &HashMap::new(), now_ms);
 
         // POST-SPLIT: `count` is terminal-hosted ONLY — pid 10. The untracked
         // stray (pid 20) is no longer folded in here; it stays in
@@ -2400,7 +2521,7 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let report = empty_report(now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &[], now_ms)),
+            Some(terminal_plane_from(&report, &[], &HashMap::new(), now_ms)),
             None,
             None,
             Some(ai_plane_from(&[], &[], now_ms)),
@@ -2517,8 +2638,13 @@ mod tests {
 
         // `root_count` IS correct: it lives on TerminalPlane, which has no
         // `rename_all`.
-        let plane =
-            serde_json::to_value(terminal_plane_from(&empty_report(now_ms), &[], now_ms)).unwrap();
+        let plane = serde_json::to_value(terminal_plane_from(
+            &empty_report(now_ms),
+            &[],
+            &HashMap::new(),
+            now_ms,
+        ))
+        .unwrap();
         assert!(plane.get("root_count").is_some(), "{plane}");
         assert!(BOUNDARY.contains("`root_count`"));
 
@@ -3001,7 +3127,12 @@ mod tests {
         let (snap, records, tpids) = three_terminal_sessions(now_ms);
         let report = evaluate_with_status(&snap, &records, &tpids, &HashMap::new(), now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &records, now_ms)),
+            Some(terminal_plane_from(
+                &report,
+                &records,
+                &HashMap::new(),
+                now_ms,
+            )),
             Some(headless_plane_from(&report)),
             Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &[], now_ms)),
@@ -3053,7 +3184,7 @@ mod tests {
             ]),
             now_ms,
         );
-        let t = terminal_plane_from(&report, &records, now_ms);
+        let t = terminal_plane_from(&report, &records, &HashMap::new(), now_ms);
         let json = serde_json::to_value(&t).unwrap();
         let procs = json["processes"].as_array().expect("processes");
         assert_eq!(procs.len(), 3);
@@ -3462,7 +3593,7 @@ mod tests {
         let totals = live_claude_totals_observed(&one, &idle_everywhere);
         assert_eq!(totals.by_activity.idle, 1);
         let v = build_verdict(
-            Some(terminal_plane_from(&one, &[], ACT_NOW)),
+            Some(terminal_plane_from(&one, &[], &HashMap::new(), ACT_NOW)),
             Some(headless_plane_from(&one)),
             Some(holder_plane_from(&one)),
             Some(ai_plane_from(&[], &[], ACT_NOW)),
@@ -3479,7 +3610,7 @@ mod tests {
     fn by_activity_serializes_under_live_claude_in_the_modules_snake_case() {
         let report = activity_report();
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &[], ACT_NOW)),
+            Some(terminal_plane_from(&report, &[], &HashMap::new(), ACT_NOW)),
             Some(headless_plane_from(&report)),
             Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &report.ai_plane, ACT_NOW)),
@@ -4036,7 +4167,7 @@ mod tests {
 
         let empty = empty_report(now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&empty, &[], now_ms)),
+            Some(terminal_plane_from(&empty, &[], &HashMap::new(), now_ms)),
             Some(headless_plane_from(&empty)),
             None,
             Some(ai_plane_from(&[], &[], now_ms)),

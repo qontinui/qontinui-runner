@@ -506,9 +506,12 @@ pub fn terminal_write(
 /// frontend's xterm.js `onTitleChange` handler (see
 /// `components/terminal/ZoneGrid.tsx`) invokes this whenever it
 /// observes a new OSC 0/2 title in a `terminal-output` paint. The
-/// runner mirrors the new title onto `TerminalSession.title` and emits
-/// a `terminal-title-changed` event so other webview windows / WS
-/// subscribers stay consistent.
+/// runner stores it as `TerminalSession::activity_title` and emits a
+/// `terminal-title-changed` event (`{id, activityTitle}`) so other webview
+/// windows / WS subscribers stay consistent. It writes ONLY the activity
+/// title: never `TerminalSession.title` and never the lifecycle record's
+/// `title`, which names the conversation (plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`, D3).
 ///
 #[tauri::command]
 pub fn terminal_set_title(
@@ -2147,9 +2150,25 @@ pub fn terminal_report_bridge_registration_failure(
 /// Returns one row per live PROCESS. Several live processes may report the
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
+///
+/// Each row also names the runner pane that holds it — `terminalId` /
+/// `pageId` — attributed by `session::live_holders::attribute_holders` over
+/// the SAME process snapshot the liveness check uses (plan
+/// 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity,
+/// Phase 2). Both keys are OMITTED when the pane is unknown: a process outside
+/// every runner pane, one under two panes, or one whose pane root failed the
+/// PID-reuse guard. An omitted pane never means "not live".
 #[tauri::command]
-pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
+pub async fn terminal_claude_session_list_live(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    // The holder census BEFORE the snapshot (as `tracking_health::compute`
+    // takes it): every holder pid it names is then judged against a snapshot
+    // at least as new as the answer. Never fails — an unreadable pane
+    // directory only leaves holder-backed panes rooted at their child pid.
+    let terminal_manager: Arc<TerminalManager> = terminal_manager.inner().clone();
+    let census = crate::terminal::holder_census::take(&terminal_manager).await;
     // Re-check liveness: a crashed process cannot remove its own registry file,
     // so PID presence is the guard against reporting a dead session as open.
     //
@@ -2163,6 +2182,32 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
     let sessions =
         crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
+
+    let live_ptys: Vec<crate::session::reconcile::LivePty> = terminal_manager
+        .list()
+        .into_iter()
+        .map(|i| crate::session::reconcile::LivePty {
+            terminal_id: i.id,
+            pid: i.pid,
+            working_dir: i.working_dir,
+            page_id: i.page_id,
+            title: i.title,
+            ai_pid: None,
+            ai_start_unix: None,
+        })
+        .collect();
+    let panes = crate::session::live_holders::pane_roots(&live_ptys, &census);
+    let guard = crate::session::live_holders::ReuseGuard {
+        verified: &census.verified_terminal_pids,
+        boot_unix_millis: crate::session::tracking_health::primary_boot_unix_millis(),
+    };
+    let sessions = crate::session::live_holders::with_holding_panes(
+        sessions,
+        &panes,
+        &snapshot,
+        std::process::id(),
+        &guard,
+    );
     Ok(CommandResponse {
         success: true,
         message: None,

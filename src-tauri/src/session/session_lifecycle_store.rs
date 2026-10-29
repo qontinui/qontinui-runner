@@ -2279,10 +2279,15 @@ impl SessionLifecycleStore {
     /// Update the persisted `title` of the OPEN record hosted by
     /// `terminal_id` (plan
     /// `2026-07-03-runner-session-tracking-drift-and-guardrails` Phase 3
-    /// item 4). Title renames (`terminal_set_title` → OSC 0 echo, the `/name`
-    /// skill, an operator rename) previously mutated only the in-memory
+    /// item 4). Title renames previously mutated only the in-memory
     /// `TerminalSession` title, so the durable registry stayed frozen at the
     /// spawn-time title and a restart restored the pane under a stale name.
+    /// Its writers are the provider-name refresh (`reconcile::refresh_titles`)
+    /// and operator renames. The OSC 0/2 relay (`terminal_set_title`) is NOT
+    /// one since plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+    /// D3: that title is the CLI's current activity, and mirroring it here
+    /// erased the conversation's name.
     /// Keyed by terminal id because the rename call sites hold only that —
     /// same resolution [`Self::find_open_by_terminal`] performs. No-op (no
     /// write) if no open record references the terminal, or the title is

@@ -67,10 +67,12 @@ pub mod create; // Remote-CREATE grants: the `create_request` directive arm + de
 pub mod dual_write;
 pub mod handoff;
 pub mod intent;
+pub mod live_holders; // The ONE pid -> runner-pane attribution for live claude processes (plan 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity, Phase 2)
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
+pub mod pane_label; // The ONE composition of a pane's conversation label, `<name> · <id8>` (plan 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity, Phase 4)
 pub mod pane_store;
 pub mod past_sessions;
 pub mod provider_adapter;
