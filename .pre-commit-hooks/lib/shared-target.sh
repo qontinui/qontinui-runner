@@ -200,8 +200,8 @@ _SHARED_TARGET_CTF_LOADED=0
 # upward from there, so asking from anywhere else could name another target —
 # as cargo itself resolves it (CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR,
 # .cargo/config, then <workspace>/target): no second resolver here to drift
-# from cargo's. Returns 1 when cargo cannot say, with cargo's first stderr line
-# in _SHARED_TARGET_META_ERR. Called directly (never in `$( )`) so that
+# from cargo's. Returns 1 when cargo cannot say, with cargo's first `error`
+# line (else its first line) in _SHARED_TARGET_META_ERR. Called directly (never in `$( )`) so that
 # variable survives; the answer is in _SHARED_TARGET_DIR.
 _SHARED_TARGET_META_ERR=""
 _SHARED_TARGET_DIR=""
@@ -211,7 +211,7 @@ _shared_target_dir_of() {
   _SHARED_TARGET_META_ERR=""
   _SHARED_TARGET_DIR=""
   errf="$(mktemp)" || return 1
-  if ! meta="$(cd "$dir_from" && cargo metadata --no-deps --format-version 1 2>"$errf")"; then
+  if ! meta="$(cd "$dir_from" && cargo metadata --color never --no-deps --format-version 1 2>"$errf")"; then
     # The first `error` line, not the first line: cargo can warn first.
     _SHARED_TARGET_META_ERR="$({ grep -m1 '^error' "$errf" || grep -m1 . "$errf"; } 2>/dev/null || true)"
     rm -f "$errf"
@@ -290,9 +290,11 @@ guard_shared_target() {
   # "waiting for the tree lock" line is invisible WHILE it waits — and a silent
   # push is what gets skipped as a hang. Say it on the terminal as well — only
   # when stderr is NOT already the terminal (i.e. something is capturing it),
-  # and never under QONTINUI_PREPUSH_NO_TTY=1 (the test suites set it). A
-  # headless push has no terminal and loses nothing.
-  if [ "${QONTINUI_PREPUSH_NO_TTY:-0}" != 1 ] && [ ! -t 2 ]; then
+  # and never under QONTINUI_PREPUSH_NO_TTY=1 (the test suites set it) or from
+  # an agent session (runner-hosted or Claude Code), whose terminal belongs to
+  # the operator while the agent, the one waiting, would never see the line.
+  # A headless push has no terminal and loses nothing.
+  if [ "${QONTINUI_PREPUSH_NO_TTY:-0}" != 1 ] && [ -z "${QONTINUI_RUNNER_CONTEXT:-}" ] && [ "${CLAUDECODE:-}" != 1 ] && [ ! -t 2 ]; then
     { printf '%s taking the tree lock on %s (waits up to %ss if a peer build holds it)\n' \
         "$tag" "$target" "$max_wait" > /dev/tty; } 2>/dev/null || :
   fi

@@ -58,7 +58,8 @@ unset CARGO_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
 # The tree-lock guard reads these; an exported lib dir, wait bound or lock
 # claim would put the guard arms below under the developer's own environment.
 unset QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
-    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF CARGO_BUILD_TARGET_DIR
+    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF CARGO_BUILD_TARGET_DIR \
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
 # The guard's "taking the tree lock" notice goes to /dev/tty; ~20 hook runs
 # below must not write it onto the developer's terminal.
 export QONTINUI_PREPUSH_NO_TTY=1
