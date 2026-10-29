@@ -19,12 +19,16 @@
 //!   under `MissedTickBehavior::Skip` the next `tick()` returns the missed
 //!   deadline immediately, so the lateness our own tick caused is excluded.
 //! * **A slow tick.** A tick that succeeds but takes longer than one interval
-//!   (start to end, sinks included) gets its own `WARN`, so a gap between
-//!   ticks wider than 2 × interval (each WARN threshold is floored at 10s for a
-//!   short `COORD_HEARTBEAT_INTERVAL_SECS`) always surfaces at once: either as a stall
-//!   (the loop was not run) or as a slow or failed tick (it was, and the tick
-//!   itself took the time). A failed tick is already a `WARN` and is not
-//!   reported twice.
+//!   (start to end, sinks included) gets its own `WARN`.
+//!
+//! Both WARN thresholds are `T = max(interval, 10s)` — the floor keeps a short
+//! `COORD_HEARTBEAT_INTERVAL_SECS` from warning on ordinary round trips — and
+//! each line prints `T`. Together they guarantee that a gap between tick
+//! starts wider than 2 × T surfaces at once: as a stall (the loop was not run)
+//! or as a slow or failed tick (it was, and the tick itself took the time). A
+//! failed tick is already a `WARN` and is not reported twice. At the 30s
+//! default, 2 × T is 2 × interval.
+//!
 //! * **Proof of sending.** Every [`SUMMARY_WINDOW`] one `info!` line beginning
 //!   `fleet::heartbeat: summary` reports ticks ok/failed, the widest
 //!   start-to-start gap and the last coord status, then the window counters
@@ -140,36 +144,38 @@ where
     }
 }
 
-/// The tick started more than one interval later than it could have.
+/// The tick started more than `threshold` (one interval, floored at 10s)
+/// later than it could have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StallWarning {
     pub late: Duration,
-    pub interval: Duration,
+    pub threshold: Duration,
 }
 
 impl StallWarning {
     pub(crate) fn line(&self) -> String {
         format!(
-            "fleet::heartbeat: loop stalled: tick started {:.1}s late (interval {}s)",
+            "fleet::heartbeat: loop stalled: tick started {:.1}s late (threshold {}s)",
             self.late.as_secs_f64(),
-            self.interval.as_secs()
+            self.threshold.as_secs()
         )
     }
 }
 
-/// A tick that succeeded but took longer than one interval.
+/// A tick that succeeded but took longer than `threshold` (one interval,
+/// floored at 10s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SlowTick {
     pub took: Duration,
-    pub interval: Duration,
+    pub threshold: Duration,
 }
 
 impl SlowTick {
     pub(crate) fn line(&self) -> String {
         format!(
-            "fleet::heartbeat: slow tick: took {:.1}s (interval {}s)",
+            "fleet::heartbeat: slow tick: took {:.1}s (threshold {}s)",
             self.took.as_secs_f64(),
-            self.interval.as_secs()
+            self.threshold.as_secs()
         )
     }
 }
@@ -258,7 +264,7 @@ impl HeartbeatLoopStats {
         let late = now.saturating_duration_since(could_start);
         (late > self.warn_threshold()).then_some(StallWarning {
             late,
-            interval: self.interval,
+            threshold: self.warn_threshold(),
         })
     }
 
@@ -270,7 +276,7 @@ impl HeartbeatLoopStats {
         let took = now.saturating_duration_since(self.last_tick_start?);
         (succeeded && took > self.warn_threshold()).then_some(SlowTick {
             took,
-            interval: self.interval,
+            threshold: self.warn_threshold(),
         })
     }
 
@@ -575,7 +581,7 @@ mod tests {
         assert_eq!(warning.late, secs(31));
         assert_eq!(
             warning.line(),
-            "fleet::heartbeat: loop stalled: tick started 31.0s late (interval 30s)"
+            "fleet::heartbeat: loop stalled: tick started 31.0s late (threshold 30s)"
         );
 
         let mut fractional = HeartbeatLoopStats::new(INTERVAL, t0);
@@ -586,7 +592,7 @@ mod tests {
             .expect("30.4s exceeds 30s");
         assert_eq!(
             w.line(),
-            "fleet::heartbeat: loop stalled: tick started 30.4s late (interval 30s)"
+            "fleet::heartbeat: loop stalled: tick started 30.4s late (threshold 30s)"
         );
     }
 
@@ -662,9 +668,13 @@ mod tests {
         );
         // Deadline 2s, previous end 5s: 9s late is under the floor.
         assert_eq!(stats.on_tick_start(t0 + secs(14), t0 + short), None);
-        assert!(
-            stats.on_tick_end(t0 + secs(25), true).is_some(),
-            "11s > 10s"
+        assert_eq!(
+            stats
+                .on_tick_end(t0 + secs(25), true)
+                .expect("11s > 10s")
+                .line(),
+            "fleet::heartbeat: slow tick: took 11.0s (threshold 10s)",
+            "the line names the floored threshold, not the 2s interval"
         );
         assert!(
             stats.on_tick_start(t0 + secs(36), t0 + secs(24)).is_some(),
@@ -686,7 +696,7 @@ mod tests {
         assert_eq!(slow.took, Duration::from_millis(85_400));
         assert_eq!(
             slow.line(),
-            "fleet::heartbeat: slow tick: took 85.4s (interval 30s)"
+            "fleet::heartbeat: slow tick: took 85.4s (threshold 30s)"
         );
 
         stats.on_tick_start(t0 + secs(90), t0 + secs(90));
@@ -829,7 +839,7 @@ mod tests {
             *events.borrow(),
             vec![LoopEvent::SlowTick(SlowTick {
                 took: secs(85),
-                interval: INTERVAL,
+                threshold: INTERVAL,
             })]
         );
     }
@@ -860,16 +870,16 @@ mod tests {
             *events.borrow(),
             vec![LoopEvent::Stall(StallWarning {
                 late: secs(41),
-                interval: INTERVAL,
+                threshold: INTERVAL,
             })]
         );
         assert_eq!(
             StallWarning {
                 late: secs(41),
-                interval: INTERVAL
+                threshold: INTERVAL
             }
             .line(),
-            "fleet::heartbeat: loop stalled: tick started 41.0s late (interval 30s)"
+            "fleet::heartbeat: loop stalled: tick started 41.0s late (threshold 30s)"
         );
     }
 }
