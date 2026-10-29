@@ -1929,6 +1929,23 @@ mod tests {
         assert!(transcript_offsets(&outbox).is_empty(), "no content left");
     }
 
+    /// The entry the transcript watcher calls (`admit`, on the wall clock)
+    /// heartbeats a bound row too — whatever the sync gate says — and throttles
+    /// a burst to one row.
+    #[test]
+    fn the_watcher_entry_heartbeats_a_bound_row_with_sync_withheld() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        for _ in 0..3 {
+            assert_eq!(t.admit(&csid, 8, false), Admit::Withheld);
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+    }
+
     /// The throttle map is bounded: once it reaches the prune threshold, keys
     /// whose window has elapsed are forgotten.
     #[test]
