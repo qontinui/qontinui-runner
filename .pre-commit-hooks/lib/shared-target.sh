@@ -201,8 +201,9 @@ _SHARED_TARGET_CTF_LOADED=0
 # as cargo itself resolves it (CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR,
 # .cargo/config, then <workspace>/target): no second resolver here to drift
 # from cargo's. Returns 1 when cargo cannot say, with cargo's first `error`
-# line (else its first line) in _SHARED_TARGET_META_ERR. Called directly (never in `$( )`) so that
-# variable survives; the answer is in _SHARED_TARGET_DIR.
+# line (else its first line) in _SHARED_TARGET_META_ERR. Called directly
+# (never in `$( )`) so that variable survives; the answer is in
+# _SHARED_TARGET_DIR.
 _SHARED_TARGET_META_ERR=""
 _SHARED_TARGET_DIR=""
 _shared_target_dir_of() {
@@ -290,9 +291,10 @@ guard_shared_target() {
   # "waiting for the tree lock" line is invisible WHILE it waits — and a silent
   # push is what gets skipped as a hang. Say it on the terminal as well — only
   # when stderr is NOT already the terminal (i.e. something is capturing it),
-  # and never under QONTINUI_PREPUSH_NO_TTY=1 (the test suites set it) or from
-  # an agent session (runner-hosted or Claude Code), whose terminal belongs to
-  # the operator while the agent, the one waiting, would never see the line.
+  # and never under QONTINUI_PREPUSH_NO_TTY=1 (the test suites set it), from
+  # Claude Code, or from any runner-spawned pane (QONTINUI_RUNNER_CONTEXT is
+  # set there for a human's shell too): there the waiter is usually an agent,
+  # which would never see the line, while the terminal is the operator's.
   # A headless push has no terminal and loses nothing.
   if [ "${QONTINUI_PREPUSH_NO_TTY:-0}" != 1 ] && [ -z "${QONTINUI_RUNNER_CONTEXT:-}" ] && [ "${CLAUDECODE:-}" != 1 ] && [ ! -t 2 ]; then
     { printf '%s taking the tree lock on %s (waits up to %ss if a peer build holds it)\n' \

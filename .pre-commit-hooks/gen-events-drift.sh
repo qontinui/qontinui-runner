@@ -442,7 +442,7 @@ if [ -f "$SHARED_TARGET_LIB" ]; then
         *)
             cannot_evaluate \
                 "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
-                "fix the cause named above (for a 'cargo metadata' failure, run it in $RUNNER_DIR/src-tauri for cargo's full error), then push again" ;;
+                "fix the cause named above (for a 'cargo metadata' failure, run 'cargo metadata --no-deps --format-version 1' in $RUNNER_DIR/src-tauri for cargo's full error), then push again" ;;
     esac
 else
     log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"
