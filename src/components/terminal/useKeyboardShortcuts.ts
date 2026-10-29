@@ -106,8 +106,12 @@ interface UseKeyboardShortcutsParams {
     needsInputCount: number;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     sessions: Array<any>;
+    /**
+     * The Session Manager's resume — THE click gate (a live id opens the
+     * resume-live dialog, an unreadable registry its UNKNOWN form).
+     */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    resumeSession: (session: any) => void;
+    resumeSession: (session: any) => Promise<unknown>;
   };
   /**
    * The terminal page's root element. Every chord below is inert while
@@ -457,8 +461,9 @@ export function useKeyboardShortcuts({
               s.source === "transcript" && s.liveStatus === "frozen",
           );
           if (frozen) {
-            // Pass the full session object (includes _transcript) to resumeSession
-            sessionManager.resumeSession(frozen);
+            // Pass the full session object (includes _transcript) to
+            // resumeSession, which gates it on liveness like a card click.
+            void sessionManager.resumeSession(frozen);
             addHistoryEvent(
               "Resume frozen",
               `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`,

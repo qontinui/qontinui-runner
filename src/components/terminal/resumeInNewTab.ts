@@ -13,14 +13,29 @@
  * only once the handshake verified. Each call takes its own spawn through the
  * resource guard (`createTerminal`'s `spawnSource`), so a bulk caller has no
  * bypass of it.
+ *
+ * One-click Resumes reach it through the click gate (`resumeGate.ts`
+ * `runClickResume`, plan
+ * `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+ * Phase 3), which reads liveness first and asks when the conversation is live
+ * or liveness is unknown; the gate's "Fork as a new conversation" lands in
+ * {@link forkInNewTab}.
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import { describeThrown } from "@/lib/utils";
-import { loadDefaultConfigHome, resolveAccountDir } from "./defaultConfigHome";
+import { loadDefaultConfigHome, resolveAccountDir, typedConfigDir } from "./defaultConfigHome";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { providerDescriptorFor } from "./providerAdapter";
+import { withForkSession } from "./resumeGate";
+import {
+  buildPickerAnswer,
+  getResumeSummaryPolicy,
+  typeResumeAndVerify,
+  type TypeAndVerifyOptions,
+} from "./resumeVerification";
 import {
   buildSessionOpenArgs,
   noteRecordedZone,
@@ -29,7 +44,7 @@ import {
   type OpenRecordTab,
   type SessionOpenArgs,
 } from "./sessionRecordArgs";
-import { runVerifiedResume } from "./useTerminalInitialization";
+import { buildResumeCmd, runVerifiedResume } from "./useTerminalInitialization";
 import type { PastSession } from "./usePastSessions";
 import type { TerminalRefsMap } from "./writeWhenReady";
 
@@ -58,8 +73,11 @@ export type ResumeFailure =
   | "invalid-session-id"
   | "needs-account"
   | "already-running"
+  | "liveness-unknown"
   | "not-created"
-  | "not-verified";
+  | "not-verified"
+  | "fork-unavailable"
+  | "fork-not-verified";
 
 export type ResumeAttempt =
   | { kind: "verified"; tabId: string }
@@ -74,10 +92,16 @@ export function describeResumeFailure(failure: ResumeFailure): string {
       return "account unknown — its account directory cannot be typed safely (not shell-safe, or possibly the unreadable default account)";
     case "already-running":
       return "already running in another window — a second resume would fork it";
+    case "liveness-unknown":
+      return "could not read which conversations are live — not resumed, it may already be open elsewhere";
     case "not-created":
       return "no terminal was created (the resource guard refused or the spawn failed)";
     case "not-verified":
       return "the resume did not verify — see the tab's Retry";
+    case "fork-unavailable":
+      return "the resume command could not carry --fork-session, so nothing was typed";
+    case "fork-not-verified":
+      return "the fork did not verify — check its tab";
   }
 }
 
@@ -123,8 +147,21 @@ export interface ResumeInNewTabDeps {
   liveSessionIds?: () => Promise<ReadonlySet<string> | null>;
   /** Injectable for tests: the verified type-and-check. */
   verify?: typeof runVerifiedResume;
+  /** Injectable for tests: the verified fork type-and-check. */
+  verifyFork?: typeof runVerifiedFork;
   /** Injectable for tests: the default Claude home (see `defaultConfigHome.ts`). */
   defaultConfigHome?: () => Promise<string | null>;
+}
+
+/** How {@link resumeInNewTab} treats a conversation some process may hold. */
+export interface ResumeInNewTabOptions {
+  /**
+   * Skip the pre-type liveness read: the operator chose "Resume anyway" in the
+   * resume-live dialog, knowing two processes will write one transcript.
+   * Default `false`: a live id is refused (`already-running`) and an
+   * unreadable registry is refused too (`liveness-unknown`).
+   */
+  allowLive?: boolean;
 }
 
 /**
@@ -146,16 +183,22 @@ async function resumeAccountDirs(
 /**
  * Open a tab for `target` and type its verified `--resume`.
  *
- * A session some live process already hosts is refused (`already-running`):
- * typing `--resume` would fork its transcript. An UNREADABLE live registry
- * does not refuse — unlike the unattended boot restore, which fails closed,
- * this is an operator's explicit click — and the verification still guards the
- * typed command.
+ * Liveness is re-read right before the tab is created — the pre-type read the
+ * click gate (`resumeGate.runClickResume`) and the bulk queues rely on, since
+ * an id can go live between their own read and this one. A session some live
+ * process already hosts is refused (`already-running`): typing `--resume`
+ * would put a second writer on its transcript. An UNREADABLE registry is
+ * refused as well (`liveness-unknown`, plan
+ * `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+ * D2): a click must never fall through to a resume that may fork. The only way
+ * past either refusal is the dialog's explicit "Resume anyway"
+ * (`options.allowLive`).
  */
 export async function resumeInNewTab(
   deps: ResumeInNewTabDeps,
   target: ResumeTarget,
   spawnSource?: ResourceGuardSource,
+  options: ResumeInNewTabOptions = {},
 ): Promise<ResumeAttempt> {
   const { claudeSessionId } = target;
   if (!SESSION_ID_RE.test(claudeSessionId)) {
@@ -170,9 +213,12 @@ export async function resumeInNewTab(
     return { kind: "failed", failure: "needs-account", tabId: null };
   }
   const { recordDir, typedDir } = dirs;
-  const live = await (deps.liveSessionIds ?? fetchLiveClaudeSessionIds)();
-  if (live?.has(claudeSessionId)) {
-    return { kind: "failed", failure: "already-running", tabId: null };
+  if (!options.allowLive) {
+    const live = await (deps.liveSessionIds ?? fetchLiveClaudeSessionIds)();
+    if (live === null) return { kind: "failed", failure: "liveness-unknown", tabId: null };
+    if (live.has(claudeSessionId)) {
+      return { kind: "failed", failure: "already-running", tabId: null };
+    }
   }
 
   const tabId = await deps.createTerminal(
@@ -226,6 +272,110 @@ export async function resumeInNewTab(
   return outcome === "verified"
     ? { kind: "verified", tabId }
     : { kind: "failed", failure: "not-verified", tabId };
+}
+
+/**
+ * Type `claude --resume <id> --fork-session` into a fresh tab and verify the
+ * Claude UI handshake — the resume-live dialog's "Fork as a new
+ * conversation". The command is the backend-rendered resume
+ * (`buildResumeCmd`, the same account and permission rules as every typed
+ * resume) with the flag appended by `withForkSession`; a command it cannot
+ * append to is not typed (`unavailable`).
+ *
+ * Unlike `runVerifiedResume` this writes NO registry record and clears NO
+ * restore-pending marker: both are keyed by the ORIGINAL id, which another
+ * process still holds, while the fork runs under a new id that only the CLI
+ * knows at this point. The runner's spawn-time pin and the provider's
+ * SessionStart hook bind the new id to the tab, as for any hand-started
+ * claude. A failed fork is not parked in `resumeFailed` either — that Retry
+ * re-types a plain resume of the tab's bound id, and a fork tab has none.
+ */
+export async function runVerifiedFork(params: {
+  terminalRefs: TerminalRefsMap;
+  tabId: string;
+  claudeSessionId: string;
+  configDir?: string;
+  provider?: string;
+  updateTab: ResumeInNewTabDeps["updateTab"];
+  defaultConfigHome?: () => Promise<string | null>;
+  /** Injectable for tests: the backend resume render. */
+  buildCommand?: typeof buildResumeCmd;
+  /** Injectable for tests: the type-and-verify loop. */
+  typeAndVerify?: typeof typeResumeAndVerify;
+  verifyOptions?: TypeAndVerifyOptions;
+}): Promise<"verified" | "failed" | "unavailable"> {
+  const { terminalRefs, tabId, claudeSessionId, provider, updateTab } = params;
+  const policy = getResumeSummaryPolicy();
+  const home = await (params.defaultConfigHome ?? loadDefaultConfigHome)();
+  let cmd: string | null;
+  try {
+    const resumeCmd = await (params.buildCommand ?? buildResumeCmd)(
+      claudeSessionId,
+      typedConfigDir(params.configDir, home),
+      policy,
+      provider,
+    );
+    cmd = withForkSession(resumeCmd, claudeSessionId);
+  } catch (err: unknown) {
+    console.warn(`[resumeInNewTab] fork not rendered for ${claudeSessionId}:`, err);
+    cmd = null;
+  }
+  if (cmd === null) {
+    updateTab(tabId, { isReconnecting: false });
+    return "unavailable";
+  }
+  const outcome = await (params.typeAndVerify ?? typeResumeAndVerify)(terminalRefs, tabId, cmd, {
+    pickerAnswer: buildPickerAnswer(policy),
+    handshakePatterns: providerDescriptorFor(provider).handshakePatterns(),
+    sessionId: claudeSessionId,
+    // A fresh plain shell: no claude can be in it before the first type.
+    skipFirstProbe: true,
+    ...params.verifyOptions,
+  });
+  updateTab(tabId, { isReconnecting: false });
+  return outcome;
+}
+
+/**
+ * Open a tab titled `forkTitle` and fork `target` into it: a NEW conversation
+ * whose history is a copy of `target`'s. The live holder is not touched and
+ * gains no second writer, so no liveness read gates it. The account rule is
+ * the same as {@link resumeInNewTab}'s. The tab is not bound to the original
+ * id (that id belongs to the holder); see {@link runVerifiedFork}.
+ */
+export async function forkInNewTab(
+  deps: ResumeInNewTabDeps,
+  target: ResumeTarget,
+  forkTitle: string,
+  spawnSource?: ResourceGuardSource,
+): Promise<ResumeAttempt> {
+  const { claudeSessionId } = target;
+  if (!SESSION_ID_RE.test(claudeSessionId)) {
+    return { kind: "failed", failure: "invalid-session-id", tabId: null };
+  }
+  const dirs = await resumeAccountDirs(target.configDir, deps.defaultConfigHome);
+  if (dirs === null) {
+    return { kind: "failed", failure: "needs-account", tabId: null };
+  }
+  const tabId = await deps.createTerminal(forkTitle, target.workingDir, undefined, spawnSource);
+  if (!tabId) return { kind: "failed", failure: "not-created", tabId: null };
+  deps.onTabCreated?.(tabId);
+  deps.updateTab(tabId, { isReconnecting: true });
+  const outcome = await (deps.verifyFork ?? runVerifiedFork)({
+    terminalRefs: deps.terminalRefs,
+    tabId,
+    claudeSessionId,
+    configDir: dirs.typedDir,
+    provider: target.provider,
+    updateTab: deps.updateTab,
+    defaultConfigHome: deps.defaultConfigHome,
+  });
+  if (outcome === "verified") return { kind: "verified", tabId };
+  return {
+    kind: "failed",
+    failure: outcome === "unavailable" ? "fork-unavailable" : "fork-not-verified",
+    tabId,
+  };
 }
 
 export interface ResumeProfileSessionDeps {
@@ -348,40 +498,48 @@ export function retryResumeArgs(params: {
   };
 }
 
+/** The operator-facing notice for a resume that THREW (an IPC that rejected). */
+export function resumeThrownNotice(err: unknown, displayName: string): string {
+  return `Could not resume "${displayName}": ${describeThrown(err, "resume failed")}`;
+}
+
 /**
- * A Previous Sessions card's one-click Resume, through THE resume path:
- * resolves to the operator-facing notice when it did not come back, `null`
- * when it did. Every way it can fail is said — a refusal before any tab (an
- * unknown account, no directory), an attempt that failed, AND a resume that
- * REJECTED (an IPC that threw), which would otherwise be silent. The directory
- * is THE resume-dir rule's (`resumeDir`: the launch dir, else its worktree
- * root), the same one the copy line uses.
+ * A Previous Sessions card's one-click Resume, before it enters THE resume
+ * funnel (`useShellIntegration().resumeClick`, which gates it on liveness and
+ * says when it did not come back): the target to resume, or the notice for a
+ * card that cannot be resumed at all — an unknown account or no directory,
+ * refused before any tab. The directory is THE resume-dir rule's
+ * (`resumeDir`: the launch dir, else its worktree root), the same one the copy
+ * line uses.
  */
-export async function pastSessionResumeNotice(
+export function pastSessionResumeTarget(
   ps: Pick<
     PastSession,
     "claudeSessionId" | "resumeName" | "resumeAccount" | "resumeDir" | "provider"
   >,
-  resume: (target: ResumeTarget) => Promise<ResumeAttempt>,
-): Promise<string | null> {
+):
+  | { kind: "target"; target: ResumeTarget; conversationName: string | null }
+  | { kind: "refused"; notice: string } {
   const displayName = ps.resumeName || `claude ${ps.claudeSessionId.slice(0, 8)}`;
   if (!ps.resumeAccount.known || !ps.resumeDir) {
-    return `Could not resume "${displayName}": ${
-      ps.resumeAccount.known
-        ? "no working directory was recorded"
-        : "the account it ran under is unknown"
-    }`;
+    return {
+      kind: "refused",
+      notice: `Could not resume "${displayName}": ${
+        ps.resumeAccount.known
+          ? "no working directory was recorded"
+          : "the account it ran under is unknown"
+      }`,
+    };
   }
-  try {
-    const attempt = await resume({
+  return {
+    kind: "target",
+    target: {
       claudeSessionId: ps.claudeSessionId,
       displayName,
       workingDir: ps.resumeDir,
       configDir: ps.resumeAccount.configDir ?? undefined,
       provider: ps.provider,
-    });
-    return resumeFailureNotice(attempt, displayName);
-  } catch (err: unknown) {
-    return `Could not resume "${displayName}": ${describeThrown(err, "resume failed")}`;
-  }
+    },
+    conversationName: ps.resumeName?.trim() || null,
+  };
 }
