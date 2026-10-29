@@ -59,6 +59,9 @@ unset CARGO_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
 # claim would put the guard arms below under the developer's own environment.
 unset QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
     CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF CARGO_BUILD_TARGET_DIR
+# The guard's "taking the tree lock" notice goes to /dev/tty; ~20 hook runs
+# below must not write it onto the developer's terminal.
+export QONTINUI_PREPUSH_NO_TTY=1
 # The pushed-range resolution reads these. A developer running the tests from
 # inside a real pre-commit pre-push invocation would otherwise have the RANGE
 # under test decided by their own push.
@@ -615,7 +618,7 @@ run_guarded_in_wt() {
 worktree_fixture; stub_lib_fixture
 run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this
 check "(a) caller CARGO_TARGET_DIR -> fmt unlocked, then acquire, refresh, clippy UNDER the lock, release" \
-    "cargo fmt held=no;acquire /caller/chose/this 900;refresh /caller/chose/this;cargo clippy held=yes;release" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;cargo clippy held=yes;release" \
     "$(lib_seq)"
 check "(a) caller CARGO_TARGET_DIR -> the push is not blocked" "0" "$HOOK_RC"
 case "$HOOK_OUT" in
@@ -627,7 +630,7 @@ esac
 worktree_fixture; stub_lib_fixture
 run_guarded_in_wt QONTINUI_PREPUSH_CARGO_GUARD="$STUB_GUARD"
 check "(b) guard-resolved shared target -> the same guarded order, on THAT target" \
-    "cargo fmt held=no;acquire $SHARED_TARGET 900;refresh $SHARED_TARGET;cargo clippy held=yes;release" \
+    "cargo fmt held=no;acquire $SHARED_TARGET 300;refresh $SHARED_TARGET;cargo clippy held=yes;release" \
     "$(lib_seq)"
 
 # (c) the primary checkout is guarded too: its own target/ is shared with every
@@ -638,10 +641,13 @@ HOOK_OUT="$(cd "$WORK" && commit_change "src-tauri/src/lib.rs" "// primary rust"
     STUB_LIB_LOG="$STUB_LIB_LOG" STUB_HELD="$STUB_HELD" bash "$PREPUSH" 2>&1 </dev/null)"
 HOOK_RC=$?
 check "(c) primary checkout -> guarded too" \
-    "cargo fmt held=no;acquire <t> 900;refresh <t>;cargo clippy held=yes;release" "$(lib_seq_no_target)"
+    "cargo fmt held=no;acquire <t> 300;refresh <t>;cargo clippy held=yes;release" "$(lib_seq_no_target)"
+# The shim answers `metadata` with `$PWD/target`, so this also pins WHERE cargo
+# is asked: from src-tauri/, where clippy runs and where cargo starts its
+# `.cargo/config.toml` lookup — not from the repo root.
 case "$(sed -n 's/^acquire \(.*\) [0-9]*$/\1/p' "$STUB_LIB_LOG")" in
-    */target) pass_note "(c) and the locked target is the one cargo reports (<checkout>/target)" ;;
-    *) fail_note "(c) expected <checkout>/target to be locked, got: $(cat "$STUB_LIB_LOG")" ;;
+    */src-tauri/target) pass_note "(c) and the locked target is the one cargo reports from src-tauri/" ;;
+    *) fail_note "(c) expected cargo to be asked from src-tauri/, got: $(cat "$STUB_LIB_LOG")" ;;
 esac
 
 # (d) every way the guard cannot be taken: clippy is NOT run, the push is not
@@ -707,7 +713,7 @@ run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \
     STUB_CLIPPY_OUT="error: this lint is denied"
 check "(g) clippy fails -> the push is refused" "1" "$HOOK_RC"
 check "(g) clippy fails -> the lock is still released" \
-    "cargo fmt held=no;acquire /caller/chose/this 900;refresh /caller/chose/this;cargo clippy held=yes;release" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;cargo clippy held=yes;release" \
     "$(lib_seq)"
 case "$HOOK_OUT" in
     *"clippy lint fired"*) pass_note "(g) and an uncoded error: line keeps the lint wording" ;;
@@ -730,6 +736,13 @@ esac
 case "$HOOK_OUT" in
     *"This target is UNGUARDED"*) fail_note "(h) a guarded build must not carry the unguarded hint" ;;
     *) pass_note "(h) and a GUARDED build carries no unguarded hint" ;;
+esac
+# ...but it still names the residual: builds that skip the lock (cargo-guard.sh
+# until qontinui-claude-config#1823) can leave a peer's units behind.
+case "$HOOK_OUT" in
+    *"builds that skip the tree lock"*"private CARGO_TARGET_DIR"*)
+        pass_note "(h) and a GUARDED compile error still names the lock-skipping residual" ;;
+    *) fail_note "(h) expected the guarded residual hint, got: $HOOK_OUT" ;;
 esac
 worktree_fixture; stub_lib_fixture
 run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \

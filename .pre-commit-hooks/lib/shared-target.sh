@@ -39,7 +39,9 @@
 # `resolve_shared_target` takes no position on what a caller prints. It accepts
 # the caller's log prefix as `$2` so `[pre-push]` and `[gen-events-drift]`
 # framing both come out right, and it NEVER fails: every miss keeps today's
-# behaviour and says so on one line. Nothing in here can block a push.
+# behaviour and says so on one line. Nothing in `resolve_shared_target` can
+# block a push. (`guard_shared_target`, below, can make a caller DECLINE its
+# build; whether that blocks is the caller's QONTINUI_*_STRICT switch.)
 
 # _shared_target_ccfg_file <primary checkout> <path under scripts/>
 #
@@ -158,9 +160,19 @@ EOF
 # per-target tree lock plus a ledger that touches this tree's files whenever
 # the target was last built from another checkout. Reused, not re-written.
 #
+# ⚠️ WHAT IT DOES NOT COVER. The ledger only knows builds that take the lock.
+# A build that does not — `cargo-guard.sh` until qontinui-claude-config#1823
+# wires the same library into it, rust-analyzer, a raw `cargo` — can rebuild
+# a peer's units into the target without moving the ledger. A later guarded
+# run from the checkout the ledger already names then takes the library's
+# same-checkout arm, touches nothing, and can still be served those units.
+# So a guarded run narrows the false verdict to that residual; it does not
+# remove it, and the hooks' compile-error message says so.
+#
 # Return codes of guard_shared_target:
 #   0   guarded — the lock is held and this tree's units will be re-judged
-#   1   the lock wait timed out (QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT, 900 s)
+#   1   the lock wait timed out (QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT, 300 s —
+#       a push is interactive; declining costs latency, never coverage)
 #   2   the lock could not be taken, the library failed to load, or cargo
 #       could not say which target it will use
 #   3   this environment claims the lock but no holder proves it (a PEER's lock)
@@ -183,27 +195,48 @@ EOF
 SHARED_TARGET_GUARD_REASON=""
 _SHARED_TARGET_CTF_LOADED=0
 
-# Print the target directory cargo will build into for the workspace at $1, as
-# cargo itself resolves it (CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR,
-# .cargo/config, then <workspace>/target), so there is no second resolver here
-# to drift from cargo's. Returns 1 when cargo cannot say.
+# Print the target directory cargo will build into when run from $1 — the
+# directory the CALLER's build runs in, because cargo reads `.cargo/config.toml`
+# upward from there, so asking from anywhere else could name another target —
+# as cargo itself resolves it (CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR,
+# .cargo/config, then <workspace>/target): no second resolver here to drift
+# from cargo's. Returns 1 when cargo cannot say, with cargo's first stderr line
+# in _SHARED_TARGET_META_ERR. Called directly (never in `$( )`) so that
+# variable survives; the answer is in _SHARED_TARGET_DIR.
+_SHARED_TARGET_META_ERR=""
+_SHARED_TARGET_DIR=""
 _shared_target_dir_of() {
-  local root="$1" meta dir bs='\'
+  local dir_from="$1" meta dir errf bs='\'
   local re='"target_directory":"([^"]*)"'
-  meta="$(cd "$root" && cargo metadata --no-deps --format-version 1 2>/dev/null)" || return 1
+  _SHARED_TARGET_META_ERR=""
+  _SHARED_TARGET_DIR=""
+  errf="$(mktemp)" || return 1
+  if ! meta="$(cd "$dir_from" && cargo metadata --no-deps --format-version 1 2>"$errf")"; then
+    # The first `error` line, not the first line: cargo can warn first.
+    _SHARED_TARGET_META_ERR="$({ grep -m1 '^error' "$errf" || grep -m1 . "$errf"; } 2>/dev/null || true)"
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
   [[ $meta =~ $re ]] || return 1
   dir="${BASH_REMATCH[1]}"
-  dir="${dir//$bs$bs/$bs}"   # JSON escapes a Windows path's backslashes
+  # JSON escapes a Windows path's backslashes. Pattern and replacement are
+  # QUOTED: unquoted, `$bs$bs` is a glob matching ONE backslash, so the
+  # substitution would replace each backslash with itself.
+  dir="${dir//"$bs$bs"/"$bs"}"
   [ -n "$dir" ] || return 1
   if command -v cygpath >/dev/null 2>&1; then
     dir="$(cygpath -u "$dir" 2>/dev/null)" || return 1
   fi
-  printf '%s\n' "$dir"
+  _SHARED_TARGET_DIR="$dir"
 }
 
-# guard_shared_target <repo-root> <log prefix> — see the block above.
+# guard_shared_target <repo-root> <log prefix> [<dir cargo runs in>] — see the
+# block above. The third argument defaults to the repo root; both hooks build
+# from `src-tauri/` and pass that.
 guard_shared_target() {
-  local root="$1" tag="${2:-[pre-push]}"
+  local root="$1" tag="${2:-[pre-push]}" cargo_dir="${3:-$1}"
+  local max_wait="${QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT:-300}"
   local common_dir libdir found target fn rc=0
   SHARED_TARGET_GUARD_REASON=""
 
@@ -243,21 +276,31 @@ guard_shared_target() {
   done
   _SHARED_TARGET_CTF_LOADED=1
 
-  if ! target="$(_shared_target_dir_of "$root")"; then
-    SHARED_TARGET_GUARD_REASON="'cargo metadata' could not say which target directory this build uses"
+  if ! _shared_target_dir_of "$cargo_dir"; then
+    SHARED_TARGET_GUARD_REASON="'cargo metadata' could not say which target directory this build uses${_SHARED_TARGET_META_ERR:+ ($_SHARED_TARGET_META_ERR)}"
     return 2
   fi
+  target="$_SHARED_TARGET_DIR"
 
   # A signal must still run the caller's EXIT trap, which releases the lock.
   trap 'exit 130' INT
   trap 'exit 143' TERM
   CTF_HOLDER_ROOT="$root"
+  # pre-commit shows a hook's output only once the hook ends, so the library's
+  # "waiting for the tree lock" line is invisible WHILE it waits — and a silent
+  # push is what gets skipped as a hang. Say it on the terminal as well — only
+  # when stderr is NOT already the terminal (i.e. something is capturing it),
+  # and never under QONTINUI_PREPUSH_NO_TTY=1 (the test suites set it). A
+  # headless push has no terminal and loses nothing.
+  if [ "${QONTINUI_PREPUSH_NO_TTY:-0}" != 1 ] && [ ! -t 2 ]; then
+    { printf '%s taking the tree lock on %s (waits up to %ss if a peer build holds it)\n' \
+        "$tag" "$target" "$max_wait" > /dev/tty; } 2>/dev/null || :
+  fi
   rc=0
-  CARGO_VERIFY_TREE_LOCK_MAX_WAIT="${QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT:-900}" \
-    ctf_lock_acquire "$target" "$tag" || rc=$?
+  CARGO_VERIFY_TREE_LOCK_MAX_WAIT="$max_wait" ctf_lock_acquire "$target" "$tag" || rc=$?
   case "$rc" in
     0) ;;
-    1) SHARED_TARGET_GUARD_REASON="timed out after ${QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT:-900}s waiting for the tree lock on $target"; return 1 ;;
+    1) SHARED_TARGET_GUARD_REASON="timed out after ${max_wait}s waiting for the tree lock on $target"; return 1 ;;
     3) SHARED_TARGET_GUARD_REASON="this environment claims the tree lock on $target, but the lock is held by a holder the claim does not prove"; return 3 ;;
     *) SHARED_TARGET_GUARD_REASON="the tree lock on $target could not be taken (rc $rc)"; return 2 ;;
   esac
