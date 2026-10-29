@@ -908,9 +908,17 @@ fn release_slot() -> &'static Mutex<Option<tokio::time::Instant>> {
 
 /// PURE: the slot a release claims, given the previously claimed one.
 ///
-/// `now` when nothing is queued ahead; otherwise `spacing + jitter` past the
-/// last claimed slot. Monotone by construction: a caller that claims LATER
-/// never gets an earlier slot.
+/// `spacing + jitter` past the last claimed slot, or `now` when that is already
+/// behind us. Monotone by construction: a caller that claims LATER never gets
+/// an earlier slot.
+///
+/// The spacing is a MINIMUM between two claims, as [`RELEASE_SPACING`] says,
+/// including a claim that arrives just after the previous slot has passed.
+/// Until plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// (Phase 2) this returned `now` for ANY past slot, so two claims 1 s apart
+/// with nothing queued both started at once. `unattended_spawn_gate` paces on
+/// this same function and its burst fixture (19 requests within 17 s) is what
+/// exposed it.
 ///
 /// That orders releases by CLAIM order, which is mutex-acquisition order after
 /// `tx.send_replace` wakes every waiter at once — scheduler order, not the
@@ -923,8 +931,8 @@ pub fn next_release_slot(
     jitter: Duration,
 ) -> tokio::time::Instant {
     match last {
-        Some(last) if last >= now => last + spacing + jitter,
-        _ => now,
+        Some(last) => now.max(last + spacing + jitter),
+        None => now,
     }
 }
 
@@ -1725,5 +1733,13 @@ mod tests {
         // A stale slot (already past) does not hold anything back.
         let later = t0 + Duration::from_secs(60);
         assert_eq!(next_release_slot(later, Some(t0), spacing, jitter), later);
+        // …but one that passed LESS than a spacing ago still does: a claim 1 s
+        // after a release waits out the rest of the spacing (plan 2026-10-28
+        // Phase 2 — this returned `t0 + 1 s` before).
+        let one_s_later = t0 + Duration::from_secs(1);
+        assert_eq!(
+            next_release_slot(one_s_later, Some(t0), spacing, jitter),
+            t0 + spacing + jitter
+        );
     }
 }

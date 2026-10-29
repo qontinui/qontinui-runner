@@ -1004,6 +1004,29 @@ async fn materialize(
     // and the claims re-acquired below belong to that same tenant.
     let tenant = TenantScope::for_session(intent.tenant_id);
 
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1): a terminal handoff opens a PTY (`start_with_parent` -> the PTY / claude_cli
+    // transport -> `TerminalManager::create`). This runs INLINE on the `/ws` read
+    // loop, so it DEFERS rather than holds, as the drain arm above does: the pending
+    // handoff replays on the next catch-up tick, and the gate remembers the first
+    // deferral so its deadline still applies. Nothing has been started or marked.
+    // Only the two PTY kinds pass it; a workflow or agentic child opens no PTY here.
+    if matches!(
+        intent.kind,
+        SessionKind::TerminalShell | SessionKind::TerminalClaude
+    ) {
+        if let Err(loaded) = crate::unattended_spawn_gate::admit_or_defer(
+            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+            "handoff session",
+            &format!("handoff:{}", handoff.source_session_id),
+        ) {
+            return Err(HandoffError::Session(format!(
+                "deferred by the unattended spawn gate: {}",
+                loaded.reason
+            )));
+        }
+    }
+
     // Start the child session locally with lineage back to the source.
     let child = registry
         .start_with_parent(intent, handoff.source_session_id)

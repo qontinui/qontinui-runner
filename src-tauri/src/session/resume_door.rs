@@ -587,6 +587,18 @@ async fn resume_one(
     if !Path::new(&cand.working_dir).is_dir() {
         return ResumeRow::skipped(&cand.id, "working_dir_missing");
     }
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1): pace this resume and hold it while the machine reads WARN or CRITICAL.
+    // The batch is a detached task, so a hold costs the caller time, never the id.
+    // Placed BEFORE the drain gate and the hop budget, so both are judged after the
+    // hold (the budget check consumes a slot) and nothing but synchronous checks
+    // stands between the release and the PTY. Same origin as the drain gate below.
+    crate::unattended_spawn_gate::admit(
+        SpawnOrigin::Respawn,
+        "resumed session",
+        &format!("resume:{}", cand.id),
+    )
+    .await;
     let gate = match crate::coord_drain_state::drain_gate_for_work(
         SpawnOrigin::Respawn,
         &format!("resume:{}", cand.id),

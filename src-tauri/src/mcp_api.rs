@@ -2559,6 +2559,15 @@ async fn health(
         // only populates where the fleet resource sample publishes, and `null`
         // there means the 256/400 floor by design, not a fault.
         "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
+        // Unattended PTY spawn admission (plan 2026-10-28-runner-spawn-bursts-
+        // overwhelm-the-box-beyond-the-continuation-cap, Phase 2):
+        // `unattendedGate` is the pacer-and-hold every unattended PTY spawn
+        // passes immediately before the PTY opens — spacing, re-probe interval,
+        // hold deadline, spawns held right now, and release / refusal / deferral
+        // totals by `why` since boot. A build serving no such key has no gate.
+        "spawnAdmission": {
+            "unattendedGate": crate::unattended_spawn_gate::health_json(),
+        },
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was

@@ -6813,6 +6813,23 @@ async fn run_continuation_terminal(
         // no qontinui-claude-config checkout has no skills dir at all.
         crate::fleet_skills::provision_fleet_skills_for_session(workdir);
 
+        // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+        // D1): pace this PTY spawn and hold it while the machine reads WARN or
+        // CRITICAL — here, after the claim, the worktree and every slow await, so the
+        // reading it releases on is the one the PTY opens under. A hold keeps the
+        // claimed work; the seam below still refuses at CRITICAL once the hold's
+        // deadline has passed. Every start attempt is paced, retries included.
+        crate::unattended_spawn_gate::admit(
+            if payload.dispatch_id.is_some() {
+                crate::coord_drain_state::SpawnOrigin::UnitContinuation
+            } else {
+                crate::coord_drain_state::SpawnOrigin::GateContinuation
+            },
+            "gate-continuation terminal",
+            payload.anchor_key.as_deref().unwrap_or(&pinned_session_id),
+        )
+        .await;
+
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
         // from the one async context on this path, so that decision is made on the
@@ -7845,6 +7862,15 @@ async fn run_condition_check_terminal(
         // From the SAME carrier the argv above was built from.
         policy_delivery,
     };
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1) — the same pace-and-hold the gate-continuation terminal passes.
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+        "condition-check terminal",
+        &format!("condition-run:{}", payload.run_id),
+    )
+    .await;
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
     // sync trust gate decides on the tenant's word, not a cold cache.

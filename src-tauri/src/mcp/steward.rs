@@ -1013,6 +1013,9 @@ pub async fn steward_start_handler(
         kind,
         request,
         crate::coord_drain_state::SpawnOrigin::Steward,
+        // A request handler: a loaded machine is answered 409 `machine_loaded`
+        // with a retry hint, never by holding the request open.
+        crate::unattended_spawn_gate::Wait::Refuse,
     )
     .await
 }
@@ -1034,6 +1037,8 @@ pub async fn steward_start(
         kind,
         StewardStartRequest { mode, interval },
         crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+        // Operator origin: the unattended gate passes it untouched either way.
+        crate::unattended_spawn_gate::Wait::Refuse,
     )
     .await
     {
@@ -1083,6 +1088,11 @@ pub(crate) async fn restart_after_drain(
             interval: None,
         },
         crate::coord_drain_state::SpawnOrigin::Steward,
+        // The runner's own task: a loaded machine HOLDS the restart (paced, and
+        // bounded by the gate's deadline) rather than dropping a steward the
+        // drain stopped — a refusal here would leave it owed until the next
+        // undrain edge, which may never come.
+        crate::unattended_spawn_gate::Wait::Hold,
     )
     .await
     {
@@ -1143,12 +1153,16 @@ pub(crate) enum RestartOutcome {
 
 /// The shared start path behind the HTTP route and the Tauri command. `origin`
 /// decides how the coord device drain applies: `Steward` (autonomous) is
-/// deferred while the drain holds, `OperatorTerminal` is not.
+/// deferred while the drain holds, `OperatorTerminal` is not. `wait` decides how
+/// the unattended spawn gate applies to an autonomous start: a request handler
+/// is refused `machine_loaded` (`Refuse`), the runner's own restart task holds
+/// (`Hold`).
 async fn start_steward(
     app_handle: tauri::AppHandle,
     kind: String,
     request: StewardStartRequest,
     origin: crate::coord_drain_state::SpawnOrigin,
+    wait: crate::unattended_spawn_gate::Wait,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let spec = steward_spec(&kind).ok_or_else(|| unknown_kind_error(&kind))?;
     let terminal_manager: Arc<TerminalManager> =
@@ -1243,6 +1257,22 @@ async fn start_steward(
     }
 
     let launch_command = build_launch_command(spec, &mode, &interval);
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1), immediately before the PTY opens and while the start claim is held, so
+    // no second start of this kind can slip in during a hold. An operator origin
+    // passes untouched.
+    if let Err(loaded) = crate::unattended_spawn_gate::admit_or_refuse(
+        wait,
+        origin,
+        "steward terminal",
+        &format!("steward:{}", spec.kind),
+    )
+    .await
+    {
+        warn!("HTTP: Not starting {} now — {}", spec.skill, loaded.reason);
+        return Err((StatusCode::CONFLICT, Json(loaded.api_refusal())));
+    }
 
     info!(
         "HTTP: Starting {} (mode={}, interval={})",

@@ -192,6 +192,12 @@ pub enum RespawnError {
     /// coord row stays pending and the next push/catch-up retries it.
     #[error("deferred by the coord device drain: {0}")]
     DeferredByDrain(String),
+    /// The unattended spawn gate deferred this respawn (the machine reads WARN
+    /// or CRITICAL, or another unattended spawn holds the pace slot). Not a
+    /// failure: the durable coord row stays pending and the next catch-up
+    /// retries it.
+    #[error("deferred by the unattended spawn gate: {0}")]
+    DeferredByMachineLoad(String),
     #[error(transparent)]
     Coord(#[from] HandoffError),
 }
@@ -750,6 +756,20 @@ async fn materialize(
     //    attempt that refuses at step 1–4 would let three failed reconnects
     //    lock a legitimate respawn out for 24 hours. Only a respawn that
     //    actually launches spends the budget.
+    //
+    //    The unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-
+    //    the-box, D1) comes first, so a deferral spends no budget slot. This runs
+    //    INLINE on the handoff receiver's `/ws` read loop, so it DEFERS rather than
+    //    holds — a hold would stop the socket being read — exactly as the drain arm
+    //    above does: the pending row replays on the next catch-up tick, and the
+    //    gate remembers the first deferral so its deadline still applies.
+    if let Err(loaded) = crate::unattended_spawn_gate::admit_or_defer(
+        crate::coord_drain_state::SpawnOrigin::Respawn,
+        "respawned session",
+        &format!("respawn:{}", respawn.source_session_id),
+    ) {
+        return Err(RespawnError::DeferredByMachineLoad(loaded.reason));
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !crate::terminal::account_migration::migration_cap_permits(&claude_session_id, now_ms) {
         return Err(RespawnError::CapReached {

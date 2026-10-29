@@ -112,6 +112,17 @@ impl TauriInvokeResponse {
             status: None,
         }
     }
+    /// A loaded machine (`unattended_spawn_gate`): a typed 409 `machine_loaded`
+    /// whose `data` carries the `retry_after_ms` hint.
+    fn machine_loaded(loaded: &crate::unattended_spawn_gate::MachineLoaded) -> Self {
+        Self {
+            success: false,
+            data: Some(serde_json::json!({ "retry_after_ms": loaded.retry_after_ms })),
+            error: Some(loaded.reason.clone()),
+            code: Some(loaded.code().to_string()),
+            status: Some(StatusCode::CONFLICT),
+        }
+    }
     /// A refused `editSiblings` input: a typed 400 `invalid_edit_sibling`,
     /// answered before any allocation (vet V9).
     fn edit_sibling_refusal(
@@ -275,18 +286,31 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
             // D3): this is the HTTP proxy of `terminal_create`, not the runner UI,
             // so its caller is autonomous and is deferred while the drain holds.
+            // Caller-supplied title — BOUNDED (review N4): a caller must not be
+            // able to grow the banner's deferred set.
+            let work_key = crate::coord_drain_state::bounded_work_key(
+                "proxy_terminal",
+                a.title.as_deref().unwrap_or("untitled"),
+            );
             if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
                 crate::coord_drain_state::drain_gate_for_work(
                     crate::coord_drain_state::SpawnOrigin::Unknown,
-                    // Caller-supplied title — BOUNDED (review N4): a caller
-                    // must not be able to grow the banner's deferred set.
-                    &crate::coord_drain_state::bounded_work_key(
-                        "proxy_terminal",
-                        a.title.as_deref().unwrap_or("untitled"),
-                    ),
+                    &work_key,
                 )
             {
                 return TauriInvokeResponse::err(reason);
+            }
+            // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-
+            // the-box, D1). A request door: decided ONCE, never held, refused with
+            // the typed code `machine_loaded` (409) and `data.retry_after_ms` —
+            // beside the drain arm, before the worktree allocation a refusal would
+            // otherwise leak.
+            if let Err(loaded) = crate::unattended_spawn_gate::check_request(
+                crate::coord_drain_state::SpawnOrigin::Unknown,
+                "proxied terminal",
+                &work_key,
+            ) {
+                return TauriInvokeResponse::machine_loaded(&loaded);
             }
             let spawn_tenant = match spawn_tenant_or_invoke_error(a.tenant_id.as_deref()) {
                 Ok(tenant) => tenant,

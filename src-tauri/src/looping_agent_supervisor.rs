@@ -1183,6 +1183,17 @@ async fn spawn_looping_agent_terminal(
         policy_delivery,
     };
 
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1): pace this PTY spawn and hold it while the machine reads WARN or
+    // CRITICAL, immediately before the PTY opens. The early-out pre-check above
+    // stays: it refuses a CRITICAL box before the home-dir and provisioning work.
+    crate::unattended_spawn_gate::admit(
+        crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+        "looping-agent terminal",
+        &looping_agent_work_key(&def.id),
+    )
+    .await;
+
     // The PTY seam derives workspace trust for `selected_config_dir` through
     // the trust gate's sync door; warm the dial from this async context so the
     // first spawn after a runner start is not decided by a cold cache.

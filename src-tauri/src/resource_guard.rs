@@ -2511,7 +2511,19 @@ pub(crate) fn admit_spawn(
     resource_override: bool,
     app: Option<&AppHandle>,
 ) -> Result<(), String> {
-    match probe_for_spawn() {
+    admit_verdict(probe_for_spawn(), what, resource_override, app)
+}
+
+/// [`admit_spawn`]'s ladder over a verdict already taken — the seam with the
+/// probe factored out, so `unattended_spawn_gate`'s tests can show that a
+/// spawn its hold deadline released still meets this ladder unchanged.
+pub(crate) fn admit_verdict(
+    verdict: SpawnGate,
+    what: &str,
+    resource_override: bool,
+    app: Option<&AppHandle>,
+) -> Result<(), String> {
+    match verdict {
         SpawnGate::Proceed => Ok(()),
         SpawnGate::Warn(observation) => {
             let message = format!(

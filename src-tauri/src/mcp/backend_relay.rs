@@ -5554,16 +5554,17 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     // dispatch, not an operator sitting at this runner, so it is deferred while
     // the device is drained or its drain state is unknown. Refused BEFORE the
     // grant gate below, so a deferral spends no create grant.
+    // Caller-supplied request id — BOUNDED (review N4).
+    let work_key = crate::coord_drain_state::bounded_work_key(
+        "relay_terminal",
+        data.get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
-            // Caller-supplied request id — BOUNDED (review N4).
-            &crate::coord_drain_state::bounded_work_key(
-                "relay_terminal",
-                data.get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-"),
-            ),
+            &work_key,
         )
     {
         return Some(serde_json::json!({
@@ -5572,6 +5573,27 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // only when coord said drained.
             "code": class.code(),
             "message": relay_create_drain_message(&reason),
+            "request_id": data.get("request_id"),
+        }));
+    }
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1). A request/reply door on the relay's bounded reply lane: decided ONCE,
+    // never held, and answered as the drain arm above answers — an error frame —
+    // with the code `machine_loaded` and `retry_after_ms`. Refused BEFORE the grant
+    // gate below, so a loaded machine spends no create grant either.
+    if let Err(loaded) = crate::unattended_spawn_gate::check_request(
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+        "relay terminal",
+        &work_key,
+    ) {
+        return Some(serde_json::json!({
+            "type": "error",
+            "code": loaded.code(),
+            "message": format!(
+                "{} — this remote terminal create was refused, not queued; nothing was spawned",
+                loaded.reason
+            ),
+            "retry_after_ms": loaded.retry_after_ms,
             "request_id": data.get("request_id"),
         }));
     }
