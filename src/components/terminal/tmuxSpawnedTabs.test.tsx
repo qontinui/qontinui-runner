@@ -78,6 +78,8 @@ describe("session manager Resume", () => {
         setSelectedTranscriptSessionId: noop,
         pageId: "page-1",
         onResumedTab,
+        // No live process holds the id: the click gate clears the resume.
+        readLiveSessions: async () => [],
       }),
     );
     // Resume reads navigator.platform to pick the shell syntax. Node 20 (CI)

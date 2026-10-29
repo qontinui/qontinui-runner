@@ -100,7 +100,7 @@ import { useFindingsActions } from "../useFindingsActions";
 import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
-import { planTabReveal } from "../tabReveal";
+import { revealTabInLayout } from "../tabReveal";
 import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes, chunkEndOffset } from "../terminalOutputTap";
@@ -398,8 +398,13 @@ const PageSessionScope = memo(function PageSessionScope({
       // them. `null` (registry unreadable) fails CLOSED: skip the whole
       // batch. Skipped sessions are dropped, not re-parked — the profile's
       // layout/tabs are untouched, and the operator can still resume any of
-      // them by hand (single-id operator-clicked resume paths stay ungated
-      // by design: the click is the intent).
+      // them by hand. A hand resume is gated too, by the CLICK gate
+      // (`resumeGate.ts` `runClickResume`, entered through
+      // `useShellIntegration`'s `handleResumeSession` / `resumeClick`): a live
+      // id opens the resume-live dialog (go to the pane, fork, or resume
+      // anyway) and an unreadable registry opens its UNKNOWN form, so a click
+      // is no longer taken as intent to fork a conversation the operator could
+      // not find.
       const liveIds = await fetchLiveClaudeSessionIds();
       for (const { s, tabId } of toResume) {
         const decision = decideColdResume(liveIds, s.claudeSessionId);
@@ -719,6 +724,8 @@ const PageSessionScope = memo(function PageSessionScope({
     pageId,
     // A session the operator resumes is shown (tmux `new-window`; no-op in grid).
     onResumedTab: zoneLayout.showSpawnedTab,
+    // A click-resume that did not come back says so on the page's notice.
+    notify: (message, type) => notificationSetterRef.current({ message, type }),
   });
 
   const getScrollback = useCallback(
@@ -767,32 +774,16 @@ const PageSessionScope = memo(function PageSessionScope({
     onFocusSessionTab: (sessionId: string, tabId: string, source: "transcript" | "tab") => {
       // Defensive: `zoneTabId` only ever names a tab this window owns, but a
       // stale or synthetic id must fall back to the transcript, not a no-op.
-      const plan = tabs.some((t) => t.id === tabId)
-        ? planTabReveal(
-            zoneLayout.assignments,
-            zoneLayout.layout.zones.length,
-            zoneLayout.focusedZone,
-            tabId,
-            zoneLayout.getReservedZones(),
-          )
-        : null;
-      if (!plan) {
+      // Place, focus and reveal it — the one reveal (`revealTabInLayout`),
+      // shared with the resume-live dialog's "go to the existing pane".
+      const revealed = tabs.some((t) => t.id === tabId) && revealTabInLayout(zoneLayout, tabId);
+      if (!revealed) {
         // A tab row has no transcript to fall back to — its id is a tab id.
         if (source === "tab") return;
         selectedSessionSetterRef.current(sessionId);
         rightPanelModeSetterRef.current("transcript" as never);
         return;
       }
-      if (plan.assign) zoneLayout.assignTabToZone(plan.zone, tabId);
-      // A maximized pane would hide the zone we focus — carry the maximize
-      // over to it so the session actually comes into view.
-      if (zoneLayout.maximizedZone !== null && zoneLayout.maximizedZone !== plan.zone) {
-        zoneLayout.setMaximizedZone(plan.zone);
-      }
-      zoneLayout.setFocusedZone(plan.zone);
-      // Scroll it into view (flow mode) and hand it the keyboard — also when
-      // it was already the focused zone, where none of the above changes state.
-      zoneLayout.requestReveal(tabId);
       // Keep the card highlighted as the current session.
       selectedSessionSetterRef.current(sessionId);
       // A tab row's id names no transcript: an open transcript panel would
@@ -800,6 +791,8 @@ const PageSessionScope = memo(function PageSessionScope({
       rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
     onCloseSessionTab: terminalManager.closeTerminal,
+    // The bulk "resume selected" summary (resumed / already live / unknown).
+    onNotify: (n) => notificationSetterRef.current(n),
   });
 
   const workflowGen = useWorkflowGeneration({

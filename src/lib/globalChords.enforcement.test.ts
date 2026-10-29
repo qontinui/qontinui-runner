@@ -400,6 +400,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/LaunchMenu.tsx",
   "components/terminal/OutputSearchBar.tsx",
   "components/terminal/PromptModal.tsx",
+  "components/terminal/ResumeLiveDialog.tsx",
   "components/terminal/SessionCard.tsx",
   "components/terminal/SessionInfoDropdown.tsx",
   "components/terminal/SessionReviewPanel.tsx",

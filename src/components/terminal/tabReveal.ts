@@ -66,3 +66,43 @@ export function planTabReveal(
   // pick — fall back to the focused zone anyway.
   return { zone: preferred, assign: true };
 }
+
+/** The slice of a page's zone layout a reveal drives (`useZoneLayout`'s return). */
+export interface RevealableZoneLayout {
+  assignments: Record<number, string>;
+  layout: { zones: readonly unknown[] };
+  focusedZone: number;
+  maximizedZone: number | null;
+  getReservedZones: () => ReadonlySet<number>;
+  assignTabToZone: (zone: number, tabId: string) => void;
+  setMaximizedZone: (zone: number | null) => void;
+  setFocusedZone: (zone: number) => void;
+  requestReveal: (tabId: string) => void;
+}
+
+/**
+ * Carry out {@link planTabReveal}: place `tabId` when it is in no zone, move a
+ * maximize onto its zone (a maximized pane would hide the zone we focus),
+ * focus that zone, and request the reveal (scroll into view in flow mode, and
+ * hand it the keyboard — also when it was already the focused zone, where
+ * nothing else changes state). The ONE reveal, shared by the Session Manager
+ * card click and the resume-live dialog's "go to the existing pane". `false`
+ * when the layout has no zone to put it in.
+ */
+export function revealTabInLayout(zoneLayout: RevealableZoneLayout, tabId: string): boolean {
+  const plan = planTabReveal(
+    zoneLayout.assignments,
+    zoneLayout.layout.zones.length,
+    zoneLayout.focusedZone,
+    tabId,
+    zoneLayout.getReservedZones(),
+  );
+  if (!plan) return false;
+  if (plan.assign) zoneLayout.assignTabToZone(plan.zone, tabId);
+  if (zoneLayout.maximizedZone !== null && zoneLayout.maximizedZone !== plan.zone) {
+    zoneLayout.setMaximizedZone(plan.zone);
+  }
+  zoneLayout.setFocusedZone(plan.zone);
+  zoneLayout.requestReveal(tabId);
+  return true;
+}

@@ -4,7 +4,29 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
-import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeInNewTab";
+import {
+  fetchLiveClaudeSessions,
+  liveSessionIdSet,
+  type LiveClaudeSession,
+} from "./liveClaudeSessions";
+import {
+  forkInNewTab,
+  resumeFailureNotice,
+  resumeInNewTab,
+  resumeThrownNotice,
+  type ResumeAttempt,
+  type ResumeInNewTabDeps,
+  type ResumeTarget,
+} from "./resumeInNewTab";
+import {
+  forkTabTitle,
+  runClickResume,
+  type ClickResumeOptions,
+  type ResumeGateChoice,
+  type ResumeGatePrompt,
+  type ResumeOutcome,
+  type StartResumeMode,
+} from "./resumeGate";
 
 export interface CommandHistoryEntry {
   command: string;
@@ -55,14 +77,50 @@ interface UseShellIntegrationParams {
    * reconcile and this is a no-op.
    */
   onResumedTab?: (tabId: string) => void;
+  /**
+   * The page's notification: says why a click-resume did not come back
+   * (refused, no tab, unverified, or threw), so a click is never silent.
+   */
+  notify?: (message: string, type: "success" | "error") => void;
+  /** Injectable for tests: the liveness oracle (`fetchLiveClaudeSessions`). */
+  readLiveSessions?: () => Promise<LiveClaudeSession[] | null>;
 }
 
-interface UseShellIntegrationResult {
+/** Options of an operator resume through the click gate. */
+export interface ResumeSessionOptions {
+  /**
+   * `false` (bulk "resume selected"): never open the resume-live dialog — a
+   * live id returns `skipped-live` and an unreadable registry
+   * `skipped-unknown`, and failures are left to the caller's summary.
+   */
+  interactive?: boolean;
+}
+
+export interface UseShellIntegrationResult {
   commandHistories: Record<string, CommandHistoryEntry[]>;
   handleShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
-  handleResumeSession: (session: TranscriptSession) => void;
-  /** THE resume path — see `resumeInNewTab`. */
+  /**
+   * Resume a transcript session (Session Manager, transcript panel, keyboard
+   * shortcut) through the click gate — see `resumeGate.runClickResume`.
+   */
+  handleResumeSession: (
+    session: TranscriptSession,
+    opts?: ResumeSessionOptions,
+  ) => Promise<ResumeOutcome>;
+  /** Resume any target through the click gate (Previous Sessions). */
+  resumeClick: (target: ResumeTarget, opts?: ClickResumeOptions) => Promise<ResumeOutcome>;
+  /**
+   * The "Since restart" queue's resume — `resumeInNewTab` with its own pre-type
+   * liveness refusal (live → `already-running`, unreadable →
+   * `liveness-unknown`), and no dialog: the queue reports each item.
+   */
   resumeTarget: (target: ResumeTarget, spawnSource?: ResourceGuardSource) => Promise<ResumeAttempt>;
+  /** The open resume-live dialog, or `null`. Rendered by `ResumeGateHost`. */
+  resumeGatePrompt: ResumeGatePrompt | null;
+  /** Open the resume-live dialog and resolve with the operator's choice. */
+  askResumeGate: (prompt: ResumeGatePrompt) => Promise<ResumeGateChoice>;
+  /** Answer the open dialog (resolves its {@link askResumeGate} promise). */
+  answerResumeGate: (choice: ResumeGateChoice) => void;
   handleFirstInput: (tabId: string, input: string) => void;
 }
 
@@ -77,6 +135,8 @@ export function useShellIntegration({
   setSelectedTranscriptSessionId,
   pageId,
   onResumedTab,
+  notify,
+  readLiveSessions,
 }: UseShellIntegrationParams): UseShellIntegrationResult {
   // Shell integration: structured command history per tab
   const [commandHistories, setCommandHistories] = useState<Record<string, CommandHistoryEntry[]>>(
@@ -138,41 +198,131 @@ export function useShellIntegration({
   //
   // THE one resume path (`resumeInNewTab`): `createTerminal` + the verified
   // `runVerifiedResume`, the boot restore's own pair. Every one-click Resume
-  // (transcript panel, session manager, Previous Sessions) and the "Since
-  // restart" bulk resume go through `resumeTarget`, so single and bulk resume
-  // type the same shared command and verify it the same way.
+  // (transcript panel, session manager, Previous Sessions) enters through the
+  // click gate below (`gatedResume`), which reads liveness first; the "Since
+  // restart" bulk resume calls `resumeTarget`, whose pre-type liveness read
+  // refuses a live or unreadable id. Single and bulk resume type the same
+  // shared command and verify it the same way.
+  const newTabDeps = useCallback(
+    (): ResumeInNewTabDeps => ({
+      createTerminal,
+      updateTab,
+      terminalRefs: terminalRefs.current,
+      pageId,
+      onTabCreated: onResumedTab,
+      // The pre-type re-read uses the SAME oracle as the gate.
+      liveSessionIds: readLiveSessions
+        ? async () => {
+            const rows = await readLiveSessions();
+            return rows === null ? null : liveSessionIdSet(rows);
+          }
+        : undefined,
+    }),
+    [createTerminal, updateTab, terminalRefs, pageId, onResumedTab, readLiveSessions],
+  );
+
   const resumeTarget = useCallback(
     (target: ResumeTarget, spawnSource?: ResourceGuardSource): Promise<ResumeAttempt> =>
-      resumeInNewTab(
+      resumeInNewTab(newTabDeps(), target, spawnSource),
+    [newTabDeps],
+  );
+
+  /**
+   * Start a resume the gate cleared or the operator chose: a plain `--resume`
+   * (re-checked for liveness right before typing unless the operator chose
+   * "Resume anyway"), or a fork into a new conversation.
+   */
+  const startResume = useCallback(
+    (target: ResumeTarget, mode: StartResumeMode): Promise<ResumeAttempt> =>
+      mode.fork
+        ? forkInNewTab(
+            newTabDeps(),
+            target,
+            mode.forkTitle ?? forkTabTitle(null, target.claudeSessionId),
+          )
+        : resumeInNewTab(newTabDeps(), target, undefined, { allowLive: mode.allowLive }),
+    [newTabDeps],
+  );
+
+  // ── The resume-live dialog ───────────────────────────────────────────────
+  //
+  // One open prompt at a time. A newer prompt cancels the older one rather
+  // than leave its caller awaiting forever.
+  const [resumeGatePrompt, setResumeGatePrompt] = useState<ResumeGatePrompt | null>(null);
+  const gateResolverRef = useRef<((choice: ResumeGateChoice) => void) | null>(null);
+  const askResumeGate = useCallback(
+    (prompt: ResumeGatePrompt): Promise<ResumeGateChoice> =>
+      new Promise<ResumeGateChoice>((resolve) => {
+        gateResolverRef.current?.("cancel");
+        gateResolverRef.current = resolve;
+        setResumeGatePrompt(prompt);
+      }),
+    [],
+  );
+  const answerResumeGate = useCallback((choice: ResumeGateChoice) => {
+    const resolve = gateResolverRef.current;
+    gateResolverRef.current = null;
+    setResumeGatePrompt(null);
+    resolve?.(choice);
+  }, []);
+
+  const gatedResume = useCallback(
+    (
+      target: ResumeTarget,
+      opts: ClickResumeOptions = {},
+      beforeStart?: () => void,
+    ): Promise<ResumeOutcome> => {
+      // A non-interactive (bulk) caller reports failures in its own summary.
+      const say = opts.interactive === false ? undefined : notify;
+      return runClickResume(
         {
-          createTerminal,
-          updateTab,
-          terminalRefs: terminalRefs.current,
-          pageId,
-          onTabCreated: onResumedTab,
+          readLive: readLiveSessions ?? fetchLiveClaudeSessions,
+          start: (t, mode) => {
+            beforeStart?.();
+            return startResume(t, mode);
+          },
+          ask: askResumeGate,
+          onFailed: (attempt, t) => {
+            const notice = resumeFailureNotice(attempt, t.displayName);
+            if (notice) say?.(notice, "error");
+          },
+          onError: (err, t) => say?.(resumeThrownNotice(err, t.displayName), "error"),
         },
         target,
-        spawnSource,
-      ),
-    [createTerminal, updateTab, terminalRefs, pageId, onResumedTab],
+        opts,
+      );
+    },
+    [notify, readLiveSessions, startResume, askResumeGate],
+  );
+
+  const resumeClick = useCallback(
+    (target: ResumeTarget, opts?: ClickResumeOptions): Promise<ResumeOutcome> =>
+      gatedResume(target, opts),
+    [gatedResume],
   );
 
   const handleResumeSession = useCallback(
-    async (session: TranscriptSession) => {
-      // Close the transcript panel so the new terminal is visible.
-      setRightPanelMode(null);
-      setSelectedTranscriptSessionId(null);
-      // The transcript was found under `config_dir`, so that IS the account.
-      await resumeTarget({
-        claudeSessionId: session.session_id,
-        // The real `--resume` name (`/rename` / ai-title), not the first-message
-        // preview in `display_name`.
-        displayName: session.resume_name?.trim() || `claude ${session.session_id.slice(0, 8)}`,
-        workingDir: session.project_path,
-        configDir: session.config_dir || undefined,
-      });
-    },
-    [resumeTarget, setRightPanelMode, setSelectedTranscriptSessionId],
+    (session: TranscriptSession, opts: ResumeSessionOptions = {}): Promise<ResumeOutcome> =>
+      gatedResume(
+        {
+          claudeSessionId: session.session_id,
+          // The real `--resume` name (`/rename` / ai-title), not the
+          // first-message preview in `display_name`.
+          displayName: session.resume_name?.trim() || `claude ${session.session_id.slice(0, 8)}`,
+          workingDir: session.project_path,
+          // The transcript was found under `config_dir`, so that IS the account.
+          configDir: session.config_dir || undefined,
+        },
+        { interactive: opts.interactive, conversationName: session.resume_name },
+        () => {
+          // Close the transcript panel so the new terminal is visible — only
+          // once a tab is actually being opened, so a cancelled dialog leaves
+          // the panel the operator was reading.
+          setRightPanelMode(null);
+          setSelectedTranscriptSessionId(null);
+        },
+      ),
+    [gatedResume, setRightPanelMode, setSelectedTranscriptSessionId],
   );
 
   // ── Auto-naming from first input ──────────────────────────────────────────
@@ -192,7 +342,11 @@ export function useShellIntegration({
     commandHistories,
     handleShellIntegration,
     handleResumeSession,
+    resumeClick,
     resumeTarget,
+    resumeGatePrompt,
+    askResumeGate,
+    answerResumeGate,
     handleFirstInput,
   };
 }

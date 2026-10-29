@@ -70,7 +70,7 @@ describe("useSessionManager — live tabs with no transcript", () => {
         sessionsLoading: false,
         desktopNotify: false,
         onRefreshSessions: () => {},
-        onResumeSession: () => {},
+        onResumeSession: async () => "resumed" as const,
         onSelectSession,
         onFocusSessionTab,
       });
@@ -108,7 +108,7 @@ describe("useSessionManager — live tabs with no transcript", () => {
         sessionsLoading: false,
         desktopNotify: false,
         onRefreshSessions: () => {},
-        onResumeSession: () => {},
+        onResumeSession: async () => "resumed" as const,
         onSelectSession: () => {},
         onFocusSessionTab: () => {},
       });
@@ -135,7 +135,7 @@ describe("useSessionManager — closing a session from its row", () => {
         sessionsLoading: false,
         desktopNotify: false,
         onRefreshSessions: () => {},
-        onResumeSession: () => {},
+        onResumeSession: async () => "resumed" as const,
         onSelectSession: () => {},
         onFocusSessionTab: () => {},
         onCloseSessionTab,
