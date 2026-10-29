@@ -3859,6 +3859,9 @@ pub mod emergency_quit {
         std::thread::spawn(move || {
             std::thread::sleep(hard_deadline);
             warn!(
+                marker = %crate::session::shutdown_marker::describe_on_disk(
+                    &crate::session::shutdown_marker::marker_path()
+                ),
                 "Force-close watchdog: teardown did not finish within {}s — exiting process",
                 hard_deadline.as_secs()
             );
@@ -4047,7 +4050,10 @@ pub mod emergency_quit {
         // Stamp the marker so the next boot classifies the restart as quiet,
         // and retract the out-of-process port advertisement (plan 2026-07-17
         // §4) so the runner stops advertising a port it is releasing. Both are
-        // idempotent backstops for `drain()`'s own stamping/retraction.
+        // idempotent backstops for `drain()`'s own stamping/retraction. The
+        // stamp says the shutdown STARTED, not that it finished:
+        // `teardown_complete` stays false until `close_all` below reports a
+        // teardown with no kill-only fallback.
         let marker_path = crate::session::shutdown_marker::marker_path();
         crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
         qontinui_runner_lib::runner_breadcrumb::remove_published();
@@ -4069,9 +4075,17 @@ pub mod emergency_quit {
         // i.e. ≈4s each and `O(terminals)` unbounded without the cap. Past the
         // deadline the remaining sessions get a kill-only teardown: the child
         // process tree still dies, the joins and the shim-dir sweep are
-        // skipped.
+        // skipped. Only a teardown with no such fallback stamps the marker
+        // `teardown_complete` — the one bit that lets the next boot trust the
+        // marker as the open rows' anchor (plan
+        // `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+        // Phase 3).
         if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
-            tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
+            if tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET)) {
+                crate::session::shutdown_marker::mark_teardown_complete(&marker_path);
+            } else {
+                warn!("Shutdown: terminal teardown degraded — marker left teardown_complete=false");
+            }
         }
 
         kill_orphaned_ai_processes(app_state, budget);
