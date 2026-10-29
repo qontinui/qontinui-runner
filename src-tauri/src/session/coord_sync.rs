@@ -556,11 +556,24 @@ impl CoordSync {
     /// `UpdateSessionRequest`, so **no coord-side change is required**.
     ///
     /// Maps the response to a coarse [`ResumeProbe`]:
-    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated)
+    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated), carrying
+    ///   the `tenant_id` of coord's answer — see below
     /// - 404 / 410 → [`ResumeProbe::NotFound`] (GC'd or never existed)
+    /// - 401 / 403 → [`ResumeProbe::Refused`] (coord answered and refused the
+    ///   credential — not an outage; the caller still resumes, but must not
+    ///   claim to have observed anything about the row)
     /// - everything else (network, timeout, 5xx, other 4xx) →
     ///   [`ResumeProbe::Unreachable`] (treat as transient; caller resumes
     ///   optimistically and the drain loop retries).
+    ///
+    /// Coord's non-close `PATCH /sessions/:id` matches by id alone
+    /// (`update_session_with_close_outcome` scopes only a close or a
+    /// harness-id bind to the caller's device + tenant), so the 2xx STATUS says
+    /// nothing about the row's tenant. Its BODY does: coord answers with the
+    /// updated row (`serde_json::to_value(SessionRow)`), whose `tenant_id` no
+    /// PATCH ever sets — the tenant the row was created under. That is parsed
+    /// into `Found(Some(t))`; a missing or unparseable field (or body) is
+    /// `Found(None)` and never fails the resume.
     ///
     /// Called by [`SessionRegistry::resume_external`].
     ///
@@ -593,9 +606,25 @@ impl CoordSync {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    ResumeProbe::Found
+                    let body = resp.text().await.unwrap_or_default();
+                    let tenant = resume_answer_tenant(&body, session_id);
+                    if tenant.is_none() {
+                        tracing::debug!(
+                            session = %session_id,
+                            "coord_sync: resume probe 2xx carried no parseable tenant_id — \
+                             the row's tenant stays unobserved"
+                        );
+                    }
+                    ResumeProbe::Found(tenant)
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
                     ResumeProbe::NotFound
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    tracing::warn!(
+                        session = %session_id,
+                        %status,
+                        "coord_sync: resume probe REFUSED by coord — the credential, not the transport"
+                    );
+                    ResumeProbe::Refused(status.as_u16())
                 } else {
                     tracing::debug!(
                         session = %session_id,
@@ -860,13 +889,29 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
 // Resume probe outcome (R2)
 // ---------------------------------------------------------------------------
 
+/// The `tenant_id` of coord's 2xx answer to the resume probe (the updated
+/// `SessionRow`). `None` for an empty / non-JSON body, an absent field, a
+/// value that is not a UUID, or an answer whose `id` is not the probed row —
+/// coord's self-registration arm answers with a server-minted row carrying
+/// the CALLER's tenant, which is not this row's. Never an error. Pure.
+fn resume_answer_tenant(body: &str, session_id: Uuid) -> Option<Uuid> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let answered = Uuid::parse_str(v.get("id")?.as_str()?.trim()).ok()?;
+    if answered != session_id {
+        return None;
+    }
+    Uuid::parse_str(v.get("tenant_id")?.as_str()?.trim()).ok()
+}
+
 /// Coarse outcome of [`CoordSync::probe_resume`], driving
 /// [`super::SessionRegistry::resume_external`]'s PATCH-vs-fresh-POST
 /// decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeProbe {
-    /// The coord row exists and was re-activated by the probe PATCH.
-    Found,
+    /// The coord row exists and was re-activated by the probe PATCH. Carries
+    /// the `tenant_id` coord's answer (the row) named — `None` when the body
+    /// carried no parseable one.
+    Found(Option<Uuid>),
     /// Coord returned 404/410 — the row was GC'd or never existed. The
     /// caller registers a fresh session.
     NotFound,
@@ -874,6 +919,10 @@ pub enum ResumeProbe {
     /// resumes optimistically under the persisted id; the drain loop
     /// retries.
     Unreachable,
+    /// Coord ANSWERED 401 / 403 (the status carried): it refused the probe's
+    /// credential. Distinct from [`Self::Unreachable`] so a refusal is never
+    /// reported as an outage; the caller's resume behaviour is the same.
+    Refused(u16),
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,10 +1878,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             //
             // `session_status = "finished"` is terminal on coord's work axis and
             // gates prompting; no coord production writer moves a row off it.
+            //
+            // The body also carries the mark's own time as `last_progress_at`
+            // (see `finished_body`), so coord stamps the finish at the instant
+            // the runner DECLARED it, not whenever this outbox row drained.
             let url = format!("{base}/sessions/{}", rec.session_id);
-            let body = json!({
-                "progress": { "session_status": "finished" },
-            });
+            let body = finished_body(&rec.payload);
             crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
@@ -2886,6 +2937,41 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     JsonValue::Object(body)
 }
 
+/// The `PATCH /sessions/:id` body for a `finished` outbox row.
+///
+/// `{progress:{session_status:"finished", last_progress_at:<RFC 3339>}}`,
+/// where `last_progress_at` is the payload's `finished_at` (unix millis — the
+/// runner's own mark, `SessionLifecycleStore::set_finished`) rendered with
+/// millisecond precision in UTC. coord's `ProgressUpdate::last_progress_at` is
+/// a `DateTime<Utc>`, and coord uses an explicit one as the write instant of
+/// the whole report, so WHENEVER this report moves coord's transition clock
+/// (`state_started_at`, served back as `since`) it moves it to this instant
+/// (plan
+/// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
+/// Phase 3 (b)). That is on a real status change on any coord, and on every
+/// finish — finished → finished included — only on a coord carrying that
+/// plan's Phase 2. Without it a late drain post-dates the finish, which is the
+/// unsafe direction for a reader deciding whether a prompt came after it.
+///
+/// A payload with no usable `finished_at` (a row queued by an older build, a
+/// `null`, or a value chrono cannot represent) omits the field, and coord
+/// stamps `now()` exactly as before. Pure.
+fn finished_body(payload: &JsonValue) -> JsonValue {
+    let mut progress = serde_json::Map::new();
+    progress.insert("session_status".into(), json!("finished"));
+    if let Some(at) = payload
+        .get("finished_at")
+        .and_then(JsonValue::as_i64)
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+    {
+        progress.insert(
+            "last_progress_at".into(),
+            json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        );
+    }
+    json!({ "progress": JsonValue::Object(progress) })
+}
+
 /// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
 /// outbox payload. The registrar records the work-progress fields flat in the
 /// payload (`session_status`, optional `last_progress_at` / `progress_detail`);
@@ -3793,12 +3879,19 @@ mod tests {
             body.contains(".patch(&url)"),
             "the finished write must be a PATCH, matching the progress arm: {body}"
         );
+        // The body is built by `finished_body` (which also carries the mark's
+        // time — pinned by `finished_body_carries_the_marks_own_time_as_last_progress_at`).
         assert!(
-            body.contains("\"session_status\": \"finished\""),
-            "the body must set coord's WORK axis to finished: {body}"
+            body.contains("finished_body(&rec.payload)"),
+            "the finished arm must send the finished body: {body}"
+        );
+        assert_eq!(
+            finished_body(&json!({}))["progress"]["session_status"],
+            "finished",
+            "the body must set coord's WORK axis to finished"
         );
     }
-    use crate::session::{Intent, SessionKind, SessionRegistry, SessionTransports};
+    use crate::session::{Intent, RowTenant, SessionKind, SessionRegistry, SessionTransports};
     use axum::{
         extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
         http::StatusCode as AxumStatus,
@@ -3936,6 +4029,13 @@ mod tests {
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
+        /// When set (and `patch_returns_404` is not), every PATCH answers
+        /// this status instead of 200 — drives the resume-probe refusal arm.
+        patch_status: Option<u16>,
+        /// The `tenant_id` field of a 2xx PATCH answer: `None` omits it (the
+        /// field-absent arm), `Some(v)` sends `v` verbatim (a non-UUID string
+        /// drives the unparseable arm).
+        patch_tenant: Option<serde_json::Value>,
         /// When set, `POST /sessions/:id/events` answers this status instead
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
@@ -4100,7 +4200,18 @@ mod tests {
                             )
                                 .into_response();
                         }
-                        (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                        if let Some(code) = g.patch_status {
+                            return (
+                                AxumStatus::from_u16(code).unwrap(),
+                                Json(json!({"error": "refused"})),
+                            )
+                                .into_response();
+                        }
+                        let mut answer = json!({"id": id});
+                        if let Some(t) = g.patch_tenant.clone() {
+                            answer["tenant_id"] = t;
+                        }
+                        (AxumStatus::OK, Json(answer)).into_response()
                     },
                 )
                 .delete(
@@ -5207,7 +5318,10 @@ mod tests {
             assert_eq!(g.patches.len(), 3, "{:?}", g.patches);
             assert_eq!(
                 g.patches[2].1,
-                json!({ "progress": { "session_status": "finished" } }),
+                json!({ "progress": {
+                    "session_status": "finished",
+                    "last_progress_at": "1970-01-01T00:00:00.001Z",
+                } }),
                 "the finished row was DELIVERED on retry"
             );
         }
@@ -5516,7 +5630,93 @@ mod tests {
         assert_eq!(g.patches[0].0, s);
         assert_eq!(
             g.patches[0].1,
-            json!({ "progress": { "session_status": "finished" } })
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "1970-01-01T00:00:00.001Z",
+            } })
+        );
+    }
+
+    /// End to end (review round 1): a RESTAMPED mark drains with the NEW time.
+    /// The lifecycle store's restamp → its finish observer → the registrar's
+    /// `finished` outbox row → `push_record` → the PATCH coord receives, whose
+    /// `last_progress_at` is the SECOND finish's stamp, not the first's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restamped_finish_drains_with_the_new_last_progress_at() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let coord_row = Uuid::new_v4();
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_row));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |r| reg.forward_finish_change(r));
+        }
+        store.record_open(test_open_record("s"));
+
+        let first = store
+            .set_finished("s", true, Some("first".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        store.mark_finish_synced("s", Some(first));
+        // Revived, then finished again: a reason-carrying re-finish restamps.
+        let again = store
+            .set_finished("s", true, Some("again".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert_ne!(again, first);
+
+        let rows: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the first finish and the re-sent one: {rows:?}"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.payload["finished_at"], again,
+            "the re-sent row carries the NEW stamp"
+        );
+        let outcome = push_record(&coord.inner, last).await;
+        assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
+
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(again)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let g = rec.lock().await;
+        let (id, body) = g.patches.last().expect("the re-sent finish was PATCHed");
+        assert_eq!(
+            *id, coord_row,
+            "addressed to the session's coord row by PATH"
+        );
+        assert_eq!(body["progress"]["session_status"], "finished");
+        assert_eq!(
+            body["progress"]["last_progress_at"],
+            expected.as_str(),
+            "coord is told the SECOND finish's time: {body}"
         );
     }
 
@@ -6882,12 +7082,21 @@ mod tests {
         })
         .await;
         let g = rec.lock().await;
-        assert!(
-            g.patches
-                .iter()
-                .any(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished"),
-            "the marker must reach coord as PATCH /sessions/:id: {:?}",
-            g.patches
+        let patch = g
+            .patches
+            .iter()
+            .find(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the marker must reach coord as PATCH /sessions/:id: {:?}",
+                    g.patches
+                )
+            });
+        assert_eq!(
+            patch.1["progress"]["last_progress_at"], "1970-01-01T00:00:00.042Z",
+            "the PATCH carries the mark's own time, so coord dates the finish at \
+             the declaration rather than at the drain: {:?}",
+            patch.1
         );
     }
 
@@ -7186,6 +7395,45 @@ mod tests {
         assert!(body.get("intent_updates").is_none());
     }
 
+    /// A `finished` row's PATCH carries the mark's own `finished_at` as an
+    /// RFC 3339 `last_progress_at`, and omits it when the payload has no usable
+    /// time.
+    #[test]
+    fn finished_body_carries_the_marks_own_time_as_last_progress_at() {
+        // 2026-09-13T10:00:00.123Z — the mark's `finished_at`, unix millis.
+        let body = finished_body(&json!({
+            "id": Uuid::new_v4(),
+            "claude_session_id": "csid",
+            "finished_at": 1_789_293_600_123_i64,
+        }));
+        assert_eq!(
+            body,
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "2026-09-13T10:00:00.123Z",
+            } }),
+            "coord deserializes `last_progress_at` as a DateTime<Utc> and uses it \
+             as the write instant, so `since` is the declared finish time"
+        );
+        // Only the two progress fields: routing keys are not forwarded.
+        assert!(body["progress"].get("claude_session_id").is_none());
+        assert!(body["progress"].get("finished_at").is_none());
+
+        // No usable time (an older row, a null, a non-integer): omitted, so
+        // coord stamps now() exactly as before.
+        for payload in [
+            json!({ "claude_session_id": "csid" }),
+            json!({ "claude_session_id": "csid", "finished_at": null }),
+            json!({ "claude_session_id": "csid", "finished_at": "yesterday" }),
+        ] {
+            assert_eq!(
+                finished_body(&payload),
+                json!({ "progress": { "session_status": "finished" } }),
+                "{payload}"
+            );
+        }
+    }
+
     /// `progress` body nests the flat work-progress fields under `progress`
     /// (coord's `UpdateSessionRequest` shape) and drops unknown keys. A minimal
     /// payload yields a `{progress:{session_status}}` body — coord stamps
@@ -7300,7 +7548,8 @@ mod tests {
         // `None` = the default binding, which is what an unpaired test box
         // holds; the tenant argument is the caller's to supply now.
         let probe = coord.probe_resume(id, None).await;
-        assert_eq!(probe, ResumeProbe::Found);
+        // The fake answers `{"id": …}` with no tenant_id: Found, unobserved.
+        assert_eq!(probe, ResumeProbe::Found(None));
         let g = rec.lock().await;
         assert_eq!(g.patches.len(), 1, "probe issues exactly one PATCH");
         let (patched_id, body) = &g.patches[0];
@@ -7344,6 +7593,193 @@ mod tests {
         );
         let probe = coord.probe_resume(Uuid::new_v4(), None).await;
         assert_eq!(probe, ResumeProbe::Unreachable);
+    }
+
+    /// `probe_resume` maps a 401 / 403 to `Refused` — a distinct outcome from
+    /// `Unreachable` — and `resume_external` still resumes under the persisted
+    /// id, but marks the record tenant-UNOBSERVED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_401_403_is_refused_not_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
+        for code in [401u16, 403] {
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_status = Some(code);
+            let coord = CoordSync::new_for_test(
+                outbox,
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Refused(code)
+            );
+            let registry = build_registry(coord.clone());
+            let persisted = Uuid::new_v4();
+            let resumed = registry
+                .resume_external(persisted, make_test_intent())
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted, "a refusal does not change resumption");
+            assert_eq!(
+                registry.row_tenant_of(persisted),
+                Some(RowTenant::Unobserved)
+            );
+        }
+    }
+
+    /// `probe_resume` reads the row's `tenant_id` from coord's 2xx answer, and
+    /// tolerates its absence or an unparseable value (Found, no tenant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_parses_the_row_tenant_from_the_2xx_answer() {
+        let _amb = crate::test_env::isolated_ambient();
+        let row_tenant = Uuid::new_v4();
+        let cases = [
+            (Some(json!(row_tenant.to_string())), Some(row_tenant)),
+            (None, None),
+            (Some(json!("not-a-uuid")), None),
+            (Some(json!(42)), None),
+            (Some(serde_json::Value::Null), None),
+        ];
+        for (field, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_tenant = field.clone();
+            let coord = CoordSync::new_for_test(
+                build_outbox(dir.path()),
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Found(expected),
+                "tenant_id field {field:?}"
+            );
+        }
+        let probed = Uuid::new_v4();
+        assert_eq!(resume_answer_tenant("", probed), None);
+        assert_eq!(resume_answer_tenant("<html>", probed), None);
+        assert_eq!(
+            resume_answer_tenant(
+                &format!(r#"{{"id":"{probed}","tenant_id":" {row_tenant} "}}"#),
+                probed
+            ),
+            Some(row_tenant)
+        );
+        // An answer about another row (coord's self-registration arm) or one
+        // naming no row is not an observation of THIS row's tenant.
+        assert_eq!(
+            resume_answer_tenant(
+                &format!(
+                    r#"{{"id":"{}","tenant_id":"{row_tenant}"}}"#,
+                    Uuid::new_v4()
+                ),
+                probed
+            ),
+            None
+        );
+        assert_eq!(
+            resume_answer_tenant(&format!(r#"{{"tenant_id":"{row_tenant}"}}"#), probed),
+            None
+        );
+    }
+
+    /// A resumed record's row tenant is coord's answer, and the stamp is NOT
+    /// re-written from it: a row created under A resumed while B resolves keeps
+    /// the stamp B (the data plane's credential) and records Observed(A).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_records_the_row_tenant_coord_answered() {
+        let _amb = crate::test_env::isolated_ambient();
+        let created_under = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_tenant = Some(json!(created_under.to_string()));
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord);
+        let persisted = Uuid::new_v4();
+        let resumed = registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(resumed, persisted);
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Observed(created_under))
+        );
+        // The stamp is the current resolution, untouched by the row's tenant.
+        assert_ne!(
+            registry.tenant_scope_of(persisted),
+            crate::auth::TenantScope::Owned(created_under)
+        );
+    }
+
+    /// A FRESH registration AUTHORS its row's tenant; a resume whose 2xx answer
+    /// names no tenant, and an optimistic one, leave it unobserved; the 404
+    /// fallback's fresh row is authored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_marks_the_row_tenant_authored_only_for_a_fresh_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        // Found.
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let persisted = Uuid::new_v4();
+        registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Unobserved)
+        );
+        // A fresh register on the same registry: authored.
+        let fresh = registry.register_external(make_test_intent()).unwrap();
+        assert_eq!(registry.row_tenant_of(fresh), Some(RowTenant::Authored));
+        // 404 fallback: the NEW row is fresh, so observed.
+        rec.lock().await.patch_returns_404 = true;
+        let gone = Uuid::new_v4();
+        let replacement = registry
+            .resume_external(gone, make_test_intent())
+            .await
+            .unwrap();
+        assert_ne!(replacement, gone);
+        assert_eq!(
+            registry.row_tenant_of(replacement),
+            Some(RowTenant::Authored)
+        );
+        assert_eq!(registry.row_tenant_of(gone), None);
+        // Unreachable: optimistic, unobserved.
+        let dir2 = tempfile::tempdir().unwrap();
+        let down = CoordSync::new_for_test(
+            build_outbox(dir2.path()),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry2 = build_registry(down);
+        let optimistic = Uuid::new_v4();
+        registry2
+            .resume_external(optimistic, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry2.row_tenant_of(optimistic),
+            Some(RowTenant::Unobserved)
+        );
     }
 
     /// `resume_external` on an existing row REUSES the persisted id (no new

@@ -86,15 +86,6 @@ export type UIBridgeRequestType =
   // Workflow execution
   | "run_workflow"
   | "get_workflow_status"
-  // Media discovery
-  | "find_media"
-  | "media_audit"
-  | "capture_media_snapshot"
-  | "analyze_media"
-  // Element image capture (DOM-based, no screen capture)
-  | "capture_element_images"
-  // Element image metadata (reads <img> src attributes from DOM)
-  | "get_element_images"
   // Browser events & timeline
   | "get_browser_events"
   | "get_timeline"
@@ -172,12 +163,8 @@ export type UIBridgeRequestType =
   | "design_evaluate_baseline"
   | "design_evaluate_contexts"
   | "design_evaluate_diff"
-  // Media compare
-  | "media_compare"
   // Pixel-accurate visual regression diff
   | "image_diff"
-  // Single-element screenshot with DOM fallback strategies
-  | "capture_single_element"
   // Annotations import
   | "annotations_import"
   // Intents NL
@@ -445,16 +432,7 @@ export type AISearchEventTypes =
 
 export type WorkflowEventTypes = "get_workflows" | "run_workflow" | "get_workflow_status";
 
-export type MediaEventTypes =
-  | "find_media"
-  | "media_audit"
-  | "capture_media_snapshot"
-  | "analyze_media"
-  | "capture_element_images"
-  | "get_element_images"
-  | "capture_single_element"
-  | "image_diff"
-  | "media_compare";
+export type MediaEventTypes = "image_diff";
 
 export type AnnotationEventTypes =
   | "annotations_list"

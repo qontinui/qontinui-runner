@@ -5,7 +5,7 @@
 //! ## Why not `close`
 //!
 //! Every close in the runner ends in `TerminalSession::close_with_deadline`,
-//! which kills the pane's process (`taskkill /F /T` on Windows, a `SIGTERM` to
+//! which kills the pane's process (an in-process tree kill on Windows, a `SIGTERM` to
 //! the single shell pid on Unix) and releases the pty — a kill of a live agent
 //! that can drop its transcript tail. Wind-down must never do that to a live
 //! `claude`.

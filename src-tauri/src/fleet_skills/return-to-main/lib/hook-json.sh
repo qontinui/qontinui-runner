@@ -80,6 +80,31 @@
 # a box whose only Python is a hanging alias does not pay the probe bound on
 # every hook call. A failed cache write never fails the source.
 #
+# ── One verdict PER PATH (plan 2026-10-19-hook-spawn-rate-and-orphaned-processes,
+#    Phase 3) ─────────────────────────────────────────────────────────────────
+# Until then the file held ONE verdict per (require, $PYTHON) and a hit needed
+# the stored PATH to equal the caller's. Every concurrent session on a box has
+# its own PATH (a runner session's `/tmp/qontinui-identity-<hash>` entry, a
+# nested shell's re-prepended `/mingw64/bin:/usr/bin`, a scratchpad tools dir),
+# so sessions overwrote each other's verdict and nearly every hook call missed
+# and re-probed under `timeout` -- measured 2026-10-19 on the operator box: every hook
+# that sourced this file in one Bash tool call paid timeout.exe x2, python.exe
+# and mv.exe. The file (`hook-py3-verdict2.<h>`, a new name so the hp3v1
+# generation still running elsewhere on the box keeps its own file) now holds
+# up to $_HP3_SLOTS records, one per PATH, most recent first, so N concurrent
+# PATHs cost N probes per TTL instead of one per alternation. Keyed by the PATH STRING, compared exactly -- not a hash of it
+# (a bash djb2 over a ~1.7 KB PATH measured 25 ms per call, on every hook) and
+# not a PATH with the volatile identity entry removed (the measured PATHs of
+# concurrent sessions differ in a dozen other entries too, so that comparison
+# still missed on every alternation).
+#
+# The litter: a writer killed between writing its temp file and renaming it
+# (the harness `taskkill`s a hook that blows its timeout) leaves
+# `hook-py3-verdict.<h>.<pid>` behind -- 1,057 of them on the operator box
+# 2026-10-19. No in-process cleanup can catch a kill, so the WRITE path sweeps
+# temp files older than an hour (one `find`, at most once per shell, and never
+# on a cache hit).
+#
 # ── Contract ─────────────────────────────────────────────────────────────────
 #   hook_shim_python3                   return 0 iff a working Python 3 is
 #                                       callable as `python3` (real or shimmed)
@@ -117,12 +142,27 @@
 #                           Several hooks that source this run under a 5-10 s
 #                           harness timeout.
 #   HOOK_PY3_CACHE_DIR, HOOK_PY3_NO_CACHE=1
+#   HOOK_PY3_CACHE_ONLY=1   never probe: answer from the fast path or the cache,
+#                           else return 1 at once. For a caller whose time is
+#                           already spent (the hook dispatcher holding a deny).
 #   HOOK_PY3_CACHE_TTL      s, default 86400
 #   HOOK_PY3_NEG_TTL        s, default 3600: a DEFINITE "no working Python"
 #   HOOK_PY3_TIMEOUT_TTL    s, default 300: a verdict that rests on a probe that
 #                           TIMED OUT (or was killed mid-probe). A slow cold start
 #                           on a loaded box is not proof that no Python exists,
 #                           so it is written off for minutes, not an hour.
+#
+# ── The jq launcher shim (same plan, Phase 3) ────────────────────────────────
+#   hook_shim_jq            run at source time, like hook_shim_python3. When the
+#                           `jq` on PATH is a scoop launcher (`shims/jq.exe` +
+#                           `jq.shim`), it defines `jq` to run the binary the
+#                           .shim names, so every `jq` call in a hook is one
+#                           process instead of two (the launcher, then jq). A
+#                           real jq, no jq, a shim that adds `args`, or a shim
+#                           whose target is gone is left exactly as PATH has it
+#                           -- the last of those must keep MISBEHAVING the way
+#                           git-guard.sh's section-9 tests stage, not vanish.
+#                           HOOK_JQ_EXE names what `jq` runs (empty: no jq).
 #
 # Needs bash >= 4.4 (`${x,,}`, `printf '%(%s)T'`, empty arrays under `set -u`).
 
@@ -268,34 +308,145 @@ _hp3_define() {
 }
 
 # _hp3_cache_file <require-code>: the verdict file for this (require, $PYTHON)
-# pair, in _HP3_F. A djb2 hash in bash arithmetic: builtins only.
+# pair, in _HP3_F. A djb2 hash in bash arithmetic: builtins only. The PATH is
+# deliberately NOT in the hash (see "One verdict PER PATH" above): it selects a
+# RECORD inside the file instead.
+#
+# The name is `hook-py3-verdict2.<h>`, NOT the hp3v1 file's `hook-py3-verdict.<h>`.
+# A box runs both generations side by side for as long as any checkout or
+# runner bundle predates this change (the operator box's primary checkout was 66
+# commits behind on 2026-10-19), and two generations sharing ONE file would
+# each read the other's write as a miss -- the very thrash this format exists
+# to end, rebuilt between versions. Separate names let each keep its own.
 _hp3_cache_file() {
   local s="$1|${PYTHON:-}" h=5381 i c
   for (( i = 0; i < ${#s}; i++ )); do
     printf -v c '%d' "'${s:i:1}"
     h=$(( (h * 33 + c) & 0x7fffffff ))
   done
-  _HP3_F="${HOOK_PY3_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/qontinui}/hook-py3-verdict.$h"
+  _HP3_F="${HOOK_PY3_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/qontinui}/hook-py3-verdict2.$h"
+}
+
+# ── File format hp3v2 ────────────────────────────────────────────────────────
+# Line 1 `hp3v2`; then one RECORD PER LINE, most recent first, at most
+# $_HP3_SLOTS of them:
+#   PATH <US> PYTHON <US> verdict <US> exe <US> arg <US> at <US> end
+# where <US> is the ASCII unit separator (0x1f), which no PATH, interpreter path
+# or verdict contains. A record is accepted only with all seven fields and the
+# literal `end`, so a record cut short by a writer that died mid-`printf` (the
+# in-place arm below, which has no rename) is never trusted. Read with ONE
+# `mapfile` -- a builtin, a C loop -- and matched with a prefix test, so a hit
+# costs the same few syscalls whatever the slot count. The `hp3v1` file (one
+# verdict, the pre-Phase-3 format) has a different NAME (see _hp3_cache_file)
+# and is never read here; a file under this name without the `hp3v2` header
+# reads as a miss and is rewritten.
+_HP3_SLOTS=32
+_HP3_US=$'\x1f'
+
+# _hp3_cache_load <file>: the file's records in _HP3_RECS (empty on failure);
+# 1 when the file is absent, unreadable or not hp3v2.
+_hp3_cache_load() {
+  _HP3_RECS=()
+  [ -r "$1" ] || return 1
+  local -a lines=()
+  mapfile -t lines < "$1" 2>/dev/null || return 1
+  [ "${#lines[@]}" -gt 0 ] && [ "${lines[0]%$'\r'}" = hp3v2 ] || return 1
+  _HP3_RECS=("${lines[@]:1}")
+  return 0
+}
+
+# _hp3_split <record>: its fields in _HP3_M=(PATH PYTHON verdict exe arg at end);
+# 1 unless it is well-formed (seven fields, the last the literal `end`).
+_hp3_split() {
+  local rest="$1"
+  _HP3_M=()
+  while [[ "$rest" == *"$_HP3_US"* ]]; do
+    _HP3_M+=("${rest%%"$_HP3_US"*}"); rest="${rest#*"$_HP3_US"}"
+  done
+  _HP3_M+=("$rest")
+  [ "${#_HP3_M[@]}" -eq 7 ] && [ "${_HP3_M[6]}" = end ]
+}
+
+# _hp3_cache_match: the record in _HP3_RECS for THIS $PATH and $PYTHON, split
+# into _HP3_M. 1 when there is none or the matching record is malformed.
+_hp3_cache_match() {
+  local rec
+  for rec in "${_HP3_RECS[@]}"; do
+    [[ "$rec" == "$PATH$_HP3_US"* ]] || continue
+    _hp3_split "$rec" && [ "${_HP3_M[1]}" = "${PYTHON:-}" ] && return 0
+    _HP3_M=()
+    return 1
+  done
+  _HP3_M=()
+  return 1
+}
+
+# _hp3_sweep <dir>: remove temp files older than an hour that killed writers
+# left behind (see "One verdict PER PATH"). WRITE PATH ONLY, at most once per
+# shell, bounded to <dir> itself, and only the temp-file shape of BOTH
+# generations, `hook-py3-verdict.<h>.<pid>` and `hook-py3-verdict2.<h>.<pid>`
+# -- the verdict files themselves, `hook-py3-verdict.<h>` and
+# `hook-py3-verdict2.<h>`, have one dot after the prefix and do not match. One
+# `find` (not Windows' find.exe, a different program); a box without one keeps
+# its litter. Never fails the caller.
+_hp3_sweep() {
+  [ -z "${_HP3_SWEPT:-}" ] || return 0
+  _HP3_SWEPT=1
+  _hp3_lookup find '*/windows/*'
+  [ -n "$_HP3_W" ] || return 0
+  "$_HP3_W" "$1" -maxdepth 1 -type f -name 'hook-py3-verdict*.*.[0-9]*' -mmin +60 -delete \
+    </dev/null >/dev/null 2>&1 || :
+  return 0
 }
 
 # _hp3_cache_write <file> <verdict> <exe> <arg> <now>: never fails the caller.
+# Puts THIS PATH's record first and keeps every other PATH's well-formed record
+# that is younger than the longest TTL, up to $_HP3_SLOTS.
+#
+# A kept record whose interpreter is NEWER than the file being replaced is
+# dropped, and that is what keeps the reader's `exe -nt file` test meaning what
+# it meant with one record per file ("not modified since the verdict was
+# written"): every rewrite moves the file's mtime forward, so a modification
+# between two writes is caught by the next writer, and one after the last write
+# by the reader.
+#
 # Written beside the target and renamed over it where `mv` exists, so a reader
 # never sees half a file. Without `mv` it is written in place; a reader rejects
-# any file that lacks its closing `end` line either way.
+# a record that lacks its closing `end` field either way. Two writers racing can
+# drop each other's newest record; the loser's PATH then misses once more and
+# writes it back.
 _hp3_cache_write() {
-  local f="$1" t="$1.$$"
+  # BASHPID, not $$: the hook dispatcher runs block guards concurrently as
+  # subshells of one shell, where $$ is shared and two writers would share t.
+  local f="$1" t="$1.${BASHPID:-$$}" rec at max="$_HP3_HOOK_PY3_CACHE_TTL" n=1
+  local -a keep=()
   { [ -d "${f%/*}" ] || mkdir -p "${f%/*}"; } 2>/dev/null || return 0
+  [ "$_HP3_HOOK_PY3_NEG_TTL" -gt "$max" ] && max="$_HP3_HOOK_PY3_NEG_TTL"
+  [ "$_HP3_HOOK_PY3_TIMEOUT_TTL" -gt "$max" ] && max="$_HP3_HOOK_PY3_TIMEOUT_TTL"
+  _hp3_cache_load "$f" || _HP3_RECS=()
+  for rec in "${_HP3_RECS[@]}"; do
+    [ "$n" -lt "$_HP3_SLOTS" ] || break
+    _hp3_split "$rec" || continue
+    [ "${_HP3_M[0]}" = "$PATH" ] && continue
+    at="${_HP3_M[5]}"
+    case "$at" in ''|*[!0-9]*) continue ;; esac
+    [ $(( $5 - at )) -lt "$max" ] || continue
+    [ -n "${_HP3_M[3]}" ] && [ "${_HP3_M[3]}" -nt "$f" ] && continue
+    keep+=("$rec"); n=$(( n + 1 ))
+  done
+  rec="$PATH$_HP3_US${PYTHON:-}$_HP3_US$2$_HP3_US$3$_HP3_US$4$_HP3_US$5${_HP3_US}end"
   if command -v mv >/dev/null 2>&1; then
-    { { printf '%s\n' hp3v1 "$PATH" "${PYTHON:-}" "$2" "$3" "$4" "$5" end > "$t" &&
+    { { printf '%s\n' hp3v2 "$rec" "${keep[@]}" > "$t" &&
         mv -f "$t" "$f"; } || rm -f "$t"; } 2>/dev/null
   else
-    { printf '%s\n' hp3v1 "$PATH" "${PYTHON:-}" "$2" "$3" "$4" "$5" end > "$f"; } 2>/dev/null
+    { printf '%s\n' hp3v2 "$rec" "${keep[@]}" > "$f"; } 2>/dev/null
   fi
+  _hp3_sweep "${f%/*}"
   return 0
 }
 
 hook_shim_python3() {
-  local req="" r cand now v p py verdict exe arg kind at end f="" prc
+  local req="" r cand now verdict exe arg kind at f="" prc
   local real_timed_out=0 alias_timed_out=0 provisional=0 force=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -339,11 +490,8 @@ hook_shim_python3() {
     _hp3_cache_file "$req"; f="$_HP3_F"
     # --force never TRUSTS a cached verdict: it exists because a verdict was
     # just measured wrong. It still WRITES the fresh one.
-    if [ "$force" = 0 ] && [ -r "$f" ] &&
-       { IFS= read -r v; IFS= read -r p; IFS= read -r py; IFS= read -r verdict
-         IFS= read -r exe; IFS= read -r arg; IFS= read -r at; IFS= read -r end; } < "$f" 2>/dev/null &&
-       [ "$v" = hp3v1 ] && [ "$end" = end ] && [ "$p" = "$PATH" ] &&
-       [ "$py" = "${PYTHON:-}" ]; then
+    if [ "$force" = 0 ] && _hp3_cache_load "$f" && _hp3_cache_match; then
+      verdict="${_HP3_M[2]}"; exe="${_HP3_M[3]}"; arg="${_HP3_M[4]}"; at="${_HP3_M[5]}"
       case "$at" in ''|*[!0-9]*) at=0 ;; esac
       if [ "$verdict" = OK ] && [ -x "$exe" ] && [ ! -d "$exe" ] && [ ! "$exe" -nt "$f" ] &&
          [ $(( now - at )) -lt "$_HP3_HOOK_PY3_CACHE_TTL" ]; then
@@ -358,6 +506,9 @@ hook_shim_python3() {
       fi
     fi
   fi
+
+  # Cache-only: a miss is answered now, with no probe and no verdict recorded.
+  [ "${HOOK_PY3_CACHE_ONLY:-0}" = 1 ] && return 1
 
   if [ -n "${PYTHON:-}" ]; then
     _hp3_path "$PYTHON"
@@ -413,6 +564,74 @@ hook_shim_python3() {
   return 0
 }
 
+# ── jq: bypass a launcher shim ───────────────────────────────────────────────
+# A scoop install puts `shims/jq.exe` on PATH: a small launcher that reads
+# `shims/jq.shim` (`path = "<real jq.exe>"`, optionally `args = …`) and starts
+# the real binary as a CHILD. So every `$(jq …)` in a hook was two processes on
+# top of the subshell -- measured 2026-10-19 on the operator box, `x=$(jq -n 1)` is 6
+# processes through the shim and 5 through a function naming the target -- and
+# every one is a CreateProcess on a box that leaks a kernel Token object for
+# about half of them. Defining `jq` as a function that runs the target directly
+# removes the launcher and changes nothing else: same binary, same arguments,
+# same stdin/stdout, same exit code.
+#
+# Resolved ONCE PER PATH and memoised in the shell, NOT in a disk cache like the
+# python verdict: proving a python costs an interpreter spawn, so its verdict is
+# worth a file; this resolution is a builtin PATH walk plus one builtin `read`
+# of a ~60-byte .shim file, which is what reading a cache file would cost too.
+#
+# NOT bypassed, so PATH's `jq` runs exactly as before:
+#   - a `jq` with no `<name>.shim` beside it (a real binary, a Linux box, a
+#     test's stub -- git-guard-payload-read-bound-test.sh section 9 stages a
+#     MISBEHAVING `jq` and must keep getting it);
+#   - a .shim that carries `args`: the launcher prepends them, so running the
+#     target bare would change the call;
+#   - a .shim whose target is gone or not executable: a broken scoop install
+#     must keep presenting as the broken launcher it is (rc 1, the measured
+#     broken-shim shape git-guard.sh's re-ask exists for), not vanish.
+#
+# _hp3_unshim <path>: the launcher's target in _HP3_W; 1 if <path> is not a
+# bypassable launcher (see above). Builtins only.
+_hp3_unshim() {
+  local d="${1%/*}" b="${1##*/}" line key val="" have=0
+  b="${b%.exe}"; b="${b%.EXE}"
+  _HP3_W=""
+  [ -r "$d/$b.shim" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    key="${line%%=*}"; key="${key//[[:space:]]/}"
+    case "$key" in
+      path) val="${line#*=}"; have=1 ;;
+      args) return 1 ;;
+    esac
+  done < "$d/$b.shim"
+  [ "$have" = 1 ] || return 1
+  val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+  val="${val#\"}"; val="${val%\"}"
+  val="${val//\\//}"
+  [ -n "$val" ] && [ -x "$val" ] && [ ! -d "$val" ] || return 1
+  _HP3_W="$val"
+}
+
+# HOOK_JQ_EXE is an OUTPUT, read by callers.
+# shellcheck disable=SC2034
+hook_shim_jq() {
+  [ "${_HJQ_SET:-}" = 1 ] && [ "${_HJQ_PATH:-}" = "$PATH" ] && return 0
+  _HJQ_SET=1; _HJQ_PATH="$PATH"
+  if [ -n "${_HJQ_OURS:-}" ]; then unset -f jq; _HJQ_OURS=""; fi
+  HOOK_JQ_EXE=""
+  _hp3_lookup jq
+  [ -n "$_HP3_W" ] || return 0
+  HOOK_JQ_EXE="$_HP3_W"
+  _hp3_unshim "$_HP3_W" || return 0
+  local q
+  printf -v q '%q' "$_HP3_W"
+  eval "jq() { $q \"\$@\"; }"
+  HOOK_JQ_EXE="$_HP3_W"; _HJQ_OURS=1
+  return 0
+}
+
 # Sourcing is the whole interface — a hook adds one line and every `python3` in
 # it resolves. Callers that want the verdict call the function again.
 hook_shim_python3 || :
+hook_shim_jq || :
