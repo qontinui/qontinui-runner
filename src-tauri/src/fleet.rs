@@ -3068,10 +3068,13 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // synchronous probe (a `claude --version` fork, up to its 3s budget) would
     // block the only worker — and with it the tick timer that bounds this whole
     // call in `heartbeat_loop::run_tick`. On the blocking pool the await is
-    // bounded by that tick timeout. A panicking probe counts as unavailable.
+    // bounded by that tick timeout. A failed probe task counts as unavailable.
     let claude_code_available = spawn_blocking_tracked(claude_code_probe)
         .await
-        .unwrap_or(false);
+        .unwrap_or_else(|e| {
+            warn!("fleet::heartbeat: claude_code_probe task failed ({e}); advertising unavailable");
+            false
+        });
 
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
@@ -3401,7 +3404,7 @@ fn detect_claude_code_now() -> bool {
 // + `git rev-parse HEAD` + `git symbolic-ref --short HEAD` + mtime-scans the
 // working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
 //
-// Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
+// Mirrors `heartbeat_to_coord` above and its loop, `heartbeat_loop::spawn_heartbeat`:
 // - Reuses `load_device_file` for identity.
 // - Reuses `profiles::connected_coord_base` for the coord HTTP endpoint.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
