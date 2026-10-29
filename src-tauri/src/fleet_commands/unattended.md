@@ -2566,7 +2566,7 @@ rewrites only the header's `Last attempt:` line.
 
 Its sidecar `PLANS-CACHE.state.json` records what the last attempt SAW, never
 what it meant: `render_exit_reason` is one of `http_<code>` (`http_404`,
-`http_401`, ...), `transport_error`, `empty_response`, `no_credential`,
+`http_401`, ...), `transport_error`, `empty_response`, `paging_incomplete`, `no_credential`,
 `runner_mint_expired`, `runner_headless`, `mint_door_refused`, `mint_transport_failed`,
 `skipped_fresh`, `write_failed` or `ok`, with `attempt_url` beside it — the URL
 that answered — and, on a 404 against a loopback base, `checkout_probe`, the
