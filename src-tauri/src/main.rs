@@ -307,6 +307,10 @@ mod tiered_info;
 mod timeout_config;
 mod trace_api;
 mod tracing_layers;
+// In-process process-TREE kill (no `taskkill` spawn) for the runner's Windows
+// kill paths — plan 2026-10-19-served-corpus-probe-budget-excludes-process-creation.
+#[cfg(windows)]
+mod tree_kill;
 mod trigger_system;
 mod tunnel;
 mod ui_bridge_evaluate;
@@ -425,7 +429,7 @@ mod zombie_sweep;
 ///   SHUTDOWN_JOIN_BUDGET    3 s   bridges + ADB reverses + extraction executor
 /// + EXIT_DRAIN_BUDGET       8 s   drain: turn-flush + WIP refs + coord claims
 /// + TERMINAL_CLOSE_BUDGET   5 s   TerminalManager::close_all (O(terminals))
-/// + AI_KILL_BUDGET          4 s   orphaned-AI taskkill loop (O(live agents))
+/// + AI_KILL_BUDGET          4 s   orphaned-AI tree-kill loop (O(live agents))
 /// + MISC_SECS               2 s   ci_node cancel, close_all_sessions, shutdown
 ///                                 marker, port breadcrumb, and the grace given
 ///                                 to the four async cleanup tasks
@@ -459,11 +463,11 @@ mod shutdown_budget {
     const EXIT_DRAIN_SECS: u64 = 8;
 
     /// `TerminalManager::close_all`. Previously UNCAPPED: per terminal it is a
-    /// `taskkill /F /T` plus two 2 s thread joins plus a recursive
+    /// process-tree kill plus two 2 s thread joins plus a recursive
     /// `remove_dir_all`, i.e. ≈ N × 4 s.
     const TERMINAL_CLOSE_SECS: u64 = 5;
 
-    /// The orphaned-AI-process `taskkill` loop. Previously UNCAPPED and serial,
+    /// The orphaned-AI-process tree-kill loop. Previously UNCAPPED and serial,
     /// with roughly one entry per live agent.
     const AI_KILL_SECS: u64 = 4;
 
@@ -492,9 +496,9 @@ mod shutdown_budget {
     /// anchored to worker completion and is a component of `MISC_SECS`.
     pub const ASYNC_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
-    /// Per-subprocess cap for a shutdown `taskkill`. A `taskkill` against a
-    /// process tree that is itself wedged can otherwise block forever on
-    /// `.output()`.
+    /// Per-kill cap for one shutdown tree kill (the walk's pass budget). The
+    /// name predates the in-process kill, when each kill was a `taskkill`
+    /// subprocess that could otherwise block forever on `.output()`.
     pub const TASKKILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Floor under [`TASKKILL_TIMEOUT`] once the budget is nearly spent.
@@ -1797,7 +1801,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     health_monitor::start_health_monitor();
 
     // Initialize Windows Job Object so spawned AI processes are auto-killed
-    // if the runner crashes (safety net for the explicit taskkill in shutdown).
+    // if the runner crashes (safety net for the explicit tree kill in shutdown).
     #[cfg(windows)]
     qontinui_runner_win32::init_job_object();
 
@@ -2971,6 +2975,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_remote_history_load,
             commands::remote_attach::terminal_remote_interactivity,
             commands::remote_attach::remote_interactivity_probe,
+            commands::remote_end::remote_session_end,
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
@@ -3505,7 +3510,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_explorer::start_exploration,
             commands::state_machine::clear_action_log,
             commands::state_machine::get_action_log_view,
-            commands::state_machine::navigate_to_state,
             commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
             commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
             commands::state_machine_configs::sm_create_config,
@@ -3571,10 +3575,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_clear_restore_pending,
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
+            commands::terminal::session_ledger_report,
+            commands::terminal::session_ledger_capture,
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_holder_sweep_settled,
             commands::terminal::terminal_holder_sweep_status,
             commands::terminal::terminal_session_mark_restore_pending,
+            commands::terminal::terminal_session_mark_awaiting_account,
+            commands::terminal::claude_default_config_home,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
             commands::terminal::terminal_session_record_open,
@@ -3779,10 +3787,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let boot = session::shutdown_marker::classify_boot(&marker_path);
                 if boot.crash_recovery {
                     warn!(
+                        teardown_complete = boot.teardown_complete,
                         "boot classification: previous shutdown was NOT clean — crash recovery"
                     );
                 } else {
-                    info!("boot classification: previous shutdown was clean — planned restart");
+                    info!(
+                        teardown_complete = boot.teardown_complete,
+                        "boot classification: previous shutdown was clean — planned restart"
+                    );
                 }
 
                 // Phase 4 (P1) crash observability — when the prior shutdown
@@ -4398,6 +4410,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     std::sync::Arc::new(session::reconcile::DiskTranscriptIndex::discover());
                 lifecycle_store.attach_transcript_probe(transcript_index.clone());
 
+                // Observation epoch (plan 2026-10-28-force-exited-runner-strands-
+                // open-sessions-out-of-the-restore-set): latch the PRIOR
+                // process's last successful observation BEFORE the census
+                // latches, so census, restore read and ledger roster share one
+                // admission. The liveness poll advances it below.
+                lifecycle_store.attach_observation_epoch(std::sync::Arc::new(
+                    session::observation_epoch::ObservationEpoch::open(
+                        &session::observation_epoch::epoch_path(),
+                        session::session_ledger::process_boot_ms(),
+                    ),
+                ));
+                // Same plan, Phase 3: the prior marker anchors open rows only
+                // when it says the teardown FINISHED — also before the latch.
+                lifecycle_store.attach_prior_teardown_complete(
+                    session::shutdown_marker::boot_classification()
+                        .is_some_and(|b| b.teardown_complete),
+                );
+
                 // RESTORE CENSUS (plan
                 // `2026-08-16-runner-session-info-dropdown-and-restore-verification`
                 // D6/P5) — LATCH the pre-restart `expected` set RIGHT HERE, and
@@ -4425,6 +4455,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     chrono::Utc::now().timestamp_millis(),
                     session::shutdown_marker::boot_classification(),
                 );
+
+                // Hold every restore candidate whose account cannot be
+                // resolved BEFORE the liveness poll starts: restore is lazy per
+                // page, so a page opened more than ~3 minutes from now would
+                // otherwise find its needs-account rows already closed
+                // `no-terminal`. Same boot inputs as the restore read itself.
+                {
+                    let boot = session::shutdown_marker::boot_classification();
+                    let held = lifecycle_store.hold_unresolved_account_candidates(
+                        boot.and_then(|c| c.prior_marker_at),
+                        boot.map(|c| !c.crash_recovery).unwrap_or(false),
+                        transcript_index.as_ref(),
+                    );
+                    if !held.is_empty() {
+                        tracing::info!(
+                            count = held.len(),
+                            "session: holding restore candidates whose account is unknown until the operator chooses one"
+                        );
+                    }
+                }
 
                 // Phase 4 of `2026-08-22-wip-custody-rebuild-survivable-
                 // attribution` — the DISK half of the same set.
@@ -4559,9 +4609,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::time::Duration;
 
                     use session::session_lifecycle_store::{
-                        boot_restore_phase, classify, close_reason_for_dead_shell,
-                        hold_for_withheld_boot_restore, match_live_terminal,
-                        withheld_boot_restore_candidate, PollAction, WorkerPlane,
+                        boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
+                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
+                        match_live_terminal, PollAction, WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -4699,6 +4749,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // stays the only per-record syscall. The claude-present
                         // signal needs image names and the PID-reuse guard needs
                         // creation times — both carried on the snapshot.
+                        let snap_captured_at_ms = chrono::Utc::now().timestamp_millis();
                         let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
                         // A totally-empty system parent_map means the snapshot
                         // helper failed → classify Skips every matched record.
@@ -4783,11 +4834,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let tick_boot_at_ms = session::shutdown_marker::boot_classification()
                             .map(|c| c.booted_at_ms);
                         let tick_restore_phase = boot_restore_phase();
+                        // The boot-latched restorable set (plan 2026-10-28-
+                        // force-exited-runner-strands-open-sessions-out-of-the-
+                        // restore-set, Phase 4): its rows are held until their
+                        // page's restore runs, in every phase.
+                        let tick_boot_census = session::restore_census::latched();
                         let tick_drain_defers_boot_resume = !crate::coord_drain_state::drain_gate(
                             crate::coord_drain_state::SpawnOrigin::BootResume,
                         )
                         .allows();
                         let mut held_for_restore: usize = 0;
+                        // The boot-census rows this tick held without judging
+                        // them; carried to the next boot with the epoch.
+                        let mut held_unjudged: Vec<String> = Vec::new();
 
                         // Review F1 (plan 2026-09-12 Phase 5): a pane a
                         // restarted runner ADOPTED from its PTY holder runs a
@@ -4835,15 +4894,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Is this a prior-boot record whose boot restore
-                            // is being withheld? Decided BEFORE matching: such a
-                            // record gets the id match only (see
-                            // `match_live_terminal`).
-                            let held = withheld_boot_restore_candidate(
+                            // is being withheld, or that is still waiting for
+                            // its page's restore? Decided BEFORE matching: a
+                            // withheld record gets the id match only (see
+                            // `match_live_terminal`); a waiting one keeps the
+                            // triple fallback and is only kept from the orphan
+                            // close (see `BootRestoreHold`).
+                            let awaiting_boot_restore =
+                                tick_boot_census.is_some_and(|c| c.awaits_restore(rec));
+                            let boot_hold = boot_restore_hold(
                                 rec.last_seen_at,
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
+                                awaiting_boot_restore,
                             );
+                            let held = boot_hold.hold;
 
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
@@ -4858,8 +4924,38 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 triple,
                                 &live_by_id,
                                 &live_by_triple,
-                                held,
+                                boot_hold.id_match_only,
                             );
+
+                            // A `needs-account` row the boot restore left for
+                            // the operator has no terminal BY DESIGN. Closing it
+                            // `no-terminal` would drop it from the roster and
+                            // from the next boot's restore set while the
+                            // operator is still being asked about it, so the
+                            // poll holds it (never refreshed, counters reset) until
+                            // a verified resume, a close or Finish ends the wait.
+                            // Only a match on the row's OWN terminal_id releases
+                            // the hold; a (page_id, title, working_dir) fallback
+                            // match is another tab, not this row's resume.
+                            // A held row is unbound, so it never matches
+                            // `Direct` through an old terminal id that now
+                            // hosts another session.
+                            let terminal_match =
+                                session::session_lifecycle_store::PollTerminalMatch::for_record(
+                                    rec,
+                                    |t| live_by_id.contains_key(t),
+                                    info.is_some(),
+                                );
+                            if session::session_lifecycle_store::poll_holds_unmatched_row(
+                                &poll_lifecycle_store,
+                                &rec.claude_session_id,
+                                terminal_match,
+                                chrono::Utc::now().timestamp_millis(),
+                                &mut consecutive_dead,
+                                &mut consecutive_no_match,
+                            ) {
+                                continue;
+                            }
 
                             let (live_is_alive, claude_present, snapshot_ok) = match info {
                                 // No matching terminal — orphan detection is
@@ -4972,6 +5068,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
+                                if carries_boot_restore_hold(
+                                    rec,
+                                    tick_boot_at_ms,
+                                    awaiting_boot_restore,
+                                    snap_captured_at_ms,
+                                ) {
+                                    held_unjudged.push(rec.claude_session_id.clone());
+                                }
                                 // A held record is waiting, not missing: any
                                 // no-match streak it built before the hold is
                                 // void, so the orphan debounce restarts from
@@ -5078,11 +5182,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // The classify loop has run to completion, so every
+                        // live row this snapshot saw has been touched: only
+                        // NOW may the observation epoch advance (never on a
+                        // failed snapshot — it observed nothing). The rows the
+                        // boot-census hold kept unjudged ride along, so the
+                        // next boot does not read this epoch as evidence
+                        // against them.
+                        if let Some(epoch) = poll_lifecycle_store.observation_epoch() {
+                            epoch.record_tick(tick_snapshot_ok, snap_captured_at_ms, &held_unjudged);
+                        }
+
                         if held_for_restore > 0 {
                             tracing::debug!(
                                 held = held_for_restore,
                                 phase = ?tick_restore_phase,
-                                "session lifecycle poll: holding prior-boot records open — their boot restore is withheld"
+                                "session lifecycle poll: holding prior-boot records open pending their boot restore"
                             );
                         }
 
@@ -6728,7 +6843,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let watchdog_label = win_label.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(force_exit_at);
+                    // The marker the next boot will classify (plan
+                    // 2026-10-28-force-exited-runner-strands-open-sessions-out-
+                    // of-the-restore-set, Phase 3): a cut-short teardown leaves
+                    // it clean but `teardown_complete=false`.
                     warn!(
+                        marker = %session::shutdown_marker::describe_on_disk(
+                            &session::shutdown_marker::marker_path()
+                        ),
                         "Force-exit watchdog: shutdown did not complete within {}s of the \
                          close request — exiting process",
                         force_exit_at.as_secs()

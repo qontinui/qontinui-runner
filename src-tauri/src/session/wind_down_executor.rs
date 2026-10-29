@@ -1443,6 +1443,7 @@ mod tests {
             nested_under_claude: nested,
             session_id: session_id.map(str::to_string),
             session_status: Some("finished".to_string()),
+            session_status_since: None,
             blocks_restart: false,
             wind_down: verdict.map(|eligibility| wind_down::WindDownView {
                 eligibility: match eligibility {
@@ -2142,6 +2143,7 @@ mod tests {
                 provider: "claude".to_string(),
                 origin: None,
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
