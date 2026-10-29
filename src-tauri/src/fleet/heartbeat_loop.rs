@@ -9,7 +9,7 @@
 //! module makes three things observable at default level:
 //!
 //! * **A hung tick.** Each tick's [`super::heartbeat_to_coord`] is bounded by
-//!   [`tick_timeout`] (3 × interval). Expiry is a failed tick with cause
+//!   [`tick_timeout`] (3 × interval, floored at 30s). Expiry is a failed tick with cause
 //!   `tick_timeout`: a `WARN` carrying the failure streak, and a miss folded
 //!   into the drain state exactly as a transport error is.
 //! * **A stalled loop.** A tick that STARTS more than one interval later than
@@ -20,7 +20,8 @@
 //!   deadline immediately, so the lateness our own tick caused is excluded.
 //! * **A slow tick.** A tick that succeeds but takes longer than one interval
 //!   (start to end, sinks included) gets its own `WARN`, so a gap between
-//!   ticks wider than 2 × interval always surfaces at once: either as a stall
+//!   ticks wider than 2 × interval (each WARN threshold is floored at 10s for a
+//!   short `COORD_HEARTBEAT_INTERVAL_SECS`) always surfaces at once: either as a stall
 //!   (the loop was not run) or as a slow or failed tick (it was, and the tick
 //!   itself took the time). A failed tick is already a `WARN` and is not
 //!   reported twice.
@@ -55,6 +56,16 @@ const DEFAULT_INTERVAL_SECS: u64 = 30;
 /// counted as failed (`tick_timeout`).
 const TICK_TIMEOUT_INTERVALS: u32 = 3;
 
+/// Lower bound on [`tick_timeout`]. `heartbeat_to_coord` carries its own inner
+/// bounds (register POST 5s, `claude --version` probe 3s, binding reconcile
+/// lock wait 10s); a short `COORD_HEARTBEAT_INTERVAL_SECS` must not cut off a
+/// tick those bounds would have let succeed.
+const TICK_TIMEOUT_FLOOR: Duration = Duration::from_secs(30);
+
+/// Lower bound on the stall and slow-tick thresholds, so a short interval
+/// does not turn an ordinary coord round trip into a WARN on every tick.
+const WARN_THRESHOLD_FLOOR: Duration = Duration::from_secs(10);
+
 /// Cadence of the `fleet::heartbeat: summary` line.
 pub(crate) const SUMMARY_WINDOW: Duration = Duration::from_secs(10 * 60);
 
@@ -69,7 +80,8 @@ fn heartbeat_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The bound on one tick's `heartbeat_to_coord` await: 3 × `interval`.
+/// The bound on one tick's `heartbeat_to_coord` await: 3 × `interval`,
+/// never below [`TICK_TIMEOUT_FLOOR`].
 ///
 /// It bounds `heartbeat_to_coord` only: the drain-state fold after a success
 /// (`note_heartbeat`) runs outside it, bounded by its own `ME_DRAIN_TIMEOUT`.
@@ -77,7 +89,7 @@ fn heartbeat_interval() -> Duration {
 /// current_thread runtime cannot be preempted, which is why the blocking
 /// probes run on the blocking pool.
 pub(crate) fn tick_timeout(interval: Duration) -> Duration {
-    interval * TICK_TIMEOUT_INTERVALS
+    (interval * TICK_TIMEOUT_INTERVALS).max(TICK_TIMEOUT_FLOOR)
 }
 
 /// Why a tick failed. `as_str` is the cause token written to the log.
@@ -224,6 +236,12 @@ impl HeartbeatLoopStats {
         }
     }
 
+    /// One interval, floored at [`WARN_THRESHOLD_FLOOR`]: the lateness a tick
+    /// start, and the duration a successful tick, may reach before it WARNs.
+    fn warn_threshold(&self) -> Duration {
+        self.interval.max(WARN_THRESHOLD_FLOOR)
+    }
+
     /// Record a tick start at `now` for the tick scheduled at `deadline` (what
     /// `Interval::tick` returned). Returns a warning when the tick started more
     /// than one interval after the later of `deadline` and the previous tick's
@@ -238,7 +256,7 @@ impl HeartbeatLoopStats {
         }
         let could_start = self.last_tick_end.map_or(deadline, |end| end.max(deadline));
         let late = now.saturating_duration_since(could_start);
-        (late > self.interval).then_some(StallWarning {
+        (late > self.warn_threshold()).then_some(StallWarning {
             late,
             interval: self.interval,
         })
@@ -250,7 +268,7 @@ impl HeartbeatLoopStats {
     pub(crate) fn on_tick_end(&mut self, now: Instant, succeeded: bool) -> Option<SlowTick> {
         self.last_tick_end = Some(now);
         let took = now.saturating_duration_since(self.last_tick_start?);
-        (succeeded && took > self.interval).then_some(SlowTick {
+        (succeeded && took > self.warn_threshold()).then_some(SlowTick {
             took,
             interval: self.interval,
         })
@@ -622,6 +640,36 @@ mod tests {
         assert_eq!(next.ticks_failed, 0);
         assert_eq!(next.max_gap, Duration::ZERO);
         assert_eq!(next.last_status, "registered/DRAINED");
+    }
+
+    /// A short interval keeps the floors: the timeout never drops below the
+    /// heartbeat's own inner bounds, and neither WARN fires on an ordinary
+    /// few-second round trip.
+    #[test]
+    fn a_short_interval_keeps_the_timeout_and_warn_floors() {
+        assert_eq!(tick_timeout(secs(1)), secs(30));
+        assert_eq!(tick_timeout(secs(10)), secs(30));
+        assert_eq!(tick_timeout(secs(11)), secs(33));
+
+        let short = secs(2);
+        let t0 = Instant::now();
+        let mut stats = HeartbeatLoopStats::new(short, t0);
+        stats.on_tick_start(t0, t0);
+        assert_eq!(
+            stats.on_tick_end(t0 + secs(5), true),
+            None,
+            "5s < 10s floor"
+        );
+        // Deadline 2s, previous end 5s: 9s late is under the floor.
+        assert_eq!(stats.on_tick_start(t0 + secs(14), t0 + short), None);
+        assert!(
+            stats.on_tick_end(t0 + secs(25), true).is_some(),
+            "11s > 10s"
+        );
+        assert!(
+            stats.on_tick_start(t0 + secs(36), t0 + secs(24)).is_some(),
+            "11s past the previous end"
+        );
     }
 
     /// Synthetic instants: a tick that SUCCEEDS but runs past one interval
