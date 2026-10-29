@@ -4439,7 +4439,9 @@ struct TerminalFocusRequest<'a> {
 /// The spawn origin of a delivered continuation: a work-unit dispatch when it
 /// carries a `dispatch_id`, otherwise a gate continuation — the same split
 /// [`continuation_drain_admission`] makes.
-fn continuation_spawn_origin(payload: &GateContinuationPayload) -> crate::coord_drain_state::SpawnOrigin {
+fn continuation_spawn_origin(
+    payload: &GateContinuationPayload,
+) -> crate::coord_drain_state::SpawnOrigin {
     if payload.dispatch_id.is_some() {
         crate::coord_drain_state::SpawnOrigin::UnitContinuation
     } else {
@@ -4473,10 +4475,15 @@ pub(crate) fn emit_terminal_focus_request(
     terminal_id: &str,
     origin: crate::coord_drain_state::SpawnOrigin,
 ) {
-    use tauri::Emitter;
-    if !crate::terminal::focus_coalescer::decide_for_focus(origin, terminal_id) {
-        return;
+    if crate::terminal::focus_coalescer::decide_for_focus(origin, terminal_id) {
+        emit_terminal_focus_event(app, terminal_id);
     }
+}
+
+/// The raw `terminal-focus-request` emit, scoped to the MAIN window. Every
+/// caller decides through [`crate::terminal::focus_coalescer`] first.
+fn emit_terminal_focus_event(app: &tauri::AppHandle, terminal_id: &str) {
+    use tauri::Emitter;
     let payload = TerminalFocusRequest { terminal_id };
     if let Err(e) = app.emit_to(
         qontinui_runner_lib::get_main_window_label(),
@@ -4502,11 +4509,15 @@ fn focus_existing_continuation(terminal_id: &str) {
                 "agent_runtime: duplicate continuation folded onto existing live \
                  terminal_id={terminal_id} — emitting focus-request"
             );
-            emit_terminal_focus_request(
-                &app,
-                terminal_id,
+            // A REFOCUS: it only peeks the live terminal's pending
+            // create-time decision, so it can never consume it and leave the
+            // original's own focus request a fresh decision.
+            if crate::terminal::focus_coalescer::decide_for_refocus(
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
-            );
+                terminal_id,
+            ) {
+                emit_terminal_focus_event(&app, terminal_id);
+            }
         }
         None => {
             debug!(

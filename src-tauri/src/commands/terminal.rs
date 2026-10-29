@@ -2226,10 +2226,10 @@ pub async fn terminal_migrate_session_account(
         &dst,
         crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
     )
-        .inspect_err(|_| {
-            // The session never reached `dst`: it must not count as a handoff.
-            crate::ai_provider::unrecord_handoff(&dst);
-        })?;
+    .inspect_err(|_| {
+        // The session never reached `dst`: it must not count as a handoff.
+        crate::ai_provider::unrecord_handoff(&dst);
+    })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
@@ -2617,7 +2617,9 @@ pub(crate) fn create_terminal_session_backend(
         // spawn cannot, and is coalesced as unattended (fail closed).
         capture_hint
             .as_ref()
-            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| h.spawn_origin),
+            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| {
+                h.spawn_origin
+            }),
     )?;
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
