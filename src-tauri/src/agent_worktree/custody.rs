@@ -1348,8 +1348,26 @@ pub mod coord {
     pub async fn walk_pages<F, Fut>(
         max_pages: usize,
         budget: Duration,
-        mut fetch_page: F,
+        fetch_page: F,
     ) -> Result<(CoordSessionWorktrees, Option<String>), String>
+    where
+        F: FnMut(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<CoordSessionWorktrees, String>>,
+    {
+        let (merged, partial, _pages_read) =
+            walk_pages_counted(max_pages, budget, fetch_page).await?;
+        Ok((merged, partial))
+    }
+
+    /// [`walk_pages`], also returning how many pages the walk MERGED — the
+    /// number [`ownership_from_walks`] reads to tell a one-snapshot walk from a
+    /// multi-snapshot one, so it comes from the walk itself rather than from a
+    /// caller-side counter no test reaches.
+    pub async fn walk_pages_counted<F, Fut>(
+        max_pages: usize,
+        budget: Duration,
+        mut fetch_page: F,
+    ) -> Result<(CoordSessionWorktrees, Option<String>, usize), String>
     where
         F: FnMut(Option<String>) -> Fut,
         Fut: std::future::Future<Output = Result<CoordSessionWorktrees, String>>,
@@ -1417,7 +1435,8 @@ pub mod coord {
                 }
             }
         }
-        Ok((merge_pages(pages), partial))
+        let pages_read = pages.len();
+        Ok((merge_pages(pages), partial, pages_read))
     }
 
     /// Project coord's five-valued session state onto the tri-state
@@ -1735,8 +1754,12 @@ pub mod coord {
         Ok(())
     }
 
-    /// PURE: validate every `(state, page)` and union them into one index,
-    /// each page read as ONE snapshot (see [`ownership_from_walks`]).
+    /// TEST HELPER: validate every `(state, page)` and union them into one
+    /// index, each page taken as ONE snapshot (see [`ownership_from_walks`]).
+    /// Test-only on purpose: it marks every listed session live, which is right
+    /// only for a one-page walk, so production goes through
+    /// [`ownership_from_walks`] with the walk's real page count.
+    #[cfg(test)]
     pub fn ownership_from_pages(
         pages: Vec<(&str, CoordSessionWorktrees)>,
         limit: usize,
@@ -1915,9 +1938,7 @@ pub mod coord {
         let mut pages = Vec::new();
         for state in LIVE_SESSION_STATES {
             let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let mut pages_read = 0usize;
-            let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
-                pages_read += 1;
+            let (merged, partial, pages_read) = walk_pages_counted(MAX_PAGES, budget, |cursor| {
                 let url = state_page_url(&base_url, state, cursor.as_deref());
                 let client = client.clone();
                 async move {
@@ -2138,6 +2159,37 @@ pub mod coord {
             .await
             .unwrap();
             (merged, partial, seen.into_inner().unwrap())
+        }
+
+        /// The one-snapshot shortcut in `ownership_from_walks` trusts this
+        /// count, so it is the walk's own: the pages it merged.
+        #[tokio::test]
+        async fn the_walk_reports_how_many_pages_it_merged() {
+            let pages: Vec<CoordSessionWorktrees> = [
+                r#"{"sessions":[],"nextCursor":"p1"}"#,
+                r#"{"sessions":[],"nextCursor":"p2"}"#,
+                r#"{"sessions":[],"nextCursor":null}"#,
+            ]
+            .into_iter()
+            .map(page)
+            .collect();
+            let (_, partial, n) =
+                walk_pages_counted(MAX_PAGES, Duration::from_secs(30), |cursor| {
+                    let i = cursor
+                        .as_deref()
+                        .map_or(0, |c| c.trim_start_matches('p').parse::<usize>().unwrap());
+                    let p = pages[i].clone();
+                    async move { Ok(p) }
+                })
+                .await
+                .unwrap();
+            assert_eq!((partial, n), (None, 3));
+            let (_, _, one) = walk_pages_counted(MAX_PAGES, Duration::from_secs(30), |_| async {
+                Ok(page(r#"{"sessions":[],"nextCursor":null}"#))
+            })
+            .await
+            .unwrap();
+            assert_eq!(one, 1);
         }
 
         #[tokio::test]
