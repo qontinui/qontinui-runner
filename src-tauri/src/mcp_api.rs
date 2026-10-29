@@ -2566,9 +2566,10 @@ async fn health(
         "transcriptWatcher": crate::terminal::transcript_watcher::health_snapshot(),
         // Coalesced view-switching (plan 2026-10-28-runner-spawn-bursts-
         // overwhelm-the-box-beyond-the-continuation-cap, D3): unattended
-        // spawns switch the operator's view at most once per `windowSecs`;
-        // `suppressedTotal` counts the rest since boot. `lastSurfaceAt: null`
-        // = no unattended view switch since boot.
+        // spawns switch the operator's view at most once per `windowSecs`
+        // (one window for the named origins, one for `Unknown`);
+        // `suppressedTotal` counts the rest since boot. `lastSurfaceAt` /
+        // `lastUnknownSurfaceAt: null` = no such view switch since boot.
         "focusCoalescer": crate::terminal::focus_coalescer::health_json(),
         "ai": {
             "configured": ai_configured,

@@ -4456,8 +4456,9 @@ const CONDITION_CHECK_SPAWN_ORIGIN: crate::coord_drain_state::SpawnOrigin =
 /// Emit a `terminal-focus-request` to the MAIN window only — when the focus
 /// coalescer surfaces it.
 ///
-/// `origin` is why the terminal was spawned. Unattended origins are coalesced
-/// to at most one view switch per minute across all of them
+/// `origin` is why the terminal was spawned. Named unattended origins are
+/// coalesced to at most one view switch per minute across all of them, and
+/// `SpawnOrigin::Unknown` to one per minute in a window of its own
 /// ([`crate::terminal::focus_coalescer`], plan
 /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
 /// D3); a terminal whose create-time `terminal-created` already carried the
@@ -4505,17 +4506,18 @@ fn emit_terminal_focus_event(app: &tauri::AppHandle, terminal_id: &str) {
 fn focus_existing_continuation(terminal_id: &str) {
     match crate::tauri_app_handle::current() {
         Some(app) => {
-            debug!(
-                "agent_runtime: duplicate continuation folded onto existing live \
-                 terminal_id={terminal_id} — emitting focus-request"
-            );
             // A REFOCUS: it only peeks the live terminal's pending
             // create-time decision, so it can never consume it and leave the
             // original's own focus request a fresh decision.
-            if crate::terminal::focus_coalescer::decide_for_refocus(
+            let surface = crate::terminal::focus_coalescer::decide_for_refocus(
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
                 terminal_id,
-            ) {
+            );
+            debug!(
+                "agent_runtime: duplicate continuation folded onto existing live \
+                 terminal_id={terminal_id} — refocus decided surface={surface}"
+            );
+            if surface {
                 emit_terminal_focus_event(&app, terminal_id);
             }
         }

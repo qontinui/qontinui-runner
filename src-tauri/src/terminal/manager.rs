@@ -18,8 +18,9 @@ use crate::coord_drain_state::SpawnOrigin;
 /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
 /// D3). `surface` says whether the frontend should SELECT the new tab; it is
 /// [`super::focus_coalescer::decide_for_create`]'s verdict for the spawn's
-/// origin — always `true` for an operator-created tab, at most once per
-/// window for unattended ones. Flattened beside the info rather than added to
+/// origin — always `true` for an operator-created tab; for unattended ones
+/// coalesced per window (one window shared by the named origins, a separate
+/// one for `SpawnOrigin::Unknown`). Flattened beside the info rather than added to
 /// `TerminalInfo`, which is the cross-repo wire schema (`qontinui-schemas`,
 /// `deny_unknown_fields`) — the same reasoning that keeps the bypass hint a
 /// separate event.
