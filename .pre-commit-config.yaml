@@ -200,9 +200,13 @@ repos:
       # shared cargo target instead of a cold per-worktree one. It also covers
       # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
       # the now-shared target from becoming a collision point between two
-      # concurrent pushes — so that script is on the trigger list too.
+      # concurrent pushes — so that script is on the trigger list too. Since plan
+      # 2026-10-29-runner-prepush-gate-builds-the-shared-target-without-the-tree-lock
+      # it also pins the tree-lock guard against the REAL
+      # qontinui-claude-config library (an arm that SKIPS, saying so, where that
+      # repo is absent); the hook-level guard arms live in push-range-test.
       - id: shared-target-test
-        name: shared cargo target resolution — tests
+        name: shared cargo target resolution + tree lock — tests
         entry: bash .pre-commit-hooks/shared-target-test.sh
         language: system
         stages: [pre-commit]
