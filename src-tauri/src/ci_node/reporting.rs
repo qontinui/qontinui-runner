@@ -269,6 +269,9 @@ async fn flusher_loop(
             .await
         {
             Ok(resp) if resp.status().is_success() => {
+                // Coord accepted the batch, which renews this dispatch's
+                // lease — the systemd watchdog gate ages build guards by it.
+                crate::sd_notify::note_ci_lease_renewed();
                 if let Ok(text) = resp.text().await {
                     if let Some(state) = parse_response_state(&text) {
                         if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {

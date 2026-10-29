@@ -870,9 +870,10 @@ fn start_build(
         dispatch_id, payload.repo, payload.head_sha, payload.check_name
     );
     // Counted for the systemd watchdog gate (plan 2026-10-19 Phase 2b,
-    // `crate::sd_notify`): a wedged runner is never watchdog-killed while a
-    // build runs. Moved into the task, so completion, cancellation, a panic or
-    // the task being dropped all release it.
+    // `crate::sd_notify`): a wedged runner is not watchdog-killed while a build
+    // runs and its lease is live (`sd_notify::CI_BUILD_PROTECTION`). Moved
+    // into the task, so completion, cancellation, a panic or the task being
+    // dropped all release it.
     let in_flight = crate::sd_notify::ci_build_in_flight();
     tokio::spawn(async move {
         let _in_flight = in_flight;
