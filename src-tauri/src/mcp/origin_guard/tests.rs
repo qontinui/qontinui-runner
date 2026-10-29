@@ -2118,3 +2118,135 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         StatusCode::OK
     );
 }
+
+/// Every refusal and shadow would-refuse the guard has counted.
+fn guard_tally(guard: &OriginGuard) -> u64 {
+    let v = guard.health_json(None);
+    let sum = |block: &Value| {
+        block
+            .as_object()
+            .map(|o| o.values().filter_map(Value::as_u64).sum::<u64>())
+            .unwrap_or(0)
+    };
+    sum(&v["refusals"]) + sum(&v["shadowWouldRefuse"])
+}
+
+/// `journeyObserve.admitted` is the guard's OWN decision for the observe
+/// route: for every route policy and every origin class, what the helper
+/// answers (through the guard the middleware hands a handler) is exactly
+/// whether a real request to `POST /apps/{app_id}/journey/observe` with the
+/// same headers is served cleanly — not refused, not counted as a would-be
+/// refusal. Since the observe route's admission comes from
+/// [`TRUSTED_ROUTES`], taking it off that list flips the Trusted answers.
+#[tokio::test]
+async fn journey_observe_admitted_is_the_guards_own_decision_for_the_observe_route() {
+    let (observe_method, observe_route) = JOURNEY_OBSERVE_ROUTE;
+    assert_eq!(observe_method, "POST");
+    assert!(
+        listed(TRUSTED_ROUTES, observe_method, observe_route),
+        "the observe route's pattern is the one TRUSTED_ROUTES admits"
+    );
+    for policy in [
+        "enforce",
+        "enforce-foreign",
+        "enforce-doors",
+        "shadow",
+        "off",
+    ] {
+        let h = harness(policy);
+        let calls = Calls::default();
+        let c = calls.clone();
+        let router = apply(
+            Router::new()
+                .route(
+                    "/ui-bridge/apps/register",
+                    post(
+                        |g: Option<axum::Extension<AdmittingGuard>>, headers: HeaderMap| async move {
+                            axum::Json(json!({
+                                "admitted": journey_observe_admitted(g.as_ref().map(|e| &e.0), &headers)
+                            }))
+                        },
+                    ),
+                )
+                .route(
+                    observe_route,
+                    post(move || {
+                        let c = c.clone();
+                        async move {
+                            c.hit("observe");
+                            "recorded"
+                        }
+                    }),
+                ),
+            h.guard.clone(),
+        );
+        let first_party = format!("http://127.0.0.1:{}", h.port.load(Ordering::Relaxed));
+        let callers: [(&str, Option<&str>); 5] = [
+            ("agent", None),
+            ("first_party", Some(first_party.as_str())),
+            ("trusted", Some(WEB)),
+            ("extension", Some("chrome-extension://abcdefghijklmnop")),
+            ("foreign", Some(EVIL)),
+        ];
+        for (label, origin) in callers {
+            let host = host(&h);
+            let mut headers: Vec<(&str, &str)> = vec![("host", host.as_str())];
+            if let Some(o) = origin {
+                headers.push(("origin", o));
+            }
+            let resp = router
+                .clone()
+                .oneshot(req("POST", "/ui-bridge/apps/register", &headers, ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{policy} {label}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let answer: Value = serde_json::from_slice(&bytes).unwrap();
+            let admitted = answer["admitted"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("{policy} {label}: {answer}"));
+
+            let tally = guard_tally(&h.guard);
+            let hits = calls.get("observe");
+            let resp = router
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/apps/qontinui-web/journey/observe",
+                    &headers,
+                    "",
+                ))
+                .await
+                .unwrap();
+            let served = resp.status() != StatusCode::FORBIDDEN && calls.get("observe") == hits + 1;
+            let clean = served && guard_tally(&h.guard) == tally;
+            assert_eq!(
+                admitted,
+                clean,
+                "{policy} {label}: the helper said {admitted}, the guard served={served} \
+                 counted={}",
+                guard_tally(&h.guard) - tally
+            );
+            // And it follows the allowlist the guard reads: a Trusted origin is
+            // admitted exactly because TRUSTED_ROUTES lists the route (`off`
+            // meters no allowlist, so it admits either way).
+            if label == "trusted" && policy != "off" {
+                assert_eq!(
+                    admitted,
+                    route_allowed(OriginClass::Trusted, observe_method, observe_route),
+                    "{policy}"
+                );
+            }
+            if label == "foreign" && policy != "off" {
+                assert!(!admitted, "{policy}: a Foreign origin is never admitted");
+            }
+        }
+    }
+}
+
+#[test]
+fn journey_observe_admitted_is_unknown_without_a_guard() {
+    assert_eq!(journey_observe_admitted(None, &HeaderMap::new()), None);
+}

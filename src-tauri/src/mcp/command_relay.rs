@@ -181,7 +181,7 @@ pub enum CommandRelayError {
     /// frame could not be read (coord finding `fb3fb468`). This is NOT the
     /// app's own failure: what the app reported is unknown, so callers keep
     /// it out of the app-code slot and, like a [`Self::Timeout`], treat the
-    /// outcome as unknown (`failure_origin: "transport"`, `retryable: null`).
+    /// outcome as unknown (`failure_origin: "unknown"`, `retryable: null`).
     #[error("the app answered, but its response frame could not be read: {0}")]
     UnreadableResponse(String),
 

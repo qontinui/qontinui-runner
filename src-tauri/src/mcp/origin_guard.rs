@@ -534,6 +534,11 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-test"),
     ("POST", "/ai/suggest-exploration-strategy"),
     ("POST", "/api-request/import-curl"),
+    // passive real-session capture: the embedding app's page relays each
+    // human interaction, with the snapshot relay's trust (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 3)
+    ("POST", "/apps/{app_id}/journey/observe"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/awas/actions"),
     ("GET", "/check-groups"),
@@ -821,6 +826,30 @@ impl RoutePolicy {
 pub struct RequesterPrincipal {
     pub class: OriginClass,
     pub origin: Option<NormOrigin>,
+}
+
+/// The guard that admitted a request, inserted into its extensions beside
+/// [`RequesterPrincipal`], so a handler can ask that SAME guard — its own
+/// classification, route tables and mode, never a copy — whether it would
+/// admit this caller on another route ([`OriginGuard::would_admit`]).
+#[derive(Clone)]
+pub struct AdmittingGuard(pub Arc<OriginGuard>);
+
+/// The route passive real-session capture relays to (`journey::observe`),
+/// as the guard matches it.
+pub const JOURNEY_OBSERVE_ROUTE: (&str, &str) = ("POST", "/apps/{app_id}/journey/observe");
+
+/// Would a relay to `POST /apps/{app_id}/journey/observe` carrying these
+/// request headers be ADMITTED by `guard` now — [`OriginGuard::would_admit`]
+/// for [`JOURNEY_OBSERVE_ROUTE`]. `None` when no guard admitted the request
+/// these headers came from (a router with no guard): unknown, never a guess.
+pub fn journey_observe_admitted(
+    guard: Option<&AdmittingGuard>,
+    headers: &HeaderMap,
+) -> Option<bool> {
+    let (method, route) = JOURNEY_OBSERVE_ROUTE;
+    let method = Method::from_bytes(method.as_bytes()).ok()?;
+    guard.map(|g| g.0.would_admit(&method, headers, route))
 }
 
 /// What the CORS layer may grant this request. Set by the guard; the CORS
@@ -1153,6 +1182,20 @@ impl OriginGuard {
         }
     }
 
+    /// Would THIS guard admit a request with `headers` to `method route` —
+    /// its own [`Self::decide`] (same classification, route tables, door
+    /// rules and current [`RoutePolicy`]), with nothing recorded. `true` only
+    /// for a clean admission ([`Verdict::Admit`], or a door's
+    /// [`Verdict::GraceAdmitted`]); a [`Verdict::ShadowWouldRefuse`] is
+    /// `false`: the guard would let it through only because it shadows the
+    /// class, and would log and count it as a would-be refusal.
+    pub fn would_admit(&self, method: &Method, headers: &HeaderMap, route: &str) -> bool {
+        matches!(
+            self.decide(method, headers, Some(route)).verdict,
+            Verdict::Admit | Verdict::GraceAdmitted
+        )
+    }
+
     fn record(&self, d: &Decision) {
         let s = &self.stats;
         match (d.verdict, d.class) {
@@ -1380,6 +1423,7 @@ async fn origin_guard_middleware(
                 class: d.class,
                 origin,
             });
+            req.extensions_mut().insert(AdmittingGuard(guard.clone()));
             next.run(req).await
         }
         Verdict::RefuseHost => {

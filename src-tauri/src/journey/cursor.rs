@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use qontinui_types::journey::{
-    ChokePoint, EdgeOutcome, JourneyNode, JourneyTrigger, NavigationTriggerKind,
+    ChokePoint, EdgeOutcome, JourneyNode, JourneyTrigger, NavigationTriggerKind, RunKind,
 };
+use qontinui_vision_core::ChangeTimeline;
 
 use super::node::{component_action_fingerprint, unknown_node, AffordanceIndex};
 
@@ -41,6 +42,14 @@ pub(crate) struct CursorKey {
     /// `windowLabel` (control) or `tabId` (SDK); `None` = main window /
     /// primary tab.
     pub scope: Option<String>,
+    /// The explorer's own cursor for the app (plan Phase 3). Its actions and
+    /// snapshots never share a pending-edge slot with an agent's unscoped
+    /// snapshot or a human's relayed click (`/journey/observe` with no
+    /// `tabId`), so neither can displace the explorer's pending edge, nor the
+    /// explorer theirs. A flag rather than a scope string: no relay tab id can
+    /// collide with it. One per app — [`super::explorer`] runs one exploration
+    /// per app at a time — so the cursor map stays bounded by the apps.
+    pub explorer: bool,
 }
 
 impl CursorKey {
@@ -53,19 +62,42 @@ impl CursorKey {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from),
+            explorer: false,
+        }
+    }
+
+    /// The explorer's cursor for `app_id` (see [`Self::explorer`]).
+    pub(crate) fn for_explorer(app_id: impl Into<String>) -> Self {
+        Self {
+            explorer: true,
+            ..Self::new(app_id, None)
         }
     }
 }
 
 /// Who acted, as far as the request says. Nothing here is invented: an absent
 /// value is `None` and lands as SQL NULL ("not reported").
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Provenance {
     /// `SdkAppInfo.version` of the app acted on; `None` = not reported (U4).
     pub app_version: Option<String>,
     /// The caller's run: the `task_run_id` query parameter the action routes
     /// already read for `ui_bridge_events` persistence; `None` when absent.
     pub run_id: Option<String>,
+    /// Who produced the edge. `agent_action` unless the action ran inside an
+    /// explorer run (`super::capture::as_explorer`, plan Phase 3) or arrived
+    /// through the passive-capture route (`passive_session`).
+    pub run_kind: RunKind,
+}
+
+impl Default for Provenance {
+    fn default() -> Self {
+        Self {
+            app_version: None,
+            run_id: None,
+            run_kind: RunKind::AgentAction,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +390,11 @@ pub(crate) struct EdgeDraft {
     pub to_node: Option<JourneyNode>,
     pub trigger: JourneyTrigger,
     pub outcome: EdgeOutcome,
+    /// The interaction timeline the action's own response carried (an
+    /// execute-with-diff `timeline`), ALREADY projected through
+    /// [`ChangeTimeline::for_ledger`] — the only value the row's `timeline`
+    /// column may hold (plan Phase 4). `None` = the action recorded none.
+    pub timeline: Option<Box<ChangeTimeline>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +404,7 @@ struct PendingEdge {
     trigger: JourneyTrigger,
     hint: Option<EdgeOutcome>,
     provenance: Provenance,
+    timeline: Option<Box<ChangeTimeline>>,
     opened_at: Instant,
 }
 
@@ -384,6 +422,7 @@ impl PendingEdge {
             to_node: to.map(|o| o.node.clone()),
             trigger: self.trigger,
             outcome,
+            timeline: self.timeline,
         }
     }
 }
@@ -393,6 +432,10 @@ struct Cursor {
     last: Option<Observed>,
     last_affordances: AffordanceIndex,
     pending: Option<PendingEdge>,
+    /// Snapshots resolved for this cursor so far (monotonic). The explorer
+    /// compares it across its own snapshot: no increase means that snapshot
+    /// never reached the worker (a dropped event), so the node is unknown.
+    snapshots: u64,
 }
 
 /// Per-cursor journey state: the last node resolved, its affordances, and at
@@ -417,6 +460,22 @@ impl Cursors {
         hint: Option<EdgeOutcome>,
         now: Instant,
     ) -> Option<EdgeDraft> {
+        self.open_with_timeline(key, action, provenance, hint, None, now)
+    }
+
+    /// [`Self::open`], carrying the action's interaction timeline onto the
+    /// pending edge so the row that edge closes into stores it. The caller
+    /// passes the [`ChangeTimeline::for_ledger`] projection, never the raw
+    /// timeline (it is re-projected at write time regardless — idempotent).
+    pub(crate) fn open_with_timeline(
+        &mut self,
+        key: &CursorKey,
+        action: &ActionSpec,
+        provenance: Provenance,
+        hint: Option<EdgeOutcome>,
+        timeline: Option<Box<ChangeTimeline>>,
+        now: Instant,
+    ) -> Option<EdgeDraft> {
         let cursor = self.map.entry(key.clone()).or_default();
         let displaced = cursor.pending.take().map(|p| p.close(key, None));
         cursor.pending = Some(PendingEdge {
@@ -429,6 +488,7 @@ impl Cursors {
             trigger: resolve_trigger(action, &cursor.last_affordances),
             hint,
             provenance,
+            timeline,
             opened_at: now,
         });
         displaced
@@ -454,8 +514,21 @@ impl Cursors {
             }
         });
         cursor.last = Some(observed);
+        cursor.snapshots += 1;
         cursor.last_affordances = affordances;
         closed
+    }
+
+    /// The cursor's position is no longer known: forget its last node and
+    /// affordances, so the next action opens its edge from the unknown node.
+    /// A pending edge closes as unobserved (returned, to be written). The
+    /// snapshot count is kept: it is monotonic for the explorer's freshness
+    /// check.
+    pub(crate) fn forget(&mut self, key: &CursorKey) -> Option<EdgeDraft> {
+        let cursor = self.map.get_mut(key)?;
+        cursor.last = None;
+        cursor.last_affordances = AffordanceIndex::default();
+        cursor.pending.take().map(|p| p.close(key, None))
     }
 
     /// Close every pending edge older than [`PENDING_TTL`] as unobserved.
@@ -469,6 +542,21 @@ impl Cursors {
             }
         }
         drafts
+    }
+
+    /// The node this runner last resolved for the cursor, if any — what the
+    /// explorer reads back to learn where it is (plan Phase 3), so it uses the
+    /// producer's own node identity rather than a second resolution.
+    pub(crate) fn last_node(&self, key: &CursorKey) -> Option<JourneyNode> {
+        self.map
+            .get(key)
+            .and_then(|c| c.last.as_ref())
+            .map(|o| o.node.clone())
+    }
+
+    /// Snapshots resolved for the cursor so far (0 when none).
+    pub(crate) fn snapshots_seen(&self, key: &CursorKey) -> u64 {
+        self.map.get(key).map_or(0, |c| c.snapshots)
     }
 
     /// Pending edges currently open, across every cursor.
@@ -490,6 +578,7 @@ mod tests {
             app_id: "qontinui-web".into(),
             runner_instance: "primary".into(),
             scope: None,
+            explorer: false,
         }
     }
 
@@ -527,6 +616,7 @@ mod tests {
                     navigation: false,
                 },
                 action_effects,
+                offers_click: true,
             },
         );
         idx
@@ -534,6 +624,45 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn forget_drops_the_position_closes_the_pending_edge_and_keeps_the_count() {
+        let now = t0();
+        let mut c = Cursors::default();
+        assert!(
+            c.forget(&key()).is_none(),
+            "an unknown cursor: nothing to do"
+        );
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            affordances_with("b", "fp-b"),
+            now,
+        );
+        c.open(&key(), &click("b"), Provenance::default(), None, now);
+        let closed = c
+            .forget(&key())
+            .expect("the pending edge closes, never silently dropped");
+        assert_eq!(closed.outcome, EdgeOutcome::ToNodeUnobserved);
+        assert_eq!(closed.to_node, None);
+        assert_eq!(closed.from_node.key(), node("home", &["idle"]).key());
+        assert_eq!(c.pending_count(), 0);
+        assert_eq!(c.last_node(&key()), None, "the position is forgotten");
+        assert_eq!(c.snapshots_seen(&key()), 1, "the snapshot count is kept");
+        // The next action runs from the UNKNOWN node, with no affordance to
+        // resolve its trigger against.
+        c.open(&key(), &click("b"), Provenance::default(), None, now);
+        let next = c
+            .observe(
+                &key(),
+                seen("detail", &["open"], "d2"),
+                AffordanceIndex::default(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(next.from_node.key(), unknown_node().key());
+        assert_eq!(next.trigger.target_fingerprint, None);
     }
 
     #[test]

@@ -145,7 +145,7 @@ pub(crate) fn validate_keep_alive_secs(secs: Option<u64>) -> Result<Option<i64>,
 /// Response returned from `POST /ui-bridge/apps/register`. Mirrors
 /// `DiscoveredApp` plus the runner's canonical view of the app's transport
 /// so the SDK can confirm it registered as expected.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterAppResponse {
     #[serde(flatten)]
@@ -169,6 +169,37 @@ pub struct RegisterAppResponse {
     /// without this echo a page that asked for an hour gets a 200 and no hint
     /// its entry dies in 30 s. `null` means the global default.
     pub keep_alive_ms: Option<i64>,
+}
+
+/// Whether passive real-session capture may relay from the registrant's
+/// origin (`journeyObserve` on the registration answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JourneyObserveAdmission {
+    /// Would `POST /apps/{app_id}/journey/observe` from THIS request's origin
+    /// be admitted by the origin guard now — the guard's own decision for
+    /// that route ([`crate::mcp::origin_guard::OriginGuard::would_admit`]):
+    /// its classification of this request's `Origin`, its route tables and
+    /// its current route policy, never a second copy of the trust list. A
+    /// relay the guard would only SHADOW-admit (logged and counted as a
+    /// would-be refusal under `enforce-doors` / `shadow`) reads `false`, so
+    /// an SDK that relays only on `true` adds nothing to the guard's
+    /// would-refuse readings. `null`: no origin guard admitted this
+    /// registration (a router built without one), so it is unknown — never
+    /// guessed; an SDK treats it as not admitted.
+    pub admitted: Option<bool>,
+}
+
+/// The answer of `POST /ui-bridge/apps/register`: the registry entry (the
+/// same shape `GET /ui-bridge/apps/registered` lists) plus what only the
+/// registration request can know — whether its origin may relay to the
+/// journey observe route. Present on EVERY success answer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterAppAnswer {
+    #[serde(flatten)]
+    pub registration: RegisterAppResponse,
+    pub journey_observe: JourneyObserveAdmission,
 }
 
 // ============================================================================
@@ -665,11 +696,18 @@ async fn ios_forward(
 /// refuses a browser with no usable `Origin`, R4 refuses a body `origin` /
 /// `baseUrl` that disagrees with the header and a browser-declared WebSocket
 /// transport, and R1/R5 refuse a claim on an id another principal holds.
+///
+/// Every success answer carries `journeyObserve.admitted`
+/// ([`JourneyObserveAdmission`]): whether the origin guard that admitted this
+/// registration would admit this origin's passive-capture relays to
+/// `POST /apps/{app_id}/journey/observe` — the SDK relays only on `true`.
 pub(crate) async fn register_app(
     State(state): State<RelayState>,
     requester: Option<Extension<RequesterPrincipal>>,
+    admitting: Option<Extension<crate::mcp::origin_guard::AdmittingGuard>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterAppRequest>,
-) -> Result<Json<ApiResponse<RegisterAppResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<RegisterAppAnswer>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::mcp::app_registry::AppTransport;
     use crate::mcp::relay_binding::{BindingMode, Principal, Refusal};
 
@@ -881,12 +919,21 @@ pub(crate) async fn register_app(
         principal.verified_origin(),
     );
 
-    Ok(Json(ApiResponse::success(RegisterAppResponse {
-        app,
-        transport,
-        verified_origin: principal.verified_origin(),
-        principal_class: principal.class_str(),
-        keep_alive_ms: claimed.keep_alive_ms,
+    let journey_observe = JourneyObserveAdmission {
+        admitted: crate::mcp::origin_guard::journey_observe_admitted(
+            admitting.as_ref().map(|e| &e.0),
+            &headers,
+        ),
+    };
+    Ok(Json(ApiResponse::success(RegisterAppAnswer {
+        registration: RegisterAppResponse {
+            app,
+            transport,
+            verified_origin: principal.verified_origin(),
+            principal_class: principal.class_str(),
+            keep_alive_ms: claimed.keep_alive_ms,
+        },
+        journey_observe,
     })))
 }
 
@@ -1198,10 +1245,11 @@ async fn dispatch_to_app_inner(
 ///   structured failure frame, or an HTTP app's `{success:false, code}` —
 ///   so a caller can branch on `NO_HANDLER` instead of parsing prose. Nothing
 ///   else ever lands in it.
-/// - `hint.failure_origin` is `"app"` when the app itself reported the
-///   failure and `"transport"` for everything else: a timeout, a disconnect,
-///   a displacement, an unreachable HTTP app, and a response frame the relay
-///   could not read, whose outcome is unknown.
+/// - `hint.failure_origin` is `sdk_client::dispatch_failure_origin`'s:
+///   `"app"` when the app itself reported the failure, `"unknown"` when it
+///   may have been reached but its answer could not be read (a timeout, a
+///   displacement, a response frame the relay could not read, a non-2xx or
+///   non-JSON reply), `"transport"` when the request was never delivered.
 /// - `hint.retryable` is the wrapper's own retry verdict when it sent one,
 ///   else `null`: UNKNOWN, never `false`.
 ///
@@ -1215,14 +1263,15 @@ async fn dispatch_to_app_inner(
 /// there.
 fn app_failure_response(err: &DispatchError) -> ApiResponse<serde_json::Value> {
     use crate::mcp::command_relay::CommandRelayError;
-    let (origin, code, retryable) = match err {
+    let origin = crate::mcp::sdk_client::dispatch_failure_origin(err);
+    let (code, retryable) = match err {
         DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
-            ("app", failure.code.clone(), failure.retryable)
+            (failure.code.clone(), failure.retryable)
         }
         DispatchError::AppAnswered {
             code, retryable, ..
-        } => ("app", code.clone(), *retryable),
-        _ => ("transport", None, None),
+        } => (code.clone(), *retryable),
+        _ => (None, None),
     };
     let mut body = match code {
         Some(code) => ApiResponse::error_with_code(err.to_user_message(), code),
@@ -1707,7 +1756,7 @@ mod tests {
     /// the wrapper's own `code` and retry verdict (coord finding `fb3fb468`);
     /// a bare-string refusal keeps the message alone, with retryability
     /// `null`; and a response frame the relay could not read is NOT the
-    /// app's failure — no app code, `failure_origin: "transport"`.
+    /// app's failure — no app code, `failure_origin: "unknown"`.
     #[tokio::test]
     async fn dispatch_to_app_inner_hands_on_the_wrappers_failure_code() {
         use crate::mcp::app_dispatch::AppDispatcher;
@@ -1741,7 +1790,7 @@ mod tests {
             (
                 Answer::Unreadable("invalid type: string \"no\", expected a boolean"),
                 None,
-                serde_json::json!({ "failure_origin": "transport", "retryable": null }),
+                serde_json::json!({ "failure_origin": "unknown", "retryable": null }),
                 "could not be read",
             ),
         ] {

@@ -224,6 +224,7 @@ mod tests {
             app_id: "app".into(),
             runner_instance: "primary".into(),
             scope: None,
+            explorer: false,
         };
         cursors.observe(&key, seen(), aff, now);
         cursors.open(
@@ -241,7 +242,8 @@ mod tests {
             .observe(&key, seen(), Default::default(), now)
             .expect("closed");
         let binds =
-            crate::journey::capture::edge_insert(&crate::journey::capture::finalize(edge)).unwrap();
+            crate::journey::capture::edge_insert(&crate::journey::capture::finalize(edge), None)
+                .unwrap();
         assert_eq!(binds.from_node_key, batch.node_key);
         assert_eq!(
             binds.target_fingerprint.as_ref(),
@@ -285,6 +287,7 @@ mod tests {
                         navigation: false,
                     },
                     action_effects: BTreeMap::new(),
+                    offers_click: true,
                 },
             );
         }
