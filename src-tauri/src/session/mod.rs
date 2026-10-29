@@ -62,6 +62,8 @@ pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
+pub(crate) mod coord_sync_drops; // Per-kind, per-reason counts of dropped session-outbox LIFECYCLE rows — /health sessionOutbox.lifecycleDrops (plan 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered, Phase 1)
+pub(crate) mod coord_sync_reregister; // A 404 session_not_found re-creates the coord row from a recorded create body (<outbox>.created.jsonl) and retries, instead of dropping the finish (plan 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered, Phase 2)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
@@ -1467,6 +1469,12 @@ impl SessionRegistry {
         // the DEFAULT binding, not an anonymous send, so resolving it here is
         // what keeps a non-default tenant's resume off the default tenant's
         // credential.
+        // Held across probe -> supersede mark -> fresh register, so no drain
+        // tick that starts in that span can 404 on the old id's queued rows and
+        // re-create it from its recorded create body while the fresh row is
+        // being made. A re-register already on the wire when the hold is taken
+        // is not stopped by it (see the `NotFound` arm).
+        let _hold = self.coord_sync.hold_drain(persisted_id);
         let probe = self
             .coord_sync
             .probe_resume(persisted_id, intent.tenant_id)
@@ -1504,6 +1512,16 @@ impl SessionRegistry {
                     session = %persisted_id,
                     "session: persisted coord session gone (404) — registering fresh"
                 );
+                // The pane abandons the old id for good. Rows still queued
+                // for it must not re-create it from its recorded create body
+                // (a zombie row nothing closes, or a
+                // `harness_session_already_bound` race that sends the fresh
+                // `started` into the conflict handler). Marked before the
+                // fresh row exists, under the drain hold taken above, so no
+                // tick that starts from here on can re-create it. The one
+                // window left is a re-register POST a tick already had on the
+                // wire before the hold — about one round trip at startup.
+                self.coord_sync.note_superseded(persisted_id);
                 self.register_external(intent)
             }
             ResumeProbe::Unreachable => {
