@@ -127,6 +127,7 @@ const R16: &str = "window lifecycle; ends the session rather than moving within 
 const R17: &str = "viewport configuration; not a UI affordance";
 const R18: &str = "clears browser storage; not a UI affordance";
 const R19: &str = "effect prediction; acts on nothing";
+const R20: &str = "dev control: swaps an image asset in place for a capture, then is undone (DELETE / TTL); alters rendering, activates no app affordance";
 
 /// POST routes that are not UI actions, each with the reason.
 const NOT_AN_ACTION: &[(&str, &str)] = &[
@@ -214,6 +215,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/control/forms/snapshot", R01),
     ("/ui-bridge/control/intents", R11),
     ("/ui-bridge/control/intents/find", R11),
+    ("/ui-bridge/control/media/override", R20),
     ("/ui-bridge/control/network-requests/wait", R02),
     ("/ui-bridge/control/network/stubs", R05),
     ("/ui-bridge/control/network/verify-stub", R05),
@@ -338,6 +340,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/sdk/control/find", R03),
     ("/ui-bridge/sdk/control/forms/diff", R01),
     ("/ui-bridge/sdk/control/forms/snapshot", R01),
+    ("/ui-bridge/sdk/control/media/override", R20),
     ("/ui-bridge/sdk/control/network-requests/wait", R02),
     ("/ui-bridge/sdk/control/page-evaluate", R12),
     ("/ui-bridge/sdk/control/page/find-by-text", R03),

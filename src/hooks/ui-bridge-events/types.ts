@@ -176,6 +176,12 @@ export type UIBridgeRequestType =
   | "media_compare"
   // Pixel-accurate visual regression diff
   | "image_diff"
+  // In-situ asset override — dev control (plan
+  // 2026-10-13-image-generation-and-visual-judgment, Phase 18); backs
+  // POST / DELETE / GET /ui-bridge/control/media/override.
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list"
   // Single-element screenshot with DOM fallback strategies
   | "capture_single_element"
   // Annotations import
@@ -454,7 +460,10 @@ export type MediaEventTypes =
   | "get_element_images"
   | "capture_single_element"
   | "image_diff"
-  | "media_compare";
+  | "media_compare"
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list";
 
 export type AnnotationEventTypes =
   | "annotations_list"
