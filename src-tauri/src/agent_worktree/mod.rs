@@ -74,6 +74,7 @@ pub mod fs_backstop;
 pub mod fs_observer;
 pub mod isolated_edit;
 pub mod maintenance_executor;
+mod materialize_serial;
 pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
@@ -2130,10 +2131,11 @@ async fn materialize_allocation(
         // serialized in-process rather than racing on its ref and worktree locks.
         // In-process only: a second runner instance on the box can still race
         // this checkout, and git's own ref/worktree locks then fail it loudly.
-        let checkout_lock = checkout_materialize_lock(&row.canonical);
-        let serialized = checkout_lock.lock().await;
-        let outcome = materialize_one_worktree(row, target_mode);
-        drop(serialized);
+        // The git work runs on the blocking pool with the checkout's lock moved
+        // into it, so neither the work nor its waiters hold an async worker
+        // (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+        // D2; see `materialize_serial`).
+        let outcome = materialize_serial::materialize_row(row, target_mode).await;
         match outcome {
             Ok(m) => materialized.push(m),
             Err(e) => {
@@ -2676,19 +2678,6 @@ fn cargo_override_is_backed(write_path: &str, contents: &str) -> bool {
             false
         }
     }
-}
-
-/// The in-process lock serializing worktree materialization against one shared
-/// checkout (see the `worktree` arm of [`allocate_and_materialize_with_claim`]).
-fn checkout_materialize_lock(canonical: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: once_cell::sync::Lazy<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > = once_cell::sync::Lazy::new(Default::default);
-    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    locks
-        .entry(worktree_resource_key(canonical))
-        .or_default()
-        .clone()
 }
 
 /// The `kind=worktree` claim for each planned row: keyed on the row's TARGET,

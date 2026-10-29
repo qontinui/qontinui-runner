@@ -280,6 +280,10 @@ mod model_gateway;
 // pick up. Must come before any module that panics during static init.
 mod skills;
 mod slash_commands;
+/// The synchronous steps of a session spawn (the PTY create, the session-cwd
+/// provisioning), run on the blocking pool instead of an async worker. Plan
+/// 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2.
+mod spawn_off_worker;
 mod spawn_placement;
 mod spec_api;
 mod spec_experimentation;
