@@ -800,6 +800,23 @@ pub struct FinishSessionRequest {
 ///   owed coord write (the retry door) and reports that attempt's verdict,
 ///   while on a synced mark it queues nothing (`reason: "not_requeued"`) —
 ///   read `session.finishSynced` for the current verdict.
+/// - `coord.delivery` reports DELIVERY, not enqueue (plan
+///   `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+///   Phase 4), decided after this call's own enqueue, in this precedence:
+///   `"acked"` (`session.finishSynced`: coord ACKed this mark's write) >
+///   `"pending"` (an unACKed `Finished` row for this mark is in the session
+///   outbox) > `"dropped:<reason>"` (the drain dropped the mark's row without
+///   coord taking it: `refused_4xx`, `not_found`, `quarantine_cap`,
+///   `quarantined` or `outbox_trim`, and nothing has re-queued it since; the
+///   record carries it as `session.finishDelivery`) > `"unknown"`. `unknown`
+///   covers an outbox that could not be read AND one that was read with no
+///   row for this mark and no drop recorded; it is never read as delivered.
+///   An unmark's delivery is not tracked (`unknown`).
+///   The retry door re-queues a `dropped` mark exactly as it re-offers any
+///   unsynced one, so on a call that re-queued it `delivery` reads `pending`
+///   and `coord.requeuedAfterDrop` (`{state, reason, at}`, else `null`)
+///   carries the drop it superseded. `dropped:<reason>` is therefore what a
+///   call answers when it could NOT re-queue (`coord.queued: false`).
 ///
 /// Honest local-only cases: a session whose harness id changed inside the
 /// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
@@ -1727,7 +1744,8 @@ mod tests {
             crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
                 .unwrap(),
         );
-        let reg = AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None);
+        let reg =
+            AiCoordRegistrar::with_tenant_resolver(outbox.clone(), uuid::Uuid::new_v4(), || None);
         reg.attach_terminal_coord_lookup(move |_| terminal_coord);
         let store = Arc::new(
             SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
@@ -1735,6 +1753,10 @@ mod tests {
         {
             let reg = reg.clone();
             store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+            // The `coord.delivery` probe, as main.rs attaches it.
+            store.attach_finish_pending_probe(move |rec| {
+                outbox.has_pending_finished(&rec.claude_session_id, rec.finished_at)
+            });
         }
         store.record_open(lifecycle::test_open_record("s"));
         (store, reg, dir)
@@ -1778,6 +1800,11 @@ mod tests {
             "the local mark landed"
         );
         assert_eq!(body["session"]["finishSynced"], false);
+        assert_eq!(
+            body["coord"]["delivery"], "unknown",
+            "nothing queued and nothing dropped is UNKNOWN, never acked: {body}"
+        );
+        assert!(body["coord"]["requeuedAfterDrop"].is_null());
     }
 
     #[test]
@@ -1790,6 +1817,87 @@ mod tests {
         assert_eq!(body["coord"]["queued"], true);
         assert_eq!(body["coord"]["coordSessionId"], coord_id.to_string());
         assert!(body["coord"]["reason"].is_null());
+        assert_eq!(
+            body["coord"]["delivery"], "pending",
+            "queued and unACKed is pending, not acked: {body}"
+        );
+    }
+
+    /// `coord.delivery` through the route (plan
+    /// `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4): `pending` while the row sits in the outbox; `dropped:<reason>`
+    /// once the drain dropped it and the call could NOT re-queue (no coord row
+    /// resolves any more); `pending` again, reporting the superseded drop,
+    /// once the retry door can re-queue; `acked` after coord's ACK.
+    #[test]
+    fn finish_route_reports_delivery_not_enqueue() {
+        let coord_id = uuid::Uuid::new_v4();
+        let resolves = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg =
+            AiCoordRegistrar::with_tenant_resolver(outbox.clone(), uuid::Uuid::new_v4(), || None);
+        {
+            let resolves = resolves.clone();
+            reg.attach_terminal_coord_lookup(move |_| {
+                resolves
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(coord_id)
+            });
+        }
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+            let probe = outbox.clone();
+            store.attach_finish_pending_probe(move |rec| {
+                probe.has_pending_finished(&rec.claude_session_id, rec.finished_at)
+            });
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+
+        let first = apply_finish(&store, "s", finish_req(Some("done"))).unwrap();
+        assert_eq!(first["coord"]["delivery"], "pending", "{first}");
+        let at = first["session"]["finishedAt"].as_i64();
+
+        // The drain drops every queued row (ACK-drop) and reports it.
+        let keys: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect();
+        outbox.ack(&keys).unwrap();
+        store.mark_finish_dropped("s", at, "refused_4xx");
+
+        // No coord row resolves now, so the read-back cannot re-queue.
+        resolves.store(false, std::sync::atomic::Ordering::SeqCst);
+        let dropped = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(dropped["coord"]["queued"], false);
+        assert_eq!(
+            dropped["coord"]["delivery"], "dropped:refused_4xx",
+            "a dropped finish is not reported as queued-and-fine: {dropped}"
+        );
+
+        // The retry door re-queues it once a row resolves.
+        resolves.store(true, std::sync::atomic::Ordering::SeqCst);
+        let retry = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(retry["changed"], "none");
+        assert_eq!(retry["coord"]["queued"], true);
+        assert_eq!(retry["coord"]["delivery"], "pending", "{retry}");
+        assert_eq!(retry["coord"]["requeuedAfterDrop"]["reason"], "refused_4xx");
+        assert!(retry["session"]["finishDelivery"].is_null());
+
+        // Coord ACKs: acked.
+        store.mark_finish_synced("s", at);
+        let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(read["coord"]["delivery"], "acked", "{read}");
+        assert!(read["session"]["finishDelivery"].is_null());
     }
 
     #[test]
@@ -1929,6 +2037,7 @@ mod tests {
         let read = apply_finish(&store, "s", finish_req(None)).unwrap();
         assert_eq!(read["session"]["finishSynced"], true, "{read}");
         assert_eq!(read["coord"]["reason"], "not_requeued");
+        assert_eq!(read["coord"]["delivery"], "acked");
         assert_eq!(read["session"]["finishedAt"], again_at);
     }
 

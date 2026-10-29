@@ -2515,6 +2515,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            finish_delivery: None,
             spawn_device_default: None,
             adopted_from: None,
         }

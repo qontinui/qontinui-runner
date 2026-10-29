@@ -1572,7 +1572,15 @@ impl AiCoordRegistrar {
                          to coord session {} — delivering the owed write",
                         rec.claude_session_id, target
                     );
-                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                    let sync =
+                        self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at);
+                    // A re-queue supersedes any recorded drop of this mark's
+                    // write (`coord.delivery` reads `pending` again). Map lock
+                    // only, so safe under `finish_forward`.
+                    if matches!(sync, FinishSync::Queued { .. }) {
+                        store.clear_finish_delivery(&rec.claude_session_id, rec.finished_at);
+                    }
+                    sync
                 })
                 .collect()
         })
@@ -3822,6 +3830,7 @@ mod tests {
                 wind_down_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_delivery: None,
                 spawn_device_default: None,
                 adopted_from: None,
             },
@@ -3924,6 +3933,7 @@ mod tests {
                 wind_down_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_delivery: None,
                 spawn_device_default: None,
                 adopted_from: None,
             },

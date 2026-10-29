@@ -130,6 +130,10 @@ fn trim_target(max_bytes: u64) -> u64 {
     max_bytes / 5 * 4
 }
 
+/// Bound on [`OutboxWriter::take_trimmed_finished`]'s backlog — far above any
+/// realistic number of finishes trimmed between two drain ticks.
+const TRIMMED_FINISHED_MAX: usize = 1024;
+
 /// A single outbox record. Persisted as one JSON line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxRecord {
@@ -323,6 +327,15 @@ pub struct OutboxWriter {
     /// coord never hears end). Surfaced via
     /// [`OutboxWriter::dropped_unacked_by_kind`].
     dropped_unacked_by_kind: Mutex<HashMap<String, u64>>,
+    /// `(claude_session_id, finished_at)` of every `finished` row the cap trim
+    /// dropped and the coord drain has not yet collected
+    /// ([`Self::take_trimmed_finished`]) — so the drain can tell the lifecycle
+    /// store that mark's write was lost (`coord.delivery: "dropped:outbox_trim"`,
+    /// plan `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4). Bounded at [`TRIMMED_FINISHED_MAX`]: with no drain collecting
+    /// it, the oldest entries go first (the per-kind counter above still
+    /// counts every one).
+    trimmed_finished: Mutex<Vec<(String, Option<i64>)>>,
     /// Group-commit state. Lock order is always `write_lock` → `commit`.
     commit: Mutex<CommitState>,
     commit_cv: Condvar,
@@ -369,6 +382,7 @@ impl OutboxWriter {
             max_bytes,
             dropped_unacked: AtomicU64::new(0),
             dropped_unacked_by_kind: Mutex::new(HashMap::new()),
+            trimmed_finished: Mutex::new(Vec::new()),
             commit: Mutex::new(CommitState {
                 written: 0,
                 durable: 0,
@@ -422,6 +436,59 @@ impl OutboxWriter {
             .lock()
             .map(|m| m.iter().map(|(k, n)| (k.clone(), *n)).collect())
             .unwrap_or_default()
+    }
+
+    /// Take (and forget) the `(claude_session_id, finished_at)` of every
+    /// `finished` row the cap trim dropped since the last call. A trimmed row
+    /// whose payload carries no `claude_session_id` is not listed (none is
+    /// written without one); it is still counted per kind.
+    pub fn take_trimmed_finished(&self) -> Vec<(String, Option<i64>)> {
+        self.trimmed_finished
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
+
+    /// READ-ONLY probe: is an unACKed `finished` row for this mark in the
+    /// outbox? Matched as the drain's ACK observer matches a record — the
+    /// payload's `claude_session_id`, and, when the row carries a
+    /// `finished_at`, that stamp equal to `finished_at` (a row of a superseded
+    /// stamp is not this mark's write).
+    ///
+    /// `Some(true)` / `Some(false)` on a successful read; `None` when the
+    /// outbox could not be read (an I/O error, a poisoned lock) — UNKNOWN,
+    /// never "no row". Unlike [`Self::pending`] it moves no drain state: it
+    /// validates a COPY of the cursor and scans from that copy's offset.
+    pub fn has_pending_finished(
+        &self,
+        claude_session_id: &str,
+        finished_at: Option<i64>,
+    ) -> Option<bool> {
+        let _guard = self.write_lock.lock().ok()?;
+        let mut cur = {
+            let real = self.cursor.lock().ok()?;
+            DrainCursor {
+                offset: real.offset,
+                anchor: real.anchor.clone(),
+                acked_ahead: real.acked_ahead.clone(),
+                frontier: Vec::new(),
+                unvalidated: real.unvalidated,
+            }
+        };
+        self.validate_cursor_locked(&mut cur).ok()?;
+        let scanned = read_from(&self.path, cur.offset).ok()?;
+        Some(scanned.iter().any(|s| {
+            let r = &s.rec;
+            r.acked_at.is_none()
+                && !cur.acked_ahead.contains(&(r.session_id, r.seq))
+                && r.event_kind == SessionEventKind::Finished.as_str()
+                && r.payload.get("claude_session_id").and_then(|v| v.as_str())
+                    == Some(claude_session_id)
+                && r.payload
+                    .get("finished_at")
+                    .and_then(|v| v.as_i64())
+                    .is_none_or(|at| Some(at) == finished_at)
+        }))
     }
 
     /// fsyncs the group committer has issued since open. One per commit
@@ -683,6 +750,7 @@ impl OutboxWriter {
         let mut drop_flags = vec![false; kept.len()];
         let mut dropped_unacked = 0usize;
         let mut dropped_by_kind: HashMap<&str, u64> = HashMap::new();
+        let mut trimmed_finished: Vec<(String, Option<i64>)> = Vec::new();
         for (i, rec) in kept.iter().enumerate() {
             if live <= target {
                 break;
@@ -694,6 +762,25 @@ impl OutboxWriter {
             live -= sizes[i];
             dropped_unacked += 1;
             *dropped_by_kind.entry(rec.event_kind.as_str()).or_insert(0) += 1;
+            if rec.event_kind == SessionEventKind::Finished.as_str() {
+                if let Some(csid) = rec
+                    .payload
+                    .get("claude_session_id")
+                    .and_then(|v| v.as_str())
+                {
+                    trimmed_finished.push((
+                        csid.to_string(),
+                        rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+                    ));
+                }
+            }
+        }
+        if !trimmed_finished.is_empty() {
+            if let Ok(mut stash) = self.trimmed_finished.lock() {
+                stash.extend(trimmed_finished);
+                let excess = stash.len().saturating_sub(TRIMMED_FINISHED_MAX);
+                stash.drain(..excess);
+            }
         }
 
         if dropped_unacked > 0 {
@@ -1484,6 +1571,53 @@ mod tests {
         assert!(!pending.is_empty());
         assert_eq!(pending.last().unwrap().seq, 400);
         assert!(pending.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    /// The `coord.delivery` probe (plan
+    /// 2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered,
+    /// Phase 4) answers only for an unACKed `finished` row of THIS mark — the
+    /// payload's `claude_session_id` and, when present, `finished_at` — and
+    /// moves no drain state.
+    #[test]
+    fn has_pending_finished_matches_the_mark_and_is_read_only() {
+        let dir = tempdir().unwrap();
+        let outbox = OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap();
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(outbox.has_pending_finished("c", Some(5)), Some(false));
+
+        let row = outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::Finished,
+                json!({ "id": s, "claude_session_id": "c", "finished_at": 5 }),
+            )
+            .unwrap();
+        outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::Heartbeat,
+                json!({ "id": s, "claude_session_id": "other" }),
+            )
+            .unwrap();
+        assert_eq!(outbox.has_pending_finished("c", Some(5)), Some(true));
+        assert_eq!(
+            outbox.has_pending_finished("c", Some(6)),
+            Some(false),
+            "a row of a superseded stamp is not this mark's write"
+        );
+        assert_eq!(outbox.has_pending_finished("other", None), Some(false));
+        // Read-only: the drain still sees both rows.
+        assert_eq!(outbox.pending().unwrap().len(), 2);
+        assert_eq!(outbox.has_pending_finished("c", Some(5)), Some(true));
+
+        outbox.ack(&[(row.session_id, row.seq)]).unwrap();
+        assert_eq!(
+            outbox.has_pending_finished("c", Some(5)),
+            Some(false),
+            "an ACKed (or ACK-dropped) row is no longer pending"
+        );
     }
 
     /// The trim's loss is counted by `event_kind`, so `GET /health` can say a

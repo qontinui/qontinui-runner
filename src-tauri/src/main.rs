@@ -3967,6 +3967,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // CoordSync drain loop drains (registration reuses the existing
                 // drain → auth → retry → 409-idempotency machinery).
                 let registrar_outbox = outbox.clone();
+                // Read-only handle for the finish route's `coord.delivery`
+                // probe (`SessionLifecycleStore::attach_finish_pending_probe`).
+                let finish_probe_outbox = outbox.clone();
                 let coord_sync_facade = session::coord_sync::CoordSync::new(outbox);
                 let pty_transport: session::DynTransport =
                     std::sync::Arc::new(session::transport::pty::PtyTransport::new(
@@ -4369,6 +4372,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(s) = store.upgrade() {
                             s.mark_finish_synced(csid, finished_at);
                         }
+                    });
+                    // The drop twin: a `finished` row the drain drops without
+                    // coord taking it stamps `finish_delivery`, so the finish
+                    // route answers `coord.delivery: "dropped:<reason>"`.
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_drop_observer(
+                        move |csid, finished_at, reason| {
+                            if let Some(s) = store.upgrade() {
+                                s.mark_finish_dropped(csid, finished_at, reason);
+                            }
+                        },
+                    );
+                    lifecycle_store.attach_finish_pending_probe(move |rec| {
+                        finish_probe_outbox
+                            .has_pending_finished(&rec.claude_session_id, rec.finished_at)
                     });
                 }
                 // Append-only session-snapshot HISTORY (session-restore

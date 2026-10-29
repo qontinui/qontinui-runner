@@ -229,6 +229,19 @@ struct CoordSyncInner {
     /// permanent failure is ACK-dropped from the outbox but NOT synced.
     /// Unattached (tests, pre-wiring) → the flag is never stamped.
     finished_ack_observer: OnceLock<FinishedAckObserver>,
+    /// The twin of `finished_ack_observer` for the opposite outcome (plan
+    /// `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4): invoked with the payload's `claude_session_id`, its
+    /// `finished_at` and the drop's wire reason whenever a `finished` row
+    /// leaves the outbox WITHOUT coord taking it — the `PermanentFailure`
+    /// ACK-drop (`refused_4xx` / `not_found`), the quarantine sidecar
+    /// (`quarantined`, or `quarantine_cap` when the sidecar is full) and the
+    /// outbox's own cap trim (`outbox_trim`, collected from the writer each
+    /// tick). main.rs attaches `SessionLifecycleStore::mark_finish_dropped`,
+    /// which is what lets the finish route answer `coord.delivery:
+    /// "dropped:<reason>"`. A HELD row (`RowMissing`) is not a drop and does
+    /// not fire. Unattached (tests, pre-wiring) → drops are counted only.
+    finished_drop_observer: OnceLock<FinishedDropObserver>,
     /// The outside observer of coord's OWN liveness (plan
     /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
     /// Phase 3b). `Some` in production, `None` under
@@ -259,6 +272,10 @@ struct CoordSyncInner {
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
 struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
+
+/// Boxed `finished`-drop callback (see `CoordSyncInner::finished_drop_observer`):
+/// `(claude_session_id, finished_at, reason)`.
+struct FinishedDropObserver(Box<dyn Fn(&str, Option<i64>, &str) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -314,6 +331,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
+                finished_drop_observer: OnceLock::new(),
                 outside_observer: Some(Arc::new(
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
@@ -350,6 +368,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
+                finished_drop_observer: OnceLock::new(),
                 // Inert by construction under test: the heartbeat harness
                 // drives this loop on a millisecond cadence against a fake
                 // coord that serves no `/mcp`, and an observer here would
@@ -458,6 +477,24 @@ impl CoordSync {
             .is_err()
         {
             tracing::warn!("coord_sync: finished-ACK observer already attached — ignoring");
+        }
+    }
+
+    /// Attach the `finished`-drop observer (once, at startup) — invoked with
+    /// the `claude_session_id`, `finished_at` and drop reason of each
+    /// `finished` row the drain drops without coord taking it. See
+    /// `CoordSyncInner::finished_drop_observer`.
+    pub fn attach_finished_drop_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>, &str) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_drop_observer
+            .set(FinishedDropObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-drop observer already attached — ignoring");
         }
     }
 
@@ -1443,10 +1480,9 @@ async fn push_chain(
                 // `started` row is a session coord will never know about.
                 let (fail_kind, fail_status) = classify_push_failure(&reason, true);
                 note_outbox_failure(fail_kind, fail_status);
-                inner.lifecycle_drops.record(
-                    &rec.event_kind,
-                    LifecycleDropReason::for_permanent_failure(fail_status, &reason),
-                );
+                let drop_reason = LifecycleDropReason::for_permanent_failure(fail_status, &reason);
+                inner.lifecycle_drops.record(&rec.event_kind, drop_reason);
+                notify_finished_drop(&inner, &rec, drop_reason.as_str());
                 tracing::error!(
                     session = %rec.session_id,
                     seq = rec.seq,
@@ -1574,6 +1610,7 @@ fn quarantine_rows(
             inner
                 .lifecycle_drops
                 .record(&r.event_kind, LifecycleDropReason::QuarantineCap);
+            notify_finished_drop(inner, r, LifecycleDropReason::QuarantineCap.as_str());
         }
         done.extend(fresh.iter().map(|r| (r.session_id, r.seq)));
         return done;
@@ -1583,6 +1620,10 @@ fn quarantine_rows(
             for r in &fresh {
                 state.in_sidecar.insert((r.session_id, r.seq));
                 done.push((r.session_id, r.seq));
+                // Sidecarred is not counted as a drop (the row is kept on
+                // disk), but coord will never receive it: for the finish
+                // route's `coord.delivery` it is gone all the same.
+                notify_finished_drop(inner, r, FINISHED_DROP_QUARANTINED);
             }
         }
         Err(e) => tracing::warn!(
@@ -1597,6 +1638,13 @@ fn quarantine_rows(
 /// One drain pass over the outbox. Split out of [`run_drain_loop`] so a test
 /// can drive ticks deterministically.
 async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> TickResult {
+    // `finished` rows the outbox's own cap trim dropped since the last tick
+    // (the trim runs on the writer's append path, which has no observer).
+    for (csid, finished_at) in inner.outbox.take_trimmed_finished() {
+        if let Some(obs) = inner.finished_drop_observer.get() {
+            (obs.0)(&csid, finished_at, LifecycleDropReason::OutboxTrim.as_str());
+        }
+    }
     // Read the pending rows and the held set as ONE snapshot, under the held
     // lock (order: held -> the outbox's write lock). Reading them separately
     // let a confirmation finish in between: the row was pending, the hold was
@@ -1874,6 +1922,40 @@ fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
             session = %rec.session_id,
             seq = rec.seq,
             "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
+        ),
+    }
+}
+
+/// The `finished_drop_observer` reason for a `finished` row moved to the
+/// quarantine sidecar (written, not dropped — so it is no
+/// `LifecycleDropReason`, but coord never receives it).
+const FINISHED_DROP_QUARANTINED: &str = "quarantined";
+
+/// Tell the lifecycle store a `finished` row left the outbox WITHOUT coord
+/// taking it — the twin of [`notify_finished_ack`], keyed the same way (the
+/// payload's `claude_session_id` and `finished_at`). Any other kind is ignored.
+fn notify_finished_drop(inner: &CoordSyncInner, rec: &OutboxRecord, reason: &str) {
+    if rec.event_kind != SessionEventKind::Finished.as_str() {
+        return;
+    }
+    let Some(obs) = inner.finished_drop_observer.get() else {
+        return;
+    };
+    match rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        Some(csid) => (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            reason,
+        ),
+        None => tracing::warn!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            reason,
+            "coord_sync: finished record dropped without a claude_session_id — cannot mark it dropped"
         ),
     }
 }
@@ -8105,6 +8187,270 @@ mod tests {
             0,
             "a 404 that is not session_not_found never re-registers"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // finished_drop_observer (plan 2026-10-29-session-outbox-drops-the-
+    // finish-of-a-session-coord-never-registered, Phase 4)
+    // -----------------------------------------------------------------
+
+    type DropLog = Arc<std::sync::Mutex<Vec<(String, Option<i64>, String)>>>;
+
+    fn attach_drop_log(coord: &CoordSync) -> DropLog {
+        let log: DropLog = Default::default();
+        let l = log.clone();
+        coord.attach_finished_drop_observer(move |csid, at, reason| {
+            l.lock()
+                .unwrap()
+                .push((csid.to_string(), at, reason.to_string()))
+        });
+        log
+    }
+
+    /// A `finished` row coord REFUSES (422) is ACK-dropped — and the drop
+    /// observer is told, with the row's own key and the `refused_4xx` reason,
+    /// while the ACK observer is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drop_observer_fires_for_a_refused_finished_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.patch_status = Some(422);
+            g.patch_status_body = Some(json!({"error": "invalid_state"}));
+        }
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let dropped = attach_drop_log(&coord);
+        let acked: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        {
+            let acked = acked.clone();
+            coord.attach_finished_ack_observer(move |csid, _| {
+                acked.lock().unwrap().push(csid.to_string())
+            });
+        }
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Finished,
+                json!({ "id": s, "claude_session_id": "csid-422", "finished_at": 11 }),
+            )
+            .unwrap();
+        // A non-finished lifecycle row refused beside it is NOT reported.
+        let other = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                other,
+                SessionEventKind::StateChange,
+                json!({ "id": other, "claude_session_id": "csid-other", "state": "idle" }),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "both rows ACK-dropped"
+        );
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            vec![("csid-422".to_string(), Some(11), "refused_4xx".to_string())]
+        );
+        assert!(acked.lock().unwrap().is_empty(), "a refusal is not an ACK");
+    }
+
+    /// The other two drop paths: the quarantine sidecar (written →
+    /// `quarantined`; at its cap → `quarantine_cap`) and the outbox's own cap
+    /// trim (`outbox_trim`, collected by the next drain tick).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drop_observer_fires_for_quarantined_and_trimmed_finished_rows() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let dropped = attach_drop_log(&coord);
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let finished = |csid: &str| {
+            outbox
+                .record(
+                    m,
+                    s,
+                    SessionEventKind::Finished,
+                    json!({ "id": s, "claude_session_id": csid, "finished_at": 1 }),
+                )
+                .unwrap()
+        };
+        let mut state = DrainState::default();
+        quarantine_rows(&coord.inner, &mut state, vec![finished("q-written")]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(quarantine_path(&outbox))
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        quarantine_rows(&coord.inner, &mut state, vec![finished("q-cap")]);
+        let reasons: Vec<(String, String)> = dropped
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _, r)| (c.clone(), r.clone()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("q-written".to_string(), "quarantined".to_string()),
+                ("q-cap".to_string(), "quarantine_cap".to_string()),
+            ]
+        );
+
+        // The trim: a small-cap outbox whose oldest row is a `finished` row.
+        let trim_dir = tempfile::tempdir().unwrap();
+        let small = Arc::new(
+            OutboxWriter::open_with_max_bytes(trim_dir.path().join("outbox.jsonl"), 16 * 1024)
+                .unwrap(),
+        );
+        let trim_coord = CoordSync::new_for_test(
+            small.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let trimmed = attach_drop_log(&trim_coord);
+        small
+            .record(
+                m,
+                s,
+                SessionEventKind::Finished,
+                json!({ "id": s, "claude_session_id": "trimmed", "finished_at": 3 }),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            small
+                .record(
+                    m,
+                    s,
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        assert!(trimmed.lock().unwrap().is_empty(), "reported by the drain");
+        drain_tick(&trim_coord.inner, &mut DrainState::default()).await;
+        assert_eq!(
+            *trimmed.lock().unwrap(),
+            vec![("trimmed".to_string(), Some(3), "outbox_trim".to_string())]
+        );
+        drain_tick(&trim_coord.inner, &mut DrainState::default()).await;
+        assert_eq!(trimmed.lock().unwrap().len(), 1, "reported once");
+    }
+
+    /// End to end, wired as main.rs wires it (registrar forwarder, outbox
+    /// probe, both observers): a finish is `pending`; coord refuses it and it
+    /// reads `dropped:refused_4xx`; the reason-less retry door re-queues it
+    /// (`pending`, the drop note cleared and reported as superseded); coord
+    /// ACKs the retry and it reads `acked` with `finish_delivery` cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_finish_is_re_queued_by_the_retry_door_and_then_acked() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::session::session_lifecycle_store::{
+            self as lifecycle, FinishDeliveryVerdict, FinishSync, SessionLifecycleStore,
+        };
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_status = Some(422);
+        rec.lock().await.patch_status_body = Some(json!({"error": "invalid_state"}));
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let coord_id = Uuid::new_v4();
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_id));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |r| reg.forward_finish_change(r));
+            let probe = outbox.clone();
+            store.attach_finish_pending_probe(move |r| {
+                probe.has_pending_finished(&r.claude_session_id, r.finished_at)
+            });
+            let st = Arc::downgrade(&store);
+            coord.attach_finished_ack_observer(move |csid, at| {
+                if let Some(s) = st.upgrade() {
+                    s.mark_finish_synced(csid, at);
+                }
+            });
+            let st = Arc::downgrade(&store);
+            coord.attach_finished_drop_observer(move |csid, at, reason| {
+                if let Some(s) = st.upgrade() {
+                    s.mark_finish_dropped(csid, at, reason);
+                }
+            });
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+
+        let first = store.set_finished("s", true, Some("done".into())).unwrap();
+        assert!(matches!(first.coord, FinishSync::Queued { .. }));
+        assert_eq!(first.response_json()["coord"]["delivery"], "pending");
+
+        // Coord refuses the row: ACK-dropped, and the mark records it.
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+        assert!(outbox.pending().unwrap().is_empty());
+        let after_drop = store.get("s").unwrap();
+        assert_eq!(
+            after_drop
+                .finish_delivery
+                .as_ref()
+                .map(|d| d.reason.as_str()),
+            Some("refused_4xx")
+        );
+        assert_eq!(
+            FinishDeliveryVerdict::decide(
+                &after_drop,
+                outbox.has_pending_finished("s", after_drop.finished_at)
+            )
+            .as_wire(),
+            "dropped:refused_4xx",
+            "with no row left and nothing re-queued, the mark reads dropped"
+        );
+
+        // The retry door (reason-less) re-queues the dropped mark.
+        let retry = store.set_finished("s", true, None).unwrap().response_json();
+        assert_eq!(retry["changed"], "none");
+        assert_eq!(retry["coord"]["queued"], true);
+        assert_eq!(retry["coord"]["delivery"], "pending", "{retry}");
+        assert_eq!(retry["coord"]["requeuedAfterDrop"]["reason"], "refused_4xx");
+        assert!(retry["session"]["finishDelivery"].is_null(), "{retry}");
+        assert!(store.get("s").unwrap().finish_delivery.is_none());
+
+        // Coord takes the retry: acked, drop note gone.
+        rec.lock().await.patch_status = None;
+        drain_tick(&coord.inner, &mut DrainState::default()).await;
+        assert!(outbox.pending().unwrap().is_empty());
+        let read = store.set_finished("s", true, None).unwrap().response_json();
+        assert_eq!(read["session"]["finishSynced"], true, "{read}");
+        assert_eq!(read["coord"]["delivery"], "acked");
+        assert!(read["coord"]["requeuedAfterDrop"].is_null());
+        assert!(store.get("s").unwrap().finish_delivery.is_none());
     }
 
     /// Plan A3 — an ABANDONED session (heartbeats ceased) must NOT

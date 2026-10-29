@@ -515,6 +515,91 @@ impl SessionIdentityUpdate {
     }
 }
 
+/// What became of a finished mark's coord write when it did NOT reach coord —
+/// [`TerminalSessionRecord::finish_delivery`]. Only the `dropped` state is
+/// recorded: `acked` is `finish_synced`, and `pending` is a property of the
+/// outbox read at answer time, never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinishDelivery {
+    pub state: FinishDeliveryState,
+    /// Why the drain dropped the row — `refused_4xx`, `not_found`,
+    /// `quarantine_cap`, `quarantined` or `outbox_trim`.
+    pub reason: String,
+    /// When the drop was observed, unix epoch millis.
+    pub at: i64,
+}
+
+/// The one recorded [`FinishDelivery`] state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishDeliveryState {
+    /// The `Finished` row left the outbox without coord taking it.
+    Dropped,
+}
+
+/// Where a finished mark's coord write stands — `coord.delivery` in the finish
+/// route's response ([`FinishOutcome::response_json`]). Decided by
+/// [`SessionLifecycleStore::set_finished`] after its own enqueue, in this
+/// precedence:
+///
+/// 1. [`Self::Acked`] — `finish_synced`: coord ACKed this mark's write.
+/// 2. [`Self::Pending`] — the outbox holds an unACKed `Finished` row for this
+///    mark (keyed as the ACK observer keys it: the payload's
+///    `claude_session_id`, and its `finished_at` when it carries one). Ranked
+///    above `dropped` because a re-queue after a drop is a live retry, and a
+///    drop observed while its own row is still in the outbox (the ACK lands a
+///    moment after the observer) must not read as final.
+/// 3. [`Self::Dropped`] — `finish_delivery` is set: the drain dropped this
+///    mark's row and nothing has re-queued it since (a re-queue clears it).
+///    It is a recorded fact, so it stands even when the outbox is unreadable.
+/// 4. [`Self::Unknown`] — everything else: the outbox could not be read (or
+///    no probe is attached), OR it was read, holds no row for this mark, and
+///    no drop was recorded. The second case is not provably a loss — a row
+///    ACKed by an observer-less path, or trimmed by a build predating the
+///    trim notice, leaves exactly this — so it is never rendered `acked`, and
+///    `coord.queued` / `coord.reason` already name a mark that was never
+///    queued at all. An unmarked session is `unknown` too: an unmark's write
+///    is a `working` progress row this field does not track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishDeliveryVerdict {
+    Acked,
+    Pending,
+    Dropped(String),
+    Unknown,
+}
+
+impl FinishDeliveryVerdict {
+    /// Decide the verdict for `rec`. `pending` is the outbox probe's answer:
+    /// `Some(true)` a row for this mark is queued, `Some(false)` none is,
+    /// `None` the outbox could not be read.
+    pub fn decide(rec: &TerminalSessionRecord, pending: Option<bool>) -> Self {
+        if rec.finished_at.is_none() {
+            return Self::Unknown;
+        }
+        if rec.finish_synced {
+            return Self::Acked;
+        }
+        if pending == Some(true) {
+            return Self::Pending;
+        }
+        if let Some(d) = &rec.finish_delivery {
+            return Self::Dropped(d.reason.clone());
+        }
+        Self::Unknown
+    }
+
+    /// The wire spelling: `acked`, `pending`, `dropped:<reason>`, `unknown`.
+    pub fn as_wire(&self) -> String {
+        match self {
+            Self::Acked => "acked".to_string(),
+            Self::Pending => "pending".to_string(),
+            Self::Dropped(reason) => format!("dropped:{reason}"),
+            Self::Unknown => "unknown".to_string(),
+        }
+    }
+}
+
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -811,9 +896,23 @@ pub struct TerminalSessionRecord {
     /// only by an outbox row already queued (or a re-run). A write coord
     /// REFUSES (4xx) is ACK-dropped and not retried until the next
     /// registration or re-run — the flag stays `false`, which is the honest
-    /// reading.
+    /// reading, and [`Self::finish_delivery`] records the drop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
+    /// Set when the drain DROPPED this mark's `Finished` row without coord
+    /// taking it (plan
+    /// `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4) — a 4xx refusal, a quarantine, or an outbox trim. Stamped by
+    /// [`SessionLifecycleStore::mark_finish_dropped`] (the coord drain's
+    /// `finished_drop_observer`), only for the row of the CURRENT mark.
+    ///
+    /// Cleared by [`SessionLifecycleStore::mark_finish_synced`], by any
+    /// re-queue of the mark (the reason-less retry door, a restamp, a late
+    /// delivery) and by an unmark — so a `Some` here is the latest known fact
+    /// about the current mark's coord write. `None` on every record written
+    /// before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_delivery: Option<FinishDelivery>,
     /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
     /// WAS SPAWNED (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
@@ -1038,6 +1137,15 @@ pub struct SessionLifecycleStore {
     /// keeps an unmark from leaving coord saying `finished`. Unattached
     /// (tests, ephemeral fallbacks) → every change stays local-only.
     finish_observer: OnceLock<FinishObserver>,
+    /// Optional outbox probe for the finish route's `coord.delivery` (plan
+    /// `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4): answers whether an unACKed `Finished` row for the given
+    /// record's CURRENT mark is in the session outbox — `Some(true)` /
+    /// `Some(false)`, or `None` when the outbox could not be read. main.rs
+    /// attaches `OutboxWriter::has_pending_finished`. Read-only. Unattached
+    /// (tests, ephemeral fallbacks) → every probe is `None`, so the verdict
+    /// can be `unknown` but never `pending`.
+    finish_pending_probe: OnceLock<FinishPendingProbe>,
     /// Unix millis at which THIS runner process booted — the line between the
     /// PRIOR process's rows and this one's own activity. The restore anchor
     /// ([`RestoreAnchors`]) judges a row stamped before it against the prior
@@ -1074,6 +1182,15 @@ struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
 /// Boxed finish-observer callback (see `SessionLifecycleStore::finish_observer`).
 /// Returns whether the change it was told about reached the coord outbox.
 struct FinishObserver(Box<dyn Fn(&TerminalSessionRecord) -> FinishSync + Send + Sync>);
+
+/// Boxed outbox probe (see `SessionLifecycleStore::finish_pending_probe`).
+struct FinishPendingProbe(Box<dyn Fn(&TerminalSessionRecord) -> Option<bool> + Send + Sync>);
+
+impl std::fmt::Debug for FinishPendingProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinishPendingProbe")
+    }
+}
 
 /// Whether a finished-marker change was handed to coord — the verdict
 /// `POST /sessions/{id}/finish` reports, so a local-only mark can never read
@@ -1161,6 +1278,15 @@ pub struct FinishOutcome {
     pub record: TerminalSessionRecord,
     pub changed: FinishChange,
     pub coord: FinishSync,
+    /// Where the mark's coord write stands AFTER this call's own enqueue —
+    /// `coord.delivery`. See [`FinishDeliveryVerdict`].
+    pub delivery: FinishDeliveryVerdict,
+    /// The drop THIS call's re-queue superseded — `coord.requeuedAfterDrop`.
+    /// `Some` only when the mark's previous write had been dropped and this
+    /// call queued it again (the retry door, or a restamp), so a caller whose
+    /// every call re-queues still learns the last write was lost even though
+    /// `delivery` now reads `pending`.
+    pub requeued_after_drop: Option<FinishDelivery>,
 }
 
 impl FinishOutcome {
@@ -1173,12 +1299,29 @@ impl FinishOutcome {
     ///  "changed": "marker" | "none",
     ///  "coord": {"queued": bool, "coordSessionId": <uuid|null>,
     ///            "reason": null | "no_coord_session" | "outbox_write_failed"
-    ///                      | "no_forwarder" | "not_requeued"}}
+    ///                      | "no_forwarder" | "not_requeued",
+    ///            "delivery": "acked" | "pending" | "dropped:<reason>" | "unknown",
+    ///            "requeuedAfterDrop": null | {"state": "dropped", "reason": <str>, "at": <ms>}}}
     /// ```
     ///
     /// `coord.queued` is decided at enqueue time; `session.finishSynced` is
     /// the later verdict the drain's ACK stamps. A caller that must know coord
     /// APPLIED the mark re-reads `finishSynced`.
+    ///
+    /// `coord.delivery` reports DELIVERY, not enqueue (plan
+    /// `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`,
+    /// Phase 4): `acked` (= `finishSynced`), `pending` (an unACKed `Finished`
+    /// row for this mark is in the outbox), `dropped:<reason>` (the drain
+    /// dropped the row and nothing re-queued it — `refused_4xx`, `not_found`,
+    /// `quarantine_cap`, `quarantined`, `outbox_trim`), or `unknown`. The
+    /// precedence and why `unknown` covers a read outbox with no row:
+    /// [`FinishDeliveryVerdict`]. A `dropped` mark is re-queued by the
+    /// reason-less retry door exactly as an unsynced one is, after which it
+    /// reads `pending` — and that call's `coord.requeuedAfterDrop` carries the
+    /// drop it superseded, so a caller whose read-back is itself the retry
+    /// still sees the loss. `dropped:<reason>` is therefore what a call answers
+    /// when it could NOT re-queue (no coord row resolves, the outbox write
+    /// failed).
     ///
     /// `changed: "marker"` on an already-finished session is a RESTAMP: the
     /// mark's `finishedAt` moved to now and `finishSynced` is `false` again
@@ -1207,6 +1350,17 @@ impl FinishOutcome {
             obj.insert(
                 "finishSynced".to_string(),
                 serde_json::Value::Bool(self.record.finish_synced),
+            );
+        }
+        let mut coord = coord;
+        if let Some(obj) = coord.as_object_mut() {
+            obj.insert(
+                "delivery".to_string(),
+                serde_json::Value::String(self.delivery.as_wire()),
+            );
+            obj.insert(
+                "requeuedAfterDrop".to_string(),
+                serde_json::to_value(&self.requeued_after_drop).unwrap_or(serde_json::Value::Null),
             );
         }
         serde_json::json!({
@@ -1263,6 +1417,7 @@ impl SessionLifecycleStore {
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
+            finish_pending_probe: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
         };
@@ -1311,6 +1466,21 @@ impl SessionLifecycleStore {
             .is_err()
         {
             warn!("session_lifecycle_store: finish observer already attached — ignoring");
+        }
+    }
+
+    /// Attach the outbox probe behind `coord.delivery` (once, at startup). See
+    /// the `finish_pending_probe` field doc.
+    pub fn attach_finish_pending_probe(
+        &self,
+        f: impl Fn(&TerminalSessionRecord) -> Option<bool> + Send + Sync + 'static,
+    ) {
+        if self
+            .finish_pending_probe
+            .set(FinishPendingProbe(Box::new(f)))
+            .is_err()
+        {
+            warn!("session_lifecycle_store: finish pending probe already attached — ignoring");
         }
     }
 
@@ -2606,13 +2776,36 @@ impl SessionLifecycleStore {
             } else {
                 FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
             };
+            // The retry door RE-QUEUES a dropped mark the same way it re-offers
+            // any unsynced one: once the row is back in the outbox the drop
+            // note no longer describes the mark's write, so it is cleared.
+            // That is bookkeeping, not a marker write — `changed` stays `none`.
+            let (record, requeued_after_drop) = if matches!(coord, FinishSync::Queued { .. }) {
+                let prior = current.finish_delivery.clone();
+                let record = self
+                    .clear_finish_delivery(claude_session_id, current.finished_at)
+                    .unwrap_or(current);
+                (record, prior)
+            } else {
+                (current, None)
+            };
+            let delivery = self.delivery_verdict(&record);
             return Ok(FinishOutcome {
-                record: current,
+                record,
                 changed: FinishChange::None,
                 coord,
+                delivery,
+                requeued_after_drop,
             });
         }
 
+        // A restamp supersedes the old mark's recorded drop (cleared below);
+        // kept here so the response can say the re-queue replaced a loss.
+        let prior_drop = if finished {
+            rec.finish_delivery.clone()
+        } else {
+            None
+        };
         if finished {
             rec.finished_at = Some(match rec.finished_at {
                 None => now,
@@ -2621,8 +2814,10 @@ impl SessionLifecycleStore {
             });
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
-            // meanwhile.
+            // meanwhile. A drop recorded against the OLD stamp no longer
+            // describes this mark.
             rec.finish_synced = false;
+            rec.finish_delivery = None;
             if let Some(r) = reason {
                 rec.finish_reason = Some(r);
             }
@@ -2633,6 +2828,7 @@ impl SessionLifecycleStore {
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
+            rec.finish_delivery = None;
         }
 
         let changed = rec.clone();
@@ -2648,11 +2844,109 @@ impl SessionLifecycleStore {
         // means it really changed). A duplicate enqueue is harmless: both coord
         // writes are idempotent path-addressed PATCHes.
         let coord = self.forward_finish_change(&changed);
+        let delivery = self.delivery_verdict(&changed);
+        let requeued_after_drop = prior_drop.filter(|_| matches!(coord, FinishSync::Queued { .. }));
         Ok(FinishOutcome {
             record: changed,
             changed: FinishChange::Marker,
             coord,
+            delivery,
+            requeued_after_drop,
         })
+    }
+
+    /// The `coord.delivery` verdict for `rec` as it now stands — see
+    /// [`FinishDeliveryVerdict`]. Probes the outbox only while the answer can
+    /// depend on it (a finished, unsynced mark). MUST be called with the map
+    /// lock released: the probe takes the outbox's lock.
+    fn delivery_verdict(&self, rec: &TerminalSessionRecord) -> FinishDeliveryVerdict {
+        let pending = if rec.finished_at.is_some() && !rec.finish_synced {
+            self.finish_pending_probe.get().and_then(|p| (p.0)(rec))
+        } else {
+            None
+        };
+        FinishDeliveryVerdict::decide(rec, pending)
+    }
+
+    /// Record that the coord drain DROPPED the `Finished` row of this
+    /// session's mark without coord taking it — the `finished_drop_observer`
+    /// main.rs attaches to `CoordSync` lands here. `reason` is the drop's
+    /// wire reason (`refused_4xx`, `quarantined`, …).
+    ///
+    /// Matched exactly as [`Self::mark_finish_synced`] matches an ACK: only a
+    /// still-finished, unsynced record, and — when `dropped_finished_at` is
+    /// `Some` — only the SAME mark, so the drop of a superseded row (an older
+    /// stamp) never marks the current mark dropped. No-op otherwise.
+    pub fn mark_finish_dropped(
+        &self,
+        claude_session_id: &str,
+        dropped_finished_at: Option<i64>,
+        reason: &str,
+    ) {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_finish_dropped");
+                return;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec)
+                if rec.finished_at.is_some()
+                    && !rec.finish_synced
+                    && dropped_finished_at.is_none_or(|at| rec.finished_at == Some(at)) =>
+            {
+                rec.finish_delivery = Some(FinishDelivery {
+                    state: FinishDeliveryState::Dropped,
+                    reason: reason.to_string(),
+                    at: Utc::now().timestamp_millis(),
+                });
+                rec.clone()
+            }
+            _ => return,
+        };
+        warn!(
+            claude_session_id,
+            reason, "session_lifecycle_store: the finished mark's coord write was DROPPED"
+        );
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+    }
+
+    /// Clear a recorded drop because the mark's write was RE-QUEUED (the retry
+    /// door, or a late delivery). `queued_finished_at` is the stamp the new row
+    /// carries; a drop is cleared only when it is still the same mark.
+    /// Returns the record as it now stands (`None` for an unknown id or an
+    /// unreadable registry); writes only when there was a note to clear.
+    pub fn clear_finish_delivery(
+        &self,
+        claude_session_id: &str,
+        queued_finished_at: Option<i64>,
+    ) -> Option<TerminalSessionRecord> {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_finish_delivery");
+                return None;
+            }
+        };
+        let rec = m.get_mut(claude_session_id)?;
+        if rec.finish_delivery.is_none() || rec.finished_at != queued_finished_at {
+            return Some(rec.clone());
+        }
+        rec.finish_delivery = None;
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed.clone()),
+            }],
+        );
+        Some(changed)
     }
 
     /// Hand `rec`'s finished-marker state to the finish observer and return
@@ -2692,6 +2986,9 @@ impl SessionLifecycleStore {
                     && acked_finished_at.is_none_or(|at| rec.finished_at == Some(at)) =>
             {
                 rec.finish_synced = true;
+                // Delivered: any drop recorded for an earlier row of this mark
+                // is history now.
+                rec.finish_delivery = None;
                 rec.clone()
             }
             _ => return,
@@ -5505,6 +5802,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
+        finish_delivery: None,
         spawn_device_default: None,
         adopted_from: None,
     }
@@ -5733,6 +6031,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            finish_delivery: None,
             spawn_device_default: None,
             adopted_from: None,
         }
@@ -8024,6 +8323,271 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // coord.delivery (plan 2026-10-29-session-outbox-drops-the-finish-of-a-
+    // session-coord-never-registered, Phase 4)
+    // -----------------------------------------------------------------
+
+    /// A store whose finish observer answers `forward` and whose outbox probe
+    /// answers whatever `probe` holds: 0 = no row, 1 = a row, 2 = unreadable.
+    fn delivery_store(
+        dir: &std::path::Path,
+        forward: FinishSync,
+    ) -> (SessionLifecycleStore, Arc<std::sync::atomic::AtomicU8>) {
+        let store = SessionLifecycleStore::open(dir.join("terminal-sessions.json")).unwrap();
+        store.attach_finish_observer(move |_| forward);
+        let probe = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        {
+            let probe = probe.clone();
+            store.attach_finish_pending_probe(move |_| {
+                match probe.load(std::sync::atomic::Ordering::SeqCst) {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                }
+            });
+        }
+        store.record_open(rec("s"));
+        (store, probe)
+    }
+
+    fn set_probe(probe: &std::sync::atomic::AtomicU8, v: u8) {
+        probe.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every arm of `coord.delivery`, in its precedence, through the store's
+    /// own `set_finished` (the observer here never re-queues, so a recorded
+    /// drop is not cleared by the read-back).
+    #[test]
+    fn coord_delivery_reports_every_arm() {
+        let dir = tempdir().unwrap();
+        let (store, probe) = delivery_store(
+            dir.path(),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+        );
+
+        // pending: an unACKed row for this mark is in the outbox.
+        set_probe(&probe, 1);
+        let out = store.set_finished("s", true, Some("done".into())).unwrap();
+        let at = out.record.finished_at;
+        assert_eq!(out.delivery, FinishDeliveryVerdict::Pending);
+        assert_eq!(out.response_json()["coord"]["delivery"], "pending");
+
+        // unknown: the outbox was read, holds no row, and no drop was recorded.
+        set_probe(&probe, 0);
+        let out = store.set_finished("s", true, None).unwrap();
+        assert_eq!(out.delivery, FinishDeliveryVerdict::Unknown);
+
+        // unknown: the outbox could not be read.
+        set_probe(&probe, 2);
+        assert_eq!(
+            store.set_finished("s", true, None).unwrap().delivery,
+            FinishDeliveryVerdict::Unknown
+        );
+
+        // dropped:<reason>: the drain dropped this mark's row.
+        store.mark_finish_dropped("s", at, "refused_4xx");
+        set_probe(&probe, 0);
+        let out = store.set_finished("s", true, None).unwrap();
+        assert_eq!(
+            out.delivery,
+            FinishDeliveryVerdict::Dropped("refused_4xx".into())
+        );
+        let body = out.response_json();
+        assert_eq!(body["coord"]["delivery"], "dropped:refused_4xx");
+        assert!(body["coord"]["requeuedAfterDrop"].is_null(), "{body}");
+        assert_eq!(body["session"]["finishDelivery"]["state"], "dropped");
+        assert_eq!(body["session"]["finishDelivery"]["reason"], "refused_4xx");
+        // A recorded drop stands even when the outbox is unreadable.
+        set_probe(&probe, 2);
+        assert_eq!(
+            store.set_finished("s", true, None).unwrap().delivery,
+            FinishDeliveryVerdict::Dropped("refused_4xx".into())
+        );
+        // A live row outranks the drop note.
+        set_probe(&probe, 1);
+        assert_eq!(
+            store.set_finished("s", true, None).unwrap().delivery,
+            FinishDeliveryVerdict::Pending
+        );
+
+        // acked: coord ACKed the mark — cleared the drop note, outranks all.
+        store.mark_finish_synced("s", at);
+        let rec_now = store.get("s").unwrap();
+        assert!(rec_now.finish_synced);
+        assert!(rec_now.finish_delivery.is_none(), "an ACK clears the drop");
+        for p in [0, 1, 2] {
+            set_probe(&probe, p);
+            assert_eq!(
+                store.set_finished("s", true, None).unwrap().delivery,
+                FinishDeliveryVerdict::Acked
+            );
+        }
+
+        // An unmarked session's delivery is not tracked: unknown.
+        let un = store.set_finished("s", false, None).unwrap();
+        assert_eq!(un.delivery, FinishDeliveryVerdict::Unknown);
+        assert_eq!(un.response_json()["coord"]["delivery"], "unknown");
+    }
+
+    /// An unreadable outbox renders `unknown` — never `acked`, never
+    /// `pending` — for an unsynced mark with no drop recorded, and with no
+    /// probe attached at all.
+    #[test]
+    fn an_unreadable_outbox_renders_unknown_never_acked() {
+        let dir = tempdir().unwrap();
+        let (store, probe) = delivery_store(
+            dir.path(),
+            FinishSync::Queued {
+                coord_session_id: uuid::Uuid::new_v4(),
+            },
+        );
+        set_probe(&probe, 2);
+        let out = store.set_finished("s", true, Some("done".into())).unwrap();
+        assert!(!out.record.finish_synced);
+        assert_eq!(out.response_json()["coord"]["delivery"], "unknown");
+
+        let bare = SessionLifecycleStore::open(dir.path().join("bare.json")).unwrap();
+        bare.record_open(rec("b"));
+        let out = bare.set_finished("b", true, None).unwrap();
+        assert_eq!(
+            out.delivery,
+            FinishDeliveryVerdict::Unknown,
+            "no probe attached is UNKNOWN, never acked"
+        );
+    }
+
+    /// The decision table itself: `pending` is never promoted to `acked`, and
+    /// only `finish_synced` yields `acked`.
+    #[test]
+    fn delivery_verdict_decide_precedence() {
+        let mut r = rec("s");
+        r.finished_at = Some(5);
+        assert_eq!(
+            FinishDeliveryVerdict::decide(&r, Some(true)),
+            FinishDeliveryVerdict::Pending
+        );
+        assert_eq!(
+            FinishDeliveryVerdict::decide(&r, None),
+            FinishDeliveryVerdict::Unknown
+        );
+        r.finish_delivery = Some(FinishDelivery {
+            state: FinishDeliveryState::Dropped,
+            reason: "quarantined".into(),
+            at: 9,
+        });
+        assert_eq!(
+            FinishDeliveryVerdict::decide(&r, Some(false)).as_wire(),
+            "dropped:quarantined"
+        );
+        assert_eq!(
+            FinishDeliveryVerdict::decide(&r, Some(true)),
+            FinishDeliveryVerdict::Pending
+        );
+        r.finish_synced = true;
+        assert_eq!(
+            FinishDeliveryVerdict::decide(&r, Some(true)),
+            FinishDeliveryVerdict::Acked
+        );
+    }
+
+    /// The drop is matched like an ACK: a drop of a SUPERSEDED row (an older
+    /// stamp) never marks the current mark dropped, nor does a drop after the
+    /// mark synced or was unmarked.
+    #[test]
+    fn a_drop_of_a_superseded_row_does_not_mark_the_current_mark() {
+        let dir = tempdir().unwrap();
+        let (store, _probe) = delivery_store(
+            dir.path(),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+        );
+        let first = store.set_finished("s", true, Some("a".into())).unwrap();
+        let old_at = first.record.finished_at.unwrap();
+        let second = store.set_finished("s", true, Some("b".into())).unwrap();
+        assert_ne!(second.record.finished_at, Some(old_at));
+
+        store.mark_finish_dropped("s", Some(old_at), "refused_4xx");
+        assert!(store.get("s").unwrap().finish_delivery.is_none());
+
+        store.mark_finish_dropped("s", second.record.finished_at, "quarantined");
+        let d = store.get("s").unwrap().finish_delivery.unwrap();
+        assert_eq!(d.state, FinishDeliveryState::Dropped);
+        assert_eq!(d.reason, "quarantined");
+
+        // A restamp supersedes the old mark's drop.
+        let third = store.set_finished("s", true, Some("c".into())).unwrap();
+        assert!(third.record.finish_delivery.is_none());
+
+        store.set_finished("s", false, None).unwrap();
+        store.mark_finish_dropped("s", None, "refused_4xx");
+        assert!(
+            store.get("s").unwrap().finish_delivery.is_none(),
+            "an unmarked session cannot be marked dropped"
+        );
+    }
+
+    /// The drop note is durable and old records (written before the field)
+    /// load with none.
+    #[test]
+    fn finish_delivery_is_durable_and_defaults_to_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        {
+            let (store, _probe) = delivery_store(
+                dir.path(),
+                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            );
+            let at = store
+                .set_finished("s", true, Some("x".into()))
+                .unwrap()
+                .record
+                .finished_at;
+            store.mark_finish_dropped("s", at, "outbox_trim");
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("s").unwrap().finish_delivery.unwrap().reason,
+            "outbox_trim"
+        );
+
+        let mut legacy = serde_json::to_value(rec("old")).unwrap();
+        legacy.as_object_mut().unwrap().remove("finishDelivery");
+        let parsed: TerminalSessionRecord = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.finish_delivery.is_none());
+    }
+
+    /// A restamp (a reason-carrying re-finish) that re-queues a mark whose
+    /// previous write was dropped reports the superseded drop in
+    /// `coord.requeuedAfterDrop`; one that could not re-queue does not.
+    #[test]
+    fn a_restamp_that_re_queues_reports_the_drop_it_superseded() {
+        let dir = tempdir().unwrap();
+        let (store, probe) = delivery_store(
+            dir.path(),
+            FinishSync::Queued {
+                coord_session_id: uuid::Uuid::new_v4(),
+            },
+        );
+        let at = store
+            .set_finished("s", true, Some("a".into()))
+            .unwrap()
+            .record
+            .finished_at;
+        store.mark_finish_dropped("s", at, "refused_4xx");
+        set_probe(&probe, 1);
+        let out = store.set_finished("s", true, Some("b".into())).unwrap();
+        assert_eq!(out.delivery, FinishDeliveryVerdict::Pending);
+        assert_eq!(
+            out.requeued_after_drop.as_ref().map(|d| d.reason.as_str()),
+            Some("refused_4xx")
+        );
+        assert_eq!(
+            out.response_json()["coord"]["requeuedAfterDrop"]["reason"],
+            "refused_4xx"
+        );
+        assert!(out.record.finish_delivery.is_none());
+    }
+
     /// A restamp only has to DIFFER from the old stamp (that is all the ACK
     /// matcher needs): two finishes inside one millisecond still differ, and a
     /// clock stepped backwards dates the new finish at `now` rather than
@@ -9667,6 +10231,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            finish_delivery: None,
             spawn_device_default: None,
             adopted_from: None,
         }
