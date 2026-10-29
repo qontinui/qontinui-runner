@@ -2648,7 +2648,9 @@ pub(crate) fn create_terminal_session_backend(
         // spawn cannot, and is coalesced as unattended (fail closed).
         capture_hint
             .as_ref()
-            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| h.spawn_origin),
+            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| {
+                h.spawn_origin
+            }),
     )?;
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
