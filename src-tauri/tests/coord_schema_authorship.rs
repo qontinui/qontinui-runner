@@ -45,6 +45,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+// The shared `is_test_only_file` predicate (plan
+// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b): one
+// definition, compiled into this gate by path rather than copied into it.
+#[path = "../src/source_lex.rs"]
+mod source_lex;
+
 /// Frozen baseline: EMPTY for the runner. The runner's production code authors
 /// no `coord.*` schema. Keep it empty; any new entry needs a justification and
 /// a follow-up-plan tracking note.
@@ -130,6 +136,11 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Scan one file's text and return the set of production (non-`#[cfg(test)]`,
 /// non-comment) `coord.*` schema-authoring tokens it contains.
 fn scan_production_ddl(text: &str) -> BTreeSet<String> {
+    // A file opening `#![cfg(test)]` (an extracted test module) is test code
+    // end to end: it carries no in-file `#[cfg(test)]` region to track.
+    if source_lex::is_test_only_file(text) {
+        return BTreeSet::new();
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut out = BTreeSet::new();
 
@@ -184,6 +195,19 @@ fn scan_production_ddl(text: &str) -> BTreeSet<String> {
             cfg_test_active = true;
             cfg_test_depth = depth;
             pending_cfg_test = false;
+        } else if pending_cfg_test
+            && line
+                .split("//")
+                .next()
+                .unwrap_or("")
+                .trim_end()
+                .ends_with(';')
+        {
+            // A braceless `#[cfg(test)]` item — `mod x;` (what the test-module
+            // extraction leaves in the parent), a `use`, a `const` — ends here.
+            // Left pending, it would latch onto the NEXT braced item, which is
+            // production code.
+            pending_cfg_test = false;
         }
         if cfg_test_active && new_depth <= cfg_test_depth {
             cfg_test_active = false;
@@ -192,6 +216,35 @@ fn scan_production_ddl(text: &str) -> BTreeSet<String> {
     }
 
     out
+}
+
+/// An extracted test module's DDL is test self-provisioning, not production
+/// authoring; the same line in a production file is still caught (the control).
+#[test]
+fn an_extracted_test_only_file_authors_no_production_ddl() {
+    let body = "fn t() {\n    let q = \"CREATE TABLE IF NOT EXISTS coord.widgets (id INT)\";\n}\n";
+    let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+    assert!(
+        scan_production_ddl(&extracted).is_empty(),
+        "a `#![cfg(test)]` file's DDL was read as production"
+    );
+    assert_eq!(
+        scan_production_ddl(body),
+        BTreeSet::from(["widgets".to_string()]),
+        "control: the scan sees the same DDL in a production file"
+    );
+}
+
+/// The parent the extraction leaves behind: `#[cfg(test)]` on a braceless
+/// `mod tests;`. The production item AFTER it is still production.
+#[test]
+fn production_after_an_out_of_line_test_mod_is_still_scanned() {
+    let parent = "#[cfg(test)]\nmod tests;\n\npub fn prod() {\n    let q = \"CREATE TABLE IF NOT EXISTS coord.widgets (id INT)\";\n}\n";
+    assert_eq!(
+        scan_production_ddl(parent),
+        BTreeSet::from(["widgets".to_string()]),
+        "the `#[cfg(test)] mod tests;` line hid the production fn after it"
+    );
 }
 
 fn is_comment(line: &str) -> bool {
