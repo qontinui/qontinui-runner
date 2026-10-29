@@ -5420,41 +5420,6 @@ async fn handle_element_state_generic(
     }
 }
 
-/// GET /ui-bridge/sdk/control/element/:id/images — Get images associated with an element
-async fn handle_element_images(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let id = id.trim().to_string();
-    let mut payload = serde_json::Map::new();
-    payload.insert("id".to_string(), serde_json::Value::String(id.clone()));
-    for (k, v) in &query {
-        payload.insert(k.clone(), serde_json::Value::String(v.clone()));
-    }
-    let mut path = format!("/control/element/{}/images", id);
-    if !query.is_empty() {
-        let qs: Vec<String> = query
-            .iter()
-            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-            .collect();
-        path = format!("{}?{}", path, qs.join("&"));
-    }
-    match dispatch_app_request(
-        &state,
-        "getElementImages",
-        serde_json::Value::Object(payload),
-        Method::GET,
-        &path,
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
 /// GET /ui-bridge/sdk/control/element/:id/history — Get element history
 async fn handle_element_history(
     State(state): State<Arc<ApiState>>,
@@ -7389,36 +7354,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/error-report",
             get(handle_error_report),
         )
-        // Media discovery & analysis
-        .route("/ui-bridge/sdk/ai/media/find", post(handle_media_find))
-        .route(
-            "/ui-bridge/sdk/ai/media/audit/accessibility",
-            post(handle_media_audit_accessibility),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/audit/performance",
-            post(handle_media_audit_performance),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/snapshot",
-            post(handle_media_snapshot),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/compare",
-            post(handle_media_compare),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/analyze",
-            post(handle_media_analyze),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/analyze/batch",
-            post(handle_media_analyze_batch),
-        )
-        .route(
-            "/ui-bridge/sdk/ai/media/analyze/page",
-            post(handle_media_analyze_page),
-        )
         // Heartbeat
         .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
         // App-agnostic convenience endpoints
@@ -7499,10 +7434,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/control/element/{id}/state-generic",
             get(handle_element_state_generic),
-        )
-        .route(
-            "/ui-bridge/sdk/control/element/{id}/images",
-            get(handle_element_images),
         )
         .route(
             "/ui-bridge/sdk/control/element/{id}/history",
@@ -8011,168 +7942,6 @@ async fn handle_navigate_by_adapter_dispatch(
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }
-    }
-}
-
-// =============================================================================
-// Media Discovery & Analysis
-// =============================================================================
-
-/// POST /ui-bridge/sdk/ai/media/find — Find media elements with filters
-async fn handle_media_find(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "findMedia",
-        body.clone(),
-        Method::POST,
-        "/ai/media/find",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/audit/accessibility — Alt text audit
-async fn handle_media_audit_accessibility(
-    State(state): State<Arc<ApiState>>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "mediaAuditAccessibility",
-        serde_json::json!({}),
-        Method::POST,
-        "/ai/media/audit/accessibility",
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/audit/performance — Performance audit
-async fn handle_media_audit_performance(
-    State(state): State<Arc<ApiState>>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "mediaAuditPerformance",
-        serde_json::json!({}),
-        Method::POST,
-        "/ai/media/audit/performance",
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/snapshot — Capture media snapshot
-async fn handle_media_snapshot(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "captureMediaSnapshot",
-        body.clone(),
-        Method::POST,
-        "/ai/media/snapshot",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/compare — Compare two media snapshots
-async fn handle_media_compare(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "compareMediaSnapshots",
-        body.clone(),
-        Method::POST,
-        "/ai/media/compare",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/analyze — AI analysis of single media element
-async fn handle_media_analyze(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "analyzeMedia",
-        body.clone(),
-        Method::POST,
-        "/ai/media/analyze",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/analyze/batch — AI analysis of multiple media elements
-async fn handle_media_analyze_batch(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "analyzeMediaBatch",
-        body.clone(),
-        Method::POST,
-        "/ai/media/analyze/batch",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
-/// POST /ui-bridge/sdk/ai/media/analyze/page — AI analysis of all visible media on page
-async fn handle_media_analyze_page(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "analyzeMediaPage",
-        body.clone(),
-        Method::POST,
-        "/ai/media/analyze/page",
-        Some(body),
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
 

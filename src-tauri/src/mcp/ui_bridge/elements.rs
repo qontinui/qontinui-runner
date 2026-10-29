@@ -703,7 +703,12 @@ pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
     if !trimmed.is_empty() && SUPPORTED_ACTION_NAMES.contains(&trimmed) {
         return Ok(trimmed);
     }
-    Err(UiBridgeError::invalid_action(raw, SUPPORTED_ACTION_NAMES))
+    Err(UiBridgeError::invalid_action(
+        raw,
+        None,
+        SUPPORTED_ACTION_NAMES,
+        None,
+    ))
 }
 
 /// True when a `get_element` IPC reply is the frontend's "there is no such
@@ -1679,18 +1684,22 @@ async fn execute_action_dispatch(
     // metadata we couldn't fetch (`element_supported_actions == None`) is
     // allowed through to IPC: we never manufacture a rejection from a failed
     // probe (mirrors the permissive `None` semantics of `is_action_advertised`).
-    if !action_is_builtin && !action_is_registered_custom && element_supported_actions.is_some() {
-        let detail = validate_action_name(&request.action)
-            .err()
-            .unwrap_or_else(|| {
-                UiBridgeError::invalid_action(&request.action, SUPPORTED_ACTION_NAMES)
-            });
+    //
+    // The 400 names THIS element's accepted verbs and a "did you mean" the
+    // element accepts (`press` → `sendKeys` on a terminal input), and a verb
+    // the element itself advertises is accepted here — see
+    // `action_vocabulary::deferred_unknown_action_error`.
+    if let Some(detail) = super::action_vocabulary::deferred_unknown_action_error(
+        &request.action,
+        &id,
+        action_is_builtin,
+        action_is_registered_custom,
+        element_supported_actions.as_deref(),
+        merged_params.as_ref(),
+    ) {
         warn!(
-            "execute_action: rejecting unknown action '{}' on element {} — \
-             not a built-in and not a registered custom action (built-ins: {})",
-            request.action,
-            id,
-            SUPPORTED_ACTION_NAMES.join(", ")
+            "execute_action: rejecting unknown action '{}' on element {}: {}",
+            request.action, id, detail.message
         );
         let msg = detail.message.clone();
         return Err((
@@ -1754,20 +1763,12 @@ async fn execute_action_dispatch(
         // `supported_actions` — by then the action WAS advertised, so the
         // list would say nothing. `supported_actions` is unique to this
         // pre-IPC body.
-        let detail = UiBridgeError {
-            code: super::types::UiBridgeErrorCode::ActionNotSupported,
-            message: format!(
-                "Action '{}' is not supported by element '{}'. \
-                 Element advertises: {:?}",
-                action_name, id, supported
-            ),
-            recovery: Some(super::types::RecoveryHint::Unrecoverable),
-            context: Some(serde_json::json!({
-                "code": "ACTION_NOT_SUPPORTED",
-                "supported_actions": supported,
-                "requested_action": action_name,
-            })),
-        };
+        let detail = super::action_vocabulary::action_not_supported_error(
+            &action_name,
+            &id,
+            &supported,
+            merged_params.as_ref(),
+        );
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
