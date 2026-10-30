@@ -29,10 +29,14 @@
 #
 # THE PREDICATE
 #
-# Compare the push's own commits — `merge-base(HEAD, upstream)..HEAD` — plus
-# its uncommitted working tree, against the set of paths in THIS repo whose
-# content can move `schemas.json`. If NONE of them is touched, then the very
-# inputs that produced this diff are already on the upstream branch, so the
+# Compare the branch's own commits — `merge-base(HEAD, default branch)..HEAD`,
+# the default branch being origin/HEAD or origin/main — plus its uncommitted
+# working tree, against the set of paths in THIS repo whose content can move
+# `schemas.json`. (It was `merge-base(HEAD, upstream)` until 2026-10-30. That
+# blamed a REBASED push for every main commit the rebase pulled in: findings
+# 8d16b76e and 79415d3d. See `push_default_base_ref` in push-range.sh.)
+# If NONE of them is touched, then the very
+# inputs that produced this diff are already on the default branch, so the
 # drift predates the push by construction. That is a proof, not a heuristic —
 # provided the path set is complete, which is why it is deliberately WIDER
 # than the hook's own pre-commit `files:` trigger. Attribution must never
@@ -767,15 +771,19 @@ gen_events_attribution() {
         return 0
     fi
 
+    # Measured against the DEFAULT branch, not the upstream: see
+    # `push_default_base_ref` for why a rebased push needs that. A full refname,
+    # so a local branch called `origin/main` cannot stand in for the remote one;
+    # ATTRIBUTION_BASE_REF carries its short form, for messages.
     local ref
-    if ! ref="$(push_base_ref "$repo")"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure against"
+    if ! ref="$(push_default_base_ref "$repo")"; then
+        ATTRIBUTION_UNAVAILABLE_REASON="no origin/HEAD, origin/main or upstream branch to measure against"
         return 0
     fi
-    ATTRIBUTION_BASE_REF="$ref"
+    ATTRIBUTION_BASE_REF="$(push_ref_short "$ref")"
     ATTRIBUTION_BASE_SHA="$(git -C "$repo" merge-base HEAD "$ref" 2>/dev/null || true)"
     if [ -z "$ATTRIBUTION_BASE_SHA" ]; then
-        ATTRIBUTION_UNAVAILABLE_REASON="could not compute merge-base(HEAD, $ref)"
+        ATTRIBUTION_UNAVAILABLE_REASON="could not compute merge-base(HEAD, $ATTRIBUTION_BASE_REF)"
         return 0
     fi
 
@@ -962,8 +970,15 @@ gen_events_attribution() {
 # globbed names, cwd-relative paths, a staged `git rm` that left a half-made
 # entry behind. What to do with local state is the pusher's call; the message
 # states the facts that call needs.
+#
+# `--inputs-only` prints just the labelled input list and the notes about it.
+# It drops the lead line, the "Measured against" line and the closing caveat.
+# The per-file verdict (lib/gen-events-file-attribution.sh) uses it after
+# printing its own lead. That lead says which drifted files are the push's,
+# so "the diff below is yours" would be false there.
 gen_events_render_mine() {
-    local stage p src label own=0 earlier=0 local_only=0
+    local stage p src label own=0 earlier=0 local_only=0 inputs_only=0
+    [ "${1:-}" = "--inputs-only" ] && inputs_only=1
     stage="$(gen_events_stage)"
 
     # `own`: something in the change being made (committed for a push, staged
@@ -981,7 +996,9 @@ gen_events_render_mine() {
     # Name the change as what it is. With nothing of its own, the drift is
     # still the author's to look at — the regen read their tree — but saying
     # THIS change moved the inputs would be the false claim #1667 met.
-    if [ "$own" = "1" ]; then
+    if [ "$inputs_only" = "1" ]; then
+        :
+    elif [ "$own" = "1" ]; then
         echo "This $stage changes sources that feed them, so the diff below is yours."
     elif [ "$earlier" = "1" ]; then
         echo "Commits already on this branch (not this commit) change sources that feed"
@@ -990,7 +1007,8 @@ gen_events_render_mine() {
         echo "Your working tree (not this $stage's changes) changes sources that feed them,"
         echo "so the diff below is yours to check."
     fi
-    echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
+    [ "$inputs_only" = "1" ] \
+        || echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
     while IFS=$'\t' read -r p src; do
         [ -n "$p" ] || continue
         case "$stage:$src" in
@@ -1034,6 +1052,9 @@ gen_events_render_mine() {
             echo "is theirs, it will follow you to the push unless they are dealt with."
         fi
     fi
-    echo "Part of the diff may still be pre-existing — the baseline is a build"
-    echo "artifact in a shared checkout and may have been behind before you began."
+    if [ "$inputs_only" = "0" ]; then
+        echo "Part of the diff may still be pre-existing — the baseline is a build"
+        echo "artifact in a shared checkout and may have been behind before you began."
+    fi
+    return 0
 }

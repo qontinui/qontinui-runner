@@ -460,6 +460,61 @@ decide
 check "with neither, origin/main is the base" "origin/main" "$ATTRIBUTION_BASE_REF"
 check "and the verdict still holds" "mine" "$ATTRIBUTION_STATE"
 
+# A REBASED branch keeps its upstream at the PRE-rebase head, whose merge-base
+# is the OLD fork point. Measured from there, every main commit the rebase
+# pulled in reads as the push's own. That is findings 8d16b76e and 79415d3d:
+# a frontend-only branch, rebased onto a main that had touched src-tauri/,
+# was blamed for main's codegen drift. The default branch is the base, so
+# only the branch's own change counts.
+fixture
+git -C "$WORK" checkout --quiet -b feature
+commit_change "src/app.ts" "// the branch's own, frontend-only, change"
+git -C "$WORK" push --quiet -u origin feature 2>/dev/null
+seed_main_only() {
+    mkdir -p "$UPSTREAM/$(dirname "$1")"
+    printf '%s\n' "$2" >> "$UPSTREAM/$1"
+    git -C "$UPSTREAM" add -A >/dev/null
+    git -C "$UPSTREAM" commit --quiet -m "main: $1"
+    git -C "$WORK" fetch --quiet origin
+}
+seed_main_only "src-tauri/src/lib.rs" "// a peer's codegen-input change, landed on main"
+git -C "$WORK" rebase --quiet origin/main >/dev/null 2>&1
+check "the rebased branch still has its pre-rebase upstream" "origin/feature" \
+    "$(git -C "$WORK" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"
+decide
+check "a rebased push is measured from the default branch, not its upstream" "origin/main" "$ATTRIBUTION_BASE_REF"
+check "  so main's own commits are not the push's: PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+check "  and nothing is listed as touched" "" "$ATTRIBUTION_TOUCHED"
+
+# The default branch is resolved by FULL refname. A short `origin/main`
+# resolves refs/heads/origin/main before refs/remotes/origin/main, so a
+# local branch named `origin/main` would otherwise become the base. Pointed at
+# the root commit here, it would make main's later codegen change read as the
+# push's.
+fixture
+seed_main_only "src-tauri/src/lib.rs" "// main moved after the root"
+git -C "$WORK" reset --hard --quiet origin/main
+# No origin/HEAD, so the cascade reaches its literal origin/main candidate:
+# the one a short refname would let the local branch shadow.
+git -C "$WORK" symbolic-ref --delete refs/remotes/origin/HEAD >/dev/null 2>&1
+git -C "$WORK" branch --quiet origin/main "$(git -C "$WORK" rev-list --max-parents=0 HEAD)" 2>/dev/null
+commit_change "src/app.ts" "// frontend only"
+decide
+check "a local branch named origin/main does not shadow the remote one" "pre-existing" "$ATTRIBUTION_STATE"
+check "  and the base reads origin/main" "origin/main" "$ATTRIBUTION_BASE_REF"
+check "  measured at the real remote-tracking ref" \
+    "$(git -C "$WORK" merge-base HEAD refs/remotes/origin/main)" "$ATTRIBUTION_BASE_SHA"
+
+# The upstream is still the LAST resort: no origin/HEAD and no origin/main.
+fixture
+git -C "$WORK" checkout --quiet -b feature
+commit_change "src/app.ts" "// ui"
+git -C "$WORK" push --quiet -u origin feature 2>/dev/null
+git -C "$WORK" symbolic-ref --delete refs/remotes/origin/HEAD >/dev/null 2>&1
+git -C "$WORK" update-ref -d refs/remotes/origin/main
+decide
+check "with no default branch at all, the upstream is the base" "origin/feature" "$ATTRIBUTION_BASE_REF"
+
 echo "  -- a hook environment must not redirect the fixtures --"
 
 # The defect this pins, verbatim: git exports GIT_DIR to every hook, GIT_DIR
