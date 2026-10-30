@@ -52,6 +52,34 @@ pub const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '
 /// input box shows this caret.
 pub const PROMPT_MARKER: char = '❯';
 
+/// Is this row the summary Claude Code prints when a turn FINISHES, e.g.
+/// `✻ Worked for 1m 23s · done 1:44 PM` or `✻ Churned for 40s`?
+///
+/// It opens with a spinner glyph, then a past-tense verb, then `for <duration>`.
+/// A LIVE spinner row never has that shape: it carries `…` and a `(<n>s …)`
+/// counter (`✢ Beaming… (34s · ↓ 2.0k tokens)`). The summary stays in the
+/// visible scrollback after the turn ends, so counting its glyph as "spinner
+/// on screen" kept every tab that had ever finished a turn from looking idle,
+/// and the looping-agent supervisor never nudged it. Conservative: anything
+/// that is not exactly this shape is NOT a summary.
+fn is_completed_turn_summary(line: &str) -> bool {
+    let t = line.trim_start();
+    let mut chars = t.chars();
+    let Some(glyph) = chars.next() else {
+        return false;
+    };
+    if !SPINNER_GLYPHS.contains(&glyph) || glyph == '·' || t.contains('…') {
+        return false;
+    }
+    let mut words = chars.as_str().split_whitespace();
+    let (Some(verb), Some(for_kw), Some(dur)) = (words.next(), words.next(), words.next()) else {
+        return false;
+    };
+    verb.chars().all(|c| c.is_alphabetic())
+        && for_kw == "for"
+        && dur.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for
 /// input. Pure over the snapshot. CONSERVATIVE: returns `false` (NOT idle)
 /// on any ambiguity. Idle requires ALL of:
@@ -73,8 +101,10 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy.
-    for line in lines {
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy. A COMPLETED turn leaves
+    // a summary row ("✻ Worked for 1m 23s") on screen that starts with the same
+    // glyph; it is the opposite of a busy signal and must not veto idle.
+    for line in lines.iter().filter(|l| !is_completed_turn_summary(l)) {
         for ch in line.chars() {
             if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
                 return false;
@@ -196,6 +226,29 @@ mod tests {
         assert!(!snapshot_looks_idle(&lines(&["✶", "❯ "]), 1));
         // A bare middot in static UI must NOT veto (it is everywhere).
         assert!(snapshot_looks_idle(&lines(&["a · b", "❯ "]), 1));
+    }
+
+    #[test]
+    fn a_completed_turn_summary_row_does_not_veto_idle() {
+        // Real rows Claude Code leaves in the scrollback after a turn ends.
+        for done in [
+            "✻ Worked for 1m 23s · done 1:44 PM",
+            "✻ Churned for 40s",
+            "  ✶ Cooked for 2h 3m 4s",
+        ] {
+            assert!(
+                snapshot_looks_idle(&lines(&[done, "", "❯ "]), 2),
+                "a finished-turn summary must not read as a spinner: {done}"
+            );
+        }
+        // A LIVE spinner row still vetoes, even beside a summary row.
+        assert!(!snapshot_looks_idle(
+            &lines(&["✻ Worked for 1m 23s", "✢ Beaming… (34s)", "❯ "]),
+            2
+        ));
+        // A glyph row that merely mentions "for" is not a summary.
+        assert!(!snapshot_looks_idle(&lines(&["✻ working for you", "❯ "]), 1));
+        assert!(!snapshot_looks_idle(&lines(&["✻ Worked for", "❯ "]), 1));
     }
 
     #[test]
