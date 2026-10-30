@@ -674,6 +674,14 @@ impl OutboxWriter {
             if rec.acked_at.is_some() || protect_from.is_some_and(|p| i >= p) {
                 continue;
             }
+            // A lifecycle row (`started` / `state_change` / `closed` /
+            // `finished`) is a few hundred bytes of the only record that
+            // defines coord's session row; the drain now holds them across a
+            // quarantine, so they are the OLDEST unacked rows and the first the
+            // trim would eat. Trim the disposable rows around them instead.
+            if super::coord_sync::is_lifecycle_kind(&rec.event_kind) {
+                continue;
+            }
             drop_flags[i] = true;
             live -= sizes[i];
             dropped_unacked += 1;
@@ -1934,6 +1942,47 @@ mod tests {
             seqs,
             vec![1, 2, 3],
             "a stale ack set must not swallow records that merely reuse those seqs"
+        );
+    }
+
+    /// D3: the over-cap trim drops the oldest unacked rows of DISPOSABLE kinds
+    /// and keeps a lifecycle row (`finished` here) even though it is the oldest.
+    #[test]
+    fn the_cap_trim_keeps_lifecycle_rows_and_drops_disposable_ones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let outbox = OutboxWriter::open_with_max_bytes(&path, 8 * 1024).unwrap();
+        let m = Uuid::new_v4();
+        let held = Uuid::new_v4();
+        // The OLDEST row of all: a finish coord has not taken yet.
+        outbox
+            .record(
+                m,
+                held,
+                SessionEventKind::Finished,
+                json!({ "finished_at": 1 }),
+            )
+            .unwrap();
+        for _ in 0..80 {
+            outbox
+                .record(
+                    m,
+                    Uuid::new_v4(),
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        let pending = outbox.pending().unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|r| r.session_id == held && r.event_kind == "finished"),
+            "the oldest unacked row was a lifecycle row, so the trim spared it"
+        );
+        assert!(
+            pending.len() < 81,
+            "the trim did drop disposable rows to get under the cap"
         );
     }
 
