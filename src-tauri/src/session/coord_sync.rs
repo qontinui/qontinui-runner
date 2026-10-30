@@ -10310,9 +10310,8 @@ mod outcome_row_drain_arming {
                 Ok(n) => n,
             };
             got.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&got).to_string();
-            if let Some(end) = text.find("\r\n\r\n") {
-                let want = text[..end]
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let want = String::from_utf8_lossy(&got[..end])
                     .lines()
                     .filter_map(|l| l.split_once(':'))
                     .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
