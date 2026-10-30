@@ -61,7 +61,8 @@ fn every_pagefile_step_runs_only_on_a_hosted_runner() {
     let mut seen = 0;
     for (name, job) in jobs {
         for step in steps(job) {
-            let is_pagefile = str_of(&step, "uses").starts_with("al-cheb/configure-pagefile-action")
+            let is_pagefile = str_of(&step, "uses")
+                .starts_with("al-cheb/configure-pagefile-action")
                 || str_of(&step, "name").starts_with("Configure pagefile");
             if !is_pagefile {
                 continue;
@@ -82,7 +83,10 @@ fn every_pagefile_step_runs_only_on_a_hosted_runner() {
             );
         }
     }
-    assert!(seen >= 2, "expected the test and clippy-windows pagefile steps, saw {seen}");
+    assert!(
+        seen >= 2,
+        "expected the test and clippy-windows pagefile steps, saw {seen}"
+    );
 }
 
 #[test]
@@ -117,7 +121,8 @@ fn a_routed_job_cannot_be_skipped_by_its_route_job() {
         );
         let runs_on = str_of(j, "runs-on");
         assert!(
-            runs_on.contains("fromJSON(needs.route.outputs.") && runs_on.contains("|| '\"windows-latest\"'"),
+            runs_on.contains("fromJSON(needs.route.outputs.")
+                && runs_on.contains("|| '\"windows-latest\"'"),
             "job `{name}`'s runs-on must read the route output with the static \
              windows-latest default for an empty one, got `{runs_on}`"
         );
@@ -132,10 +137,20 @@ fn a_fail_fast_answer_fails_the_job_first() {
             .into_iter()
             .next()
             .expect("the job has steps");
-        assert_eq!(str_of(&first, "name"), "CI capacity (route said fail_fast)", "job `{name}`");
-        assert!(str_of(&first, "if").contains("_lane == 'fail_fast'"), "job `{name}`");
+        assert_eq!(
+            str_of(&first, "name"),
+            "CI capacity (route said fail_fast)",
+            "job `{name}`"
+        );
+        assert!(
+            str_of(&first, "if").contains("_lane == 'fail_fast'"),
+            "job `{name}`"
+        );
         let run = str_of(&first, "run");
-        assert!(run.contains("ci-capacity") && run.contains("exit 1"), "job `{name}`");
+        assert!(
+            run.contains("ci-capacity") && run.contains("exit 1"),
+            "job `{name}`"
+        );
         assert!(
             !run.contains("${{"),
             "job `{name}`: the reason is untrusted text and travels through env, never \
@@ -154,15 +169,23 @@ fn the_route_job_cannot_fail() {
         .collect();
     assert_eq!(route_steps.len(), 2, "one route step per routed job");
     for s in &route_steps {
-        assert_eq!(s.get("continue-on-error").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            s.get("continue-on-error").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert!(str_of(s, "run").trim_end().ends_with("|| true"));
         assert_eq!(str_of(s, "shell"), "bash");
     }
-    let script = repo_root().join(".github").join("scripts").join("route_ci_job.py");
+    let script = repo_root()
+        .join(".github")
+        .join("scripts")
+        .join("route_ci_job.py");
     let text = std::fs::read_to_string(&script)
         .unwrap_or_else(|e| panic!("read {}: {e}", script.display()));
     assert!(
-        text.contains("VENDORED COPY -- the source is qontinui-coord/.github/scripts/route_ci_job.py"),
+        text.contains(
+            "VENDORED COPY -- the source is qontinui-coord/.github/scripts/route_ci_job.py"
+        ),
         "the vendored route script must name its source"
     );
     assert!(text.contains("THIS JOB MUST NOT FAIL"));
