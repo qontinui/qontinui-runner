@@ -138,11 +138,13 @@ pub fn record_tree(process_id: &str, descendants: &[PidWithSpawnedAt]) {
 
 /// Reclaim any orphan descendants left over from a prior session.
 ///
-/// For each persisted PID, query the live `Win32_Process` / `/proc/<pid>/stat`
-/// creation time. If the PID is alive AND its creation time matches the
-/// persisted `spawned_at_unix` (within ±2s to absorb tick-resolution drift),
-/// it's an orphan — reap it via `health::kill_descendant_tree`. Otherwise
-/// it's PID reuse (a new unrelated process); skip.
+/// For each persisted PID, read its live creation time from one fresh
+/// process-table snapshot. If the PID is alive AND its creation time matches
+/// the persisted `spawned_at_unix` ([`super::health::is_same_process`]: within
+/// ±2s to absorb tick-resolution drift), it's an orphan — reap it via
+/// `health::kill_descendant_tree`, which re-checks that creation time on a
+/// handle held through the kill (Windows). Otherwise it's PID reuse (a new
+/// unrelated process); skip.
 ///
 /// After reclaim the file is rewritten with empty trees so a crash mid-loop
 /// doesn't double-reap (or kill an innocent process whose PID happens to
@@ -171,7 +173,7 @@ pub async fn reclaim_orphans() {
 /// cleared.
 pub(crate) async fn reclaim_at<F, Fut>(path: &Path, snapshot: &ProcessSnapshot, mut kill: F)
 where
-    F: FnMut(u32) -> Fut,
+    F: FnMut(PidWithSpawnedAt) -> Fut,
     Fut: std::future::Future<Output = usize>,
 {
     let state = load_from(path);
@@ -188,12 +190,12 @@ where
 
     let mut total_reaped: usize = 0;
     let surviving_count: usize = state.trees.values().map(Vec::len).sum();
-    for (process_id, pid) in targets {
-        let killed = kill(pid).await;
+    for (process_id, root) in targets {
+        let killed = kill(root).await;
         tracing::info!(
             "orphan_state: reaped orphan tree for '{}' (root PID {}, {} processes killed)",
             process_id,
-            pid,
+            root.pid,
             killed
         );
         total_reaped += killed;
@@ -215,15 +217,16 @@ where
     }
 }
 
-/// The `(process id, root pid)` pairs the startup reclaim may kill, judged
-/// against `snapshot` — or `Err` when the snapshot is UNKNOWN (`stale`, or an
-/// empty table), in which case NOTHING may be killed: a pid absent from, or
-/// present in, a table that was not read now proves nothing about the
-/// process holding that pid now.
+/// The `(process id, recorded root)` pairs the startup reclaim may kill,
+/// judged against `snapshot` — the recorded root carries the persisted
+/// creation time the kill re-checks — or `Err` when the snapshot is UNKNOWN
+/// (`stale`, or an empty table), in which case NOTHING may be killed: a pid
+/// absent from, or present in, a table that was not read now proves nothing
+/// about the process holding that pid now.
 pub(crate) fn reclaim_targets(
     state: &OrphanState,
     snapshot: &ProcessSnapshot,
-) -> Result<Vec<(String, u32)>, String> {
+) -> Result<Vec<(String, PidWithSpawnedAt)>, String> {
     if snapshot.is_unknown() {
         return Err(format!(
             "the process table is UNKNOWN (stale: {}, empty: {}); no orphan is killed from it",
@@ -246,8 +249,11 @@ pub(crate) fn reclaim_targets(
             // when BOTH timestamps parsed successfully (`> 0`). If either
             // side is 0 we can't tell "still our orphan" from "PID reused
             // by an unrelated process", so we fail closed and skip the
-            // kill rather than risk reaping a coincidental match. Within
-            // ±2s of clock-resolution drift counts as the same process.
+            // kill rather than risk reaping a coincidental match. When the
+            // record and the table both carry the exact FILETIME they must be
+            // equal; otherwise ±2s of clock-resolution drift counts as the
+            // same process (`health::is_same_process`, the rule the kill
+            // re-checks on a held handle).
             if entry.spawned_at_unix == 0 || live_ts == 0 {
                 tracing::debug!(
                     "orphan_state: PID {} creation timestamp unavailable \
@@ -260,7 +266,8 @@ pub(crate) fn reclaim_targets(
                 );
                 continue;
             }
-            if (live_ts - entry.spawned_at_unix).abs() > 2 {
+            let live_ft = snapshot.creation_filetimes.get(&entry.pid).copied();
+            if !super::health::is_same_process(*entry, live_ts, live_ft) {
                 tracing::debug!(
                     "orphan_state: PID {} reused since prior session \
                      (persisted spawned_at={}, live={}); skipping reclaim for '{}'",
@@ -271,7 +278,7 @@ pub(crate) fn reclaim_targets(
                 );
                 continue;
             }
-            targets.push((process_id.clone(), entry.pid));
+            targets.push((process_id.clone(), *entry));
         }
     }
     Ok(targets)
@@ -288,6 +295,7 @@ mod tests {
             vec![PidWithSpawnedAt {
                 pid,
                 spawned_at_unix,
+                spawned_at_ft: None,
             }],
         );
         s
@@ -312,7 +320,14 @@ mod tests {
         // The same table read fresh IS a target: the refusal is the flag.
         assert_eq!(
             reclaim_targets(&state, &live(4242, 1_715_911_000, false)).unwrap(),
-            vec![("backend".to_string(), 4242)]
+            vec![(
+                "backend".to_string(),
+                PidWithSpawnedAt {
+                    pid: 4242,
+                    spawned_at_unix: 1_715_911_000,
+                    spawned_at_ft: None,
+                }
+            )]
         );
         // An empty (fresh-flagged) table is a failed read too.
         let empty = ProcessSnapshot {
@@ -332,7 +347,7 @@ mod tests {
         save_to(&path, &one_orphan(4242, 1_715_911_000)).expect("seed");
         let before = std::fs::read(&path).expect("read");
 
-        let never_kill = |_pid: u32| -> std::future::Ready<usize> {
+        let never_kill = |_root: PidWithSpawnedAt| -> std::future::Ready<usize> {
             panic!("nothing may be killed from an UNKNOWN table")
         };
         reclaim_at(&path, &live(4242, 1_715_911_000, true), never_kill).await;
@@ -373,6 +388,47 @@ mod tests {
         );
     }
 
+    /// W2: a record and a table that both carry the exact FILETIME are
+    /// compared exactly — one tick apart in the same second is a reused pid —
+    /// and a table without it falls back to the 2 s window.
+    #[test]
+    fn orphan_state_compares_exact_filetimes_exactly() {
+        const FT: u64 = 133_000_000_000_000_000;
+        let mut state = OrphanState::new();
+        state.trees.insert(
+            "backend".to_string(),
+            vec![PidWithSpawnedAt {
+                pid: 4242,
+                spawned_at_unix: 1_715_911_000,
+                spawned_at_ft: Some(FT),
+            }],
+        );
+        let with_ft = |ft: u64| {
+            let mut s = live(4242, 1_715_911_000, false);
+            s.creation_filetimes.insert(4242, ft);
+            s
+        };
+        assert!(reclaim_targets(&state, &with_ft(FT + 1))
+            .unwrap()
+            .is_empty());
+        assert_eq!(reclaim_targets(&state, &with_ft(FT)).unwrap().len(), 1);
+        assert_eq!(
+            reclaim_targets(&state, &live(4242, 1_715_911_002, false))
+                .unwrap()
+                .len(),
+            1,
+            "no live FILETIME: the 2 s window decides"
+        );
+    }
+
+    /// A state file written before `spawned_at_ft` existed still loads.
+    #[test]
+    fn orphan_state_loads_records_without_a_filetime() {
+        let json = r#"{"schema_version":1,"trees":{"backend":[{"pid":7,"spawned_at_unix":5}]}}"#;
+        let parsed: OrphanState = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.trees["backend"][0].spawned_at_ft, None);
+    }
+
     #[test]
     fn round_trip_orphan_state() {
         let mut s = OrphanState::new();
@@ -381,6 +437,7 @@ mod tests {
             vec![PidWithSpawnedAt {
                 pid: 1234,
                 spawned_at_unix: 1715911000,
+                spawned_at_ft: None,
             }],
         );
         let json = serde_json::to_string(&s).unwrap();
