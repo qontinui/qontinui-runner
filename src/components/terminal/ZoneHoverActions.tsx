@@ -130,13 +130,13 @@ export const HEADER_TRUNCATING_FLOORS_PX = {
 
 /**
  * What a REMOTE tab adds to the row (`RemoteTabControls`), every item
- * truncating: the device badge (`px-1`, 8); the "earlier output" / "reattach"
+ * truncating: the device badge, which keeps its Monitor icon (`min-w-[18px]`); the "earlier output" / "reattach"
  * action — one at a time, live vs ended — which keeps its icon (`min-w-[18px]`);
  * and the three status lines (interactivity summary, input note, action note),
  * which truncate to nothing. Each still takes a row gap.
  */
 export const HEADER_REMOTE_FLOORS_PX = {
-  remoteBadge: 8,
+  remoteBadge: 18,
   remoteAction: 18,
   remoteStatus: 0,
   remoteInputNote: 0,

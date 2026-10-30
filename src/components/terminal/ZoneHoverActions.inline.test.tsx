@@ -244,7 +244,7 @@ describe("header reserve for the hover overlay", () => {
 describe("narrow zones collapse the hover cluster", () => {
   it("the collapse width is left padding + the header's minimum + the full reserve", () => {
     expect(headerControlsMinPx()).toBe(256);
-    expect(headerControlsMinPx(true)).toBe(312);
+    expect(headerControlsMinPx(true)).toBe(322);
     // The hover padding replaces only the row's right `px-2`; the left 8 stays.
     expect(ZONE_HOVER_COLLAPSE_BELOW_PX).toBe(
       8 + headerControlsMinPx() + ZONE_HEADER_HOVER_RESERVE_PX,
@@ -260,7 +260,7 @@ describe("narrow zones collapse the hover cluster", () => {
     // Known limit (headerReserve.ts): with every header item present, the
     // collapsed layout still needs this much; narrower zones overlap.
     expect(8 + headerControlsMinPx() + ZONE_HEADER_COLLAPSED_RESERVE_PX).toBe(324);
-    expect(8 + headerControlsMinPx(true) + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(402);
+    expect(8 + headerControlsMinPx(true) + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(412);
     expect(8 + headerControlsMinPx() + ZONE_HEADER_COLLAPSED_RESERVE_PX).toBeLessThan(
       ZONE_HOVER_COLLAPSE_BELOW_PX,
     );

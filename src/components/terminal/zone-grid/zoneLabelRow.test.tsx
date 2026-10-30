@@ -177,12 +177,14 @@ describe("zone header row against headerControlsMinPx", () => {
     // The device badge and the action keep their full text in their title.
     const badge = row.querySelector('[data-ui-bridge-id="terminal.remote-badge.t1"]')!;
     expect(badge.getAttribute("title")).toContain("dev-1234-5678");
+    // Both keep their icon: the badge's Monitor icon is the only sign the tab is remote.
+    expect(classes(badge)).toContain("min-w-[18px]");
     expect(classes(earlier)).toContain("min-w-[18px]");
     expect(earlier.getAttribute("title")).toBeTruthy();
     expect(row.querySelector('[data-ui-bridge-id="terminal.remote-note.t1"]')?.textContent).toBe(
       "no earlier output",
     );
-    expect(headerControlsMinPx(true)).toBe(312);
+    expect(headerControlsMinPx(true)).toBe(322);
   });
 
   it("the session-info count is capped so its budget holds", () => {
