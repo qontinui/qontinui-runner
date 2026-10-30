@@ -49,8 +49,9 @@ use tracing::{debug, info, warn};
 use qontinui_runner_lib::looping_agent::desired_state::{
     self, CoordDesiredState, DesiredSource, EffectiveDesired,
 };
+use qontinui_runner_lib::looping_agent::holder::{self, HolderObservation};
 use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
-use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot};
+use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot, SlotHolder};
 use qontinui_runner_lib::looping_agent::playbook;
 use qontinui_runner_lib::looping_agent::policy::{self, Action, Liveness, SpawnReason, TickInput};
 use qontinui_runner_lib::looping_agent::registry::{
@@ -120,6 +121,59 @@ fn set_held_slot(agent_id: &str, slot: HeldSlot) {
 fn clear_held_slot(agent_id: &str) -> Option<HeldSlot> {
     let mut guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_mut().and_then(|m| m.remove(agent_id))
+}
+
+/// Latest holder observation per slot `resource_key` — the cache that bounds
+/// the `/coord/claims/by-resource` fallback to one read per lease TTL per key
+/// (`holder::holder_lookup_due`). Failed reads are cached too, so a down coord
+/// costs one retry per TTL rather than one per tick.
+///
+/// In-memory only, in the `HELD_SLOTS` idiom and for the same reason: coord is
+/// the authority, this is an informational memo. A restart re-observes on the
+/// next held tick.
+static SLOT_HOLDER_OBS: Mutex<Option<HashMap<String, HolderObservation>>> = Mutex::new(None);
+
+fn slot_holder_obs_for(resource_key: &str) -> Option<HolderObservation> {
+    let guard = SLOT_HOLDER_OBS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(resource_key)).cloned()
+}
+
+fn set_slot_holder_obs(resource_key: &str, obs: HolderObservation) {
+    let mut guard = SLOT_HOLDER_OBS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(resource_key.to_string(), obs);
+}
+
+/// Observe who holds `resource_key` on the `Held` arm.
+///
+/// * The acquire reply named the holder → record it (`source = Acquire`).
+/// * Else, a fallback read is due (no observation yet, or the last one is at
+///   least one lease TTL old) → `GET /coord/claims/by-resource` and record
+///   `ByResource`, `NotHeldAtLookup` or `LookupFailed`.
+/// * Else → reuse the prior observation.
+///
+/// The result is informational: it feeds a log line and the status surface,
+/// never the spawn decision.
+async fn observe_slot_holder(
+    resource_key: &str,
+    acquire_holder: Option<&SlotHolder>,
+) -> HolderObservation {
+    let now = std::time::Instant::now();
+    if let Some(h) = acquire_holder {
+        let obs = HolderObservation::from_acquire(h.clone(), now);
+        set_slot_holder_obs(resource_key, obs.clone());
+        return obs;
+    }
+    let ttl = holder::holder_observation_ttl();
+    let prior = slot_holder_obs_for(resource_key);
+    if let Some(p) = prior.filter(|p| !holder::holder_lookup_due(None, Some(p), now, ttl)) {
+        return p;
+    }
+    let result = crate::looping_agent_coord::lookup_slot_holder(resource_key).await;
+    let obs = HolderObservation::from_lookup(result, now);
+    set_slot_holder_obs(resource_key, obs.clone());
+    obs
 }
 
 /// Last-logged effective posture per agent, so the posture line is
@@ -803,10 +857,18 @@ async fn reconcile_slot_lease(
                 return true;
             }
             lease::AcquireOutcome::Held { holder } => {
+                // FAIL-OPEN INVARIANT: the holder observation below is
+                // INFORMATIONAL ONLY. It is never passed to
+                // `lease::spawn_permitted` / `gate_action`, and it never changes
+                // this arm's control flow — a Held slot stays held and we fall
+                // through to "try the next slot" whatever the lookup says
+                // (named, not-held-at-lookup, or failed).
+                let obs = observe_slot_holder(&resource_key, holder.as_ref()).await;
                 debug!(
                     agent = %agent_id,
                     %resource_key,
-                    holder = holder.as_ref().map(|h| h.machine_id.as_str()).unwrap_or("unknown"),
+                    holder = obs.holder.as_ref().map(|h| h.machine_id.as_str()).unwrap_or("unknown"),
+                    holder_source = ?obs.source,
                     "looping_agent_supervisor: slot held by another runner — trying the next"
                 );
             }
